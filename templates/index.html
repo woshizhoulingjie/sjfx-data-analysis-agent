@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>数据分析智能体</title>
+  <link rel="stylesheet" href="/static/style.css?v=12">
+</head>
+<body>
+  <header class="topbar">
+    <h1>数据分析智能体</h1>
+  </header>
+
+  <main class="layout">
+    <section class="control-panel card">
+      <div class="section-title"><span>01</span> 导入与完整分析</div>
+      <label for="rootPath">服务器本地数据包目录</label>
+      <div class="input-row">
+        <input id="rootPath" value="/home/nas511/zhoulingjie/sjfx/demo_data" autocomplete="off">
+        <button id="scanBtn" class="primary">导入并分析</button>
+      </div>
+      <div class="parse-mode-box">
+        <label for="parseMode">解析模式</label>
+        <select id="parseMode">
+          <option value="fast" selected>快速解析（推荐）</option>
+          <option value="accurate">高精度解析</option>
+        </select>
+        <small id="parseModeHelp">快速提取正文；扫描型 PDF 仅预览前几页 OCR。需要完整版面、表格和图片识别时请选择高精度解析。</small>
+      </div>
+      <div id="pipeline" class="pipeline empty">
+        <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+        <div id="progressText">导入后将按所选模式完成资料分析并生成概览报告。</div>
+      </div>
+      <div class="privacy-check">
+        <input type="checkbox" id="cloudConfirmed">
+        <label for="cloudConfirmed">允许使用已配置的模型增强摘要（服务器本机 Ollama 模式不会出网）</label>
+      </div>
+      <div class="button-row wrap">
+        <button id="testBtn" class="ghost">测试本地模型</button>
+        <button id="reanalyzeBtn" disabled>重新执行本地完整分析</button>
+        <button id="reportBtn" disabled>重新生成概览 Word</button>
+      </div>
+      <div id="scanStats" class="stats empty">尚未导入数据包</div>
+      <div id="reportResult" class="report-result empty">完整分析结束后将自动生成概览 Word，并返回推荐研究方向。</div>
+    </section>
+
+    <section class="tree-panel card">
+      <div class="panel-heading">
+        <div class="section-title"><span>02</span> 交互式目录与分类树</div>
+        <div class="segmented">
+          <button id="physicalTreeBtn" class="active" disabled>原始目录</button>
+          <button id="analysisTreeBtn" disabled>主题目录</button>
+        </div>
+      </div>
+      <div id="tree" class="tree empty">导入后显示原始目录；完整分析完成后自动显示语义主题目录。</div>
+    </section>
+
+    <section class="detail-panel card">
+      <div class="section-title"><span>03</span> 节点摘要、深度阅读与证据链</div>
+      <div id="selection" class="selection empty">请从目录树选择文件或文件夹</div>
+      <div class="button-row wrap">
+        <button id="summaryBtn" class="primary" disabled>生成模型深度摘要</button>
+        <button id="deepenBtn" disabled>补充分析当前范围</button>
+        <button id="exportBtn" disabled>导出待整编数据包</button>
+      </div>
+      <div id="selectionCart" class="selection-cart empty">可勾选多个主题、目录、文档或原文证据，组合导出时会自动去重。</div>
+      <div class="retrieval-box">
+        <label for="retrievalQuery">本地证据检索（RAG）</label>
+        <div class="input-row">
+          <input id="retrievalQuery" placeholder="例如：哪些资料支持该研究方向？" autocomplete="off">
+          <button id="retrievalBtn" disabled>检索证据</button>
+        </div>
+        <small>使用本地 BM25 与 TF-IDF 字符向量，不调用云端模型。</small>
+      </div>
+      <div id="summary" class="summary empty">文件夹摘要、文档解析结果、全文深度摘要和证据来源将在这里显示。</div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" aria-live="polite"></div>
+  <script src="/static/app.js?v=12"></script>
+</body>
+</html>

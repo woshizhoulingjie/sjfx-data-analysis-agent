@@ -1,0 +1,87 @@
+import os
+from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def load_local_env():
+    env_file = BASE_DIR / ".env"
+    if not env_file.exists():
+        return
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_local_env()
+
+# Defaults must be applied after .env loading, otherwise setdefault() would
+# make the hard-coded defaults win over project-local configuration.
+os.environ.setdefault("HF_HOME", str(BASE_DIR / "models" / "huggingface"))
+os.environ.setdefault("DOCLING_CACHE_DIR", str(BASE_DIR / "models" / "docling"))
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+# The laboratory server has no outbound Hugging Face route.  Never let a
+# document parse attempt a model download into a shared system cache or wait
+# for a network timeout; Docling may use only artifacts stored under this app.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+class Config:
+    BASE_DIR = BASE_DIR
+    DATA_DIR = BASE_DIR / "data"
+    OUTPUT_DIR = BASE_DIR / "outputs"
+    LOG_DIR = BASE_DIR / "logs"
+    MODELS_DIR = BASE_DIR / "models"
+    DOCLING_ARTIFACTS_DIR = MODELS_DIR / "docling"
+    RAPIDOCR_MODEL_DIR = MODELS_DIR / "rapidocr"
+    DB_PATH = DATA_DIR / "agent.db"
+    DOCUMENT_CACHE_DIR = DATA_DIR / "document_payloads"
+    # The server already provides a local Ollama instance. Keep local mode as
+    # the default so an absent .env can never send document text to the internet.
+    LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").strip().lower()
+    # Cloud document transmission is opt-in for physically isolated hosts.
+    ENABLE_CLOUD_FEATURES = os.getenv("ENABLE_CLOUD_FEATURES", "0").strip().lower() in {"1", "true", "yes"}
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen-agent:latest")
+    OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "qwen-embed:latest")
+    LLM_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1")))
+    # The available Ollama service is shared by the laboratory. Do not send
+    # long document prompts to it unless a dedicated scheduling decision was made.
+    ENABLE_SHARED_OLLAMA = os.getenv("ENABLE_SHARED_OLLAMA", "0").strip().lower() in {"1", "true", "yes"}
+    ENABLE_SHARED_OLLAMA_EMBEDDINGS = os.getenv("ENABLE_SHARED_OLLAMA_EMBEDDINGS", "0").strip().lower() in {"1", "true", "yes"}
+    SHARED_OLLAMA_REQUEST_TIMEOUT = max(60, int(os.getenv("SHARED_OLLAMA_REQUEST_TIMEOUT", "600")))
+    SHARED_OLLAMA_MAX_CHARS = max(4000, int(os.getenv("SHARED_OLLAMA_MAX_CHARS", "48000")))
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    HOST = os.getenv("HOST", "127.0.0.1")
+    PORT = int(os.getenv("PORT", "8000"))
+    MAX_EXTRACT_CHARS = int(os.getenv("MAX_EXTRACT_CHARS", "60000"))
+    MAX_FULL_DOCUMENT_CHARS = int(os.getenv("MAX_FULL_DOCUMENT_CHARS", "2000000"))
+    MAX_DOCUMENT_CHUNKS = int(os.getenv("MAX_DOCUMENT_CHUNKS", "12"))
+    # ZIP64 is used by the exporter.  A 4-5 GB analysis package may legitimately
+    # need a larger handoff archive than the previous demonstration cap.
+    MAX_EXPORT_BYTES = int(os.getenv("MAX_EXPORT_BYTES", str(5 * 1024 * 1024 * 1024)))
+    MAX_SCAN_FILES = int(os.getenv("MAX_SCAN_FILES", "50000"))
+    SIDECAR_PAYLOAD_BYTES = int(os.getenv("SIDECAR_PAYLOAD_BYTES", str(256 * 1024)))
+    LARGE_PACKAGE_THRESHOLD_BYTES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_BYTES", str(1024 * 1024 * 1024)))
+    LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
+    LARGE_PACKAGE_INITIAL_PARSE_FILES = int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "700"))
+    LARGE_PACKAGE_DEEPEN_BATCH_FILES = int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "500"))
+    LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE = int(os.getenv("LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE", "30000"))
+    MAX_ANALYSIS_JOBS = max(1, int(os.getenv("MAX_ANALYSIS_JOBS", "1")))
+    MAX_CLOUD_REQUESTS = max(1, int(os.getenv("MAX_CLOUD_REQUESTS", "3")))
+
+
+Config.DATA_DIR.mkdir(exist_ok=True)
+Config.DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+Config.OUTPUT_DIR.mkdir(exist_ok=True)
+Config.LOG_DIR.mkdir(exist_ok=True)
+Config.MODELS_DIR.mkdir(exist_ok=True)
+Config.DOCLING_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+Config.RAPIDOCR_MODEL_DIR.mkdir(parents=True, exist_ok=True)

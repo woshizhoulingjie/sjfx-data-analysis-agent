@@ -1,0 +1,8 @@
+Flask>=1.1,<4
+pypdf>=5,<7
+python-docx>=1.1,<2
+python-pptx>=1.0,<2
+openpyxl>=3.1,<4
+docling[rapidocr]>=2.114,<3
+scikit-learn>=1.5,<2
+psutil>=6,<8

@@ -1,0 +1,738 @@
+import hashlib
+import json
+import os
+import posixpath
+import re
+import threading
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from xml.etree import ElementTree
+
+from services.scanner import extract_text
+
+
+SUPPORTED_EXTENSIONS = {
+    ".pdf", ".docx", ".pptx", ".xlsx", ".xlsm",
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
+    ".xml", ".html", ".htm", ".log", ".yaml", ".yml",
+}
+
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def sha256_file(path, block_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while True:
+            block = stream.read(block_size)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _digest_text(text):
+    return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _short_text(text, limit=900):
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    return value[:limit]
+
+
+def _get_value(obj, name, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _label_name(value):
+    if value is None:
+        return "text"
+    return str(getattr(value, "value", value))
+
+
+def _tableformer_available(artifacts_path):
+    if not artifacts_path:
+        return False
+    root = Path(artifacts_path) / "docling-project--docling-models" / "model_artifacts" / "tableformer"
+    for mode, filename in (("accurate", "tableformer_accurate.safetensors"), ("fast", "tableformer_fast.safetensors")):
+        folder = root / mode
+        weights = folder / filename
+        # A partially copied safetensors file exists but cannot be loaded. The
+        # lower bounds are deliberately conservative for Docling's shipped
+        # TableFormer weights and keep an interrupted personal upload safe.
+        minimum_size = 100 * 1024 * 1024 if mode == "accurate" else 80 * 1024 * 1024
+        if weights.exists() and weights.stat().st_size >= minimum_size and (folder / "tm_config.json").exists():
+            return True
+    return False
+
+
+def _docling_artifacts_ready(artifacts_path):
+    """Require the local layout model before enabling Docling.
+
+    Importing Docling alone is not enough: a partial cache used to make the
+    first high-accuracy parse attempt an inaccessible Hugging Face download.
+    """
+    if not artifacts_path:
+        return False
+    root = Path(artifacts_path)
+    layout = root / "docling-project--docling-layout-heron"
+    weights = layout / "model.safetensors"
+    return (
+        (layout / "config.json").exists()
+        and weights.exists()
+        and weights.stat().st_size >= 150 * 1024 * 1024
+    )
+
+
+class UnifiedDocumentParser:
+    """Docling-first parser with an explicit, auditable local fallback.
+
+    One converter is reused because Docling model initialization is expensive.
+    The converter is protected by a lock; package-level callers may still hash and
+    organise documents concurrently without racing the native OCR pipeline.
+    """
+
+    def __init__(self, artifacts_path=None, rapidocr_model_dir=None, max_chars=2_000_000, fast_office_ocr=True):
+        self.artifacts_path = Path(artifacts_path) if artifacts_path else None
+        self.rapidocr_model_dir = Path(rapidocr_model_dir) if rapidocr_model_dir else None
+        self.max_chars = max_chars
+        self.fast_office_ocr = bool(fast_office_ocr)
+        self._converter = None
+        self._converter_error = None
+        self._ocr_engine = None
+        self._lock = threading.Lock()
+        # These flags also cover direct use outside app.py/config.py.
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    @property
+    def docling_available(self):
+        if not _docling_artifacts_ready(self.artifacts_path):
+            return False
+        try:
+            import docling  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def status(self):
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+        except ImportError:  # Python 3.7 local development compatibility
+            try:
+                from importlib_metadata import PackageNotFoundError, version
+            except ImportError:
+                PackageNotFoundError = Exception
+
+                def version(_name):
+                    raise PackageNotFoundError()
+        versions = {}
+        for module_name in ("docling", "rapidocr", "onnxruntime"):
+            try:
+                versions[module_name] = version(module_name)
+            except PackageNotFoundError:
+                versions[module_name] = None
+        models = {}
+        if self.rapidocr_model_dir:
+            for name in ("ch_PP-OCRv5_det_mobile.onnx", "ch_PP-OCRv5_rec_mobile.onnx", "ch_ppocr_mobile_v2.0_cls_mobile.onnx"):
+                models[name] = (self.rapidocr_model_dir / name).exists()
+        tableformer_ready = _tableformer_available(self.artifacts_path)
+        return {
+            "primary_parser": "Docling",
+            "ocr_engine": "RapidOCR (ONNX Runtime)",
+            "available": bool(versions["docling"]) and _docling_artifacts_ready(self.artifacts_path),
+            "versions": versions,
+            "remote_services_enabled": False,
+            "artifacts_path": str(self.artifacts_path) if self.artifacts_path else None,
+            "rapidocr_models": models,
+            "tableformer_ready": tableformer_ready,
+            "offline_only": True,
+            "local_artifacts_ready": _docling_artifacts_ready(self.artifacts_path),
+            "initialization_error": self._converter_error,
+        }
+
+    def _build_converter(self):
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions, TableFormerMode
+        from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
+
+        pdf_options = PdfPipelineOptions()
+        pdf_options.do_ocr = True
+        local_artifacts_ready = _docling_artifacts_ready(self.artifacts_path)
+        tableformer_ready = _tableformer_available(self.artifacts_path)
+        # Missing table artifacts are a feature reduction, not permission to
+        # fetch them from the network during a user analysis job.
+        pdf_options.do_table_structure = tableformer_ready
+        if tableformer_ready and self.artifacts_path:
+            accurate = self.artifacts_path / "docling-project--docling-models" / "model_artifacts" / "tableformer" / "accurate" / "tableformer_accurate.safetensors"
+            pdf_options.table_structure_options.mode = TableFormerMode.ACCURATE if accurate.exists() else TableFormerMode.FAST
+        pdf_options.enable_remote_services = False
+        # Docling 2.119 enables torch.compile for the Heron layout model by
+        # default. On a clean Windows demo host that would require MSVC "cl".
+        # Disable compilation so inference stays portable and CPU-only.
+        if hasattr(pdf_options, "layout_options") and hasattr(pdf_options.layout_options, "engine_options"):
+            if hasattr(pdf_options.layout_options.engine_options, "compile_model"):
+                pdf_options.layout_options.engine_options.compile_model = False
+        if local_artifacts_ready:
+            pdf_options.artifacts_path = self.artifacts_path
+        model_dir = self.rapidocr_model_dir
+        det = model_dir / "ch_PP-OCRv5_det_mobile.onnx" if model_dir else None
+        rec = model_dir / "ch_PP-OCRv5_rec_mobile.onnx" if model_dir else None
+        cls = model_dir / "ch_ppocr_mobile_v2.0_cls_mobile.onnx" if model_dir else None
+        ocr_kwargs = {"force_full_page_ocr": False}
+        if det and rec and cls and det.exists() and rec.exists() and cls.exists():
+            ocr_kwargs.update({"det_model_path": str(det), "rec_model_path": str(rec), "cls_model_path": str(cls)})
+        try:
+            pdf_options.ocr_options = RapidOcrOptions(**ocr_kwargs)
+        except TypeError:
+            ocr_kwargs.pop("force_full_page_ocr", None)
+            pdf_options.ocr_options = RapidOcrOptions(**ocr_kwargs)
+        return DocumentConverter(
+            allowed_formats=[
+                InputFormat.PDF, InputFormat.IMAGE, InputFormat.DOCX,
+                InputFormat.PPTX, InputFormat.XLSX, InputFormat.HTML,
+                InputFormat.MD, InputFormat.CSV,
+            ],
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
+                InputFormat.IMAGE: ImageFormatOption(pipeline_options=pdf_options),
+            },
+        )
+
+    def _get_converter(self):
+        if self._converter is not None:
+            return self._converter
+        if self._converter_error:
+            raise RuntimeError(self._converter_error)
+        try:
+            self._converter = self._build_converter()
+            return self._converter
+        except Exception as exc:
+            self._converter_error = "Docling 初始化失败：{}".format(exc)
+            raise RuntimeError(self._converter_error) from exc
+
+    def _get_ocr_engine(self):
+        if self._ocr_engine is not None:
+            return self._ocr_engine
+        from rapidocr import RapidOCR
+        params = {}
+        if self.rapidocr_model_dir:
+            mapping = {
+                "Det.model_path": "ch_PP-OCRv5_det_mobile.onnx",
+                "Rec.model_path": "ch_PP-OCRv5_rec_mobile.onnx",
+                "Cls.model_path": "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+            }
+            for key, name in mapping.items():
+                model = self.rapidocr_model_dir / name
+                if model.exists():
+                    params[key] = str(model)
+        self._ocr_engine = RapidOCR(params=params or None)
+        return self._ocr_engine
+
+    def parse(self, path, relative_path=None, mode="accurate"):
+        path = Path(path).resolve()
+        relative_path = str(relative_path or path.name).replace("\\", "/")
+        mode = "fast" if str(mode).lower() == "fast" else "accurate"
+        source_hash = sha256_file(path)
+        base = {
+            "schema_version": "unified-document/1.0",
+            "source": {
+                "path": relative_path,
+                "absolute_path": str(path),
+                "name": path.name,
+                "extension": path.suffix.lower(),
+                "size": path.stat().st_size,
+                "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
+                "sha256": source_hash,
+            },
+            "parsed_at": utc_now(),
+            "parser": {},
+            "structure": {"title": path.stem, "headings": [], "page_count": None, "table_count": 0, "picture_count": 0},
+            "text": "",
+            "content_sha256": "",
+            "coverage": {
+                "extracted_characters": 0,
+                "stored_characters": 0,
+                "embedded_ocr_characters": 0,
+                "complete": True,
+                "truncated_by_limit": False,
+                "limited_by_fast_mode": False,
+                "coverage_ratio": 1.0,
+            },
+            "evidence": [],
+            "warnings": [],
+        }
+        ext = path.suffix.lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
+            base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
+            return base
+
+        if mode == "fast":
+            self._fast_parse(path, base)
+            base["parser"]["mode"] = "fast"
+        # Plain text formats do not benefit from layout models; they are still
+        # normalised into the exact same schema and evidence representation.
+        docling_formats = {".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".html", ".htm", ".md", ".csv"}
+        if mode != "fast" and ext in docling_formats and self.docling_available:
+            try:
+                with self._lock:
+                    result = self._get_converter().convert(str(path))
+                document = result.document
+                text = document.export_to_markdown() or document.export_to_text()
+                base["text"] = str(text or "")[: self.max_chars]
+                base["coverage"]["extracted_characters"] = len(str(text or ""))
+                base["parser"] = {
+                    "name": "Docling",
+                    "degraded": False,
+                    "ocr": ext in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"},
+                    "mode": "accurate",
+                    "remote_services_enabled": False,
+                }
+                self._extract_docling_items(document, base)
+                if ext in {".docx", ".pptx", ".xlsx", ".xlsm"}:
+                    self._rapidocr_office_images(path, base)
+                if len(str(text or "")) > self.max_chars:
+                    base["coverage"]["truncated_by_limit"] = True
+                    base["warnings"].append("统一正文超过演示版字符上限，证据项仍按已解析结构保留。")
+            except Exception as exc:
+                base["warnings"].append("Docling 解析失败，已切换本地兼容解析器：{}".format(exc))
+                self._fallback(path, base)
+        elif mode != "fast":
+            if ext in docling_formats and not self.docling_available:
+                base["warnings"].append("Docling 未安装，已切换本地兼容解析器。")
+            self._fallback(path, base)
+            base["parser"]["mode"] = "accurate-fallback"
+
+        base["content_sha256"] = _digest_text(base["text"])
+        base["coverage"]["stored_characters"] = len(base["text"])
+        total_available = base["coverage"].get("extracted_characters", 0) + base["coverage"].get("embedded_ocr_characters", 0)
+        if not total_available:
+            total_available = len(base["text"])
+            base["coverage"]["extracted_characters"] = total_available
+        base["coverage"]["complete"] = (
+            not base["coverage"].get("truncated_by_limit")
+            and not base["coverage"].get("limited_by_fast_mode")
+            and len(base["text"]) >= total_available
+        )
+        if not base["coverage"].get("limited_by_fast_mode"):
+            base["coverage"]["coverage_ratio"] = round(min(1.0, len(base["text"]) / float(total_available or 1)), 6)
+        if not base["evidence"] and base["text"].strip():
+            self._add_fallback_evidence(base)
+        return base
+
+    def _fast_parse(self, path, base):
+        """Low-latency parsing for inventory and first-pass evidence discovery.
+
+        Text PDFs and Office files use lightweight native readers. Images still
+        use RapidOCR. Image-only PDFs OCR only a small leading sample and are
+        explicitly marked incomplete so the UI cannot present them as fully read.
+        """
+        self._fallback(path, base, ocr_empty_pdf=False)
+        ext = path.suffix.lower()
+        base["warnings"].append("当前使用快速解析模式；未执行 Docling 版面模型或 TableFormer。")
+        if self.fast_office_ocr and ext in {".docx", ".pptx", ".xlsx", ".xlsm"}:
+            self._rapidocr_office_images(path, base)
+        elif ext in {".docx", ".pptx", ".xlsx", ".xlsm"}:
+            base["warnings"].append("快速模式已跳过 Office 内嵌图片 OCR；可切换高精度解析。")
+            base["coverage"]["complete"] = False
+            base["coverage"]["limited_by_fast_mode"] = True
+            base["coverage"]["coverage_ratio"] = None
+            base["coverage"]["coverage_ratio_reason"] = "快速模式跳过 Office 内嵌图片 OCR，无法从正文字符数估算完整覆盖率。"
+        if ext == ".pdf" and not base["text"].strip():
+            page_count = int(base.get("structure", {}).get("page_count") or 0)
+            preview_pages = min(3, page_count) if page_count else 3
+            try:
+                processed = self._rapidocr_pdf(path, base, max_pages=preview_pages)
+                if page_count and processed < page_count:
+                    base["coverage"]["limited_by_fast_mode"] = True
+                    base["coverage"]["coverage_ratio"] = round(processed / float(page_count), 6)
+                    base["warnings"].append(
+                        "扫描型 PDF 在快速模式下仅 OCR 前 {} 页；如需全文证据，请改用高精度解析。".format(processed)
+                    )
+            except Exception as exc:
+                base["warnings"].append("快速模式扫描 PDF 预览 OCR 失败：{}".format(exc))
+        base["parser"]["degraded"] = False
+        base["parser"]["fast_preview"] = bool(base["coverage"].get("limited_by_fast_mode"))
+
+    @staticmethod
+    def _office_image_contexts(archive, ext):
+        """Return media path -> best available Office location metadata.
+
+        DOCX has no stable page number before pagination, so the nearest heading
+        and paragraph ordinal are used. PPTX images are tied to a slide number.
+        XLSX images retain their media name when worksheet drawing relationships
+        cannot be resolved without executing Office.
+        """
+        contexts = {}
+        names = set(archive.namelist())
+        if ext == ".docx" and "word/document.xml" in names:
+            rels = {}
+            rel_path = "word/_rels/document.xml.rels"
+            if rel_path in names:
+                root = ElementTree.fromstring(archive.read(rel_path))
+                for rel in root:
+                    rel_id = rel.attrib.get("Id")
+                    target = rel.attrib.get("Target", "")
+                    if rel_id and "media/" in target:
+                        rels[rel_id] = posixpath.normpath(posixpath.join("word", target))
+            ns = {
+                "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            }
+            root = ElementTree.fromstring(archive.read("word/document.xml"))
+            current_heading = None
+            paragraph_no = 0
+            for paragraph in root.findall(".//w:body/w:p", ns):
+                paragraph_no += 1
+                text = "".join(node.text or "" for node in paragraph.findall(".//w:t", ns)).strip()
+                style = paragraph.find("./w:pPr/w:pStyle", ns)
+                style_value = style.attrib.get("{%s}val" % ns["w"], "") if style is not None else ""
+                if text and ("heading" in style_value.lower() or "标题" in style_value):
+                    current_heading = text[:160]
+                for blip in paragraph.findall(".//a:blip", ns):
+                    rel_id = blip.attrib.get("{%s}embed" % ns["r"])
+                    media = rels.get(rel_id)
+                    if media:
+                        label = "第{}段内嵌图片".format(paragraph_no)
+                        if current_heading:
+                            label = "{} · {}".format(current_heading, label)
+                        contexts[media] = {"page": None, "section": label}
+        elif ext == ".pptx":
+            ns = {
+                "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+            }
+            for name in sorted(names):
+                match = re.fullmatch(r"ppt/slides/_rels/slide(\d+)\.xml\.rels", name)
+                if not match:
+                    continue
+                slide_no = int(match.group(1))
+                slide_name = "ppt/slides/slide{}.xml".format(slide_no)
+                title = ""
+                if slide_name in names:
+                    slide_root = ElementTree.fromstring(archive.read(slide_name))
+                    text_values = [node.text.strip() for node in slide_root.findall(".//a:t", ns) if node.text and node.text.strip()]
+                    title = text_values[0][:120] if text_values else ""
+                rel_root = ElementTree.fromstring(archive.read(name))
+                for rel in rel_root:
+                    target = rel.attrib.get("Target", "")
+                    if "media/" not in target:
+                        continue
+                    media = posixpath.normpath(posixpath.join(posixpath.dirname(slide_name), target))
+                    section = "幻灯片 {}".format(slide_no)
+                    if title:
+                        section += " · " + title
+                    contexts[media] = {"page": slide_no, "section": section}
+        return contexts
+
+    def _rapidocr_office_images(self, path, base):
+        """OCR embedded Office images and merge them into the unified model."""
+        ext = path.suffix.lower()
+        prefixes = {
+            ".docx": "word/media/",
+            ".pptx": "ppt/media/",
+            ".xlsx": "xl/media/",
+            ".xlsm": "xl/media/",
+        }
+        prefix = prefixes.get(ext)
+        if not prefix:
+            return
+        try:
+            with zipfile.ZipFile(str(path)) as archive:
+                media = [name for name in archive.namelist() if name.startswith(prefix) and not name.endswith("/")]
+                if not media:
+                    return
+                contexts = self._office_image_contexts(archive, ext)
+                seen_hashes = set()
+                recognized_assets = 0
+                ocr_characters = 0
+                for ordinal, name in enumerate(sorted(media), 1):
+                    blob = archive.read(name)
+                    image_hash = hashlib.sha256(blob).hexdigest()
+                    if image_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(image_hash)
+                    context = contexts.get(name, {})
+                    with self._lock:
+                        result = self._get_ocr_engine()(blob)
+                    texts = list(result.txts) if result.txts is not None else []
+                    if not texts:
+                        continue
+                    recognized_assets += 1
+                    ocr_characters += sum(len(str(value)) for value in texts)
+                    scores = list(result.scores) if result.scores is not None else []
+                    boxes = list(result.boxes) if result.boxes is not None else []
+                    section = context.get("section") or "内嵌图片 {}（{}）".format(ordinal, Path(name).name)
+                    marker = "[{} OCR]\n{}".format(section, "\n".join(str(value) for value in texts))
+                    remaining = max(0, self.max_chars - len(base["text"]))
+                    if remaining:
+                        base["text"] += ("\n\n" if base["text"] else "") + marker[:remaining]
+                    if len(marker) > remaining:
+                        base["coverage"]["truncated_by_limit"] = True
+                    for index, value in enumerate(texts):
+                        snippet = _short_text(value)
+                        if not snippet or len(base["evidence"]) >= 3000:
+                            continue
+                        bbox = boxes[index] if index < len(boxes) else None
+                        if hasattr(bbox, "tolist"):
+                            bbox = bbox.tolist()
+                        base["evidence"].append({
+                            "evidence_id": "E-{}-{:05d}".format(base["source"]["sha256"][:10], len(base["evidence"]) + 1),
+                            "source_path": base["source"]["path"],
+                            "page": context.get("page"),
+                            "section": section,
+                            "label": "embedded_image_ocr",
+                            "text": snippet,
+                            "bbox": bbox,
+                            "score": float(scores[index]) if index < len(scores) else None,
+                            "parser": "RapidOCR PP-OCRv5 mobile",
+                            "embedded_asset": name,
+                            "embedded_asset_sha256": image_hash,
+                            "source_sha256": base["source"]["sha256"],
+                            "content_sha256": _digest_text(snippet),
+                        })
+                base["structure"]["picture_count"] = max(base["structure"].get("picture_count", 0), len(seen_hashes))
+                if recognized_assets:
+                    base["parser"]["ocr"] = True
+                    base["parser"]["office_embedded_image_ocr"] = True
+                    base["parser"]["ocr_models"] = "PP-OCRv5 mobile det/rec"
+                    base["structure"]["ocr_picture_count"] = recognized_assets
+                    base["coverage"]["embedded_ocr_characters"] += ocr_characters
+                if len(base["text"]) >= self.max_chars:
+                    base["warnings"].append("统一正文达到本地字符上限；内嵌图片证据仍已独立保留。")
+        except (OSError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+            base["warnings"].append("Office 内嵌图片 OCR 检查失败：{}".format(exc))
+
+    def _extract_docling_items(self, document, base):
+        headings = []
+        pages = set()
+        evidence = []
+        table_count = 0
+        picture_count = 0
+        items = []
+        if hasattr(document, "iterate_items"):
+            try:
+                items = [item for item, _level in document.iterate_items()]
+            except Exception:
+                items = []
+        if not items:
+            items = list(getattr(document, "texts", []) or [])
+            items += list(getattr(document, "tables", []) or [])
+            items += list(getattr(document, "pictures", []) or [])
+        current_section = None
+        for index, item in enumerate(items, 1):
+            label = _label_name(_get_value(item, "label", "text"))
+            if "table" in label:
+                table_count += 1
+            if "picture" in label or "image" in label:
+                picture_count += 1
+            item_text = _get_value(item, "text", "") or ""
+            if not item_text and "table" in label:
+                try:
+                    item_text = item.export_to_markdown(document)
+                except Exception:
+                    item_text = ""
+            if label in {"title", "section_header", "heading"} and item_text:
+                current_section = _short_text(item_text, 200)
+                headings.append(current_section)
+                if label == "title" and current_section:
+                    base["structure"]["title"] = current_section
+            snippet = _short_text(item_text)
+            if not snippet:
+                continue
+            provenance = list(_get_value(item, "prov", []) or [])
+            if not provenance:
+                provenance = [None]
+            for prov in provenance[:3]:
+                page = _get_value(prov, "page_no") if prov is not None else None
+                if page is not None:
+                    pages.add(int(page))
+                bbox = _get_value(prov, "bbox") if prov is not None else None
+                bbox_value = None
+                if bbox is not None:
+                    if hasattr(bbox, "model_dump"):
+                        bbox_value = bbox.model_dump()
+                    elif hasattr(bbox, "dict"):
+                        bbox_value = bbox.dict()
+                    else:
+                        bbox_value = str(bbox)
+                evidence.append({
+                    "evidence_id": "E-{}-{:05d}".format(base["source"]["sha256"][:10], len(evidence) + 1),
+                    "source_path": base["source"]["path"],
+                    "page": page,
+                    "section": current_section,
+                    "label": label,
+                    "text": snippet,
+                    "bbox": bbox_value,
+                    "parser": "Docling",
+                    "source_sha256": base["source"]["sha256"],
+                    "content_sha256": _digest_text(snippet),
+                })
+                if len(evidence) >= 3000:
+                    base["warnings"].append("证据项超过 3000 条，演示版仅保留前 3000 条。")
+                    break
+            if len(evidence) >= 3000:
+                break
+        base["structure"].update({
+            "headings": list(dict.fromkeys(headings))[:200],
+            "page_count": max(pages) if pages else None,
+            "table_count": table_count,
+            "picture_count": picture_count,
+        })
+        base["evidence"] = evidence
+
+    def _fallback(self, path, base, ocr_empty_pdf=True):
+        extracted = extract_text(path, max_chars=self.max_chars)
+        base["text"] = extracted.get("text", "")
+        base["coverage"]["extracted_characters"] = (
+            extracted.get("char_count", len(base["text"])) if extracted.get("truncated") else len(base["text"])
+        )
+        if extracted.get("truncated"):
+            base["coverage"]["complete"] = False
+            base["coverage"]["truncated_by_limit"] = True
+        base["parser"] = {
+            "name": extracted.get("parser", "unsupported"),
+            "degraded": True,
+            "ocr": False,
+            "remote_services_enabled": False,
+        }
+        metadata = extracted.get("metadata", {})
+        base["structure"].update({
+            "page_count": metadata.get("page_count") or metadata.get("slide_count"),
+            "table_count": metadata.get("table_count", 0),
+        })
+        base["warnings"].extend(extracted.get("warnings", []))
+        ext = path.suffix.lower()
+        image_extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+        try:
+            if ext in image_extensions:
+                self._rapidocr_image(path, base, page_number=1)
+                base["structure"]["page_count"] = 1
+            elif ext == ".pdf" and not base["text"].strip() and ocr_empty_pdf:
+                self._rapidocr_pdf(path, base)
+        except Exception as exc:
+            base["warnings"].append("RapidOCR 兼容 OCR 失败：{}".format(exc))
+        if base["text"].strip():
+            base["warnings"] = [warning for warning in base["warnings"] if warning != "该文件类型尚未配置正文解析器"]
+
+    def _rapidocr_image(self, image, base, page_number=1):
+        with self._lock:
+            result = self._get_ocr_engine()(image)
+        texts = list(result.txts) if result.txts is not None else []
+        scores = list(result.scores) if result.scores is not None else []
+        boxes = list(result.boxes) if result.boxes is not None else []
+        if not texts:
+            base["warnings"].append("RapidOCR 未在第 {} 页/张识别到文字。".format(page_number))
+            return
+        page_text = "\n".join(texts)
+        page_marker = "[第 {} 页/张 OCR]\n{}".format(page_number, page_text)
+        if base["text"]:
+            base["text"] += "\n\n" + page_marker
+        else:
+            base["text"] = page_marker
+        base["parser"] = {"name": "RapidOCR", "degraded": True, "ocr": True, "ocr_models": "PP-OCRv5 mobile det/rec", "remote_services_enabled": False}
+        for index, text in enumerate(texts):
+            snippet = _short_text(text)
+            if not snippet:
+                continue
+            bbox = boxes[index] if index < len(boxes) else None
+            if hasattr(bbox, "tolist"):
+                bbox = bbox.tolist()
+            base["evidence"].append({
+                "evidence_id": "E-{}-{:05d}".format(base["source"]["sha256"][:10], len(base["evidence"]) + 1),
+                "source_path": base["source"]["path"],
+                "page": page_number,
+                "section": None,
+                "label": "ocr_text",
+                "text": snippet,
+                "bbox": bbox,
+                "score": float(scores[index]) if index < len(scores) else None,
+                "parser": "RapidOCR PP-OCRv5 mobile",
+                "source_sha256": base["source"]["sha256"],
+                "content_sha256": _digest_text(snippet),
+            })
+
+    def _rapidocr_pdf(self, path, base, max_pages=None):
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(str(path))
+        total_pages = len(pdf)
+        processed = 0
+        try:
+            page_limit = min(total_pages, max_pages) if max_pages else total_pages
+            for index in range(page_limit):
+                page = pdf[index]
+                try:
+                    bitmap = page.render(scale=2.0)
+                    image = bitmap.to_numpy()
+                    self._rapidocr_image(image, base, page_number=index + 1)
+                    processed += 1
+                    if len(base["text"]) >= self.max_chars:
+                        base["text"] = base["text"][: self.max_chars]
+                        base["warnings"].append("扫描 PDF 的 OCR 正文达到演示版字符上限。")
+                        break
+                finally:
+                    page.close()
+        finally:
+            pdf.close()
+        base["structure"]["page_count"] = total_pages
+        return processed
+
+    def _add_fallback_evidence(self, base):
+        chunks = re.split(r"(?=\[第\s*\d+\s*页(?:/张)?(?:\s*OCR)?\]|\[幻灯片\s*\d+\]|\n#{1,6}\s+)", base["text"])
+        evidence = []
+        for raw in chunks:
+            page_match = re.search(r"\[第\s*(\d+)\s*页(?:/张)?(?:\s*OCR)?\]", raw)
+            slide_match = re.search(r"\[幻灯片\s*(\d+)\]", raw)
+            page = int((page_match or slide_match).group(1)) if (page_match or slide_match) else None
+            for start in range(0, len(raw), 1200):
+                snippet = _short_text(raw[start:start + 1200], 1200)
+                if not snippet:
+                    continue
+                evidence.append({
+                    "evidence_id": "E-{}-{:05d}".format(base["source"]["sha256"][:10], len(evidence) + 1),
+                    "source_path": base["source"]["path"],
+                    "page": page,
+                    "section": None,
+                    "label": "text_chunk",
+                    "text": snippet,
+                    "character_range": [start, min(len(raw), start + 1200)],
+                    "bbox": None,
+                    "parser": base["parser"].get("name"),
+                    "source_sha256": base["source"]["sha256"],
+                    "content_sha256": _digest_text(snippet),
+                })
+                if len(evidence) >= 3000:
+                    base["warnings"].append("文本证据块超过 3000 条，当前演示版仅保留前 3000 条。")
+                    break
+            if len(evidence) >= 3000:
+                break
+        base["evidence"] = evidence
+
+
+def compact_document(document, include_text=False):
+    payload = {
+        "schema_version": document.get("schema_version"),
+        "source": document.get("source"),
+        "parsed_at": document.get("parsed_at"),
+        "parser": document.get("parser"),
+        "structure": document.get("structure"),
+        "classification": document.get("classification", {}),
+        "coverage": document.get("coverage", {}),
+        "content_sha256": document.get("content_sha256"),
+        "warnings": document.get("warnings", []),
+        "evidence_count": len(document.get("evidence", [])),
+    }
+    if include_text:
+        payload["text"] = document.get("text", "")
+    return payload
+
+
+def dumps_document(document):
+    return json.dumps(document, ensure_ascii=False, indent=2)
