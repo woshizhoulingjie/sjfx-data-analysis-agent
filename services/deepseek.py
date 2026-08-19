@@ -168,22 +168,25 @@ class OllamaClient(DeepSeekClient):
             return {"reachable": False, "model_available": False, "models": [], "error": str(exc)}
 
     def _request(self, payload, retries=2, timeout=None):
-        # A shared local model should never amplify an overloaded request with
-        # automatic retries. The caller can return a local, evidence-backed
-        # fallback instead.
-        retries = 0
-        # Document-analysis helpers have shorter legacy timeouts. A reasoning
-        # model needs the client-level budget to finish both its thought trace
-        # and final answer.
-        effective_timeout = max(timeout or 0, self.timeout)
-        body_payload = dict(payload)
-        body_payload.pop("thinking", None)
-        # Older Ollama OpenAI-compatible endpoints do not implement this
-        # optional OpenAI extension; the prompt still enforces JSON output.
-        body_payload.pop("response_format", None)
-        body = json.dumps(body_payload, ensure_ascii=False).encode("utf-8")
+        """Call native Ollama chat with thinking disabled.
+
+        Qwen can put all limited output in the OpenAI-compatible endpoint's
+        reasoning field.  The native endpoint honors ``think: false`` and
+        returns the usable answer in ``message.content``.
+        """
+        native_base = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        body = json.dumps({
+            "model": payload["model"],
+            "messages": payload["messages"],
+            "stream": False,
+            "think": False,
+            "options": {
+                "temperature": payload.get("temperature", 0.1),
+                "num_predict": max(1, int(payload.get("max_tokens", 1800))),
+            },
+        }, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
-            self.base_url + "/chat/completions",
+            native_base.rstrip("/") + "/api/chat",
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -192,35 +195,30 @@ class OllamaClient(DeepSeekClient):
             },
             method="POST",
         )
-        last_error = None
-        for attempt in range(retries + 1):
-            try:
-                with self._semaphore:
-                    with urllib.request.urlopen(request, timeout=effective_timeout) as response:
-                        raw = response.read().decode("utf-8")
-                data = json.loads(raw)
-                choice = data.get("choices", [{}])[0]
-                message = choice.get("message", {})
-                content = message.get("content")
-                if not content:
-                    raise DeepSeekError("Ollama 返回了空内容")
-                return {
-                    "content": content,
-                    "reasoning_content": message.get("reasoning_content") or message.get("reasoning"),
-                    "model": data.get("model", self.model),
-                    "usage": data.get("usage", {}),
-                    "finish_reason": choice.get("finish_reason"),
-                }
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                last_error = DeepSeekError("Ollama HTTP {}: {}".format(exc.code, detail[:500]))
-                if exc.code not in (408, 429, 500, 502, 503, 504):
-                    break
-            except (urllib.error.URLError, TimeoutError, ValueError, DeepSeekError) as exc:
-                last_error = DeepSeekError("本机 Ollama 调用失败：{}".format(exc))
-            if attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
-        raise DeepSeekError(str(last_error))
+        try:
+            with self._semaphore:
+                with urllib.request.urlopen(request, timeout=max(timeout or 0, self.timeout)) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise DeepSeekError("Ollama HTTP {}: {}".format(exc.code, detail[:500]))
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+            raise DeepSeekError("本机 Ollama 调用失败：{}".format(exc))
+
+        message = data.get("message", {})
+        content = (message.get("content") or "").strip()
+        if not content:
+            raise DeepSeekError("Ollama 未返回最终答案")
+        return {
+            "content": content,
+            "reasoning_content": message.get("thinking") or message.get("reasoning"),
+            "model": data.get("model", self.model),
+            "usage": {
+                "prompt_tokens": data.get("prompt_eval_count", 0),
+                "completion_tokens": data.get("eval_count", 0),
+            },
+            "finish_reason": data.get("done_reason") or ("stop" if data.get("done") else None),
+        }
 
     def _stream_request(self, payload, timeout=None):
         # The OpenAI-compatible endpoint ignores `think: false` for the shared
