@@ -474,6 +474,21 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(handoff["unique_source_file_count"], 2)
             self.assertEqual(manifest["unique_source_file_count"], 2)
 
+    def test_export_reports_progress_and_commits_zip_atomically(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "package"
+            root.mkdir()
+            (root / "a.txt").write_text("A", encoding="utf-8")
+            calls = []
+            archive_path = export_node(
+                root, root, {"summary": "摘要"}, Path(folder), 1024 * 1024,
+                task_topic="主题",
+                progress_callback=lambda *args: calls.append(args),
+            )
+            self.assertTrue(archive_path.exists())
+            self.assertFalse(archive_path.with_name(archive_path.name + ".part").exists())
+            self.assertEqual(calls[-1][0], 1)
+
     def test_large_package_first_pass_is_bounded_and_coverage_is_honest(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
