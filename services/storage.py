@@ -4,6 +4,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -67,12 +68,19 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS analysis_jobs (
                     id TEXT PRIMARY KEY,
                     scan_id TEXT NOT NULL,
+                    task_type TEXT NOT NULL DEFAULT 'analyze_package',
                     status TEXT NOT NULL,
+                    stage TEXT NOT NULL DEFAULT 'queued',
                     progress INTEGER NOT NULL DEFAULT 0,
                     message TEXT,
                     result TEXT,
                     error TEXT,
                     options TEXT,
+                    worker_id TEXT,
+                    heartbeat_at REAL,
+                    started_at REAL,
+                    finished_at REAL,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS file_analysis_states (
@@ -100,8 +108,20 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_file_analysis_states_scan_status ON file_analysis_states(scan_id, status);
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_jobs)").fetchall()}
-            if "options" not in columns:
-                conn.execute("ALTER TABLE analysis_jobs ADD COLUMN options TEXT")
+            migrations = {
+                "options": "TEXT",
+                "task_type": "TEXT NOT NULL DEFAULT 'analyze_package'",
+                "stage": "TEXT NOT NULL DEFAULT 'queued'",
+                "worker_id": "TEXT",
+                "heartbeat_at": "REAL",
+                "started_at": "REAL",
+                "finished_at": "REAL",
+                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in migrations.items():
+                if name not in columns:
+                    conn.execute("ALTER TABLE analysis_jobs ADD COLUMN {} {}".format(name, definition))
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_jobs_queue ON analysis_jobs(status, updated_at)")
 
     def _sidecar_path(self, scan_id, node_path):
         digest = hashlib.sha256("{}|{}".format(scan_id, node_path).encode("utf-8")).hexdigest()
@@ -174,13 +194,26 @@ class Storage:
                 "evidence": [],
             }
 
-    def recover_stale_jobs(self):
+    def recover_stale_jobs(self, stale_after_seconds=900):
+        """Requeue only abandoned work, never a healthy active worker."""
+        cutoff = time.time() - max(30, int(stale_after_seconds))
         with self.lock, self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE analysis_jobs SET status='queued', progress=MIN(progress,95), message=?, error=NULL, updated_at=CURRENT_TIMESTAMP WHERE status IN ('queued','running')",
-                ("服务重启，任务已自动重新排队，将从头校验并继续分析。",),
+                "UPDATE analysis_jobs SET status='queued', stage='queued', worker_id=NULL, "
+                "progress=MIN(progress,95), message=?, error=NULL, heartbeat_at=NULL, "
+                "cancel_requested=0, updated_at=CURRENT_TIMESTAMP WHERE status='running' "
+                "AND (heartbeat_at IS NULL OR heartbeat_at < ?)",
+                ("检测到中断的 Worker，任务已重新排队，将从检查点继续。", cutoff),
             )
             changed = cursor.rowcount
+            cursor.close()
+            cursor = conn.execute(
+                "UPDATE analysis_jobs SET status='cancelled', stage='cancelled', worker_id=NULL, "
+                "message=?, error=NULL, finished_at=?, heartbeat_at=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE status='cancelling' AND (heartbeat_at IS NULL OR heartbeat_at < ?)",
+                ("Worker 中断时任务已处于取消状态，已安全结束。", time.time(), cutoff),
+            )
+            changed += cursor.rowcount
             cursor.close()
         return changed
 
@@ -227,16 +260,13 @@ class Storage:
             ).fetchone()
         if not row:
             return None
-        result = dict(row)
-        result["result"] = json.loads(result["result"]) if result.get("result") else None
-        result["options"] = json.loads(result["options"]) if result.get("options") else {}
-        return result
+        return self._decode_job(dict(row))
 
-    def save_scan(self, payload):
-        scan_id = uuid.uuid4().hex[:12]
+    def save_scan(self, payload, scan_id=None):
+        scan_id = scan_id or uuid.uuid4().hex[:12]
         with self.lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO scans(id, root_path, payload) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO scans(id, root_path, payload) VALUES (?, ?, ?)",
                 (scan_id, payload["root"], json.dumps(payload, ensure_ascii=False)),
             )
         return scan_id
@@ -347,29 +377,50 @@ class Storage:
             row = conn.execute("SELECT payload FROM package_analyses WHERE scan_id=?", (scan_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
 
-    def create_job(self, scan_id, options=None):
+    def create_job(self, scan_id, options=None, task_type="analyze_package"):
         job_id = uuid.uuid4().hex[:12]
         with self.lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO analysis_jobs(id,scan_id,status,progress,message,options) VALUES (?,?,?,?,?,?)",
-                (job_id, scan_id, "queued", 0, "等待开始", json.dumps(options or {}, ensure_ascii=False)),
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options) VALUES (?,?,?,?,?,?,?,?)",
+                (job_id, scan_id, task_type, "queued", "queued", 0, "等待开始", json.dumps(options or {}, ensure_ascii=False)),
             )
         return job_id
 
     def create_or_get_job(self, scan_id, options=None):
+        return self.create_or_get_typed_job(scan_id, "analyze_package", options=options)
+
+    def create_or_get_typed_job(self, scan_id, task_type, options=None):
+        """Deduplicate only equivalent active work for the same data package."""
         with self.lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT id FROM analysis_jobs WHERE scan_id=? AND status IN ('queued','running') ORDER BY updated_at DESC LIMIT 1",
-                (scan_id,),
+                "SELECT id FROM analysis_jobs WHERE scan_id=? AND task_type=? "
+                "AND status IN ('queued','running','cancelling') ORDER BY updated_at DESC LIMIT 1",
+                (scan_id, task_type),
             ).fetchone()
             if row:
                 return row["id"], False
             job_id = uuid.uuid4().hex[:12]
             conn.execute(
-                "INSERT INTO analysis_jobs(id,scan_id,status,progress,message,options) VALUES (?,?,?,?,?,?)",
-                (job_id, scan_id, "queued", 1, "已进入本地解析队列", json.dumps(options or {}, ensure_ascii=False)),
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options) VALUES (?,?,?,?,?,?,?,?)",
+                (job_id, scan_id, task_type, "queued", "queued", 1, "已进入本地任务队列", json.dumps(options or {}, ensure_ascii=False)),
             )
         return job_id, True
+
+    def create_scan_job(self, root_path, max_files, parse_mode, max_depth):
+        """Create a scan-and-analyze workflow without touching the filesystem yet."""
+        job_id = uuid.uuid4().hex[:12]
+        options = {
+            "root_path": str(root_path),
+            "max_files": int(max_files),
+            "parse_mode": str(parse_mode),
+            "max_depth": int(max_depth),
+        }
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options) VALUES (?,?,?,?,?,?,?,?)",
+                (job_id, job_id, "scan_and_analyze", "queued", "queued", 0, "等待扫描目录", json.dumps(options, ensure_ascii=False)),
+            )
+        return job_id
 
     def cancel_queued_jobs(self, except_scan_id=None):
         """Deprecated compatibility method; a new scan must never cancel another.
@@ -386,10 +437,7 @@ class Storage:
             ).fetchone()
         if not row:
             return None
-        result = dict(row)
-        result["result"] = json.loads(result["result"]) if result.get("result") else None
-        result["options"] = json.loads(result["options"]) if result.get("options") else {}
-        return result
+        return self._decode_job(dict(row))
 
     def get_queue_position(self, job_id):
         with self._connect() as conn:
@@ -406,31 +454,65 @@ class Storage:
             ).fetchone()["value"]
         return int(ahead) + 1
 
-    def update_job(self, job_id, status=None, progress=None, message=None, result=None, error=None):
+    def update_job(self, job_id, status=None, progress=None, message=None, result=None, error=None, stage=None, heartbeat=False):
         fields = ["updated_at=CURRENT_TIMESTAMP"]
         values = []
-        for name, value in (("status", status), ("progress", progress), ("message", message), ("result", result), ("error", error)):
+        for name, value in (("status", status), ("stage", stage), ("progress", progress), ("message", message), ("result", result), ("error", error)):
             if value is not None:
                 fields.append(name + "=?")
                 values.append(json.dumps(value, ensure_ascii=False) if name == "result" else value)
+        if heartbeat:
+            fields.append("heartbeat_at=?")
+            values.append(time.time())
+        if status in {"completed", "failed", "cancelled"}:
+            fields.append("finished_at=?")
+            values.append(time.time())
         values.append(job_id)
         with self.lock, self._connect() as conn:
-            conn.execute("UPDATE analysis_jobs SET {} WHERE id=?".format(",".join(fields)), values)
+            condition = "id=?"
+            if status not in {"cancelled", "cancelling"}:
+                condition += " AND status NOT IN ('cancelled','cancelling')"
+            conn.execute("UPDATE analysis_jobs SET {} WHERE {}".format(",".join(fields), condition), values)
 
     def cancel_job(self, job_id):
         with self.lock, self._connect() as conn:
             conn.execute(
-                "UPDATE analysis_jobs SET status='cancelled', message=?, error=NULL, updated_at=CURRENT_TIMESTAMP "
-                "WHERE id=? AND status IN ('queued','running')",
-                ("任务已取消", job_id),
+                "UPDATE analysis_jobs SET status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancelling' END, "
+                "cancel_requested=1, message=?, error=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status IN ('queued','running','cancelling')",
+                ("已请求取消任务，当前步骤结束后停止。", job_id),
             )
+
+    def claim_next_job(self, worker_id):
+        """Atomically claim the oldest queued job for one independent worker."""
+        with self.lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT id FROM analysis_jobs WHERE status='queued' ORDER BY rowid LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            now = time.time()
+            cursor = conn.execute(
+                "UPDATE analysis_jobs SET status='running', stage='claimed', worker_id=?, started_at=COALESCE(started_at,?), heartbeat_at=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status='queued'",
+                (str(worker_id), now, now, row["id"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (row["id"],)).fetchone()
+        return self._decode_job(dict(claimed)) if claimed else None
+
+    @staticmethod
+    def _decode_job(result):
+        result["result"] = json.loads(result["result"]) if result.get("result") else None
+        result["options"] = json.loads(result["options"]) if result.get("options") else {}
+        result["cancel_requested"] = bool(result.get("cancel_requested"))
+        return result
 
     def get_job(self, job_id):
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone()
         if not row:
             return None
-        result = dict(row)
-        result["result"] = json.loads(result["result"]) if result.get("result") else None
-        result["options"] = json.loads(result["options"]) if result.get("options") else {}
-        return result
+        return self._decode_job(dict(row))

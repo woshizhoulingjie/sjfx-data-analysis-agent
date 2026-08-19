@@ -720,6 +720,10 @@ def analyze_folder(
             retries=0,
 
             timeout=180,
+
+            required_fields=("summary",),
+
+            output_context="目录节点摘要",
         )
 
         summary = _attach_model_evidence(

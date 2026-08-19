@@ -173,6 +173,8 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
             strict=True,
             retries=1,
             timeout=150,
+            required_fields=("core_summary",),
+            output_context="全文文档分析",
         )
         summary = result["json"]
         if unified_document:
@@ -198,6 +200,8 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
             strict=True,
             retries=1,
             timeout=150,
+            required_fields=("section_summary",),
+            output_context="文档分块分析",
         )
         data = result["json"]
         data["chunk_index"] = chunk["index"]
@@ -237,6 +241,8 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
             strict=True,
             retries=1,
             timeout=180,
+            required_fields=("core_summary",),
+            output_context="全文分块汇总",
         )
         summary = final_result["json"]
     except DeepSeekError as exc:

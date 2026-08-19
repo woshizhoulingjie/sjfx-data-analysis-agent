@@ -4,6 +4,8 @@ import time
 import urllib.error
 import urllib.request
 
+from services.model_output import ModelOutputError, extract_json_value, validate_json_object
+
 
 class DeepSeekError(RuntimeError):
     pass
@@ -89,22 +91,15 @@ class DeepSeekClient:
         }, retries=retries, timeout=timeout)
 
     @staticmethod
-    def _parse_json_content(content):
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[-1]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3].rstrip()
+    def _parse_json_content(content, required_fields=None, context="模型输出"):
         try:
-            return json.loads(cleaned)
-        except ValueError:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start >= 0 and end > start:
-                return json.loads(cleaned[start:end + 1])
-            raise
+            return validate_json_object(
+                extract_json_value(content), required_fields=required_fields, context=context
+            )
+        except ModelOutputError as exc:
+            raise DeepSeekError(str(exc))
 
-    def chat_json(self, system_prompt, user_prompt, max_tokens=2400, strict=True, retries=2, timeout=None):
+    def chat_json(self, system_prompt, user_prompt, max_tokens=2400, strict=True, retries=2, timeout=None, required_fields=None, output_context="模型输出"):
         prompt = system_prompt + "\n你必须只输出一个合法 JSON 对象，不要输出 Markdown 代码围栏。"
         payload = {
             "model": self.model,
@@ -127,9 +122,11 @@ class DeepSeekClient:
                 timeout=timeout,
             )
             try:
-                result["json"] = self._parse_json_content(result["content"])
+                result["json"] = self._parse_json_content(
+                    result["content"], required_fields=required_fields, context=output_context
+                )
                 return result
-            except ValueError as exc:
+            except (ValueError, DeepSeekError) as exc:
                 last_error = exc
         raise DeepSeekError("模型未返回合法 JSON: {}".format(last_error))
 
@@ -296,7 +293,7 @@ class OllamaClient(DeepSeekClient):
             "finish_reason": finish_reason,
         }
 
-    def chat_json(self, system_prompt, user_prompt, max_tokens=2400, strict=True, retries=2, timeout=None):
+    def chat_json(self, system_prompt, user_prompt, max_tokens=2400, strict=True, retries=2, timeout=None, required_fields=None, output_context="模型输出"):
         prompt = system_prompt + "\n你必须只输出一个合法 JSON 对象，不要输出 Markdown 代码围栏。"
         result = self._stream_request({
             "model": self.model,
@@ -310,9 +307,11 @@ class OllamaClient(DeepSeekClient):
             "max_tokens": max(1024, max_tokens),
         }, timeout=timeout)
         try:
-            result["json"] = self._parse_json_content(result["content"])
+            result["json"] = self._parse_json_content(
+                result["content"], required_fields=required_fields, context=output_context
+            )
             return result
-        except ValueError as exc:
+        except (ValueError, DeepSeekError) as exc:
             raise DeepSeekError("本机 Ollama 未返回合法 JSON：{}".format(exc))
 
 

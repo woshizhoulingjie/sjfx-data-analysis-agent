@@ -1,8 +1,7 @@
 import json
 import logging
 import logging.handlers
-import threading
-import time
+import re
 import uuid
 from collections import Counter
 from datetime import datetime
@@ -33,10 +32,35 @@ from services.unified_parser import UnifiedDocumentParser
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("sjfx")
+
+
+class _SensitiveLogFilter(logging.Filter):
+    """Prevent accidental token/key logging from future diagnostics."""
+
+    _patterns = (
+        (re.compile(r"(Authorization\s*[:=]\s*Bearer\s+)[^\s,;]+", re.I), r"\1***"),
+        (re.compile(r"([\"']?(?:api[_-]?key|token|password)[\"']?\s*[:=]\s*[\"'])[^\"']+", re.I), r"\1***"),
+    )
+
+    def filter(self, record):
+        message = record.getMessage()
+        for pattern, replacement in self._patterns:
+            message = pattern.sub(replacement, message)
+        record.msg = message
+        record.args = ()
+        return True
+
+
+_log_filter = _SensitiveLogFilter()
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_log_filter)
+# Parser libraries can otherwise emit user document names for every page.  The
+# application records task ids and failure categories, not raw prompts or paths.
+logging.getLogger("docling").setLevel(logging.WARNING)
+logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 app.config["JSON_AS_ASCII"] = False
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 storage = Storage(Config.DB_PATH, Config.DOCUMENT_CACHE_DIR, Config.SIDECAR_PAYLOAD_BYTES)
-storage.recover_stale_jobs()
 _requested_backend = Config.LLM_BACKEND
 if _requested_backend not in {"ollama", "deepseek"}:
     logger.warning("未知 LLM_BACKEND=%s，回退到本机 Ollama", _requested_backend)
@@ -84,13 +108,12 @@ else:
     _embedding_client = None
     set_embedding_provider(None)
 parser = UnifiedDocumentParser(Config.DOCLING_ARTIFACTS_DIR, Config.RAPIDOCR_MODEL_DIR, Config.MAX_FULL_DOCUMENT_CHARS)
-analysis_threads = {}
-analysis_semaphore = threading.BoundedSemaphore(Config.MAX_ANALYSIS_JOBS)
 if not logger.handlers:
     _file_handler = logging.handlers.RotatingFileHandler(
         str(Config.LOG_DIR / "app.log"), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
     )
     _file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    _file_handler.addFilter(_log_filter)
     logger.addHandler(_file_handler)
 
 
@@ -492,7 +515,7 @@ class JobCancelled(Exception):
 
 def _ensure_job_active(job_id):
     job = storage.get_job(job_id)
-    if not job or job.get("status") == "cancelled":
+    if not job or job.get("status") in {"cancelled", "cancelling"} or job.get("cancel_requested"):
         raise JobCancelled()
     return job
 
@@ -627,6 +650,8 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
             strict=True,
             retries=0,
             timeout=300,
+            required_fields=("recommended_research_direction",),
+            output_context="报告研究方向分析",
         )
         merged = merge_cloud_report(report_data, result["json"], evidence_catalog)
         merged["model_analysis"] = {
@@ -667,104 +692,164 @@ def _write_local_overview(scan_id):
     }
 
 
-def _run_analysis_job(job_id, scan_id):
-    try:
-        # Threads are lightweight queue waiters.  They may be created in any
-        # order, so only the oldest queued job may claim the single parser slot.
-        missing_position_retries = 0
-        while True:
-            queued_job = _ensure_job_active(job_id)
-            if not queued_job or queued_job.get("status") != "queued":
-                return
-            position = storage.get_queue_position(job_id)
-            if position is None:
-                # A concurrent cancellation/update may briefly make the queue
-                # row unavailable; re-check the job state instead of spinning
-                # on a permanently false comparison.
-                missing_position_retries += 1
-                if missing_position_retries >= 10:
-                    raise RuntimeError("任务队列状态异常，连续多次无法定位队列位置")
-                time.sleep(0.5)
-                continue
-            missing_position_retries = 0
-            if position == 1:
-                break
-            time.sleep(0.2)
-        with analysis_semaphore:
-            queued_job = _ensure_job_active(job_id)
-            if not queued_job or queued_job.get("status") != "queued":
-                return
-            if storage.get_queue_position(job_id) != 1:
-                return
-            scan_result = require_scan(scan_id)
-            job_options = (storage.get_job(job_id) or {}).get("options") or {}
-            scope_label = job_options.get("scope_label")
-            storage.update_job(
-                job_id, status="running", progress=1,
-                message=("开始补充分析：{}".format(scope_label) if scope_label else "开始本地完整分析"),
-            )
+def _package_large_options():
+    return {
+        "threshold_bytes": Config.LARGE_PACKAGE_THRESHOLD_BYTES,
+        "threshold_files": Config.LARGE_PACKAGE_THRESHOLD_FILES,
+        "initial_parse_files": Config.LARGE_PACKAGE_INITIAL_PARSE_FILES,
+        "deepen_batch_files": Config.LARGE_PACKAGE_DEEPEN_BATCH_FILES,
+        "overview_chars_per_file": Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE,
+    }
 
-            def progress(percent, message):
-                _ensure_job_active(job_id)
-                storage.update_job(job_id, status="running", progress=percent, message=message)
 
-            analysis = analyze_package(
-                scan_id,
-                scan_result,
-                storage,
-                parser,
-                progress,
-                embedding_client=_package_embedding_client,
-                llm=(llm if llm_generation_enabled else None),
-                large_options={
-                    "threshold_bytes": Config.LARGE_PACKAGE_THRESHOLD_BYTES,
-                    "threshold_files": Config.LARGE_PACKAGE_THRESHOLD_FILES,
-                    "initial_parse_files": Config.LARGE_PACKAGE_INITIAL_PARSE_FILES,
-                    "deepen_batch_files": Config.LARGE_PACKAGE_DEEPEN_BATCH_FILES,
-                    "overview_chars_per_file": Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE,
-                },
-                target_paths=job_options.get("target_paths"),
-            )
-            _ensure_job_active(job_id)
-            storage.update_job(job_id, status="running", progress=96, message="自动生成情况概览 Word")
-            overview = _write_local_overview(scan_id)
-            _ensure_job_active(job_id)
-            storage.update_job(job_id, status="completed", progress=100, message="完整分析与概览报告已生成", result={
-                "analysis": analysis.get("statistics", {}),
-                "classification_dimensions": analysis.get("classification_dimensions", []),
-                "overview": overview,
-            })
-    except JobCancelled:
-        storage.update_job(job_id, status="cancelled", message="任务已取消")
-    except Exception as exc:
-        logger.exception("分析任务失败 scan_id=%s job_id=%s", scan_id, job_id)
-        storage.update_job(job_id, status="failed", progress=100, message="分析失败", error=str(exc))
-    finally:
-        analysis_threads.pop(job_id, None)
+def _run_claimed_report_job(job):
+    """Generate an on-demand overview report outside the HTTP request."""
+    job_id = job["id"]
+    scan_id = job["scan_id"]
+    storage.update_job(job_id, progress=5, stage="generating_report", message="正在整理情况概览报告", heartbeat=True)
+    _ensure_job_active(job_id)
+    report = _write_local_overview(scan_id)
+    _ensure_job_active(job_id)
+    return {"scan_id": scan_id, "overview": report}
+
+
+def _run_claimed_summary_job(job):
+    """Run an uncached model-backed node/document summary outside Flask HTTP."""
+    job_id = job["id"]
+    payload = dict(job.get("options") or {})
+    payload["_worker_execution"] = True
+    scan_id = job["scan_id"]
+    storage.update_job(job_id, progress=5, stage="generating_summary", message="正在生成当前节点深度摘要", heartbeat=True)
+    _ensure_job_active(job_id)
+    # Reuse the established summary implementation under an isolated request
+    # context. The web route has no model call after the async gate below.
+    with app.test_request_context("/api/summary", method="POST", json=payload):
+        response = summarize()
+    status_code = 200
+    if isinstance(response, tuple):
+        response, status_code = response[0], response[1]
+    data = response.get_json(silent=True) if hasattr(response, "get_json") else None
+    if status_code >= 400 or not data or not data.get("ok"):
+        raise ValueError((data or {}).get("error") or "摘要生成失败")
+    _ensure_job_active(job_id)
+    return {
+        "scan_id": scan_id,
+        "summary": data.get("summary"),
+        "cached": bool(data.get("cached")),
+        "degraded": bool(data.get("degraded")),
+        "node_id": payload.get("node_id"),
+        "kind": payload.get("kind", "file"),
+    }
+
+
+def _run_claimed_export_job(job):
+    """Build a potentially multi-gigabyte handoff archive in the Worker."""
+    job_id = job["id"]
+    scan_id = job["scan_id"]
+    options = job.get("options") or {}
+    scan_result = require_scan(scan_id)
+    storage.update_job(job_id, progress=3, stage="preparing_export", message="正在准备待整编节点和证据", heartbeat=True)
+    _ensure_job_active(job_id)
+    analysis = storage.get_analysis(scan_id) or {}
+    documents = _package_documents(scan_id)
+    context = _combined_export_context(scan_id, scan_result, analysis, options)
+    selected = Path(scan_result["root"])
+    state_by_path = {item.get("node_path"): item for item in storage.list_file_states(scan_id)}
+    storage.update_job(
+        job_id, progress=8, stage="exporting", message="正在生成去重资料包和统一交接说明（可能需要较长时间）", heartbeat=True,
+    )
+    archive = export_node(
+        scan_result["root"], selected, context["summary"], Config.OUTPUT_DIR, Config.MAX_EXPORT_BYTES,
+        analysis=analysis, documents=documents,
+        task_topic=options.get("task_topic"),
+        member_paths=context["member_paths"],
+        node_name=context["summary"]["title"],
+        node_id="combined-{}".format(scan_id),
+        selection_metadata=context["selection_metadata"],
+        selected_evidence_ids=context["selected_evidence_ids"],
+        inventory_metadata=inventory_by_path(scan_result),
+        file_states=state_by_path,
+    )
+    _ensure_job_active(job_id)
+    return {
+        "scan_id": scan_id,
+        "file_name": archive.name,
+        "download_url": "/outputs/{}".format(archive.name),
+        "source_file_count": len(context["member_paths"]),
+        "selection_count": len(context["selection_metadata"]),
+    }
+
+
+def _run_claimed_analysis_job(job):
+    """Execute an already-claimed package-analysis job in the local Worker."""
+    job_id = job["id"]
+    scan_id = job["scan_id"]
+    options = job.get("options") or {}
+    scan_result = require_scan(scan_id)
+    scope_label = options.get("scope_label")
+    storage.update_job(
+        job_id, progress=max(1, int(job.get("progress") or 0)), stage="analyzing", heartbeat=True,
+        message=("开始补充分析：{}".format(scope_label) if scope_label else "开始本地完整分析"),
+    )
+
+    def progress(percent, message):
+        _ensure_job_active(job_id)
+        storage.update_job(job_id, progress=percent, stage="analyzing", message=message, heartbeat=True)
+
+    analysis = analyze_package(
+        scan_id, scan_result, storage, parser, progress,
+        embedding_client=_package_embedding_client,
+        llm=(llm if llm_generation_enabled else None),
+        large_options=_package_large_options(),
+        target_paths=options.get("target_paths"),
+    )
+    _ensure_job_active(job_id)
+    storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
+    overview = _write_local_overview(scan_id)
+    _ensure_job_active(job_id)
+    return {
+        "scan_id": scan_id,
+        "analysis": analysis.get("statistics", {}),
+        "classification_dimensions": analysis.get("classification_dimensions", []),
+        "overview": overview,
+    }
+
+
+def _run_claimed_scan_and_analyze_job(job):
+    """Inventory a filesystem path asynchronously, then run the normal workflow."""
+    job_id = job["id"]
+    options = job.get("options") or {}
+    root_path = str(options.get("root_path") or "").strip()
+    if not root_path:
+        raise ValueError("扫描任务缺少目录路径")
+
+    def scan_progress(file_count):
+        _ensure_job_active(job_id)
+        storage.update_job(
+            job_id, progress=min(14, 2 + int(file_count / 1000)), stage="scanning",
+            message="正在盘点目录：已发现 {} 个文件".format(file_count), heartbeat=True,
+        )
+
+    storage.update_job(job_id, progress=1, stage="scanning", message="正在验证并扫描目录", heartbeat=True)
+    scan_result = scan_directory(
+        root_path, options.get("max_files", Config.MAX_SCAN_FILES),
+        max_depth=options.get("max_depth", Config.MAX_SCAN_DEPTH),
+        progress_callback=scan_progress, cancel_check=lambda: _ensure_job_active(job_id),
+    )
+    scan_result["parse_mode"] = "accurate" if options.get("parse_mode") == "accurate" else "fast"
+    scan_result["scan_id"] = job_id
+    storage.save_scan(scan_result, scan_id=job_id)
+    storage.update_job(job_id, progress=15, stage="scanned", message="目录盘点完成，开始解析、去重和主题分析", heartbeat=True)
+    # The scan task keeps its own id as scan_id so the browser can use one job id
+    # throughout the complete unknown-package workflow.
+    return _run_claimed_analysis_job({
+        "id": job_id, "scan_id": job_id, "options": {}, "progress": 15,
+    })
 
 
 def _start_analysis_job(scan_id, options=None):
-    job_id, created = storage.create_or_get_job(scan_id, options=options)
-    if created:
-        thread = threading.Thread(target=_run_analysis_job, args=(job_id, scan_id), daemon=True)
-        analysis_threads[job_id] = thread
-        thread.start()
-    return job_id, created
-
-
-# Re-enqueue jobs that were interrupted by a process restart.  The queue is
-# persisted in SQLite; only this user's worker threads are recreated here.
-_seen_startup_jobs = set()
-for _scan_id in storage.list_queued_scan_ids():
-    _queued = storage.get_active_job(_scan_id)
-    if _queued and _queued["id"] not in _seen_startup_jobs:
-        _job = storage.get_job(_queued["id"])
-        if not _job or _job.get("status") != "queued":
-            continue
-        _seen_startup_jobs.add(_queued["id"])
-        _thread = threading.Thread(target=_run_analysis_job, args=(_queued["id"], _scan_id), daemon=True)
-        analysis_threads[_queued["id"]] = _thread
-        _thread.start()
+    """Persist work for the independent Worker; the API process never runs it."""
+    return storage.create_or_get_job(scan_id, options=options)
 
 
 @app.route("/")
@@ -839,12 +924,22 @@ def scan():
     if not path:
         return api_error("请输入要扫描的本地目录")
     try:
-        result = scan_directory(path, payload.get("max_files", Config.MAX_SCAN_FILES))
-        result["parse_mode"] = parse_mode
-        scan_id = storage.save_scan(result)
-        result["scan_id"] = scan_id
-        job_id, _created = _start_analysis_job(scan_id)
-        return jsonify({"ok": True, "scan": result, "analysis_job_id": job_id})
+        root = Path(path).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            raise ValueError("目录不存在或不是文件夹")
+        job_id = storage.create_scan_job(
+            root, payload.get("max_files", Config.MAX_SCAN_FILES), parse_mode,
+            payload.get("max_depth", Config.MAX_SCAN_DEPTH),
+        )
+        return jsonify({
+            "ok": True,
+            "accepted": True,
+            "job_id": job_id,
+            # Kept for old front-end clients.  The scan id becomes available in
+            # the completed task result.
+            "analysis_job_id": job_id,
+            "status_url": "/api/jobs/{}".format(job_id),
+        }), 202
     except Exception as exc:
         return api_error(str(exc))
 
@@ -1173,6 +1268,39 @@ def summarize():
         force = bool(payload.get("force"))
         scan_result = require_scan(scan_id)
 
+        # Cache hits and local-only fallbacks stay synchronous. Any uncached
+        # model-backed request is persisted and handled by the dedicated Worker.
+        if llm_generation_enabled and not payload.get("_worker_execution"):
+            if node_id:
+                node = _find_analysis_node(scan_id, node_id)
+                if node.get("kind") != "group":
+                    raise ValueError("只有主题或子方向节点可以生成节点摘要")
+                cached = storage.get_summary(scan_id, "node:{}".format(node_id), "folder")
+                if force or not (cached and cached.get("schema_version") in {3, 4}):
+                    require_cloud_confirmation(payload)
+                    job_id = storage.create_job(
+                        scan_id, options=payload, task_type="generate_summary"
+                    )
+                    return jsonify({
+                        "ok": True, "accepted": True, "job_id": job_id,
+                        "reused_active_job": False,
+                        "status_url": "/api/jobs/{}".format(job_id),
+                    }), 202
+            else:
+                selected = resolve_under(scan_result["root"], node_path)
+                summary_type = "folder" if selected.is_dir() or kind == "directory" else "file"
+                cached = storage.get_summary(scan_id, node_path, summary_type)
+                if force or not (cached and cached.get("schema_version") == 3 and not bool(cached.get("parser_info", {}).get("degraded"))):
+                    require_cloud_confirmation(payload)
+                    job_id = storage.create_job(
+                        scan_id, options=payload, task_type="generate_summary"
+                    )
+                    return jsonify({
+                        "ok": True, "accepted": True, "job_id": job_id,
+                        "reused_active_job": False,
+                        "status_url": "/api/jobs/{}".format(job_id),
+                    }), 202
+
         if node_id:
             node = _find_analysis_node(scan_id, node_id)
             if node.get("kind") != "group":
@@ -1329,46 +1457,15 @@ def report():
     payload = request.get_json(silent=True) or {}
     try:
         scan_id = payload.get("scan_id", "")
-        scan_result = require_scan(scan_id)
-        summaries = storage.list_summaries(scan_id)
-        report_summaries = list(summaries)
-        if not compact_summary_context(report_summaries) and scan_result.get("file_count", 0):
-            try:
-                evidence_context = folder_context(Path(scan_result["root"]), scan_result["root"], max_files=8, max_chars=16000)
-                if evidence_context.get("excerpts"):
-                    report_summaries.append({
-                        "path": ".",
-                        "type": "local_evidence_sample",
-                        "payload": {
-                            "schema_version": 3,
-                            "title": "均匀抽样证据",
-                            "summary": evidence_context["excerpts"][:15000],
-                            "topics": [],
-                            "key_facts": [],
-                        },
-                    })
-            except Exception:
-                pass
-        analysis = storage.get_analysis(scan_id) or {}
-        report_data = build_local_report(scan_result, report_summaries, analysis)
+        require_scan(scan_id)
         if llm.requires_confirmation and payload.get("cloud_confirmed") is not True:
-            warning = "尚未确认云端调用；报告保留待模型分析的研究方向。"
-            model_name, model_usage = None, {}
-        else:
-            report_data, model_name, model_usage, warning = _analyze_report_with_model(
-                scan_result, report_summaries, analysis, report_data
-            )
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        name = "情况概览报告_{}_{}.docx".format(safe_name(Path(scan_result["root"]).name), stamp)
-        output_path = Config.OUTPUT_DIR / name
-        create_report_docx(report_data, scan_result, output_path)
-        storage.save_summary(scan_id, ".", "report", report_data)
+            raise ValueError("请先确认：选中的文件内容将发送至 DeepSeek 云端 API")
+        job_id, created = storage.create_or_get_typed_job(scan_id, "generate_report")
         return jsonify({
-            "ok": True, "report": report_data, "file_name": name,
-            "download_url": "/outputs/{}".format(name), "model": model_name, "usage": model_usage,
-            "fallback_used": report_data.get("generation_mode") != "model_analyzed",
-            "warning": warning,
-        })
+            "ok": True, "accepted": True, "job_id": job_id,
+            "reused_active_job": not created,
+            "status_url": "/api/jobs/{}".format(job_id),
+        }), 202
     except (ValueError, DeepSeekError, RuntimeError) as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
@@ -1381,25 +1478,25 @@ def export():
     payload = request.get_json(silent=True) or {}
     try:
         scan_id = payload.get("scan_id", "")
-        scan_result = require_scan(scan_id)
-        analysis = storage.get_analysis(scan_id) or {}
-        documents = _package_documents(scan_id)
-        context = _combined_export_context(scan_id, scan_result, analysis, payload)
-        selected = Path(scan_result["root"])
-        state_by_path = {item.get("node_path"): item for item in storage.list_file_states(scan_id)}
-        archive = export_node(
-            scan_result["root"], selected, context["summary"], Config.OUTPUT_DIR, Config.MAX_EXPORT_BYTES,
-            analysis=analysis, documents=documents,
-            task_topic=payload.get("task_topic"),
-            member_paths=context["member_paths"],
-            node_name=context["summary"]["title"],
-            node_id="combined-{}".format(scan_id),
-            selection_metadata=context["selection_metadata"],
-            selected_evidence_ids=context["selected_evidence_ids"],
-            inventory_metadata=inventory_by_path(scan_result),
-            file_states=state_by_path,
-        )
-        return jsonify({"ok": True, "file_name": archive.name, "download_url": "/outputs/{}".format(archive.name)})
+        require_scan(scan_id)
+        selections = payload.get("selections")
+        if selections is not None and (not isinstance(selections, list) or not selections):
+            raise ValueError("请至少选择一个主题、目录、文档或证据")
+        options = {
+            "selections": selections,
+            "path": payload.get("path"),
+            "kind": payload.get("kind"),
+            "node_id": payload.get("node_id"),
+            "name": payload.get("name"),
+            "task_topic": str(payload.get("task_topic") or "").strip(),
+        }
+        if not options["task_topic"]:
+            raise ValueError("请输入整编任务主题")
+        job_id = storage.create_job(scan_id, options=options, task_type="export_package")
+        return jsonify({
+            "ok": True, "accepted": True, "job_id": job_id,
+            "status_url": "/api/jobs/{}".format(job_id),
+        }), 202
     except ValueError as exc:
         return api_error(str(exc), 400)
 

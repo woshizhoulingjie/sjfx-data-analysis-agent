@@ -18,6 +18,10 @@
 - 支持选中主题、目录、文档或部分证据后组合导出；重复源文件会自动去重。
 - 自动生成数据包情况概览 Word，并可导出带整编任务说明的 ZIP 交接包。
 
+## 运行架构
+
+Web 进程只负责提交任务、查询状态和提供下载；长耗时扫描、模型调用、报告与多 GB 导出由独立 worker.py 处理。SQLite WAL 保存任务状态、进度、心跳、取消标记和检查点，项目不要求 Redis/RQ/Celery。Worker 使用 data/worker.lock 保证单实例，避免多个任务同时挤占共享 Ollama GPU。
+
 ## 分析流程
 
 ```text
@@ -172,8 +176,12 @@ models/
 
 ```bash
 source .venv/bin/activate
-python app.py
+mkdir -p .logs
+nohup python -u app.py </dev/null > .logs/flask.log 2>&1 &
+nohup python -u worker.py </dev/null > .logs/worker.log 2>&1 &
 ```
+
+扫描、深度摘要、报告和导出接口均采用“提交后轮询”：接口先返回 202 与 job_id，前端通过 /api/jobs/<job_id> 获取进度和结果。开发调试时也可以直接运行 python app.py，但生产环境必须同时运行 worker.py。
 
 浏览器访问：
 
@@ -198,7 +206,8 @@ http://服务器地址:18000
 
 ```text
 .
-├── app.py                       # Flask API 与任务调度
+├── app.py                       # Flask API、任务提交与 Worker 可调用用例
+├── worker.py                    # 独立 SQLite 任务 Worker（单实例）
 ├── config.py                    # 配置项
 ├── services/
 │   ├── unified_parser.py         # 统一文档解析、OCR 与证据抽取

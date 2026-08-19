@@ -68,6 +68,9 @@ class Config:
     # need a larger handoff archive than the previous demonstration cap.
     MAX_EXPORT_BYTES = int(os.getenv("MAX_EXPORT_BYTES", str(5 * 1024 * 1024 * 1024)))
     MAX_SCAN_FILES = int(os.getenv("MAX_SCAN_FILES", "50000"))
+    # Bound recursive inventory construction before Python stack or hostile media
+    # can exhaust the local analysis box.  Symlinks are never followed.
+    MAX_SCAN_DEPTH = max(1, min(256, int(os.getenv("MAX_SCAN_DEPTH", "32"))))
     SIDECAR_PAYLOAD_BYTES = int(os.getenv("SIDECAR_PAYLOAD_BYTES", str(256 * 1024)))
     LARGE_PACKAGE_THRESHOLD_BYTES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_BYTES", str(1024 * 1024 * 1024)))
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
@@ -76,6 +79,8 @@ class Config:
     LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE = int(os.getenv("LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE", "30000"))
     MAX_ANALYSIS_JOBS = max(1, int(os.getenv("MAX_ANALYSIS_JOBS", "1")))
     MAX_CLOUD_REQUESTS = max(1, int(os.getenv("MAX_CLOUD_REQUESTS", "3")))
+    WORKER_POLL_SECONDS = max(0.1, float(os.getenv("WORKER_POLL_SECONDS", "0.5")))
+    WORKER_STALE_SECONDS = max(60, int(os.getenv("WORKER_STALE_SECONDS", "900")))
 
 
 Config.DATA_DIR.mkdir(exist_ok=True)

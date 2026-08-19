@@ -1,0 +1,15 @@
+[Unit]
+Description=SJFX Data Analysis Agent Local Worker
+After=network.target
+
+[Service]
+Type=simple
+User=zhoulingjie
+WorkingDirectory=/home/nas511/zhoulingjie/sjfx
+ExecStart=/home/nas511/zhoulingjie/sjfx/.venv/bin/python -u worker.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

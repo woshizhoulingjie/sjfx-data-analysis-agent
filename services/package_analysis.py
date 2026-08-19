@@ -743,6 +743,8 @@ def _name_subtopic_nodes(tree, documents, llm):
             strict=True,
             retries=0,
             timeout=180,
+            required_fields=("subtopics",),
+            output_context="子方向命名",
         )
         named = {
             item.get("node_id"): item
@@ -1689,6 +1691,8 @@ def _name_semantic_clusters(
             strict=True,
             retries=0,
             timeout=180,
+            required_fields=("clusters",),
+            output_context="主题聚类命名",
         )
 
         payload = result.get("json", {})

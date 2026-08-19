@@ -45,6 +45,7 @@ wx/
 *.bak*
 *_old.txt
 .gitignore.save
+.gitignore.save.*
 
 # Editor and operating-system files
 .vscode/

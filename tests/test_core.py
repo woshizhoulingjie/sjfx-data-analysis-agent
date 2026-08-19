@@ -12,6 +12,7 @@ from services.exporter import export_node
 from services.package_analysis import _document_role, _group_similar, _hamming, _topic_clusters, _walk_files, analyze_package, simhash64
 from services.reporting import build_local_report, build_report_analysis_prompt, merge_cloud_report
 from services.folder_analysis import analyze_folder
+from services.model_output import ModelOutputError, extract_json_value, validate_json_object
 from services.retrieval import retrieve_evidence
 from services.scanner import resolve_under, scan_directory
 from services.storage import Storage
@@ -288,11 +289,52 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(created_first)
             self.assertFalse(created_second)
             self.assertEqual(first, second)
-            self.assertEqual(storage.recover_stale_jobs(), 1)
+            self.assertEqual(storage.recover_stale_jobs(), 0)
             third, created_third = storage.create_or_get_job("scan-1")
             self.assertFalse(created_third)
             self.assertEqual(first, third)
             self.assertEqual(storage.get_job(first)["status"], "queued")
+
+    def test_worker_claim_is_atomic_and_healthy_heartbeat_is_not_requeued(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "test.db")
+            job_id = storage.create_scan_job(folder, 10, "fast", 8)
+            claimed = storage.claim_next_job("worker-a")
+            self.assertEqual(claimed["id"], job_id)
+            self.assertEqual(claimed["task_type"], "scan_and_analyze")
+            self.assertIsNone(storage.claim_next_job("worker-b"))
+            self.assertEqual(storage.recover_stale_jobs(stale_after_seconds=900), 0)
+            storage.cancel_job(job_id)
+            self.assertEqual(storage.get_job(job_id)["status"], "cancelling")
+
+    def test_model_json_extractor_handles_fence_prefix_and_quoted_braces(self):
+        value = extract_json_value(
+            "模型结果如下：\n```json\n{\"regex\": \"[0-9]{1,3}\", \"ok\": true}\n```"
+        )
+        self.assertEqual(value["regex"], "[0-9]{1,3}")
+        self.assertTrue(value["ok"])
+        self.assertEqual(extract_json_value("说明 {\"ok\": true} 尾注"), {"ok": True})
+        with self.assertRaises(ModelOutputError):
+            validate_json_object(["not", "an", "object"])
+
+    def test_scan_depth_limit_and_symlink_are_observable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            current = root
+            for name in ("one", "two", "three"):
+                current = current / name
+                current.mkdir()
+            (current / "deep.txt").write_text("deep", encoding="utf-8")
+            link = root / "self-link"
+            try:
+                link.symlink_to(root, target_is_directory=True)
+            except (NotImplementedError, OSError):
+                link = None
+            result = scan_directory(root, max_depth=2)
+            self.assertGreaterEqual(result["depth_limited_directory_count"], 1)
+            self.assertEqual(result["max_depth"], 2)
+            if link is not None:
+                self.assertGreaterEqual(result["skipped_symlink_count"], 1)
 
     def test_job_can_be_cancelled_without_cancelling_other_jobs(self):
         with tempfile.TemporaryDirectory() as folder:

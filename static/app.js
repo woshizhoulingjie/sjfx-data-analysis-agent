@@ -1194,10 +1194,13 @@ function updateStats() {
 }
 
 
-async function refreshScan() {
+async function refreshScan(scanId = state.scan?.scan_id) {
+  if (!scanId) {
+    return;
+  }
   const data =
     await api(
-      `/api/scan/${state.scan.scan_id}`
+      `/api/scan/${scanId}`
     );
 
   state.scan =
@@ -1285,7 +1288,47 @@ async function pollJob(jobId) {
       job.status ===
       'completed'
     ) {
-      await refreshScan();
+      if (job.task_type === 'export_package') {
+        const result = job.result || {};
+        $('reportResult').className = 'report-result';
+        $('reportResult').innerHTML =
+          `<strong>待整编数据包已生成</strong>`
+          + `<p>已合并 ${escapeHtml(result.selection_count || 0)} 个选择，去重后包含 ${escapeHtml(result.source_file_count || 0)} 个源文件。</p>`
+          + (result.download_url
+            ? `<p><a class="download-link" href="${result.download_url}">下载待整编数据包</a></p>`
+            : '');
+        toast('待整编数据包已生成，可下载。');
+        state.jobId = null;
+        return;
+      }
+
+      if (job.task_type === 'generate_summary') {
+        const result = job.result || {};
+        if (result.summary) {
+          state.summary = result.summary;
+          renderSummary(
+            result.summary,
+            result.node_id ? '主题节点深度摘要' : '模型深度摘要'
+          );
+        }
+        toast(
+          result.degraded
+            ? '深度摘要已完成，但部分内容使用了本地保底结果'
+            : '深度摘要生成完成'
+        );
+        state.jobId = null;
+        return;
+      }
+
+      const completedScanId =
+        job.result?.scan_id
+        || state.scan?.scan_id
+        || job.scan_id;
+
+      if (completedScanId) {
+        state.scan = { scan_id: completedScanId };
+        await refreshScan(completedScanId);
+      }
 
       /*
        * 完整分析成功后自动显示分析主题目录。
@@ -1325,7 +1368,11 @@ async function pollJob(jobId) {
         'report-result';
 
       $('reportResult').innerHTML =
-        `<strong>自动概览已生成</strong>`
+        `<strong>${
+          job.task_type === 'generate_report'
+            ? '概览 Word 已重新生成'
+            : '自动概览已生成'
+        }</strong>`
         +
         `<p><span class="inference-badge">推论</span> ${
           escapeHtml(
@@ -1356,7 +1403,9 @@ async function pollJob(jobId) {
         }`;
 
       toast(
-        '完整分析、证据链和概览 Word 已生成'
+        job.task_type === 'generate_report'
+          ? '概览 Word 已生成'
+          : '完整分析、证据链和概览 Word 已生成'
       );
 
       state.jobId =
@@ -1367,6 +1416,7 @@ async function pollJob(jobId) {
 
     if (
       job.status === 'failed'
+      || job.status === 'cancelled'
     ) {
       state.jobId =
         null;
@@ -1374,7 +1424,7 @@ async function pollJob(jobId) {
       throw new Error(
         job.message
         || job.error
-        || '完整分析失败'
+        || (job.status === 'cancelled' ? '任务已取消' : '完整分析失败')
       );
     }
 
@@ -1424,6 +1474,22 @@ $('scanBtn').onclick =
       .textContent =
         '正在遍历服务器目录；大数据包扫描阶段可能需要一段时间…';
 
+    // A new scan starts a new UI session; clear selections from the prior package.
+    state.scan = null;
+    state.analysis = null;
+    state.summary = null;
+    state.summaries = new Map();
+    state.selected = null;
+    state.selectedNodes = new Map();
+    state.activeTree = 'physical';
+    $('analysisTreeBtn').classList.remove('active');
+    $('physicalTreeBtn').classList.add('active');
+    $('analysisTreeBtn').disabled = true;
+    $('reportBtn').disabled = true;
+    $('reanalyzeBtn').disabled = true;
+    $('retrievalBtn').disabled = true;
+    updateSelectionCart();
+
     try {
       const data =
         await api(
@@ -1444,59 +1510,9 @@ $('scanBtn').onclick =
           }
         );
 
-      $('progressBar')
-        .style
-        .width =
-          '5%';
-
-      $('progressText')
-        .textContent =
-          '目录扫描完成，开始本地解析与分析…';
-
-      state.scan =
-        data.scan;
-
-      state.analysis =
-        null;
-
-      state.selected =
-        null;
-
-      state.selectedNodes = new Map();
-      updateSelectionCart();
-
-      state.activeTree =
-        'physical';
-
-      renderTree(
-        data.scan.tree
-      );
-
-      updateStats();
-
-      $('physicalTreeBtn').disabled =
-        false;
-
-      $('physicalTreeBtn')
-        .classList
-        .add(
-          'active'
-        );
-
-      $('analysisTreeBtn')
-        .classList
-        .remove(
-          'active'
-        );
-
-      $('reanalyzeBtn').disabled =
-        true;
-
-      $('reportBtn').disabled =
-        true;
-
       await pollJob(
-        data.analysis_job_id
+        data.job_id
+        || data.analysis_job_id
       );
 
     } catch (e) {
@@ -1746,6 +1762,12 @@ $('summaryBtn').onclick =
           }
         );
 
+      if (data.accepted && data.job_id) {
+        toast('已提交深度摘要任务，Worker 正在处理当前节点。');
+        await pollJob(data.job_id);
+        return;
+      }
+
       state.summary =
         data.summary;
 
@@ -1845,53 +1867,7 @@ $('reportBtn').onclick =
           }
         );
 
-      const d =
-        data.report
-          ?.recommended_research_direction
-        || {};
-
-      $('reportResult')
-        .className =
-          'report-result';
-
-      $('reportResult')
-        .innerHTML =
-          `<strong>概览 Word 已重新生成</strong>`
-          +
-          `<p><span class="inference-badge">推论</span> ${
-            escapeHtml(
-              d.title
-              || '待确定'
-            )
-          }</p>`
-          +
-          `<p>${
-            escapeHtml(
-              d.rationale
-              || ''
-            )
-          }</p>`
-          +
-          `<a class="download-link" href="${data.download_url}">下载情况概览 Word</a>`
-          +
-          `<br>`
-          +
-          `<small>${
-            escapeHtml(
-              data.warning
-              ||
-              (
-                data.fallback_used
-                  ? '本地完整分析'
-                  : '本机模型增强完成'
-              )
-            )
-          }</small>`;
-
-      toast(
-        data.warning
-        || '概览 Word 已生成'
-      );
+      await pollJob(data.job_id);
 
     } catch (e) {
       toast(
@@ -1991,12 +1967,8 @@ $('exportBtn').onclick =
           }
         );
 
-      toast(
-        '待整编数据包已生成：已合并选中节点、自动去重，并附交接说明、覆盖清单和结论—证据链'
-      );
-
-      window.location.href =
-        data.download_url;
+      toast('已提交待整编任务，Worker 将生成去重资料包和统一交接说明。');
+      await pollJob(data.job_id);
 
     } catch (e) {
       toast(

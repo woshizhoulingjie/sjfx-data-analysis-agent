@@ -80,20 +80,32 @@ def _file_metadata(path, root):
     }
 
 
-def scan_directory(root, max_files=10000):
+def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None, cancel_check=None):
+    """Build a bounded physical inventory without following symbolic links.
+
+    ``max_depth`` protects the web/worker process from pathological directory
+    structures.  Reaching the bound is visible in the result instead of being
+    silently treated as a complete scan.  The optional callbacks let the worker
+    publish progress and honour cancellation without coupling this module to
+    Flask or the task database.
+    """
     root = Path(root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError("目录不存在或不是文件夹")
     max_files = max(1, min(int(max_files), 50000))
+    max_depth = max(1, min(int(max_depth), 256))
     count = 0
     total_size = 0
     type_counts = {}
     errors = []
     truncated = False
     ignored_file_count = 0
+    skipped_symlink_count = 0
+    depth_limited_directory_count = 0
 
-    def walk(folder):
+    def walk(folder, depth=0):
         nonlocal count, total_size, truncated, ignored_file_count
+        nonlocal skipped_symlink_count, depth_limited_directory_count
         node = {
             "id": path_id(folder),
             "name": folder.name or str(folder),
@@ -106,7 +118,15 @@ def scan_directory(root, max_files=10000):
             "direct_directory_count": 0,
             "total_size": 0,
             "type_counts": {},
+            "scan_depth": depth,
         }
+        if cancel_check:
+            cancel_check()
+        if depth >= max_depth:
+            depth_limited_directory_count += 1
+            node["depth_limited"] = True
+            node["simple_summary"] = "目录层级超过安全上限，未继续向下扫描。"
+            return node
         try:
             entries = sorted(
                 os.scandir(str(folder)),
@@ -116,6 +136,8 @@ def scan_directory(root, max_files=10000):
             errors.append({"path": str(folder), "error": str(exc)})
             return node
         for entry in entries:
+            if cancel_check:
+                cancel_check()
             if entry.name in IGNORED_DIRS:
                 continue
             if count >= max_files:
@@ -123,10 +145,11 @@ def scan_directory(root, max_files=10000):
                 break
             try:
                 if entry.is_symlink():
+                    skipped_symlink_count += 1
                     continue
                 item_path = Path(entry.path)
                 if entry.is_dir(follow_symlinks=False):
-                    child = walk(item_path)
+                    child = walk(item_path, depth + 1)
                     node["children"].append(child)
                     node["direct_directory_count"] += 1
                     node["directory_count"] += 1 + child["directory_count"]
@@ -148,6 +171,8 @@ def scan_directory(root, max_files=10000):
                     ext = meta["extension"] or "[无扩展名]"
                     type_counts[ext] = type_counts.get(ext, 0) + 1
                     node["type_counts"][ext] = node["type_counts"].get(ext, 0) + 1
+                    if progress_callback and (count == 1 or count % 100 == 0):
+                        progress_callback(count)
             except (OSError, PermissionError) as exc:
                 errors.append({"path": entry.path, "error": str(exc)})
         node["size_human"] = human_size(node["total_size"])
@@ -174,6 +199,9 @@ def scan_directory(root, max_files=10000):
         "file_count": count,
         "directory_count": tree["directory_count"],
         "ignored_file_count": ignored_file_count,
+        "skipped_symlink_count": skipped_symlink_count,
+        "depth_limited_directory_count": depth_limited_directory_count,
+        "max_depth": max_depth,
         "total_size": total_size,
         "total_size_human": human_size(total_size),
         "type_counts": dict(sorted(type_counts.items(), key=lambda item: (-item[1], item[0]))),
@@ -305,7 +333,7 @@ def extract_text(path, max_chars=60000):
     }
 
 
-def folder_context(folder, root, max_files=30, max_chars=50000):
+def folder_context(folder, root, max_files=30, max_chars=50000, max_depth=32):
     folder = Path(folder)
     root = Path(root)
     inventory = []
@@ -316,8 +344,16 @@ def folder_context(folder, root, max_files=30, max_chars=50000):
     total_size = 0
     type_counts = {}
     candidates = []
-    for current_root, dirs, files in os.walk(str(folder)):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+    root_depth = len(folder.resolve().parts)
+    for current_root, dirs, files in os.walk(str(folder), followlinks=False):
+        current = Path(current_root)
+        depth = max(0, len(current.resolve().parts) - root_depth)
+        dirs[:] = [
+            d for d in dirs
+            if d not in IGNORED_DIRS and not (current / d).is_symlink()
+        ]
+        if depth >= max(1, int(max_depth)):
+            dirs[:] = []
         total_dirs += len(dirs)
         for name in sorted(files, key=natural_key):
             if should_ignore_file(name):
