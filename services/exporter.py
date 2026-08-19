@@ -2,6 +2,7 @@ import json
 import os
 import re
 import zipfile
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -35,7 +36,8 @@ def collect_files(path):
 
 def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, documents=None, task_topic=None,
                 member_paths=None, node_name=None, node_id=None, selection_metadata=None,
-                selected_evidence_ids=None, inventory_metadata=None, file_states=None):
+                selected_evidence_ids=None, inventory_metadata=None, file_states=None,
+                progress_callback=None, cancel_check=None):
     root = Path(root).resolve()
     selected = Path(selected).resolve()
     documents = documents or []
@@ -74,12 +76,21 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
             prefix = selected_rel.rstrip("/") + "/"
             selected_documents = [item for item in documents if item.get("path") == selected_rel or item.get("path", "").startswith(prefix)]
         export_label = selected.name
-    total_size = sum(path.stat().st_size for path in files)
+    source_sizes = {}
+    try:
+        for path in files:
+            source_sizes[path] = path.stat().st_size
+    except (OSError, PermissionError) as exc:
+        raise ValueError("导出前无法读取源文件：{}".format(exc))
+    total_size = sum(source_sizes.values())
     if total_size > max_bytes:
         raise ValueError("导出内容为 {:.1f} MB，超过演示版上限 {:.1f} MB".format(total_size / 1048576, max_bytes / 1048576))
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     archive_name = "待整编数据包_{}_{}.zip".format(safe_name(export_label), stamp)
     archive_path = Path(output_dir) / archive_name
+    temporary_archive_path = archive_path.with_name(archive_path.name + ".part")
+    with suppress(OSError):
+        temporary_archive_path.unlink()
     evidence_candidates = []
     for item in selected_documents:
         evidence_candidates.extend(item.get("payload", {}).get("evidence", []))
@@ -122,9 +133,25 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
             "selected_evidence_count": len(selected_evidence_ids),
         },
     }
-    with zipfile.ZipFile(str(archive_path), "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in files:
+    written_size = 0
+    with zipfile.ZipFile(str(temporary_archive_path), "w", compression=zipfile.ZIP_DEFLATED,
+                         allowZip64=True) as archive:
+        for index, path in enumerate(files, 1):
+            if cancel_check:
+                cancel_check()
+            expected_size = source_sizes[path]
+            try:
+                current_size = path.stat().st_size
+            except (OSError, PermissionError) as exc:
+                raise ValueError("导出过程中源文件不可访问：{}".format(exc))
+            if current_size != expected_size:
+                raise ValueError("源文件在导出过程中发生变化：{}".format(path.name))
+            if written_size + current_size > max_bytes:
+                raise ValueError("源文件总大小超过导出上限，已停止写入")
             archive.write(str(path), arcname=str(path.relative_to(root)).replace("\\", "/"))
+            written_size += current_size
+            if progress_callback:
+                progress_callback(index, len(files), written_size, total_size)
         archive.writestr(
             "节点摘要.json",
             json.dumps(summary or {"message": "尚未生成摘要"}, ensure_ascii=False, indent=2),
@@ -206,6 +233,12 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 "contents": ["支持格式原始文件", "节点摘要.json", "整编任务说明.json", "结论-证据链.json", "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json"],
             }, ensure_ascii=False, indent=2),
         )
+    try:
+        os.replace(str(temporary_archive_path), str(archive_path))
+    except Exception:
+        with suppress(OSError):
+            temporary_archive_path.unlink()
+        raise
     return archive_path
 
 

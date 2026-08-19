@@ -758,6 +758,27 @@ def _run_claimed_export_job(job):
     storage.update_job(
         job_id, progress=8, stage="exporting", message="正在生成去重资料包和统一交接说明（可能需要较长时间）", heartbeat=True,
     )
+    last_reported = {"index": 0}
+
+    def export_cancel_check():
+        _ensure_job_active(job_id)
+
+    def export_progress(index, total, written_size, total_size):
+        report_step = max(1, total // 100)
+        if index != total and index - last_reported["index"] < report_step:
+            return
+        last_reported["index"] = index
+        ratio = index / float(max(1, total))
+        storage.update_job(
+            job_id,
+            progress=min(94, 8 + int(ratio * 86)),
+            stage="exporting",
+            message="正在写入资料包：{}/{} 个文件，{} / {}".format(
+                index, total, human_size(written_size), human_size(total_size)
+            ),
+            heartbeat=True,
+        )
+
     archive = export_node(
         scan_result["root"], selected, context["summary"], Config.OUTPUT_DIR, Config.MAX_EXPORT_BYTES,
         analysis=analysis, documents=documents,
@@ -769,6 +790,8 @@ def _run_claimed_export_job(job):
         selected_evidence_ids=context["selected_evidence_ids"],
         inventory_metadata=inventory_by_path(scan_result),
         file_states=state_by_path,
+        progress_callback=export_progress,
+        cancel_check=export_cancel_check,
     )
     _ensure_job_active(job_id)
     return {
