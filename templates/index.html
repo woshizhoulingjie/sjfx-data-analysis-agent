@@ -38,6 +38,7 @@
       <div class="button-row wrap">
         <button id="testBtn" class="ghost">测试本地模型</button>
         <button id="reanalyzeBtn" disabled>重新执行本地完整分析</button>
+        <button id="retryBtn" disabled>重试失败文件</button>
         <button id="reportBtn" disabled>重新生成概览 Word</button>
       </div>
       <div id="scanStats" class="stats empty">尚未导入数据包</div>
@@ -72,11 +73,19 @@
         </div>
         <small>使用本地 BM25 与 TF-IDF 字符向量，不调用云端模型。</small>
       </div>
+      <div class="retrieval-box">
+          <label for="numericQuestion">结构化数据精确统计（非通用问答）</label>
+        <div class="input-row">
+          <input id="numericQuestion" placeholder="例如：销售额的总和是多少？" autocomplete="off">
+          <button id="numericQuestionBtn" disabled>计算</button>
+        </div>
+          <small>只对 CSV/XLSX/JSON 画像中的数值字段计算合计、平均、最大、最小、数量，并返回字段、表名和行范围证据。</small>
+      </div>
       <div id="summary" class="summary empty">文件夹摘要、文档解析结果、全文深度摘要和证据来源将在这里显示。</div>
     </section>
   </main>
 
   <div id="toast" class="toast" aria-live="polite"></div>
-  <script src="/static/app.js?v=12"></script>
+  <script src="/static/app.js?v=15"></script>
 </body>
 </html>

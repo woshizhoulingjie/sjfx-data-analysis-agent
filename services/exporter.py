@@ -73,16 +73,18 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 raise ValueError("主题节点包含越界文件，已拒绝导出")
             if not candidate.exists() or candidate.is_symlink():
                 excluded_files.append(candidate)
-            elif candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
-                files.append(candidate)
             else:
-                excluded_files.append(candidate)
+                # Handoff packages preserve every selected source file. Parsing
+                # support controls analysis coverage, never raw-material export.
+                files.append(candidate)
         selected_documents = [item for item in documents if item.get("path") in set(virtual_paths)]
         export_label = node_name or "主题节点"
     else:
         all_files = collect_files(selected)
-        files = [path for path in all_files if path.suffix.lower() in SUPPORTED_EXTENSIONS]
-        excluded_files = [path for path in all_files if path.suffix.lower() not in SUPPORTED_EXTENSIONS]
+        # Export all original files, including formats the parser cannot read.
+        # Unsupported files remain visible in the coverage manifest as metadata-only.
+        files = all_files
+        excluded_files = []
         selected_rel = str(selected.relative_to(root)).replace("\\", "/") if selected != root else "."
         if selected_rel == ".":
             selected_documents = documents
@@ -243,7 +245,7 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 "excluded_files": [str(path.relative_to(root)).replace("\\", "/") for path in excluded_files[:100]],
                 "total_size": total_size,
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
-                "contents": ["支持格式原始文件", "节点摘要.json", "整编任务说明.json", "结论-证据链.json", "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json"],
+                "contents": ["所选范围全部原始文件（按相对路径去重）", "节点摘要.json", "整编任务说明.json", "结论-证据链.json", "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json"],
             }, ensure_ascii=False, indent=2),
         )
     return archive_path

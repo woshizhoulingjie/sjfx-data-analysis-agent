@@ -35,26 +35,77 @@ function toast(message, error = false) {
 
 
 async function api(url, options = {}) {
-  const response = await fetch(
-    url,
-    {
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      ...options
+  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+  let token = window.localStorage.getItem('sjfx_api_token') || '';
+  if (token) headers['X-SJFX-Token'] = token;
+  let response = await fetch(url, { ...options, headers });
+  if (response.status === 401) {
+    token = window.prompt('请输入 SJFX API Token（首次访问输入一次即可）', '') || '';
+    if (token) {
+      window.localStorage.setItem('sjfx_api_token', token);
+      headers['X-SJFX-Token'] = token;
+      response = await fetch(url, { ...options, headers });
     }
-  );
-
-  const data = await response.json();
-
-  if (!response.ok || !data.ok) {
-    throw new Error(
-      data.error || '请求失败'
-    );
   }
-
+  const data = await response.json();
+  if (!response.ok || !data.ok) throw new Error(data.error || '请求失败');
   return data;
 }
+
+// Downloads cannot use a plain <a href> when API-token authentication is on:
+// browsers do not attach the X-SJFX-Token header to a normal navigation.
+// Fetch the artifact with the same authenticated header as other API calls,
+// then save the returned Blob locally.
+async function authenticatedDownload(url) {
+  const headers = {};
+  let token = window.localStorage.getItem('sjfx_api_token') || '';
+  if (token) headers['X-SJFX-Token'] = token;
+  let response = await fetch(url, { headers });
+  if (response.status === 401) {
+    token = window.prompt('请输入 SJFX API Token（首次访问输入一次即可）', '') || '';
+    if (token) {
+      window.localStorage.setItem('sjfx_api_token', token);
+      headers['X-SJFX-Token'] = token;
+      response = await fetch(url, { headers });
+    }
+  }
+  if (!response.ok) {
+    let message = '下载失败';
+    try { message = (await response.json()).error || message; } catch (_) {}
+    throw new Error(message);
+  }
+  const disposition = response.headers.get('Content-Disposition') || '';
+  const encoded = (disposition.match(/filename\*=UTF-8''([^;]+)/i) || [])[1];
+  const quoted = (disposition.match(/filename="?([^";]+)"?/i) || [])[1];
+  const filename = encoded ? decodeURIComponent(encoded) : (quoted || 'sjfx-download');
+  const blobUrl = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement('a');
+  anchor.href = blobUrl;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(blobUrl);
+}
+
+function downloadLink(url, label) {
+  return `<a class="download-link authenticated-download" href="#" data-download-url="${escapeHtml(url)}">${escapeHtml(label)}</a>`;
+}
+
+document.addEventListener('click', async (event) => {
+  const link = event.target.closest('.authenticated-download');
+  if (!link) return;
+  event.preventDefault();
+  try {
+    link.classList.add('disabled');
+    await authenticatedDownload(link.dataset.downloadUrl || '');
+    toast('文件已开始下载');
+  } catch (error) {
+    toast(error.message || '下载失败', true);
+  } finally {
+    link.classList.remove('disabled');
+  }
+});
 
 
 function cloudConfirmed() {
@@ -311,6 +362,28 @@ function renderTree(tree) {
   host.appendChild(ul);
 }
 
+// Show a physical-tree placeholder immediately after a scan is submitted.
+// The worker replaces this skeleton with the complete inventory as soon as
+// directory enumeration finishes, while parsing and semantic analysis continue.
+function renderInitialPhysicalTree(rootPath) {
+  const raw = String(rootPath || '').trim();
+  const name = raw.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || raw || '待扫描目录';
+  renderTree({
+    kind: 'directory',
+    name,
+    path: raw || '.',
+    file_count: 0,
+    directory_count: 0,
+    children: [],
+    scan_pending: true
+  });
+  const row = $('tree').querySelector('.tree-row');
+  if (row) {
+    const meta = row.querySelector('.file-meta');
+    if (meta) meta.textContent = '正在盘点…';
+  }
+}
+
 
 function summaryKey(
   path,
@@ -537,6 +610,9 @@ async function selectNode(
 
   $('retrievalBtn').disabled =
     !state.scan;
+  if ($('numericQuestionBtn')) {
+    $('numericQuestionBtn').disabled = !state.scan;
+  }
 
   const local =
     localSummaryFor(node);
@@ -783,6 +859,13 @@ function renderDocument(doc) {
       }`
       +
       `</p>`;
+  }
+
+  const profile = doc.data_profile || (doc.data_profiles && doc.data_profiles[0]?.profile);
+  if (profile && profile.status !== "skipped" && profile.status !== "failed") {
+    const judgment = profile.value_judgment || {};
+    html += `<div class="coverage-card"><strong>结构化数据画像：</strong>${profile.row_count ?? 0} 行 / ${profile.column_count ?? 0} 列；质量评分 ${profile.quality_score ?? "—"} / 100；价值判断 ${escapeHtml(judgment.value_level || "—")}。` +
+      `${profile.duplicate_row_count ? `重复行 ${profile.duplicate_row_count}；` : ""}${profile.missing_columns?.length ? `缺失字段 ${profile.missing_columns.length} 个；` : ""}${profile.sensitive_columns?.length ? `敏感字段 ${profile.sensitive_columns.length} 个，建议脱敏。` : ""}</div>`;
   }
 
   if (
@@ -1172,6 +1255,8 @@ function updateStats() {
     +
     `<div><b>${a.evidence_items ?? '—'}</b><span>证据项</span></div>`
     +
+    `<div><b>${a.structured_profiled_files ?? '—'}</b><span>结构化画像</span></div>`
+    +
     `</div>`
     +
     `<p>`
@@ -1185,6 +1270,14 @@ function updateStats() {
     `语义主题：${a.semantic_topic_clusters ?? a.topic_clusters ?? '—'}`
     +
     `</p>`;
+  const overview = state.analysis?.overview || {};
+  const judgment = state.analysis?.value_judgment || {};
+  if (overview.file_count != null || judgment.level) {
+    $('scanStats').innerHTML +=
+      `<div class="coverage-card"><strong>数据概览：</strong>已解析 ${overview.parsed_files ?? a.parsed_files ?? 0} 个文件，证据 ${overview.evidence_count ?? a.evidence_items ?? 0} 条；` +
+      `价值判断：${escapeHtml(judgment.level || '待分析')}（${escapeHtml(judgment.confidence || '—')}）` +
+      `${judgment.limitations?.length ? `<br><small>${escapeHtml(judgment.limitations.join('；'))}</small>` : ''}</div>`;
+  }
   if (coverage.inventory_files != null) {
     $('scanStats').innerHTML +=
       `<div class="coverage-card"><strong>分析覆盖：${escapeHtml(coverage.status || '—')}</strong> · 已分析 ${coverage.parsed_files || 0}/${coverage.inventory_files || 0}（${ratio}）` +
@@ -1243,15 +1336,21 @@ async function refreshScan(scanId = state.scan?.scan_id) {
 
   $('analysisTreeBtn').disabled =
     !state.analysis?.analysis_tree;
+  // The physical inventory remains available after semantic analysis.
+  $('physicalTreeBtn').disabled = false;
 
   $('reportBtn').disabled =
     false;
 
   $('reanalyzeBtn').disabled =
     false;
+  $('retryBtn').disabled = !(state.analysis?.statistics?.failed_files > 0);
 
   $('retrievalBtn').disabled =
     !state.analysis;
+  if ($('numericQuestionBtn')) {
+    $('numericQuestionBtn').disabled = !state.analysis;
+  }
 
   updateSelectionCart();
 }
@@ -1284,6 +1383,32 @@ async function pollJob(jobId) {
     $('progressText').textContent =
       `${job.progress || 0}% · ${job.message || job.status}`;
 
+    // A scan-and-analyze job publishes its inventory before parsing begins.
+    // Load and show the physical tree immediately instead of making the user
+    // wait for semantic clustering and report generation.
+    const partialScanId = job.result?.scan_available
+      ? (job.result.scan_id || job.scan_id)
+      : null;
+    if (partialScanId && !state.scan?.tree) {
+      try {
+        const partial = await api(`/api/scan/${partialScanId}`);
+        state.scan = partial.scan;
+        state.analysis = partial.analysis;
+        state.summaries = new Map((partial.summaries || []).map(item => [summaryKey(item.path, item.type), item.payload]));
+        state.activeTree = 'physical';
+        $('physicalTreeBtn').disabled = false;
+        $('physicalTreeBtn').classList.add('active');
+        $('analysisTreeBtn').classList.remove('active');
+        renderTree(state.scan.tree);
+        updateStats();
+        $('tree').classList.remove('empty');
+        toast('原始目录已加载，后台继续进行深度分析。');
+      } catch (partialError) {
+        // The main job status remains authoritative; a transient fetch error
+        // should not abort polling.
+      }
+    }
+
     if (
       job.status ===
       'completed'
@@ -1295,7 +1420,7 @@ async function pollJob(jobId) {
           `<strong>待整编数据包已生成</strong>`
           + `<p>已合并 ${escapeHtml(result.selection_count || 0)} 个选择，去重后包含 ${escapeHtml(result.source_file_count || 0)} 个源文件。</p>`
           + (result.download_url
-            ? `<p><a class="download-link" href="${result.download_url}">下载待整编数据包</a></p>`
+            ? `<p>${downloadLink(result.download_url, '下载待整编数据包')}</p>`
             : '');
         toast('待整编数据包已生成，可下载。');
         state.jobId = null;
@@ -1330,29 +1455,15 @@ async function pollJob(jobId) {
         await refreshScan(completedScanId);
       }
 
-      /*
-       * 完整分析成功后自动显示分析主题目录。
-       * 不再停留在原始物理目录。
-       */
-      if (
-        state.analysis
-        && state.analysis.analysis_tree
-      ) {
-        state.activeTree = 'analysis';
-
-        $('physicalTreeBtn')
-          .classList
-          .remove('active');
-
-        $('analysisTreeBtn')
-          .classList
-          .add('active');
-
-        $('analysisTreeBtn').disabled = false;
-
-        renderTree(
-          state.analysis.analysis_tree
-        );
+      // Keep the original physical directory as the default view. Users can
+      // switch to the semantic topic tree explicitly after analysis completes.
+      // This preserves the source structure and avoids making it appear lost.
+      $('physicalTreeBtn').disabled = false;
+      if (state.activeTree !== 'analysis' || !state.analysis?.analysis_tree) {
+        state.activeTree = 'physical';
+        $('physicalTreeBtn').classList.add('active');
+        $('analysisTreeBtn').classList.remove('active');
+        renderTree(state.scan?.tree || state.scan);
       }
 
       const overview =
@@ -1392,11 +1503,7 @@ async function pollJob(jobId) {
           overview?.download_url
 
             ? (
-                `<a class="download-link" href="${overview.download_url}">`
-                +
-                `下载自动生成的情况概览 Word`
-                +
-                `</a>`
+                downloadLink(overview.download_url, '下载自动生成的情况概览 Word')
               )
 
             : ''
@@ -1482,12 +1589,15 @@ $('scanBtn').onclick =
     state.selected = null;
     state.selectedNodes = new Map();
     state.activeTree = 'physical';
+    $('tree').className = 'tree';
+    renderInitialPhysicalTree($('rootPath').value);
     $('analysisTreeBtn').classList.remove('active');
     $('physicalTreeBtn').classList.add('active');
     $('analysisTreeBtn').disabled = true;
     $('reportBtn').disabled = true;
     $('reanalyzeBtn').disabled = true;
     $('retrievalBtn').disabled = true;
+    if ($('numericQuestionBtn')) $('numericQuestionBtn').disabled = true;
     updateSelectionCart();
 
     try {
@@ -1835,6 +1945,19 @@ $('summaryBtn').onclick =
   };
 
 
+$('retryBtn').onclick = async () => {
+  if (!state.scan) return;
+  const btn = $('retryBtn');
+  setBusy(btn, true, '正在重试…');
+  try {
+    const data = await api(`/api/retry-failed/${state.scan.scan_id}`, { method: 'POST', body: JSON.stringify({}) });
+    if (data.job_id) await pollJob(data.job_id);
+    else toast(data.message || '当前没有失败文件');
+  } catch (e) { toast(e.message, true); }
+  finally { setBusy(btn, false); }
+};
+
+
 $('reportBtn').onclick =
   async () => {
     if (!state.scan) {
@@ -2167,6 +2290,46 @@ $('retrievalBtn').onclick =
         btn,
         false
       );
+    }
+  };
+
+
+$('numericQuestionBtn').onclick =
+  async () => {
+    if (!state.scan) return;
+    const question = $('numericQuestion').value.trim();
+    if (!question) {
+      toast('请输入精确数字问题', true);
+      return;
+    }
+    const btn = $('numericQuestionBtn');
+    setBusy(btn, true, '计算中…');
+    try {
+      const payload = {
+        scan_id: state.scan.scan_id,
+        question,
+        path: state.selected?.path || '.'
+      };
+      if (state.selected?.node_id) payload.node_id = state.selected.node_id;
+      const data = await api('/api/ask', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+      const answer = data.answer || {};
+      $('summary').className = 'summary';
+      $('summary').innerHTML =
+        `<div class="summary-kicker">可验证精确数字问答</div>` +
+        `<h2>${escapeHtml(answer.question || question)}</h2>` +
+        `<div class="metric-grid"><div><b>${escapeHtml(answer.value ?? '—')}</b><span>${escapeHtml(answer.operation || '结果')}</span></div>` +
+        `<div><b>${escapeHtml(answer.column || '记录数')}</b><span>字段</span></div>` +
+        `<div><b>${escapeHtml(answer.confidence || '—')}</b><span>置信度</span></div></div>` +
+        `<p>来源：${escapeHtml(answer.source_path || '当前范围')}；表/成员：${escapeHtml(answer.table || '—')}</p>` +
+        evidenceHtml(answer.evidence || []);
+      toast('已返回带来源定位的精确统计结果');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setBusy(btn, false);
     }
   };
 

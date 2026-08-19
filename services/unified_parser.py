@@ -1,22 +1,37 @@
 import hashlib
+import gzip
+import io
+import bz2
 import json
 import os
 import posixpath
 import re
 import threading
 import zipfile
+import tarfile
+import tempfile
+import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree
 
 from services.scanner import extract_text
+from services.structured_profile import profile_path
 
+
+ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".tar.gz", ".tar.bz2", ".rar", ".7z"}
+ARCHIVE_MAX_ENTRIES = max(1, int(os.getenv("MAX_ARCHIVE_ENTRIES", "1500")))
+ARCHIVE_MAX_MEMBER_BYTES = int(os.getenv("MAX_ARCHIVE_MEMBER_BYTES", str(128 * 1024 * 1024)))
+ARCHIVE_MAX_TOTAL_BYTES = int(os.getenv("MAX_ARCHIVE_UNCOMPRESSED_BYTES", str(2 * 1024 * 1024 * 1024)))
+ARCHIVE_MAX_DEPTH = max(0, int(os.getenv("MAX_ARCHIVE_DEPTH", "1")))
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".xlsm",
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
     ".xml", ".html", ".htm", ".log", ".yaml", ".yml",
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".rar", ".7z",
 }
 
 
@@ -235,8 +250,13 @@ class UnifiedDocumentParser:
         self._ocr_engine = RapidOCR(params=params or None)
         return self._ocr_engine
 
-    def parse(self, path, relative_path=None, mode="accurate"):
+    def parse(self, path, relative_path=None, mode="accurate", _archive_depth=0):
         path = Path(path).resolve()
+        file_size = path.stat().st_size
+        # Keep parser behaviour aligned with Config.MAX_SINGLE_FILE_BYTES and
+        # the value shown by /api/status.  A deployment may explicitly raise
+        # this limit in .env after evaluating its memory and time budget.
+        max_single_file_bytes = max(1, int(os.getenv("MAX_SINGLE_FILE_BYTES", str(1024 * 1024 * 1024))))
         relative_path = str(relative_path or path.name).replace("\\", "/")
         mode = "fast" if str(mode).lower() == "fast" else "accurate"
         source_hash = sha256_file(path)
@@ -247,7 +267,7 @@ class UnifiedDocumentParser:
                 "absolute_path": str(path),
                 "name": path.name,
                 "extension": path.suffix.lower(),
-                "size": path.stat().st_size,
+                "size": file_size,
                 "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
                 "sha256": source_hash,
             },
@@ -268,10 +288,26 @@ class UnifiedDocumentParser:
             "evidence": [],
             "warnings": [],
         }
+        if file_size > max_single_file_bytes:
+            base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
+            base["coverage"].update({"complete": False, "coverage_ratio": 0.0, "limited_by_size": True})
+            base["warnings"].append("文件超过单文件解析上限（{} 字节），仅保留元数据和哈希。".format(max_single_file_bytes))
+            return base
         ext = path.suffix.lower()
         if ext not in SUPPORTED_EXTENSIONS:
             base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
             base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
+            return base
+
+        archive_name = path.name.lower()
+        is_archive = ext in ARCHIVE_EXTENSIONS or archive_name.endswith(".tar.gz") or archive_name.endswith(".tar.bz2")
+        if is_archive:
+            self._parse_archive(path, base, mode=mode, archive_depth=_archive_depth)
+            base["content_sha256"] = _digest_text(base["text"])
+            base["coverage"]["stored_characters"] = len(base["text"])
+            base["coverage"]["complete"] = not base["coverage"].get("truncated_by_limit")
+            if not base["evidence"] and base["text"].strip():
+                self._add_fallback_evidence(base)
             return base
 
         if mode == "fast":
@@ -325,7 +361,132 @@ class UnifiedDocumentParser:
             base["coverage"]["coverage_ratio"] = round(min(1.0, len(base["text"]) / float(total_available or 1)), 6)
         if not base["evidence"] and base["text"].strip():
             self._add_fallback_evidence(base)
+        try:
+            profile = profile_path(path)
+            if profile:
+                base["data_profile"] = profile
+                for column_name, column in list((profile.get("columns") or {}).items())[:40]:
+                    if len(base["evidence"]) >= 3000:
+                        break
+                    base["evidence"].append({
+                        "evidence_id": "E-{}-{:05d}".format(base["source"]["sha256"][:10], len(base["evidence"]) + 1),
+                        "source_path": base["source"]["path"], "label": "structured_column",
+                        "table": "主数据表", "column": column_name,
+                        "row_range": [2, int(profile.get("row_count") or 1) + 1],
+                        "text": "字段 {}：类型={}，缺失率={}，唯一值={}。".format(column_name, column.get("inferred_type"), column.get("missing_ratio"), column.get("unique_count")),
+                        "source_sha256": base["source"]["sha256"], "content_sha256": _digest_text(column_name),
+                    })
+                judgment = profile.get("value_judgment") or {}
+                if judgment.get("reason"):
+                    base["warnings"].append("数据画像：{}".format(judgment["reason"]))
+        except Exception as exc:
+            base["warnings"].append("结构化数据画像失败，正文解析仍可用：{}".format(exc))
         return base
+
+    def _parse_archive(self, path, base, mode="accurate", archive_depth=0):
+        """Parse supported members without writing into the user's data root.
+
+        Every member is size/path checked before extraction. The archive remains
+        one source document in the inventory, while its member paths and
+        evidence are visible in the generated summary.
+        """
+        base["parser"] = {"name": "archive-members", "degraded": False, "archive": True, "mode": mode}
+        base["structure"]["archive_member_count"] = 0
+        base["structure"]["archive_members"] = []
+        if archive_depth >= ARCHIVE_MAX_DEPTH:
+            base["parser"]["degraded"] = True
+            base["warnings"].append("压缩包嵌套层级达到安全上限，未继续展开。")
+            return
+        total_uncompressed = 0
+        member_index = 0
+        temp_root = Path(tempfile.mkdtemp(prefix="sjfx-archive-"))
+        try:
+            entries = []
+            name = path.name.lower()
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(str(path)) as archive:
+                    entries = [(info.filename, int(info.file_size), lambda info=info: archive.open(info)) for info in archive.infolist() if not info.is_dir()]
+                    self._parse_archive_entries(path, base, entries, temp_root, mode, archive_depth)
+                    return
+            if name.endswith(".gz") and not name.endswith((".tar.gz", ".tgz")):
+                with gzip.open(str(path), "rb") as source:
+                    blob = source.read(ARCHIVE_MAX_MEMBER_BYTES + 1)
+                self._parse_archive_entries(path, base, [(Path(path.stem).name + ".txt", len(blob), lambda blob=blob: io.BytesIO(blob))], temp_root, mode, archive_depth)
+                return
+            if name.endswith(".bz2") and not name.endswith((".tar.bz2", ".tbz")):
+                with bz2.open(str(path), "rb") as source:
+                    blob = source.read(ARCHIVE_MAX_MEMBER_BYTES + 1)
+                self._parse_archive_entries(path, base, [(Path(path.stem).name + ".txt", len(blob), lambda blob=blob: io.BytesIO(blob))], temp_root, mode, archive_depth)
+                return
+            if name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz")):
+                tar_mode = "r:*"
+                with tarfile.open(str(path), tar_mode) as archive:
+                    entries = [(info.name, int(info.size), lambda info=info, archive=archive: archive.extractfile(info)) for info in archive.getmembers() if info.isfile()]
+                    self._parse_archive_entries(path, base, entries, temp_root, mode, archive_depth)
+                    return
+            base["parser"]["degraded"] = True
+            base["warnings"].append("当前环境未安装 RAR/7z 解包组件；仅保留压缩包元数据。")
+        except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as exc:
+            base["parser"]["degraded"] = True
+            base["warnings"].append("压缩包展开失败：{}".format(exc))
+        finally:
+            shutil.rmtree(str(temp_root), ignore_errors=True)
+
+    def _parse_archive_entries(self, path, base, entries, temp_root, mode, archive_depth):
+        total_uncompressed = 0
+        for raw_name, declared_size, opener in entries:
+            if len(base["structure"]["archive_members"]) >= ARCHIVE_MAX_ENTRIES:
+                base["warnings"].append("压缩包成员超过 {} 个，仅保留前部成员。".format(ARCHIVE_MAX_ENTRIES))
+                break
+            member_name = posixpath.normpath(str(raw_name).replace("\\", "/")).lstrip("/")
+            if not member_name or member_name == "." or member_name.startswith("../") or "/../" in member_name:
+                base["warnings"].append("已跳过越界压缩包成员：{}".format(raw_name))
+                continue
+            if declared_size < 0 or declared_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + declared_size > ARCHIVE_MAX_TOTAL_BYTES:
+                base["warnings"].append("已跳过超过安全大小限制的压缩包成员：{}".format(member_name))
+                continue
+            destination = temp_root / member_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source = opener()
+            if source is None:
+                continue
+            with source, destination.open("wb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+            actual_size = destination.stat().st_size
+            if actual_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + actual_size > ARCHIVE_MAX_TOTAL_BYTES:
+                destination.unlink(missing_ok=True)
+                base["warnings"].append("已跳过实际解压后超过限制的成员：{}".format(member_name))
+                continue
+            total_uncompressed += actual_size
+            base["structure"]["archive_members"].append(member_name)
+            base["structure"]["archive_member_count"] += 1
+            child_ext = destination.suffix.lower()
+            if child_ext not in SUPPORTED_EXTENSIONS or child_ext in ARCHIVE_EXTENSIONS:
+                continue
+            try:
+                child = self.parse(destination, relative_path=member_name, mode=mode, _archive_depth=archive_depth + 1)
+            except Exception as exc:
+                base["warnings"].append("成员 {} 解析失败：{}".format(member_name, exc))
+                continue
+            child_text = str(child.get("text") or "")
+            if child_text:
+                block = "\n\n[压缩包成员：{}]\n{}".format(member_name, child_text)
+                base["text"] = (base["text"] + block)[: self.max_chars]
+            for evidence in child.get("evidence") or []:
+                item = dict(evidence)
+                item["source_path"] = "{}::{}".format(path.name, member_name)
+                item["archive_member"] = member_name
+                item["archive_source_path"] = base["source"]["path"]
+                base["evidence"].append(item)
+                if len(base["evidence"]) >= 3000:
+                    break
+            if child.get("data_profile"):
+                base.setdefault("data_profiles", []).append({"member": member_name, "profile": child["data_profile"]})
+            if len(base["evidence"]) >= 3000:
+                break
+        if base["structure"]["archive_member_count"] == 0:
+            base["parser"]["degraded"] = True
+            base["warnings"].append("压缩包中没有找到可解析的文本/办公文档成员。")
 
     def _fast_parse(self, path, base):
         """Low-latency parsing for inventory and first-pass evidence discovery.
@@ -724,6 +885,8 @@ def compact_document(document, include_text=False):
         "parser": document.get("parser"),
         "structure": document.get("structure"),
         "classification": document.get("classification", {}),
+        "data_profile": document.get("data_profile"),
+        "data_profiles": document.get("data_profiles", []),
         "coverage": document.get("coverage", {}),
         "content_sha256": document.get("content_sha256"),
         "warnings": document.get("warnings", []),

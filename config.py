@@ -61,8 +61,15 @@ class Config:
     DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
     HOST = os.getenv("HOST", "127.0.0.1")
     PORT = int(os.getenv("PORT", "8000"))
+    API_ACCESS_TOKEN = os.getenv("SJFX_API_ACCESS_TOKEN", "").strip()
+    AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "0" if HOST in {"127.0.0.1", "localhost", "::1"} else "1").strip().lower() in {"1", "true", "yes"}
+    _allowed_roots = os.getenv("SCAN_ALLOWED_ROOTS", str(BASE_DIR.parent))
+    SCAN_ALLOWED_ROOTS = tuple(Path(item).expanduser().resolve() for item in _allowed_roots.split(":") if item.strip())
     MAX_EXTRACT_CHARS = int(os.getenv("MAX_EXTRACT_CHARS", "60000"))
     MAX_FULL_DOCUMENT_CHARS = int(os.getenv("MAX_FULL_DOCUMENT_CHARS", "2000000"))
+    MAX_SINGLE_FILE_BYTES = int(os.getenv("MAX_SINGLE_FILE_BYTES", str(1024 * 1024 * 1024)))
+    MAX_PARSE_SECONDS = max(10, int(os.getenv("MAX_PARSE_SECONDS", "300")))
+    MAX_WORKER_MEMORY_MB = max(256, int(os.getenv("MAX_WORKER_MEMORY_MB", "8192")))
     MAX_DOCUMENT_CHUNKS = int(os.getenv("MAX_DOCUMENT_CHUNKS", "12"))
     # ZIP64 is used by the exporter.  A 4-5 GB analysis package may legitimately
     # need a larger handoff archive than the previous demonstration cap.
@@ -77,6 +84,11 @@ class Config:
     LARGE_PACKAGE_INITIAL_PARSE_FILES = int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "700"))
     LARGE_PACKAGE_DEEPEN_BATCH_FILES = int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "500"))
     LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE = int(os.getenv("LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE", "30000"))
+    MAX_ARCHIVE_ENTRIES = max(1, int(os.getenv("MAX_ARCHIVE_ENTRIES", "1500")))
+    MAX_ARCHIVE_MEMBER_BYTES = int(os.getenv("MAX_ARCHIVE_MEMBER_BYTES", str(128 * 1024 * 1024)))
+    MAX_ARCHIVE_UNCOMPRESSED_BYTES = int(os.getenv("MAX_ARCHIVE_UNCOMPRESSED_BYTES", str(2 * 1024 * 1024 * 1024)))
+    MAX_STRUCTURED_PROFILE_ROWS = max(100, int(os.getenv("MAX_STRUCTURED_PROFILE_ROWS", "100000")))
+    MAX_STRUCTURED_PROFILE_BYTES = int(os.getenv("MAX_STRUCTURED_PROFILE_BYTES", str(256 * 1024 * 1024)))
     MAX_ANALYSIS_JOBS = max(1, int(os.getenv("MAX_ANALYSIS_JOBS", "1")))
     MAX_CLOUD_REQUESTS = max(1, int(os.getenv("MAX_CLOUD_REQUESTS", "3")))
     WORKER_POLL_SECONDS = max(0.1, float(os.getenv("WORKER_POLL_SECONDS", "0.5")))

@@ -1,6 +1,8 @@
 import hashlib
 import json
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -34,6 +36,31 @@ STOPWORDS = {
 
 def _now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _parse_with_limits(parser, path, node_path, mode):
+    """Apply per-file wall-clock and best-effort process-memory guards."""
+    timeout = max(10, int(os.getenv("MAX_PARSE_SECONDS", "300")))
+    memory_limit = max(256, int(os.getenv("MAX_WORKER_MEMORY_MB", "8192"))) * 1024 * 1024
+    try:
+        import resource
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+        if rss > memory_limit:
+            raise MemoryError("Worker 内存已达到 {} MB 上限，跳过该文件".format(memory_limit // (1024 * 1024)))
+    except ImportError:
+        pass
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(parser.parse, path, node_path, mode=mode)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError("单文件解析超过 {} 秒，已标记为可恢复失败".format(timeout)) from exc
+    finally:
+        # A native OCR call cannot always be force-killed safely. Do not block
+        # the worker while it unwinds; the next parser call remains serialized
+        # by UnifiedDocumentParser's internal lock.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _walk_files(node):
@@ -1961,7 +1988,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             continue
         path = resolve_under(scan["root"], file_node["path"])
         try:
-            document = parser.parse(path, node_path, mode=actual_parse_mode)
+            document = _parse_with_limits(parser, path, node_path, mode=actual_parse_mode)
             if policy.get("enabled"):
                 document = compact_overview_document(document, policy["overview_chars_per_file"])
             documents[node_path] = document
@@ -2121,6 +2148,71 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     )
     adaptive_tree = attach_tree_coverage(adaptive_tree, coverage_for_paths, all_paths)
     exact_duplicate_files = sum(group["duplicate_count"] for group in exact_groups)
+    structured_profiles = []
+    for profile_path, document in documents.items():
+        profile = document.get("data_profile")
+        if profile and profile.get("status") == "completed":
+            structured_profiles.append({"path": profile_path, "profile": profile})
+        for item in document.get("data_profiles", []) or []:
+            nested = item.get("profile") or {}
+            if nested.get("status") == "completed":
+                structured_profiles.append({"path": "{}::{}".format(profile_path, item.get("member")), "profile": nested})
+    profile_scores = [float(item["profile"].get("quality_score", 0)) for item in structured_profiles if item["profile"].get("quality_score") is not None]
+    entity_statistics = {}
+    recommendation_questions = []
+    for category in ("person", "location", "event"):
+        merged = Counter()
+        columns = set()
+        for item in structured_profiles:
+            profile = item["profile"]
+            columns.update((profile.get("entity_columns") or {}).get(category, []))
+            for value in ((profile.get("entity_statistics") or {}).get(category, {}).get("top_values") or []):
+                if isinstance(value, dict):
+                    merged[str(value.get("value") or "")] += int(value.get("count") or 0)
+        if columns or merged:
+            entity_statistics[category] = {
+                "columns": sorted(columns),
+                "distinct_count": len(merged),
+                "top_values": [{"value": key, "count": count} for key, count in merged.most_common(20)],
+            }
+    for item in structured_profiles:
+        recommendation_questions.extend(item["profile"].get("recommendation_questions") or [])
+    structured_overview = {
+        "profiled_files": len(structured_profiles),
+        "total_rows": sum(int(item["profile"].get("row_count") or 0) for item in structured_profiles),
+        "average_quality_score": round(sum(profile_scores) / len(profile_scores), 2) if profile_scores else None,
+        "missing_value_columns": sorted(set(name for item in structured_profiles for name in item["profile"].get("missing_columns", []))),
+        "sensitive_columns": sorted(set(name for item in structured_profiles for name in item["profile"].get("sensitive_columns", []))),
+        "entity_statistics": entity_statistics,
+        "recommendation_questions": list(dict.fromkeys(recommendation_questions))[:12],
+        "profiles": structured_profiles[:200],
+    }
+    parsed_ratio = float(package_coverage.get("parsed_file_ratio") or 0)
+    evidence_count = sum(len(document.get("evidence", [])) for document in documents.values())
+    overview = {
+        "file_count": scan.get("file_count", 0),
+        "directory_count": scan.get("directory_count", 0),
+        "total_size": scan.get("total_size", 0),
+        "total_size_human": scan.get("total_size_human"),
+        "format_counts": scan.get("type_counts", {}),
+        "parsed_files": len(documents),
+        "pending_files": len(pending_paths),
+        "failed_files": len(failures),
+        "evidence_count": evidence_count,
+        "structured_data": structured_overview,
+    }
+    value_judgment = {
+        "level": "高" if parsed_ratio >= 0.9 and evidence_count else ("中" if parsed_ratio >= 0.5 or evidence_count else "待分析"),
+        "basis": "基于文件覆盖率、可回溯证据数量、数据格式多样性和结构化数据质量评分。",
+        "confidence": "高" if parsed_ratio >= 0.9 and not failures else "中",
+        "limitations": (["仍有 {} 个文件待分析".format(len(pending_paths))] if pending_paths else []) + (["有 {} 个文件解析失败，可调用失败文件重试接口".format(len(failures))] if failures else []),
+        "structured_data_signals": {
+            "profiled_files": structured_overview["profiled_files"],
+            "total_rows": structured_overview["total_rows"],
+            "average_quality_score": structured_overview["average_quality_score"],
+            "entity_categories": sorted(structured_overview["entity_statistics"]),
+        },
+    }
     analysis = {
         "schema_version": "package-analysis/2.0",
         "scan_id": scan_id,
@@ -2159,6 +2251,12 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "local_file_summary_count": local_file_summary_count,
             "small_file_summary_skipped": max(0, len(documents) - local_file_summary_count),
             "document_roles": dict(Counter(document.get("classification", {}).get("document_role", "一般资料") for document in documents.values())),
+            "structured_profiled_files": structured_overview["profiled_files"],
+            "structured_total_rows": structured_overview["total_rows"],
+            "structured_average_quality_score": structured_overview["average_quality_score"],
+            "structured_sensitive_column_count": len(structured_overview["sensitive_columns"]),
+            "structured_entity_category_count": len(structured_overview["entity_statistics"]),
+            "structured_recommended_question_count": len(structured_overview["recommendation_questions"]),
         },
         "exact_duplicate_groups": exact_groups,
         "similar_document_clusters": similar_groups,
@@ -2174,6 +2272,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "classification_dimensions": adaptive_tree["dimensions"],
         "analysis_tree": adaptive_tree,
         "coverage": package_coverage,
+        "overview": overview,
+        "value_judgment": value_judgment,
+        "structured_data_overview": structured_overview,
         "node_summaries": node_summaries,
         "document_index": [compact_document(document) for document in documents.values()],
         "failures": failures,
@@ -2216,6 +2317,21 @@ def refresh_package_coverage(scan_id, scan, storage):
     tree = attach_tree_coverage(analysis.get("analysis_tree") or {}, coverage_for_paths, all_paths)
     analysis["analysis_tree"] = tree
     analysis["coverage"] = package_coverage
+    structured = []
+    for path, document in documents.items():
+        if (document.get("data_profile") or {}).get("status") == "completed":
+            structured.append({"path": path, "profile": document["data_profile"]})
+        for item in document.get("data_profiles", []) or []:
+            if (item.get("profile") or {}).get("status") == "completed":
+                structured.append({"path": "{}::{}".format(path, item.get("member")), "profile": item["profile"]})
+    scores = [float(item["profile"].get("quality_score", 0)) for item in structured if item["profile"].get("quality_score") is not None]
+    analysis["structured_data_overview"] = {
+        "profiled_files": len(structured), "total_rows": sum(int(item["profile"].get("row_count") or 0) for item in structured),
+        "average_quality_score": round(sum(scores) / len(scores), 2) if scores else None,
+        "missing_value_columns": sorted(set(name for item in structured for name in item["profile"].get("missing_columns", []))),
+        "sensitive_columns": sorted(set(name for item in structured for name in item["profile"].get("sensitive_columns", []))),
+        "profiles": structured[:200],
+    }
     statistics = analysis.setdefault("statistics", {})
     statistics.update({
         "parsed_files": len(documents), "failed_files": len(failures),

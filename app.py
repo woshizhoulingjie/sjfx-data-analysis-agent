@@ -1,4 +1,6 @@
 import json
+import hashlib
+import hmac
 import logging
 import logging.handlers
 import re
@@ -7,7 +9,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, has_request_context, jsonify, render_template, request, send_from_directory
 
 from config import Config
 from services.deepseek import DeepSeekClient, DeepSeekError, OllamaClient, OllamaEmbeddingClient
@@ -15,7 +17,7 @@ from services.document_analysis import analyze_document
 from services.evidence import embedding_mode, select_evidence, set_embedding_provider
 from services.exporter import create_report_docx, export_node, safe_name
 from services.folder_analysis import analyze_folder
-from services.package_analysis import analyze_package, refresh_package_coverage
+from services.package_analysis import analyze_package, refresh_package_coverage, _parse_with_limits
 from services.large_package import file_fingerprint, inventory_by_path
 from services.reporting import (
     build_local_report,
@@ -26,6 +28,7 @@ from services.reporting import (
 from services.retrieval import retrieve_evidence
 from services.scanner import folder_context, human_size, resolve_under, scan_directory
 from services.storage import Storage
+from services.structured_qa import answer_question
 from services.unified_parser import UnifiedDocumentParser
 
 
@@ -61,6 +64,16 @@ logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 app.config["JSON_AS_ASCII"] = False
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 storage = Storage(Config.DB_PATH, Config.DOCUMENT_CACHE_DIR, Config.SIDECAR_PAYLOAD_BYTES)
+# Bind historical pre-authentication records to the configured token before
+# serving requests.  This closes the legacy "first caller claims the record"
+# loophole while keeping existing demo links usable for the project owner.
+_configured_owner_id = (
+    hashlib.sha256(Config.API_ACCESS_TOKEN.encode("utf-8")).hexdigest()[:24]
+    if Config.AUTH_REQUIRED and Config.API_ACCESS_TOKEN else None
+)
+if _configured_owner_id:
+    storage.migrate_legacy_ownership(_configured_owner_id)
+    storage.register_existing_outputs(Config.OUTPUT_DIR, _configured_owner_id)
 _requested_backend = Config.LLM_BACKEND
 if _requested_backend not in {"ollama", "deepseek"}:
     logger.warning("未知 LLM_BACKEND=%s，回退到本机 Ollama", _requested_backend)
@@ -117,6 +130,39 @@ if not logger.handlers:
     logger.addHandler(_file_handler)
 
 
+@app.before_request
+def _access_guard():
+    if not Config.AUTH_REQUIRED:
+        return None
+    if request.path.startswith("/static/") or request.path == "/":
+        return None
+    if not (request.path.startswith("/api/") or request.path.startswith("/outputs/")):
+        return None
+    configured = Config.API_ACCESS_TOKEN
+    supplied = request.headers.get("X-SJFX-Token", "")
+    if not supplied:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+    if not configured or not supplied or not hmac.compare_digest(supplied, configured):
+        return jsonify({"ok": False, "error": "未授权访问，请提供有效的 SJFX API Token"}), 401
+    return None
+
+
+def _resolve_allowed_scan_root(raw_path):
+    root = Path(raw_path).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError("目录不存在或不是文件夹")
+    for allowed in Config.SCAN_ALLOWED_ROOTS:
+        try:
+            root.relative_to(allowed)
+            return root
+        except ValueError:
+            continue
+    allowed_text = "、".join(str(item) for item in Config.SCAN_ALLOWED_ROOTS)
+    raise ValueError("扫描目录不在允许范围内。当前允许根目录：{}".format(allowed_text))
+
+
 def api_error(message, status=400, details=None):
     payload = {"ok": False, "error": message}
     if details:
@@ -124,10 +170,22 @@ def api_error(message, status=400, details=None):
     return jsonify(payload), status
 
 
+def _request_owner_id():
+    if not Config.AUTH_REQUIRED or not has_request_context():
+        return None
+    supplied = request.headers.get("X-SJFX-Token", "")
+    if not supplied:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+    if not supplied:
+        return "anonymous"
+    return hashlib.sha256(supplied.encode("utf-8")).hexdigest()[:24]
+
 def require_scan(scan_id):
-    scan = storage.get_scan(scan_id)
+    scan = storage.get_scan(scan_id, owner_id=_request_owner_id())
     if not scan:
-        raise ValueError("扫描任务不存在或已失效")
+        raise ValueError("扫描任务不存在、已失效或不属于当前访问用户")
     return scan
 def _walk_analysis_nodes(node):
     """遍历分析树中的所有节点。"""
@@ -514,7 +572,7 @@ class JobCancelled(Exception):
 
 
 def _ensure_job_active(job_id):
-    job = storage.get_job(job_id)
+    job = storage.get_job(job_id, owner_id=_request_owner_id())
     if not job or job.get("status") in {"cancelled", "cancelling"} or job.get("cancel_requested"):
         raise JobCancelled()
     return job
@@ -670,7 +728,7 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
         return report_data, None, {}, "模型研究方向分析失败：{}。报告未使用关键词规则替代。".format(exc)
 
 
-def _write_local_overview(scan_id):
+def _write_local_overview(scan_id, owner_id=None, job_id=None):
     scan_result = require_scan(scan_id)
     analysis = storage.get_analysis(scan_id) or {}
     summaries = storage.list_summaries(scan_id)
@@ -681,6 +739,7 @@ def _write_local_overview(scan_id):
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     name = "情况概览报告_{}_{}_自动.docx".format(safe_name(Path(scan_result["root"]).name), stamp)
     create_report_docx(report_data, scan_result, Config.OUTPUT_DIR / name)
+    storage.save_artifact(name, owner_id, scan_id=scan_id, job_id=job_id, kind="overview_report")
     storage.save_summary(scan_id, ".", "report", report_data)
     return {
         "file_name": name,
@@ -708,7 +767,7 @@ def _run_claimed_report_job(job):
     scan_id = job["scan_id"]
     storage.update_job(job_id, progress=5, stage="generating_report", message="正在整理情况概览报告", heartbeat=True)
     _ensure_job_active(job_id)
-    report = _write_local_overview(scan_id)
+    report = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id)
     _ensure_job_active(job_id)
     return {"scan_id": scan_id, "overview": report}
 
@@ -723,7 +782,15 @@ def _run_claimed_summary_job(job):
     _ensure_job_active(job_id)
     # Reuse the established summary implementation under an isolated request
     # context. The web route has no model call after the async gate below.
-    with app.test_request_context("/api/summary", method="POST", json=payload):
+    # The route enforces scan ownership.  A Worker has no browser request, so
+    # explicitly carry the job's owner token into this internal request rather
+    # than letting the task fail as an anonymous caller.
+    with app.test_request_context(
+        "/api/summary",
+        method="POST",
+        json=payload,
+        headers={"X-SJFX-Token": Config.API_ACCESS_TOKEN} if Config.AUTH_REQUIRED else {},
+    ):
         response = summarize()
     status_code = 200
     if isinstance(response, tuple):
@@ -794,6 +861,7 @@ def _run_claimed_export_job(job):
         cancel_check=export_cancel_check,
     )
     _ensure_job_active(job_id)
+    storage.save_artifact(archive.name, job.get("owner_id"), scan_id=scan_id, job_id=job_id, kind="handoff_export")
     return {
         "scan_id": scan_id,
         "file_name": archive.name,
@@ -828,7 +896,7 @@ def _run_claimed_analysis_job(job):
     )
     _ensure_job_active(job_id)
     storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
-    overview = _write_local_overview(scan_id)
+    overview = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id)
     _ensure_job_active(job_id)
     return {
         "scan_id": scan_id,
@@ -861,8 +929,20 @@ def _run_claimed_scan_and_analyze_job(job):
     )
     scan_result["parse_mode"] = "accurate" if options.get("parse_mode") == "accurate" else "fast"
     scan_result["scan_id"] = job_id
-    storage.save_scan(scan_result, scan_id=job_id)
-    storage.update_job(job_id, progress=15, stage="scanned", message="目录盘点完成，开始解析、去重和主题分析", heartbeat=True)
+    storage.save_scan(scan_result, scan_id=job_id, owner_id=options.get("owner_id") or "legacy")
+    # Make the physical inventory available to the browser immediately after
+    # scanning, while the longer parse/cluster/report stages continue in the
+    # same background job.  Only the id is stored here; the tree is fetched via
+    # the authenticated /api/scan endpoint to avoid duplicating a large JSON
+    # payload in the job row.
+    storage.update_job(
+        job_id,
+        result={"scan_id": job_id, "scan_available": True},
+        progress=15,
+        stage="scanned",
+        message="目录盘点完成，已显示原始目录，继续解析、去重和主题分析",
+        heartbeat=True,
+    )
     # The scan task keeps its own id as scan_id so the browser can use one job id
     # throughout the complete unknown-package workflow.
     return _run_claimed_analysis_job({
@@ -872,7 +952,7 @@ def _run_claimed_scan_and_analyze_job(job):
 
 def _start_analysis_job(scan_id, options=None):
     """Persist work for the independent Worker; the API process never runs it."""
-    return storage.create_or_get_job(scan_id, options=options)
+    return storage.create_or_get_job(scan_id, options=options, owner_id=_request_owner_id() or "legacy")
 
 
 @app.route("/")
@@ -895,11 +975,17 @@ def status():
         "python_compatible": True,
         "output_dir": str(Config.OUTPUT_DIR),
         "document_parser": parser.status(),
-        "supported_inputs": ["PDF", "Word", "PowerPoint", "Excel", "图片 OCR", "文本/Markdown/CSV/HTML"],
+        "supported_inputs": ["PDF", "Word", "PowerPoint", "Excel", "CSV/XLSX/JSON 数据画像", "图片 OCR", "文本/Markdown/HTML", "ZIP/TAR/TAR.GZ/TAR.BZ2 压缩包"],
         "local_features": ["Office 内嵌图片 OCR", "SHA-256 去重", "SimHash+LSH 聚类", "BM25+TF-IDF 本地证据检索", "自适应分析树", "自动概览 Word"],
         "limits": {
             "max_scan_files": Config.MAX_SCAN_FILES,
             "max_document_characters": Config.MAX_FULL_DOCUMENT_CHARS,
+            "max_single_file_bytes": Config.MAX_SINGLE_FILE_BYTES,
+            "max_parse_seconds": Config.MAX_PARSE_SECONDS,
+            "max_worker_memory_mb": Config.MAX_WORKER_MEMORY_MB,
+            "max_archive_entries": Config.MAX_ARCHIVE_ENTRIES,
+            "max_archive_member_bytes": Config.MAX_ARCHIVE_MEMBER_BYTES,
+            "max_archive_uncompressed_bytes": Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,
             "max_analysis_jobs": Config.MAX_ANALYSIS_JOBS,
             "max_cloud_requests": Config.MAX_CLOUD_REQUESTS,
             "max_export_bytes": Config.MAX_EXPORT_BYTES,
@@ -947,12 +1033,11 @@ def scan():
     if not path:
         return api_error("请输入要扫描的本地目录")
     try:
-        root = Path(path).expanduser().resolve()
-        if not root.exists() or not root.is_dir():
-            raise ValueError("目录不存在或不是文件夹")
+        root = _resolve_allowed_scan_root(path)
         job_id = storage.create_scan_job(
             root, payload.get("max_files", Config.MAX_SCAN_FILES), parse_mode,
             payload.get("max_depth", Config.MAX_SCAN_DEPTH),
+            owner_id=_request_owner_id() or "legacy",
         )
         return jsonify({
             "ok": True,
@@ -1003,6 +1088,8 @@ def get_document(scan_id):
             "parser": document.get("parser"),
             "structure": document.get("structure"),
             "coverage": document.get("coverage", {}),
+            "data_profile": document.get("data_profile"),
+            "data_profiles": document.get("data_profiles", []),
             "warnings": document.get("warnings", []),
             "text_preview": document.get("text", "")[:5000],
             "evidence": select_evidence(
@@ -1198,9 +1285,37 @@ def retrieve():
         )
 
 
+@app.route("/api/ask", methods=["POST"])
+def ask_numeric():
+    """Answer bounded, exact numeric questions from structured profiles.
+
+    This endpoint deliberately refuses unsupported free-form questions instead
+    of inventing an answer. Every returned value carries source/table/row-range
+    evidence so it can be checked in the original data.
+    """
+    payload = request.get_json(silent=True) or {}
+    try:
+        scan_id = payload.get("scan_id", "")
+        scan_result = require_scan(scan_id)
+        documents = _package_documents(scan_id)
+        node_id = payload.get("node_id")
+        if node_id:
+            node = _find_analysis_node(scan_id, node_id)
+            member_paths = set(node.get("member_paths") or [])
+            documents = [item for item in documents if item.get("path") in member_paths]
+        elif payload.get("path"):
+            member_paths = set(_physical_scope_member_paths(scan_result, payload.get("path") or "."))
+            documents = [item for item in documents if item.get("path") in member_paths]
+        result = answer_question(payload.get("question", ""), documents)
+        result["scope"] = "node:{}".format(node_id) if node_id else (payload.get("path") or ".")
+        return jsonify({"ok": True, "answer": result})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
 @app.route("/api/jobs/<job_id>")
 def get_job(job_id):
-    job = storage.get_job(job_id)
+    job = storage.get_job(job_id, owner_id=_request_owner_id())
     if not job:
         return api_error("分析任务不存在", 404)
     if job.get("status") == "queued":
@@ -1225,13 +1340,13 @@ def get_job(job_id):
 
 @app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
 def cancel_job(job_id):
-    job = storage.get_job(job_id)
+    job = storage.get_job(job_id, owner_id=_request_owner_id())
     if not job:
         return api_error("分析任务不存在", 404)
     if job.get("status") in {"completed", "failed", "cancelled"}:
         return jsonify({"ok": True, "job": job, "cancelled": job.get("status") == "cancelled"})
     storage.cancel_job(job_id)
-    return jsonify({"ok": True, "job": storage.get_job(job_id), "cancelled": True})
+    return jsonify({"ok": True, "job": storage.get_job(job_id, owner_id=_request_owner_id()), "cancelled": True})
 
 
 @app.route("/api/analyze-package", methods=["POST"])
@@ -1245,6 +1360,25 @@ def rerun_package_analysis():
             storage.update_scan(scan_id, scan_result)
         job_id, created = _start_analysis_job(scan_id)
         return jsonify({"ok": True, "job_id": job_id, "reused_active_job": not created})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/retry-failed/<scan_id>", methods=["POST"])
+def retry_failed(scan_id):
+    """Requeue failed file parses from the last checkpoint, optionally scoped."""
+    try:
+        require_scan(scan_id)
+        payload = request.get_json(silent=True) or {}
+        failed = [item for item in storage.list_file_states(scan_id) if item.get("status") == "failed"]
+        requested = payload.get("target_paths")
+        failed_paths = {item.get("node_path") for item in failed if item.get("node_path")}
+        target_paths = sorted(failed_paths & set(requested)) if isinstance(requested, list) else sorted(failed_paths)
+        if not target_paths:
+            return jsonify({"ok": True, "accepted": False, "message": "当前没有可重试的失败文件", "failed_files": 0})
+        options = {"target_paths": target_paths, "scope_label": "失败文件重试", "retry_failed": True}
+        job_id, created = storage.create_or_get_typed_job(scan_id, "analyze_package", options=options, owner_id=_request_owner_id() or "legacy")
+        return jsonify({"ok": True, "accepted": True, "job_id": job_id, "reused_active_job": not created, "retry_files": len(target_paths), "status_url": "/api/jobs/{}".format(job_id)}), 202
     except ValueError as exc:
         return api_error(str(exc), 400)
 
@@ -1302,7 +1436,7 @@ def summarize():
                 if force or not (cached and cached.get("schema_version") in {3, 4}):
                     require_cloud_confirmation(payload)
                     job_id = storage.create_job(
-                        scan_id, options=payload, task_type="generate_summary"
+                        scan_id, options=payload, task_type="generate_summary", owner_id=_request_owner_id() or "legacy"
                     )
                     return jsonify({
                         "ok": True, "accepted": True, "job_id": job_id,
@@ -1316,7 +1450,7 @@ def summarize():
                 if force or not (cached and cached.get("schema_version") == 3 and not bool(cached.get("parser_info", {}).get("degraded"))):
                     require_cloud_confirmation(payload)
                     job_id = storage.create_job(
-                        scan_id, options=payload, task_type="generate_summary"
+                        scan_id, options=payload, task_type="generate_summary", owner_id=_request_owner_id() or "legacy"
                     )
                     return jsonify({
                         "ok": True, "accepted": True, "job_id": job_id,
@@ -1412,7 +1546,7 @@ def summarize():
             # the package responsive, and immediately refreshes coverage.
             if (unified_document or {}).get("coverage", {}).get("overview_sampled"):
                 deep_mode = "fast" if scan_result.get("parse_mode") == "fast" else "accurate"
-                unified_document = parser.parse(selected, node_path, mode=deep_mode)
+                unified_document = _parse_with_limits(parser, selected, node_path, mode=deep_mode)
                 storage.save_document(scan_id, node_path, unified_document)
                 source_node = inventory_by_path(scan_result).get(node_path, {})
                 storage.set_file_state(
@@ -1483,7 +1617,7 @@ def report():
         require_scan(scan_id)
         if llm.requires_confirmation and payload.get("cloud_confirmed") is not True:
             raise ValueError("请先确认：选中的文件内容将发送至 DeepSeek 云端 API")
-        job_id, created = storage.create_or_get_typed_job(scan_id, "generate_report")
+        job_id, created = storage.create_or_get_typed_job(scan_id, "generate_report", owner_id=_request_owner_id() or "legacy")
         return jsonify({
             "ok": True, "accepted": True, "job_id": job_id,
             "reused_active_job": not created,
@@ -1515,7 +1649,7 @@ def export():
         }
         if not options["task_topic"]:
             raise ValueError("请输入整编任务主题")
-        job_id = storage.create_job(scan_id, options=options, task_type="export_package")
+        job_id = storage.create_job(scan_id, options=options, task_type="export_package", owner_id=_request_owner_id() or "legacy")
         return jsonify({
             "ok": True, "accepted": True, "job_id": job_id,
             "status_url": "/api/jobs/{}".format(job_id),
@@ -1526,6 +1660,24 @@ def export():
 
 @app.route("/outputs/<path:filename>")
 def outputs(filename):
+    # Output artifacts may contain original user资料; require an ownership
+    # record in addition to the global API token and reject path tricks.
+    if Path(filename).name != filename:
+        return api_error("非法输出文件路径", 404)
+    owner_id = _request_owner_id()
+    output_path = Config.OUTPUT_DIR / filename
+    if not output_path.is_file():
+        return api_error("输出文件不存在或已被清理", 404)
+    registered_owner = storage.artifact_owner(filename)
+    # Older reports may predate output_artifacts registration. In this
+    # single-token deployment, bind an existing unregistered file to the
+    # configured authenticated owner on first access; never rebind a file
+    # that is already registered to a different owner.
+    if registered_owner is None and owner_id:
+        storage.save_artifact(filename, owner_id, kind="legacy_result")
+        registered_owner = owner_id
+    if registered_owner != owner_id:
+        return api_error("输出文件不存在或不属于当前访问用户", 404)
     return send_from_directory(str(Config.OUTPUT_DIR), filename, as_attachment=True)
 
 

@@ -54,3 +54,6 @@ wx/
 Thumbs.db
 *.swp
 *~
+
+# Server-side emergency backups
+backups/

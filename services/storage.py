@@ -43,6 +43,7 @@ class Storage:
                     id TEXT PRIMARY KEY,
                     root_path TEXT NOT NULL,
                     payload TEXT NOT NULL,
+                    owner_id TEXT NOT NULL DEFAULT 'legacy',
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS summaries (
@@ -76,6 +77,7 @@ class Storage:
                     result TEXT,
                     error TEXT,
                     options TEXT,
+                    owner_id TEXT NOT NULL DEFAULT 'legacy',
                     worker_id TEXT,
                     heartbeat_at REAL,
                     started_at REAL,
@@ -102,6 +104,14 @@ class Storage:
                     evidence_ids TEXT NOT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS output_artifacts (
+                    filename TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    scan_id TEXT,
+                    job_id TEXT,
+                    kind TEXT NOT NULL DEFAULT 'result',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE INDEX IF NOT EXISTS idx_documents_scan_path ON unified_documents(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_summaries_scan_path ON summaries(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_retrieval_sessions_scan_created ON retrieval_sessions(scan_id, created_at);
@@ -121,6 +131,12 @@ class Storage:
             for name, definition in migrations.items():
                 if name not in columns:
                     conn.execute("ALTER TABLE analysis_jobs ADD COLUMN {} {}".format(name, definition))
+            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_jobs)").fetchall()}
+            if "owner_id" not in job_columns:
+                conn.execute("ALTER TABLE analysis_jobs ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'")
+            scan_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scans)").fetchall()}
+            if "owner_id" not in scan_columns:
+                conn.execute("ALTER TABLE scans ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_jobs_queue ON analysis_jobs(status, updated_at)")
 
     def _sidecar_path(self, scan_id, node_path):
@@ -143,7 +159,7 @@ class Storage:
             text = text[:head] + "\n\n[正文已折叠；选择文件可读取完整解析缓存]\n\n" + text[-tail:]
         projection = {
             key: payload.get(key)
-            for key in ("schema_version", "source", "parsed_at", "parser", "structure", "coverage", "warnings", "classification", "content_sha256")
+            for key in ("schema_version", "source", "parsed_at", "parser", "structure", "coverage", "warnings", "classification", "content_sha256", "data_profile", "data_profiles")
             if key in payload
         }
         projection["text"] = text
@@ -262,19 +278,84 @@ class Storage:
             return None
         return self._decode_job(dict(row))
 
-    def save_scan(self, payload, scan_id=None):
+    def save_scan(self, payload, scan_id=None, owner_id="legacy"):
         scan_id = scan_id or uuid.uuid4().hex[:12]
         with self.lock, self._connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO scans(id, root_path, payload) VALUES (?, ?, ?)",
-                (scan_id, payload["root"], json.dumps(payload, ensure_ascii=False)),
+                "INSERT OR REPLACE INTO scans(id, root_path, payload, owner_id) VALUES (?, ?, ?, ?)",
+                (scan_id, payload["root"], json.dumps(payload, ensure_ascii=False), owner_id or "legacy"),
             )
         return scan_id
 
-    def get_scan(self, scan_id):
+    def migrate_legacy_ownership(self, owner_id):
+        """Bind pre-authentication records to the configured owner once."""
+        if not owner_id:
+            return
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE scans SET owner_id=? WHERE owner_id IS NULL OR owner_id IN ('legacy','default')",
+                (owner_id,),
+            )
+            conn.execute(
+                "UPDATE analysis_jobs SET owner_id=? WHERE owner_id IS NULL OR owner_id IN ('legacy','default')",
+                (owner_id,),
+            )
+            conn.execute(
+                "UPDATE output_artifacts SET owner_id=? WHERE owner_id IS NULL OR owner_id IN ('legacy','default')",
+                (owner_id,),
+            )
+
+    def register_existing_outputs(self, output_dir, owner_id):
+        """Register legacy output files so existing links remain protected."""
+        if not owner_id:
+            return
+        output_dir = Path(output_dir)
+        with self.lock, self._connect() as conn:
+            for item in output_dir.iterdir() if output_dir.exists() else ():
+                if not item.is_file() or item.name.startswith("."):
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO output_artifacts(filename,owner_id,kind) VALUES (?,?,?)",
+                    (item.name, owner_id, "legacy_result"),
+                )
+
+    def save_artifact(self, filename, owner_id, scan_id=None, job_id=None, kind="result"):
+        if not filename or not owner_id:
+            return
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO output_artifacts(filename,owner_id,scan_id,job_id,kind) VALUES (?,?,?,?,?)",
+                (str(filename), str(owner_id), scan_id, job_id, kind or "result"),
+            )
+
+    def artifact_owned(self, filename, owner_id=None):
         with self._connect() as conn:
-            row = conn.execute("SELECT payload FROM scans WHERE id=?", (scan_id,)).fetchone()
-        return json.loads(row["payload"]) if row else None
+            row = conn.execute(
+                "SELECT owner_id FROM output_artifacts WHERE filename=?",
+                (str(filename),),
+            ).fetchone()
+        if not row:
+            return False
+        return not owner_id or row["owner_id"] == owner_id
+
+    def artifact_owner(self, filename):
+        """Return the registered owner, or None when the artifact is unregistered."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT owner_id FROM output_artifacts WHERE filename=?",
+                (str(filename),),
+            ).fetchone()
+        return row["owner_id"] if row else None
+
+    def get_scan(self, scan_id, owner_id=None):
+        with self.lock, self._connect() as conn:
+            row = conn.execute("SELECT payload, owner_id FROM scans WHERE id=?", (scan_id,)).fetchone()
+            if not row:
+                return None
+            stored_owner = row["owner_id"] or "legacy"
+            if owner_id and stored_owner != owner_id:
+                return None
+        return json.loads(row["payload"])
 
     def update_scan(self, scan_id, payload):
         with self.lock, self._connect() as conn:
@@ -377,36 +458,52 @@ class Storage:
             row = conn.execute("SELECT payload FROM package_analyses WHERE scan_id=?", (scan_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
 
-    def create_job(self, scan_id, options=None, task_type="analyze_package"):
+    def create_job(self, scan_id, options=None, task_type="analyze_package", owner_id="legacy"):
         job_id = uuid.uuid4().hex[:12]
         with self.lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options) VALUES (?,?,?,?,?,?,?,?)",
-                (job_id, scan_id, task_type, "queued", "queued", 0, "等待开始", json.dumps(options or {}, ensure_ascii=False)),
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (job_id, scan_id, task_type, "queued", "queued", 0, "等待开始", json.dumps(options or {}, ensure_ascii=False), owner_id or "legacy"),
             )
         return job_id
 
-    def create_or_get_job(self, scan_id, options=None):
-        return self.create_or_get_typed_job(scan_id, "analyze_package", options=options)
+    def create_or_get_job(self, scan_id, options=None, owner_id="legacy"):
+        return self.create_or_get_typed_job(scan_id, "analyze_package", options=options, owner_id=owner_id)
 
-    def create_or_get_typed_job(self, scan_id, task_type, options=None):
+    def create_or_get_typed_job(self, scan_id, task_type, options=None, owner_id="legacy"):
         """Deduplicate only equivalent active work for the same data package."""
         with self.lock, self._connect() as conn:
-            row = conn.execute(
-                "SELECT id FROM analysis_jobs WHERE scan_id=? AND task_type=? "
-                "AND status IN ('queued','running','cancelling') ORDER BY updated_at DESC LIMIT 1",
+            options_json = json.dumps(options or {}, ensure_ascii=False, sort_keys=True)
+            # Scope-aware deduplication: two different topic selections must
+            # never reuse one another's active supplement task.
+            scope = (options or {}).get("target_paths") or []
+            scope_key = json.dumps(sorted(set(str(item) for item in scope)), ensure_ascii=False)
+            rows = conn.execute(
+                "SELECT id, options, owner_id FROM analysis_jobs WHERE scan_id=? AND task_type=? "
+                "AND status IN ('queued','running','cancelling') ORDER BY updated_at DESC",
                 (scan_id, task_type),
-            ).fetchone()
+            ).fetchall()
+            row = None
+            for candidate in rows:
+                try:
+                    candidate_options = json.loads(candidate["options"] or "{}")
+                except (TypeError, ValueError):
+                    candidate_options = {}
+                candidate_scope = json.dumps(sorted(set(str(item) for item in (candidate_options.get("target_paths") or []))), ensure_ascii=False)
+                candidate_owner = candidate["owner_id"] or "legacy"
+                if candidate_scope == scope_key and (not owner_id or candidate_owner == owner_id):
+                    row = candidate
+                    break
             if row:
                 return row["id"], False
             job_id = uuid.uuid4().hex[:12]
             conn.execute(
-                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options) VALUES (?,?,?,?,?,?,?,?)",
-                (job_id, scan_id, task_type, "queued", "queued", 1, "已进入本地任务队列", json.dumps(options or {}, ensure_ascii=False)),
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (job_id, scan_id, task_type, "queued", "queued", 1, "已进入本地任务队列", options_json, owner_id or "legacy"),
             )
         return job_id, True
 
-    def create_scan_job(self, root_path, max_files, parse_mode, max_depth):
+    def create_scan_job(self, root_path, max_files, parse_mode, max_depth, owner_id="legacy"):
         """Create a scan-and-analyze workflow without touching the filesystem yet."""
         job_id = uuid.uuid4().hex[:12]
         options = {
@@ -414,11 +511,12 @@ class Storage:
             "max_files": int(max_files),
             "parse_mode": str(parse_mode),
             "max_depth": int(max_depth),
+            "owner_id": owner_id or "legacy",
         }
         with self.lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options) VALUES (?,?,?,?,?,?,?,?)",
-                (job_id, job_id, "scan_and_analyze", "queued", "queued", 0, "等待扫描目录", json.dumps(options, ensure_ascii=False)),
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (job_id, job_id, "scan_and_analyze", "queued", "queued", 0, "等待扫描目录", json.dumps(options, ensure_ascii=False), owner_id or "legacy"),
             )
         return job_id
 
@@ -510,9 +608,12 @@ class Storage:
         result["cancel_requested"] = bool(result.get("cancel_requested"))
         return result
 
-    def get_job(self, job_id):
-        with self._connect() as conn:
+    def get_job(self, job_id, owner_id=None):
+        with self.lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone()
-        if not row:
-            return None
+            if not row:
+                return None
+            stored_owner = row["owner_id"] or "legacy"
+            if owner_id and stored_owner != owner_id:
+                return None
         return self._decode_job(dict(row))
