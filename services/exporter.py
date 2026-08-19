@@ -2,7 +2,7 @@ import json
 import os
 import re
 import zipfile
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +32,20 @@ def collect_files(path):
                 continue
             files.append(candidate)
     return files
+
+
+@contextmanager
+def _atomic_zip(temporary_path, final_path):
+    """Write a ZIP privately and publish it only after it closes cleanly."""
+    try:
+        with zipfile.ZipFile(str(temporary_path), "w", compression=zipfile.ZIP_DEFLATED,
+                             allowZip64=True) as archive:
+            yield archive
+        os.replace(str(temporary_path), str(final_path))
+    except BaseException:
+        with suppress(OSError):
+            Path(temporary_path).unlink()
+        raise
 
 
 def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, documents=None, task_topic=None,
@@ -134,8 +148,7 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
         },
     }
     written_size = 0
-    with zipfile.ZipFile(str(temporary_archive_path), "w", compression=zipfile.ZIP_DEFLATED,
-                         allowZip64=True) as archive:
+    with _atomic_zip(temporary_archive_path, archive_path) as archive:
         for index, path in enumerate(files, 1):
             if cancel_check:
                 cancel_check()
@@ -233,12 +246,6 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 "contents": ["支持格式原始文件", "节点摘要.json", "整编任务说明.json", "结论-证据链.json", "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json"],
             }, ensure_ascii=False, indent=2),
         )
-    try:
-        os.replace(str(temporary_archive_path), str(archive_path))
-    except Exception:
-        with suppress(OSError):
-            temporary_archive_path.unlink()
-        raise
     return archive_path
 
 
