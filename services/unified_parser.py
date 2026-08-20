@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import shutil
 import time
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree
@@ -103,6 +104,19 @@ def _docling_artifacts_ready(artifacts_path):
         and weights.exists()
         and weights.stat().st_size >= 150 * 1024 * 1024
     )
+
+
+class DocumentParseError(RuntimeError):
+    """A source document could not be parsed after all local fallbacks."""
+
+
+def _looks_like_corrupt_pdf_warning(warnings):
+    signals = (
+        "EOF marker", "xref", "trailer dictionary", "Data format error",
+        "Stream has ended unexpectedly", "not valid",
+    )
+    text = "\n".join(str(item) for item in warnings or [])
+    return any(signal.lower() in text.lower() for signal in signals)
 
 
 class UnifiedDocumentParser:
@@ -250,6 +264,51 @@ class UnifiedDocumentParser:
         self._ocr_engine = RapidOCR(params=params or None)
         return self._ocr_engine
 
+    def _repair_pdf_copy(self, source):
+        """Attempt an isolated local PDF repair without altering the source.
+
+        qpdf is preferred because it can reconstruct some damaged xref tables.
+        ``pikepdf`` is used when the deployment ships it.  A failed repair is
+        deliberately not hidden: callers receive a diagnosis and the original
+        follows the usual parser fallbacks.
+        """
+        source = Path(source)
+        # Avoid a repair subprocess for PDFs that pypdf can already read.
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(source), strict=False)
+            _ = len(reader.pages)
+            return None, None
+        except Exception as original_error:
+            reason = "PDF 结构校验失败：{}".format(str(original_error)[:300])
+
+        fd, temp_name = tempfile.mkstemp(prefix="sjfx-pdf-repair-", suffix=".pdf")
+        os.close(fd)
+        repaired = Path(temp_name)
+        try:
+            qpdf = shutil.which("qpdf")
+            if qpdf:
+                result = subprocess.run(
+                    [qpdf, "--warning-exit-0", "--linearize", str(source), str(repaired)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90,
+                )
+                if result.returncode == 0 and repaired.stat().st_size > 0:
+                    return repaired, "检测到损坏 PDF，已使用 qpdf 重建副本后解析。"
+
+            try:
+                import pikepdf
+                with pikepdf.open(str(source), attempt_recovery=True) as document:
+                    document.save(str(repaired))
+                if repaired.stat().st_size > 0:
+                    return repaired, "检测到损坏 PDF，已使用 pikepdf 恢复副本后解析。"
+            except Exception:
+                pass
+            repaired.unlink(missing_ok=True)
+            return None, reason + "；本地恢复工具未能重建该文件。请重新获取或重新导出原始 PDF。"
+        except (OSError, subprocess.SubprocessError) as exc:
+            repaired.unlink(missing_ok=True)
+            return None, reason + "；PDF 恢复尝试失败：{}".format(str(exc)[:200])
+
     def parse(self, path, relative_path=None, mode="accurate", _archive_depth=0):
         path = Path(path).resolve()
         file_size = path.stat().st_size
@@ -299,6 +358,22 @@ class UnifiedDocumentParser:
             base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
             return base
 
+        # A surprising number of field PDFs are interrupted copies: their page
+        # streams may still be present, but the xref/trailer is missing.  Do
+        # not give a corrupted original to Docling first.  Try a local repair
+        # tool, then parse the repaired *temporary* copy while retaining the
+        # original source hash and provenance in ``base``.
+        parse_path = path
+        repaired_path = None
+        if ext == ".pdf":
+            repaired_path, repair_note = self._repair_pdf_copy(path)
+            if repair_note:
+                base["warnings"].append(repair_note)
+            if repaired_path:
+                parse_path = repaired_path
+                base["parser"]["repair_attempted"] = True
+                base["parser"]["repair_succeeded"] = True
+
         archive_name = path.name.lower()
         is_archive = ext in ARCHIVE_EXTENSIONS or archive_name.endswith(".tar.gz") or archive_name.endswith(".tar.bz2")
         if is_archive:
@@ -311,7 +386,7 @@ class UnifiedDocumentParser:
             return base
 
         if mode == "fast":
-            self._fast_parse(path, base)
+            self._fast_parse(parse_path, base)
             base["parser"]["mode"] = "fast"
         # Plain text formats do not benefit from layout models; they are still
         # normalised into the exact same schema and evidence representation.
@@ -319,7 +394,7 @@ class UnifiedDocumentParser:
         if mode != "fast" and ext in docling_formats and self.docling_available:
             try:
                 with self._lock:
-                    result = self._get_converter().convert(str(path))
+                    result = self._get_converter().convert(str(parse_path))
                 document = result.document
                 text = document.export_to_markdown() or document.export_to_text()
                 base["text"] = str(text or "")[: self.max_chars]
@@ -339,13 +414,23 @@ class UnifiedDocumentParser:
                     base["warnings"].append("统一正文超过演示版字符上限，证据项仍按已解析结构保留。")
             except Exception as exc:
                 base["warnings"].append("Docling 解析失败，已切换本地兼容解析器：{}".format(exc))
-                self._fallback(path, base)
+                self._fallback(parse_path, base)
         elif mode != "fast":
             if ext in docling_formats and not self.docling_available:
                 base["warnings"].append("Docling 未安装，已切换本地兼容解析器。")
-            self._fallback(path, base)
+            self._fallback(parse_path, base)
             base["parser"]["mode"] = "accurate-fallback"
 
+        if repaired_path:
+            try:
+                repaired_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if ext == ".pdf" and not base["text"].strip() and _looks_like_corrupt_pdf_warning(base["warnings"]):
+            raise DocumentParseError(
+                "PDF 文件损坏或传输不完整，Docling/PDFium/OCR 均无法读取。"
+                "请重新下载或重新导出原文件；系统未将其误标为已解析。"
+            )
         base["content_sha256"] = _digest_text(base["text"])
         base["coverage"]["stored_characters"] = len(base["text"])
         total_available = base["coverage"].get("extracted_characters", 0) + base["coverage"].get("embedded_ocr_characters", 0)

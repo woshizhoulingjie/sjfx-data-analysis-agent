@@ -9,7 +9,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, has_request_context, jsonify, render_template, request, send_from_directory
+from web_compat import SJFXFastAPI, has_request_context, jsonify, render_template, request, send_from_directory
 
 from config import Config
 from services.deepseek import DeepSeekClient, DeepSeekError, OllamaClient, OllamaEmbeddingClient
@@ -30,9 +30,10 @@ from services.scanner import folder_context, human_size, resolve_under, scan_dir
 from services.storage import Storage
 from services.structured_qa import answer_question
 from services.unified_parser import UnifiedDocumentParser
+from services.agent_runtime import PydanticAgentRuntime
 
 
-app = Flask(__name__)
+app = SJFXFastAPI(title="SJFX Data Analysis Agent", version="2.1")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("sjfx")
 
@@ -82,7 +83,7 @@ if _requested_backend == "deepseek" and not Config.ENABLE_CLOUD_FEATURES:
     logger.warning("DeepSeek 云端后端已配置但 ENABLE_CLOUD_FEATURES 未开启，强制使用本机 Ollama")
     _requested_backend = "ollama"
 if _requested_backend == "ollama":
-    llm = OllamaClient(
+    llm_transport = OllamaClient(
         api_key="local",
         base_url=Config.OLLAMA_BASE_URL,
         model=Config.OLLAMA_MODEL,
@@ -90,18 +91,19 @@ if _requested_backend == "ollama":
         max_concurrency=Config.LLM_MAX_CONCURRENCY,
     )
 else:
-    llm = DeepSeekClient(
+    llm_transport = DeepSeekClient(
         api_key=Config.DEEPSEEK_API_KEY,
         base_url=Config.DEEPSEEK_BASE_URL,
         model=Config.DEEPSEEK_MODEL,
         max_concurrency=Config.MAX_CLOUD_REQUESTS,
     )
-ACTIVE_LLM_BACKEND = "ollama" if isinstance(llm, OllamaClient) else "deepseek"
-llm_generation_enabled = Config.ENABLE_SHARED_OLLAMA if isinstance(llm, OllamaClient) else Config.ENABLE_CLOUD_FEATURES
+ACTIVE_LLM_BACKEND = "ollama" if isinstance(llm_transport, OllamaClient) else "deepseek"
+llm_generation_enabled = Config.ENABLE_SHARED_OLLAMA if isinstance(llm_transport, OllamaClient) else Config.ENABLE_CLOUD_FEATURES
+llm = PydanticAgentRuntime(llm_transport)
 # 完整分析专用的文档级 embedding。
 # 只用于 analyze_package 中的一文档一向量语义聚类，
 # 不受 evidence embedding 开关影响。
-if isinstance(llm, OllamaClient):
+if isinstance(llm_transport, OllamaClient):
     _package_embedding_client = OllamaEmbeddingClient(
         Config.OLLAMA_BASE_URL,
         Config.OLLAMA_EMBED_MODEL,
@@ -1003,7 +1005,7 @@ def status():
 def test_model():
     try:
         require_cloud_confirmation(request.get_json(silent=True) or {})
-        if isinstance(llm, OllamaClient):
+        if isinstance(llm_transport, OllamaClient):
             health = llm.health_check()
             if not health["reachable"]:
                 return api_error("本机 Ollama 服务不可达：{}".format(health.get("error", "未知错误")), 503)
@@ -1555,7 +1557,7 @@ def summarize():
                 )
                 refresh_package_coverage(scan_id, scan_result, storage)
             model_max_chars = Config.MAX_FULL_DOCUMENT_CHARS
-            if isinstance(llm, OllamaClient):
+            if isinstance(llm_transport, OllamaClient):
                 model_max_chars = min(model_max_chars, Config.SHARED_OLLAMA_MAX_CHARS)
             try:
                 if local_only:
@@ -1682,5 +1684,6 @@ def outputs(filename):
 
 
 if __name__ == "__main__":
+    import uvicorn
     logger.info("数据分析 Agent 启动 http://%s:%s backend=%s model=%s", Config.HOST, Config.PORT, ACTIVE_LLM_BACKEND, llm.model)
-    app.run(host=Config.HOST, port=Config.PORT, debug=False, threaded=True)
+    uvicorn.run(app, host=Config.HOST, port=Config.PORT, log_level="info")

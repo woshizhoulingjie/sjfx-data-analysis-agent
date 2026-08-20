@@ -20,7 +20,7 @@
 
 ## 当前工程化与安全能力
 
-本项目当前采用“模块化单体 Web + 独立本地 Worker + SQLite WAL”的单机部署架构，重点保证未知数据分析过程可控、可恢复、可追溯：
+本项目当前采用“FastAPI 模块化单体 Web + 独立本地 Worker + SQLite WAL”的单机部署架构，重点保证未知数据分析过程可控、可恢复、可追溯：
 
 - 所有 API 和成果下载均支持 `X-SJFX-Token` 或 `Authorization: Bearer ...` 鉴权；扫描、任务和成果按令牌指纹隔离。
 - 扫描目录受 `SCAN_ALLOWED_ROOTS` 白名单限制，并防止路径越界；扫描跳过符号链接，限制最大深度、文件数和单文件资源。
@@ -34,7 +34,7 @@
 
 ## 运行架构
 
-Web 进程只负责提交任务、查询状态和提供下载；长耗时扫描、模型调用、报告与多 GB 导出由独立 worker.py 处理。SQLite WAL 保存任务状态、进度、心跳、取消标记和检查点，项目不要求 Redis/RQ/Celery。Worker 使用 data/worker.lock 保证单实例，避免多个任务同时挤占共享 Ollama GPU。
+FastAPI Web 进程只负责提交任务、查询状态和提供下载；长耗时扫描、模型调用、报告与多 GB 导出由独立 worker.py 处理。SQLite WAL 保存任务状态、进度、心跳、取消标记和检查点，项目不要求 Redis/RQ/Celery。Worker 使用 data/worker.lock 保证单实例，避免多个任务同时挤占共享 Ollama GPU。
 
 ## 分析流程
 
@@ -206,7 +206,7 @@ models/
 ```bash
 source .venv/bin/activate
 mkdir -p .logs
-nohup python -u app.py </dev/null > .logs/flask.log 2>&1 &
+nohup python -u app.py </dev/null > .logs/app.log 2>&1 &
 nohup python -u worker.py </dev/null > .logs/worker.log 2>&1 &
 ```
 
@@ -235,11 +235,13 @@ http://服务器地址:18000
 
 ```text
 .
-├── app.py                       # Flask API、任务提交与 Worker 可调用用例
+├── app.py                       # FastAPI/Uvicorn API、任务提交与 Worker 可调用用例
+├── web_compat.py                # 旧同步视图的 FastAPI 渐进迁移边界
 ├── worker.py                    # 独立 SQLite 任务 Worker（单实例）
 ├── config.py                    # 配置项
 ├── services/
 │   ├── unified_parser.py         # 统一文档解析、OCR 与证据抽取
+│   ├── agent_runtime.py          # PydanticAI 类型化 Agent 运行时边界
 │   ├── package_analysis.py       # 数据包分析、主题树与结论—证据
 │   ├── large_package.py          # 大数据包策略与覆盖率计算
 │   ├── retrieval.py              # 本地证据检索

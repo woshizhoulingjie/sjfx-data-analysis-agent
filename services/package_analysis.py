@@ -27,6 +27,19 @@ from services.unified_parser import compact_document
 SMALL_FILE_SUMMARY_BYTES = 16 * 1024
 
 
+def _optional_llm_enrichment_enabled():
+    """Return whether non-essential model naming may run.
+
+    Parsing, evidence extraction, coverage calculation, and the lexical
+    fallback tree must remain usable when the shared Ollama runner is busy or
+    temporarily unavailable.  Semantic names are an enhancement, not a
+    prerequisite for a valid analysis result.
+    """
+    return str(os.getenv("ENABLE_OPTIONAL_LLM_ENRICHMENT", "true")).strip().lower() not in {
+        "0", "false", "no", "off", "disabled",
+    }
+
+
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}")
 STOPWORDS = {
     "the", "and", "for", "with", "from", "this", "that", "研究", "分析", "报告",
@@ -39,16 +52,34 @@ def _now():
 
 
 def _parse_with_limits(parser, path, node_path, mode):
-    """Apply per-file wall-clock and best-effort process-memory guards."""
+    """Apply per-file wall-clock and current-process-memory guards.
+
+    ``resource.getrusage(...).ru_maxrss`` is a *lifetime high-water mark*,
+    not the Worker\'s current memory use.  Docling/OCR may legitimately push
+    that high-water mark above the configured budget while loading a model;
+    using it as a preflight check would then reject every later file instantly.
+    On Linux read /proc/self/statm instead, which reports the current RSS.
+    """
     timeout = max(10, int(os.getenv("MAX_PARSE_SECONDS", "300")))
     memory_limit = max(256, int(os.getenv("MAX_WORKER_MEMORY_MB", "8192"))) * 1024 * 1024
+    rss = None
     try:
-        import resource
-        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
-        if rss > memory_limit:
-            raise MemoryError("Worker 内存已达到 {} MB 上限，跳过该文件".format(memory_limit // (1024 * 1024)))
-    except ImportError:
-        pass
+        with open("/proc/self/statm", "r", encoding="ascii") as handle:
+            resident_pages = int(handle.read().split()[1])
+        rss = resident_pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError, AttributeError):
+        # Keep a conservative fallback for non-Linux development machines.
+        try:
+            import resource
+            rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+        except (ImportError, AttributeError):
+            rss = None
+    if rss is not None and rss > memory_limit:
+        raise MemoryError(
+            "Worker 当前内存为 {} MB，已达到 {} MB 上限，跳过该文件".format(
+                int(rss / (1024 * 1024)), memory_limit // (1024 * 1024)
+            )
+        )
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(parser.parse, path, node_path, mode=mode)
     try:
@@ -2067,17 +2098,22 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 "生成语义主题名称",
             )
 
-            semantic_clusters, naming_result = (
-                _name_semantic_clusters(
-                    semantic_clusters,
-                    documents,
-                    llm=llm,
+            if llm is not None and _optional_llm_enrichment_enabled():
+                semantic_clusters, naming_result = (
+                    _name_semantic_clusters(
+                        semantic_clusters,
+                        documents,
+                        llm=llm,
+                    )
                 )
-            )
 
-            if naming_result:
-                semantic_naming_model = (
-                    naming_result.get("model")
+                if naming_result:
+                    semantic_naming_model = (
+                        naming_result.get("model")
+                    )
+            else:
+                semantic_error = (
+                    "可选模型增强已跳过；保留 embedding 聚类和本地规则命名"
                 )
 
         except Exception as exc:
@@ -2134,11 +2170,14 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         )
     )
     progress(88, "生成可下钻子方向名称")
-    adaptive_tree, subtopic_naming_result = _name_subtopic_nodes(
-        adaptive_tree,
-        documents,
-        llm,
-    )
+    if llm is not None and _optional_llm_enrichment_enabled():
+        adaptive_tree, subtopic_naming_result = _name_subtopic_nodes(
+            adaptive_tree,
+            documents,
+            llm,
+        )
+    else:
+        subtopic_naming_result = None
     if policy.get("enabled"):
         waiting = pending_group(pending_paths, inventory, policy)
         if waiting:
