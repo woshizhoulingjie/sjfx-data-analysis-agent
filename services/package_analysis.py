@@ -522,7 +522,7 @@ def _needs_local_file_summary(document):
     """Keep automatic brief summaries for substantial files only.
 
     Small files remain fully selectable: users can inspect the unified document,
-    evidence chain and request the unchanged cloud deep-summary workflow.
+    evidence chain and request the unchanged local deep-summary workflow.
     """
     source = document.get("source", {})
     size = int(source.get("size") or 0)

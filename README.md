@@ -123,7 +123,6 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 最小的服务器配置示例：
 
 ```env
-LLM_BACKEND=ollama
 OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
 OLLAMA_MODEL=qwen-agent:latest
 OLLAMA_EMBED_MODEL=qwen-embed:latest
@@ -195,7 +194,7 @@ http://服务器IP:18000
 
 1. 在“服务器本地数据包目录”输入服务器绝对路径。
 2. 首次建议选择“快速解析（推荐）”。
-3. 若本机 Ollama 允许被本项目调用，勾选“允许使用已配置的模型增强摘要”。
+3. 若本机 Ollama 允许被本项目调用，将 `.env` 中 `ENABLE_SHARED_OLLAMA` 设为 `1`。
 4. 点击“导入并分析”。
 5. 页面会持续轮询后台任务，显示阶段、进度和说明。
 
@@ -255,7 +254,7 @@ http://服务器IP:18000
 2. 在“本地证据检索（RAG）”输入具体问题。
 3. 点击“检索证据”。
 
-检索使用本地 BM25 和 TF-IDF，不调用云端模型。检索结果同样经过证据质量门槛，不会因为标题重复了问题词就自动排在前面。连续检索可以基于上一次结果进一步收窄。
+检索使用本地 BM25 和 TF-IDF，检索过程不调用生成模型。检索结果同样经过证据质量门槛，不会因为标题重复了问题词就自动排在前面。连续检索可以基于上一次结果进一步收窄。
 
 ### 6.7 结构化数据精确统计
 
@@ -457,7 +456,7 @@ ollama list
 
 - `worker.py` 是否运行；
 - `.env` 是否允许项目调用该 Ollama（专用实例可设 `ENABLE_SHARED_OLLAMA=1`）；
-- 页面是否勾选“允许使用已配置的模型增强摘要”；
+- `.env` 是否设置 `ENABLE_SHARED_OLLAMA=1`；
 - `OLLAMA_MODEL` 是否存在；
 - `logs/worker.log` 是否有超时、内存或模型错误。
 

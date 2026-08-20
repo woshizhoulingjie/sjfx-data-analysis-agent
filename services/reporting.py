@@ -497,18 +497,18 @@ def _model_evidence_chain(evidence_catalog, evidence_ids, fallback):
     return selected or list(fallback or [])
 
 
-def merge_cloud_report(local_report, cloud_report, evidence_catalog=None):
+def merge_model_report(local_report, model_report, evidence_catalog=None):
     merged = dict(local_report)
     # Content categories are a complete, deterministic projection of the local
     # analysis tree. Language enhancement must never truncate or replace them.
     for key in ("key_findings", "directions"):
-        if isinstance(cloud_report.get(key), list) and cloud_report[key]:
-            merged[key] = cloud_report[key]
+        if isinstance(model_report.get(key), list) and model_report[key]:
+            merged[key] = model_report[key]
     evidence_catalog = evidence_catalog or []
     fallback_evidence = local_report.get("recommended_research_direction", {}).get("evidence_chain", [])
-    recommendation = cloud_report.get("recommended_research_direction")
+    recommendation = model_report.get("recommended_research_direction")
     if isinstance(recommendation, dict) and recommendation.get("title"):
-        # The cloud model may improve language and questions, but it must not erase
+        # The local model may improve language and questions, but it must not erase
         # locally generated traceability or the inference label.
         recommendation = dict(recommendation)
         recommendation["type"] = "推论"

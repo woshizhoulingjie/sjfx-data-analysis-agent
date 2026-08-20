@@ -2,7 +2,7 @@ import json
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from services.deepseek import DeepSeekError
+from services.ollama import LocalModelError
 from services.evidence import select_evidence
 from services.scanner import extract_text
 
@@ -245,8 +245,8 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
             output_context="全文分块汇总",
         )
         summary = final_result["json"]
-    except DeepSeekError as exc:
-        summary = _local_merge(node_path, chunks, ordered, extracted["warnings"] + ["最终云端汇总失败：{}".format(exc)])
+    except LocalModelError as exc:
+        summary = _local_merge(node_path, chunks, ordered, extracted["warnings"] + ["最终本地模型汇总失败：{}".format(exc)])
         final_result = {"model": None, "usage": {}, "content": ""}
 
     failed_chunks = [item["chunk_index"] for item in ordered if item.get("error")]

@@ -108,9 +108,6 @@ document.addEventListener('click', async (event) => {
 });
 
 
-function cloudConfirmed() {
-  return $('cloudConfirmed').checked;
-}
 
 
 function setBusy(button, busy, label) {
@@ -1804,10 +1801,7 @@ $('testBtn').onclick =
           {
             method: 'POST',
 
-            body: JSON.stringify({
-              cloud_confirmed:
-                cloudConfirmed()
-            })
+            body: JSON.stringify({})
           }
         );
 
@@ -1871,10 +1865,7 @@ $('summaryBtn').onclick =
           || '.',
 
         kind:
-          state.selected.kind,
-
-        cloud_confirmed:
-          cloudConfirmed()
+          state.selected.kind
       };
 
       /*
@@ -2014,10 +2005,7 @@ $('reportBtn').onclick =
 
             body: JSON.stringify({
               scan_id:
-                state.scan.scan_id,
-
-              cloud_confirmed:
-                cloudConfirmed()
+                state.scan.scan_id
             })
           }
         );

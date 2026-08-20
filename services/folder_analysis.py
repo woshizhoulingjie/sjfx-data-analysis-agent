@@ -1,6 +1,6 @@
 import json
 
-from services.deepseek import DeepSeekError
+from services.ollama import LocalModelError
 from services.evidence import attach_claim_evidence, evidence_support
 
 
@@ -765,7 +765,7 @@ def analyze_folder(
         )
 
     except (
-        DeepSeekError,
+        LocalModelError,
         ValueError,
         KeyError,
     ) as exc:

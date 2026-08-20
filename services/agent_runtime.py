@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent
 
-from services.deepseek import DeepSeekError
+from services.ollama import LocalModelError
 from services.model_output import extract_json_value, validate_json_object
 
 
@@ -83,7 +83,7 @@ class PydanticAgentRuntime:
                 usage=result.get("usage") or {},
             )
         except (ValidationError, ValueError, TypeError) as exc:
-            raise DeepSeekError("{} 返回不符合结构化契约：{}".format(output_context, exc)) from exc
+            raise LocalModelError("{} 返回不符合结构化契约：{}".format(output_context, exc)) from exc
         return {
             "content": envelope.content,
             "json": envelope.data,

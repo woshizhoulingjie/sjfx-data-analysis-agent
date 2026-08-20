@@ -5,12 +5,12 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from services.deepseek import OllamaClient
+from services.ollama import OllamaClient
 from services.document_analysis import _local_merge
 from services.evidence import select_evidence, set_embedding_provider
 from services.exporter import export_node
 from services.package_analysis import _document_role, _group_similar, _hamming, _topic_clusters, _walk_files, analyze_package, simhash64
-from services.reporting import build_local_report, build_report_analysis_prompt, merge_cloud_report
+from services.reporting import build_local_report, build_report_analysis_prompt, merge_model_report
 from services.folder_analysis import analyze_folder
 from services.model_output import ModelOutputError, extract_json_value, validate_json_object
 from services.retrieval import retrieve_evidence
@@ -190,9 +190,9 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertEqual(len(report["global_categories"]), 1)
         self.assertIn("分类未完成", report["global_categories"][0]["name"])
 
-    def test_cloud_merge_does_not_replace_complete_local_categories(self):
+    def test_model_merge_does_not_replace_complete_local_categories(self):
         local = {"global_categories": [{"name": "研究文献"}], "key_findings": ["本地发现"], "directions": []}
-        merged = merge_cloud_report(local, {"global_categories": [{"name": "云端错误分类"}], "key_findings": ["增强发现"]})
+        merged = merge_model_report(local, {"global_categories": [{"name": "模型错误分类"}], "key_findings": ["增强发现"]})
 
         self.assertEqual(merged["global_categories"], [{"name": "研究文献"}])
         self.assertEqual(merged["key_findings"], ["增强发现"])
@@ -209,7 +209,7 @@ class CoreRegressionTests(unittest.TestCase):
         report = build_local_report(scan, [], analysis)
         prompt, catalog = build_report_analysis_prompt(scan, [], analysis, report)
         self.assertIn('"evidence_id": "E-1"', prompt)
-        merged = merge_cloud_report(report, {
+        merged = merge_model_report(report, {
             "recommended_research_direction": {
                 "title": "基于实验结果的复核研究", "evidence_ids": ["unknown", "E-1"],
             }
@@ -240,8 +240,8 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertFalse(errors)
 
     def test_ollama_json_uses_native_api_with_thinking_disabled(self):
-        client = OllamaClient("local", "http://127.0.0.1:11434/v1", "qwen-agent:latest", timeout=5)
-        with patch("services.deepseek.urllib.request.urlopen", return_value=self._NativeOllamaResponse()) as urlopen:
+        client = OllamaClient("http://127.0.0.1:11434/v1", "qwen-agent:latest", timeout=5)
+        with patch("services.ollama.urllib.request.urlopen", return_value=self._NativeOllamaResponse()) as urlopen:
             result = client.chat_json("system", "user", max_tokens=1200, timeout=5)
         request = urlopen.call_args[0][0]
         payload = json.loads(request.data.decode("utf-8"))

@@ -12,7 +12,7 @@ from pathlib import Path
 from web_compat import SJFXFastAPI, has_request_context, jsonify, render_template, request, send_from_directory
 
 from config import Config
-from services.deepseek import DeepSeekClient, DeepSeekError, OllamaClient, OllamaEmbeddingClient
+from services.ollama import LocalModelError, OllamaClient, OllamaEmbeddingClient
 from services.document_analysis import analyze_document
 from services.evidence import embedding_mode, select_evidence, set_embedding_provider
 from services.exporter import create_report_docx, export_node, safe_name
@@ -23,7 +23,7 @@ from services.reporting import (
     build_local_report,
     build_report_analysis_prompt,
     compact_summary_context,
-    merge_cloud_report,
+    merge_model_report,
 )
 from services.retrieval import retrieve_evidence
 from services.scanner import folder_context, human_size, resolve_under, scan_directory
@@ -75,30 +75,15 @@ _configured_owner_id = (
 if _configured_owner_id:
     storage.migrate_legacy_ownership(_configured_owner_id)
     storage.register_existing_outputs(Config.OUTPUT_DIR, _configured_owner_id)
-_requested_backend = Config.LLM_BACKEND
-if _requested_backend not in {"ollama", "deepseek"}:
-    logger.warning("未知 LLM_BACKEND=%s，回退到本机 Ollama", _requested_backend)
-    _requested_backend = "ollama"
-if _requested_backend == "deepseek" and not Config.ENABLE_CLOUD_FEATURES:
-    logger.warning("DeepSeek 云端后端已配置但 ENABLE_CLOUD_FEATURES 未开启，强制使用本机 Ollama")
-    _requested_backend = "ollama"
-if _requested_backend == "ollama":
-    llm_transport = OllamaClient(
-        api_key="local",
-        base_url=Config.OLLAMA_BASE_URL,
-        model=Config.OLLAMA_MODEL,
-        timeout=Config.SHARED_OLLAMA_REQUEST_TIMEOUT,
-        max_concurrency=Config.LLM_MAX_CONCURRENCY,
-    )
-else:
-    llm_transport = DeepSeekClient(
-        api_key=Config.DEEPSEEK_API_KEY,
-        base_url=Config.DEEPSEEK_BASE_URL,
-        model=Config.DEEPSEEK_MODEL,
-        max_concurrency=Config.MAX_CLOUD_REQUESTS,
-    )
-ACTIVE_LLM_BACKEND = "ollama" if isinstance(llm_transport, OllamaClient) else "deepseek"
-llm_generation_enabled = Config.ENABLE_SHARED_OLLAMA if isinstance(llm_transport, OllamaClient) else Config.ENABLE_CLOUD_FEATURES
+# The deployment is intentionally local-only: all generation uses Ollama on this host.
+llm_transport = OllamaClient(
+    base_url=Config.OLLAMA_BASE_URL,
+    model=Config.OLLAMA_MODEL,
+    timeout=Config.SHARED_OLLAMA_REQUEST_TIMEOUT,
+    max_concurrency=Config.LLM_MAX_CONCURRENCY,
+)
+ACTIVE_LLM_BACKEND = "ollama"
+llm_generation_enabled = Config.ENABLE_SHARED_OLLAMA
 llm = PydanticAgentRuntime(llm_transport)
 # 完整分析专用的文档级 embedding。
 # 只用于 analyze_package 中的一文档一向量语义聚类，
@@ -564,9 +549,9 @@ def _combined_export_context(scan_id, scan_result, analysis, payload):
         },
     }
 
-def require_cloud_confirmation(payload):
-    if llm.requires_confirmation and payload.get("cloud_confirmed") is not True:
-        raise ValueError("请先确认：选中的文件内容将发送至 DeepSeek 云端 API")
+def require_local_model_enabled():
+    if not llm_generation_enabled:
+        raise ValueError("本地模型生成未启用，请将 ENABLE_SHARED_OLLAMA 设置为 1 后重试")
 
 
 class JobCancelled(Exception):
@@ -713,7 +698,7 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
             required_fields=("recommended_research_direction",),
             output_context="报告研究方向分析",
         )
-        merged = merge_cloud_report(report_data, result["json"], evidence_catalog)
+        merged = merge_model_report(report_data, result["json"], evidence_catalog)
         merged["model_analysis"] = {
             "status": "completed",
             "model": result.get("model"),
@@ -725,7 +710,7 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
             result["usage"],
             None,
         )
-    except DeepSeekError as exc:
+    except LocalModelError as exc:
         report_data["model_analysis"] = {"status": "failed", "error": str(exc)}
         return report_data, None, {}, "模型研究方向分析失败：{}。报告未使用关键词规则替代。".format(exc)
 
@@ -968,7 +953,7 @@ def status():
         "ok": True,
         "configured": llm.configured,
         "backend": ACTIVE_LLM_BACKEND,
-        "cloud_features_enabled": Config.ENABLE_CLOUD_FEATURES,
+        "local_model_enabled": Config.ENABLE_SHARED_OLLAMA,
         "evidence_relevance_mode": embedding_mode(),
         "privacy": llm.privacy_label,
         "model_generation_enabled": llm_generation_enabled,
@@ -989,7 +974,7 @@ def status():
             "max_archive_member_bytes": Config.MAX_ARCHIVE_MEMBER_BYTES,
             "max_archive_uncompressed_bytes": Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,
             "max_analysis_jobs": Config.MAX_ANALYSIS_JOBS,
-            "max_cloud_requests": Config.MAX_CLOUD_REQUESTS,
+            "llm_max_concurrency": Config.LLM_MAX_CONCURRENCY,
             "max_export_bytes": Config.MAX_EXPORT_BYTES,
             "large_package": {
                 "threshold_bytes": Config.LARGE_PACKAGE_THRESHOLD_BYTES,
@@ -1004,7 +989,7 @@ def status():
 @app.route("/api/test-model", methods=["POST"])
 def test_model():
     try:
-        require_cloud_confirmation(request.get_json(silent=True) or {})
+        require_local_model_enabled()
         if isinstance(llm_transport, OllamaClient):
             health = llm.health_check()
             if not health["reachable"]:
@@ -1023,7 +1008,7 @@ def test_model():
             })
         result = llm.chat("你是连接测试助手。", "只回复：连接成功", temperature=0, max_tokens=20)
         return jsonify({"ok": True, "reply": result["content"], "model": result["model"], "usage": result["usage"]})
-    except (ValueError, DeepSeekError) as exc:
+    except (ValueError, LocalModelError) as exc:
         return api_error(str(exc), 400)
 
 
@@ -1436,7 +1421,7 @@ def summarize():
                     raise ValueError("只有主题或子方向节点可以生成节点摘要")
                 cached = storage.get_summary(scan_id, "node:{}".format(node_id), "folder")
                 if force or not (cached and cached.get("schema_version") in {3, 4}):
-                    require_cloud_confirmation(payload)
+                    require_local_model_enabled()
                     job_id = storage.create_job(
                         scan_id, options=payload, task_type="generate_summary", owner_id=_request_owner_id() or "legacy"
                     )
@@ -1450,7 +1435,7 @@ def summarize():
                 summary_type = "folder" if selected.is_dir() or kind == "directory" else "file"
                 cached = storage.get_summary(scan_id, node_path, summary_type)
                 if force or not (cached and cached.get("schema_version") == 3 and not bool(cached.get("parser_info", {}).get("degraded"))):
-                    require_cloud_confirmation(payload)
+                    require_local_model_enabled()
                     job_id = storage.create_job(
                         scan_id, options=payload, task_type="generate_summary", owner_id=_request_owner_id() or "legacy"
                     )
@@ -1472,7 +1457,7 @@ def summarize():
             context = _virtual_node_context(scan_id, node)
             local_summary = _virtual_node_summary(scan_id, node, context)
             if llm_generation_enabled:
-                require_cloud_confirmation(payload)
+                require_local_model_enabled()
                 generated, result, batch_errors = analyze_folder(llm, context, node.get("name") or cache_path)
                 generated.update({
                     "title": generated.get("title") or local_summary["title"],
@@ -1484,7 +1469,7 @@ def summarize():
                 })
                 generated["parser_info"] = {
                     **local_summary["parser_info"],
-                    "cloud_model": result.get("model"),
+                    "local_model": result.get("model"),
                     "usage": result.get("usage", {}),
                     "batch_errors": batch_errors,
                     "degraded": bool(batch_errors or not result.get("model")),
@@ -1505,7 +1490,7 @@ def summarize():
         summary_type = "folder" if selected.is_dir() or kind == "directory" else "file"
         local_only = not llm_generation_enabled
         if not local_only:
-            require_cloud_confirmation(payload)
+            require_local_model_enabled()
         cached = storage.get_summary(scan_id, node_path, summary_type)
         if cached and cached.get("schema_version") == 3 and not force and not bool(cached.get("parser_info", {}).get("degraded")):
             degraded = bool(cached.get("parser_info", {}).get("degraded"))
@@ -1520,7 +1505,7 @@ def summarize():
                 "total_files": context["total_files"], "total_dirs": context["total_dirs"],
                 "total_size": context["total_size_human"], "type_counts": context["type_counts"],
                 "sampled_files": context["sampled_files"], "sample_truncated": context["sample_truncated"],
-                "coverage": context.get("coverage", {}), "cloud_model": None, "usage": {},
+                "coverage": context.get("coverage", {}), "local_model": None, "usage": {},
                 "batch_errors": batch_errors, "degraded": True,
             }
         elif summary_type == "folder":
@@ -1534,7 +1519,7 @@ def summarize():
                 "sampled_files": context["sampled_files"],
                 "sample_truncated": context["sample_truncated"],
                 "coverage": context.get("coverage", {}),
-                "cloud_model": result.get("model"),
+                "local_model": result.get("model"),
                 "usage": result.get("usage", {}),
                 "batch_errors": batch_errors,
                 "degraded": bool(batch_errors or not result.get("model")),
@@ -1561,7 +1546,7 @@ def summarize():
                 model_max_chars = min(model_max_chars, Config.SHARED_OLLAMA_MAX_CHARS)
             try:
                 if local_only:
-                    raise DeepSeekError("模型生成未启用")
+                    raise LocalModelError("模型生成未启用")
                 summary, coverage, result = analyze_document(
                     llm,
                     selected,
@@ -1570,7 +1555,7 @@ def summarize():
                     max_chunks=Config.MAX_DOCUMENT_CHUNKS,
                     unified_document=unified_document,
                 )
-            except DeepSeekError as exc:
+            except LocalModelError as exc:
                 summary = _local_document_fallback(unified_document, node_path, str(exc))
                 coverage_data = (unified_document or {}).get("coverage", {})
                 coverage = {
@@ -1594,7 +1579,7 @@ def summarize():
                 "metadata": coverage["metadata"],
                 "warnings": coverage["warnings"],
                 "coverage": coverage.get("metadata", {}).get("coverage", {}),
-                "cloud_model": result["model"],
+                "local_model": result["model"],
                 "usage": result["usage"],
                 "degraded": bool(coverage.get("failed_chunks") or not result.get("model")),
             }
@@ -1605,7 +1590,7 @@ def summarize():
         storage.save_summary(scan_id, node_path, summary_type, summary)
         degraded = bool(summary.get("parser_info", {}).get("degraded"))
         return jsonify({"ok": True, "summary": summary, "cached": False, "degraded": degraded})
-    except (ValueError, DeepSeekError) as exc:
+    except (ValueError, LocalModelError) as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
         return api_error("摘要生成失败", 500, str(exc))
@@ -1617,15 +1602,13 @@ def report():
     try:
         scan_id = payload.get("scan_id", "")
         require_scan(scan_id)
-        if llm.requires_confirmation and payload.get("cloud_confirmed") is not True:
-            raise ValueError("请先确认：选中的文件内容将发送至 DeepSeek 云端 API")
         job_id, created = storage.create_or_get_typed_job(scan_id, "generate_report", owner_id=_request_owner_id() or "legacy")
         return jsonify({
             "ok": True, "accepted": True, "job_id": job_id,
             "reused_active_job": not created,
             "status_url": "/api/jobs/{}".format(job_id),
         }), 202
-    except (ValueError, DeepSeekError, RuntimeError) as exc:
+    except (ValueError, LocalModelError, RuntimeError) as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
         logger.exception("报告生成失败")

@@ -31,10 +31,6 @@
         <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
         <div id="progressText">导入后将按所选模式完成资料分析并生成概览报告。</div>
       </div>
-      <div class="privacy-check">
-        <input type="checkbox" id="cloudConfirmed">
-        <label for="cloudConfirmed">允许使用已配置的模型增强摘要（服务器本机 Ollama 模式不会出网）</label>
-      </div>
       <div class="button-row wrap">
         <button id="testBtn" class="ghost">测试本地模型</button>
         <button id="reanalyzeBtn" disabled>重新执行本地完整分析</button>
@@ -71,7 +67,7 @@
           <input id="retrievalQuery" placeholder="例如：哪些资料支持该研究方向？" autocomplete="off">
           <button id="retrievalBtn" disabled>检索证据</button>
         </div>
-        <small>使用本地 BM25 与 TF-IDF 字符向量，不调用云端模型。</small>
+        <small>使用本地 BM25 与 TF-IDF 字符向量，检索过程不调用生成模型。</small>
       </div>
       <div class="retrieval-box">
           <label for="numericQuestion">结构化数据精确统计（非通用问答）</label>
