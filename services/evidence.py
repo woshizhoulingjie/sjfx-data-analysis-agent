@@ -13,6 +13,10 @@ from collections import defaultdict
 
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,8}")
 STOPWORDS = {"内容", "文件", "文档", "资料", "分析", "主要", "相关", "情况", "主题", "研究"}
+QUERY_STOPWORDS = STOPWORDS | {
+    "问题", "哪些", "什么", "为何", "为什么", "如何", "是否", "怎么", "怎样",
+    "请问", "请分析", "一下", "可以", "能够", "需要", "有关", "这个", "该",
+}
 INDIRECT_SIGNALS = {
     "经济影响": ("吞吐", "收入", "产量", "就业", "价格", "增长", "下降", "成本"),
     "冲突": ("伤亡", "袭击", "攻击", "停火", "战斗", "流离失所"),
@@ -86,6 +90,14 @@ def _terms(values):
     return output
 
 
+def _claim_terms(values):
+    """Return question terms that can establish a substantive source match."""
+    return {
+        term for term in _terms(values)
+        if len(term) >= 2 and term not in QUERY_STOPWORDS
+    }
+
+
 def compact_evidence(item, max_chars=520):
     """Copy an evidence item as a bounded excerpt without losing provenance."""
     result = {
@@ -104,11 +116,126 @@ def compact_evidence(item, max_chars=520):
     return result
 
 
+NAVIGATION_LABELS = {"title", "section_header", "heading"}
+WEAK_NAVIGATION_RE = re.compile(r"^(?:第?[一二三四五六七八九十\d]+[章节部分、.]?\s*)?.{1,80}[?？]$")
+FACTUAL_CUE_RE = re.compile(
+    r"(?:是|为|具有|通过|采用|支持|提供|实现|包括|导致|提升|降低|减少|增加|能够|可以|用于|依赖|需[要须]|应当|必须|表明|显示|发现|结果|优势|特点|机制|原因|影响|风险|限制|缺陷|许可|安全|成本|性能)"
+)
+
+
+def evidence_quality(item):
+    """Classify whether a source unit can support an analytical answer.
+
+    A title, heading, question, or a short keyword is useful for navigation but
+    cannot serve as evidence.  This quality gate is intentionally shared by
+    evidence-chain selection and interactive retrieval.
+    """
+    if not isinstance(item, dict):
+        return {"eligible": False, "reason": "证据项格式无效", "score": -100}
+    text = " ".join(str(item.get("text") or "").split())
+    label = str(item.get("label") or "").lower()
+    normalized = text.strip(" \t\r\n：:;；。.")
+    if len(normalized) < 24:
+        return {"eligible": False, "reason": "正文过短，无法构成可验证陈述", "score": -80}
+    if label in NAVIGATION_LABELS:
+        return {"eligible": False, "reason": "标题或章节名仅用于定位，不作为支撑证据", "score": -75}
+    if normalized.endswith(("?", "？")) or WEAK_NAVIGATION_RE.match(normalized):
+        return {"eligible": False, "reason": "疑问句只提出问题，未提供回答依据", "score": -70}
+    # Short phrases such as "开源软件的特点" often arrive as a paragraph label.
+    if len(normalized) < 55 and not FACTUAL_CUE_RE.search(normalized):
+        return {"eligible": False, "reason": "仅为主题短语，缺少事实或解释", "score": -55}
+
+    sentence_count = len(re.findall(r"[。！？；.!?;]", normalized))
+    factual = bool(FACTUAL_CUE_RE.search(normalized))
+    numeric = bool(re.search(r"\d+(?:\.\d+)?\s*(?:%|％|万|亿|吨|元|天|次|例|倍|项|种)", normalized))
+    score = min(len(normalized), 360) / 18.0 + sentence_count * 2 + int(factual) * 8 + int(numeric) * 5
+    return {
+        "eligible": True,
+        "reason": "包含可回查的{}。".format("量化事实" if numeric else "解释性或事实性陈述"),
+        "score": round(score, 3),
+        "factual": factual,
+        "numeric": numeric,
+    }
+
+
+def _supporting_quote(text, terms, max_chars=280):
+    """Quote the most claim-like sentence instead of echoing a heading."""
+    text = " ".join(str(text or "").split())
+    sentences = [part.strip(" ，,；;") for part in re.split(r"(?<=[。！？；.!?;])\s*", text) if part.strip()]
+    if not sentences:
+        return text[:max_chars]
+    def score(sentence):
+        lowered = sentence.lower()
+        return (
+            sum(1 for term in terms if term.lower() in lowered) * 8
+            + int(bool(FACTUAL_CUE_RE.search(sentence))) * 6
+            + int(bool(re.search(r"\d", sentence))) * 3
+            + min(len(sentence), 220) / 80.0
+        )
+    quote = max(sentences, key=score)
+    return quote[:max_chars] + ("..." if len(quote) > max_chars else "")
+
+
+def _claim_match(item, topics, semantic_score=0.0, indirect_signals=None):
+    """Explain whether an eligible excerpt actually supports this question.
+
+    A document can be high-quality prose but still be irrelevant to a particular
+    conclusion.  This second gate makes that distinction explicit and is kept
+    separate from ``evidence_quality`` so callers can show a useful reason.
+    """
+    topic_text = " ".join(str(value or "") for value in (topics or []))
+    if not topic_text:
+        return {
+            "supports_claim": True,
+            "support_type": "代表性正文",
+            "support_reason": "未指定问题，展示可回查的代表性正文。",
+            "matched_terms": [],
+        }
+    text = " ".join(str(item.get("text") or "").split())
+    lowered = text.lower()
+    terms = _claim_terms([topic_text])
+    matched = sorted(
+        {term for term in terms if term.lower() in lowered},
+        key=lambda value: (-len(value), value),
+    )[:8]
+    indirect = sorted({
+        signal for signal in (indirect_signals or set())
+        if str(signal).lower() in lowered
+    })[:6]
+    if matched:
+        return {
+            "supports_claim": True,
+            "support_type": "直接证据",
+            "support_reason": "正文直接回应问题中的关键概念：{}。".format("、".join(matched[:4])),
+            "matched_terms": matched,
+        }
+    if indirect:
+        return {
+            "supports_claim": True,
+            "support_type": "间接证据",
+            "support_reason": "正文包含与问题对应的可核查信号：{}；需要结合上下文理解。".format("、".join(indirect[:4])),
+            "matched_terms": [],
+        }
+    if float(semantic_score or 0.0) >= 0.62:
+        return {
+            "supports_claim": True,
+            "support_type": "语义证据",
+            "support_reason": "与问题语义高度相关，但未出现直接关键词，建议人工复核。",
+            "matched_terms": [],
+        }
+    return {
+        "supports_claim": False,
+        "support_type": "不构成支撑",
+        "support_reason": "未找到能直接或可靠间接回答该问题的依据。",
+        "matched_terms": [],
+    }
+
+
 def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=520):
     """Select diverse, topic-aligned evidence from a larger local corpus."""
     candidates = []
     seen = set()
-    terms = _terms(topics or [])
+    terms = _claim_terms(topics or [])
     topic_text = " ".join(str(value or "") for value in topics or [])
     indirect_signals = set()
     for topic, signals in INDIRECT_SIGNALS.items():
@@ -124,15 +251,20 @@ def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=52
             continue
         seen.add(key)
         text = " ".join(str(item.get("text") or "").split())
-        item_terms = _terms([text, item.get("section")])
+        quality = evidence_quality(item)
+        if not quality["eligible"]:
+            continue
+        # A section name provides location context, but must not manufacture a
+        # question match when the body itself does not support the claim.
+        item_terms = _claim_terms([text])
         relevance = len(terms.intersection(item_terms)) if terms else 0
         relevance += 2 if indirect_signals.intersection(item_terms) else 0
         if re.search(r"\d+(?:\.\d+)?\s*(?:%|％|万|亿|吨|元|天|次|例)", text):
             relevance += 1
         # Page/section-bearing units are more useful for one-click source review.
         provenance = int(item.get("page") is not None) + int(bool(item.get("section")))
-        label_bonus = 1 if item.get("label") in {"title", "section_header", "heading", "table"} else 0
-        candidates.append((relevance * 10 + provenance * 2 + label_bonus, -index, item, relevance, provenance, label_bonus))
+        label_bonus = 2 if item.get("label") in {"table", "paragraph", "text_chunk", "list_item", "structured_column"} else 0
+        candidates.append((relevance * 10 + provenance * 2 + label_bonus + quality["score"], -index, item, relevance, provenance, label_bonus))
 
     semantic_scores = {}
     relevance_mode = "lexical-fallback"
@@ -148,17 +280,30 @@ def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=52
     rescored = []
     for score, order, item, relevance, provenance, label_bonus in candidates:
         semantic = float(item.pop("_semantic_score", 0.0) or 0.0)
+        claim_match = _claim_match(
+            item,
+            topics,
+            semantic_score=semantic,
+            indirect_signals=indirect_signals,
+        )
+        # For a named question/conclusion, do not pad an evidence chain with a
+        # merely well-written but unrelated paragraph.
+        if topics and not claim_match["supports_claim"]:
+            continue
         combined = semantic * 80.0 + relevance * 10.0 + provenance * 2.0 + label_bonus
-        rescored.append((combined, order, item, semantic, relevance_mode))
+        rescored.append((combined, order, item, semantic, relevance_mode, claim_match))
 
     rescored.sort(key=lambda value: (-value[0], value[1]))
     selected = []
     source_counts = defaultdict(int)
-    for score, order, item, semantic, mode in rescored:
+    for score, order, item, semantic, mode, claim_match in rescored:
         source = item.get("source_path") or ""
         if source_counts[source] >= max(1, per_source):
             continue
         compact = compact_evidence(item, max_chars=max_chars)
+        compact["supporting_quote"] = _supporting_quote(item.get("text"), terms, max_chars=min(280, max_chars))
+        compact["evidence_quality"] = evidence_quality(item)
+        compact.update(claim_match)
         compact["semantic_score"] = round(semantic, 6)
         compact["relevance_mode"] = mode
         selected.append(compact)

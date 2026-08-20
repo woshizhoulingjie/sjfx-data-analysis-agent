@@ -2,6 +2,8 @@ import math
 import re
 from collections import Counter, defaultdict
 
+from services.evidence import evidence_quality
+
 
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}")
 
@@ -60,6 +62,11 @@ def evidence_corpus(documents, scope="."):
             text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
             if len(text) < 2:
                 continue
+            quality = evidence_quality(item)
+            # Interactive search must not promote headings/question prompts as
+            # evidence merely because they repeat the user's query words.
+            if not quality.get("eligible"):
+                continue
             key = (path, item.get("page"), item.get("section"), item.get("content_sha256") or text)
             if key in seen:
                 continue
@@ -76,6 +83,7 @@ def evidence_corpus(documents, scope="."):
                 "parser": item.get("parser"),
                 "source_sha256": item.get("source_sha256") or source.get("sha256"),
                 "content_sha256": item.get("content_sha256"),
+                "evidence_quality": quality,
             })
     return chunks
 

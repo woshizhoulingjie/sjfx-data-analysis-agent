@@ -717,6 +717,20 @@ function evidenceHtml(items) {
 
               : '';
 
+          const quote =
+            item.supporting_quote
+            && item.supporting_quote !== item.text
+              ? (`<p><strong>支撑原句：</strong>${escapeHtml(item.supporting_quote)}</p>`)
+              : '';
+
+          const supportReason =
+            item.support_reason
+            || item.evidence_quality?.reason;
+
+          const supportType =
+            item.support_type
+            || '';
+
           return (
             `<article class="evidence-card">`
             +
@@ -741,6 +755,20 @@ function evidenceHtml(items) {
                 || ''
               )
             }</p>`
+            +
+            quote
+            +
+            (
+              supportReason
+                ? `<small>入选原因：${escapeHtml(supportReason)}</small><br>`
+                : ''
+            )
+            +
+            (
+              supportType
+                ? `<small>证据类型：${escapeHtml(supportType)}</small><br>`
+                : ''
+            )
             +
             relevance
             +
