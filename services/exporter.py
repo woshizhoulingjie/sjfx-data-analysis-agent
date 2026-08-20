@@ -2,6 +2,7 @@ import json
 import os
 import re
 import zipfile
+import hashlib
 from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,44 @@ def collect_files(path):
                 continue
             files.append(candidate)
     return files
+
+
+def _sha256_file(path, block_size=1024 * 1024):
+    """Return the raw-source digest used for handoff-package deduplication."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            block = handle.read(block_size)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _deduplicate_files(files, root):
+    """Keep one stable canonical source per identical byte stream.
+
+    UI selections are path based, but a handoff package must not contain two
+    distinct names for exactly the same source bytes.  The manifest retains all
+    omitted paths, so no provenance is lost.
+    """
+    groups = {}
+    for path in sorted(set(files), key=lambda item: str(item.relative_to(root)).replace("\\", "/")):
+        digest = _sha256_file(path)
+        groups.setdefault(digest, []).append(path)
+
+    unique_files = []
+    duplicates = []
+    for digest, members in groups.items():
+        canonical = members[0]
+        unique_files.append(canonical)
+        if len(members) > 1:
+            duplicates.append({
+                "sha256": digest,
+                "canonical": str(canonical.relative_to(root)).replace("\\", "/"),
+                "omitted": [str(item.relative_to(root)).replace("\\", "/") for item in members[1:]],
+            })
+    return unique_files, duplicates
 
 
 @contextmanager
@@ -92,6 +131,11 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
             prefix = selected_rel.rstrip("/") + "/"
             selected_documents = [item for item in documents if item.get("path") == selected_rel or item.get("path", "").startswith(prefix)]
         export_label = selected.name
+    selected_file_count = len(files)
+    try:
+        files, content_duplicates = _deduplicate_files(files, root)
+    except (OSError, PermissionError) as exc:
+        raise ValueError("导出前无法计算源文件去重指纹：{}".format(exc))
     source_sizes = {}
     try:
         for path in files:
@@ -144,9 +188,13 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
         "selected_nodes": selection_metadata,
         "unique_source_file_count": len(files),
         "deduplication": {
-            "method": "按源文件相对路径去重；多主题/目录重叠文件仅导出一次。",
+            "method": "先按相对路径合并重叠选择，再按 SHA-256 精确去重；相同字节的源文件仅导出规范副本。",
             "source_selection_count": len(selection_metadata),
             "selected_evidence_count": len(selected_evidence_ids),
+            "selected_file_count_before_content_deduplication": selected_file_count,
+            "content_duplicate_group_count": len(content_duplicates),
+            "content_duplicate_file_count": sum(len(item["omitted"]) for item in content_duplicates),
+            "content_duplicate_groups": content_duplicates,
         },
     }
     written_size = 0
@@ -173,10 +221,11 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
         )
         archive.writestr("整编任务说明.json", json.dumps(handoff, ensure_ascii=False, indent=2))
         archive.writestr("结论-证据链.json", json.dumps({
-            "schema_version": "conclusion-evidence/1.0",
+            "schema_version": "question-answer-evidence/2.0",
             "selected_path": selected_rel,
             "selected_node_name": node_name,
             "conclusions": (summary or {}).get("conclusion_evidence", []),
+            "question_answer_evidence": (summary or {}).get("conclusion_evidence", []),
             "evidence_count": len(evidence_chain),
             "candidate_count": len(evidence_candidates),
             "omitted_count": max(0, len(evidence_candidates) - len(evidence_chain)),
@@ -239,13 +288,17 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
             json.dumps({
                 "selected_path": selected_rel,
                 "file_count": len(files),
+                "selected_file_count_before_content_deduplication": selected_file_count,
                 "unique_source_file_count": len(files),
+                "content_duplicate_group_count": len(content_duplicates),
+                "content_duplicate_file_count": sum(len(item["omitted"]) for item in content_duplicates),
+                "content_duplicate_groups": content_duplicates,
                 "selected_node_count": len(selection_metadata),
                 "excluded_file_count": len(excluded_files),
                 "excluded_files": [str(path.relative_to(root)).replace("\\", "/") for path in excluded_files[:100]],
                 "total_size": total_size,
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
-                "contents": ["所选范围全部原始文件（按相对路径去重）", "节点摘要.json", "整编任务说明.json", "结论-证据链.json", "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json"],
+                "contents": ["所选范围全部原始文件（相对路径和 SHA-256 精确去重）", "节点摘要.json", "整编任务说明.json", "结论-证据链.json", "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json"],
             }, ensure_ascii=False, indent=2),
         )
     return archive_path

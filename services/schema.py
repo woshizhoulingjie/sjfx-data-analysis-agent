@@ -42,6 +42,11 @@ def normalize_conclusion_evidence(payload):
             continue
         conclusion = dict(item)
         conclusion.setdefault("statement", conclusion.get("conclusion") or "分析结论")
+        # Version 2 presents evidence around an answerable analysis question.
+        # Older persisted summaries remain readable through these fallbacks.
+        conclusion.setdefault("analysis_question", conclusion.get("question") or "该范围内有哪些可回查的关键判断？")
+        conclusion.setdefault("question_value", "帮助用户判断该资料范围是否值得继续分析，并明确后续核查重点。")
+        conclusion.setdefault("answer", conclusion.get("statement"))
         conclusion.setdefault("confidence", "待核验")
         default_type = "inference" if str(conclusion.get("type") or "").lower() in {"推论", "inference"} else "direct"
         conclusion["evidence"] = [_normalize_evidence_item(e, default_type) for e in conclusion.get("evidence", []) if isinstance(e, dict)]

@@ -669,13 +669,25 @@ def _enrich_analysis_tree(tree, documents):
                 max_items=5,
             )
             confidence = "高" if len(paths) >= 3 else "中" if len(paths) >= 2 else "低"
+            analysis_question = "“{}”主题中的“{}”具体讨论了什么，现有资料能够形成哪些可回查判断？".format(
+                topic_name, subtopic_name
+            )
+            question_value = (
+                "该问题用于判断“{}”是否构成独立分析方向，以及资料是否足以支持后续深入研判。"
+            ).format(subtopic_name)
+            answer = "“{}”可作为“{}”下的独立分析方向，当前由 {} 份资料共同支撑。".format(
+                subtopic_name, topic_name, len(paths)
+            )
             conclusion = {
-                "statement": "数据包中的“{}”主题可进一步下钻为“{}”，当前由 {} 份资料共同支撑。".format(
-                    topic_name, subtopic_name, len(paths)
-                ),
-                "type": "分析结论",
+                # A traceable analysis unit is a valuable question, its answer,
+                # and the evidence that directly supports that answer.
+                "analysis_question": analysis_question,
+                "question_value": question_value,
+                "answer": answer,
+                "statement": answer,
+                "type": "问题—回答—证据",
                 "confidence": confidence,
-                "basis": "依据为该子方向内文件的正文主题聚合，以及下列可回查原文证据。",
+                "basis": "回答来自该子方向内文件的正文主题聚合，并由下列可回查原文证据直接支撑。",
                 "evidence": evidence,
             }
             conclusion_evidence.append(conclusion)
@@ -783,14 +795,15 @@ def _name_subtopic_nodes(tree, documents, llm):
 要求：
 1. name 应为 4-22 个字，必要时保留 TEE、SEV-SNP、RFC 等专有名词。
 2. summary 一句话说明该子方向关注什么。
-3. conclusion 是“该子方向资料主要涉及什么”的可核验概览，不得加入证据没有支持的具体事实。
+3. question 是一个值得分析、且只能依据当前子方向资料回答的问题；不要问泛泛的“这是什么”。
+4. answer 是对 question 的谨慎回答，不得加入证据没有支持的具体事实。
 4. 必须保留 node_id，返回每个 node_id 一条结果。
 
 输入节点：
 {}
 
 输出 JSON：
-{{"subtopics":[{{"node_id":"group-...","name":"子方向名称","summary":"一句话说明","conclusion":"可核验概览"}}]}}""".format(
+{{"subtopics":[{{"node_id":"group-...","name":"子方向名称","summary":"一句话说明","question":"有价值的分析问题","answer":"有证据支撑的谨慎回答"}}]}}""".format(
         json.dumps(descriptors, ensure_ascii=False)
     )
     try:
@@ -817,13 +830,19 @@ def _name_subtopic_nodes(tree, documents, llm):
             summary = str(item.get("summary") or subtopic.get("summary") or "").strip()[:300]
             if summary:
                 subtopic["summary"] = summary
-            conclusion = str(item.get("conclusion") or "").strip()[:360]
-            if conclusion and subtopic.get("conclusion_evidence"):
-                subtopic["conclusion_evidence"][0]["statement"] = conclusion
-                subtopic["conclusion_evidence"][0]["basis"] = "该结论由本子方向的代表材料和下列可回查原文证据支撑。"
+            question = str(item.get("question") or "").strip()[:300]
+            answer = str(item.get("answer") or item.get("conclusion") or "").strip()[:360]
+            if subtopic.get("conclusion_evidence"):
+                unit = subtopic["conclusion_evidence"][0]
+                if question:
+                    unit["analysis_question"] = question
+                if answer:
+                    unit["answer"] = answer
+                    unit["statement"] = answer
+                unit["basis"] = "该回答由本子方向的代表材料和下列可回查原文证据直接支撑。"
                 for topic_conclusion in topic.get("conclusion_evidence", []):
-                    if topic_conclusion.get("evidence") == subtopic["conclusion_evidence"][0].get("evidence"):
-                        topic_conclusion.update(subtopic["conclusion_evidence"][0])
+                    if topic_conclusion.get("evidence") == unit.get("evidence"):
+                        topic_conclusion.update(unit)
         return tree, result
     except Exception:
         return tree, None

@@ -1159,14 +1159,18 @@ function renderSummary(
     data.conclusion_evidence?.length
   ) {
     html +=
-      `<h3>关键结论—证据链</h3>`
+      `<h3>问题—回答—证据链</h3>`
       +
       data.conclusion_evidence
         .map(
           item =>
             `<section class="conclusion-evidence">`
             +
-            `<p><strong>${escapeHtml(item.statement || '分析结论')}</strong> <span class="inference-badge">${escapeHtml(item.confidence || '待核验')}</span></p>`
+            `<p><strong>问题：</strong>${escapeHtml(item.analysis_question || '该范围内有哪些可回查的关键判断？')}</p>`
+            +
+            `<p><strong>价值：</strong>${escapeHtml(item.question_value || '帮助判断该资料范围是否值得继续分析，并明确后续核查重点。')}</p>`
+            +
+            `<p><strong>回答：</strong>${escapeHtml(item.answer || item.statement || '暂无可回查回答')} <span class="inference-badge">${escapeHtml(item.confidence || '待核验')}</span></p>`
             +
             `<p>${escapeHtml(item.basis || '该结论由下列证据支撑。')}</p>`
             +
