@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from services.scanner import human_size, resolve_under
-from services.evidence import evidence_support, select_evidence
+from services.evidence import evidence_quality, evidence_support, select_evidence
 from services.large_package import (
     attach_tree_coverage,
     build_coverage,
@@ -385,7 +385,11 @@ def _document_role(document):
 
 def _first_evidence(document):
     for evidence in document.get("evidence", []):
-        if evidence.get("text"):
+        # The first extracted unit is often a title or heading.  It is useful
+        # for navigation but cannot support a conclusion by itself.  Pick the
+        # first eligible body unit so directory/topic summaries do not bypass
+        # the shared evidence-quality gate.
+        if evidence.get("text") and evidence_quality(evidence).get("eligible"):
             result = {
                 "evidence_id": evidence.get("evidence_id"),
                 "source_path": evidence.get("source_path"),
@@ -408,6 +412,7 @@ def _first_evidence(document):
                     topics=topics
                 )
             )
+            result["evidence_quality"] = evidence_quality(evidence)
 
             return result
 

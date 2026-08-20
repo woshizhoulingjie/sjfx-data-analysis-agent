@@ -135,8 +135,14 @@ def evidence_quality(item):
     text = " ".join(str(item.get("text") or "").split())
     label = str(item.get("label") or "").lower()
     normalized = text.strip(" \t\r\n：:;；。.")
-    if len(normalized) < 24:
+    # Short, page-addressable statements such as "风险评估结论" or
+    # "港口关闭导致物流延误" can still be useful evidence when they carry a
+    # factual/causal cue.  Reject bare labels, but do not reject every concise
+    # sentence merely because a parser extracted one line from a page.
+    if len(normalized) < 10:
         return {"eligible": False, "reason": "正文过短，无法构成可验证陈述", "score": -80}
+    if len(normalized) < 24 and not FACTUAL_CUE_RE.search(normalized):
+        return {"eligible": False, "reason": "正文过短且缺少事实或解释", "score": -80}
     if label in NAVIGATION_LABELS:
         return {"eligible": False, "reason": "标题或章节名仅用于定位，不作为支撑证据", "score": -75}
     if normalized.endswith(("?", "？")) or WEAK_NAVIGATION_RE.match(normalized):
