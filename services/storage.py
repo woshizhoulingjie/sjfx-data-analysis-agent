@@ -1,6 +1,7 @@
 import json
 import gzip
 import hashlib
+import logging
 import os
 import sqlite3
 import threading
@@ -12,6 +13,9 @@ from pathlib import Path
 from services.schema import normalize_summary
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 class Storage:
     def __init__(self, db_path, sidecar_dir=None, sidecar_threshold=256 * 1024):
         self.db_path = str(db_path)
@@ -19,13 +23,54 @@ class Storage:
         self.sidecar_dir.mkdir(parents=True, exist_ok=True)
         self.sidecar_threshold = max(32 * 1024, int(sidecar_threshold))
         self.lock = threading.Lock()
+        self._checkpoint_lock = threading.Lock()
+        self._last_checkpoint = 0.0
+        self.sqlite_busy_timeout_ms = self._env_int(
+            "SJFX_SQLITE_BUSY_TIMEOUT_MS", 30000, minimum=1000, maximum=300000
+        )
+        self.sqlite_wal_autocheckpoint = self._env_int(
+            "SJFX_SQLITE_WAL_AUTOCHECKPOINT", 1000, minimum=100, maximum=100000
+        )
+        self.sqlite_journal_size_limit = self._env_int(
+            "SJFX_SQLITE_JOURNAL_SIZE_LIMIT", 64 * 1024 * 1024,
+            minimum=1024 * 1024, maximum=4 * 1024 * 1024 * 1024,
+        )
+        self.sqlite_checkpoint_interval = self._env_int(
+            "SJFX_SQLITE_CHECKPOINT_INTERVAL", 60, minimum=10, maximum=3600
+        )
         self._init_db()
+
+    @staticmethod
+    def _env_int(name, default, minimum=None, maximum=None):
+        try:
+            value = int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            value = int(default)
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
 
     @contextmanager
     def _connect(self):
-        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection = sqlite3.connect(
+            self.db_path, timeout=self.sqlite_busy_timeout_ms / 1000.0
+        )
         connection.row_factory = sqlite3.Row
         try:
+            connection.execute(
+                "PRAGMA busy_timeout={}".format(self.sqlite_busy_timeout_ms)
+            )
+            # These two pragmas are connection-local.  Applying them here
+            # prevents a new API/Worker connection from silently reverting to
+            # SQLite's tiny default checkpoint threshold.
+            connection.execute(
+                "PRAGMA wal_autocheckpoint={}".format(self.sqlite_wal_autocheckpoint)
+            )
+            connection.execute(
+                "PRAGMA journal_size_limit={}".format(self.sqlite_journal_size_limit)
+            )
             yield connection
             connection.commit()
         except Exception:
@@ -38,6 +83,12 @@ class Storage:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(
+                "PRAGMA wal_autocheckpoint={}".format(self.sqlite_wal_autocheckpoint)
+            )
+            conn.execute(
+                "PRAGMA journal_size_limit={}".format(self.sqlite_journal_size_limit)
+            )
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS scans (
                     id TEXT PRIMARY KEY,
@@ -138,6 +189,55 @@ class Storage:
             if "owner_id" not in scan_columns:
                 conn.execute("ALTER TABLE scans ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_jobs_queue ON analysis_jobs(status, updated_at)")
+
+    def checkpoint_wal(self, force=False):
+        """Bound the SQLite WAL without deleting a live database.
+
+        ``PASSIVE`` is used for periodic maintenance so readers are never
+        blocked.  ``TRUNCATE`` is reserved for Worker startup (or an explicit
+        forced call) and only removes frames SQLite has already checkpointed.
+        The return value is intentionally diagnostic and safe to expose in
+        health checks.
+        """
+        now = time.monotonic()
+        if not force and now - self._last_checkpoint < self.sqlite_checkpoint_interval:
+            return {"skipped": True, "reason": "interval", "wal_bytes": self._wal_size()}
+        with self._checkpoint_lock:
+            now = time.monotonic()
+            if not force and now - self._last_checkpoint < self.sqlite_checkpoint_interval:
+                return {"skipped": True, "reason": "interval", "wal_bytes": self._wal_size()}
+            wal_bytes = self._wal_size()
+            mode = "TRUNCATE" if force or wal_bytes >= self.sqlite_journal_size_limit else "PASSIVE"
+            try:
+                with self._connect() as conn:
+                    row = conn.execute("PRAGMA wal_checkpoint({})".format(mode)).fetchone()
+                values = list(row) if row is not None else []
+                result = {
+                    "skipped": False,
+                    "mode": mode,
+                    "busy": int(values[0]) if len(values) > 0 else 0,
+                    "log_frames": int(values[1]) if len(values) > 1 else 0,
+                    "checkpointed_frames": int(values[2]) if len(values) > 2 else 0,
+                    "wal_bytes_before": wal_bytes,
+                    "wal_bytes": self._wal_size(),
+                }
+                self._last_checkpoint = now
+                return result
+            except sqlite3.DatabaseError as exc:
+                LOGGER.warning("SQLite WAL checkpoint 失败：%s", exc)
+                self._last_checkpoint = now
+                return {
+                    "skipped": False,
+                    "mode": mode,
+                    "error": str(exc),
+                    "wal_bytes": self._wal_size(),
+                }
+
+    def _wal_size(self):
+        try:
+            return int(Path(self.db_path + "-wal").stat().st_size)
+        except (OSError, ValueError):
+            return 0
 
     def _sidecar_path(self, scan_id, node_path):
         digest = hashlib.sha256("{}|{}".format(scan_id, node_path).encode("utf-8")).hexdigest()

@@ -1,8 +1,11 @@
 import json
+import logging
 import os
 import re
 import zipfile
 import hashlib
+import time
+import uuid
 from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +13,43 @@ from pathlib import Path
 from services.scanner import IGNORED_DIRS, should_ignore_file
 from services.evidence import select_evidence
 from services.unified_parser import SUPPORTED_EXTENSIONS
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def xml_safe_text(value):
+    """Return text that is safe for XML 1.0 / python-docx.
+
+    Parsed files can legally contain NUL bytes, terminal control characters,
+    Unicode noncharacters, or even isolated UTF-16 surrogate code points.  XML
+    1.0 cannot represent those values and lxml raises before the report can be
+    saved.  Keep normal text plus tab/newline/carriage return, and filter only
+    characters that are unsafe for the document package.
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    safe = []
+    for character in text:
+        codepoint = ord(character)
+        if codepoint in (0x09, 0x0A, 0x0D):
+            safe.append(character)
+            continue
+        if codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            continue
+        if 0xD800 <= codepoint <= 0xDFFF:
+            continue
+        if codepoint > 0x10FFFF:
+            continue
+        # Unicode noncharacters cannot carry meaningful source text and are
+        # rejected by several XML consumers even where a parser is permissive.
+        if 0xFDD0 <= codepoint <= 0xFDEF:
+            continue
+        if (codepoint & 0xFFFF) in (0xFFFE, 0xFFFF):
+            continue
+        safe.append(character)
+    return "".join(safe)
 
 
 def safe_name(value):
@@ -76,15 +116,57 @@ def _deduplicate_files(files, root):
 @contextmanager
 def _atomic_zip(temporary_path, final_path):
     """Write a ZIP privately and publish it only after it closes cleanly."""
+    temporary_path = Path(temporary_path)
+    final_path = Path(final_path)
+    temporary_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(str(temporary_path), "w", compression=zipfile.ZIP_DEFLATED,
                              allowZip64=True) as archive:
             yield archive
+        # Ensure the directory entry is durable before publishing the name.
+        # A crash can therefore leave only a harmless .part file, never a
+        # half-valid final archive.
+        try:
+            with temporary_path.open("rb") as stream:
+                os.fsync(stream.fileno())
+        except (OSError, AttributeError):
+            pass
         os.replace(str(temporary_path), str(final_path))
     except BaseException:
         with suppress(OSError):
-            Path(temporary_path).unlink()
+            temporary_path.unlink()
         raise
+
+
+def cleanup_stale_part_files(output_dir, max_age_seconds=24 * 60 * 60):
+    """Remove abandoned exporter work files, never published archives.
+
+    Only files directly under the configured output directory with the exact
+    ``*.zip.part`` suffix are considered, and recent files are preserved in
+    case another process is still writing them.  This makes recovery after a
+    worker kill deterministic without risking a valid ``.zip`` result.
+    """
+    output_dir = Path(output_dir)
+    if not output_dir.exists() or not output_dir.is_dir() or output_dir.is_symlink():
+        return 0
+    now = time.time()
+    removed = 0
+    try:
+        candidates = output_dir.glob("*.zip.part")
+        for item in candidates:
+            try:
+                if not item.is_file() or item.is_symlink():
+                    continue
+                age = max(0.0, now - item.stat().st_mtime)
+                if age < max(60, int(max_age_seconds)):
+                    continue
+                item.unlink()
+                removed += 1
+            except OSError:
+                LOGGER.warning("清理导出临时文件失败：%s", item, exc_info=True)
+    except OSError:
+        LOGGER.warning("扫描导出临时文件失败：%s", output_dir, exc_info=True)
+    return removed
 
 
 def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, documents=None, task_topic=None,
@@ -99,6 +181,9 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
     selected_evidence_ids = set(selected_evidence_ids or [])
     inventory_metadata = inventory_metadata or {}
     file_states = file_states or {}
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_part_files(output_dir)
     virtual_paths = sorted(set(member_paths or []))
     if virtual_paths:
         selected_rel = "virtual:{}".format(node_id or safe_name(node_name or "topic"))
@@ -146,11 +231,13 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
     if total_size > max_bytes:
         raise ValueError("导出内容为 {:.1f} MB，超过演示版上限 {:.1f} MB".format(total_size / 1048576, max_bytes / 1048576))
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    archive_name = "待整编数据包_{}_{}.zip".format(safe_name(export_label), stamp)
+    # A random suffix prevents two same-second exports from sharing the same
+    # final or .part pathname.  The human-readable prefix remains unchanged.
+    archive_name = "待整编数据包_{}_{}_{}.zip".format(
+        safe_name(export_label), stamp, uuid.uuid4().hex[:8]
+    )
     archive_path = Path(output_dir) / archive_name
     temporary_archive_path = archive_path.with_name(archive_path.name + ".part")
-    with suppress(OSError):
-        temporary_archive_path.unlink()
     evidence_candidates = []
     for item in selected_documents:
         evidence_candidates.extend(item.get("payload", {}).get("evidence", []))
@@ -314,6 +401,18 @@ def create_report_docx(report, scan, output_path):
     except ImportError:
         raise RuntimeError("未安装 python-docx，无法生成 Word 报告")
 
+    def add_paragraph(text="", style=None):
+        return doc.add_paragraph(xml_safe_text(text), style=style)
+
+    def add_heading(text, level):
+        return doc.add_heading(xml_safe_text(text), level=level)
+
+    def add_run(paragraph, text=""):
+        return paragraph.add_run(xml_safe_text(text))
+
+    def set_xml_text(element, value):
+        element.text = xml_safe_text(value)
+
     def set_font(run, name="Microsoft YaHei", size=None, color=None, bold=None):
         run.font.name = name
         run._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), name)
@@ -327,7 +426,7 @@ def create_report_docx(report, scan, output_path):
             run.bold = bold
 
     def clean_evidence(value, limit=220):
-        text = re.sub(r"\s+", " ", str(value or "")).replace("|", " / ").strip(" /-")
+        text = re.sub(r"\s+", " ", xml_safe_text(value)).replace("|", " / ").strip(" /-")
         return text[:limit] + ("…" if len(text) > limit else "")
 
     def configure_style(style, size, color, before, after, line_spacing, bold=False):
@@ -343,10 +442,10 @@ def create_report_docx(report, scan, output_path):
     def add_items(values, style="List Bullet", empty_text="暂无可用信息"):
         values = values or []
         if not values:
-            doc.add_paragraph(empty_text)
+            add_paragraph(empty_text)
             return
         for value in values:
-            doc.add_paragraph(str(value), style=style)
+            add_paragraph(value, style=style)
 
     def add_conclusion_evidence(values):
         for conclusion in values or []:
@@ -354,16 +453,16 @@ def create_report_docx(report, scan, output_path):
                 continue
             statement = conclusion.get("statement") or "分析结论"
             confidence = conclusion.get("confidence") or "待核验"
-            doc.add_paragraph("结论：{}（置信度：{}）".format(statement, confidence), style="List Bullet")
+            add_paragraph("结论：{}（置信度：{}）".format(statement, confidence), style="List Bullet")
             if conclusion.get("basis"):
-                doc.add_paragraph("依据：{}".format(conclusion["basis"]))
+                add_paragraph("依据：{}".format(conclusion["basis"]))
             for evidence in conclusion.get("evidence", [])[:4]:
                 if not isinstance(evidence, dict):
                     continue
                 location = evidence.get("source_path", "未知文件")
                 if evidence.get("page"):
                     location += "，第 {} 页".format(evidence["page"])
-                doc.add_paragraph(
+                add_paragraph(
                     "[{}] {}：{}".format(
                         evidence.get("evidence_id") or "证据",
                         location,
@@ -392,28 +491,28 @@ def create_report_docx(report, scan, output_path):
     configure_style(styles["List Number"], 11, (0, 0, 0), 0, 8, 1.167)
 
     header = section.header.paragraphs[0]
-    header.text = "数据分析 Agent｜数据包情况概览"
+    set_xml_text(header, "数据分析 Agent｜数据包情况概览")
     set_font(header.runs[0], size=9, color=(100, 100, 100))
     footer = section.footer.paragraphs[0]
     footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    footer_run = footer.add_run("第 ")
+    footer_run = add_run(footer, "第 ")
     set_font(footer_run, size=9, color=(100, 100, 100))
     field_begin = OxmlElement("w:fldChar")
     field_begin.set(qn("w:fldCharType"), "begin")
     field_instr = OxmlElement("w:instrText")
     field_instr.set(qn("xml:space"), "preserve")
-    field_instr.text = " PAGE "
+    set_xml_text(field_instr, " PAGE ")
     field_end = OxmlElement("w:fldChar")
     field_end.set(qn("w:fldCharType"), "end")
     footer_run._r.extend([field_begin, field_instr, field_end])
-    tail = footer.add_run(" 页")
+    tail = add_run(footer, " 页")
     set_font(tail, size=9, color=(100, 100, 100))
 
-    title = doc.add_paragraph()
+    title = add_paragraph()
     title.paragraph_format.space_after = Pt(4)
-    title_run = title.add_run("数据包情况概览报告")
+    title_run = add_run(title, "数据包情况概览报告")
     set_font(title_run, size=23, bold=True)
-    subtitle = doc.add_paragraph("自动扫描、证据摘要与研究方向建议")
+    subtitle = add_paragraph("自动扫描、证据摘要与研究方向建议")
     subtitle.paragraph_format.space_after = Pt(16)
     set_font(subtitle.runs[0], size=13, color=(70, 70, 70))
 
@@ -423,16 +522,16 @@ def create_report_docx(report, scan, output_path):
         ("扫描时间", scan["scanned_at"]),
         ("生成模式", "模型分析（解析与证据链仍为本地）" if report.get("generation_mode") == "model_analyzed" else "本地解析完成，研究方向待模型分析"),
     ):
-        paragraph = doc.add_paragraph()
+        paragraph = add_paragraph()
         paragraph.paragraph_format.space_after = Pt(2)
-        label_run = paragraph.add_run(label + "：")
+        label_run = add_run(paragraph, label + "：")
         set_font(label_run, size=10.5, bold=True)
-        value_run = paragraph.add_run(str(value))
+        value_run = add_run(paragraph, value)
         set_font(value_run, size=10.5)
 
-    doc.add_heading("一、数据包基本信息", level=1)
+    add_heading("一、数据包基本信息", level=1)
     add_items(report.get("basic_information"))
-    doc.add_heading("二、全局分类", level=1)
+    add_heading("二、全局分类", level=1)
     categories = report.get("global_categories") or []
     classification_coverage = report.get("classification_coverage", {})
     if classification_coverage:
@@ -441,7 +540,7 @@ def create_report_docx(report, scan, output_path):
             "physical_directory_fallback": "原始目录树（自适应分析不可用时的降级结果）",
             "root_fallback": "扫描根节点（未形成可用分类）",
         }.get(classification_coverage.get("source"), "本地分类结果")
-        doc.add_paragraph(
+        add_paragraph(
             "分类来源：{}；顶层类别 {} 个；已归入 {} / {} 个已解析文件（{}）。".format(
                 source_label,
                 classification_coverage.get("top_level_category_count", 0),
@@ -451,32 +550,32 @@ def create_report_docx(report, scan, output_path):
             )
         )
     if not categories:
-        doc.add_paragraph("暂无可用分类。")
+        add_paragraph("暂无可用分类。")
     for item in categories:
         if isinstance(item, dict):
-            doc.add_heading(
+            add_heading(
                 "{}（{}：{} 个文件）".format(
                     item.get("name", "未命名分类"), item.get("dimension", "内容类别"), item.get("file_count", 0)
                 ),
                 level=2,
             )
-            doc.add_paragraph(item.get("description") or "暂无分类说明。")
+            add_paragraph(item.get("description") or "暂无分类说明。")
             type_counts = item.get("type_counts", {})
             if type_counts:
-                doc.add_paragraph("格式构成：{}。".format(
+                add_paragraph("格式构成：{}。".format(
                     "；".join("{} {}个".format(extension, count) for extension, count in type_counts.items())
                 ))
             if item.get("topics"):
-                doc.add_paragraph("内容线索：{}。".format("、".join(item["topics"][:12])))
+                add_paragraph("内容线索：{}。".format("、".join(item["topics"][:12])))
             if item.get("representative_documents"):
-                doc.add_paragraph("代表文档：{}".format("；".join(item["representative_documents"][:5])))
+                add_paragraph("代表文档：{}".format("；".join(item["representative_documents"][:5])))
             if item.get("conclusion_evidence"):
-                doc.add_paragraph("关键结论—证据链：")
+                add_paragraph("关键结论—证据链：")
                 add_conclusion_evidence(item["conclusion_evidence"])
             for subcategory in item.get("subcategories", []):
                 if not isinstance(subcategory, dict):
                     continue
-                doc.add_heading(
+                add_heading(
                     "{}（{}：{} 个文件）".format(
                         subcategory.get("name", "未命名主题"),
                         subcategory.get("dimension", "内容主题"),
@@ -484,17 +583,17 @@ def create_report_docx(report, scan, output_path):
                     ),
                     level=3,
                 )
-                doc.add_paragraph(subcategory.get("description") or "该主题下的文件已完成统一解析。")
+                add_paragraph(subcategory.get("description") or "该主题下的文件已完成统一解析。")
                 if subcategory.get("topics"):
-                    doc.add_paragraph("内容线索：{}。".format("、".join(subcategory["topics"][:10])))
+                    add_paragraph("内容线索：{}。".format("、".join(subcategory["topics"][:10])))
                 if subcategory.get("representative_documents"):
-                    doc.add_paragraph("代表文档：{}".format("；".join(subcategory["representative_documents"][:3])))
+                    add_paragraph("代表文档：{}".format("；".join(subcategory["representative_documents"][:3])))
                 if subcategory.get("conclusion_evidence"):
-                    doc.add_paragraph("关键结论—证据链：")
+                    add_paragraph("关键结论—证据链：")
                     add_conclusion_evidence(subcategory["conclusion_evidence"])
             category_evidence = item.get("evidence_chain", [])
             if category_evidence:
-                doc.add_paragraph("分类依据与可回查证据：")
+                add_paragraph("分类依据与可回查证据：")
                 for evidence in category_evidence[:4]:
                     if not isinstance(evidence, dict):
                         continue
@@ -503,7 +602,7 @@ def create_report_docx(report, scan, output_path):
                         location += "，第 {} 页".format(evidence["page"])
                     if evidence.get("section"):
                         location += "，{}".format(evidence["section"])
-                    doc.add_paragraph(
+                    add_paragraph(
                         "[{}] {}：{}".format(
                             evidence.get("evidence_id") or "元数据证据",
                             location,
@@ -512,22 +611,22 @@ def create_report_docx(report, scan, output_path):
                         style="List Bullet",
                     )
         else:
-            doc.add_paragraph(str(item), style="List Bullet")
-    doc.add_heading("三、关键发现", level=1)
+            add_paragraph(item, style="List Bullet")
+    add_heading("三、关键发现", level=1)
     add_items(report.get("key_findings"))
 
-    doc.add_heading("四、推荐研究方向", level=1)
+    add_heading("四、推荐研究方向", level=1)
     recommendation = report.get("recommended_research_direction") or {}
-    doc.add_heading(recommendation.get("title") or "待进一步确定研究方向", level=2)
-    lead = doc.add_paragraph()
-    lead_run = lead.add_run("性质：推论；优先级：{}；置信度：{}".format(recommendation.get("priority", "中"), recommendation.get("confidence", "中")))
+    add_heading(recommendation.get("title") or "待进一步确定研究方向", level=2)
+    lead = add_paragraph()
+    lead_run = add_run(lead, "性质：推论；优先级：{}；置信度：{}".format(recommendation.get("priority", "中"), recommendation.get("confidence", "中")))
     set_font(lead_run, size=11, color=(31, 58, 95), bold=True)
-    doc.add_paragraph(recommendation.get("rationale") or "需要先生成代表性文档的全文摘要，再确定研究重点。")
-    doc.add_heading("拟研究问题", level=3)
+    add_paragraph(recommendation.get("rationale") or "需要先生成代表性文档的全文摘要，再确定研究重点。")
+    add_heading("拟研究问题", level=3)
     add_items(recommendation.get("research_questions") or recommendation.get("questions"), style="List Number")
-    doc.add_heading("建议方法", level=3)
+    add_heading("建议方法", level=3)
     add_items(recommendation.get("methods"), empty_text="建议采用分层抽样、证据矩阵和专题复核方法。")
-    doc.add_heading("方向依据与证据", level=3)
+    add_heading("方向依据与证据", level=3)
     recommendation_evidence = recommendation.get("evidence_chain", [])
     if recommendation_evidence:
         for evidence in recommendation_evidence[:12]:
@@ -537,32 +636,32 @@ def create_report_docx(report, scan, output_path):
                     location += "，第 {} 页".format(evidence["page"])
                 if evidence.get("section"):
                     location += "，{}".format(evidence["section"])
-                doc.add_paragraph("[{}] {}：{}".format(evidence.get("evidence_id") or "元数据证据", location, clean_evidence(evidence.get("text"))), style="List Bullet")
+                add_paragraph("[{}] {}：{}".format(evidence.get("evidence_id") or "元数据证据", location, clean_evidence(evidence.get("text"))), style="List Bullet")
     else:
-        doc.add_paragraph("当前未形成可引用正文证据，方向置信度应下调并优先人工复核。")
+        add_paragraph("当前未形成可引用正文证据，方向置信度应下调并优先人工复核。")
 
-    doc.add_heading("五、其他深入方向建议", level=1)
+    add_heading("五、其他深入方向建议", level=1)
     for item in report.get("directions", []):
         if isinstance(item, dict):
-            doc.add_heading(item.get("direction", "建议"), level=2)
-            doc.add_paragraph("类型：{}；置信度：{}".format(item.get("type", "推论"), item.get("confidence", "未标注")))
+            add_heading(item.get("direction", "建议"), level=2)
+            add_paragraph("类型：{}；置信度：{}".format(item.get("type", "推论"), item.get("confidence", "未标注")))
             for evidence in item.get("evidence_chain", item.get("evidence", [])):
                 if isinstance(evidence, dict):
-                    doc.add_paragraph("依据：[{}] {}{}".format(
+                    add_paragraph("依据：[{}] {}{}".format(
                         evidence.get("evidence_id") or "证据",
                         evidence.get("source_path") or evidence.get("reason", ""),
                         "：" + clean_evidence(evidence.get("text") or evidence.get("fact", "")) if (evidence.get("text") or evidence.get("fact")) else "",
                     ), style="List Bullet")
             if item.get("confidence_note"):
-                doc.add_paragraph("置信度说明：{}".format(item["confidence_note"]))
+                add_paragraph("置信度说明：{}".format(item["confidence_note"]))
         else:
-            doc.add_paragraph(str(item), style="List Bullet")
+            add_paragraph(item, style="List Bullet")
     if not report.get("directions"):
-        doc.add_paragraph("暂无其他深入方向建议。")
-    doc.add_heading("六、分析方法与边界", level=1)
+        add_paragraph("暂无其他深入方向建议。")
+    add_heading("六、分析方法与边界", level=1)
     method = report.get("analysis_method", {})
     for key, label in (("parse", "统一解析"), ("deduplication", "精确去重"), ("similarity", "相似聚类"), ("retrieval", "本地证据检索"), ("classification", "自适应分类"), ("traceability", "证据回溯")):
         if method.get(key):
-            doc.add_paragraph("{}：{}".format(label, method[key]), style="List Bullet")
-    doc.add_paragraph("本报告是数据分析智能体自身的情况概览交付物，不等同于报告整编智能体生成的正式专题报告。模型仅用于语言与研究方向增强；文档解析、OCR、去重、聚类、建树和证据链均在本地执行。")
+            add_paragraph("{}：{}".format(label, method[key]), style="List Bullet")
+    add_paragraph("本报告是数据分析智能体自身的情况概览交付物，不等同于报告整编智能体生成的正式专题报告。模型仅用于语言与研究方向增强；文档解析、OCR、去重、聚类、建树和证据链均在本地执行。")
     doc.save(str(output_path))

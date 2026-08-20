@@ -889,8 +889,13 @@ function renderDocument(doc) {
   const profile = doc.data_profile || (doc.data_profiles && doc.data_profiles[0]?.profile);
   if (profile && profile.status !== "skipped" && profile.status !== "failed") {
     const judgment = profile.value_judgment || {};
+    const profileCoverage = profile.coverage || profile.limits || {};
+    const partialNote = profile.status === "partial" || profileCoverage.complete === false
+      ? `；有界采样${profileCoverage.truncation_reasons?.length ? `（${escapeHtml(profileCoverage.truncation_reasons.join('、'))}）` : ''}，统计结果需回原表复核`
+      : '';
     html += `<div class="coverage-card"><strong>结构化数据画像：</strong>${profile.row_count ?? 0} 行 / ${profile.column_count ?? 0} 列；质量评分 ${profile.quality_score ?? "—"} / 100；价值判断 ${escapeHtml(judgment.value_level || "—")}。` +
       `${profile.duplicate_row_count ? `重复行 ${profile.duplicate_row_count}；` : ""}${profile.missing_columns?.length ? `缺失字段 ${profile.missing_columns.length} 个；` : ""}${profile.sensitive_columns?.length ? `敏感字段 ${profile.sensitive_columns.length} 个，建议脱敏。` : ""}</div>`;
+    if (partialNote) html += `<p class="coverage-card"><strong>画像覆盖提示：</strong>${partialNote}</p>`;
   }
 
   if (
@@ -2336,6 +2341,7 @@ $('numericQuestionBtn').onclick =
         body: JSON.stringify(payload)
       });
       const answer = data.answer || {};
+      const answerCoverage = answer.coverage || {};
       $('summary').className = 'summary';
       $('summary').innerHTML =
         `<div class="summary-kicker">可验证精确数字问答</div>` +
@@ -2344,6 +2350,7 @@ $('numericQuestionBtn').onclick =
         `<div><b>${escapeHtml(answer.column || '记录数')}</b><span>字段</span></div>` +
         `<div><b>${escapeHtml(answer.confidence || '—')}</b><span>置信度</span></div></div>` +
         `<p>来源：${escapeHtml(answer.source_path || '当前范围')}；表/成员：${escapeHtml(answer.table || '—')}</p>` +
+        `${answerCoverage.complete === false ? `<p class="coverage-card"><strong>覆盖提示：</strong>${escapeHtml(answerCoverage.warning || '结果基于有界采样，请回原表复核。')}</p>` : ''}` +
         evidenceHtml(answer.evidence || []);
       toast('已返回带来源定位的精确统计结果');
     } catch (e) {

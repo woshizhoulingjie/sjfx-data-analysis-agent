@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -31,6 +32,35 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 
+def _split_path_list(value):
+    """Split an allow-list using the host separator without breaking drives."""
+    raw = str(value or "")
+    separator = os.pathsep
+    # ``os.pathsep`` is ``;`` on Windows, so ``C:\data;D:\archive`` remains
+    # intact.  POSIX deployments use ``:`` as documented by the sample env.
+    return [item.strip() for item in raw.split(separator) if item.strip()]
+
+
+def _token_expiry(raw):
+    """Normalize an optional token expiry to a UTC epoch timestamp."""
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            # A malformed expiry is represented by a sentinel in the past;
+            # the API will fail closed instead of silently issuing a permanent
+            # token.  The raw value is never logged or returned to clients.
+            return 0.0
+
+
 class Config:
     BASE_DIR = BASE_DIR
     DATA_DIR = BASE_DIR / "data"
@@ -56,14 +86,26 @@ class Config:
     HOST = os.getenv("HOST", "127.0.0.1")
     PORT = int(os.getenv("PORT", "8000"))
     API_ACCESS_TOKEN = os.getenv("SJFX_API_ACCESS_TOKEN", "").strip()
+    API_TOKEN_EXPIRES_AT = _token_expiry(os.getenv("SJFX_API_TOKEN_EXPIRES_AT", ""))
     AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "0" if HOST in {"127.0.0.1", "localhost", "::1"} else "1").strip().lower() in {"1", "true", "yes"}
     _allowed_roots = os.getenv("SCAN_ALLOWED_ROOTS", str(BASE_DIR.parent))
-    SCAN_ALLOWED_ROOTS = tuple(Path(item).expanduser().resolve() for item in _allowed_roots.split(":") if item.strip())
+    SCAN_ALLOWED_ROOTS = tuple(Path(item).expanduser().resolve() for item in _split_path_list(_allowed_roots))
     MAX_EXTRACT_CHARS = int(os.getenv("MAX_EXTRACT_CHARS", "60000"))
     MAX_FULL_DOCUMENT_CHARS = int(os.getenv("MAX_FULL_DOCUMENT_CHARS", "2000000"))
     MAX_SINGLE_FILE_BYTES = int(os.getenv("MAX_SINGLE_FILE_BYTES", str(1024 * 1024 * 1024)))
-    MAX_PARSE_SECONDS = max(10, int(os.getenv("MAX_PARSE_SECONDS", "300")))
+    MAX_PARSE_SECONDS = max(1, int(os.getenv("MAX_PARSE_SECONDS", "300")))
     MAX_WORKER_MEMORY_MB = max(256, int(os.getenv("MAX_WORKER_MEMORY_MB", "8192")))
+    MAX_PARSE_PROCESS_MEMORY_MB = max(
+        256,
+        int(os.getenv("MAX_PARSE_PROCESS_MEMORY_MB", str(MAX_WORKER_MEMORY_MB))),
+    )
+    ENABLE_PARSE_PROCESS_ISOLATION = os.getenv("ENABLE_PARSE_PROCESS_ISOLATION", "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    DOCLING_DEVICE = os.getenv("DOCLING_DEVICE", "cpu").strip().lower()
+    if DOCLING_DEVICE not in {"cpu", "cuda", "auto"}:
+        DOCLING_DEVICE = "cpu"
+    DOCLING_CPU_THREADS = max(1, min(64, int(os.getenv("DOCLING_CPU_THREADS", "4"))))
     MAX_DOCUMENT_CHUNKS = int(os.getenv("MAX_DOCUMENT_CHUNKS", "12"))
     # ZIP64 is used by the exporter.  A 4-5 GB analysis package may legitimately
     # need a larger handoff archive than the previous demonstration cap.
@@ -84,7 +126,6 @@ class Config:
     MAX_STRUCTURED_PROFILE_ROWS = max(100, int(os.getenv("MAX_STRUCTURED_PROFILE_ROWS", "100000")))
     MAX_STRUCTURED_PROFILE_BYTES = int(os.getenv("MAX_STRUCTURED_PROFILE_BYTES", str(256 * 1024 * 1024)))
     MAX_ANALYSIS_JOBS = max(1, int(os.getenv("MAX_ANALYSIS_JOBS", "1")))
-    LLM_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "3")))
     WORKER_POLL_SECONDS = max(0.1, float(os.getenv("WORKER_POLL_SECONDS", "0.5")))
     WORKER_STALE_SECONDS = max(60, int(os.getenv("WORKER_STALE_SECONDS", "900")))
 

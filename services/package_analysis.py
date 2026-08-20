@@ -22,9 +22,12 @@ from services.large_package import (
 )
 from services.retrieval import build_retrieval_manifest
 from services.unified_parser import compact_document
+from services.unified_parser import UnifiedDocumentParser
+from services.parse_isolation import ParseIsolationError, runner_for
 
 
 SMALL_FILE_SUMMARY_BYTES = 16 * 1024
+PROFILE_USABLE_STATUSES = {"completed", "partial"}
 
 
 def _optional_llm_enrichment_enabled():
@@ -60,7 +63,7 @@ def _parse_with_limits(parser, path, node_path, mode):
     using it as a preflight check would then reject every later file instantly.
     On Linux read /proc/self/statm instead, which reports the current RSS.
     """
-    timeout = max(10, int(os.getenv("MAX_PARSE_SECONDS", "300")))
+    timeout = max(1, int(os.getenv("MAX_PARSE_SECONDS", "300")))
     memory_limit = max(256, int(os.getenv("MAX_WORKER_MEMORY_MB", "8192"))) * 1024 * 1024
     rss = None
     try:
@@ -80,6 +83,26 @@ def _parse_with_limits(parser, path, node_path, mode):
                 int(rss / (1024 * 1024)), memory_limit // (1024 * 1024)
             )
         )
+    # A Python thread cannot be force-killed while native PDF/OCR code is
+    # blocked.  Use a dedicated parser process for the real parser so a hard
+    # timeout genuinely releases the Worker and any native resources.  Custom
+    # parser doubles used by tests/extensions keep the lightweight thread
+    # path, preserving their existing injection contract.
+    isolate = str(os.getenv("ENABLE_PARSE_PROCESS_ISOLATION", "1")).strip().lower() not in {
+        "0", "false", "no", "off", "disabled",
+    }
+    if isolate and isinstance(parser, UnifiedDocumentParser):
+        try:
+            return runner_for(parser).parse(
+                path,
+                node_path,
+                mode=mode,
+                timeout=timeout,
+                memory_mb=max(256, int(os.getenv("MAX_PARSE_PROCESS_MEMORY_MB", os.getenv("MAX_WORKER_MEMORY_MB", "8192")))),
+            )
+        except ParseIsolationError:
+            raise
+
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(parser.parse, path, node_path, mode=mode)
     try:
@@ -2214,11 +2237,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     structured_profiles = []
     for profile_path, document in documents.items():
         profile = document.get("data_profile")
-        if profile and profile.get("status") == "completed":
+        if profile and profile.get("status") in PROFILE_USABLE_STATUSES:
             structured_profiles.append({"path": profile_path, "profile": profile})
         for item in document.get("data_profiles", []) or []:
             nested = item.get("profile") or {}
-            if nested.get("status") == "completed":
+            if nested.get("status") in PROFILE_USABLE_STATUSES:
                 structured_profiles.append({"path": "{}::{}".format(profile_path, item.get("member")), "profile": nested})
     profile_scores = [float(item["profile"].get("quality_score", 0)) for item in structured_profiles if item["profile"].get("quality_score") is not None]
     entity_statistics = {}
@@ -2382,10 +2405,10 @@ def refresh_package_coverage(scan_id, scan, storage):
     analysis["coverage"] = package_coverage
     structured = []
     for path, document in documents.items():
-        if (document.get("data_profile") or {}).get("status") == "completed":
+        if (document.get("data_profile") or {}).get("status") in PROFILE_USABLE_STATUSES:
             structured.append({"path": path, "profile": document["data_profile"]})
         for item in document.get("data_profiles", []) or []:
-            if (item.get("profile") or {}).get("status") == "completed":
+            if (item.get("profile") or {}).get("status") in PROFILE_USABLE_STATUSES:
                 structured.append({"path": "{}::{}".format(path, item.get("member")), "profile": item["profile"]})
     scores = [float(item["profile"].get("quality_score", 0)) for item in structured if item["profile"].get("quality_score") is not None]
     analysis["structured_data_overview"] = {

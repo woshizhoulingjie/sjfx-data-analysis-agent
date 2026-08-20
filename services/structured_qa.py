@@ -1,5 +1,4 @@
 
-from collections import Counter
 import re
 
 OPERATION_WORDS = (
@@ -27,40 +26,48 @@ def _profile_items(documents):
         for nested in payload.get("data_profiles") or []:
             profiles.append((nested.get("member") or "压缩包成员", nested.get("profile") or {}))
         for table_name, profile in profiles:
-            if profile.get("status") == "completed":
+            if profile.get("status") in {"completed", "partial"}:
                 yield path, table_name, profile
 
 def answer_question(question, documents):
     question = str(question or "").strip()
     if not question:
         raise ValueError("请输入问题")
-    if not any(True for _ in _profile_items(documents)):
-        raise ValueError("当前范围没有已完成的 CSV/XLSX/JSON 结构化数据画像；请切换到原始目录根节点或选择一个表格文件后重试")
+    profiles = list(_profile_items(documents))
+    if not profiles:
+        raise ValueError("当前范围没有可用的 CSV/XLSX/JSON 结构化数据画像；请切换到原始目录根节点或选择一个表格文件后重试")
+    partial_profiles = [item for item in profiles if item[2].get("status") == "partial"]
+    coverage = {
+        "complete": not partial_profiles,
+        "partial_profiles": len(partial_profiles),
+        "warning": "结果基于有界采样，不能代表未采样记录；请补充分析或回到原表复核。" if partial_profiles else None,
+    }
     operation = _operation(question)
     if not operation:
         raise ValueError("暂时只支持合计、平均、最大、最小、数量等可验证的精确数字问题")
     candidates = []
-    for source_path, table_name, profile in _profile_items(documents):
+    for source_path, table_name, profile in profiles:
         for name, column in (profile.get("columns") or {}).items():
             if column.get("inferred_type") == "number":
                 score = 0
                 lowered = str(name).lower()
                 if lowered and lowered in question.lower():
                     score += 10
-                for token in re.split(r"[_\\s-]+", str(name)):
+                for token in re.split(r"[_\s-]+", str(name)):
                     token = token.strip()
                     if len(token) >= 2 and token.lower() in question.lower():
                         score += 4
-                for token in re.findall(r"[A-Za-z0-9_\\u4e00-\\u9fff]{2,}", str(name)):
+                for token in re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]{2,}", str(name)):
                     if token.lower() in question.lower():
                         score += 2
                 candidates.append((score, source_path, table_name, name, column, profile))
     if operation == "count" and not candidates:
-        total = sum(int(profile.get("row_count") or 0) for _, _, profile in _profile_items(documents))
+        total = sum(int(profile.get("row_count") or 0) for _, _, profile in profiles)
         return {
             "question": question, "operation": operation, "value": total,
-            "unit": "行", "confidence": "高" if total else "待核验",
-            "evidence": [{"source_path": path, "table": table, "row_range": [2, int(profile.get("row_count") or 0) + 1], "text": "结构化画像记录数：{} 行".format(profile.get("row_count") or 0)} for path, table, profile in _profile_items(documents)][:20],
+            "unit": "行", "confidence": "中" if partial_profiles and total else ("高" if total else "待核验"),
+            "coverage": coverage,
+            "evidence": [{"source_path": path, "table": table, "row_range": [2, int(profile.get("row_count") or 0) + 1], "text": "结构化画像记录数：{} 行{}".format(profile.get("row_count") or 0, "（有界采样）" if profile.get("status") == "partial" else "")} for path, table, profile in profiles][:20],
         }
     if not candidates:
         raise ValueError("没有找到与问题匹配的数值字段，请在问题中写出字段名")
@@ -87,10 +94,11 @@ def answer_question(question, documents):
     return {
         "question": question, "operation": operation, "value": value,
         "column": column_name, "source_path": source_path, "table": table_name,
-        "confidence": "高" if candidates[0][0] >= 10 else "中",
+        "confidence": "中" if partial_profiles else ("高" if candidates[0][0] >= 10 else "中"),
+        "coverage": coverage,
         "evidence": [{
             "source_path": source_path, "table": table_name,
             "column": column_name, "row_range": [2, int(profile.get("row_count") or 0) + 1],
-            "text": "字段 {}：{}={}，样本记录 {} 行。{}".format(column_name, operation, value, profile.get("row_count") or 0, "由均值×数值记录数重建，建议复核原表。" if reconstructed else ""),
+            "text": "字段 {}：{}={}，样本记录 {} 行。{}{}".format(column_name, operation, value, profile.get("row_count") or 0, "有界采样，建议复核原表。" if profile.get("status") == "partial" else "", "由均值×数值记录数重建，建议复核原表。" if reconstructed else ""),
         }],
     }

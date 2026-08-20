@@ -4,6 +4,7 @@ import hmac
 import logging
 import logging.handlers
 import re
+import time
 import uuid
 from collections import Counter
 from datetime import datetime
@@ -117,6 +118,11 @@ if not logger.handlers:
     logger.addHandler(_file_handler)
 
 
+def _api_token_expired():
+    expiry = Config.API_TOKEN_EXPIRES_AT
+    return expiry is not None and time.time() >= float(expiry)
+
+
 @app.before_request
 def _access_guard():
     if not Config.AUTH_REQUIRED:
@@ -131,6 +137,8 @@ def _access_guard():
         authorization = request.headers.get("Authorization", "")
         if authorization.lower().startswith("bearer "):
             supplied = authorization[7:].strip()
+    if _api_token_expired():
+        return jsonify({"ok": False, "error": "SJFX API Token 已过期，请更新服务器配置后重启"}), 401
     if not configured or not supplied or not hmac.compare_digest(supplied, configured):
         return jsonify({"ok": False, "error": "未授权访问，请提供有效的 SJFX API Token"}), 401
     return None
@@ -970,6 +978,8 @@ def status():
             "max_single_file_bytes": Config.MAX_SINGLE_FILE_BYTES,
             "max_parse_seconds": Config.MAX_PARSE_SECONDS,
             "max_worker_memory_mb": Config.MAX_WORKER_MEMORY_MB,
+            "max_parse_process_memory_mb": Config.MAX_PARSE_PROCESS_MEMORY_MB,
+            "parse_process_isolation": Config.ENABLE_PARSE_PROCESS_ISOLATION,
             "max_archive_entries": Config.MAX_ARCHIVE_ENTRIES,
             "max_archive_member_bytes": Config.MAX_ARCHIVE_MEMBER_BYTES,
             "max_archive_uncompressed_bytes": Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,

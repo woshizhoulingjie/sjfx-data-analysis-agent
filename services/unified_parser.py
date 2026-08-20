@@ -60,6 +60,36 @@ def _short_text(text, limit=900):
     return value[:limit]
 
 
+def _safe_archive_destination(temp_root, member_name):
+    """Return a resolved extraction path that is guaranteed below ``temp_root``.
+
+    Normalising ``..`` segments before writing is not sufficient: an archive can
+    contain an absolute path, mixed separators, or a member whose parent is a
+    symlink created by an earlier member.  Resolve the candidate both before and
+    after creating parent directories and reject anything that escapes the
+    private temporary root.
+    """
+    try:
+        root = Path(temp_root).resolve()
+        candidate = (root / str(member_name)).resolve(strict=False)
+        candidate.relative_to(root)
+        if candidate == root:
+            return None
+        return candidate
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _open_archive_target(path):
+    """Open an archive member without following a symlink at the target."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    # O_NOFOLLOW is available on Linux/macOS.  The resolve check above remains
+    # the portable guard on platforms that do not expose it (notably Windows).
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(path), flags, 0o600)
+    return os.fdopen(descriptor, "wb")
+
+
 def _get_value(obj, name, default=None):
     if isinstance(obj, dict):
         return obj.get(name, default)
@@ -132,6 +162,16 @@ class UnifiedDocumentParser:
         self.rapidocr_model_dir = Path(rapidocr_model_dir) if rapidocr_model_dir else None
         self.max_chars = max_chars
         self.fast_office_ocr = bool(fast_office_ocr)
+        # Docling must not opportunistically claim the GPU that is reserved for
+        # the local language model.  CPU is the safe default; a deployment that
+        # has a separate GPU budget may opt in explicitly with DOCLING_DEVICE.
+        requested_device = str(os.getenv("DOCLING_DEVICE", "cpu")).strip().lower()
+        self.docling_device = requested_device if requested_device in {"cpu", "cuda", "auto"} else "cpu"
+        try:
+            requested_threads = int(os.getenv("DOCLING_CPU_THREADS", "4"))
+        except (TypeError, ValueError):
+            requested_threads = 4
+        self.docling_cpu_threads = max(1, min(32, requested_threads))
         self._converter = None
         self._converter_error = None
         self._ocr_engine = None
@@ -182,6 +222,9 @@ class UnifiedDocumentParser:
             "rapidocr_models": models,
             "tableformer_ready": tableformer_ready,
             "offline_only": True,
+            "docling_device": self.docling_device,
+            "docling_cpu_threads": self.docling_cpu_threads,
+            "ocr_device": "cpu (ONNX Runtime)",
             "local_artifacts_ready": _docling_artifacts_ready(self.artifacts_path),
             "initialization_error": self._converter_error,
         }
@@ -193,6 +236,16 @@ class UnifiedDocumentParser:
 
         pdf_options = PdfPipelineOptions()
         pdf_options.do_ocr = True
+        # Docling's current default is ``auto``.  Set it explicitly so a model
+        # upgrade cannot silently move layout/table inference onto the Ollama
+        # GPU.  The assignment is guarded for compatibility with older Docling
+        # releases that did not expose accelerator_options.
+        accelerator_options = getattr(pdf_options, "accelerator_options", None)
+        if accelerator_options is not None:
+            if hasattr(accelerator_options, "device"):
+                accelerator_options.device = self.docling_device
+            if hasattr(accelerator_options, "num_threads"):
+                accelerator_options.num_threads = self.docling_cpu_threads
         local_artifacts_ready = _docling_artifacts_ready(self.artifacts_path)
         tableformer_ready = _tableformer_available(self.artifacts_path)
         # Missing table artifacts are a feature reduction, not permission to
@@ -250,7 +303,16 @@ class UnifiedDocumentParser:
         if self._ocr_engine is not None:
             return self._ocr_engine
         from rapidocr import RapidOCR
-        params = {}
+        # RapidOCR's ONNX provider defaults to CPU today, but an environment
+        # with onnxruntime-gpu can otherwise select CUDA automatically after a
+        # dependency upgrade.  Pin every accelerator switch off for the OCR
+        # engine; the language model owns the GPU budget.
+        params = {
+            "EngineConfig.onnxruntime.use_cuda": False,
+            "EngineConfig.onnxruntime.use_dml": False,
+            "EngineConfig.onnxruntime.use_cann": False,
+            "EngineConfig.onnxruntime.use_coreml": False,
+        }
         if self.rapidocr_model_dir:
             mapping = {
                 "Det.model_path": "ch_PP-OCRv5_det_mobile.onnx",
@@ -261,7 +323,13 @@ class UnifiedDocumentParser:
                 model = self.rapidocr_model_dir / name
                 if model.exists():
                     params[key] = str(model)
-        self._ocr_engine = RapidOCR(params=params or None)
+        try:
+            self._ocr_engine = RapidOCR(params=params or None)
+        except (KeyError, TypeError, ValueError):
+            # Older RapidOCR releases did not expose EngineConfig switches;
+            # their ONNX backend is CPU-only.  Keep compatibility with those
+            # releases while retaining the explicit settings on current ones.
+            self._ocr_engine = RapidOCR(params=None)
         return self._ocr_engine
 
     def _repair_pdf_copy(self, source):
@@ -530,14 +598,58 @@ class UnifiedDocumentParser:
             if declared_size < 0 or declared_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + declared_size > ARCHIVE_MAX_TOTAL_BYTES:
                 base["warnings"].append("已跳过超过安全大小限制的压缩包成员：{}".format(member_name))
                 continue
-            destination = temp_root / member_name
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination = _safe_archive_destination(temp_root, member_name)
+            if destination is None:
+                base["warnings"].append("已跳过解析后越界或含符号链接的压缩包成员：{}".format(raw_name))
+                continue
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                # A parent could have changed between the first resolve and
+                # mkdir (for example, when another process touches the temp
+                # directory).  Re-check the fully resolved path immediately
+                # before opening it.
+                destination = _safe_archive_destination(temp_root, member_name)
+                if destination is None or destination.is_symlink():
+                    raise ValueError("extraction target escaped temporary root")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+            except (OSError, ValueError) as exc:
+                base["warnings"].append("已跳过不安全的压缩包成员 {}：{}".format(member_name, str(exc)[:160]))
+                continue
             source = opener()
             if source is None:
                 continue
-            with source, destination.open("wb") as target:
-                shutil.copyfileobj(source, target, length=1024 * 1024)
-            actual_size = destination.stat().st_size
+            allowed_member_bytes = min(
+                ARCHIVE_MAX_MEMBER_BYTES,
+                max(0, ARCHIVE_MAX_TOTAL_BYTES - total_uncompressed),
+            )
+            copied_bytes = 0
+            exceeded_stream_limit = False
+            try:
+                with source, _open_archive_target(destination) as target:
+                    while True:
+                        chunk = source.read(min(1024 * 1024, allowed_member_bytes - copied_bytes + 1))
+                        if not chunk:
+                            break
+                        if copied_bytes + len(chunk) > allowed_member_bytes:
+                            exceeded_stream_limit = True
+                            break
+                        target.write(chunk)
+                        copied_bytes += len(chunk)
+            except (OSError, ValueError) as exc:
+                destination.unlink(missing_ok=True)
+                base["warnings"].append("压缩包成员 {} 写入失败：{}".format(member_name, str(exc)[:160]))
+                continue
+            if exceeded_stream_limit:
+                destination.unlink(missing_ok=True)
+                base["warnings"].append("已中止实际解压后超过限制的压缩包成员：{}".format(member_name))
+                continue
+            # Resolve once more after writing.  This catches a symlink race and
+            # prevents a later parser from reading a path outside the sandbox.
+            if _safe_archive_destination(temp_root, member_name) != destination:
+                destination.unlink(missing_ok=True)
+                base["warnings"].append("已丢弃写入后越界的压缩包成员：{}".format(member_name))
+                continue
+            actual_size = copied_bytes
             if actual_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + actual_size > ARCHIVE_MAX_TOTAL_BYTES:
                 destination.unlink(missing_ok=True)
                 base["warnings"].append("已跳过实际解压后超过限制的成员：{}".format(member_name))

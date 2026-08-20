@@ -1,7 +1,9 @@
 """Bounded, dependency-light profiling for CSV/XLSX/JSON data files."""
 
 import csv
+import codecs
 import json
+import os
 import re
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -67,7 +69,7 @@ def _kind(value):
     return "text"
 
 
-def _profile_rows(rows, columns, row_count, duplicate_rows, max_values=20):
+def _profile_rows(rows, columns, row_count, duplicate_rows, max_values=20, limits=None, status="completed"):
     result = {}
     for name, values in columns.items():
         kinds = Counter(_kind(value) for value in values)
@@ -117,6 +119,10 @@ def _profile_rows(rows, columns, row_count, duplicate_rows, max_values=20):
     uniqueness = sum(1 for item in result.values() if item.get("unique_count", 0) >= max(1, row_count * 0.9)) / float(len(result) or 1)
     duplicate_penalty = min(0.25, duplicate_rows / float(max(1, row_count)))
     quality = round(max(0.0, min(100.0, (completeness * 70 + uniqueness * 30) * (1 - duplicate_penalty))), 2)
+    if not row_count or not result:
+        # An empty/invalid source is not a moderately healthy dataset merely
+        # because there are no missing cells to count.
+        quality = 0.0
     missing_columns = [name for name, item in result.items() if item["missing_count"]]
     numeric_columns = [name for name, item in result.items() if item["inferred_type"] == "number"]
     temporal_columns = [name for name, item in result.items() if item["inferred_type"] == "datetime"]
@@ -148,60 +154,449 @@ def _profile_rows(rows, columns, row_count, duplicate_rows, max_values=20):
         recommendation_questions.append("不同地区/地点的数据分布和质量差异是什么？")
     if entity_statistics.get("event"):
         recommendation_questions.append("不同事件/类型/状态的数量和关键指标如何比较？")
+    profile_limits = {
+        "sampled": True,
+        "max_rows": _env_int("MAX_STRUCTURED_PROFILE_ROWS", 100000),
+    }
+    profile_limits.update(limits or {})
+    truncated = bool(profile_limits.get("truncated"))
     return {
-        "schema_version": "structured-profile/1.0", "status": "completed", "row_count": row_count,
+        "schema_version": "structured-profile/1.1", "status": status, "row_count": row_count,
         "column_count": len(result), "columns": result, "duplicate_row_count": duplicate_rows,
         "quality_score": quality, "missing_columns": missing_columns, "numeric_columns": numeric_columns,
         "temporal_columns": temporal_columns, "sensitive_columns": sensitive_columns,
         "entity_columns": entity_columns, "entity_statistics": entity_statistics,
         "recommendation_questions": recommendation_questions[:8],
+        "coverage": {
+            "complete": bool(status == "completed" and not truncated),
+            "truncated": truncated,
+            "sampled_rows": row_count,
+            "truncation_reasons": list(profile_limits.get("truncation_reasons") or []),
+        },
         "value_judgment": {
             "usable": bool(row_count and result),
             "value_level": "高" if quality >= 80 and row_count >= 10 else ("中" if quality >= 50 else "待治理"),
             "reason": "包含可统计字段、{} 行记录，数据质量评分 {} / 100。".format(row_count, quality),
             "recommended_next_steps": (["脱敏后进行精确统计"] if sensitive_columns else []) + (["核查缺失值和重复记录"] if missing_columns or duplicate_rows else []) + (["按时间字段做趋势分析"] if temporal_columns else []),
         },
-        "limits": {"sampled": True, "max_rows": _env_int("MAX_STRUCTURED_PROFILE_ROWS", 100000)},
+        "limits": profile_limits,
     }
+
+
+def _detect_text_encoding(path, probe_bytes=1024 * 1024):
+    """Detect the small set of encodings commonly emitted by Chinese tools.
+
+    UTF-8 is tried first, then GB18030 (a superset that can decode GBK and
+    GB2312).  The probe is bounded and never reads an entire large source.
+    """
+    with Path(path).open("rb") as stream:
+        sample = stream.read(max(1, probe_bytes))
+    if sample.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff", b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return "utf-16"
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            sample.decode(encoding, errors="strict")
+            return encoding
+        except UnicodeDecodeError as exc:
+            # A bounded probe can end halfway through a multibyte UTF-8
+            # character.  Treat only that trailing fragment as incomplete;
+            # invalid bytes in the middle still cause the next codec to be
+            # tried.
+            if encoding == "utf-8" and exc.start >= max(0, len(sample) - 4):
+                try:
+                    sample[: exc.start].decode("utf-8", errors="strict")
+                    return encoding
+                except UnicodeDecodeError:
+                    pass
+            continue
+    # Keep the parser usable for mixed/broken exports.  Replacement characters
+    # are counted and surfaced in the profile instead of being silently hidden.
+    return "utf-8"
+
+
+class _BoundedLineReader:
+    """Yield decoded lines while reading at most ``limit`` source bytes."""
+
+    def __init__(self, path, limit, encoding, max_line_bytes=None):
+        self.stream = Path(path).open("rb")
+        self.limit = max(1, int(limit))
+        self.encoding = encoding
+        self.max_line_bytes = max(1, int(max_line_bytes)) if max_line_bytes else None
+        self.bytes_read = 0
+        self.replacement_count = 0
+        self.hit_limit = False
+        self.cut_mid_record = False
+        self.source_record_exceeded_limit = False
+        self._discarding_line = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            if self._discarding_line:
+                # Consume the remainder of an overlong logical record in
+                # bounded chunks.  It must not be exposed as a second record
+                # to csv.reader/json.loads on the next iteration.
+                while self.bytes_read < self.limit:
+                    remaining = self.limit - self.bytes_read
+                    discard_size = min(remaining, self.max_line_bytes or remaining)
+                    discarded = self.stream.readline(discard_size)
+                    if not discarded:
+                        self._discarding_line = False
+                        raise StopIteration
+                    self.bytes_read += len(discarded)
+                    if discarded.endswith((b"\n", b"\r")):
+                        self._discarding_line = False
+                        break
+                if self._discarding_line or self.bytes_read >= self.limit:
+                    self._discarding_line = False
+                    self.hit_limit = self.bytes_read >= self.limit
+                    raise StopIteration
+                continue
+            if self.bytes_read >= self.limit:
+                self.hit_limit = True
+                raise StopIteration
+            remaining = self.limit - self.bytes_read
+            read_size = remaining
+            if self.max_line_bytes:
+                read_size = min(read_size, self.max_line_bytes)
+            raw = self.stream.readline(read_size)
+            if not raw:
+                self._discarding_line = False
+                raise StopIteration
+            self.bytes_read += len(raw)
+            ended = raw.endswith((b"\n", b"\r"))
+            if not ended and len(raw) >= read_size:
+                self.cut_mid_record = True
+                if self.max_line_bytes and read_size == self.max_line_bytes and self.bytes_read < self.limit:
+                    self.source_record_exceeded_limit = True
+                if self.bytes_read >= self.limit:
+                    self.hit_limit = True
+                # Yield the bounded prefix once, then consume the rest of this
+                # overlong record without ever placing it in memory.
+                self._discarding_line = True
+            if self._discarding_line and ended:
+                self._discarding_line = False
+            text = raw.decode(self.encoding, errors="replace")
+            self.replacement_count += text.count("\ufffd")
+            if self._discarding_line and not ended:
+                # This is the first prefix of an overlong line.  The next call
+                # enters the discard branch below; the JSONL/CSV caller sees a
+                # parse error/partial record rather than a fake second row.
+                return text
+            return text
+
+    def close(self):
+        self.stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        self.close()
+
+
+class _LimitedBinaryStream:
+    """File-like adapter used by ijson so a malformed 5GB source is bounded."""
+
+    def __init__(self, stream, limit):
+        self.stream = stream
+        self.limit = max(1, int(limit))
+        self.bytes_read = 0
+
+    def readable(self):
+        return True
+
+    def read(self, size=-1):
+        remaining = self.limit - self.bytes_read
+        if remaining <= 0:
+            return b""
+        if size is None or size < 0 or size > remaining:
+            size = remaining
+        data = self.stream.read(size)
+        self.bytes_read += len(data)
+        return data
+
+    def readline(self, size=-1):
+        remaining = self.limit - self.bytes_read
+        if remaining <= 0:
+            return b""
+        if size is None or size < 0 or size > remaining:
+            size = remaining
+        data = self.stream.readline(size)
+        self.bytes_read += len(data)
+        return data
+
+
+class _IncrementalJsonReader:
+    """Incrementally decode JSON without materialising the source document."""
+
+    def __init__(self, path, encoding, max_bytes, max_record_chars):
+        self.source = Path(path).open("rb")
+        self.stream = _LimitedBinaryStream(self.source, max_bytes)
+        codec = "utf-8" if encoding == "utf-8-sig" else encoding
+        self.decoder = codecs.getincrementaldecoder(codec)(errors="replace")
+        self.buffer = ""
+        self.eof = False
+        self.max_record_chars = max(1024, int(max_record_chars))
+        self.replacement_characters = 0
+
+    @property
+    def bytes_read(self):
+        return self.stream.bytes_read
+
+    def close(self):
+        self.source.close()
+
+    def _read_more(self):
+        if self.eof:
+            return False
+        raw = self.stream.read(64 * 1024)
+        if raw:
+            text = self.decoder.decode(raw, final=False)
+            self.replacement_characters += text.count("\ufffd")
+            self.buffer += text
+            return True
+        tail = self.decoder.decode(b"", final=True)
+        self.replacement_characters += tail.count("\ufffd")
+        self.buffer += tail
+        self.eof = True
+        return bool(tail)
+
+    def skip_whitespace(self):
+        while True:
+            self.buffer = self.buffer.lstrip()
+            if self.buffer:
+                return True
+            if not self._read_more():
+                return False
+
+    def parse_value(self):
+        decoder = json.JSONDecoder()
+        while True:
+            if not self.skip_whitespace():
+                raise ValueError("JSON 文档意外结束")
+            try:
+                value, end = decoder.raw_decode(self.buffer)
+                self.buffer = self.buffer[end:]
+                return value
+            except json.JSONDecodeError as exc:
+                if self.eof:
+                    raise ValueError("JSON 文档不完整：{}".format(exc)) from exc
+                if len(self.buffer) > self.max_record_chars:
+                    raise ValueError("单条 JSON 记录超过安全上限 {} 字符".format(self.max_record_chars)) from exc
+                if not self._read_more():
+                    raise ValueError("JSON 文档意外结束") from exc
+
+
+def _iter_json_incremental(path, encoding, max_rows, max_bytes):
+    """Parse a JSON array/root object with a bounded incremental reader.
+
+    Returns ``None`` when the source cannot be classified from its first token;
+    callers can then use the optional ijson path.  The returned values are
+    already limited to dictionaries because those are the rows understood by
+    the profile engine.
+    """
+    max_record_chars = _env_int("MAX_STRUCTURED_JSON_RECORD_CHARS", 16 * 1024 * 1024)
+    reader = _IncrementalJsonReader(path, encoding, max_bytes, max_record_chars)
+    rows = []
+    stopped_for_row_limit = False
+    metadata = {
+        "streaming": True,
+        "truncated": Path(path).stat().st_size > max_bytes,
+        "truncation_reasons": ["byte_limit"] if Path(path).stat().st_size > max_bytes else [],
+        "parse_errors": 0,
+    }
+    try:
+        if not reader.skip_whitespace():
+            return rows, metadata
+        if reader.buffer.startswith("\ufeff"):
+            reader.buffer = reader.buffer[1:]
+            if not reader.skip_whitespace():
+                return rows, metadata
+        is_array = reader.buffer.startswith("[")
+        if is_array:
+            reader.buffer = reader.buffer[1:]
+            while True:
+                if not reader.skip_whitespace():
+                    raise ValueError("JSON 数组缺少结束符")
+                if reader.buffer.startswith("]"):
+                    reader.buffer = reader.buffer[1:]
+                    break
+                if len(rows) >= max_rows:
+                    metadata["truncated"] = True
+                    metadata["truncation_reasons"].append("row_limit")
+                    stopped_for_row_limit = True
+                    break
+                value = reader.parse_value()
+                if isinstance(value, dict):
+                    rows.append(value)
+                else:
+                    metadata["parse_errors"] += 1
+                if not reader.skip_whitespace():
+                    raise ValueError("JSON 数组缺少逗号或结束符")
+                if reader.buffer.startswith(","):
+                    reader.buffer = reader.buffer[1:]
+                    continue
+                if reader.buffer.startswith("]"):
+                    reader.buffer = reader.buffer[1:]
+                    break
+                raise ValueError("JSON 数组成员之间缺少逗号")
+        else:
+            value = reader.parse_value()
+            if isinstance(value, dict):
+                rows.append(value)
+            elif isinstance(value, list):
+                rows = [item for item in value[:max_rows] if isinstance(item, dict)]
+                if len(value) > max_rows:
+                    metadata["truncated"] = True
+                    metadata["truncation_reasons"].append("row_limit")
+        if not stopped_for_row_limit:
+            reader.skip_whitespace()
+        if reader.buffer.strip() and not stopped_for_row_limit:
+            # Trailing non-whitespace is malformed, even if the leading rows
+            # were valid.  Keep the rows but make the partial result visible.
+            raise ValueError("JSON 文档包含尾随非空内容")
+    except ValueError as exc:
+        metadata["parse_errors"] += 1
+        metadata["parse_error"] = str(exc)[:300]
+    finally:
+        metadata["sampled_bytes"] = reader.bytes_read
+        metadata["replacement_characters"] = reader.replacement_characters
+        reader.close()
+    return rows, metadata
+
+
+def _column_names(header):
+    seen, names = Counter(), []
+    for index, name in enumerate(header or []):
+        name = str(name).strip() or "column_{}".format(index + 1)
+        seen[name] += 1
+        names.append(name if seen[name] == 1 else "{}_{}".format(name, seen[name]))
+    return names
 
 
 def _iter_csv(path, max_rows, max_bytes):
     rows = []
-    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
-        reader = csv.reader(stream, delimiter="\t" if path.suffix.lower() == ".tsv" else ",")
-        header = next(reader, None)
-        if not header:
-            return rows, [], 0
-        seen, names = Counter(), []
-        for index, name in enumerate(header):
-            name = str(name).strip() or "column_{}".format(index + 1)
-            seen[name] += 1
-            names.append(name if seen[name] == 1 else "{}_{}".format(name, seen[name]))
-        consumed = 0
-        for values in reader:
-            consumed += sum(len(str(value)) for value in values)
-            if consumed > max_bytes or len(rows) >= max_rows:
-                break
-            rows.append(dict(zip(names, values)))
-        return rows, names, consumed
+    names = []
+    encoding = _detect_text_encoding(path)
+    meta = {
+        "encoding": encoding,
+        "source_bytes": Path(path).stat().st_size,
+        "sampled_bytes": 0,
+        "truncated": False,
+        "truncation_reasons": [],
+        "parse_errors": 0,
+        "streaming": True,
+    }
+    with _BoundedLineReader(
+        path, max_bytes, encoding,
+        max_line_bytes=min(max_bytes, 64 * 1024 * 1024),
+    ) as lines:
+        reader = csv.reader(lines, delimiter="\t" if Path(path).suffix.lower() == ".tsv" else ",")
+        try:
+            header = next(reader, None)
+            names = _column_names(header)
+            if not names:
+                meta["sampled_bytes"] = lines.bytes_read
+                return rows, [], meta["sampled_bytes"], meta
+            try:
+                csv.field_size_limit(max(128 * 1024, min(max_bytes, 64 * 1024 * 1024)))
+            except (OverflowError, ValueError):
+                pass
+            for values in reader:
+                if len(rows) >= max_rows:
+                    meta["truncated"] = True
+                    meta["truncation_reasons"].append("row_limit")
+                    break
+                rows.append(dict(zip(names, values)))
+        except csv.Error as exc:
+            meta["parse_errors"] += 1
+            meta["parse_error"] = str(exc)[:300]
+        meta["sampled_bytes"] = lines.bytes_read
+        meta["replacement_characters"] = lines.replacement_count
+        if lines.hit_limit or meta["source_bytes"] > max_bytes:
+            meta["truncated"] = True
+            if "byte_limit" not in meta["truncation_reasons"]:
+                meta["truncation_reasons"].append("byte_limit")
+        if lines.cut_mid_record and "partial_record" not in meta["truncation_reasons"]:
+            meta["truncation_reasons"].append("partial_record")
+            if lines.source_record_exceeded_limit and "record_limit" not in meta["truncation_reasons"]:
+                meta["truncation_reasons"].append("record_limit")
+    return rows, names, meta["sampled_bytes"], meta
 
 
 def _iter_json(path, max_rows, max_bytes):
-    raw = path.read_bytes()[: max_bytes + 1]
-    text = raw[:max_bytes].decode("utf-8-sig", errors="replace")
-    try:
-        if path.suffix.lower() == ".jsonl":
-            values = [json.loads(line) for line in text.splitlines() if line.strip()][:max_rows]
-        else:
-            value = json.loads(text)
-            values = value if isinstance(value, list) else ([value] if isinstance(value, dict) else [])
-            values = values[:max_rows]
-    except (ValueError, TypeError):
-        return [], [], len(raw)
-    if not values or not isinstance(values[0], dict):
-        return [], [], len(raw)
-    names = list(dict.fromkeys(key for item in values if isinstance(item, dict) for key in item))
-    return [{name: item.get(name) for name in names} for item in values if isinstance(item, dict)], names, len(raw)
+    path = Path(path)
+    source_bytes = path.stat().st_size
+    encoding = _detect_text_encoding(path)
+    meta = {
+        "encoding": encoding,
+        "source_bytes": source_bytes,
+        "sampled_bytes": 0,
+        "truncated": source_bytes > max_bytes,
+        "truncation_reasons": ["byte_limit"] if source_bytes > max_bytes else [],
+        "parse_errors": 0,
+        "streaming": False,
+    }
+    rows = []
+
+    if path.suffix.lower() == ".jsonl":
+        meta["streaming"] = True
+        record_limit = _env_int("MAX_STRUCTURED_JSON_RECORD_BYTES", 16 * 1024 * 1024)
+        with _BoundedLineReader(path, max_bytes, encoding, max_line_bytes=record_limit) as lines:
+            for line in lines:
+                if not line.strip():
+                    continue
+                if len(rows) >= max_rows:
+                    meta["truncated"] = True
+                    meta["truncation_reasons"].append("row_limit")
+                    break
+                try:
+                    value = json.loads(line)
+                except (ValueError, TypeError) as exc:
+                    meta["parse_errors"] += 1
+                    meta.setdefault("parse_error_samples", []).append(str(exc)[:160])
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+                else:
+                    meta["parse_errors"] += 1
+            meta["sampled_bytes"] = lines.bytes_read
+            meta["replacement_characters"] = lines.replacement_count
+            if lines.hit_limit or meta["source_bytes"] > max_bytes or lines.cut_mid_record:
+                meta["truncated"] = True
+                if (lines.hit_limit or meta["source_bytes"] > max_bytes) and "byte_limit" not in meta["truncation_reasons"]:
+                    meta["truncation_reasons"].append("byte_limit")
+                if lines.cut_mid_record and "partial_record" not in meta["truncation_reasons"]:
+                    meta["truncation_reasons"].append("partial_record")
+                if lines.source_record_exceeded_limit and "record_limit" not in meta["truncation_reasons"]:
+                    meta["truncation_reasons"].append("record_limit")
+    else:
+        # Keep one bounded implementation for every encoding.  Some streaming
+        # JSON libraries materialise each object without a per-record limit;
+        # the local reader enforces both a byte budget and a record budget even
+        # when an input contains one pathological 5GB value.
+        incremental_rows, incremental_meta = _iter_json_incremental(
+            path, encoding, max_rows, max_bytes
+        )
+        rows = incremental_rows
+        for key, value in incremental_meta.items():
+            if key == "truncation_reasons":
+                meta[key] = list(dict.fromkeys((meta.get(key) or []) + (value or [])))
+            else:
+                meta[key] = value
+        meta["streaming"] = True
+
+    if meta["source_bytes"] > max_bytes and "byte_limit" not in meta["truncation_reasons"]:
+        meta["truncated"] = True
+        meta["truncation_reasons"].append("byte_limit")
+    names = list(dict.fromkeys(key for item in rows if isinstance(item, dict) for key in item))
+    rows = [{name: item.get(name) for name in names} for item in rows if isinstance(item, dict)]
+    return rows, names, meta["sampled_bytes"], meta
 
 
 def profile_path(path, max_rows=None, max_bytes=None):
@@ -212,12 +607,13 @@ def profile_path(path, max_rows=None, max_bytes=None):
     max_rows = max_rows or _env_int("MAX_STRUCTURED_PROFILE_ROWS", 100000)
     max_bytes = max_bytes or _env_int("MAX_STRUCTURED_PROFILE_BYTES", 256 * 1024 * 1024)
     if path.stat().st_size > max_bytes and ext in {".xlsx", ".xlsm"}:
-        return {"schema_version": "structured-profile/1.0", "status": "skipped", "reason": "文件超过结构化画像大小上限", "value_judgment": {"usable": False, "value_level": "待治理"}}
+        return {"schema_version": "structured-profile/1.1", "status": "skipped", "reason": "文件超过结构化画像大小上限", "limits": {"sampled": False, "source_bytes": path.stat().st_size, "max_bytes": max_bytes, "truncated": True, "truncation_reasons": ["byte_limit"]}, "coverage": {"complete": False, "truncated": True, "sampled_rows": 0, "truncation_reasons": ["byte_limit"]}, "value_judgment": {"usable": False, "value_level": "待治理"}}
+    metadata = {"encoding": None, "source_bytes": path.stat().st_size, "sampled_bytes": 0, "truncated": False, "truncation_reasons": [], "parse_errors": 0}
     try:
         if ext in {".csv", ".tsv"}:
-            rows, names, consumed = _iter_csv(path, max_rows, max_bytes)
+            rows, names, consumed, metadata = _iter_csv(path, max_rows, max_bytes)
         elif ext in {".json", ".jsonl"}:
-            rows, names, consumed = _iter_json(path, max_rows, max_bytes)
+            rows, names, consumed, metadata = _iter_json(path, max_rows, max_bytes)
         else:
             from openpyxl import load_workbook
             book = load_workbook(str(path), read_only=True, data_only=True)
@@ -228,12 +624,14 @@ def profile_path(path, max_rows=None, max_bytes=None):
             rows = []
             for values in iterator:
                 if len(rows) >= max_rows:
+                    metadata["truncated"] = True
+                    metadata["truncation_reasons"].append("row_limit")
                     break
                 rows.append(dict(zip(names, values)))
             consumed = path.stat().st_size
             book.close()
     except Exception as exc:
-        return {"schema_version": "structured-profile/1.0", "status": "failed", "error": str(exc)[:300], "value_judgment": {"usable": False, "value_level": "待治理"}}
+        return {"schema_version": "structured-profile/1.1", "status": "failed", "error": str(exc)[:300], "coverage": {"complete": False, "truncated": False, "sampled_rows": 0, "truncation_reasons": []}, "value_judgment": {"usable": False, "value_level": "待治理"}}
     columns = defaultdict(list)
     duplicate_counter = Counter()
     for row in rows:
@@ -241,7 +639,27 @@ def profile_path(path, max_rows=None, max_bytes=None):
         for name in names:
             columns[name].append(row.get(name))
     duplicate_rows = sum(count - 1 for count in duplicate_counter.values() if count > 1)
-    profile = _profile_rows(rows, columns, len(rows), duplicate_rows)
-    profile["source"] = {"path": str(path), "extension": ext, "size": path.stat().st_size}
-    profile["limits"].update({"sampled_bytes": consumed, "source_bytes": path.stat().st_size})
+    status = "completed"
+    if metadata.get("truncated") or metadata.get("parse_errors"):
+        status = "partial" if rows else "failed"
+    if metadata.get("replacement_characters"):
+        metadata.setdefault("warnings", []).append("文本编码存在无法解码的字符，已使用替换字符；请核对原始文件。")
+    if metadata.get("truncated"):
+        metadata.setdefault("warnings", []).append("画像仅覆盖文件的有界采样范围，未将其视为完整数据集。")
+    profile = _profile_rows(rows, columns, len(rows), duplicate_rows, limits={
+        "max_rows": max_rows,
+        "max_bytes": max_bytes,
+        "sampled_bytes": consumed,
+        "source_bytes": path.stat().st_size,
+        "encoding": metadata.get("encoding"),
+        "truncated": bool(metadata.get("truncated")),
+        "truncation_reasons": list(dict.fromkeys(metadata.get("truncation_reasons") or [])),
+        "parse_errors": int(metadata.get("parse_errors") or 0),
+        "streaming": bool(metadata.get("streaming", False)),
+    }, status=status)
+    profile["source"] = {"path": str(path), "extension": ext, "size": path.stat().st_size, "encoding": metadata.get("encoding")}
+    if metadata.get("parse_error"):
+        profile["warnings"] = ["结构化数据解析未完全成功：{}".format(metadata["parse_error"])]
+    if metadata.get("warnings"):
+        profile.setdefault("warnings", []).extend(metadata["warnings"])
     return profile

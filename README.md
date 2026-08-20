@@ -53,7 +53,7 @@ SQLite WAL（任务、进度、结果、检查点）
 本地 Ollama / 本地解析器
 ```
 
-Web 与 Worker 必须同时运行。只启动 `app.py` 时页面可以打开，但分析任务不会被执行。项目默认只允许一个 Worker，以免多个任务同时占用共享 GPU。
+Web 与 Worker 必须同时运行。只启动 `app.py` 时页面可以打开，但分析任务不会被执行。Worker 启动时不再导入 Web 应用；只有真正领取任务时才懒加载分析执行器，因此可选 Docling/OCR 依赖损坏不会让任务队列连启动都失败。项目默认只允许一个 Worker，以免多个任务同时占用共享 GPU。
 
 ## 4. 环境要求
 
@@ -65,6 +65,19 @@ Web 与 Worker 必须同时运行。只启动 `app.py` 时页面可以打开，�
 - 足够存放原始资料、解析侧存和导出包的磁盘空间；
 - 可选的本地 Ollama，用于主题命名和深度摘要；
 - 可选的本地 Docling/RapidOCR 模型，用于高精度版面、表格和 OCR。
+
+Ubuntu/Debian 服务器建议先安装解析器所需的系统库（没有图像/PDF任务时也可以先跳过）：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+# 只有需要损坏 PDF 修复时才需要：
+sudo apt-get install -y qpdf
+```
+
+`libgl1`/`libglib2.0-0` 用于 ONNX/OCR 的动态库加载；缺少它们时，普通 TXT/CSV
+仍可工作，但图片或扫描 PDF 可能在导入阶段失败。生产部署应把 Python 直接依赖
+和系统库一起写入镜像/运维脚本，不要在任务运行时临时联网安装。
 
 没有 Ollama 时，扫描、基础解析、本地规则概览、目录和证据组织仍可工作，但模型增强摘要会降级。没有 Docling 离线模型时，系统会尝试其他可用解析器并标记解析覆盖情况。
 
@@ -105,6 +118,18 @@ python -m venv .venv
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+安装后建议检查原生依赖是否冲突：
+
+```bash
+python -m pip check
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python -c "import onnxruntime as o; print(o.get_available_providers())"
+```
+
+Docling 会带来 PyTorch/ONNX 等原生依赖。不要在同一个虚拟环境中随意混装不同
+CUDA 版 `torch`、`onnxruntime-gpu` 或 FAISS；本项目默认使用 CPU Docling/RapidOCR，
+Qwen 的 GPU 由本地 Ollama 独占。更换芯片或 CUDA 后应先单独验证上述命令。
 
 ### 第三步：创建配置
 
@@ -279,6 +304,8 @@ http://服务器IP:18000
 4. 必要时再次执行，直到关注范围达到所需覆盖率。
 
 系统会复用已解析文件和检查点，不会故意重复处理同一内容。
+结构化 CSV/JSON 画像如果达到行数或字节上限，会标为 `partial`，仍可用于概览和
+精确统计，但结果会明确带“有界采样”警告，不能把样本统计误当成全量结论。
 
 ### 6.9 重试失败文件
 
@@ -328,7 +355,23 @@ MAX_SCAN_DEPTH=32
 MAX_SINGLE_FILE_BYTES=10737418240
 MAX_PARSE_SECONDS=300
 MAX_WORKER_MEMORY_MB=8192
+MAX_PARSE_PROCESS_MEMORY_MB=8192
+ENABLE_PARSE_PROCESS_ISOLATION=1
+MAX_STRUCTURED_PROFILE_ROWS=100000
+MAX_STRUCTURED_PROFILE_BYTES=268435456
+MAX_STRUCTURED_JSON_RECORD_BYTES=16777216
+MAX_STRUCTURED_JSON_RECORD_CHARS=16777216
 MAX_EXPORT_BYTES=5368709120
+
+# Docling/RapidOCR 默认只使用 CPU，给本地 Qwen/ Ollama 留出 GPU 显存。
+DOCLING_DEVICE=cpu
+DOCLING_CPU_THREADS=4
+
+# SQLite WAL 维护（Worker 启动和周期性执行 checkpoint）。
+SJFX_SQLITE_BUSY_TIMEOUT_MS=30000
+SJFX_SQLITE_WAL_AUTOCHECKPOINT=1000
+SJFX_SQLITE_JOURNAL_SIZE_LIMIT=67108864
+SJFX_SQLITE_CHECKPOINT_INTERVAL=60
 
 LARGE_PACKAGE_THRESHOLD_BYTES=1073741824
 LARGE_PACKAGE_THRESHOLD_FILES=3000
@@ -347,6 +390,9 @@ LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE=30000
 - 扫描、任务、结果和下载按 Token 的不可逆指纹隔离。
 - 浏览器把 Token 保存在当前浏览器的 localStorage 中，下载时也会自动携带请求头。
 - 不同 Token 无法读取彼此的扫描和成果。
+- 可选设置 `SJFX_API_TOKEN_EXPIRES_AT`（UTC epoch 或 ISO-8601 时间）让泄露的 Token
+  自动失效；修改 Token 或过期时间后必须重启 Web 和 Worker。未设置时仍建议定期更换
+  `.env` 中的 Token。
 
 如果浏览器保存了错误 Token，按 `F12` 打开控制台并执行：
 
@@ -364,7 +410,15 @@ localStorage.removeItem('sjfx_api_token')
 SCAN_ALLOWED_ROOTS=/data/incoming:/data/research
 ```
 
+Windows 使用分号分隔（例如 `C:\data;D:\research`），不会把盘符中的冒号误当成分隔符。
+
 系统不会跟随符号链接，并限制目录深度、文件总数、单文件体积、解析时间和 Worker 内存。
+每个真实文档默认在独立解析进程中执行；超过 `MAX_PARSE_SECONDS` 或
+`MAX_PARSE_PROCESS_MEMORY_MB` 会终止该子进程并把文件标记为可重试失败，主 Worker
+不会被损坏的 PDF/OCR 调用永久卡住。需要排查兼容性时可临时设
+`ENABLE_PARSE_PROCESS_ISOLATION=0`，验证后应恢复为 `1`。
+Linux 默认使用 `fork` 以减少子进程启动成本；如果未来在 Worker 内预加载了 CUDA/PyTorch，
+建议改为 `SJFX_PARSE_START_METHOD=spawn`，避免原生运行时继承状态。
 
 ### 压缩包边界
 
@@ -482,6 +536,13 @@ ollama list
 - 是否可以先用“快速解析”，再对重点文件做补充高精度分析。
 
 修复源文件或配置后，点击“重试失败文件”。
+
+### 单个损坏文件超时，其他文件是否会继续
+
+会。真实文档默认在独立解析子进程中运行；达到单文件时间或内存上限后，子进程会
+被终止，当前文件进入失败清单，Worker 继续处理队列。先查看失败原因，再使用“重试
+失败文件”或切换快速解析模式。不要为了一个异常文件把 `MAX_PARSE_SECONDS` 和
+`MAX_PARSE_PROCESS_MEMORY_MB` 无限调大。
 
 ### 证据链出现标题或问题复述
 
