@@ -108,6 +108,9 @@ class Config:
     MAX_FULL_DOCUMENT_CHARS = int(os.getenv("MAX_FULL_DOCUMENT_CHARS", "2000000"))
     MAX_SINGLE_FILE_BYTES = int(os.getenv("MAX_SINGLE_FILE_BYTES", str(1024 * 1024 * 1024)))
     MAX_PARSE_SECONDS = max(1, int(os.getenv("MAX_PARSE_SECONDS", "300")))
+    # Large archives can become visible on a NAS before their copy finishes.
+    # Observe them briefly so an incomplete ZIP is reported as changing input.
+    SOURCE_STABILITY_SECONDS = max(0.0, min(10.0, float(os.getenv("SOURCE_STABILITY_SECONDS", "2"))))
     MAX_WORKER_MEMORY_MB = max(256, int(os.getenv("MAX_WORKER_MEMORY_MB", "8192")))
     MAX_PARSE_PROCESS_MEMORY_MB = max(
         256,

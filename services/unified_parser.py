@@ -581,7 +581,12 @@ class UnifiedDocumentParser:
             base["warnings"].append("当前环境未安装 RAR/7z 解包组件；仅保留压缩包元数据。")
         except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as exc:
             base["parser"]["degraded"] = True
-            base["warnings"].append("压缩包展开失败：{}".format(exc))
+            if isinstance(exc, zipfile.BadZipFile):
+                base["warnings"].append(
+                    "ZIP 中央目录不可用：文件可能仍在复制、已经损坏、被加密或属于未收齐的分卷压缩包（{}）".format(exc)
+                )
+            else:
+                base["warnings"].append("压缩包展开失败：{}".format(exc))
         finally:
             shutil.rmtree(str(temp_root), ignore_errors=True)
 

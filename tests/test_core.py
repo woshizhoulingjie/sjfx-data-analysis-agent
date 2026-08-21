@@ -9,7 +9,18 @@ from services.ollama import OllamaClient
 from services.document_analysis import _local_merge
 from services.evidence import select_evidence, set_embedding_provider
 from services.exporter import export_node
-from services.package_analysis import _document_role, _group_similar, _hamming, _topic_clusters, _walk_files, analyze_package, simhash64
+from services.package_analysis import (
+    SourceFileChangedError,
+    _assert_source_stable,
+    _source_has_open_writer,
+    _document_role,
+    _group_similar,
+    _hamming,
+    _topic_clusters,
+    _walk_files,
+    analyze_package,
+    simhash64,
+)
 from services.reporting import build_local_report, build_report_analysis_prompt, merge_model_report
 from services.folder_analysis import analyze_folder
 from services.model_output import ModelOutputError, extract_json_value, validate_json_object
@@ -548,6 +559,34 @@ class CoreRegressionTests(unittest.TestCase):
             root = Path(folder)
             with self.assertRaises(ValueError):
                 resolve_under(root, "../outside.txt")
+
+    def test_source_changed_after_scan_is_rejected_before_parse(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = root / "copying.zip"
+            path.write_bytes(b"first")
+            file_node = next(_walk_files(scan_directory(root)["tree"]))
+            path.write_bytes(b"first-second")
+            with self.assertRaisesRegex(SourceFileChangedError, "仍在复制|扫描后发生变化"):
+                _assert_source_stable(path, file_node)
+
+    def test_bad_zip_warning_explains_incomplete_copy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "broken.zip"
+            path.write_bytes(b"PK\x03\x04incomplete")
+            document = UnifiedDocumentParser(max_chars=1000).parse(path, "broken.zip")
+            self.assertTrue(document["parser"]["degraded"])
+            self.assertTrue(any("仍在复制" in item and "ZIP 中央目录" in item for item in document["warnings"]))
+
+    def test_linux_open_archive_writer_is_detected(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("Linux /proc is required for open-writer detection")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "upload.zip"
+            with path.open("wb") as handle:
+                handle.write(b"partial")
+                handle.flush()
+                self.assertTrue(_source_has_open_writer(path))
 
     def test_long_text_reports_coverage_and_chunks_evidence(self):
         with tempfile.TemporaryDirectory() as folder:

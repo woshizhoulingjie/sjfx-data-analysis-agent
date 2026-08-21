@@ -1,0 +1,25 @@
+button.danger {
+  color: var(--danger);
+  background: #fff4f1;
+  border-color: #e4b8b0;
+  font-weight: 700;
+}
+
+button.danger:hover:not(:disabled) {
+  background: #fbe8e4;
+  border-color: #ce8f83;
+}
+
+.task-center-main .task-actions {
+  align-items: center;
+}
+
+.task-center-main .task-actions button {
+  margin: 0;
+}
+
+.task-center-side .task-safety-note {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}

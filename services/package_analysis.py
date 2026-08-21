@@ -134,6 +134,101 @@ def _now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+class SourceFileChangedError(RuntimeError):
+    """Raised when a source is still being copied or changed after inventory."""
+
+
+def _stat_signature(path):
+    stat = Path(path).stat()
+    return int(stat.st_size), int(stat.st_mtime_ns)
+
+
+def _inventory_mtime_seconds(file_node):
+    value = str(file_node.get("modified_at") or "").strip()
+    if not value:
+        return None
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _is_archive_node(file_node):
+    name = str(file_node.get("path") or file_node.get("name") or "").lower()
+    return name.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".gz", ".bz2", ".7z", ".rar"))
+
+
+def _source_has_open_writer(path):
+    """Best-effort Linux check for an uploader that still owns a write fd."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return False
+    target = str(Path(path).resolve())
+    try:
+        processes = proc_root.iterdir()
+    except OSError:
+        return False
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        fd_root = process / "fd"
+        try:
+            descriptors = list(fd_root.iterdir())
+        except (OSError, PermissionError):
+            continue
+        for descriptor in descriptors:
+            try:
+                if os.path.realpath(str(descriptor)) != target:
+                    continue
+                flags_line = next(
+                    (line for line in (process / "fdinfo" / descriptor.name).read_text(encoding="ascii").splitlines() if line.startswith("flags:")),
+                    "",
+                )
+                flags = int(flags_line.split()[1], 8)
+                if flags & os.O_ACCMODE in {os.O_WRONLY, os.O_RDWR}:
+                    return True
+            except (OSError, PermissionError, ValueError, IndexError, StopIteration):
+                continue
+    return False
+
+
+def _assert_source_stable(path, file_node, previous_signature=None, cancel_check=None):
+    """Verify that parsing reads the exact file recorded by the inventory."""
+    current = _stat_signature(path)
+    expected_size = int(file_node.get("size") or 0)
+    expected_mtime = _inventory_mtime_seconds(file_node)
+    current_mtime = int(Path(path).stat().st_mtime)
+    if current[0] != expected_size or (expected_mtime is not None and current_mtime != expected_mtime):
+        raise SourceFileChangedError(
+            "源文件在目录扫描后发生变化（扫描时 {} 字节，当前 {} 字节）。"
+            "文件可能仍在复制；请等待复制完成后重新导入数据包。".format(expected_size, current[0])
+        )
+    if previous_signature is not None and current != previous_signature:
+        raise SourceFileChangedError(
+            "源文件在解析期间发生变化，结果已丢弃。请等待文件复制完成后重新导入数据包。"
+        )
+    if previous_signature is None and _is_archive_node(file_node) and _source_has_open_writer(path):
+        raise SourceFileChangedError(
+            "压缩包仍被上传或复制程序以写入方式打开，中央目录尚未就绪。"
+            "请等待复制完成、写入句柄关闭后重新导入数据包。"
+        )
+    observe_seconds = float(getattr(Config, "SOURCE_STABILITY_SECONDS", 0.0) or 0.0)
+    if previous_signature is None and observe_seconds > 0 and _is_archive_node(file_node):
+        deadline = time.monotonic() + observe_seconds
+        while time.monotonic() < deadline:
+            if cancel_check is not None and cancel_check():
+                raise ParseIsolationCancelled("任务已取消，停止检查源文件稳定性")
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+        observed = _stat_signature(path)
+        if observed != current:
+            raise SourceFileChangedError(
+                "压缩包仍在写入（{} 字节增至 {} 字节），尚不能安全展开。"
+                "请等待复制完成后重新导入数据包。".format(current[0], observed[0])
+            )
+        current = observed
+    return current
+
+
 def _parse_with_limits(parser, path, node_path, mode, cancel_check=None):
     """Apply per-file wall-clock and current-process-memory guards.
 
@@ -267,7 +362,9 @@ def _parallel_parse_files(
                 raise ParseIsolationCancelled("任务已取消，停止提交新的解析文件")
             path = resolve_under(scan_root, file_node["path"])
             try:
+                source_signature = _assert_source_stable(path, file_node, cancel_check=cancel_check)
                 document = _parse_with_limits(parser, path, file_node["path"], mode, cancel_check=cancel_check)
+                _assert_source_stable(path, file_node, previous_signature=source_signature, cancel_check=cancel_check)
                 item = (index, file_node, document, None)
             except ParseIsolationCancelled:
                 raise
@@ -297,6 +394,7 @@ def _parallel_parse_files(
             child_parser = getattr(_PARSE_THREAD_LOCAL, "parser", parser)
             path = resolve_under(scan_root, file_node["path"])
             try:
+                source_signature = _assert_source_stable(path, file_node, cancel_check=cancel_check)
                 document = _parse_with_limits(
                     child_parser,
                     path,
@@ -304,6 +402,7 @@ def _parallel_parse_files(
                     mode,
                     cancel_check=cancel_check,
                 )
+                _assert_source_stable(path, file_node, previous_signature=source_signature, cancel_check=cancel_check)
                 return index, file_node, document, None
             except ParseIsolationCancelled:
                 raise
@@ -2325,6 +2424,16 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         try:
             if error is not None:
                 raise error
+            if (
+                (document.get("parser") or {}).get("archive")
+                and not int((document.get("structure") or {}).get("archive_member_count") or 0)
+                and not str(document.get("text") or "").strip()
+            ):
+                details = "；".join(str(item) for item in document.get("warnings") or [] if item)
+                raise ValueError(
+                    "压缩包没有完成有效展开。{}。若文件正在复制，请等待完成后重新导入；"
+                    "若文件已完整，请检查是否损坏、加密或属于分卷压缩包。".format(details or "未发现可解析成员")
+                )
             if policy.get("enabled"):
                 document = compact_overview_document(document, policy["overview_chars_per_file"])
             documents[node_path] = document

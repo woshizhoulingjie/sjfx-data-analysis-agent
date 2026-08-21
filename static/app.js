@@ -1422,9 +1422,61 @@ async function refreshScan(scanId = state.scan?.scan_id) {
 }
 
 
+function updateJobControls(job = {}) {
+  const status = String(job.status || '').toLowerCase();
+  const active = ['queued', 'running', 'cancelling'].includes(status) && Boolean(state.jobId);
+  const cancelling = status === 'cancelling';
+  const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+  const stage = job.current_stage || job.stage || '';
+  const currentFile = job.current_file || '';
+  const detail = currentFile && currentFile !== stage
+    ? `${stage} · ${currentFile}`
+    : (stage || job.message || (active ? '任务运行中' : '当前没有运行中的任务'));
+  ['cancelJobBtn', 'taskCenterCancelBtn'].forEach((id) => {
+    const button = $(id);
+    if (!button) return;
+    button.disabled = !active || cancelling;
+    button.textContent = cancelling ? '正在取消…' : '取消当前任务';
+  });
+  if ($('jobStatusChip')) {
+    $('jobStatusChip').textContent = cancelling ? 'CANCELLING' : (active ? 'RUNNING' : (status || 'IDLE').toUpperCase());
+  }
+  if ($('taskCenterProgressBar')) $('taskCenterProgressBar').style.width = `${progress}%`;
+  if ($('taskCenterProgressText')) $('taskCenterProgressText').textContent = `${progress}% · ${detail}`;
+}
+
+
+async function cancelCurrentJob() {
+  const jobId = state.jobId;
+  if (!jobId) {
+    toast('当前没有可以取消的任务。');
+    return;
+  }
+  updateJobControls({ status: 'cancelling', progress: Number(($('progressBar')?.style.width || '0').replace('%', '')), message: '正在请求取消任务' });
+  try {
+    const data = await api(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    updateJobControls(data.job || { status: 'cancelling', message: '已发送取消请求' });
+    toast('已发送取消请求，Worker 正在安全停止当前步骤。');
+  } catch (error) {
+    updateJobControls({ status: 'running', message: '取消请求失败，任务仍在运行' });
+    toast(error.message || '取消任务失败', true);
+  }
+}
+
+
+document.addEventListener('click', (event) => {
+  const button = event.target.closest('#cancelJobBtn, #taskCenterCancelBtn');
+  if (!button) return;
+  event.preventDefault();
+  cancelCurrentJob();
+});
+
+
 async function pollJob(jobId) {
   state.jobId =
     jobId;
+
+  updateJobControls({ status: 'queued', progress: 0, message: '任务已提交，等待本地 Worker' });
 
   $('pipeline')
     .classList
@@ -1442,6 +1494,8 @@ async function pollJob(jobId) {
 
     const job =
       data.job;
+
+    updateJobControls(job);
 
     $('progressBar').style.width =
       `${job.progress || 0}%`;
@@ -1495,6 +1549,7 @@ async function pollJob(jobId) {
             : '');
         toast('待整编数据包已生成，可下载。');
         state.jobId = null;
+        updateJobControls({ ...job, status: 'completed', progress: 100 });
         return;
       }
 
@@ -1513,6 +1568,7 @@ async function pollJob(jobId) {
             : '深度摘要生成完成'
         );
         state.jobId = null;
+        updateJobControls({ ...job, status: 'completed', progress: 100 });
         return;
       }
 
@@ -1589,20 +1645,30 @@ async function pollJob(jobId) {
       state.jobId =
         null;
 
+      updateJobControls({ ...job, status: 'completed', progress: 100 });
+
       return;
     }
 
-    if (
-      job.status === 'failed'
-      || job.status === 'cancelled'
-    ) {
+    if (job.status === 'cancelled') {
       state.jobId =
         null;
+
+      updateJobControls(job);
+      toast(job.message || '任务已取消，已完成的文件检查点已保留。');
+      return;
+    }
+
+    if (job.status === 'failed') {
+      state.jobId =
+        null;
+
+      updateJobControls(job);
 
       throw new Error(
         job.message
         || job.error
-        || (job.status === 'cancelled' ? '任务已取消' : '完整分析失败')
+        || '完整分析失败'
       );
     }
 

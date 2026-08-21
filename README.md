@@ -354,6 +354,7 @@ MAX_SCAN_FILES=50000
 MAX_SCAN_DEPTH=32
 MAX_SINGLE_FILE_BYTES=10737418240
 MAX_PARSE_SECONDS=300
+SOURCE_STABILITY_SECONDS=2
 MAX_WORKER_MEMORY_MB=8192
 MAX_PARSE_PROCESS_MEMORY_MB=8192
 ENABLE_PARSE_PROCESS_ISOLATION=1
@@ -444,6 +445,10 @@ MAX_ARCHIVE_UNCOMPRESSED_BYTES=2147483648
 ```
 
 这些限制用于降低路径穿越和压缩炸弹风险。压缩包超过边界时会被标记为受限或失败，不应随意把上限改成无限。
+
+开始分析前应确认大压缩包已经复制完成。系统会比较扫描时与解析时的文件大小、修改时间，并对压缩包做短暂稳定性观察；若文件仍在增长，会明确标记为可恢复失败，提示等待复制完成后重新导入，而不会把不完整结果写成成功分析。
+
+任务运行时，“数据包管理”的当前任务卡和“任务中心”都提供“取消当前任务”按钮。取消会停止提交新文件并终止仍在等待的隔离解析进程，已经完成的文件检查点会保留。
 
 ### 不应提交到 GitHub 的内容
 

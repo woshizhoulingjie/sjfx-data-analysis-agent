@@ -1012,6 +1012,7 @@ def status():
             "max_document_characters": Config.MAX_FULL_DOCUMENT_CHARS,
             "max_single_file_bytes": Config.MAX_SINGLE_FILE_BYTES,
             "max_parse_seconds": Config.MAX_PARSE_SECONDS,
+            "source_stability_seconds": Config.SOURCE_STABILITY_SECONDS,
             "max_worker_memory_mb": Config.MAX_WORKER_MEMORY_MB,
             "max_parse_process_memory_mb": Config.MAX_PARSE_PROCESS_MEMORY_MB,
             "parse_process_isolation": Config.ENABLE_PARSE_PROCESS_ISOLATION,

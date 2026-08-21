@@ -45,6 +45,55 @@
     }
   }
 
+  function ensureTaskControls() {
+    const packageActions = document.querySelector('.task-card .task-actions');
+    if (packageActions && !$('cancelJobBtn')) {
+      const button = document.createElement('button');
+      button.id = 'cancelJobBtn';
+      button.className = 'danger';
+      button.disabled = true;
+      button.textContent = '取消当前任务';
+      packageActions.prepend(button);
+    }
+    const chip = document.querySelector('.task-card .status-chip');
+    if (chip && !chip.id) {
+      chip.id = 'jobStatusChip';
+      chip.textContent = 'IDLE';
+    }
+    const mount = $('taskPipelineMount');
+    if (mount) {
+      mount.innerHTML = '<div class="progress-track"><div id="taskCenterProgressBar" class="progress-bar"></div></div>'
+        + '<div id="taskCenterProgressText">当前没有运行中的任务。</div>';
+      const main = mount.closest('.task-center-main');
+      const routeButton = main?.querySelector('[data-go-route="packages"]');
+      if (main && routeButton && !$('taskCenterCancelBtn')) {
+        const actions = document.createElement('div');
+        actions.className = 'task-actions';
+        const cancel = document.createElement('button');
+        cancel.id = 'taskCenterCancelBtn';
+        cancel.className = 'danger';
+        cancel.disabled = true;
+        cancel.textContent = '取消当前任务';
+        routeButton.before(actions);
+        actions.append(cancel, routeButton);
+      }
+    }
+    const recovery = document.querySelector('.task-center-side');
+    if (recovery && !recovery.querySelector('.task-safety-note')) {
+      const note = document.createElement('p');
+      note.className = 'task-safety-note';
+      note.textContent = '取消后会停止提交新文件并终止等待中的隔离解析进程；已经完成的文件检查点会保留。';
+      recovery.appendChild(note);
+    }
+    if (!document.querySelector('link[data-task-controls]')) {
+      const style = document.createElement('link');
+      style.rel = 'stylesheet';
+      style.href = '/static/task-controls.css?v=1';
+      style.dataset.taskControls = '1';
+      document.head.appendChild(style);
+    }
+  }
+
   function activate(route) {
     route = routeNames[route] ? route : 'dashboard';
     activeRoute = route;
@@ -65,6 +114,7 @@
   }
 
   function bind() {
+    ensureTaskControls();
     document.querySelectorAll('[data-route]').forEach((el) => el.addEventListener('click', () => activate(el.dataset.route)));
     document.querySelectorAll('[data-go-route]').forEach((el) => el.addEventListener('click', () => activate(el.dataset.goRoute)));
     document.querySelectorAll('[data-forward]').forEach((el) => el.addEventListener('click', () => $(el.dataset.forward)?.click()));
@@ -78,7 +128,6 @@
     if (stats) new MutationObserver(syncDashboard).observe(stats, { childList: true, subtree: true, characterData: true });
     mirror('reportResult', 'overviewResultMount');
     mirror('summary', 'evidenceResultMount');
-    mirror('pipeline', 'taskPipelineMount');
     setInterval(syncDashboard, 1500);
   }
 
