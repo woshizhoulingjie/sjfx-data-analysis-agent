@@ -3,85 +3,59 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>数据分析智能体</title>
-  <link rel="stylesheet" href="/static/style.css?v=12">
+  <meta name="theme-color" content="#102d27">
+  <title>SJFX · 数据分析工作台</title>
+  <link rel="stylesheet" href="/static/style.css?v=20">
 </head>
 <body>
-  <header class="topbar">
-    <h1>数据分析智能体</h1>
-  </header>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand"><div class="brand-mark">S</div><div><div class="brand-name">SJFX</div><div class="brand-caption">数据分析工作台</div></div></div>
+      <div class="workspace-switcher"><span class="workspace-label">当前工作空间</span><strong id="workspaceName">尚未导入数据包</strong><span class="workspace-status"><i></i> 本地安全模式</span></div>
+      <nav class="side-nav">
+        <div class="nav-label">工作区</div>
+        <button class="nav-item active" data-route="dashboard"><span class="nav-icon">⌂</span>工作台</button>
+        <button class="nav-item" data-route="packages"><span class="nav-icon">▣</span>数据包</button>
+        <button class="nav-item" data-route="physical"><span class="nav-icon">⌘</span>原始目录</button>
+        <button class="nav-item" data-route="analysis"><span class="nav-icon">✦</span>智能分析</button>
+        <button class="nav-item" data-route="evidence"><span class="nav-icon">⌕</span>证据问答</button>
+        <button class="nav-item" data-route="overview"><span class="nav-icon">▤</span>情况概览</button>
+        <button class="nav-item" data-route="exports"><span class="nav-icon">⇩</span>导出中心</button>
+        <button class="nav-item" data-route="tasks"><span class="nav-icon">◷</span>任务中心</button>
+        <div class="nav-label nav-label-spaced">系统</div>
+        <button class="nav-item" data-route="settings"><span class="nav-icon">⚙</span>系统设置</button>
+      </nav>
+      <div class="sidebar-footer"><div class="local-badge"><span></span><div><b>本地部署</b><small>数据不出服务器</small></div></div><div class="sidebar-version">SJFX / local edition</div></div>
+    </aside>
 
-  <main class="layout">
-    <section class="control-panel card">
-      <div class="section-title"><span>01</span> 导入与完整分析</div>
-      <label for="rootPath">服务器本地数据包目录</label>
-      <div class="input-row">
-        <input id="rootPath" value="/home/nas511/zhoulingjie/sjfx/demo_data" autocomplete="off">
-        <button id="scanBtn" class="primary">导入并分析</button>
-      </div>
-      <div class="parse-mode-box">
-        <label for="parseMode">解析模式</label>
-        <select id="parseMode">
-          <option value="fast" selected>快速解析（推荐）</option>
-          <option value="accurate">高精度解析</option>
-        </select>
-        <small id="parseModeHelp">快速提取正文；扫描型 PDF 仅预览前几页 OCR。需要完整版面、表格和图片识别时请选择高精度解析。</small>
-      </div>
-      <div id="pipeline" class="pipeline empty">
-        <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
-        <div id="progressText">导入后将按所选模式完成资料分析并生成概览报告。</div>
-      </div>
-      <div class="button-row wrap">
-        <button id="testBtn" class="ghost">测试本地模型</button>
-        <button id="reanalyzeBtn" disabled>重新执行本地完整分析</button>
-        <button id="retryBtn" disabled>重试失败文件</button>
-        <button id="reportBtn" disabled>重新生成概览 Word</button>
-      </div>
-      <div id="scanStats" class="stats empty">尚未导入数据包</div>
-      <div id="reportResult" class="report-result empty">完整分析结束后将自动生成概览 Word，并返回推荐研究方向。</div>
-    </section>
+    <main class="main-area">
+      <header class="app-header"><div class="mobile-brand"><div class="brand-mark">S</div><strong>SJFX</strong></div><div class="breadcrumbs"><span id="breadcrumbRoot">工作台</span><span class="breadcrumb-sep">/</span><strong id="breadcrumbCurrent">数据概览</strong></div><div class="header-actions"><div class="system-health"><span class="health-dot"></span><span>本地服务正常</span></div><button class="header-token" id="headerTokenBtn" title="重新设置访问 Token">Token</button><button class="mobile-menu" id="mobileMenuBtn" aria-label="打开导航">☰</button></div></header>
+      <div class="content-wrap">
+        <section class="app-view active" data-view="dashboard">
+          <div class="page-heading"><div><div class="eyebrow">OVERVIEW / WORKSPACE</div><h1>欢迎回来，开始梳理你的数据</h1><p>从一批未知资料开始，逐步建立目录、发现主题、核验问题并完成交接。</p></div><button class="primary large-action" data-go-route="packages">＋ 新建分析</button></div>
+          <div class="metric-grid dashboard-metrics"><div class="metric-card"><span class="metric-label">当前文件</span><b id="dashboardFileCount">—</b><small>等待导入</small></div><div class="metric-card"><span class="metric-label">数据规模</span><b id="dashboardSize">—</b><small>原始资料总量</small></div><div class="metric-card"><span class="metric-label">解析覆盖率</span><b id="dashboardCoverage">—</b><small>基于当前分析</small></div><div class="metric-card accent"><span class="metric-label">研究价值</span><b id="dashboardValue">—</b><small>等待分析判断</small></div></div>
+          <div class="dashboard-grid"><article class="surface hero-card"><div class="surface-kicker">A CLEAR PATH THROUGH UNKNOWN DATA</div><h2>让资料从“堆在一起”变成“可以继续研究的线索”。</h2><p>系统先保留真实原始目录，再用本地解析、去重、聚类和证据筛选建立智能分析目录。每个结论都尽量回到原始正文。</p><div class="flow-steps"><div><i>01</i><b>导入资料</b><small>确认原始目录完整</small></div><div><i>02</i><b>发现主题</b><small>查看主题与子方向</small></div><div><i>03</i><b>核验证据</b><small>提出问题并追溯原文</small></div><div><i>04</i><b>交接导出</b><small>生成可复用成果包</small></div></div><button class="secondary" data-go-route="packages">进入数据包管理 →</button></article><article class="surface quick-card"><div class="surface-heading"><div><span class="section-kicker">QUICK START</span><h3>开始一次新的分析</h3></div><span class="round-icon">＋</span></div><p>输入服务器上的资料目录，选择解析模式，系统会先展示原始目录，再在后台继续分析。</p><button class="primary full" data-go-route="packages">导入数据包</button><div class="quick-note"><span>▣</span> 支持 PDF、Office、CSV、JSON、图片和 ZIP 压缩包</div></article></div>
+          <div class="surface recent-card"><div class="surface-heading"><div><span class="section-kicker">RECENT ACTIVITY</span><h3>最近工作状态</h3></div><button class="text-button" data-go-route="tasks">查看任务中心 →</button></div><div id="dashboardActivity" class="activity-empty">导入数据包后，这里会显示最近一次分析和导出状态。</div></div>
+        </section>
 
-    <section class="tree-panel card">
-      <div class="panel-heading">
-        <div class="section-title"><span>02</span> 交互式目录与分类树</div>
-        <div class="segmented">
-          <button id="physicalTreeBtn" class="active" disabled>原始目录</button>
-          <button id="analysisTreeBtn" disabled>主题目录</button>
-        </div>
-      </div>
-      <div id="tree" class="tree empty">导入后显示原始目录；完整分析完成后自动显示语义主题目录。</div>
-    </section>
+        <section class="app-view" data-view="packages"><div class="page-heading compact"><div><div class="eyebrow">DATA PACKAGES</div><h1>数据包管理</h1><p>导入新的资料、继续未完成的任务，或检查当前数据包的处理边界。</p></div><button class="ghost" id="testBtn">测试本地模型</button></div><div class="package-layout"><article class="surface import-card"><div class="surface-heading"><div><span class="section-kicker">NEW ANALYSIS</span><h2>导入一个数据包</h2></div><span class="step-pill">STEP 01</span></div><label for="rootPath">服务器本地数据包目录</label><div class="input-row"><input id="rootPath" value="/home/nas511/zhoulingjie/sjfx/demo_data" autocomplete="off"><button id="scanBtn" class="primary">导入并分析</button></div><div class="parse-mode-box"><label for="parseMode">解析模式</label><select id="parseMode"><option value="fast" selected>快速解析（推荐）</option><option value="accurate">高精度解析</option></select><small id="parseModeHelp">快速提取正文；扫描型 PDF 仅预览前几页 OCR。需要完整版面、表格和图片识别时请选择高精度解析。</small></div><div class="privacy-note"><span>⌁</span><div><b>本地处理</b><small>解析、OCR、聚类和模型调用均在当前服务器完成。</small></div></div></article><article class="surface task-card"><div class="surface-heading"><div><span class="section-kicker">LIVE TASK</span><h2>当前任务</h2></div><span class="status-chip">LOCAL WORKER</span></div><div id="pipeline" class="pipeline empty"><div class="progress-track"><div id="progressBar" class="progress-bar"></div></div><div id="progressText">导入后将按所选模式完成资料分析并生成概览报告。</div></div><div class="task-actions"><button id="reanalyzeBtn" disabled>重新执行完整分析</button><button id="retryBtn" disabled>重试失败文件</button><button id="reportBtn" disabled>重新生成概览 Word</button></div></article></div><div class="surface stats-surface"><div class="surface-heading"><div><span class="section-kicker">PACKAGE SNAPSHOT</span><h2>数据包状态</h2></div><button class="text-button" data-go-route="physical">查看原始目录 →</button></div><div id="scanStats" class="stats empty">尚未导入数据包</div></div><div id="packageReportHint" class="surface report-result empty">完整分析结束后将自动生成概览 Word，并返回推荐研究方向。结果会在“情况概览”中集中展示。</div><div id="reportResult" class="report-result hidden-result">完整分析结束后将自动生成概览 Word，并返回推荐研究方向。</div></section>
 
-    <section class="detail-panel card">
-      <div class="section-title"><span>03</span> 节点摘要、深度阅读与证据链</div>
-      <div id="selection" class="selection empty">请从目录树选择文件或文件夹</div>
-      <div class="button-row wrap">
-        <button id="summaryBtn" class="primary" disabled>生成模型深度摘要</button>
-        <button id="deepenBtn" disabled>补充分析当前范围</button>
-        <button id="exportBtn" disabled>导出待整编数据包</button>
-      </div>
-      <div id="selectionCart" class="selection-cart empty">可勾选多个主题、目录、文档或原文证据，组合导出时会自动去重。</div>
-      <div class="retrieval-box">
-        <label for="retrievalQuery">本地证据检索（RAG）</label>
-        <div class="input-row">
-          <input id="retrievalQuery" placeholder="例如：哪些资料支持该研究方向？" autocomplete="off">
-          <button id="retrievalBtn" disabled>检索证据</button>
-        </div>
-        <small>使用本地 BM25 与 TF-IDF 字符向量，检索过程不调用生成模型。</small>
-      </div>
-      <div class="retrieval-box">
-          <label for="numericQuestion">结构化数据精确统计（非通用问答）</label>
-        <div class="input-row">
-          <input id="numericQuestion" placeholder="例如：销售额的总和是多少？" autocomplete="off">
-          <button id="numericQuestionBtn" disabled>计算</button>
-        </div>
-          <small>只对 CSV/XLSX/JSON 画像中的数值字段计算合计、平均、最大、最小、数量，并返回字段、表名和行范围证据。</small>
-      </div>
-      <div id="summary" class="summary empty">文件夹摘要、文档解析结果、全文深度摘要和证据来源将在这里显示。</div>
-    </section>
-  </main>
+        <section class="app-view explore-view" data-view="explore"><div class="page-heading compact"><div><div class="eyebrow">EXPLORE / TRACE / UNDERSTAND</div><h1 id="exploreTitle">原始目录</h1><p id="exploreSubtitle">先确认真实资料，再进入语义主题和证据下钻。</p></div><div class="explore-tools"><button id="exportBtn" disabled class="primary">导出待整编数据包</button></div></div><div class="explore-layout"><article class="surface tree-surface"><div class="panel-heading"><div><span class="section-kicker">NAVIGATE</span><h2>资料目录</h2></div><div class="segmented"><button id="physicalTreeBtn" class="active" disabled>原始目录</button><button id="analysisTreeBtn" disabled>智能目录</button></div></div><div id="tree" class="tree empty">导入后显示原始目录；完整分析完成后可切换智能主题目录。</div></article><article class="surface detail-surface"><div class="panel-heading"><div><span class="section-kicker">INSPECT</span><h2>节点详情</h2></div><span class="detail-hint">选择左侧节点开始下钻</span></div><div id="selection" class="selection empty">请从目录树选择文件、主题或文件夹</div><div class="button-row wrap detail-actions"><button id="summaryBtn" class="primary" disabled>生成模型深度摘要</button><button id="deepenBtn" disabled>补充分析当前范围</button></div><div id="selectionCart" class="selection-cart empty">可勾选多个主题、目录、文档或原文证据，组合导出时会自动去重。</div><div id="summary" class="summary empty">文件夹摘要、文档解析结果、全文深度摘要和证据来源将在这里显示。</div></article></div></section>
 
+        <section class="app-view evidence-view" data-view="evidence"><div class="page-heading compact"><div><div class="eyebrow">EVIDENCE / QUESTIONS</div><h1>证据与问答</h1><p>提出一个有价值的问题，检索能够直接解释它的正文证据。</p></div></div><div class="evidence-layout"><article class="surface question-card"><div class="surface-heading"><div><span class="section-kicker">LOCAL RETRIEVAL</span><h2>从资料中提问</h2></div><span class="round-icon">⌕</span></div><label for="retrievalQuery">问题</label><div class="input-row"><input id="retrievalQuery" placeholder="例如：哪些资料支持该研究方向？" autocomplete="off"><button id="retrievalBtn" disabled class="primary">检索证据</button></div><small class="help-text">使用本地 BM25 与 TF-IDF 字符向量，检索过程不调用生成模型。</small><div class="question-divider"></div><label for="numericQuestion">结构化数据精确统计</label><div class="input-row"><input id="numericQuestion" placeholder="例如：销售额的总和是多少？" autocomplete="off"><button id="numericQuestionBtn" disabled>计算</button></div><small class="help-text">仅对 CSV/XLSX/JSON 画像中的数值字段计算合计、平均、最大、最小和数量，并返回行范围证据。</small></article><article class="surface evidence-result-card"><div class="surface-heading"><div><span class="section-kicker">TRACEABLE ANSWER</span><h2>问题—回答—证据</h2></div><button class="text-button" data-go-route="analysis">回到智能目录 →</button></div><div id="evidenceSummary" class="evidence-summary-note">检索结果和当前节点的证据链会在这里显示。每条证据都应能回到原始文件的位置。</div><div id="evidenceResultMount"></div></article></div></section>
+
+        <section class="app-view overview-view" data-view="overview"><div class="page-heading compact"><div><div class="eyebrow">REPORT / INSIGHT</div><h1>情况概览</h1><p>集中查看数据包价值判断、关键发现、研究方向和覆盖率边界。</p></div><button class="primary" data-go-route="packages" id="overviewReportAction">生成或刷新概览</button></div><div class="overview-grid"><article class="surface overview-main"><div class="overview-placeholder"><div class="placeholder-icon">▤</div><h2>概览结果会显示在这里</h2><p>完成一次分析后，系统会把自动生成的 Word 概览、推荐研究方向和覆盖率限制集中呈现。</p><button class="secondary" data-go-route="packages">前往数据包管理开始分析</button></div><div id="overviewResultMount"></div></article><aside class="surface overview-side"><span class="section-kicker">WHAT TO CHECK</span><h3>阅读概览时关注</h3><ul class="check-list"><li><span>01</span>数据是否完成全量分析</li><li><span>02</span>推荐方向是否有有效证据</li><li><span>03</span>哪些文件仍待处理或失败</li><li><span>04</span>结论是否需要人工核验</li></ul></aside></div></section>
+
+        <section class="app-view utility-view" data-view="settings"><div class="page-heading compact"><div><div class="eyebrow">SYSTEM / LOCAL RUNTIME</div><h1>系统设置</h1><p>查看本地模型、解析边界和访问安全状态。</p></div></div><div class="settings-grid"><article class="surface settings-card"><span class="section-kicker">LOCAL MODEL</span><h2>本地模型服务</h2><div class="setting-line"><span>模型运行方式</span><b>服务器本机 Ollama</b></div><div class="setting-line"><span>数据是否出网</span><b class="safe-text">否 · 本地处理</b></div><div class="setting-line"><span>模型并发</span><b>1（GPU 安全模式）</b></div><button id="settingsTestBtn" class="secondary" data-forward="testBtn">测试本地模型</button></article><article class="surface settings-card"><span class="section-kicker">ACCESS CONTROL</span><h2>访问与目录边界</h2><div class="setting-line"><span>API 访问 Token</span><b>已启用</b></div><div class="setting-line"><span>扫描目录白名单</span><b>服务端配置</b></div><div class="setting-line"><span>结果隔离</span><b>按用户权限隔离</b></div><button class="secondary" id="headerTokenBtnSecondary">重新设置 Token</button></article><article class="surface settings-card"><span class="section-kicker">PARSER LIMITS</span><h2>解析资源</h2><div class="setting-line"><span>CPU 解析并发</span><b>默认 2</b></div><div class="setting-line"><span>单文件超时</span><b>受配置限制</b></div><div class="setting-line"><span>压缩包安全</span><b>路径穿越防护</b></div></article></div></section>
+
+        <section class="app-view utility-view" data-view="exports"><div class="page-heading compact"><div><div class="eyebrow">HANDOFF / EXPORTS</div><h1>导出中心</h1><p>选择主题、文档或证据，生成去重后的原始资料与分析成果交接包。</p></div><button class="primary" data-go-route="analysis">选择内容并导出</button></div><div class="empty-state surface"><div class="placeholder-icon">⇩</div><h2>导出从智能目录发起</h2><p>在智能目录中勾选节点后，系统会自动去重文件，并将目录树、覆盖率、问题—回答—证据链和失败清单写入交接包。</p><button class="secondary" data-go-route="analysis">打开智能目录</button></div></section>
+
+        <section class="app-view utility-view" data-view="tasks"><div class="page-heading compact"><div><div class="eyebrow">QUEUE / OPERATIONS</div><h1>任务中心</h1><p>长时间任务独立运行，实时查看阶段、当前文件、进度、失败和取消状态。</p></div></div><div class="task-center-grid"><article class="surface task-center-main"><span class="section-kicker">CURRENT JOB</span><h2>当前任务进度</h2><div class="task-pipeline-mount" id="taskPipelineMount">任务开始后会在这里显示实时进度。你可以从“数据包”页面发起分析。</div><button class="secondary" data-go-route="packages">前往数据包管理</button></article><article class="surface task-center-side"><span class="section-kicker">RECOVERY</span><h3>任务可恢复</h3><p>Worker 会从 SQLite 检查点继续未完成文件；单文件失败不会阻塞其他文件，可在数据包页面重试失败文件。</p></article></div></section>
+      </div>
+    </main>
+  </div>
   <div id="toast" class="toast" aria-live="polite"></div>
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/product-shell.js?v=1"></script>
+  <script src="/static/app.js?v=16"></script>
 </body>
 </html>
