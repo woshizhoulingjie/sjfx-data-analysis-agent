@@ -18,7 +18,11 @@
   function mirror(sourceId, targetId) {
     const source = $(sourceId); const target = $(targetId);
     if (!source || !target) return;
-    const copy = () => { target.innerHTML = source.innerHTML; target.className = source.className.replace(/\bhidden-result\b/g, '').trim(); };
+    const copy = () => {
+      target.innerHTML = source.innerHTML;
+      target.className = source.className.replace(/\bhidden-result\b/g, '').trim();
+      target.style.display = source.classList.contains('hidden-result') ? 'none' : '';
+    };
     new MutationObserver(copy).observe(source, { childList: true, subtree: true, characterData: true, attributes: true });
     copy();
   }
