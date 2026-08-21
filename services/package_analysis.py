@@ -2926,10 +2926,6 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )
-    exact_groups = _group_exact(documents)
-    canonical_documents, _canonical_by_path, _aliases = _canonical_projection(documents, exact_groups)
-    analysis["exact_duplicate_groups"] = exact_groups
-    storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))
     adaptive_tree = attach_tree_coverage(adaptive_tree, coverage_for_paths, all_paths)
     exact_duplicate_files = sum(group["duplicate_count"] for group in exact_groups)
     structured_profiles = []
@@ -3117,6 +3113,10 @@ def refresh_package_coverage(scan_id, scan, storage):
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )
+    exact_groups = _group_exact(documents)
+    canonical_documents, _canonical_by_path, _aliases = _canonical_projection(documents, exact_groups)
+    analysis["exact_duplicate_groups"] = exact_groups
+    storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))
     tree = attach_tree_coverage(analysis.get("analysis_tree") or {}, coverage_for_paths, all_paths)
     analysis["analysis_tree"] = tree
     analysis["coverage"] = package_coverage
