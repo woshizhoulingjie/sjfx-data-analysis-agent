@@ -578,6 +578,15 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(document["parser"]["degraded"])
             self.assertTrue(any("仍在复制" in item and "ZIP 中央目录" in item for item in document["warnings"]))
 
+    def test_archive_container_has_separate_size_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bounded.zip"
+            path.write_bytes(b"PK\x03\x04incomplete")
+            with patch.dict("os.environ", {"MAX_SINGLE_FILE_BYTES": "4", "MAX_ARCHIVE_FILE_BYTES": "1024"}):
+                document = UnifiedDocumentParser(max_chars=1000).parse(path, "bounded.zip")
+            self.assertTrue(document["parser"].get("archive"))
+            self.assertNotEqual(document["parser"]["name"], "metadata-only")
+
     def test_linux_open_archive_writer_is_detected(self):
         if not Path("/proc/self/fd").is_dir():
             self.skipTest("Linux /proc is required for open-writer detection")

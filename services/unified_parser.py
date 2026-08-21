@@ -380,10 +380,18 @@ class UnifiedDocumentParser:
     def parse(self, path, relative_path=None, mode="accurate", _archive_depth=0):
         path = Path(path).resolve()
         file_size = path.stat().st_size
+        ext = path.suffix.lower()
+        archive_name = path.name.lower()
+        is_archive = ext in ARCHIVE_EXTENSIONS or archive_name.endswith(".tar.gz") or archive_name.endswith(".tar.bz2")
         # Keep parser behaviour aligned with Config.MAX_SINGLE_FILE_BYTES and
         # the value shown by /api/status.  A deployment may explicitly raise
         # this limit in .env after evaluating its memory and time budget.
         max_single_file_bytes = max(1, int(os.getenv("MAX_SINGLE_FILE_BYTES", str(1024 * 1024 * 1024))))
+        max_archive_file_bytes = max(
+            max_single_file_bytes,
+            int(os.getenv("MAX_ARCHIVE_FILE_BYTES", str(5 * 1024 * 1024 * 1024))),
+        )
+        effective_file_limit = max_archive_file_bytes if is_archive else max_single_file_bytes
         relative_path = str(relative_path or path.name).replace("\\", "/")
         mode = "fast" if str(mode).lower() == "fast" else "accurate"
         source_hash = sha256_file(path)
@@ -415,12 +423,12 @@ class UnifiedDocumentParser:
             "evidence": [],
             "warnings": [],
         }
-        if file_size > max_single_file_bytes:
+        if file_size > effective_file_limit:
             base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
             base["coverage"].update({"complete": False, "coverage_ratio": 0.0, "limited_by_size": True})
-            base["warnings"].append("文件超过单文件解析上限（{} 字节），仅保留元数据和哈希。".format(max_single_file_bytes))
+            limit_label = "压缩容器" if is_archive else "单文件"
+            base["warnings"].append("文件超过{}解析上限（{} 字节），仅保留元数据和哈希。".format(limit_label, effective_file_limit))
             return base
-        ext = path.suffix.lower()
         if ext not in SUPPORTED_EXTENSIONS:
             base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
             base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
@@ -442,8 +450,6 @@ class UnifiedDocumentParser:
                 base["parser"]["repair_attempted"] = True
                 base["parser"]["repair_succeeded"] = True
 
-        archive_name = path.name.lower()
-        is_archive = ext in ARCHIVE_EXTENSIONS or archive_name.endswith(".tar.gz") or archive_name.endswith(".tar.bz2")
         if is_archive:
             self._parse_archive(path, base, mode=mode, archive_depth=_archive_depth)
             base["content_sha256"] = _digest_text(base["text"])

@@ -1022,6 +1022,7 @@ def status():
                 Config.ENABLE_PARSE_PROCESS_ISOLATION and str(Config.DOCLING_DEVICE).lower() == "cpu"
             ),
             "max_archive_entries": Config.MAX_ARCHIVE_ENTRIES,
+            "max_archive_file_bytes": Config.MAX_ARCHIVE_FILE_BYTES,
             "max_archive_member_bytes": Config.MAX_ARCHIVE_MEMBER_BYTES,
             "max_archive_uncompressed_bytes": Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,
             "max_analysis_jobs": Config.MAX_ANALYSIS_JOBS,
