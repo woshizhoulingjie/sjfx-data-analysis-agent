@@ -199,6 +199,23 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         )
         deep_analyzed = len(parsed) - sampled
         complete_analysis = bool(selected) and not pending and not failed and partial == 0
+        archive_manifests = []
+        for path in sorted(parsed):
+            manifest = documents.get(path, {}).get("archive_manifest")
+            if isinstance(manifest, dict) and manifest.get("total_members") is not None:
+                compact = dict(manifest)
+                compact["container_path"] = compact.get("container_path") or path
+                archive_manifests.append(compact)
+        archive_total_members = sum(int(item.get("total_members") or 0) for item in archive_manifests)
+        archive_parsed_members = sum(int(item.get("parsed_members") or 0) for item in archive_manifests)
+        archive_skipped_members = sum(int(item.get("skipped_members") or 0) for item in archive_manifests)
+        archive_failed_members = sum(int(item.get("failed_members") or 0) for item in archive_manifests)
+        if complete_analysis:
+            coverage_level = "full_text_analysis"
+        elif parsed:
+            coverage_level = "representative_overview"
+        else:
+            coverage_level = "inventory_complete"
         status = "完整" if complete_analysis else "部分覆盖"
         if not parsed and selected:
             status = "待分析"
@@ -213,6 +230,12 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             limitations.append("{} 个文件尚未进入内容分析。".format(len(pending)))
         if failed:
             limitations.append("{} 个文件解析失败，可通过失败文件重试继续处理。".format(len(failed)))
+        if archive_skipped_members or archive_failed_members:
+            limitations.append(
+                "压缩包成员仅解析 {}/{} 个，跳过 {} 个、失败 {} 个；压缩包不得视为完整覆盖。".format(
+                    archive_parsed_members, archive_total_members, archive_skipped_members, archive_failed_members
+                )
+            )
         return {
             "mode": (policy or {}).get("mode", "standard"),
             "status": status,
@@ -234,6 +257,19 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "parsed_bytes": parsed_bytes,
             "parsed_byte_ratio": round(parsed_bytes / float(total_bytes or 1), 6),
             "complete_analysis": complete_analysis,
+            "coverage_level": coverage_level,
+            "coverage_level_label": {
+                "inventory_complete": "全量盘点",
+                "representative_overview": "代表性概览",
+                "full_text_analysis": "全文深度分析",
+            }[coverage_level],
+            "archive_containers": archive_manifests,
+            "archive_member_totals": {
+                "total_members": archive_total_members,
+                "parsed_members": archive_parsed_members,
+                "skipped_members": archive_skipped_members,
+                "failed_members": archive_failed_members,
+            },
             "limitations": limitations,
             "pending_paths": sorted(pending)[:200],
             "failed_paths": sorted(failed)[:200],

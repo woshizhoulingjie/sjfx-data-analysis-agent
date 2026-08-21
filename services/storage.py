@@ -165,10 +165,29 @@ class Storage:
                     kind TEXT NOT NULL DEFAULT 'result',
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS embedding_cache (
+                    cache_key TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    vector TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (cache_key, model)
+                );
+                CREATE TABLE IF NOT EXISTS evidence_index (
+                    scan_id TEXT NOT NULL,
+                    index_key TEXT NOT NULL,
+                    source_path TEXT,
+                    archive_source_path TEXT,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, index_key)
+                );
                 CREATE INDEX IF NOT EXISTS idx_documents_scan_path ON unified_documents(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_summaries_scan_path ON summaries(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_retrieval_sessions_scan_created ON retrieval_sessions(scan_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_file_analysis_states_scan_status ON file_analysis_states(scan_id, status);
+                CREATE INDEX IF NOT EXISTS idx_embedding_cache_updated ON embedding_cache(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_evidence_index_scan_source ON evidence_index(scan_id, source_path);
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_jobs)").fetchall()}
             migrations = {
@@ -263,7 +282,7 @@ class Storage:
             text = text[:head] + "\n\n[正文已折叠；选择文件可读取完整解析缓存]\n\n" + text[-tail:]
         projection = {
             key: payload.get(key)
-            for key in ("schema_version", "source", "parsed_at", "parser", "structure", "coverage", "warnings", "classification", "content_sha256", "data_profile", "data_profiles")
+            for key in ("schema_version", "source", "parsed_at", "parser", "structure", "coverage", "archive_manifest", "warnings", "classification", "deduplication", "content_sha256", "data_profile", "data_profiles")
             if key in payload
         }
         projection["text"] = text
@@ -286,6 +305,8 @@ class Storage:
             "source": payload.get("source", {}),
             "parser": payload.get("parser", {}),
             "coverage": payload.get("coverage", {}),
+            "archive_manifest": payload.get("archive_manifest"),
+            "deduplication": payload.get("deduplication", {}),
             "warnings": payload.get("warnings", []),
             "projection": self._document_projection(payload),
         }, ensure_ascii=False)
@@ -357,6 +378,91 @@ class Storage:
                 "DELETE FROM retrieval_sessions WHERE rowid IN ("
                 "SELECT rowid FROM retrieval_sessions ORDER BY created_at DESC LIMIT -1 OFFSET 1000)"
             )
+
+    def get_embeddings(self, cache_keys, model):
+        """Return reusable local embedding vectors without loading all rows."""
+        keys = list(dict.fromkeys(str(value) for value in cache_keys if value))
+        if not keys or not model:
+            return {}
+        output = {}
+        with self._connect() as conn:
+            for start in range(0, len(keys), 400):
+                batch = keys[start:start + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    "SELECT cache_key,vector FROM embedding_cache WHERE model=? AND cache_key IN ({})".format(placeholders),
+                    [str(model)] + batch,
+                ).fetchall()
+                for row in rows:
+                    try:
+                        vector = json.loads(row["vector"])
+                        if isinstance(vector, list) and vector:
+                            output[row["cache_key"]] = vector
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+        return output
+
+    def save_embeddings(self, model, vectors):
+        """Atomically upsert a bounded batch of local embedding vectors."""
+        rows = []
+        for cache_key, vector in (vectors or {}).items():
+            if not cache_key or not isinstance(vector, list) or not vector:
+                continue
+            rows.append((
+                str(cache_key), str(model), json.dumps(vector, ensure_ascii=False, separators=(",", ":")), len(vector)
+            ))
+        if not rows:
+            return 0
+        with self.lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO embedding_cache(cache_key,model,vector,dimensions,updated_at) "
+                "VALUES (?,?,?,?,CURRENT_TIMESTAMP)",
+                rows,
+            )
+        return len(rows)
+
+    def replace_evidence_index(self, scan_id, chunks):
+        """Publish one canonical evidence catalog in a single transaction."""
+        rows = []
+        for item in chunks or []:
+            payload = dict(item)
+            source_path = str(payload.get("source_path") or "")
+            archive_source = str(payload.get("archive_source_path") or "")
+            identity = "{}|{}|{}|{}".format(
+                source_path,
+                payload.get("evidence_id") or "",
+                payload.get("content_sha256") or "",
+                payload.get("text") or "",
+            )
+            index_key = hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()
+            rows.append((
+                str(scan_id), index_key, source_path, archive_source,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            ))
+        with self.lock, self._connect() as conn:
+            conn.execute("DELETE FROM evidence_index WHERE scan_id=?", (str(scan_id),))
+            if rows:
+                conn.executemany(
+                    "INSERT INTO evidence_index(scan_id,index_key,source_path,archive_source_path,payload) VALUES (?,?,?,?,?)",
+                    rows,
+                )
+        return len(rows)
+
+    def list_evidence_index(self, scan_id):
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM evidence_index WHERE scan_id=? ORDER BY rowid",
+                (str(scan_id),),
+            ).fetchall()
+        output = []
+        for row in rows:
+            try:
+                item = json.loads(row["payload"])
+                if isinstance(item, dict):
+                    output.append(item)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return output
 
     def get_retrieval_result(self, result_id, scan_id=None):
         with self._connect() as conn:

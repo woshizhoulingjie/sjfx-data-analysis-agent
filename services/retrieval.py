@@ -24,7 +24,10 @@ def _in_scope(path, scope):
     if not scope or scope == ".":
         return True
     prefix = scope.rstrip("/") + "/"
-    return path == scope or path.startswith(prefix)
+    # Archive members are virtual evidence paths.  Selecting the physical
+    # container must include ``archive.zip::member.pdf`` without broadening the
+    # scope to unrelated files.
+    return path == scope or path.startswith(prefix) or path.startswith(scope + "::")
 
 
 def _document_items(documents):
@@ -40,8 +43,6 @@ def evidence_corpus(documents, scope="."):
     for path, document in _document_items(documents):
         if not path:
             path = document.get("source", {}).get("path", "")
-        if not _in_scope(path, scope):
-            continue
         source = document.get("source", {})
         evidence = list(document.get("evidence", []) or [])
         if not evidence and document.get("text"):
@@ -59,6 +60,9 @@ def evidence_corpus(documents, scope="."):
                 for index in range(0, len(text), 1200)
             ]
         for item in evidence:
+            item_source = item.get("archive_source_path") or item.get("source_path") or path
+            if not (_in_scope(path, scope) or _in_scope(str(item_source), scope)):
+                continue
             text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
             if len(text) < 2:
                 continue
@@ -83,6 +87,8 @@ def evidence_corpus(documents, scope="."):
                 "parser": item.get("parser"),
                 "source_sha256": item.get("source_sha256") or source.get("sha256"),
                 "content_sha256": item.get("content_sha256"),
+                "archive_source_path": item.get("archive_source_path"),
+                "archive_member": item.get("archive_member"),
                 "evidence_quality": quality,
             })
     return chunks
@@ -129,11 +135,20 @@ def _tfidf_scores(texts, query):
         return [0.0] * len(texts), False
 
 
-def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3, candidate_evidence_ids=None):
+def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
+                      candidate_evidence_ids=None, indexed_chunks=None):
     query = re.sub(r"\s+", " ", str(query or "")).strip()
     if not query:
         raise ValueError("检索问题不能为空")
-    chunks = evidence_corpus(documents, scope=scope)
+    if indexed_chunks is None:
+        chunks = evidence_corpus(documents, scope=scope)
+        index_mode = "rebuilt-corpus"
+    else:
+        chunks = [
+            dict(item) for item in indexed_chunks
+            if _in_scope(str(item.get("archive_source_path") or item.get("source_path") or ""), scope)
+        ]
+        index_mode = "persistent-evidence-index"
     if candidate_evidence_ids is not None:
         allowed = {str(value) for value in candidate_evidence_ids}
         chunks = [item for item in chunks if str(item.get("evidence_id")) in allowed]
@@ -145,6 +160,7 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3, 
             "corpus_chunks": 0,
             "results": [],
             "warnings": ["当前范围没有可检索正文证据。"],
+            "index_mode": index_mode,
         }
     # File paths are metadata, not document content. Including them here lets
     # names such as "Q3" or "财报" contaminate BM25/TF-IDF ranking.
@@ -183,6 +199,7 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3, 
         "result_count": len(results),
         "results": results,
         "warnings": [] if results else ["未找到与问题有明显相关性的证据。"],
+        "index_mode": index_mode,
     }
 
 

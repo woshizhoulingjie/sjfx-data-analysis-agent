@@ -123,12 +123,15 @@ def _normalize_question_answer_evidence(summary, catalog, node_path, context=Non
             "evidence_ids": [item.get("evidence_id") for item in all_evidence if item.get("evidence_id")],
             "support_status": "supported" if all_evidence else "insufficient",
         })
-    supported = any(item.get("support_status") == "supported" for item in claims)
+    supported = bool(claims) and all(item.get("support_status") == "supported" for item in claims)
+    if not supported:
+        answer = "证据不足，当前不能形成可靠回答。"
+        all_evidence = []
     summary["question"] = question
     summary["value"] = value
     summary["answer"] = answer
     summary["claims"] = claims
-    summary["evidence"] = all_evidence or [item for item in summary.get("evidence") or [] if evidence_quality(item).get("eligible")]
+    summary["evidence"] = all_evidence
     summary["evidence_ids"] = [item.get("evidence_id") for item in summary["evidence"] if item.get("evidence_id")]
     summary["evidence_status"] = "supported" if supported else "insufficient"
     summary["evidence_contract"] = "question-answer-evidence/2.0"
@@ -154,6 +157,18 @@ def _path_in_folder(path, folder):
     return (
         path == folder
         or path.startswith(prefix)
+        or path.startswith(folder + "::")
+    )
+
+
+def _evidence_in_member_scope(evidence, member_paths):
+    source_path = str(evidence.get("source_path") or "")
+    archive_source = str(evidence.get("archive_source_path") or "")
+    return any(
+        source_path == member
+        or source_path.startswith(member + "::")
+        or archive_source == member
+        for member in member_paths
     )
 
 
@@ -267,7 +282,7 @@ def _evidence_catalog(
             if (
                 virtual_scope
                 and source_path
-                and source_path not in member_paths
+                and not _evidence_in_member_scope(evidence, member_paths)
             ):
                 continue
 
@@ -323,6 +338,8 @@ def _evidence_catalog(
                 "support_reason": evidence.get(
                     "support_reason"
                 ),
+                "archive_source_path": evidence.get("archive_source_path"),
+                "archive_member": evidence.get("archive_member"),
             }
 
             # =================================================
@@ -413,7 +430,7 @@ def _evidence_catalog(
 
                     if (
                         virtual_scope
-                        and source_path not in member_paths
+                        and not _evidence_in_member_scope(evidence, member_paths)
                     ):
                         continue
 
@@ -459,6 +476,8 @@ def _evidence_catalog(
                         "support_reason": evidence.get(
                             "support_reason"
                         ),
+                        "archive_source_path": evidence.get("archive_source_path"),
+                        "archive_member": evidence.get("archive_member"),
                     }
 
                     item.update(
@@ -561,7 +580,7 @@ def _attach_model_evidence(
             )
         ): item
         for item in catalog
-        if item.get("evidence_id")
+        if item.get("evidence_id") and evidence_quality(item).get("eligible")
     }
 
     requested = (
@@ -582,10 +601,7 @@ def _attach_model_evidence(
         if str(item) in by_id
     ]
 
-    summary["evidence"] = (
-        evidence
-        or catalog[:8]
-    )
+    summary["evidence"] = evidence
 
     direction = summary.get(
         "recommended_research_direction"
@@ -609,14 +625,15 @@ def _attach_model_evidence(
             if str(item) in by_id
         ]
 
-        if not direction[
-            "evidence_chain"
-        ]:
-            direction[
-                "evidence_chain"
-            ] = summary[
-                "evidence"
-            ][:5]
+        direction["evidence_status"] = (
+            "supported" if direction["evidence_chain"] else "insufficient"
+        )
+        if not direction["evidence_chain"]:
+            direction["priority"] = "低"
+            direction["confidence"] = "低"
+            direction.setdefault("limitations", []).append(
+                "模型未引用当前节点中的合法正文证据，该方向不能作为正式推荐。"
+            )
 
     return summary
 

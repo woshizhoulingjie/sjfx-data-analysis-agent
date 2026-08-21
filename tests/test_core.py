@@ -206,7 +206,7 @@ class CoreRegressionTests(unittest.TestCase):
         merged = merge_model_report(local, {"global_categories": [{"name": "模型错误分类"}], "key_findings": ["增强发现"]})
 
         self.assertEqual(merged["global_categories"], [{"name": "研究文献"}])
-        self.assertEqual(merged["key_findings"], ["增强发现"])
+        self.assertEqual(merged["key_findings"], ["本地发现"])
 
     def test_model_research_prompt_uses_numbered_evidence_and_merge_rejects_unknown_ids(self):
         scan = self._overview_scan([])
@@ -240,12 +240,13 @@ class CoreRegressionTests(unittest.TestCase):
                 "topic": "实验方法",
                 "members": ["a.pdf", "b.pdf"],
                 "representative_documents": ["a.pdf"],
-                "evidence": [{"evidence_id": "E-1", "source_path": "a.pdf", "page": 3, "text": "实验结果与条件"}],
+                "evidence": [{"evidence_id": "E-1", "source_path": "a.pdf", "page": 3, "label": "paragraph", "text": "实验采用相同样本条件进行对照，结果显示两种方法在准确率方面存在可核验差异。"}],
             }],
         }
         summary, result, errors = analyze_folder(model, context, ".")
         self.assertEqual(model.calls, 1)
         self.assertEqual(summary["summary_mode"], "topic_cluster_evidence")
+        self.assertEqual(summary["evidence_status"], "supported")
         self.assertEqual(summary["evidence"][0]["evidence_id"], "E-1")
         self.assertEqual(summary["recommended_research_direction"]["evidence_chain"][0]["page"], 3)
         self.assertFalse(errors)
@@ -616,7 +617,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(document["parser"]["name"], "text")
             self.assertIn("快速解析测试正文", document["text"])
 
-    def test_small_files_skip_brief_but_all_folders_have_summary(self):
+    def test_small_files_and_all_folders_have_immediate_summary(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "small.txt").write_text("根目录小文件", encoding="utf-8")
@@ -630,9 +631,9 @@ class CoreRegressionTests(unittest.TestCase):
             summaries = {(item["path"], item["type"]) for item in storage.list_summaries(scan_id)}
             self.assertIn((".", "folder"), summaries)
             self.assertIn(("nested", "folder"), summaries)
-            self.assertNotIn(("small.txt", "file"), summaries)
-            self.assertNotIn(("nested/child.txt", "file"), summaries)
-            self.assertEqual(analysis["statistics"]["small_file_summary_skipped"], 2)
+            self.assertIn(("small.txt", "file"), summaries)
+            self.assertIn(("nested/child.txt", "file"), summaries)
+            self.assertEqual(analysis["statistics"]["small_file_summary_skipped"], 0)
 
     def test_analysis_tree_classifies_same_file_type_by_content(self):
         with tempfile.TemporaryDirectory() as folder:

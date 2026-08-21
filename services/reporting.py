@@ -77,17 +77,26 @@ def _direction_candidates(scan, analysis, limit=8):
             continue
         evidence = _cluster_evidence(cluster, analysis, topic)
         evidence_count = len(evidence)
+        if not evidence:
+            # An evidence-free classification may remain visible in the
+            # directory, but it is not a formal research recommendation.
+            continue
+        independent_sources = len({
+            item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path")
+            for item in evidence
+            if item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path")
+        })
         concentration = min(1.0, len(members) / float(parsed))
         unique_signal = min(1.0, len(set(members)) / float(len(members) or 1))
         evidence_signal = min(1.0, evidence_count / 6.0)
         score = round(100 * (0.35 * min(1.0, concentration * 3) + 0.25 * evidence_signal + 0.20 * unique_signal + 0.20 * float(coverage.get("parsed_file_ratio") or 0)), 1)
-        if score >= 70:
+        if score >= 70 and evidence_count >= 3 and independent_sources >= 2:
             priority = "高"
         elif score >= 45:
             priority = "中"
         else:
             priority = "低"
-        confidence = "高" if evidence_count >= 3 and coverage.get("complete_analysis") else ("中" if evidence_count else "低")
+        confidence = "高" if evidence_count >= 3 and independent_sources >= 2 and coverage.get("complete_analysis") else "中"
         limitations = list(coverage.get("limitations") or [])
         if not evidence:
             limitations.append("当前主题没有达到正文证据门槛，不能据此形成可靠结论。")
@@ -101,6 +110,7 @@ def _direction_candidates(scan, analysis, limit=8):
                 "document_count": len(members),
                 "topic_concentration": round(concentration, 6),
                 "evidence_count": evidence_count,
+                "independent_source_count": independent_sources,
                 "unique_signal": round(unique_signal, 6),
                 "coverage_ratio": coverage.get("parsed_file_ratio"),
             },
@@ -577,8 +587,8 @@ def build_local_report(scan, summaries, analysis=None):
         "direction_candidates": _direction_candidates(scan, analysis),
         "analysis_method": {
             "parse": "Docling 统一文档模型；图片和扫描 PDF 使用 RapidOCR；失败项显式降级",
-            "deduplication": "SHA-256 精确去重",
-            "similarity": "64-bit SimHash + 8-band LSH + 特征包含率",
+            "deduplication": "SHA-256 规范文档投影；主题、检索、证据独立来源和价值评分排除精确重复副本，原始路径仍完整保留",
+            "similarity": "64-bit SimHash + 8-band LSH + 特征包含率；语义聚类在 500 份规范文档以上切换 MiniBatchKMeans",
             "retrieval": analysis.get("retrieval", {}).get("method", "BM25 + 本地 TF-IDF 字符向量"),
             "classification": "根据实际目录、格式、时间与正文高频主题动态选择维度",
             "traceability": "节点摘要和研究方向引用 evidence_id、文件路径、页/节、片段与源文件 SHA-256",
@@ -598,18 +608,15 @@ def _model_evidence_chain(evidence_catalog, evidence_ids, fallback):
         item = by_id.get(str(evidence_id))
         if item and item not in selected:
             selected.append(item)
-    if selected:
-        return selected
-    return [item for item in (fallback or []) if evidence_quality(item).get("eligible")]
+    return selected
 
 
 def merge_model_report(local_report, model_report, evidence_catalog=None):
     merged = dict(local_report)
     # Content categories are a complete, deterministic projection of the local
     # analysis tree. Language enhancement must never truncate or replace them.
-    for key in ("key_findings", "directions"):
-        if isinstance(model_report.get(key), list) and model_report[key]:
-            merged[key] = model_report[key]
+    # Free-form model findings without evidence ids must never replace the
+    # deterministic local overview.  Directions are validated below.
     evidence_catalog = evidence_catalog or []
     fallback_evidence = local_report.get("recommended_research_direction", {}).get("evidence_chain", [])
     recommendation = model_report.get("recommended_research_direction")
@@ -633,8 +640,17 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
             "support_status": recommendation["evidence_status"],
         }]
         recommendation.setdefault("confidence", "中")
-        merged["recommended_research_direction"] = recommendation
-    for direction in merged.get("directions", []):
+        if recommendation["evidence_status"] == "insufficient":
+            recommendation["priority"] = "低"
+            recommendation["confidence"] = "低"
+            recommendation["rationale"] = "证据不足，当前不能形成可靠推荐。"
+            recommendation.setdefault("limitations", []).append("模型未引用合法正文证据，该方向不进入正式首选方向。")
+        if recommendation["evidence_status"] == "supported":
+            merged["recommended_research_direction"] = recommendation
+        else:
+            merged["rejected_model_recommendation"] = recommendation
+    validated_directions = []
+    for direction in model_report.get("directions", []) or []:
         if isinstance(direction, dict):
             direction["type"] = "推论"
             direction["evidence_chain"] = _model_evidence_chain(
@@ -651,6 +667,10 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
                 "support_status": direction["evidence_status"],
             }]
             direction.setdefault("confidence", "中")
+            if direction["evidence_status"] == "supported":
+                validated_directions.append(direction)
+    if validated_directions:
+        merged["directions"] = validated_directions
     merged["generation_mode"] = "model_analyzed"
     return merged
 

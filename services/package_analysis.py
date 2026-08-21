@@ -23,14 +23,54 @@ from services.large_package import (
     pending_group,
     representative_paths,
 )
-from services.retrieval import build_retrieval_manifest
+from services.retrieval import build_retrieval_manifest, evidence_corpus
 from services.unified_parser import compact_document
 from services.unified_parser import UnifiedDocumentParser
 from services.parse_isolation import ParseIsolationCancelled, ParseIsolationError, runner_for
 
 
-SMALL_FILE_SUMMARY_BYTES = 16 * 1024
 PROFILE_USABLE_STATUSES = {"completed", "partial"}
+
+
+def _canonical_projection(documents, exact_groups):
+    """Return one analysis document per byte-identical source.
+
+    The physical inventory is deliberately left untouched.  This projection is
+    used by every content-weighted operation so copied files cannot amplify a
+    topic, evidence source count, retrieval result, or value score.
+    """
+    canonical_by_path = {path: path for path in documents}
+    aliases_by_canonical = defaultdict(list)
+    group_by_path = {}
+    for group in exact_groups:
+        canonical = group.get("canonical")
+        if canonical not in documents:
+            continue
+        for path in group.get("members") or []:
+            if path not in documents:
+                continue
+            canonical_by_path[path] = canonical
+            group_by_path[path] = group.get("group_id")
+            if path != canonical:
+                aliases_by_canonical[canonical].append(path)
+
+    for path, document in documents.items():
+        canonical = canonical_by_path[path]
+        duplicate = document.setdefault("deduplication", {})
+        duplicate.update({
+            "canonical_path": canonical,
+            "role": "canonical" if path == canonical else "duplicate_alias",
+            "duplicate_of": None if path == canonical else canonical,
+            "group_id": group_by_path.get(path),
+            "aliases": sorted(aliases_by_canonical.get(path, [])) if path == canonical else [],
+        })
+    canonical_documents = {
+        path: document for path, document in documents.items()
+        if canonical_by_path[path] == path
+    }
+    return canonical_documents, canonical_by_path, {
+        path: sorted(values) for path, values in aliases_by_canonical.items()
+    }
 
 
 def _build_value_judgment(scan, documents, analysis_stats, coverage, exact_groups,
@@ -43,17 +83,24 @@ def _build_value_judgment(scan, documents, analysis_stats, coverage, exact_group
     unsupported claim of business value.
     """
     scanned = max(0, int(scan.get("file_count") or 0))
-    parsed = max(0, int(analysis_stats.get("parsed_files") or 0))
+    parsed = max(0, int(analysis_stats.get("parsed_files") or len(documents)))
+    canonical_count = len(documents)
     parsed_ratio = float(coverage.get("parsed_file_ratio") or 0.0)
     byte_ratio = float(coverage.get("parsed_byte_ratio") or 0.0)
     failed = max(0, int(analysis_stats.get("failed_files") or len(failures)))
     duplicate_files = sum(int(group.get("duplicate_count") or 0) for group in exact_groups)
-    unique_ratio = max(0.0, min(1.0, 1.0 - duplicate_files / float(scanned or 1)))
+    unique_ratio = max(0.0, min(1.0, canonical_count / float(canonical_count + duplicate_files or 1)))
     cluster_sizes = [len(item.get("members") or []) for item in topic_clusters]
-    largest_cluster_ratio = max(cluster_sizes or [0]) / float(parsed or 1)
+    largest_cluster_ratio = max(cluster_sizes or [0]) / float(canonical_count or 1)
     topic_concentration = max(0.0, min(1.0, largest_cluster_ratio))
-    evidence_count = sum(len(document.get("evidence") or []) for document in documents.values())
-    evidence_density = max(0.0, min(1.0, evidence_count / float(max(parsed, 1) * 3)))
+    valid_evidence = [
+        item for document in documents.values() for item in (document.get("evidence") or [])
+        if evidence_quality(item).get("eligible")
+    ]
+    evidence_count = len(valid_evidence)
+    evidence_density = max(0.0, min(1.0, evidence_count / float(max(canonical_count, 1) * 3)))
+    text_characters = sum(len(str(document.get("text") or "")) for document in documents.values())
+    information_signal = min(1.0, text_characters / float(max(canonical_count, 1) * 8000))
     quality_score = structured_overview.get("average_quality_score")
     structured_quality = max(0.0, min(1.0, float(quality_score) / 100.0)) if quality_score is not None else None
 
@@ -72,16 +119,17 @@ def _build_value_judgment(scan, documents, analysis_stats, coverage, exact_group
             "score": pct(structured_quality),
             "basis": "CSV/XLSX/JSON 画像质量评分",
         }
-    research_components = [
-        unique_ratio,
-        topic_concentration,
-        evidence_density,
-        parsed_ratio,
-    ]
+    # Duplicate copies are reported, but never increase or decrease the
+    # research-potential score.  Only canonical content signals participate.
+    research_components = [topic_concentration, evidence_density, information_signal]
     if structured_quality is not None:
         research_components.append(structured_quality)
     research_score = pct(sum(research_components) / float(len(research_components) or 1))
-    if research_score >= 75:
+    enough_research_basis = canonical_count >= 3 and evidence_count >= 3
+    if not enough_research_basis:
+        research_score = min(research_score, 59.0)
+        research_level = "待确认"
+    elif research_score >= 75:
         research_level = "高"
     elif research_score >= 45:
         research_level = "中高" if topic_clusters or evidence_count else "中"
@@ -92,11 +140,53 @@ def _build_value_judgment(scan, documents, analysis_stats, coverage, exact_group
         limitations.append("存在 {} 个解析失败文件。".format(failed))
     if not topic_clusters:
         limitations.append("当前未形成稳定主题簇，研究方向需要人工确认。")
+    usability_score = pct(min(parsed_ratio, byte_ratio or parsed_ratio))
+    richness_score = pct((information_signal + evidence_density) / 2.0)
+    task_topic = str(scan.get("task_topic") or scan.get("analysis_goal") or "").strip()
+    task_relevance = {
+        "level": "未评估",
+        "score": None,
+        "basis": "尚未提供客户任务或研究目标，系统不推测业务相关性。",
+    }
+    if task_topic:
+        topic_tokens = set(_tokens(task_topic))
+        matched = sum(
+            1 for document in documents.values()
+            if topic_tokens.intersection(_tokens(_semantic_document_profile("", document, 1200)))
+        )
+        relevance_score = pct(matched / float(canonical_count or 1))
+        task_relevance = {
+            "level": "高" if relevance_score >= 70 else "中" if relevance_score >= 35 else "低",
+            "score": relevance_score,
+            "basis": "客户任务关键词与规范文档正文的本地匹配比例。",
+        }
+    if not enough_research_basis:
+        limitations.append("规范文档少于 3 份或有效正文证据少于 3 条，研究潜力最高只能标为待确认。")
     return {
         "level": "高" if parsed_ratio >= 0.9 and evidence_count else ("中" if parsed_ratio >= 0.5 or evidence_count else "待分析"),
         "availability": "高" if parsed_ratio >= 0.9 and not failed else ("中" if parsed_ratio >= 0.5 else "低"),
         "research_value": research_level,
         "research_score": research_score,
+        "data_usability": {
+            "level": "高" if usability_score >= 85 else "中" if usability_score >= 50 else "低",
+            "score": usability_score,
+            "basis": "文件与字节解析覆盖率的保守值。",
+        },
+        "information_richness": {
+            "level": "高" if richness_score >= 70 else "中" if richness_score >= 35 else "低",
+            "score": richness_score,
+            "basis": "规范文档正文规模与有效证据密度，不受重复副本数量影响。",
+        },
+        "research_potential": {
+            "level": research_level,
+            "score": research_score,
+            "basis": "规范文档主题集中度、正文丰富度和有效证据密度。",
+            "minimum_basis_met": enough_research_basis,
+        },
+        "task_relevance": task_relevance,
+        "canonical_document_count": canonical_count,
+        "duplicate_alias_count": duplicate_files,
+        "valid_evidence_count": evidence_count,
         "dimensions": dimensions,
         "basis": "基于可读性、覆盖完整性、内容独特性、主题集中度和可回查证据密度计算；不代表外部业务价值。",
         "confidence": "高" if coverage.get("complete_analysis") else "中",
@@ -437,7 +527,10 @@ def _parallel_parse_files(
                     submit_one(next_index)
                     next_index += 1
     finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except TypeError:  # Python 3.8 compatibility
+            executor.shutdown(wait=True)
         # Terminate idle parser children now rather than retaining one process
         # per pool thread for the lifetime of the Worker.
         for owned_parser in parser_registry:
@@ -752,6 +845,8 @@ def _first_evidence(document):
                 "section": evidence.get("section"),
                 "text": evidence.get("text", "")[:300],
                 "source_sha256": evidence.get("source_sha256"),
+                "archive_source_path": evidence.get("archive_source_path"),
+                "archive_member": evidence.get("archive_member"),
             }
 
             topics = document.get("structure", {}).get("headings", [])[:8]
@@ -842,9 +937,10 @@ def _node_summary(node, documents):
 def _file_summary(path, document):
     source = document.get("source", {})
     structure = document.get("structure", {})
-    evidence = document.get("evidence", [])[:3]
-    headings = structure.get("headings", [])[:6]
+    evidence = [item for item in document.get("evidence", []) if evidence_quality(item).get("eligible")][:3]
+    headings = structure.get("headings", [])[:2]
     first_text = next((item.get("text", "") for item in evidence if item.get("text")), "")
+    coverage = document.get("coverage") or {}
     summary = "{} 文件，大小 {}，解析器为 {}。".format(
         source.get("extension") or "未知格式",
         human_size(source.get("size", 0)),
@@ -858,6 +954,9 @@ def _file_summary(path, document):
         summary += "内容线索：{}".format(first_text[:260])
     if document.get("warnings"):
         summary += "该文件存在解析告警，引用前应复核。"
+    duplicate = document.get("deduplication") or {}
+    if duplicate.get("role") == "duplicate_alias":
+        summary += "该文件是 {} 的字节级重复副本，不重复参与主题与价值计算。".format(duplicate.get("canonical_path"))
     return {
         "schema_version": 4,
         "summary_type": "file",
@@ -866,6 +965,12 @@ def _file_summary(path, document):
         "summary": summary,
         "topics": _document_topics(document, 8),
         "structure_overview": structure,
+        "coverage": coverage,
+        "representative_evidence": evidence[:1],
+        "deep_analysis_recommended": bool(
+            evidence and (not coverage.get("complete", True) or len(str(document.get("text") or "")) >= 8000)
+        ),
+        "deduplication": duplicate,
         "representative_documents": [path],
         "evidence_chain": evidence,
         "generated_by": "local-unified-parser",
@@ -873,21 +978,38 @@ def _file_summary(path, document):
     }
 
 
-def _needs_local_file_summary(document):
-    """Keep automatic brief summaries for substantial files only.
+def _inventory_file_summary(path, file_node, state="pending"):
+    """Create an immediate metadata summary before content parsing finishes."""
+    size = int(file_node.get("size") or 0)
+    extension = file_node.get("extension") or Path(path).suffix.lower() or "未知格式"
+    status_text = "等待内容解析" if state == "pending" else "内容解析失败，可在任务中心重试"
+    return {
+        "schema_version": 4,
+        "summary_type": "file",
+        "node_path": path,
+        "title": Path(path).stem,
+        "summary": "{} 文件，大小 {}，已完成原始盘点；当前{}。".format(
+            extension, human_size(size), status_text
+        ),
+        "topics": [],
+        "structure_overview": {"title": Path(path).stem, "headings": []},
+        "coverage": {
+            "complete": False,
+            "coverage_ratio": 0.0,
+            "status": state,
+        },
+        "representative_documents": [path],
+        "representative_evidence": [],
+        "evidence_chain": [],
+        "deep_analysis_recommended": state != "failed",
+        "generated_by": "local-inventory",
+        "generated_at": _now(),
+    }
 
-    Small files remain fully selectable: users can inspect the unified document,
-    evidence chain and request the unchanged local deep-summary workflow.
-    """
-    source = document.get("source", {})
-    size = int(source.get("size") or 0)
-    extension = source.get("extension") or ""
-    text_length = len(document.get("text", ""))
-    # Structured/text files often carry the package's key configuration in a
-    # compact form.  Do not hide a 30-60 KB CSV/JSON just because it is small.
-    if extension in {".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml", ".ini", ".cfg"}:
-        return text_length >= 512
-    return size >= SMALL_FILE_SUMMARY_BYTES
+
+def _needs_local_file_summary(document):
+    """Every parsed file receives a bounded local summary without an LLM call."""
+    return bool(document)
 
 
 def _stable_group_node_id(dimension, name, member_paths):
@@ -1035,8 +1157,15 @@ def _enrich_analysis_tree(tree, documents):
             question_value = (
                 "该问题用于判断“{}”是否构成独立分析方向，以及资料是否足以支持后续深入研判。"
             ).format(subtopic_name)
-            answer = "“{}”可作为“{}”下的独立分析方向，当前由 {} 份资料共同支撑。".format(
-                subtopic_name, topic_name, len(paths)
+            supporting_quotes = [
+                " ".join(str(item.get("supporting_quote") or item.get("text") or "").split())
+                for item in evidence
+                if str(item.get("supporting_quote") or item.get("text") or "").strip()
+            ]
+            answer = (
+                "基于当前正文证据，可谨慎回答：{}".format(supporting_quotes[0][:420])
+                if supporting_quotes
+                else "证据不足，当前不能形成可靠回答。"
             )
             conclusion = {
                 # A traceable analysis unit is a valuable question, its answer,
@@ -1110,6 +1239,81 @@ def _enrich_analysis_tree(tree, documents):
 
         topic_node["conclusion_evidence"] = conclusion_evidence
         topic_node["children"] = subtopic_nodes
+    return tree
+
+
+def _expand_duplicate_aliases_in_tree(
+    tree, documents, canonical_by_path, aliases_by_canonical, node_summaries
+):
+    """Restore every physical path after canonical-only semantic analysis."""
+    def annotate_file(node, path, canonical):
+        payload = dict(node)
+        duplicate = documents.get(path, {}).get("deduplication") or {}
+        source = documents.get(path, {}).get("source") or {}
+        payload.update({
+            "name": Path(path).name,
+            "path": path,
+            "canonical_path": canonical,
+            "duplicate_role": duplicate.get("role", "canonical"),
+            "duplicate_of": duplicate.get("duplicate_of"),
+            "duplicate_aliases": duplicate.get("aliases", []),
+            "size": int(source.get("size") or payload.get("size") or 0),
+            "size_human": human_size(int(source.get("size") or payload.get("size") or 0)),
+            "summary": (node_summaries.get(path) or {}).get("summary") or payload.get("summary"),
+        })
+        if path != canonical:
+            payload["children"] = []
+            payload["evidence_ids"] = []
+        return payload
+
+    def visit(node):
+        children = []
+        for child in node.get("children") or []:
+            if child.get("kind") == "file":
+                canonical = canonical_by_path.get(child.get("path"), child.get("path"))
+                children.append(annotate_file(child, canonical, canonical))
+                for alias in aliases_by_canonical.get(canonical, []):
+                    children.append(annotate_file(child, alias, canonical))
+            else:
+                visit(child)
+                children.append(child)
+        node["children"] = children
+        if node.get("kind") == "group":
+            canonical_paths = list(dict.fromkeys(node.get("member_paths") or []))
+            expanded = []
+            for canonical in canonical_paths:
+                expanded.append(canonical)
+                expanded.extend(aliases_by_canonical.get(canonical, []))
+            node["member_paths"] = list(dict.fromkeys(expanded))
+            node["canonical_file_count"] = len(canonical_paths)
+            node["duplicate_alias_count"] = max(0, len(node["member_paths"]) - len(canonical_paths))
+            node["file_count"] = len(node["member_paths"])
+    visit(tree)
+    tree["deduplication"] = {
+        "analysis_uses_canonical_documents": True,
+        "canonical_document_count": len(set(canonical_by_path.values())),
+        "original_path_count": len(canonical_by_path),
+    }
+    return tree
+
+
+def _annotate_physical_tree_deduplication(tree, canonical_by_path, documents, node_summaries):
+    """Keep every physical path and expose its canonical relationship."""
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if node.get("kind") == "file" and node.get("path") in canonical_by_path:
+            path = node["path"]
+            canonical = canonical_by_path[path]
+            duplicate = (documents.get(path) or {}).get("deduplication") or {}
+            node.update({
+                "canonical_path": canonical,
+                "duplicate_role": duplicate.get("role", "canonical"),
+                "duplicate_of": duplicate.get("duplicate_of"),
+                "duplicate_aliases": duplicate.get("aliases", []),
+                "simple_summary": (node_summaries.get(path) or {}).get("summary"),
+            })
+        stack.extend(reversed(node.get("children") or []))
     return tree
 
 
@@ -1723,6 +1927,7 @@ def _semantic_document_clusters(
     embedding_client,
     batch_size=6,
     batch_progress=None,
+    storage=None,
 ):
     """
     Document-level semantic clustering.
@@ -1743,28 +1948,45 @@ def _semantic_document_clusters(
         for path in paths
     }
 
-    vectors = []
+    model_name = str(getattr(embedding_client, "model", "local-embedding"))
+    cache_keys = {
+        path: hashlib.sha256(
+            "{}|{}".format(
+                (documents[path].get("source") or {}).get("sha256") or "",
+                profiles[path],
+            ).encode("utf-8", errors="replace")
+        ).hexdigest()
+        for path in paths
+    }
+    cached = storage.get_embeddings(cache_keys.values(), model_name) if storage else {}
+    vectors_by_path = {
+        path: cached[cache_keys[path]] for path in paths if cache_keys[path] in cached
+    }
+    missing_paths = [path for path in paths if path not in vectors_by_path]
 
-    for start in range(0, len(paths), batch_size):
-        batch_paths = paths[start:start + batch_size]
-
-        batch_vectors = embedding_client.embed([
-            profiles[path]
-            for path in batch_paths
-        ])
+    for start in range(0, len(missing_paths), batch_size):
+        batch_paths = missing_paths[start:start + batch_size]
+        batch_vectors = embedding_client.embed([profiles[path] for path in batch_paths])
 
         if len(batch_vectors) != len(batch_paths):
             raise ValueError(
                 "文档级 embedding 返回数量不一致"
             )
-
-        vectors.extend(batch_vectors)
+        newly_cached = {}
+        for path, vector in zip(batch_paths, batch_vectors):
+            vectors_by_path[path] = vector
+            newly_cached[cache_keys[path]] = vector
+        if storage:
+            storage.save_embeddings(model_name, newly_cached)
 
         if batch_progress:
             batch_progress(
-                min(start + len(batch_paths), len(paths)),
+                min(len(cached) + start + len(batch_paths), len(paths)),
                 len(paths),
             )
+    if batch_progress and not missing_paths:
+        batch_progress(len(paths), len(paths))
+    vectors = [vectors_by_path[path] for path in paths]
 
     if len(paths) == 1:
         return [{
@@ -1775,9 +1997,67 @@ def _semantic_document_clusters(
             "keywords": [],
             "name": None,
             "summary": None,
+            "algorithm": "single-document",
         }], None
 
     count = len(paths)
+
+    if count > 500:
+        # Average-link clustering is intentionally bounded to small corpora.
+        # MiniBatchKMeans gives predictable memory/time behaviour for thousands
+        # of small files and never allocates an n*n similarity matrix.
+        cluster_count = max(8, min(96, int(round(math.sqrt(count)))))
+        try:
+            from sklearn.cluster import MiniBatchKMeans
+            model = MiniBatchKMeans(
+                n_clusters=min(cluster_count, count),
+                random_state=42,
+                batch_size=min(1024, count),
+                n_init=3,
+                max_iter=120,
+            )
+            labels = model.fit_predict(vectors).tolist()
+            centers = model.cluster_centers_.tolist()
+            algorithm = "MiniBatchKMeans"
+        except Exception:
+            # Deterministic bounded fallback for minimal/offline deployments.
+            labels = []
+            for vector in vectors:
+                signature = "".join("1" if float(value) >= 0 else "0" for value in vector[:16])
+                labels.append(int(signature or "0", 2) % cluster_count)
+            centers = None
+            algorithm = "deterministic-vector-buckets"
+        grouped = defaultdict(list)
+        for index, label in enumerate(labels):
+            grouped[int(label)].append(index)
+        results = []
+        for label, member_indices in grouped.items():
+            member_paths = sorted(paths[index] for index in member_indices)
+            if centers is not None:
+                center = centers[label]
+                ranked = sorted(
+                    ((_cosine_vector(vectors[index], center), paths[index]) for index in member_indices),
+                    key=lambda item: (-item[0], item[1]),
+                )
+                representatives = [path for _score, path in ranked[:3]]
+                mean_similarity = round(sum(score for score, _path in ranked) / len(ranked), 6)
+            else:
+                representatives = member_paths[:3]
+                mean_similarity = None
+            results.append({
+                "members": member_paths,
+                "representative_documents": representatives,
+                "mean_similarity": mean_similarity,
+                "keywords": [],
+                "name": None,
+                "summary": None,
+                "algorithm": algorithm,
+                "algorithm_parameters": {"document_threshold": 500, "cluster_count": len(grouped)},
+            })
+        results.sort(key=lambda cluster: (-len(cluster["members"]), cluster["members"]))
+        for index, cluster in enumerate(results, 1):
+            cluster["cluster_id"] = "SEM-{:04d}".format(index)
+        return results, None
 
     similarities = [
         [0.0] * count
@@ -1937,6 +2217,8 @@ def _semantic_document_clusters(
             "keywords": [],
             "name": None,
             "summary": None,
+            "algorithm": "adaptive-average-link",
+            "algorithm_parameters": {"document_threshold": 500, "similarity_threshold": round(threshold, 6)},
         })
 
     results.sort(
@@ -2485,13 +2767,23 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     progress(72, "执行精确去重与高相似文档聚类")
     exact_groups = _group_exact(documents)
+    canonical_documents, canonical_by_path, aliases_by_canonical = _canonical_projection(
+        documents, exact_groups
+    )
+    # Persist the canonical/alias relationship on every original path.  It is
+    # visible in the physical tree and survives a Worker restart.
+    for document_path, document in documents.items():
+        storage.save_document(scan_id, document_path, document)
     similar_groups = _group_similar(documents, exact_groups)
-    topic_clusters = _topic_clusters(documents)
-    retrieval = build_retrieval_manifest(documents, topic_clusters)
+    topic_clusters = _topic_clusters(canonical_documents)
+    retrieval = build_retrieval_manifest(canonical_documents, topic_clusters)
+    evidence_index_count = storage.replace_evidence_index(
+        scan_id, evidence_corpus(canonical_documents)
+    )
     research_documents = {
-        path: document for path, document in documents.items()
+        path: document for path, document in canonical_documents.items()
         if document.get("classification", {}).get("document_role") not in {"要求与说明材料", "派生概览材料"}
-    } or documents
+    } or canonical_documents
     research_topic_clusters = _topic_clusters(research_documents)
     research_retrieval = build_retrieval_manifest(research_documents, research_topic_clusters)
 
@@ -2503,7 +2795,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     semantic_naming_model = None
     semantic_error = None
 
-    if embedding_client is not None and documents and not policy.get("enabled"):
+    if embedding_client is not None and canonical_documents and not policy.get("enabled"):
         try:
             progress(74, "生成文档级语义向量")
 
@@ -2521,10 +2813,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
             semantic_clusters, semantic_threshold = (
                 _semantic_document_clusters(
-                    documents,
+                    canonical_documents,
                     embedding_client,
                     batch_size=6,
                     batch_progress=semantic_progress,
+                    storage=storage,
                 )
             )
 
@@ -2537,7 +2830,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 semantic_clusters, naming_result = (
                     _name_semantic_clusters(
                         semantic_clusters,
-                        documents,
+                        canonical_documents,
                         llm=llm,
                     )
                 )
@@ -2565,12 +2858,15 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         storage.save_summary(scan_id, directory["path"], "folder", summary)
     local_file_summary_count = 0
     for path, document in documents.items():
-        if not _needs_local_file_summary(document):
-            continue
         summary = _file_summary(path, document)
         node_summaries[path] = summary
         storage.save_summary(scan_id, path, "file", summary)
         local_file_summary_count += 1
+    for path in sorted(all_paths - set(documents)):
+        state = "failed" if path in failed_paths else "pending"
+        summary = _inventory_file_summary(path, inventory.get(path, {}), state=state)
+        node_summaries[path] = summary
+        storage.save_summary(scan_id, path, "file", summary)
 
     retrieved_evidence = []
     retrieved_ids = set()
@@ -2593,14 +2889,14 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     adaptive_tree = (
         _semantic_adaptive_tree(
             scan,
-            documents,
+            canonical_documents,
             node_summaries,
             semantic_clusters,
         )
         if semantic_clusters
         else _adaptive_tree(
             scan,
-            documents,
+            canonical_documents,
             node_summaries,
         )
     )
@@ -2608,11 +2904,21 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     if llm is not None and _optional_llm_enrichment_enabled():
         adaptive_tree, subtopic_naming_result = _name_subtopic_nodes(
             adaptive_tree,
-            documents,
+            canonical_documents,
             llm,
         )
     else:
         subtopic_naming_result = None
+    adaptive_tree = _expand_duplicate_aliases_in_tree(
+        adaptive_tree,
+        documents,
+        canonical_by_path,
+        aliases_by_canonical,
+        node_summaries,
+    )
+    scan["tree"] = _annotate_physical_tree_deduplication(
+        scan["tree"], canonical_by_path, documents, node_summaries
+    )
     if policy.get("enabled"):
         waiting = pending_group(pending_paths, inventory, policy)
         if waiting:
@@ -2620,6 +2926,10 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )
+    exact_groups = _group_exact(documents)
+    canonical_documents, _canonical_by_path, _aliases = _canonical_projection(documents, exact_groups)
+    analysis["exact_duplicate_groups"] = exact_groups
+    storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))
     adaptive_tree = attach_tree_coverage(adaptive_tree, coverage_for_paths, all_paths)
     exact_duplicate_files = sum(group["duplicate_count"] for group in exact_groups)
     structured_profiles = []
@@ -2662,7 +2972,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "profiles": structured_profiles[:200],
     }
     parsed_ratio = float(package_coverage.get("parsed_file_ratio") or 0)
-    evidence_count = sum(len(document.get("evidence", [])) for document in documents.values())
+    evidence_count = sum(len(document.get("evidence", [])) for document in canonical_documents.values())
     overview = {
         "file_count": scan.get("file_count", 0),
         "directory_count": scan.get("directory_count", 0),
@@ -2684,8 +2994,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     }
     value_judgment = _build_value_judgment(
         scan,
-        documents,
-        {"parsed_files": len(documents), "failed_files": len(failures)},
+        canonical_documents,
+        {"parsed_files": len(canonical_documents), "failed_files": len(failures)},
         package_coverage,
         exact_groups,
         topic_clusters,
@@ -2718,13 +3028,16 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "large_package_mode": policy.get("enabled"),
             "exact_duplicate_groups": len(exact_groups),
             "exact_duplicate_files": exact_duplicate_files,
+            "canonical_documents": len(canonical_documents),
+            "duplicate_aliases_excluded_from_analysis": len(documents) - len(canonical_documents),
             "similar_document_clusters": len(similar_groups),
             "topic_clusters": len(topic_clusters),
             "semantic_topic_clusters": len(semantic_clusters),
             "semantic_cluster_threshold": semantic_threshold,
             "semantic_cluster_error": semantic_error,
             "subtopic_nodes": sum(len(item.get("children", [])) for item in adaptive_tree.get("children", [])),
-            "evidence_items": sum(len(document.get("evidence", [])) for document in documents.values()),
+            "evidence_items": sum(len(document.get("evidence", [])) for document in canonical_documents.values()),
+            "raw_evidence_items": sum(len(document.get("evidence", [])) for document in documents.values()),
             "complete_text_files": sum(1 for document in documents.values() if document.get("coverage", {}).get("complete", True)),
             "truncated_text_files": sum(1 for document in documents.values() if not document.get("coverage", {}).get("complete", True)),
             "fast_preview_paths": [
@@ -2733,10 +3046,12 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             ],
             "office_embedded_image_ocr_files": sum(1 for document in documents.values() if document.get("parser", {}).get("office_embedded_image_ocr")),
             "retrieval_evidence_chunks": retrieval.get("evidence_chunks", 0),
+            "persistent_evidence_index_chunks": evidence_index_count,
             "parse_mode": parse_mode,
             "folder_summary_count": sum(1 for item in node_summaries.values() if item.get("summary_type") == "folder"),
             "local_file_summary_count": local_file_summary_count,
-            "small_file_summary_skipped": max(0, len(documents) - local_file_summary_count),
+            "metadata_file_summary_count": len(all_paths - set(documents)),
+            "small_file_summary_skipped": 0,
             "document_roles": dict(Counter(document.get("classification", {}).get("document_role", "一般资料") for document in documents.values())),
             "structured_profiled_files": structured_overview["profiled_files"],
             "structured_total_rows": structured_overview["total_rows"],
@@ -2764,15 +3079,16 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "structured_data_overview": structured_overview,
         "node_summaries": node_summaries,
         "document_index": [compact_document(document) for document in documents.values()],
+        "canonical_document_index": [compact_document(document) for document in canonical_documents.values()],
         "failures": failures,
         "policy": {
             "parse_mode": parse_mode,
             "analysis_mode": policy.get("mode"),
             "large_package": policy,
-            "small_file_summary_threshold_bytes": SMALL_FILE_SUMMARY_BYTES,
+            "all_nodes_have_local_summary": True,
             "docling_remote_services": False,
             "model_exception": "摘要增强仅调用已配置模型；解析、OCR、去重、聚类、建树均在本地执行。",
-            "deduplication_scope": "当前数据包内部",
+            "deduplication_scope": "当前数据包内部；聚类、检索、价值判断仅计算规范文档，原始路径全部保留",
         },
     }
     scan["analysis"] = analysis["statistics"]
@@ -2805,7 +3121,7 @@ def refresh_package_coverage(scan_id, scan, storage):
     analysis["analysis_tree"] = tree
     analysis["coverage"] = package_coverage
     structured = []
-    for path, document in documents.items():
+    for path, document in canonical_documents.items():
         if (document.get("data_profile") or {}).get("status") in PROFILE_USABLE_STATUSES:
             structured.append({"path": path, "profile": document["data_profile"]})
         for item in document.get("data_profiles", []) or []:
@@ -2832,13 +3148,16 @@ def refresh_package_coverage(scan_id, scan, storage):
         "parsed_byte_ratio": package_coverage.get("parsed_byte_ratio"),
         "complete_analysis": package_coverage.get("complete_analysis", False),
         "coverage_limitations": package_coverage.get("limitations", []),
+        "canonical_documents": len(canonical_documents),
+        "exact_duplicate_groups": len(exact_groups),
+        "exact_duplicate_files": len(documents) - len(canonical_documents),
     })
     analysis["value_judgment"] = _build_value_judgment(
         scan,
-        documents,
-        statistics,
+        canonical_documents,
+        {**statistics, "parsed_files": len(canonical_documents)},
         package_coverage,
-        analysis.get("exact_duplicate_groups", []),
+        exact_groups,
         analysis.get("topic_clusters", []),
         failures,
         pending_paths,

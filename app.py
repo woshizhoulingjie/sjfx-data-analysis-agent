@@ -236,11 +236,17 @@ def _physical_scope_member_paths(scan, node_path):
     return sorted(set(paths))
 
 
-def _package_documents(scan_id):
+def _package_documents(scan_id, canonical_only=False):
     """Avoid hydrating all deep documents when operating on a large package."""
     analysis = storage.get_analysis(scan_id) or {}
     is_large = bool(((analysis.get("policy") or {}).get("large_package") or {}).get("enabled"))
-    return storage.list_documents(scan_id, hydrate=not is_large)
+    documents = storage.list_documents(scan_id, hydrate=not is_large)
+    if canonical_only:
+        documents = [
+            item for item in documents
+            if ((item.get("payload") or {}).get("deduplication") or {}).get("role") != "duplicate_alias"
+        ]
+    return documents
 
 
 def _virtual_node_context(scan_id, node, max_files=30):
@@ -253,7 +259,7 @@ def _virtual_node_context(scan_id, node, max_files=30):
     if not member_paths:
         raise ValueError("当前主题节点没有关联文件")
 
-    all_documents = _package_documents(scan_id)
+    all_documents = _package_documents(scan_id, canonical_only=True)
 
     documents = [
         item
@@ -598,7 +604,7 @@ def _ensure_job_active(job_id):
 
 
 def _documents_context(scan_id, node_path, scan_result, max_files=30, max_chars=50000):
-    documents = _package_documents(scan_id)
+    documents = _package_documents(scan_id, canonical_only=True)
     if node_path != ".":
         prefix = node_path.rstrip("/") + "/"
         documents = [item for item in documents if item["path"] == node_path or item["path"].startswith(prefix)]
@@ -1170,7 +1176,8 @@ def retrieve():
             scan_id
         )
 
-        documents = _package_documents(scan_id)
+        documents = _package_documents(scan_id, canonical_only=True)
+        indexed_chunks = storage.list_evidence_index(scan_id)
 
         if not documents:
             return api_error(
@@ -1204,6 +1211,14 @@ def retrieve():
                 for item in documents
                 if item.get("path")
                 in member_paths
+            ]
+            indexed_chunks = [
+                item for item in indexed_chunks
+                if str(item.get("archive_source_path") or item.get("source_path") or "") in member_paths
+                or any(
+                    str(item.get("source_path") or "").startswith(path + "::")
+                    for path in member_paths
+                )
             ]
 
             # 保存检索结果时使用这个作用域标识
@@ -1281,6 +1296,7 @@ def retrieve():
                 10
             ),
             candidate_evidence_ids=candidate_ids,
+            indexed_chunks=indexed_chunks or None,
         )
 
         # 返回前端真正的逻辑范围
@@ -1336,7 +1352,7 @@ def ask_numeric():
     try:
         scan_id = payload.get("scan_id", "")
         scan_result = require_scan(scan_id)
-        documents = _package_documents(scan_id)
+        documents = _package_documents(scan_id, canonical_only=True)
         node_id = payload.get("node_id")
         if node_id:
             node = _find_analysis_node(scan_id, node_id)

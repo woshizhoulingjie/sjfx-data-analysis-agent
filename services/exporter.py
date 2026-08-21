@@ -538,6 +538,56 @@ def create_report_docx(report, scan, output_path):
 
     add_heading("一、数据包基本信息", level=1)
     add_items(report.get("basic_information"))
+    coverage = report.get("coverage") or {}
+    if coverage:
+        add_heading("覆盖等级与限制", level=2)
+        add_paragraph(
+            "{}（{}）：已解析 {}/{} 个文件；抽样 {} 个；待处理 {} 个；失败 {} 个。".format(
+                coverage.get("coverage_level_label", "覆盖等级未标注"),
+                coverage.get("status", "待分析"),
+                coverage.get("parsed_files", 0),
+                coverage.get("inventory_files", 0),
+                coverage.get("sampled_files", 0),
+                coverage.get("pending_files", 0),
+                coverage.get("failed_files", 0),
+            )
+        )
+        archive_totals = coverage.get("archive_member_totals") or {}
+        if archive_totals.get("total_members"):
+            add_paragraph(
+                "压缩包成员：已解析 {}/{}；跳过 {}；失败 {}。".format(
+                    archive_totals.get("parsed_members", 0), archive_totals.get("total_members", 0),
+                    archive_totals.get("skipped_members", 0), archive_totals.get("failed_members", 0),
+                )
+            )
+        add_items(coverage.get("limitations"), empty_text="当前未发现覆盖限制。")
+    judgment = report.get("value_judgment") or {}
+    if judgment:
+        add_heading("数据价值判断", level=2)
+        labels = (
+            ("data_usability", "数据可用性"),
+            ("information_richness", "信息丰富度"),
+            ("research_potential", "研究潜力"),
+            ("task_relevance", "与客户任务的相关性"),
+        )
+        for key, label in labels:
+            item = judgment.get(key) or {}
+            add_paragraph(
+                "{}：{}{}。依据：{}".format(
+                    label,
+                    item.get("level", "未评估"),
+                    "（{}分）".format(item["score"]) if item.get("score") is not None else "",
+                    item.get("basis", "未提供"),
+                ),
+                style="List Bullet",
+            )
+        add_paragraph(
+            "规范文档 {} 份；重复副本 {} 份；有效正文证据 {} 条。".format(
+                judgment.get("canonical_document_count", 0), judgment.get("duplicate_alias_count", 0),
+                judgment.get("valid_evidence_count", 0),
+            )
+        )
+        add_items(judgment.get("limitations"), empty_text="当前没有额外价值判断限制。")
     add_heading("二、全局分类", level=1)
     categories = report.get("global_categories") or []
     classification_coverage = report.get("classification_coverage", {})

@@ -270,8 +270,10 @@ function renderTreeNode(node) {
     meta.textContent =
       `${node.file_count || 0} 文件 / ${node.directory_count || 0} 目录`;
   } else if (node.kind === 'file') {
-    meta.textContent =
-      node.size_human || '';
+    const duplicateNote = node.duplicate_role === 'duplicate_alias'
+      ? ` · 重复副本 → ${node.duplicate_of || node.canonical_path}`
+      : (node.duplicate_aliases?.length ? ` · ${node.duplicate_aliases.length} 个副本` : '');
+    meta.textContent = `${node.size_human || ''}${duplicateNote}`;
   } else if (node.kind === 'evidence') {
     meta.textContent =
       node.evidence?.page
@@ -1330,20 +1332,29 @@ function updateStats() {
   const overview = state.analysis?.overview || {};
   const judgment = state.analysis?.value_judgment || {};
   if (overview.file_count != null || judgment.level) {
+    const usability = judgment.data_usability || {};
+    const richness = judgment.information_richness || {};
+    const potential = judgment.research_potential || {};
+    const relevance = judgment.task_relevance || {};
     $('scanStats').innerHTML +=
       `<div class="coverage-card"><strong>数据概览：</strong>已解析 ${overview.parsed_files ?? a.parsed_files ?? 0} 个文件，证据 ${overview.evidence_count ?? a.evidence_items ?? 0} 条；` +
-      `价值判断：${escapeHtml(judgment.level || '待分析')}（${escapeHtml(judgment.confidence || '—')}）` +
+      `规范文档 ${judgment.canonical_document_count ?? a.canonical_documents ?? '—'} 份，重复副本 ${judgment.duplicate_alias_count ?? a.exact_duplicate_files ?? 0} 份。<br>` +
+      `<strong>四维判断：</strong>数据可用性 ${escapeHtml(usability.level || '—')} · 信息丰富度 ${escapeHtml(richness.level || '—')} · 研究潜力 ${escapeHtml(potential.level || judgment.research_value || '待分析')} · 任务相关性 ${escapeHtml(relevance.level || '未评估')}` +
       `${judgment.limitations?.length ? `<br><small>${escapeHtml(judgment.limitations.join('；'))}</small>` : ''}</div>`;
   }
   if (coverage.inventory_files != null) {
     $('scanStats').innerHTML +=
-      `<div class="coverage-card"><strong>分析覆盖：${escapeHtml(coverage.status || '—')}</strong> · 已分析 ${coverage.parsed_files || 0}/${coverage.inventory_files || 0}（${ratio}）` +
+      `<div class="coverage-card"><strong>分析覆盖：${escapeHtml(coverage.status || '—')}</strong> · ${escapeHtml(coverage.coverage_level_label || '覆盖等级未标注')} · 已分析 ${coverage.parsed_files || 0}/${coverage.inventory_files || 0}（${ratio}）` +
       `；抽样 ${coverage.sampled_files ?? coverage.sampled_overview_files ?? 0}；深度分析 ${coverage.deep_analyzed_files ?? 0}` +
       `；待处理 ${coverage.pending_files || 0}；失败 ${coverage.failed_files || 0}` +
       `；${coverage.complete_analysis ? '完整分析' : '部分覆盖'}` +
       `${coverage.large_package_notice ? `<br><small>${escapeHtml(coverage.large_package_notice)}</small>` : ''}</div>`;
     if (coverage.limitations?.length) {
       $('scanStats').innerHTML += `<div class="coverage-card"><strong>覆盖限制：</strong>${escapeHtml(coverage.limitations.join('；'))}</div>`;
+    }
+    const archiveTotals = coverage.archive_member_totals || {};
+    if (archiveTotals.total_members) {
+      $('scanStats').innerHTML += `<div class="coverage-card"><strong>压缩包成员覆盖：</strong>已解析 ${archiveTotals.parsed_members || 0}/${archiveTotals.total_members || 0}；跳过 ${archiveTotals.skipped_members || 0}；失败 ${archiveTotals.failed_members || 0}。</div>`;
     }
   }
   if (judgment.dimensions) {

@@ -454,7 +454,13 @@ class UnifiedDocumentParser:
             self._parse_archive(path, base, mode=mode, archive_depth=_archive_depth)
             base["content_sha256"] = _digest_text(base["text"])
             base["coverage"]["stored_characters"] = len(base["text"])
-            base["coverage"]["complete"] = not base["coverage"].get("truncated_by_limit")
+            archive_manifest = base.get("archive_manifest") or {}
+            archive_complete = archive_manifest.get("coverage_status") == "complete"
+            base["coverage"]["complete"] = bool(
+                archive_complete and not base["coverage"].get("truncated_by_limit")
+            )
+            base["coverage"]["archive"] = archive_manifest
+            base["coverage"]["coverage_ratio"] = archive_manifest.get("member_coverage_ratio", 0.0)
             if not base["evidence"] and base["text"].strip():
                 self._add_fallback_evidence(base)
             return base
@@ -552,6 +558,19 @@ class UnifiedDocumentParser:
         base["parser"] = {"name": "archive-members", "degraded": False, "archive": True, "mode": mode}
         base["structure"]["archive_member_count"] = 0
         base["structure"]["archive_members"] = []
+        base["archive_manifest"] = {
+            "container_path": base.get("source", {}).get("path"),
+            "total_members": 0,
+            "parsed_members": 0,
+            "skipped_members": 0,
+            "failed_members": 0,
+            "truncated_members": 0,
+            "coverage_status": "partial",
+            "member_coverage_ratio": 0.0,
+            "skip_reasons": {},
+            "member_records": [],
+            "member_records_truncated": False,
+        }
         if archive_depth >= ARCHIVE_MAX_DEPTH:
             base["parser"]["degraded"] = True
             base["warnings"].append("压缩包嵌套层级达到安全上限，未继续展开。")
@@ -598,20 +617,42 @@ class UnifiedDocumentParser:
 
     def _parse_archive_entries(self, path, base, entries, temp_root, mode, archive_depth):
         total_uncompressed = 0
-        for raw_name, declared_size, opener in entries:
+        manifest = base["archive_manifest"]
+        manifest["total_members"] = len(entries)
+
+        def record(member_name, status, reason=None):
+            key = "{}_members".format(status)
+            if key in manifest:
+                manifest[key] += 1
+            if reason:
+                reasons = manifest["skip_reasons"]
+                reasons[reason] = int(reasons.get(reason) or 0) + 1
+            if len(manifest["member_records"]) < 500:
+                manifest["member_records"].append({
+                    "member": str(member_name)[:500], "status": status, "reason": reason,
+                })
+            else:
+                manifest["member_records_truncated"] = True
+
+        for entry_index, (raw_name, declared_size, opener) in enumerate(entries):
             if len(base["structure"]["archive_members"]) >= ARCHIVE_MAX_ENTRIES:
                 base["warnings"].append("压缩包成员超过 {} 个，仅保留前部成员。".format(ARCHIVE_MAX_ENTRIES))
+                for remaining_name, _size, _opener in entries[entry_index:]:
+                    record(remaining_name, "skipped", "member_count_limit")
                 break
             member_name = posixpath.normpath(str(raw_name).replace("\\", "/")).lstrip("/")
             if not member_name or member_name == "." or member_name.startswith("../") or "/../" in member_name:
                 base["warnings"].append("已跳过越界压缩包成员：{}".format(raw_name))
+                record(raw_name, "skipped", "unsafe_path")
                 continue
             if declared_size < 0 or declared_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + declared_size > ARCHIVE_MAX_TOTAL_BYTES:
                 base["warnings"].append("已跳过超过安全大小限制的压缩包成员：{}".format(member_name))
+                record(member_name, "skipped", "size_limit")
                 continue
             destination = _safe_archive_destination(temp_root, member_name)
             if destination is None:
                 base["warnings"].append("已跳过解析后越界或含符号链接的压缩包成员：{}".format(raw_name))
+                record(raw_name, "skipped", "unsafe_path")
                 continue
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -625,9 +666,11 @@ class UnifiedDocumentParser:
                 destination.parent.mkdir(parents=True, exist_ok=True)
             except (OSError, ValueError) as exc:
                 base["warnings"].append("已跳过不安全的压缩包成员 {}：{}".format(member_name, str(exc)[:160]))
+                record(member_name, "skipped", "unsafe_path")
                 continue
             source = opener()
             if source is None:
+                record(member_name, "failed", "member_unreadable")
                 continue
             allowed_member_bytes = min(
                 ARCHIVE_MAX_MEMBER_BYTES,
@@ -649,36 +692,47 @@ class UnifiedDocumentParser:
             except (OSError, ValueError) as exc:
                 destination.unlink(missing_ok=True)
                 base["warnings"].append("压缩包成员 {} 写入失败：{}".format(member_name, str(exc)[:160]))
+                record(member_name, "failed", "extraction_error")
                 continue
             if exceeded_stream_limit:
                 destination.unlink(missing_ok=True)
                 base["warnings"].append("已中止实际解压后超过限制的压缩包成员：{}".format(member_name))
+                record(member_name, "skipped", "stream_size_limit")
                 continue
             # Resolve once more after writing.  This catches a symlink race and
             # prevents a later parser from reading a path outside the sandbox.
             if _safe_archive_destination(temp_root, member_name) != destination:
                 destination.unlink(missing_ok=True)
                 base["warnings"].append("已丢弃写入后越界的压缩包成员：{}".format(member_name))
+                record(member_name, "skipped", "unsafe_path")
                 continue
             actual_size = copied_bytes
             if actual_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + actual_size > ARCHIVE_MAX_TOTAL_BYTES:
                 destination.unlink(missing_ok=True)
                 base["warnings"].append("已跳过实际解压后超过限制的成员：{}".format(member_name))
+                record(member_name, "skipped", "size_limit")
                 continue
             total_uncompressed += actual_size
             base["structure"]["archive_members"].append(member_name)
             base["structure"]["archive_member_count"] += 1
             child_ext = destination.suffix.lower()
             if child_ext not in SUPPORTED_EXTENSIONS or child_ext in ARCHIVE_EXTENSIONS:
+                record(member_name, "skipped", "unsupported_or_nested_type")
                 continue
             try:
                 child = self.parse(destination, relative_path=member_name, mode=mode, _archive_depth=archive_depth + 1)
             except Exception as exc:
                 base["warnings"].append("成员 {} 解析失败：{}".format(member_name, exc))
+                record(member_name, "failed", "parse_error")
                 continue
+            record(member_name, "parsed")
+            if not (child.get("coverage") or {}).get("complete", True):
+                manifest["truncated_members"] += 1
             child_text = str(child.get("text") or "")
             if child_text:
                 block = "\n\n[压缩包成员：{}]\n{}".format(member_name, child_text)
+                if len(base["text"]) + len(block) > self.max_chars:
+                    base["coverage"]["truncated_by_limit"] = True
                 base["text"] = (base["text"] + block)[: self.max_chars]
             for evidence in child.get("evidence") or []:
                 item = dict(evidence)
@@ -691,7 +745,37 @@ class UnifiedDocumentParser:
             if child.get("data_profile"):
                 base.setdefault("data_profiles", []).append({"member": member_name, "profile": child["data_profile"]})
             if len(base["evidence"]) >= 3000:
+                remaining = max(0, len(entries) - entry_index - 1)
+                for remaining_name, _size, _opener in entries[entry_index + 1:]:
+                    record(remaining_name, "skipped", "evidence_limit")
+                if remaining:
+                    base["warnings"].append("证据数量达到上限，后续 {} 个成员未继续解析。".format(remaining))
                 break
+        handled = manifest["parsed_members"] + manifest["skipped_members"] + manifest["failed_members"]
+        if handled < manifest["total_members"]:
+            manifest["skipped_members"] += manifest["total_members"] - handled
+            manifest["skip_reasons"]["not_processed"] = manifest["total_members"] - handled
+        manifest["member_coverage_ratio"] = round(
+            manifest["parsed_members"] / float(manifest["total_members"] or 1), 6
+        )
+        manifest["coverage_status"] = (
+            "complete"
+            if manifest["total_members"] > 0
+            and manifest["parsed_members"] == manifest["total_members"]
+            and not manifest["failed_members"]
+            and not manifest["skipped_members"]
+            and not manifest["truncated_members"]
+            and not base["coverage"].get("truncated_by_limit")
+            else "partial"
+        )
+        if manifest["coverage_status"] != "complete":
+            base["parser"]["degraded"] = True
+            base["warnings"].append(
+                "压缩包为部分覆盖：共 {} 个成员，解析 {} 个，跳过 {} 个，失败 {} 个，截断 {} 个。".format(
+                    manifest["total_members"], manifest["parsed_members"], manifest["skipped_members"],
+                    manifest["failed_members"], manifest["truncated_members"],
+                )
+            )
         if base["structure"]["archive_member_count"] == 0:
             base["parser"]["degraded"] = True
             base["warnings"].append("压缩包中没有找到可解析的文本/办公文档成员。")
@@ -1096,6 +1180,8 @@ def compact_document(document, include_text=False):
         "data_profile": document.get("data_profile"),
         "data_profiles": document.get("data_profiles", []),
         "coverage": document.get("coverage", {}),
+        "archive_manifest": document.get("archive_manifest"),
+        "deduplication": document.get("deduplication", {}),
         "content_sha256": document.get("content_sha256"),
         "warnings": document.get("warnings", []),
         "evidence_count": len(document.get("evidence", [])),
