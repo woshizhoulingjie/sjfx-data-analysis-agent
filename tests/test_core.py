@@ -357,6 +357,56 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(storage.get_job(first)["status"], "cancelled")
             self.assertEqual(storage.get_job(second)["status"], "queued")
 
+    def test_queued_cancel_is_terminal_and_retry_gets_a_new_job(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "test.db")
+            first, _ = storage.create_or_get_job("scan-1")
+            cancelled = storage.cancel_job(first)
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(cancelled["stage"], "cancelled")
+            self.assertIsNotNone(cancelled["finished_at"])
+            second, created = storage.create_or_get_job("scan-1")
+            self.assertTrue(created)
+            self.assertNotEqual(first, second)
+
+    def test_finalize_job_resolves_cancel_completion_race(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "test.db")
+            job_id = storage.create_scan_job(folder, 10, "fast", 8)
+            storage.claim_next_job("worker-a")
+            storage.cancel_job(job_id)
+            final = storage.finalize_job(job_id, result={"should_not_publish": True})
+            self.assertEqual(final["status"], "cancelled")
+            self.assertIsNone(final["result"])
+
+    def test_running_progress_is_monotonic(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "test.db")
+            job_id = storage.create_scan_job(folder, 10, "fast", 8)
+            storage.claim_next_job("worker-a")
+            storage.update_job(job_id, progress=15, heartbeat=True)
+            storage.update_job(job_id, progress=2, heartbeat=True)
+            self.assertEqual(storage.get_job(job_id)["progress"], 15)
+
+    def test_primary_import_has_priority_over_optional_summary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "test.db")
+            summary_id = storage.create_job("scan-old", task_type="generate_summary")
+            scan_id = storage.create_scan_job(folder, 10, "fast", 8)
+            claimed = storage.claim_next_job("worker-a")
+            self.assertEqual(claimed["id"], scan_id)
+            self.assertEqual(storage.get_queue_position(summary_id), 1)
+
+    def test_summary_batch_is_published_in_one_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "test.db")
+            written = storage.save_summaries("scan-1", [
+                (".", "folder", {"summary": "根目录"}),
+                ("a.txt", "file", {"summary": "文件摘要"}),
+            ])
+            self.assertEqual(written, 2)
+            self.assertEqual(len(storage.list_summaries("scan-1")), 2)
+
     def test_local_long_document_fallback_has_actionable_direction(self):
         result = _local_merge("paper.txt", [
             {"chunk_index": 1, "section_summary": "实验设计和结论", "key_facts": ["样本存在差异"]},

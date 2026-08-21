@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,7 +81,8 @@ def _file_metadata(path, root):
     }
 
 
-def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None, cancel_check=None):
+def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
+                   activity_callback=None, cancel_check=None):
     """Build a bounded physical inventory without following symbolic links.
 
     ``max_depth`` protects the web/worker process from pathological directory
@@ -102,10 +104,23 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None, 
     ignored_file_count = 0
     skipped_symlink_count = 0
     depth_limited_directory_count = 0
+    visited_directory_count = 0
+    last_activity_at = 0.0
+
+    def publish_activity(current_path, force=False):
+        nonlocal last_activity_at
+        if not activity_callback:
+            return
+        now = time.monotonic()
+        if force or now - last_activity_at >= 0.75:
+            activity_callback(count, visited_directory_count, str(current_path))
+            last_activity_at = now
 
     def walk(folder, depth=0):
         nonlocal count, total_size, truncated, ignored_file_count
-        nonlocal skipped_symlink_count, depth_limited_directory_count
+        nonlocal skipped_symlink_count, depth_limited_directory_count, visited_directory_count
+        visited_directory_count += 1
+        publish_activity(folder, force=visited_directory_count == 1)
         node = {
             "id": path_id(folder),
             "name": folder.name or str(folder),
@@ -128,9 +143,18 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None, 
             node["simple_summary"] = "目录层级超过安全上限，未继续向下扫描。"
             return node
         try:
-            entries = sorted(
-                os.scandir(str(folder)),
-                key=lambda e: (not e.is_dir(follow_symlinks=False), natural_key(e.name)),
+            entries = []
+            with os.scandir(str(folder)) as iterator:
+                for entry_index, entry in enumerate(iterator, 1):
+                    if cancel_check:
+                        cancel_check()
+                    entries.append(entry)
+                    if entry_index % 64 == 0:
+                        publish_activity(folder)
+            if cancel_check:
+                cancel_check()
+            entries.sort(
+                key=lambda e: (not e.is_dir(follow_symlinks=False), natural_key(e.name))
             )
         except (OSError, PermissionError) as exc:
             errors.append({"path": str(folder), "error": str(exc)})
@@ -171,8 +195,9 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None, 
                     ext = meta["extension"] or "[无扩展名]"
                     type_counts[ext] = type_counts.get(ext, 0) + 1
                     node["type_counts"][ext] = node["type_counts"].get(ext, 0) + 1
-                    if progress_callback and (count == 1 or count % 100 == 0):
+                    if progress_callback and (count == 1 or count % 25 == 0):
                         progress_callback(count)
+                    publish_activity(item_path)
             except (OSError, PermissionError) as exc:
                 errors.append({"path": entry.path, "error": str(exc)})
         node["size_human"] = human_size(node["total_size"])
@@ -190,9 +215,11 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None, 
             )
         else:
             node["simple_summary"] = "本文件夹当前为空，未发现可分析文件。"
+        publish_activity(folder)
         return node
 
     tree = walk(root)
+    publish_activity(root, force=True)
     return {
         "root": str(root),
         "scanned_at": now_iso(),
@@ -201,6 +228,7 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None, 
         "ignored_file_count": ignored_file_count,
         "skipped_symlink_count": skipped_symlink_count,
         "depth_limited_directory_count": depth_limited_directory_count,
+        "scanned_directory_count": visited_directory_count,
         "max_depth": max_depth,
         "total_size": total_size,
         "total_size_human": human_size(total_size),

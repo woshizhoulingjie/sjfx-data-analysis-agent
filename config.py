@@ -156,7 +156,23 @@ class Config:
     MAX_STRUCTURED_PROFILE_BYTES = int(os.getenv("MAX_STRUCTURED_PROFILE_BYTES", str(256 * 1024 * 1024)))
     MAX_ANALYSIS_JOBS = max(1, int(os.getenv("MAX_ANALYSIS_JOBS", "1")))
     WORKER_POLL_SECONDS = max(0.1, float(os.getenv("WORKER_POLL_SECONDS", "0.5")))
+    WORKER_MONITOR_SECONDS = max(0.1, min(2.0, float(os.getenv("WORKER_MONITOR_SECONDS", "0.5"))))
+    WORKER_HEARTBEAT_SECONDS = max(1.0, min(30.0, float(os.getenv("WORKER_HEARTBEAT_SECONDS", "3"))))
+    WORKER_TERMINATE_GRACE_SECONDS = max(1.0, min(30.0, float(os.getenv("WORKER_TERMINATE_GRACE_SECONDS", "5"))))
     WORKER_STALE_SECONDS = max(60, int(os.getenv("WORKER_STALE_SECONDS", "900")))
+    # End-to-end task boundaries are deliberately separate from a single file
+    # or model request timeout. Large package analysis/export can run for hours,
+    # while an interactive summary must release the queue within minutes.
+    JOB_DEFAULT_TIMEOUT_SECONDS = max(60, int(os.getenv("JOB_DEFAULT_TIMEOUT_SECONDS", "3600")))
+    JOB_SCAN_TIMEOUT_SECONDS = max(300, int(os.getenv("JOB_SCAN_TIMEOUT_SECONDS", "86400")))
+    JOB_ANALYSIS_TIMEOUT_SECONDS = max(300, int(os.getenv("JOB_ANALYSIS_TIMEOUT_SECONDS", "86400")))
+    JOB_SUMMARY_TIMEOUT_SECONDS = max(60, int(os.getenv("JOB_SUMMARY_TIMEOUT_SECONDS", "420")))
+    JOB_DOCUMENT_SUMMARY_TIMEOUT_SECONDS = max(
+        JOB_SUMMARY_TIMEOUT_SECONDS,
+        int(os.getenv("JOB_DOCUMENT_SUMMARY_TIMEOUT_SECONDS", "1800")),
+    )
+    JOB_REPORT_TIMEOUT_SECONDS = max(60, int(os.getenv("JOB_REPORT_TIMEOUT_SECONDS", "900")))
+    JOB_EXPORT_TIMEOUT_SECONDS = max(300, int(os.getenv("JOB_EXPORT_TIMEOUT_SECONDS", "21600")))
 
 
 Config.DATA_DIR.mkdir(exist_ok=True)

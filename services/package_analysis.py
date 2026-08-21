@@ -428,6 +428,7 @@ def _parallel_parse_files(
     max_workers=1,
     cancel_check=None,
     on_complete=None,
+    on_tick=None,
 ):
     """Parse independent files concurrently while preserving hard limits.
 
@@ -450,6 +451,8 @@ def _parallel_parse_files(
         for index, file_node in enumerate(candidates):
             if cancel_check is not None and cancel_check():
                 raise ParseIsolationCancelled("任务已取消，停止提交新的解析文件")
+            if on_tick is not None:
+                on_tick(index, len(candidates), [file_node.get("path") or ""])
             path = resolve_under(scan_root, file_node["path"])
             try:
                 source_signature = _assert_source_stable(path, file_node, cancel_check=cancel_check)
@@ -476,6 +479,7 @@ def _parallel_parse_files(
     future_map = {}
     results = [None] * len(candidates)
     next_index = 0
+    completed_count = 0
 
     def submit_one(index):
         file_node = candidates[index]
@@ -513,6 +517,12 @@ def _parallel_parse_files(
                 for future in future_map:
                     future.cancel()
                 raise ParseIsolationCancelled("任务已取消，停止等待并行解析")
+            if on_tick is not None:
+                active_paths = [
+                    candidates[index].get("path") or ""
+                    for index in list(future_map.values())[:workers]
+                ]
+                on_tick(completed_count, len(candidates), active_paths)
             done, _pending = wait(tuple(future_map), timeout=0.25, return_when=FIRST_COMPLETED)
             if not done:
                 continue
@@ -521,6 +531,7 @@ def _parallel_parse_files(
                 item = future.result()
                 index, file_node, document, error = item
                 results[index] = item
+                completed_count += 1
                 if on_complete is not None:
                     on_complete(index, file_node, document, error)
                 if next_index < len(candidates):
@@ -2744,6 +2755,22 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         if str(getattr(parser, "docling_device", "cpu")).lower() != "cpu":
             parse_workers = 1
 
+        parse_pulse = {"at": 0.0}
+
+        def parse_tick(done_count, total_count, active_paths):
+            now = time.monotonic()
+            if now - parse_pulse["at"] < 1.5:
+                return
+            parse_pulse["at"] = now
+            overall_done = min(len(candidates), reusable_count + int(done_count or 0))
+            active_text = "、".join(str(path) for path in (active_paths or [])[:2] if path)
+            progress(
+                2 + int(68 * overall_done / total_candidates),
+                "{}：已完成 {}/{}；正在解析 {}".format(
+                    phase_label, overall_done, len(candidates), active_text or "当前文件",
+                ),
+            )
+
         _parallel_parse_files(
             parser,
             [item[0] for item in parse_candidates],
@@ -2752,18 +2779,32 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             max_workers=parse_workers,
             cancel_check=cancel_check,
             on_complete=commit_parse_result,
+            on_tick=parse_tick,
         )
 
     failed_paths = {item.get("path") for item in failures}
     pending_paths = all_paths - set(documents) - failed_paths
 
-    for document_path, document in documents.items():
+    classified_batch = []
+    classified_total = max(1, len(documents))
+    for classified_index, (document_path, document) in enumerate(documents.items(), 1):
+        if cancel_check is not None and cancel_check():
+            raise ParseIsolationCancelled("任务已取消，停止文档角色分析")
         role, details = _document_role_details(document)
         classification = document.setdefault("classification", {})
         classification["document_role"] = role
         classification["role_reason"] = details["reason"]
         classification["role_scores"] = details["scores"]
-        storage.save_document(scan_id, document_path, document)
+        classified_batch.append((document_path, document))
+        if len(classified_batch) >= 250:
+            storage.save_documents(scan_id, classified_batch)
+            classified_batch = []
+            progress(
+                70 + int(2 * classified_index / classified_total),
+                "整理文档角色与质量：{}/{}".format(classified_index, len(documents)),
+            )
+    if classified_batch:
+        storage.save_documents(scan_id, classified_batch)
 
     progress(72, "执行精确去重与高相似文档聚类")
     exact_groups = _group_exact(documents)
@@ -2850,23 +2891,46 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     progress(82, "生成所有文件夹的本地摘要与证据链")
     node_summaries = {}
-    for directory in _walk_directories(scan["tree"]):
+    directories = list(_walk_directories(scan["tree"]))
+    unparsed_paths = sorted(all_paths - set(documents))
+    summary_total = max(1, len(directories) + len(documents) + len(unparsed_paths))
+    summary_done = 0
+    summary_batch = []
+
+    def queue_summary(path, summary_type, summary):
+        nonlocal summary_done, summary_batch
+        summary_batch.append((path, summary_type, summary))
+        summary_done += 1
+        if len(summary_batch) >= 250:
+            if cancel_check is not None and cancel_check():
+                raise ParseIsolationCancelled("任务已取消，停止生成节点摘要")
+            storage.save_summaries(scan_id, summary_batch)
+            summary_batch = []
+            progress(
+                min(87, 82 + int(5 * summary_done / summary_total)),
+                "批量生成节点摘要：{}/{}".format(summary_done, summary_total),
+            )
+
+    for directory in directories:
         summary = _node_summary(directory, documents)
         node_summaries[directory["path"]] = summary
         directory["simple_summary"] = summary["summary"]
         directory["evidence_count"] = len(summary["evidence_chain"])
-        storage.save_summary(scan_id, directory["path"], "folder", summary)
+        queue_summary(directory["path"], "folder", summary)
     local_file_summary_count = 0
     for path, document in documents.items():
         summary = _file_summary(path, document)
         node_summaries[path] = summary
-        storage.save_summary(scan_id, path, "file", summary)
+        queue_summary(path, "file", summary)
         local_file_summary_count += 1
-    for path in sorted(all_paths - set(documents)):
+    for path in unparsed_paths:
         state = "failed" if path in failed_paths else "pending"
         summary = _inventory_file_summary(path, inventory.get(path, {}), state=state)
         node_summaries[path] = summary
-        storage.save_summary(scan_id, path, "file", summary)
+        queue_summary(path, "file", summary)
+    if summary_batch:
+        storage.save_summaries(scan_id, summary_batch)
+    progress(87, "节点摘要已生成：{}/{}".format(summary_done, summary_total))
 
     retrieved_evidence = []
     retrieved_ids = set()

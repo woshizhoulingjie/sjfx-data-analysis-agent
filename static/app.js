@@ -8,8 +8,14 @@ const state = {
   jobId: null,
   modelGenerationEnabled: null,
   lastRetrievalId: null,
-  selectedNodes: new Map()
+  selectedNodes: new Map(),
+  jobs: new Map(),
+  jobsEndpointAvailable: null,
+  taskCenterRefreshInFlight: false
 };
+
+const ACTIVE_JOB_STATUSES = new Set(['queued', 'running', 'cancelling']);
+const TASK_REGISTRY_KEY = 'sjfx_task_registry_v1';
 
 const $ = (id) => document.getElementById(id);
 
@@ -40,15 +46,28 @@ async function api(url, options = {}) {
   if (token) headers['X-SJFX-Token'] = token;
   let response = await fetch(url, { ...options, headers });
   if (response.status === 401) {
-    token = window.prompt('请输入 SJFX API Token（首次访问输入一次即可）', '') || '';
+    token = window.localStorage.getItem('sjfx_api_token')
+      || window.prompt('请输入 SJFX API Token（首次访问输入一次即可）', '')
+      || '';
     if (token) {
       window.localStorage.setItem('sjfx_api_token', token);
       headers['X-SJFX-Token'] = token;
       response = await fetch(url, { ...options, headers });
     }
   }
-  const data = await response.json();
-  if (!response.ok || !data.ok) throw new Error(data.error || '请求失败');
+  let data = {};
+  try {
+    data = await response.json();
+  } catch (_) {
+    // Reverse proxies can return an HTML error page while the Worker/Web
+    // process restarts. Keep the HTTP status so polling can retry safely.
+  }
+  if (!response.ok || !data.ok) {
+    const error = new Error(data.error || `请求失败（HTTP ${response.status}）`);
+    error.status = response.status;
+    error.transient = response.status >= 500 || [408, 425, 429].includes(response.status);
+    throw error;
+  }
   return data;
 }
 
@@ -62,7 +81,9 @@ async function authenticatedDownload(url) {
   if (token) headers['X-SJFX-Token'] = token;
   let response = await fetch(url, { headers });
   if (response.status === 401) {
-    token = window.prompt('请输入 SJFX API Token（首次访问输入一次即可）', '') || '';
+    token = window.localStorage.getItem('sjfx_api_token')
+      || window.prompt('请输入 SJFX API Token（首次访问输入一次即可）', '')
+      || '';
     if (token) {
       window.localStorage.setItem('sjfx_api_token', token);
       headers['X-SJFX-Token'] = token;
@@ -1433,16 +1454,295 @@ async function refreshScan(scanId = state.scan?.scan_id) {
 }
 
 
-function updateJobControls(job = {}) {
-  const status = String(job.status || '').toLowerCase();
-  const active = ['queued', 'running', 'cancelling'].includes(status) && Boolean(state.jobId);
-  const cancelling = status === 'cancelling';
-  const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+function jobIdOf(job, fallbackId = '') {
+  return String(job?.id || job?.job_id || fallbackId || '');
+}
+
+
+function persistTaskRegistry() {
+  try {
+    const jobs = [...state.jobs.values()]
+      .sort((left, right) => Number(right.updated_local || 0) - Number(left.updated_local || 0))
+      .slice(0, 30)
+      .map((job) => ({
+        id: job.id,
+        scan_id: job.scan_id || '',
+        task_type: job.task_type || '',
+        status: job.status || 'queued',
+        stage: job.stage || '',
+        current_stage: job.current_stage || '',
+        current_file: job.current_file || '',
+        progress: Number(job.progress || 0),
+        message: job.message || '',
+        error: job.error || '',
+        queue_position: job.queue_position ?? null,
+        blocking_job: job.blocking_job || null,
+        heartbeat_at: job.heartbeat_at || null,
+        heartbeat_age_seconds: job.heartbeat_age_seconds ?? null,
+        worker_online: job.worker_online ?? null,
+        updated_at: job.updated_at || null,
+        updated_local: Number(job.updated_local || Date.now())
+      }));
+    window.localStorage.setItem(TASK_REGISTRY_KEY, JSON.stringify(jobs));
+  } catch (_) {
+    // Task polling must continue even when localStorage is disabled or full.
+  }
+}
+
+
+function loadTaskRegistry() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(TASK_REGISTRY_KEY) || '[]');
+    const oldest = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    if (!Array.isArray(stored)) return;
+    stored.forEach((job) => {
+      const id = jobIdOf(job);
+      if (id && Number(job.updated_local || 0) >= oldest) {
+        state.jobs.set(id, { ...job, id });
+      }
+    });
+  } catch (_) {
+    window.localStorage.removeItem(TASK_REGISTRY_KEY);
+  }
+}
+
+
+function rememberJob(job = {}, fallbackId = '') {
+  const id = jobIdOf(job, fallbackId);
+  if (!id) return job;
+  const previous = state.jobs.get(id) || {};
+  const normalized = {
+    ...previous,
+    ...job,
+    id,
+    status: String(job.status || previous.status || 'queued').toLowerCase(),
+    progress: Math.max(0, Math.min(100, Number(job.progress ?? previous.progress ?? 0))),
+    updated_local: Date.now()
+  };
+  state.jobs.set(id, normalized);
+  persistTaskRegistry();
+  renderTaskCenter();
+  return normalized;
+}
+
+
+function removeRememberedJob(jobId) {
+  state.jobs.delete(String(jobId || ''));
+  persistTaskRegistry();
+  renderTaskCenter();
+}
+
+
+function timestampMilliseconds(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value < 100000000000 ? value * 1000 : value;
+  }
+  const parsed = Date.parse(value || '');
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+
+function relativeHeartbeat(value, reportedAge = null) {
+  const numericAge = Number(reportedAge);
+  const hasReportedAge = reportedAge !== null && reportedAge !== '' && Number.isFinite(numericAge);
+  const milliseconds = timestampMilliseconds(value);
+  if (!milliseconds && !hasReportedAge) {
+    return { label: '尚未上报心跳', stale: false };
+  }
+  const age = hasReportedAge
+    ? Math.max(0, Math.round(numericAge))
+    : Math.max(0, Math.round((Date.now() - milliseconds) / 1000));
+  if (age < 8) return { label: '心跳刚刚更新', stale: false };
+  if (age < 60) return { label: `心跳 ${age} 秒前`, stale: false };
+  const minutes = Math.floor(age / 60);
+  return { label: `心跳 ${minutes} 分钟前`, stale: age >= 120 };
+}
+
+
+function jobTaskLabel(taskType) {
+  return ({
+    scan_and_analyze: '导入与完整分析',
+    analyze_package: '数据包分析',
+    generate_report: '生成情况概览',
+    generate_summary: '生成深度摘要',
+    export_package: '导出交接包'
+  })[taskType] || '分析任务';
+}
+
+
+function jobStatusLabel(status) {
+  return ({
+    queued: '排队中', running: '运行中', cancelling: '正在取消',
+    completed: '已完成', failed: '已失败', cancelled: '已取消'
+  })[status] || '状态未知';
+}
+
+
+function jobStageLabel(stage) {
+  return ({
+    queued: '等待 Worker', claimed: 'Worker 已接收', scanning: '盘点目录',
+    parsing: '解析文件', analyzing: '内容分析', generating_report: '生成概览',
+    generating_summary: '生成深度摘要', preparing_export: '准备导出', exporting: '生成交接包',
+    completed: '已完成', failed: '已失败', cancelled: '已取消'
+  })[stage] || stage || '';
+}
+
+
+function jobActivityText(job = {}) {
   const stage = job.current_stage || job.stage || '';
   const currentFile = job.current_file || '';
-  const detail = currentFile && currentFile !== stage
-    ? `${stage} · ${currentFile}`
-    : (stage || job.message || (active ? '任务运行中' : '当前没有运行中的任务'));
+  const stageLabel = jobStageLabel(stage);
+  if (currentFile && currentFile !== stage) return `${stageLabel || '处理文件'} · ${currentFile}`;
+  return job.message || stageLabel || jobStatusLabel(job.status) || '等待状态更新';
+}
+
+
+function queueSummary(job = {}) {
+  if (job.status !== 'queued') return '';
+  const position = Number(job.queue_position || 0);
+  const positionText = position > 0 ? `当前队列第 ${position} 位` : '正在获取队列位置';
+  const blocker = job.blocking_job || null;
+  if (!blocker) return `${positionText}；Worker 空闲后会自动启动。`;
+  const heartbeat = relativeHeartbeat(blocker.heartbeat_at, blocker.heartbeat_age_seconds);
+  return `${positionText}；前序任务 ${String(blocker.id || '').slice(0, 8) || '共享 Worker'} `
+    + `${Math.max(0, Math.min(100, Number(blocker.progress || 0)))}% · ${blocker.message || '处理中'} · ${heartbeat.label}。`;
+}
+
+
+function renderTaskCenter() {
+  const list = $('activeTaskList');
+  if (!list) return;
+  const jobs = [...state.jobs.values()].sort((left, right) => {
+    const leftActive = ACTIVE_JOB_STATUSES.has(left.status) ? 1 : 0;
+    const rightActive = ACTIVE_JOB_STATUSES.has(right.status) ? 1 : 0;
+    if (leftActive !== rightActive) return rightActive - leftActive;
+    if (left.status === 'running' && right.status !== 'running') return -1;
+    if (right.status === 'running' && left.status !== 'running') return 1;
+    return Number(right.updated_local || 0) - Number(left.updated_local || 0);
+  });
+  const activeCount = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
+  if ($('taskCenterActiveCount')) {
+    $('taskCenterActiveCount').textContent = activeCount ? `${activeCount} 个活动任务` : '队列空闲';
+  }
+  if (!jobs.length) {
+    list.className = 'task-list empty';
+    list.innerHTML = '<div class="task-list-empty"><strong>当前没有任务</strong><span>导入数据包后，排队、运行、取消和失败状态会显示在这里。</span></div>';
+    return;
+  }
+  list.className = 'task-list';
+  list.innerHTML = jobs.slice(0, 12).map((job) => {
+    const status = String(job.status || '').toLowerCase();
+    const active = ACTIVE_JOB_STATUSES.has(status);
+    const cancelling = status === 'cancelling';
+    const heartbeat = relativeHeartbeat(job.heartbeat_at, job.heartbeat_age_seconds);
+    const queue = queueSummary(job);
+    const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+    const heartbeatHtml = status === 'running' || status === 'cancelling'
+      ? `<span class="task-heartbeat${heartbeat.stale ? ' stale' : ''}">${escapeHtml(heartbeat.label)}</span>`
+      : '';
+    return `<article class="task-list-item status-${escapeHtml(status || 'unknown')}" data-task-id="${escapeHtml(job.id)}">`
+      + '<div class="task-list-heading">'
+      + `<div><strong>${escapeHtml(jobTaskLabel(job.task_type))}</strong><span class="task-id">#${escapeHtml(String(job.id).slice(0, 12))}</span></div>`
+      + `<span class="task-state">${escapeHtml(jobStatusLabel(status))}</span></div>`
+      + `<div class="task-list-progress"><i style="width:${progress}%"></i></div>`
+      + `<div class="task-list-meta"><b>${progress}%</b><span>${escapeHtml(jobActivityText(job))}</span>${heartbeatHtml}</div>`
+      + (queue ? `<p class="task-queue-detail">${escapeHtml(queue)}</p>` : '')
+      + (job.connection_issue ? `<p class="task-network-warning">${escapeHtml(job.connection_issue)}</p>` : '')
+      + (job.error && status === 'failed' ? `<p class="task-error-detail">${escapeHtml(job.error)}</p>` : '')
+      + '<div class="task-list-actions">'
+      + (active ? `<button type="button" class="text-button" data-job-watch="${escapeHtml(job.id)}">查看实时进度</button>` : '')
+      + (active ? `<button type="button" class="danger compact" data-job-cancel="${escapeHtml(job.id)}" ${cancelling ? 'disabled' : ''}>${cancelling ? '正在取消…' : (status === 'queued' ? '取消排队' : '取消任务')}</button>` : '')
+      + '</div></article>';
+  }).join('');
+
+  const latest = jobs[0];
+  if ($('dashboardActivity') && latest) {
+    $('dashboardActivity').className = 'activity-task';
+    $('dashboardActivity').innerHTML = `<strong>${escapeHtml(jobTaskLabel(latest.task_type))}</strong>`
+      + `<span>${escapeHtml(jobStatusLabel(latest.status))} · ${escapeHtml(jobActivityText(latest))}</span>`;
+  }
+}
+
+
+async function refreshKnownJobs(jobIds) {
+  await Promise.all(jobIds.map(async (jobId) => {
+    try {
+      const data = await api(`/api/jobs/${jobId}`);
+      rememberJob({ ...(data.job || {}), connection_issue: '' }, jobId);
+    } catch (error) {
+      if ([403, 404].includes(error.status)) {
+        removeRememberedJob(jobId);
+        return;
+      }
+      const previous = state.jobs.get(jobId) || { id: jobId, status: 'queued' };
+      rememberJob({ ...previous, connection_issue: '暂时无法同步服务器状态，将自动重试。' }, jobId);
+    }
+  }));
+}
+
+
+async function refreshTaskCenter() {
+  if (state.taskCenterRefreshInFlight) return;
+  state.taskCenterRefreshInFlight = true;
+  const indicator = $('taskCenterSyncState');
+  try {
+    let listedIds = null;
+    if (state.jobsEndpointAvailable !== false) {
+      try {
+        const data = await api('/api/jobs?status=active&limit=50');
+        if (!Array.isArray(data.jobs)) throw new Error('任务列表响应格式错误');
+        state.jobsEndpointAvailable = true;
+        listedIds = new Set();
+        data.jobs.forEach((job) => {
+          const remembered = rememberJob({ ...job, connection_issue: '' });
+          if (remembered.id) listedIds.add(remembered.id);
+        });
+        if (indicator) indicator.textContent = '已与 Worker 队列同步';
+      } catch (error) {
+        if ([404, 405].includes(error.status)) {
+          state.jobsEndpointAvailable = false;
+        } else if (indicator) {
+          indicator.textContent = '连接波动，正在自动重试';
+        }
+      }
+    }
+    const knownActiveIds = [...state.jobs.values()]
+      .filter((job) => ACTIVE_JOB_STATUSES.has(job.status) && job.id !== state.jobId)
+      .map((job) => job.id)
+      .filter((jobId) => !listedIds || !listedIds.has(jobId));
+    if (knownActiveIds.length) await refreshKnownJobs(knownActiveIds);
+    if (state.jobsEndpointAvailable === false && indicator) {
+      indicator.textContent = '已同步本浏览器提交的任务';
+    }
+  } finally {
+    state.taskCenterRefreshInFlight = false;
+    renderTaskCenter();
+  }
+}
+
+
+function startTaskCenterRefresh() {
+  loadTaskRegistry();
+  renderTaskCenter();
+  refreshTaskCenter();
+  window.setInterval(refreshTaskCenter, 3000);
+}
+
+
+function updateJobControls(job = {}) {
+  const status = String(job.status || '').toLowerCase();
+  if (state.jobId) job = rememberJob(job, state.jobId);
+  const active = ACTIVE_JOB_STATUSES.has(status) && Boolean(state.jobId);
+  const cancelling = status === 'cancelling';
+  const progress = Math.max(0, Math.min(100, Number(job.progress || 0)));
+  const baseDetail = jobActivityText(job);
+  const queueDetail = queueSummary(job);
+  const heartbeat = relativeHeartbeat(job.heartbeat_at, job.heartbeat_age_seconds);
+  const detail = status === 'queued' && queueDetail
+    ? `${baseDetail} · ${queueDetail}`
+    : ((status === 'running' || status === 'cancelling')
+      ? `${baseDetail} · ${heartbeat.label}`
+      : baseDetail);
   ['cancelJobBtn', 'taskCenterCancelBtn'].forEach((id) => {
     const button = $(id);
     if (!button) return;
@@ -1450,44 +1750,86 @@ function updateJobControls(job = {}) {
     button.textContent = cancelling ? '正在取消…' : '取消当前任务';
   });
   if ($('jobStatusChip')) {
-    $('jobStatusChip').textContent = cancelling ? 'CANCELLING' : (active ? 'RUNNING' : (status || 'IDLE').toUpperCase());
+    $('jobStatusChip').textContent = (status || 'idle').toUpperCase();
+    $('jobStatusChip').dataset.status = status || 'idle';
   }
   if ($('taskCenterProgressBar')) $('taskCenterProgressBar').style.width = `${progress}%`;
   if ($('taskCenterProgressText')) $('taskCenterProgressText').textContent = `${progress}% · ${detail}`;
 }
 
 
-async function cancelCurrentJob() {
-  const jobId = state.jobId;
+async function cancelJob(jobId) {
   if (!jobId) {
     toast('当前没有可以取消的任务。');
     return;
   }
-  updateJobControls({ status: 'cancelling', progress: Number(($('progressBar')?.style.width || '0').replace('%', '')), message: '正在请求取消任务' });
+  const previous = state.jobs.get(jobId) || { id: jobId, status: 'running', progress: 0 };
+  const cancelling = rememberJob({ ...previous, status: 'cancelling', message: '正在请求 Worker 安全停止' }, jobId);
+  if (state.jobId === jobId) updateJobControls(cancelling);
   try {
     const data = await api(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
-    updateJobControls(data.job || { status: 'cancelling', message: '已发送取消请求' });
-    toast('已发送取消请求，Worker 正在安全停止当前步骤。');
+    const updated = rememberJob(data.job || { ...cancelling, status: 'cancelling', message: '已发送取消请求' }, jobId);
+    if (state.jobId === jobId) updateJobControls(updated);
+    toast(updated.status === 'cancelled'
+      ? '排队任务已取消。'
+      : '已发送取消请求，Worker 正在安全停止当前步骤。');
+    refreshTaskCenter();
   } catch (error) {
-    updateJobControls({ status: 'running', message: '取消请求失败，任务仍在运行' });
+    const restored = rememberJob({ ...previous, connection_issue: '取消请求未确认，请重试。' }, jobId);
+    if (state.jobId === jobId) updateJobControls(restored);
     toast(error.message || '取消任务失败', true);
   }
 }
 
 
+async function cancelCurrentJob() {
+  return cancelJob(state.jobId);
+}
+
+
 document.addEventListener('click', (event) => {
-  const button = event.target.closest('#cancelJobBtn, #taskCenterCancelBtn');
-  if (!button) return;
+  const cancelButton = event.target.closest('#cancelJobBtn, #taskCenterCancelBtn, [data-job-cancel]');
+  if (cancelButton) {
+    event.preventDefault();
+    if (cancelButton.disabled) return;
+    const jobId = cancelButton.dataset.jobCancel || state.jobId;
+    cancelJob(jobId);
+    return;
+  }
+  const watchButton = event.target.closest('[data-job-watch]');
+  if (watchButton) {
+    event.preventDefault();
+    const jobId = watchButton.dataset.jobWatch;
+    const job = state.jobs.get(jobId);
+    if (!job || !ACTIVE_JOB_STATUSES.has(job.status)) return;
+    if (window.SJFXShell) window.SJFXShell.activate('tasks');
+    pollJob(jobId).catch((error) => toast(error.message || '任务轮询失败', true));
+    return;
+  }
+  const refreshButton = event.target.closest('#taskCenterRefreshBtn');
+  if (!refreshButton) return;
   event.preventDefault();
-  cancelCurrentJob();
+  setBusy(refreshButton, true, '同步中…');
+  refreshTaskCenter().finally(() => setBusy(refreshButton, false));
 });
+
+
+function isTransientPollError(error) {
+  return Boolean(error?.transient || !error?.status || window.navigator.onLine === false);
+}
+
+
+function waitFor(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
 
 
 async function pollJob(jobId) {
   state.jobId =
     jobId;
 
-  updateJobControls({ status: 'queued', progress: 0, message: '任务已提交，等待本地 Worker' });
+  const registered = rememberJob({ id: jobId, status: 'queued', progress: 0, message: '任务已提交，等待本地 Worker' }, jobId);
+  updateJobControls(registered);
 
   $('pipeline')
     .classList
@@ -1495,27 +1837,49 @@ async function pollJob(jobId) {
       'empty'
     );
 
+  let consecutivePollErrors = 0;
   while (
     state.jobId === jobId
   ) {
-    const data =
-      await api(
-        `/api/jobs/${jobId}`
-      );
+    let data;
+    try {
+      data = await api(`/api/jobs/${jobId}`);
+      consecutivePollErrors = 0;
+    } catch (error) {
+      if (state.jobId !== jobId) return;
+      if (!isTransientPollError(error)) {
+        if ([403, 404].includes(error.status)) removeRememberedJob(jobId);
+        state.jobId = null;
+        updateJobControls({ status: 'failed', progress: 0, message: error.message || '无法访问任务状态' });
+        throw error;
+      }
+      consecutivePollErrors += 1;
+      const delay = Math.min(10000, 1000 * (2 ** Math.min(consecutivePollErrors - 1, 4)));
+      const previous = state.jobs.get(jobId) || registered;
+      const retryMessage = window.navigator.onLine === false
+        ? '网络已断开，恢复后将自动继续同步任务。'
+        : `状态同步暂时失败，${Math.ceil(delay / 1000)} 秒后自动重试。`;
+      const retryJob = rememberJob({ ...previous, connection_issue: retryMessage }, jobId);
+      updateJobControls(retryJob);
+      if ($('progressText')) $('progressText').textContent = `${retryJob.progress || 0}% · ${retryMessage}`;
+      await waitFor(delay);
+      continue;
+    }
 
-    const job =
-      data.job;
+    const job = rememberJob({ ...(data.job || {}), connection_issue: '' }, jobId);
 
     updateJobControls(job);
 
     $('progressBar').style.width =
       `${job.progress || 0}%`;
 
-    const currentStage = job.current_stage || job.stage || '';
-    const currentFile = job.current_file || '';
-    const activity = currentFile && currentFile !== currentStage
-      ? `${currentStage} · ${currentFile}`
-      : (currentStage || job.message || job.status);
+    const queueDetail = queueSummary(job);
+    const heartbeat = relativeHeartbeat(job.heartbeat_at, job.heartbeat_age_seconds);
+    const activity = job.status === 'queued' && queueDetail
+      ? `${jobActivityText(job)} · ${queueDetail}`
+      : ((job.status === 'running' || job.status === 'cancelling')
+        ? `${jobActivityText(job)} · ${heartbeat.label}`
+        : jobActivityText(job));
     $('progressText').textContent =
       `${job.progress || 0}% · ${activity}`;
 
@@ -1683,13 +2047,7 @@ async function pollJob(jobId) {
       );
     }
 
-    await new Promise(
-      resolve =>
-        setTimeout(
-          resolve,
-          1000
-        )
-    );
+    await waitFor(1000);
   }
 }
 
@@ -2530,3 +2888,10 @@ async function refreshModelStatus() {
 
 
 refreshModelStatus();
+startTaskCenterRefresh();
+
+window.addEventListener('online', refreshTaskCenter);
+window.SJFXTasks = {
+  refresh: refreshTaskCenter,
+  cancel: cancelJob
+};

@@ -6,12 +6,16 @@ claiming safe even if an operator accidentally starts a second Worker.
 """
 
 import errno
+import ctypes
 import logging
 import logging.handlers
+import multiprocessing
 import os
 import re
+import signal
 import socket
 import time
+import traceback
 from pathlib import Path
 
 from config import Config
@@ -47,9 +51,26 @@ if not logger.handlers:
     _worker_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     _worker_handler.addFilter(_WorkerSensitiveFilter())
     logger.addHandler(_worker_handler)
+    logger.propagate = False
 
 
 WORKER_ID = "{}:{}".format(socket.gethostname(), os.getpid())
+
+
+class JobCancelled(RuntimeError):
+    """The parent Worker terminated a supervised task after cancellation."""
+
+
+class JobExecutionTimeout(RuntimeError):
+    """A task exceeded its configured end-to-end execution boundary."""
+
+
+class RemoteJobError(RuntimeError):
+    """A supervised child reported an execution error."""
+
+    def __init__(self, message, remote_traceback=""):
+        super().__init__(message)
+        self.remote_traceback = remote_traceback
 
 
 class _HeldWorkerLock:
@@ -110,6 +131,175 @@ def execute(job):
     if task_type == "export_package":
         return _run_claimed_export_job(job)
     raise ValueError("未知任务类型：{}".format(task_type))
+
+
+def _execute_job_child(job, sender):
+    """Run one task in a killable process and return a compact outcome."""
+    try:
+        parent_pid = os.getppid()
+        if os.name != "nt" and hasattr(os, "setsid"):
+            # Docling isolation may create parser grandchildren. A dedicated
+            # process group lets timeout/cancellation terminate the complete
+            # task tree instead of leaving OCR/parser processes orphaned.
+            os.setsid()
+            if os.uname().sysname.lower() == "linux":
+                # Ensure a service restart cannot leave the supervised job (or
+                # its parser grandchildren) writing after the queue owner died.
+                def parent_exit_handler(_signum, _frame):
+                    try:
+                        os.killpg(os.getpgrp(), signal.SIGKILL)
+                    finally:
+                        os._exit(128 + signal.SIGTERM)
+
+                signal.signal(signal.SIGTERM, parent_exit_handler)
+                try:
+                    libc = ctypes.CDLL(None)
+                    libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
+                    if os.getppid() != parent_pid:
+                        parent_exit_handler(signal.SIGTERM, None)
+                except (AttributeError, OSError):
+                    pass
+        sender.send({"status": "ok", "result": execute(job)})
+    except BaseException as exc:  # the parent owns final status publication
+        try:
+            sender.send({
+                "status": "error",
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            })
+        except Exception:
+            pass
+    finally:
+        try:
+            sender.close()
+        except Exception:
+            pass
+
+
+def _task_runtime_limit(job):
+    limits = {
+        "scan_and_analyze": Config.JOB_SCAN_TIMEOUT_SECONDS,
+        "analyze_package": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
+        "generate_summary": Config.JOB_SUMMARY_TIMEOUT_SECONDS,
+        "generate_report": Config.JOB_REPORT_TIMEOUT_SECONDS,
+        "export_package": Config.JOB_EXPORT_TIMEOUT_SECONDS,
+    }
+    limit = limits.get(job.get("task_type"), Config.JOB_DEFAULT_TIMEOUT_SECONDS)
+    if job.get("task_type") == "generate_summary":
+        options = job.get("options") or {}
+        if not options.get("node_id") and options.get("kind", "file") not in {"directory", "group"}:
+            limit = Config.JOB_DOCUMENT_SUMMARY_TIMEOUT_SECONDS
+    return max(30, int(limit))
+
+
+def _stop_process(process):
+    if not process or not process.is_alive():
+        return
+    group_signalled = False
+    if os.name != "nt" and hasattr(os, "killpg"):
+        try:
+            if os.getpgid(process.pid) == process.pid:
+                os.killpg(process.pid, signal.SIGTERM)
+                group_signalled = True
+        except (ProcessLookupError, PermissionError, OSError):
+            group_signalled = False
+    if not group_signalled:
+        process.terminate()
+    process.join(timeout=Config.WORKER_TERMINATE_GRACE_SECONDS)
+    if process.is_alive() and hasattr(process, "kill"):
+        killed_group = False
+        if os.name != "nt" and hasattr(os, "killpg"):
+            try:
+                if os.getpgid(process.pid) == process.pid:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    killed_group = True
+            except (ProcessLookupError, PermissionError, OSError):
+                killed_group = False
+        if not killed_group:
+            process.kill()
+        process.join(timeout=2)
+
+
+def execute_supervised(job):
+    """Execute a task with heartbeat, hard cancellation and a total timeout.
+
+    Library calls such as NAS directory enumeration, Docling and a local model
+    socket can block below Python's cooperative cancellation points. Keeping
+    the queue owner in the parent process lets it publish liveness and safely
+    terminate only the current task process without killing the Worker.
+    """
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_execute_job_child,
+        args=(job, sender),
+        name="sjfx-job-{}".format(job["id"]),
+    )
+    process.daemon = False
+    started = time.monotonic()
+    timeout = _task_runtime_limit(job)
+    next_heartbeat = 0.0
+    packet = None
+    try:
+        process.start()
+        sender.close()
+        while True:
+            if receiver.poll(Config.WORKER_MONITOR_SECONDS):
+                try:
+                    packet = receiver.recv()
+                except EOFError:
+                    packet = None
+                break
+            if not process.is_alive():
+                break
+            if storage.is_job_cancel_requested(job["id"]):
+                # Cooperative parser loops get a brief chance to close their
+                # own child process and sidecar files before the hard stop.
+                process.join(timeout=min(2.0, Config.WORKER_TERMINATE_GRACE_SECONDS))
+                _stop_process(process)
+                raise JobCancelled("任务已按用户请求终止")
+            now = time.monotonic()
+            if now >= next_heartbeat:
+                storage.heartbeat_job(job["id"], WORKER_ID)
+                next_heartbeat = now + Config.WORKER_HEARTBEAT_SECONDS
+            if now - started > timeout:
+                _stop_process(process)
+                raise JobExecutionTimeout(
+                    "{}任务运行超过 {} 秒，已终止当前任务进程；已完成检查点仍会保留".format(
+                        job.get("task_type") or "分析", timeout,
+                    )
+                )
+        process.join(timeout=5)
+        if packet is None and receiver.poll(0.1):
+            try:
+                packet = receiver.recv()
+            except EOFError:
+                packet = None
+        if not packet:
+            raise RemoteJobError(
+                "任务子进程异常退出（exit_code={}），Worker仍保持可用".format(process.exitcode)
+            )
+        if packet.get("status") == "ok":
+            return packet.get("result")
+        error_type = packet.get("error_type") or "RemoteError"
+        if error_type in {"JobCancelled", "ParseIsolationCancelled"}:
+            raise JobCancelled(packet.get("error") or "任务已取消")
+        raise RemoteJobError(
+            "{}: {}".format(error_type, packet.get("error") or "任务执行失败"),
+            packet.get("traceback") or "",
+        )
+    finally:
+        if process.is_alive():
+            _stop_process(process)
+        try:
+            receiver.close()
+        except Exception:
+            pass
+        try:
+            process.close()
+        except (ValueError, OSError):
+            pass
 
 
 def _acquire_worker_lock():
@@ -208,23 +398,20 @@ def run_forever():
             job_id = job["id"]
             try:
                 logger.info("Worker claimed task id=%s type=%s scan_id=%s", job_id, job.get("task_type"), job.get("scan_id"))
-                result = execute(job)
-                storage.update_job(
-                    job_id, status="completed", stage="completed", progress=100,
-                    message="任务已完成", result=result, heartbeat=True,
-                )
+                result = execute_supervised(job)
+                storage.finalize_job(job_id, result=result)
             except Exception as exc:
-                if exc.__class__.__name__ in {"JobCancelled", "ParseIsolationCancelled"}:
-                    storage.update_job(
-                        job_id, status="cancelled", stage="cancelled", message="任务已取消",
-                        current_stage="已取消", current_file="", heartbeat=True,
-                    )
+                if isinstance(exc, JobCancelled) or exc.__class__.__name__ == "ParseIsolationCancelled":
+                    storage.finalize_job(job_id)
                     continue
-                logger.exception("Worker task failed id=%s type=%s", job_id, job.get("task_type"))
-                storage.update_job(
-                    job_id, status="failed", stage="failed", progress=100,
-                    message="任务失败", error=str(exc), heartbeat=True,
-                )
+                if isinstance(exc, RemoteJobError) and exc.remote_traceback:
+                    logger.error(
+                        "Worker task failed id=%s type=%s\n%s",
+                        job_id, job.get("task_type"), exc.remote_traceback,
+                    )
+                else:
+                    logger.exception("Worker task failed id=%s type=%s", job_id, job.get("task_type"))
+                storage.finalize_job(job_id, error=exc)
     finally:
         try:
             lock_handle.close()

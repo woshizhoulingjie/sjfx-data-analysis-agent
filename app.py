@@ -116,6 +116,7 @@ if not logger.handlers:
     _file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     _file_handler.addFilter(_log_filter)
     logger.addHandler(_file_handler)
+    logger.propagate = False
 
 
 def _api_token_expired():
@@ -156,6 +157,22 @@ def _resolve_allowed_scan_root(raw_path):
             continue
     allowed_text = "、".join(str(item) for item in Config.SCAN_ALLOWED_ROOTS)
     raise ValueError("扫描目录不在允许范围内。当前允许根目录：{}".format(allowed_text))
+
+
+def _validate_scan_path_request(raw_path):
+    """Validate request shape without touching a potentially stalled NAS.
+
+    Existence, symlink resolution and the allow-list are enforced again in the
+    supervised Worker process immediately before scanning. This keeps the HTTP
+    endpoint responsive even when a mounted directory is unavailable.
+    """
+    value = str(raw_path or "").strip()
+    if not value or "\x00" in value:
+        raise ValueError("请输入有效的本地目录")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("扫描目录必须使用服务器绝对路径")
+    return str(candidate)
 
 
 def api_error(message, status=400, details=None):
@@ -903,8 +920,19 @@ def _run_claimed_analysis_job(job):
     options = job.get("options") or {}
     scan_result = require_scan(scan_id)
     scope_label = options.get("scope_label")
+    progress_start = job.get("_progress_start")
+    progress_end = job.get("_progress_end", 95)
+
+    def mapped_progress(percent):
+        value = max(0, min(95, int(percent)))
+        if progress_start is None:
+            return value
+        start = max(0, min(95, int(progress_start)))
+        end = max(start, min(95, int(progress_end)))
+        return start + int((end - start) * value / 95.0)
+
     storage.update_job(
-        job_id, progress=max(1, int(job.get("progress") or 0)), stage="analyzing", heartbeat=True,
+        job_id, progress=max(mapped_progress(1), int(job.get("progress") or 0)), stage="analyzing", heartbeat=True,
         message=("开始补充分析：{}".format(scope_label) if scope_label else "开始本地完整分析"),
         current_stage="分析准备",
         current_file=scope_label or "",
@@ -913,7 +941,7 @@ def _run_claimed_analysis_job(job):
     def progress(percent, message):
         _ensure_job_active(job_id)
         storage.update_job(
-            job_id, progress=percent, stage="analyzing", message=message, heartbeat=True,
+            job_id, progress=mapped_progress(percent), stage="analyzing", message=message, heartbeat=True,
             current_stage="解析与分析",
             current_file=str(message or "")[-500:],
         )
@@ -946,22 +974,26 @@ def _run_claimed_scan_and_analyze_job(job):
     if not root_path:
         raise ValueError("扫描任务缺少目录路径")
 
-    def scan_progress(file_count):
+    def scan_progress(file_count, directory_count=0, current_path=""):
         _ensure_job_active(job_id)
+        activity_count = max(0, int(file_count or 0)) + max(0, int(directory_count or 0))
+        scan_percent = min(14, 2 + max(0, activity_count.bit_length() - 1))
         storage.update_job(
-            job_id, progress=min(14, 2 + int(file_count / 1000)), stage="scanning",
-            message="正在盘点目录：已发现 {} 个文件".format(file_count), heartbeat=True,
-            current_stage="目录扫描", current_file=root_path,
+            job_id, progress=scan_percent, stage="scanning",
+            message="正在盘点目录：已发现 {} 个文件、{} 个目录".format(file_count, directory_count), heartbeat=True,
+            current_stage="目录扫描", current_file=current_path or root_path,
         )
 
     storage.update_job(
         job_id, progress=1, stage="scanning", message="正在验证并扫描目录", heartbeat=True,
         current_stage="目录扫描", current_file=root_path,
     )
+    resolved_root = _resolve_allowed_scan_root(root_path)
     scan_result = scan_directory(
-        root_path, options.get("max_files", Config.MAX_SCAN_FILES),
+        resolved_root, options.get("max_files", Config.MAX_SCAN_FILES),
         max_depth=options.get("max_depth", Config.MAX_SCAN_DEPTH),
-        progress_callback=scan_progress, cancel_check=lambda: _ensure_job_active(job_id),
+        activity_callback=scan_progress,
+        cancel_check=lambda: _ensure_job_active(job_id),
     )
     scan_result["parse_mode"] = "accurate" if options.get("parse_mode") == "accurate" else "fast"
     scan_result["scan_id"] = job_id
@@ -983,6 +1015,7 @@ def _run_claimed_scan_and_analyze_job(job):
     # throughout the complete unknown-package workflow.
     return _run_claimed_analysis_job({
         "id": job_id, "scan_id": job_id, "options": {}, "progress": 15,
+        "_progress_start": 15, "_progress_end": 95,
     })
 
 
@@ -1078,7 +1111,10 @@ def scan():
     if not path:
         return api_error("请输入要扫描的本地目录")
     try:
-        root = _resolve_allowed_scan_root(path)
+        # Do not synchronously resolve/inspect a NAS path in the HTTP process.
+        # The supervised Worker performs the authoritative allow-list and
+        # existence check, where a cancel request can terminate a blocked call.
+        root = _validate_scan_path_request(path)
         job_id = storage.create_scan_job(
             root, payload.get("max_files", Config.MAX_SCAN_FILES), parse_mode,
             payload.get("max_depth", Config.MAX_SCAN_DEPTH),
@@ -1368,28 +1404,80 @@ def ask_numeric():
         return api_error(str(exc), 400)
 
 
+def _job_api_view(source, include_blocker=True):
+    job = dict(source or {})
+    now = time.time()
+    heartbeat_at = job.get("heartbeat_at")
+    started_at = job.get("started_at")
+    job["heartbeat_age_seconds"] = (
+        max(0, int(now - float(heartbeat_at))) if heartbeat_at else None
+    )
+    job["elapsed_seconds"] = (
+        max(0, int((job.get("finished_at") or now) - float(started_at)))
+        if started_at else 0
+    )
+    live_window = max(10, int(Config.WORKER_HEARTBEAT_SECONDS * 3))
+    job["worker_online"] = bool(
+        job.get("status") in {"running", "cancelling"}
+        and job.get("heartbeat_age_seconds") is not None
+        and job["heartbeat_age_seconds"] <= live_window
+    )
+    if job.get("status") == "queued":
+        running = storage.get_running_job()
+        job["queue_position"] = storage.get_queue_position(job.get("id"))
+        job["progress"] = max(1, int(job.get("progress") or 0))
+        if running and include_blocker:
+            same_owner = not _request_owner_id() or running.get("owner_id") == _request_owner_id()
+            job["blocking_job"] = {
+                "id": running.get("id") if same_owner else None,
+                "task_type": running.get("task_type"),
+                "status": running.get("status"),
+                "progress": running.get("progress"),
+                "message": running.get("message") if same_owner else "另一项本地任务正在运行",
+                "heartbeat_age_seconds": (
+                    max(0, int(now - float(running.get("heartbeat_at"))))
+                    if running.get("heartbeat_at") else None
+                ),
+            }
+            ahead = max(0, int(job.get("queue_position") or 1) - 1)
+            job["message"] = "排队第 {} 位（前方 {} 个）：当前任务 {}% · {}".format(
+                job.get("queue_position") or 1,
+                ahead,
+                running.get("progress", 0),
+                (running.get("message") if same_owner else "本地 Worker 正在处理其他任务") or "处理中",
+            )
+        else:
+            job["message"] = "本地解析任务即将启动"
+    return job
+
+
+@app.route("/api/jobs")
+def list_jobs():
+    status_filter = str(request.args.get("status", "active") or "active").strip().lower()
+    if status_filter == "active":
+        statuses = ["queued", "running", "cancelling"]
+    elif status_filter in {"queued", "running", "cancelling", "completed", "failed", "cancelled"}:
+        statuses = [status_filter]
+    else:
+        statuses = None
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    jobs = storage.list_jobs(owner_id=_request_owner_id(), statuses=statuses, limit=limit)
+    return jsonify({
+        "ok": True,
+        "jobs": [_job_api_view(job) for job in jobs],
+        "server_time": time.time(),
+    })
+
+
 @app.route("/api/jobs/<job_id>")
 def get_job(job_id):
     job = storage.get_job(job_id, owner_id=_request_owner_id())
     if not job:
         return api_error("分析任务不存在", 404)
-    if job.get("status") == "queued":
-        running = storage.get_running_job()
-        job["queue_position"] = storage.get_queue_position(job_id)
-        job["progress"] = max(1, int(job.get("progress") or 0))
-        if running:
-            job["blocking_job"] = {
-                "id": running.get("id"),
-                "progress": running.get("progress"),
-                "message": running.get("message"),
-            }
-            job["message"] = "排队中（前方 {} 个任务）：当前解析任务 {}% · {}".format(
-                job["queue_position"],
-                running.get("progress", 0),
-                running.get("message") or "处理中",
-            )
-        else:
-            job["message"] = "本地解析任务即将启动"
+    job = _job_api_view(job)
     return jsonify({"ok": True, "job": job})
 
 
@@ -1400,8 +1488,13 @@ def cancel_job(job_id):
         return api_error("分析任务不存在", 404)
     if job.get("status") in {"completed", "failed", "cancelled"}:
         return jsonify({"ok": True, "job": job, "cancelled": job.get("status") == "cancelled"})
-    storage.cancel_job(job_id)
-    return jsonify({"ok": True, "job": storage.get_job(job_id, owner_id=_request_owner_id()), "cancelled": True})
+    job = storage.cancel_job(job_id)
+    return jsonify({
+        "ok": True,
+        "job": _job_api_view(job),
+        "cancel_requested": True,
+        "cancelled": bool(job and job.get("status") == "cancelled"),
+    })
 
 
 @app.route("/api/analyze-package", methods=["POST"])
@@ -1490,12 +1583,12 @@ def summarize():
                 cached = storage.get_summary(scan_id, "node:{}".format(node_id), "folder")
                 if force or not (cached and cached.get("schema_version") in {3, 4}):
                     require_local_model_enabled()
-                    job_id = storage.create_job(
-                        scan_id, options=payload, task_type="generate_summary", owner_id=_request_owner_id() or "legacy"
+                    job_id, created = storage.create_or_get_typed_job(
+                        scan_id, "generate_summary", options=payload, owner_id=_request_owner_id() or "legacy"
                     )
                     return jsonify({
                         "ok": True, "accepted": True, "job_id": job_id,
-                        "reused_active_job": False,
+                        "reused_active_job": not created,
                         "status_url": "/api/jobs/{}".format(job_id),
                     }), 202
             else:
@@ -1504,12 +1597,12 @@ def summarize():
                 cached = storage.get_summary(scan_id, node_path, summary_type)
                 if force or not (cached and cached.get("schema_version") == 3 and not bool(cached.get("parser_info", {}).get("degraded"))):
                     require_local_model_enabled()
-                    job_id = storage.create_job(
-                        scan_id, options=payload, task_type="generate_summary", owner_id=_request_owner_id() or "legacy"
+                    job_id, created = storage.create_or_get_typed_job(
+                        scan_id, "generate_summary", options=payload, owner_id=_request_owner_id() or "legacy"
                     )
                     return jsonify({
                         "ok": True, "accepted": True, "job_id": job_id,
-                        "reused_active_job": False,
+                        "reused_active_job": not created,
                         "status_url": "/api/jobs/{}".format(job_id),
                     }), 202
 

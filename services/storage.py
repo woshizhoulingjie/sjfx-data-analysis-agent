@@ -136,6 +136,8 @@ class Storage:
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     current_stage TEXT,
                     current_file TEXT,
+                    priority INTEGER NOT NULL DEFAULT 50,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS file_analysis_states (
@@ -201,6 +203,8 @@ class Storage:
                 "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
                 "current_stage": "TEXT",
                 "current_file": "TEXT",
+                "priority": "INTEGER NOT NULL DEFAULT 50",
+                "created_at": "TEXT",
             }
             for name, definition in migrations.items():
                 if name not in columns:
@@ -208,10 +212,16 @@ class Storage:
             job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_jobs)").fetchall()}
             if "owner_id" not in job_columns:
                 conn.execute("ALTER TABLE analysis_jobs ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'")
+            conn.execute(
+                "UPDATE analysis_jobs SET created_at=COALESCE(created_at, updated_at, CURRENT_TIMESTAMP)"
+            )
             scan_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scans)").fetchall()}
             if "owner_id" not in scan_columns:
                 conn.execute("ALTER TABLE scans ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_jobs_queue ON analysis_jobs(status, updated_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_analysis_jobs_queue "
+                "ON analysis_jobs(status, priority DESC, created_at)"
+            )
 
     def checkpoint_wal(self, force=False):
         """Bound the SQLite WAL without deleting a live database.
@@ -581,6 +591,29 @@ class Storage:
                 (scan_id, node_path, summary_type, json.dumps(payload, ensure_ascii=False)),
             )
 
+    def save_summaries(self, scan_id, summaries):
+        """Publish many local summaries in one transaction.
+
+        Large inventories can contain tens of thousands of nodes. Committing
+        one SQLite transaction per node makes the 82% stage look stalled and
+        needlessly grows the WAL. The caller still builds bounded batches so
+        cancellation and progress remain visible between commits.
+        """
+        rows = []
+        for node_path, summary_type, payload in summaries or []:
+            rows.append((
+                str(scan_id), str(node_path), str(summary_type),
+                json.dumps(payload, ensure_ascii=False),
+            ))
+        if not rows:
+            return 0
+        with self.lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO summaries(scan_id,node_path,summary_type,payload) VALUES (?,?,?,?)",
+                rows,
+            )
+        return len(rows)
+
     def get_summary(self, scan_id, node_path, summary_type):
         with self._connect() as conn:
             row = conn.execute(
@@ -607,6 +640,22 @@ class Storage:
                 "INSERT OR REPLACE INTO unified_documents(scan_id,node_path,payload) VALUES (?,?,?)",
                 (scan_id, node_path, stored),
             )
+
+    def save_documents(self, scan_id, documents):
+        rows = []
+        for node_path, payload in documents or []:
+            rows.append((
+                str(scan_id), str(node_path),
+                self._store_document_payload(scan_id, node_path, payload),
+            ))
+        if not rows:
+            return 0
+        with self.lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO unified_documents(scan_id,node_path,payload) VALUES (?,?,?)",
+                rows,
+            )
+        return len(rows)
 
     def get_document(self, scan_id, node_path):
         with self._connect() as conn:
@@ -668,12 +717,27 @@ class Storage:
             row = conn.execute("SELECT payload FROM package_analyses WHERE scan_id=?", (scan_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
 
+    @staticmethod
+    def _job_priority(task_type):
+        # New package imports and explicit supplement analysis are the primary
+        # workflow. Optional summaries/reports must not indefinitely hide them
+        # behind a long FIFO tail. A running task is never pre-empted.
+        return {
+            "scan_and_analyze": 100,
+            "analyze_package": 80,
+            "export_package": 60,
+            "generate_summary": 40,
+            "generate_report": 30,
+        }.get(str(task_type or ""), 50)
+
     def create_job(self, scan_id, options=None, task_type="analyze_package", owner_id="legacy"):
         job_id = uuid.uuid4().hex[:12]
+        priority = self._job_priority(task_type)
         with self.lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                (job_id, scan_id, task_type, "queued", "queued", 0, "等待开始", json.dumps(options or {}, ensure_ascii=False), owner_id or "legacy"),
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                (job_id, scan_id, task_type, "queued", "queued", 0, "等待开始", json.dumps(options or {}, ensure_ascii=False), owner_id or "legacy", priority),
             )
         return job_id
 
@@ -687,10 +751,13 @@ class Storage:
             # Scope-aware deduplication: two different topic selections must
             # never reuse one another's active supplement task.
             scope = (options or {}).get("target_paths") or []
-            scope_key = json.dumps(sorted(set(str(item) for item in scope)), ensure_ascii=False)
+            scope_key = (
+                json.dumps(sorted(set(str(item) for item in scope)), ensure_ascii=False)
+                if task_type == "analyze_package" else options_json
+            )
             rows = conn.execute(
                 "SELECT id, options, owner_id FROM analysis_jobs WHERE scan_id=? AND task_type=? "
-                "AND status IN ('queued','running','cancelling') ORDER BY updated_at DESC",
+                "AND status IN ('queued','running') AND cancel_requested=0 ORDER BY updated_at DESC",
                 (scan_id, task_type),
             ).fetchall()
             row = None
@@ -699,7 +766,11 @@ class Storage:
                     candidate_options = json.loads(candidate["options"] or "{}")
                 except (TypeError, ValueError):
                     candidate_options = {}
-                candidate_scope = json.dumps(sorted(set(str(item) for item in (candidate_options.get("target_paths") or []))), ensure_ascii=False)
+                candidate_scope = (
+                    json.dumps(sorted(set(str(item) for item in (candidate_options.get("target_paths") or []))), ensure_ascii=False)
+                    if task_type == "analyze_package"
+                    else json.dumps(candidate_options, ensure_ascii=False, sort_keys=True)
+                )
                 candidate_owner = candidate["owner_id"] or "legacy"
                 if candidate_scope == scope_key and (not owner_id or candidate_owner == owner_id):
                     row = candidate
@@ -707,9 +778,11 @@ class Storage:
             if row:
                 return row["id"], False
             job_id = uuid.uuid4().hex[:12]
+            priority = self._job_priority(task_type)
             conn.execute(
-                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                (job_id, scan_id, task_type, "queued", "queued", 1, "已进入本地任务队列", options_json, owner_id or "legacy"),
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                (job_id, scan_id, task_type, "queued", "queued", 1, "已进入本地任务队列", options_json, owner_id or "legacy", priority),
             )
         return job_id, True
 
@@ -723,10 +796,12 @@ class Storage:
             "max_depth": int(max_depth),
             "owner_id": owner_id or "legacy",
         }
+        priority = self._job_priority("scan_and_analyze")
         with self.lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                (job_id, job_id, "scan_and_analyze", "queued", "queued", 0, "等待扫描目录", json.dumps(options, ensure_ascii=False), owner_id or "legacy"),
+                "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                (job_id, job_id, "scan_and_analyze", "queued", "queued", 0, "等待扫描目录", json.dumps(options, ensure_ascii=False), owner_id or "legacy", priority),
             )
         return job_id
 
@@ -741,7 +816,8 @@ class Storage:
     def get_running_job(self):
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM analysis_jobs WHERE status='running' ORDER BY updated_at DESC LIMIT 1"
+                "SELECT * FROM analysis_jobs WHERE status IN ('running','cancelling') "
+                "ORDER BY started_at DESC LIMIT 1"
             ).fetchone()
         if not row:
             return None
@@ -750,15 +826,16 @@ class Storage:
     def get_queue_position(self, job_id):
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT rowid AS queue_order FROM analysis_jobs WHERE id=? AND status='queued'",
+                "SELECT rowid AS queue_order, priority FROM analysis_jobs WHERE id=? AND status='queued'",
                 (job_id,),
             ).fetchone()
             if not row:
                 return None
             ahead = conn.execute(
                 "SELECT COUNT(*) AS value FROM analysis_jobs "
-                "WHERE status='queued' AND rowid < ?",
-                (row["queue_order"],),
+                "WHERE status='queued' AND cancel_requested=0 AND "
+                "(priority > ? OR (priority = ? AND rowid < ?))",
+                (row["priority"], row["priority"], row["queue_order"]),
             ).fetchone()["value"]
         return int(ahead) + 1
 
@@ -768,10 +845,15 @@ class Storage:
         values = []
         if current_stage is None and stage is not None:
             current_stage = stage
-        for name, value in (("status", status), ("stage", stage), ("progress", progress), ("message", message), ("result", result), ("error", error), ("current_stage", current_stage), ("current_file", current_file)):
+        for name, value in (("status", status), ("stage", stage), ("message", message), ("result", result), ("error", error), ("current_stage", current_stage), ("current_file", current_file)):
             if value is not None:
                 fields.append(name + "=?")
                 values.append(json.dumps(value, ensure_ascii=False) if name == "result" else value)
+        if progress is not None:
+            # A stage transition must never make a live progress bar move
+            # backwards (for example scan 15% -> analysis 2%).
+            fields.append("progress=MAX(progress,?)")
+            values.append(max(0, min(100, int(progress))))
         if heartbeat:
             fields.append("heartbeat_at=?")
             values.append(time.time())
@@ -785,6 +867,23 @@ class Storage:
                 condition += " AND status NOT IN ('cancelled','cancelling')"
             conn.execute("UPDATE analysis_jobs SET {} WHERE {}".format(",".join(fields), condition), values)
 
+    def heartbeat_job(self, job_id, worker_id=None):
+        """Refresh liveness without overwriting child-stage progress text."""
+        now = time.time()
+        values = [now]
+        worker_clause = ""
+        if worker_id:
+            worker_clause = ", worker_id=COALESCE(worker_id,?)"
+            values.append(str(worker_id))
+        values.append(job_id)
+        with self.lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE analysis_jobs SET heartbeat_at=?{} "
+                "WHERE id=? AND status IN ('running','cancelling')".format(worker_clause),
+                values,
+            )
+            return cursor.rowcount == 1
+
     def is_job_cancel_requested(self, job_id):
         """Cheap cooperative cancellation probe for parser/model loops."""
         with self._connect() as conn:
@@ -795,20 +894,81 @@ class Storage:
         return bool(row and (row["cancel_requested"] or row["status"] in {"cancelled", "cancelling"}))
 
     def cancel_job(self, job_id):
+        """Cancel queued work immediately or request termination of live work."""
+        now = time.time()
         with self.lock, self._connect() as conn:
             conn.execute(
-                "UPDATE analysis_jobs SET status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancelling' END, "
-                "cancel_requested=1, message=?, error=NULL, updated_at=CURRENT_TIMESTAMP "
-                "WHERE id=? AND status IN ('queued','running','cancelling')",
-                ("已请求取消任务，当前步骤结束后停止。", job_id),
+                "UPDATE analysis_jobs SET status='cancelled', stage='cancelled', cancel_requested=1, "
+                "message=?, current_stage=?, current_file='', worker_id=NULL, heartbeat_at=NULL, "
+                "finished_at=?, error=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status='queued'",
+                ("排队任务已取消。", "已取消", now, job_id),
             )
+            conn.execute(
+                "UPDATE analysis_jobs SET status='cancelling', stage='cancelling', cancel_requested=1, "
+                "message=?, current_stage=?, error=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status IN ('running','cancelling')",
+                ("正在停止当前步骤，已完成的检查点会保留。", "正在取消", job_id),
+            )
+            row = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone()
+        return self._decode_job(dict(row)) if row else None
+
+    def finalize_job(self, job_id, result=None, error=None):
+        """Atomically resolve completion/cancellation races.
+
+        A cancel request arriving after execution returns but before the final
+        write must win. Otherwise the old guarded update silently leaves a job
+        in ``cancelling`` forever.
+        """
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status,cancel_requested FROM analysis_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return None
+            cancelled = bool(row["cancel_requested"] or row["status"] in {"cancelled", "cancelling"})
+            if cancelled:
+                status, stage, message, stored_error, progress = (
+                    "cancelled", "cancelled", "任务已取消", None, None,
+                )
+            elif error is not None:
+                status, stage, message, stored_error, progress = (
+                    "failed", "failed", "任务失败", str(error), 100,
+                )
+            else:
+                status, stage, message, stored_error, progress = (
+                    "completed", "completed", "任务已完成", None, 100,
+                )
+            fields = [
+                "status=?", "stage=?", "message=?", "error=?", "finished_at=?",
+                "heartbeat_at=?", "worker_id=NULL", "current_stage=?", "current_file=''",
+                "updated_at=CURRENT_TIMESTAMP",
+            ]
+            values = [status, stage, message, stored_error, now, now, "已取消" if cancelled else stage]
+            if progress is not None:
+                fields.append("progress=MAX(progress,?)")
+                values.append(progress)
+            if result is not None and not cancelled and error is None:
+                fields.append("result=?")
+                values.append(json.dumps(result, ensure_ascii=False))
+            values.append(job_id)
+            conn.execute(
+                "UPDATE analysis_jobs SET {} WHERE id=?".format(",".join(fields)),
+                values,
+            )
+            final = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone()
+        return self._decode_job(dict(final)) if final else None
 
     def claim_next_job(self, worker_id):
         """Atomically claim the oldest queued job for one independent worker."""
         with self.lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT id FROM analysis_jobs WHERE status='queued' ORDER BY rowid LIMIT 1"
+                "SELECT id FROM analysis_jobs WHERE status='queued' AND cancel_requested=0 "
+                "ORDER BY priority DESC, rowid LIMIT 1"
             ).fetchone()
             if not row:
                 return None
@@ -822,6 +982,30 @@ class Storage:
                 return None
             claimed = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (row["id"],)).fetchone()
         return self._decode_job(dict(claimed)) if claimed else None
+
+    def list_jobs(self, owner_id=None, statuses=None, limit=50):
+        """Return an owner-scoped task history for the product task center."""
+        limit = max(1, min(200, int(limit or 50)))
+        clauses = []
+        values = []
+        if owner_id:
+            clauses.append("owner_id=?")
+            values.append(owner_id)
+        statuses = [str(item) for item in (statuses or []) if item]
+        if statuses:
+            clauses.append("status IN ({})".format(",".join("?" for _ in statuses)))
+            values.extend(statuses)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        values.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM analysis_jobs{} ORDER BY "
+                "CASE WHEN status IN ('running','cancelling') THEN 0 "
+                "WHEN status='queued' THEN 1 ELSE 2 END, "
+                "COALESCE(started_at,0) DESC, rowid DESC LIMIT ?".format(where),
+                values,
+            ).fetchall()
+        return [self._decode_job(dict(row)) for row in rows]
 
     @staticmethod
     def _decode_job(result):

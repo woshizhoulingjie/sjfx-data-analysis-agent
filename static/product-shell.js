@@ -61,9 +61,11 @@
       chip.textContent = 'IDLE';
     }
     const mount = $('taskPipelineMount');
-    if (mount) {
+    if (mount && !$('taskCenterProgressBar')) {
       mount.innerHTML = '<div class="progress-track"><div id="taskCenterProgressBar" class="progress-bar"></div></div>'
         + '<div id="taskCenterProgressText">当前没有运行中的任务。</div>';
+    }
+    if (mount) {
       const main = mount.closest('.task-center-main');
       const routeButton = main?.querySelector('[data-go-route="packages"]');
       if (main && routeButton && !$('taskCenterCancelBtn')) {
@@ -79,7 +81,7 @@
       }
     }
     const recovery = document.querySelector('.task-center-side');
-    if (recovery && !recovery.querySelector('.task-safety-note')) {
+    if (recovery && !recovery.querySelector('.task-safety-note, .task-recovery-points')) {
       const note = document.createElement('p');
       note.className = 'task-safety-note';
       note.textContent = '取消后会停止提交新文件并终止等待中的隔离解析进程；已经完成的文件检查点会保留。';
@@ -88,7 +90,7 @@
     if (!document.querySelector('link[data-task-controls]')) {
       const style = document.createElement('link');
       style.rel = 'stylesheet';
-      style.href = '/static/task-controls.css?v=1';
+      style.href = '/static/task-controls.css?v=2';
       style.dataset.taskControls = '1';
       document.head.appendChild(style);
     }
@@ -108,6 +110,7 @@
     if (route === 'analysis' && $('analysisTreeBtn') && !$('analysisTreeBtn').disabled) $('analysisTreeBtn').click();
     if ($('exploreTitle')) $('exploreTitle').textContent = route === 'analysis' ? '智能分析目录' : '原始目录';
     if ($('exploreSubtitle')) $('exploreSubtitle').textContent = route === 'analysis' ? '从主题到子方向、文档和证据逐层下钻。' : '确认真实资料结构，原始目录不会被语义分类覆盖。';
+    if (route === 'tasks') window.SJFXTasks?.refresh();
     syncDashboard();
     window.scrollTo({ top: 0, behavior: 'smooth' });
     document.querySelector('.sidebar')?.classList.remove('open');
