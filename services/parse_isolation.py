@@ -118,7 +118,13 @@ class IsolatedParserRunner:
         preferred = str(os.getenv("SJFX_PARSE_START_METHOD", "")).strip()
         available = mp.get_all_start_methods()
         if preferred not in available:
-            preferred = "fork" if "fork" in available else "spawn"
+            # Forking a multi-threaded Worker (the CPU parse pool) can inherit
+            # locked native runtimes.  Keep fork for the original serial path,
+            # but automatically select spawn when a runner is created from a
+            # pool thread.  Operators can always set the environment variable
+            # explicitly for their platform.
+            in_threaded_worker = threading.current_thread() is not threading.main_thread() or threading.active_count() > 1
+            preferred = "spawn" if in_threaded_worker and "spawn" in available else ("fork" if "fork" in available else "spawn")
         self._ctx = mp.get_context(preferred)
         self._process = None
         self._recv = None
