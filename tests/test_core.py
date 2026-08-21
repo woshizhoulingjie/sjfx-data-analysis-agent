@@ -319,6 +319,39 @@ class CoreRegressionTests(unittest.TestCase):
             storage.cancel_job(job_id)
             self.assertEqual(storage.get_job(job_id)["status"], "cancelling")
 
+    def test_new_locked_worker_immediately_recovers_fresh_orphaned_jobs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "test.db")
+            running_id = storage.create_scan_job(folder, 10, "fast", 8)
+            storage.claim_next_job("worker-that-exited")
+            storage.heartbeat_job(running_id, "worker-that-exited")
+            self.assertEqual(storage.recover_stale_jobs(stale_after_seconds=900), 0)
+
+            cancelling_id = storage.create_scan_job(folder, 10, "fast", 8)
+            storage.cancel_job(running_id)
+            storage.claim_next_job("worker-that-exited")
+            storage.cancel_job(cancelling_id)
+
+            self.assertEqual(storage.recover_orphaned_jobs_after_lock(), 2)
+            recovered = storage.get_job(running_id)
+            cancelled = storage.get_job(cancelling_id)
+            self.assertEqual(recovered["status"], "cancelled")
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertIsNotNone(cancelled["finished_at"])
+
+    def test_new_locked_worker_requeues_fresh_running_job(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "test.db")
+            job_id = storage.create_scan_job(folder, 10, "fast", 8)
+            storage.claim_next_job("worker-that-exited")
+            storage.heartbeat_job(job_id, "worker-that-exited")
+
+            self.assertEqual(storage.recover_orphaned_jobs_after_lock(), 1)
+            recovered = storage.get_job(job_id)
+            self.assertEqual(recovered["status"], "queued")
+            self.assertIsNone(recovered["worker_id"])
+            self.assertFalse(recovered["cancel_requested"])
+
     def test_model_json_extractor_handles_fence_prefix_and_quoted_braces(self):
         value = extract_json_value(
             "模型结果如下：\n```json\n{\"regex\": \"[0-9]{1,3}\", \"ok\": true}\n```"

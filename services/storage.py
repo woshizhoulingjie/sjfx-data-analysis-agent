@@ -368,6 +368,37 @@ class Storage:
             cursor.close()
         return changed
 
+    def recover_orphaned_jobs_after_lock(self):
+        """Recover every unfinished claim after acquiring the Worker lock.
+
+        The caller must hold the project's exclusive Worker process lock. At
+        that point no healthy queue owner can still exist, even when its final
+        heartbeat is only a few seconds old. Keeping this takeover separate
+        from time-based stale recovery prevents a second process from
+        requeueing work that is still legitimately running.
+        """
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE analysis_jobs SET status='queued', stage='queued', worker_id=NULL, "
+                "progress=MIN(progress,95), message=?, error=NULL, heartbeat_at=NULL, "
+                "cancel_requested=0, finished_at=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE status='running'",
+                ("检测到 Worker 已重启，任务已重新排队，将从已保存的检查点继续。",),
+            )
+            changed = cursor.rowcount
+            cursor.close()
+            cursor = conn.execute(
+                "UPDATE analysis_jobs SET status='cancelled', stage='cancelled', worker_id=NULL, "
+                "message=?, error=NULL, finished_at=?, heartbeat_at=NULL, current_stage=?, "
+                "current_file='', updated_at=CURRENT_TIMESTAMP WHERE status='cancelling'",
+                ("Worker 重启前已请求取消，任务现已安全结束。", now, "已取消"),
+            )
+            changed += cursor.rowcount
+            cursor.close()
+        return changed
+
     def list_queued_scan_ids(self):
         with self._connect() as conn:
             rows = conn.execute(

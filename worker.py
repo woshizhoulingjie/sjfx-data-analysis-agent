@@ -375,7 +375,9 @@ def _acquire_worker_lock():
 
 def run_forever():
     lock_handle = _acquire_worker_lock()
-    storage.recover_stale_jobs(Config.WORKER_STALE_SECONDS)
+    recovered = storage.recover_orphaned_jobs_after_lock()
+    if recovered:
+        logger.warning("Worker startup recovered %s orphaned task(s)", recovered)
     try:
         storage.checkpoint_wal(force=True)
     except Exception:
@@ -383,14 +385,25 @@ def run_forever():
     logger.info("SJFX local Worker started id=%s", WORKER_ID)
     last_checkpoint = time.monotonic()
     checkpoint_interval = getattr(storage, "sqlite_checkpoint_interval", 60)
+    last_recovery = time.monotonic()
+    recovery_interval = max(30.0, min(300.0, Config.WORKER_STALE_SECONDS / 3.0))
     try:
         while True:
-            if time.monotonic() - last_checkpoint >= checkpoint_interval:
+            now = time.monotonic()
+            if now - last_checkpoint >= checkpoint_interval:
                 try:
                     storage.checkpoint_wal()
                 except Exception:
                     logger.warning("周期性 SQLite WAL checkpoint 失败", exc_info=True)
                 last_checkpoint = time.monotonic()
+            if now - last_recovery >= recovery_interval:
+                try:
+                    recovered = storage.recover_stale_jobs(Config.WORKER_STALE_SECONDS)
+                    if recovered:
+                        logger.warning("Worker recovered %s stale task(s)", recovered)
+                except Exception:
+                    logger.warning("周期性失联任务恢复失败，将继续运行", exc_info=True)
+                last_recovery = time.monotonic()
             job = storage.claim_next_job(WORKER_ID)
             if not job:
                 time.sleep(Config.WORKER_POLL_SECONDS)
