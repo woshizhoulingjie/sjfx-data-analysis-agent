@@ -1,7 +1,7 @@
 import json
 
 from services.ollama import LocalModelError
-from services.evidence import attach_claim_evidence, evidence_support
+from services.evidence import attach_claim_evidence, evidence_quality, evidence_support
 
 
 def _fallback(context, node_path, errors=None):
@@ -22,7 +22,7 @@ def _fallback(context, node_path, errors=None):
             )
         )
 
-    return {
+    summary = {
         "title": "{} 文件夹概览".format(node_path),
 
         "summary": (
@@ -43,6 +43,7 @@ def _fallback(context, node_path, errors=None):
         "notable_items": notable,
 
         "limitations": warnings,
+        "coverage": context.get("coverage") or {},
 
         "recommended_research_direction": {
             "title": "围绕主要文件类型开展分层抽样研究",
@@ -58,6 +59,90 @@ def _fallback(context, node_path, errors=None):
             ],
         },
     }
+    return _normalize_question_answer_evidence(summary, [], node_path, context)
+
+
+def _normalize_question_answer_evidence(summary, catalog, node_path, context=None):
+    """Expose one stable question -> answer -> claim -> evidence contract."""
+    summary = dict(summary or {})
+    context = context or {}
+    question = str(
+        summary.get("question")
+        or summary.get("analysis_question")
+        or "该分析节点主要包含哪些内容，哪些方向值得继续下钻？"
+    ).strip()
+    value = str(
+        summary.get("value")
+        or summary.get("question_value")
+        or "该问题用于判断当前节点是否形成值得继续分析的独立方向。"
+    ).strip()
+    answer = str(summary.get("answer") or summary.get("summary") or "").strip()
+    by_id = {
+        str(item.get("evidence_id")): item
+        for item in list(catalog or []) + list(summary.get("evidence") or [])
+        if isinstance(item, dict) and item.get("evidence_id") and evidence_quality(item).get("eligible")
+    }
+    raw_claims = summary.get("claims") or summary.get("evidence_claims") or []
+    claims = []
+    all_evidence = []
+    seen = set()
+    for raw in raw_claims:
+        if isinstance(raw, dict):
+            statement = str(raw.get("statement") or raw.get("claim") or raw.get("text") or "").strip()
+            raw_items = raw.get("evidence") or raw.get("evidence_chain") or []
+            ids = list(raw.get("evidence_ids") or [])
+        else:
+            statement = str(raw or "").strip()
+            raw_items, ids = [], []
+        evidence = []
+        evidence.extend(item for item in raw_items if isinstance(item, dict))
+        evidence.extend(by_id[str(item)] for item in ids if str(item) in by_id)
+        valid = []
+        for item in evidence:
+            evidence_id = str(item.get("evidence_id") or "")
+            if not evidence_id or evidence_id in {str(value.get("evidence_id")) for value in valid}:
+                continue
+            if evidence_quality(item).get("eligible"):
+                valid.append(item)
+        for item in valid:
+            key = str(item.get("evidence_id"))
+            if key not in seen:
+                seen.add(key)
+                all_evidence.append(item)
+        if statement:
+            claims.append({
+                "statement": statement,
+                "type": raw.get("type") if isinstance(raw, dict) else "observation",
+                "evidence_ids": [item.get("evidence_id") for item in valid if item.get("evidence_id")],
+                "support_status": "supported" if valid else "insufficient",
+            })
+    if not claims and answer:
+        claims.append({
+            "statement": answer,
+            "type": "summary",
+            "evidence_ids": [item.get("evidence_id") for item in all_evidence if item.get("evidence_id")],
+            "support_status": "supported" if all_evidence else "insufficient",
+        })
+    supported = any(item.get("support_status") == "supported" for item in claims)
+    summary["question"] = question
+    summary["value"] = value
+    summary["answer"] = answer
+    summary["claims"] = claims
+    summary["evidence"] = all_evidence or [item for item in summary.get("evidence") or [] if evidence_quality(item).get("eligible")]
+    summary["evidence_ids"] = [item.get("evidence_id") for item in summary["evidence"] if item.get("evidence_id")]
+    summary["evidence_status"] = "supported" if supported else "insufficient"
+    summary["evidence_contract"] = "question-answer-evidence/2.0"
+    summary["question_answer_evidence"] = {
+        "question": question,
+        "value": value,
+        "answer": answer,
+        "claims": claims,
+        "evidence": summary["evidence"],
+        "coverage": context.get("coverage") or {},
+        "limitations": list(summary.get("limitations") or []) + ([] if supported else ["当前没有足够的有效正文证据支撑该回答。"]),
+    }
+    summary["limitations"] = list(dict.fromkeys(summary["question_answer_evidence"]["limitations"]))
+    return summary
 
 
 def _path_in_folder(path, folder):
@@ -661,7 +746,7 @@ def analyze_folder(
 证据目录：{evidence}
 
 只输出 JSON：
-{{"title":"标题","summary":"300字以内的概览摘要","topics":["主题"],"notable_items":["发现"],"evidence_ids":["E-..."],"limitations":["局限"],"recommended_research_direction":{{"title":"首选深入方向","rationale":"理由","questions":["可验证问题"],"methods":["建议方法"],"evidence_ids":["E-..."]}}}}
+{{"title":"标题","question":"本节点要回答的问题","value":"为什么值得分析","answer":"基于证据的谨慎回答","summary":"300字以内的概览摘要","topics":["主题"],"notable_items":["发现"],"claims":[{{"statement":"可核验结论","type":"direct_fact或inference","evidence_ids":["E-..."]}}],"evidence_ids":["E-..."],"limitations":["局限"],"recommended_research_direction":{{"title":"首选深入方向","rationale":"理由","questions":["可验证问题"],"methods":["建议方法"],"evidence_ids":["E-..."]}}}}
 
 要求：
 1. 只能使用证据目录中的 evidence_id。
@@ -669,6 +754,7 @@ def analyze_folder(
 3. 不能编造外部事实。
 4. 发现与推论必须分开。
 5. 摘要重点说明这个节点实际包含的内容，而不是只罗列文件类型。
+6. claims 中的每个结论必须引用 evidence_ids；没有有效证据时标记证据不足，不得编造。
 """.format(
         path=node_path,
 
@@ -742,6 +828,7 @@ def analyze_folder(
             ),
             max_items=3,
         )
+        summary = _normalize_question_answer_evidence(summary, catalog, node_path, context)
 
         summary.setdefault(
             "limitations",
@@ -777,10 +864,11 @@ def analyze_folder(
         ]
 
         return (
-            _fallback(
-                context,
+            _normalize_question_answer_evidence(
+                _fallback(context, node_path, errors),
+                catalog,
                 node_path,
-                errors
+                context,
             ),
 
             {

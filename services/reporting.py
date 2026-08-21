@@ -2,6 +2,8 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from services.evidence import evidence_quality, select_evidence
+
 
 DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx", ".md", ".txt", ".png", ".jpg", ".jpeg"}
 DATA_EXTENSIONS = {".csv", ".xlsx", ".xlsm", ".json", ".jsonl"}
@@ -44,27 +46,101 @@ def _analysis_evidence(analysis, limit=8):
     return output[:limit]
 
 
-def _research_direction(_scan, _summaries, analysis):
-    """Return an honest placeholder until the model evaluates the evidence.
+def _cluster_evidence(cluster, analysis, topic, limit=8):
+    """Collect only claim-eligible正文 evidence belonging to one topic."""
+    candidates = list(cluster.get("evidence_chain") or [])
+    member_paths = set(cluster.get("members") or [])
+    for item in analysis.get("document_index", []) or []:
+        path = (item.get("source") or {}).get("path") or item.get("path")
+        if path not in member_paths:
+            continue
+        candidates.extend(item.get("evidence") or [])
+    selected = select_evidence(candidates, topics=[topic], max_items=limit, per_source=2, max_chars=620)
+    return [item for item in selected if evidence_quality(item).get("eligible")]
 
-    Rules may rank and preserve evidence, but they must never manufacture a
-    domain-specific research recommendation from a few trigger words.
+
+def _direction_candidates(scan, analysis, limit=8):
+    """Rank explainable local directions before optional model wording.
+
+    The model may improve prose later, but it cannot invent the candidate,
+    scope, score or evidence ids produced here.
     """
-    evidence = _analysis_evidence(analysis, 8)
     statistics = analysis.get("statistics", {})
-    parsed = int(statistics.get("parsed_files") or 0)
-    failed = int(statistics.get("failed_files") or 0)
-    topic_count = int(statistics.get("topic_clusters") or 0)
+    parsed = max(1, int(statistics.get("parsed_files") or 0))
+    coverage = analysis.get("coverage") or {}
+    clusters = analysis.get("research_topic_clusters") or analysis.get("topic_clusters") or []
+    directions = []
+    for cluster in clusters:
+        topic = str(cluster.get("topic") or cluster.get("name") or "").strip()
+        members = list(dict.fromkeys(cluster.get("members") or []))
+        if not topic or not members:
+            continue
+        evidence = _cluster_evidence(cluster, analysis, topic)
+        evidence_count = len(evidence)
+        concentration = min(1.0, len(members) / float(parsed))
+        unique_signal = min(1.0, len(set(members)) / float(len(members) or 1))
+        evidence_signal = min(1.0, evidence_count / 6.0)
+        score = round(100 * (0.35 * min(1.0, concentration * 3) + 0.25 * evidence_signal + 0.20 * unique_signal + 0.20 * float(coverage.get("parsed_file_ratio") or 0)), 1)
+        if score >= 70:
+            priority = "高"
+        elif score >= 45:
+            priority = "中"
+        else:
+            priority = "低"
+        confidence = "高" if evidence_count >= 3 and coverage.get("complete_analysis") else ("中" if evidence_count else "低")
+        limitations = list(coverage.get("limitations") or [])
+        if not evidence:
+            limitations.append("当前主题没有达到正文证据门槛，不能据此形成可靠结论。")
+        directions.append({
+            "title": topic,
+            "direction": topic,
+            "type": "推论",
+            "priority": priority,
+            "score": score,
+            "score_breakdown": {
+                "document_count": len(members),
+                "topic_concentration": round(concentration, 6),
+                "evidence_count": evidence_count,
+                "unique_signal": round(unique_signal, 6),
+                "coverage_ratio": coverage.get("parsed_file_ratio"),
+            },
+            "rationale": "该方向包含 {} 个已解析成员，形成 {} 条符合正文质量门槛的证据；主题集中度为 {:.1%}。".format(len(members), evidence_count, concentration),
+            "basis": "优先级由成员数量、主题集中度、独特内容信号、证据数量和当前覆盖率共同计算；属于本地分析推论。",
+            "research_questions": [
+                "该方向的代表性文档之间有哪些共同结论和差异？",
+                "该方向的关键结论能否由多个独立来源直接支撑？",
+            ],
+            "methods": ["先阅读代表性文档并核对原文证据", "按时间、来源和版本关系进行交叉比较"],
+            "representative_documents": list(cluster.get("representative_documents") or members[:5])[:5],
+            "evidence_chain": evidence,
+            "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
+            "limitations": list(dict.fromkeys(limitations)),
+            "confidence": confidence,
+        })
+    directions.sort(key=lambda item: (-float(item.get("score") or 0), item.get("title") or ""))
+    return directions[:max(1, limit)]
+
+
+def _research_direction(_scan, _summaries, analysis):
+    candidates = _direction_candidates(_scan, analysis)
+    if candidates:
+        return candidates[0]
+    evidence = _analysis_evidence(analysis, 8)
+    coverage = analysis.get("coverage") or {}
     return {
-        "title": "核验高频主题与代表文档之间的一致性",
+        "title": "补充解析并核验代表性正文证据",
+        "direction": "补充解析并核验代表性正文证据",
         "type": "推论",
-        "rationale": "本地已解析 {} 个文件并形成 {} 个主题簇，当前最可执行的深入方向是核验主题线索在代表文档中的一致性；{} 个文件仍需复核。".format(parsed, topic_count, failed),
-        "basis": "依据为本地解析统计、主题簇代表文档和下列可定位证据；这是推论，不是外部事实。",
-        "research_questions": [],
-        "methods": [],
-        "priority": "待定",
-        "confidence": "待模型评估",
+        "priority": "低",
+        "score": 0,
+        "rationale": "当前尚未形成有足够正文证据支撑的稳定主题，不能强行推荐领域方向。",
+        "basis": "先补充待分析或失败文件，再重新生成概览。",
+        "research_questions": ["哪些文件可以形成稳定主题？", "当前证据是否足以回答客户指定问题？"],
+        "methods": ["重试失败文件", "选择待分析节点进行分批深化"],
         "evidence_chain": evidence,
+        "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
+        "limitations": list(coverage.get("limitations") or []) + ["证据不足，当前方向仅作为处理建议。"],
+        "confidence": "低",
     }
 
 
@@ -386,6 +462,8 @@ def _global_categories(scan, analysis):
 def build_local_report(scan, summaries, analysis=None):
     analysis = analysis or {}
     stats = analysis.get("statistics", {})
+    coverage = analysis.get("coverage") or {}
+    value_judgment = analysis.get("value_judgment") or {}
     type_counts = scan.get("type_counts", {})
     ordered_types = list(type_counts.items())
     root_summary = analysis.get("node_summaries", {}).get(".", {})
@@ -424,6 +502,8 @@ def build_local_report(scan, summaries, analysis=None):
         "统一解析成功登记 {} 个文件，生成 {} 条可回查证据；{} 个文件解析失败。".format(stats.get("parsed_files", 0), stats.get("evidence_items", 0), stats.get("failed_files", 0)),
         "本地混合检索已建立 {} 个证据块；{} 个 Office 文件启用了内嵌图片 OCR。".format(stats.get("retrieval_evidence_chunks", 0), stats.get("office_embedded_image_ocr_files", 0)),
     ]
+    if coverage.get("limitations"):
+        findings.append("分析覆盖限制：{}".format("；".join(coverage.get("limitations", [])[:3])))
     degraded = root_summary.get("statistics", {}).get("degraded_document_count", 0)
     if degraded:
         findings.append("有 {} 个文件使用兼容解析或仅保留元数据，涉及结论应优先人工复核。".format(degraded))
@@ -462,7 +542,19 @@ def build_local_report(scan, summaries, analysis=None):
                 classification_coverage["parsed_file_count"],
                 "完整" if classification_coverage["complete"] else "存在未归类或重复归类，请复核",
             ),
+            "分析覆盖：扫描 {} 个文件，已解析 {} 个，抽样 {} 个，深度分析 {} 个，待处理 {} 个，失败 {} 个；文件覆盖率 {}，字节覆盖率 {}。".format(
+                coverage.get("scanned_files", coverage.get("inventory_files", scan.get("file_count", 0))),
+                coverage.get("parsed_files", stats.get("parsed_files", 0)),
+                coverage.get("sampled_files", coverage.get("sampled_overview_files", 0)),
+                coverage.get("deep_analyzed_files", 0),
+                coverage.get("pending_files", stats.get("pending_files", 0)),
+                coverage.get("failed_files", stats.get("failed_files", 0)),
+                "{:.1%}".format(float(coverage.get("coverage_ratio", coverage.get("parsed_file_ratio") or 0))),
+                "{:.1%}".format(float(coverage.get("parsed_byte_ratio") or 0)),
+            ),
         ],
+        "coverage": coverage,
+        "value_judgment": value_judgment,
         "global_categories": categories,
         "classification_coverage": classification_coverage,
         "key_findings": findings,
@@ -470,11 +562,19 @@ def build_local_report(scan, summaries, analysis=None):
         "directions": [{
             "direction": direction["title"],
             "type": "推论",
+            "question": (direction.get("research_questions") or [None])[0],
+            "value": direction.get("rationale"),
+            "answer": direction.get("rationale"),
             "confidence": direction["confidence"],
+            "priority": direction.get("priority"),
+            "representative_documents": direction.get("representative_documents", []),
+            "evidence_ids": direction.get("evidence_ids", []),
             "evidence_chain": direction["evidence_chain"],
             "basis": direction.get("basis") or direction["rationale"],
+            "limitations": direction.get("limitations", []),
             "confidence_note": "置信度由跨文档主题覆盖与可引用证据数量决定；建议在正式研究前复核代表文档原文。",
         }],
+        "direction_candidates": _direction_candidates(scan, analysis),
         "analysis_method": {
             "parse": "Docling 统一文档模型；图片和扫描 PDF 使用 RapidOCR；失败项显式降级",
             "deduplication": "SHA-256 精确去重",
@@ -488,13 +588,19 @@ def build_local_report(scan, summaries, analysis=None):
 
 
 def _model_evidence_chain(evidence_catalog, evidence_ids, fallback):
-    by_id = {str(item.get("evidence_id")): item for item in evidence_catalog if item.get("evidence_id")}
+    by_id = {
+        str(item.get("evidence_id")): item
+        for item in evidence_catalog
+        if item.get("evidence_id") and evidence_quality(item).get("eligible")
+    }
     selected = []
     for evidence_id in evidence_ids or []:
         item = by_id.get(str(evidence_id))
         if item and item not in selected:
             selected.append(item)
-    return selected or list(fallback or [])
+    if selected:
+        return selected
+    return [item for item in (fallback or []) if evidence_quality(item).get("eligible")]
 
 
 def merge_model_report(local_report, model_report, evidence_catalog=None):
@@ -519,6 +625,13 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
         recommendation["supports_evidence_ids"] = [
             item.get("evidence_id") for item in recommendation["evidence_chain"] if item.get("evidence_id") in selected_ids
         ]
+        recommendation["evidence_status"] = "supported" if recommendation["evidence_chain"] else "insufficient"
+        recommendation["claims"] = [{
+            "statement": recommendation.get("rationale") or recommendation.get("title"),
+            "type": "inference",
+            "evidence_ids": [item.get("evidence_id") for item in recommendation["evidence_chain"] if item.get("evidence_id")],
+            "support_status": recommendation["evidence_status"],
+        }]
         recommendation.setdefault("confidence", "中")
         merged["recommended_research_direction"] = recommendation
     for direction in merged.get("directions", []):
@@ -530,6 +643,13 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
             direction["supports_evidence_ids"] = [
                 item.get("evidence_id") for item in direction["evidence_chain"] if item.get("evidence_id")
             ]
+            direction["evidence_status"] = "supported" if direction["evidence_chain"] else "insufficient"
+            direction["claims"] = [{
+                "statement": direction.get("basis") or direction.get("direction") or direction.get("title"),
+                "type": "inference",
+                "evidence_ids": [item.get("evidence_id") for item in direction["evidence_chain"] if item.get("evidence_id")],
+                "support_status": direction["evidence_status"],
+            }]
             direction.setdefault("confidence", "中")
     merged["generation_mode"] = "model_analyzed"
     return merged

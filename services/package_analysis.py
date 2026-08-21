@@ -30,6 +30,83 @@ SMALL_FILE_SUMMARY_BYTES = 16 * 1024
 PROFILE_USABLE_STATUSES = {"completed", "partial"}
 
 
+def _build_value_judgment(scan, documents, analysis_stats, coverage, exact_groups,
+                          topic_clusters, failures, pending_paths, structured_overview):
+    """Build a transparent value assessment from local, auditable signals.
+
+    This is intentionally not an LLM opinion.  It separates whether the data
+    can be read from whether it appears worth deeper research, and exposes the
+    component scores so the UI/report cannot turn a high parse ratio into an
+    unsupported claim of business value.
+    """
+    scanned = max(0, int(scan.get("file_count") or 0))
+    parsed = max(0, int(analysis_stats.get("parsed_files") or 0))
+    parsed_ratio = float(coverage.get("parsed_file_ratio") or 0.0)
+    byte_ratio = float(coverage.get("parsed_byte_ratio") or 0.0)
+    failed = max(0, int(analysis_stats.get("failed_files") or len(failures)))
+    duplicate_files = sum(int(group.get("duplicate_count") or 0) for group in exact_groups)
+    unique_ratio = max(0.0, min(1.0, 1.0 - duplicate_files / float(scanned or 1)))
+    cluster_sizes = [len(item.get("members") or []) for item in topic_clusters]
+    largest_cluster_ratio = max(cluster_sizes or [0]) / float(parsed or 1)
+    topic_concentration = max(0.0, min(1.0, largest_cluster_ratio))
+    evidence_count = sum(len(document.get("evidence") or []) for document in documents.values())
+    evidence_density = max(0.0, min(1.0, evidence_count / float(max(parsed, 1) * 3)))
+    quality_score = structured_overview.get("average_quality_score")
+    structured_quality = max(0.0, min(1.0, float(quality_score) / 100.0)) if quality_score is not None else None
+
+    def pct(value):
+        return round(max(0.0, min(1.0, float(value))) * 100, 1)
+
+    dimensions = {
+        "readability": {"score": pct(parsed_ratio), "basis": "已完成解析的文件占扫描文件比例"},
+        "completeness": {"score": pct(min(parsed_ratio, byte_ratio or parsed_ratio)), "basis": "文件覆盖率与字节覆盖率取保守值"},
+        "uniqueness": {"score": pct(unique_ratio), "basis": "精确重复文件越少，独特内容比例越高"},
+        "topic_concentration": {"score": pct(topic_concentration), "basis": "最大主题簇占已解析内容的比例"},
+        "evidence_density": {"score": pct(evidence_density), "basis": "可回查正文证据数量与解析文件规模"},
+    }
+    if structured_quality is not None:
+        dimensions["structured_quality"] = {
+            "score": pct(structured_quality),
+            "basis": "CSV/XLSX/JSON 画像质量评分",
+        }
+    research_components = [
+        unique_ratio,
+        topic_concentration,
+        evidence_density,
+        parsed_ratio,
+    ]
+    if structured_quality is not None:
+        research_components.append(structured_quality)
+    research_score = pct(sum(research_components) / float(len(research_components) or 1))
+    if research_score >= 75:
+        research_level = "高"
+    elif research_score >= 45:
+        research_level = "中高" if topic_clusters or evidence_count else "中"
+    else:
+        research_level = "待分析" if pending_paths or not parsed else "低"
+    limitations = list(coverage.get("limitations") or [])
+    if failed:
+        limitations.append("存在 {} 个解析失败文件。".format(failed))
+    if not topic_clusters:
+        limitations.append("当前未形成稳定主题簇，研究方向需要人工确认。")
+    return {
+        "level": "高" if parsed_ratio >= 0.9 and evidence_count else ("中" if parsed_ratio >= 0.5 or evidence_count else "待分析"),
+        "availability": "高" if parsed_ratio >= 0.9 and not failed else ("中" if parsed_ratio >= 0.5 else "低"),
+        "research_value": research_level,
+        "research_score": research_score,
+        "dimensions": dimensions,
+        "basis": "基于可读性、覆盖完整性、内容独特性、主题集中度和可回查证据密度计算；不代表外部业务价值。",
+        "confidence": "高" if coverage.get("complete_analysis") else "中",
+        "limitations": list(dict.fromkeys(limitations)),
+        "structured_data_signals": {
+            "profiled_files": structured_overview.get("profiled_files", 0),
+            "total_rows": structured_overview.get("total_rows", 0),
+            "average_quality_score": structured_overview.get("average_quality_score"),
+            "entity_categories": sorted((structured_overview.get("entity_statistics") or {}).keys()),
+        },
+    }
+
+
 def _optional_llm_enrichment_enabled():
     """Return whether non-essential model naming may run.
 
@@ -711,12 +788,23 @@ def _enrich_analysis_tree(tree, documents):
                 # and the evidence that directly supports that answer.
                 "analysis_question": analysis_question,
                 "question_value": question_value,
+                "question": analysis_question,
+                "value": question_value,
                 "answer": answer,
                 "statement": answer,
                 "type": "问题—回答—证据",
                 "confidence": confidence,
                 "basis": "回答来自该子方向内文件的正文主题聚合，并由下列可回查原文证据直接支撑。",
                 "evidence": evidence,
+                "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
+                "claims": [{
+                    "statement": answer,
+                    "type": "inference",
+                    "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
+                    "support_status": "supported" if evidence else "insufficient",
+                }],
+                "evidence_status": "supported" if evidence else "insufficient",
+                "limitations": [] if evidence else ["当前子方向没有达到有效正文证据门槛，不能据此形成可靠结论。"],
             }
             conclusion_evidence.append(conclusion)
 
@@ -2282,23 +2370,29 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "total_size_human": scan.get("total_size_human"),
         "format_counts": scan.get("type_counts", {}),
         "parsed_files": len(documents),
+        "sampled_files": package_coverage.get("sampled_files", 0),
+        "deep_analyzed_files": package_coverage.get("deep_analyzed_files", 0),
         "pending_files": len(pending_paths),
         "failed_files": len(failures),
+        "scanned_bytes": package_coverage.get("scanned_bytes", package_coverage.get("inventory_bytes", 0)),
+        "parsed_bytes": package_coverage.get("parsed_bytes", 0),
+        "coverage_ratio": package_coverage.get("coverage_ratio", package_coverage.get("parsed_file_ratio")),
+        "complete_analysis": package_coverage.get("complete_analysis", False),
+        "limitations": package_coverage.get("limitations", []),
         "evidence_count": evidence_count,
         "structured_data": structured_overview,
     }
-    value_judgment = {
-        "level": "高" if parsed_ratio >= 0.9 and evidence_count else ("中" if parsed_ratio >= 0.5 or evidence_count else "待分析"),
-        "basis": "基于文件覆盖率、可回溯证据数量、数据格式多样性和结构化数据质量评分。",
-        "confidence": "高" if parsed_ratio >= 0.9 and not failures else "中",
-        "limitations": (["仍有 {} 个文件待分析".format(len(pending_paths))] if pending_paths else []) + (["有 {} 个文件解析失败，可调用失败文件重试接口".format(len(failures))] if failures else []),
-        "structured_data_signals": {
-            "profiled_files": structured_overview["profiled_files"],
-            "total_rows": structured_overview["total_rows"],
-            "average_quality_score": structured_overview["average_quality_score"],
-            "entity_categories": sorted(structured_overview["entity_statistics"]),
-        },
-    }
+    value_judgment = _build_value_judgment(
+        scan,
+        documents,
+        {"parsed_files": len(documents), "failed_files": len(failures)},
+        package_coverage,
+        exact_groups,
+        topic_clusters,
+        failures,
+        pending_paths,
+        structured_overview,
+    )
     analysis = {
         "schema_version": "package-analysis/2.0",
         "scan_id": scan_id,
@@ -2310,10 +2404,17 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "statistics": {
             "scanned_files": scan.get("file_count", 0),
             "parsed_files": len(documents),
+            "sampled_files": package_coverage.get("sampled_files", 0),
+            "deep_analyzed_files": package_coverage.get("deep_analyzed_files", 0),
             "failed_files": len(failures),
             "pending_files": len(pending_paths),
+            "scanned_bytes": package_coverage.get("scanned_bytes", package_coverage.get("inventory_bytes", 0)),
+            "parsed_bytes": package_coverage.get("parsed_bytes", 0),
             "parsed_file_ratio": package_coverage.get("parsed_file_ratio"),
+            "coverage_ratio": package_coverage.get("coverage_ratio", package_coverage.get("parsed_file_ratio")),
             "parsed_byte_ratio": package_coverage.get("parsed_byte_ratio"),
+            "complete_analysis": package_coverage.get("complete_analysis", False),
+            "coverage_limitations": package_coverage.get("limitations", []),
             "large_package_mode": policy.get("enabled"),
             "exact_duplicate_groups": len(exact_groups),
             "exact_duplicate_files": exact_duplicate_files,
@@ -2422,8 +2523,38 @@ def refresh_package_coverage(scan_id, scan, storage):
     statistics.update({
         "parsed_files": len(documents), "failed_files": len(failures),
         "pending_files": len(pending_paths),
+        "sampled_files": package_coverage.get("sampled_files", 0),
+        "deep_analyzed_files": package_coverage.get("deep_analyzed_files", 0),
+        "scanned_bytes": package_coverage.get("scanned_bytes", package_coverage.get("inventory_bytes", 0)),
+        "parsed_bytes": package_coverage.get("parsed_bytes", 0),
         "parsed_file_ratio": package_coverage.get("parsed_file_ratio"),
+        "coverage_ratio": package_coverage.get("coverage_ratio", package_coverage.get("parsed_file_ratio")),
         "parsed_byte_ratio": package_coverage.get("parsed_byte_ratio"),
+        "complete_analysis": package_coverage.get("complete_analysis", False),
+        "coverage_limitations": package_coverage.get("limitations", []),
+    })
+    analysis["value_judgment"] = _build_value_judgment(
+        scan,
+        documents,
+        statistics,
+        package_coverage,
+        analysis.get("exact_duplicate_groups", []),
+        analysis.get("topic_clusters", []),
+        failures,
+        pending_paths,
+        analysis.get("structured_data_overview", {}),
+    )
+    analysis.setdefault("overview", {}).update({
+        "parsed_files": len(documents),
+        "sampled_files": package_coverage.get("sampled_files", 0),
+        "deep_analyzed_files": package_coverage.get("deep_analyzed_files", 0),
+        "pending_files": len(pending_paths),
+        "failed_files": len(failures),
+        "scanned_bytes": package_coverage.get("scanned_bytes", package_coverage.get("inventory_bytes", 0)),
+        "parsed_bytes": package_coverage.get("parsed_bytes", 0),
+        "coverage_ratio": package_coverage.get("coverage_ratio", package_coverage.get("parsed_file_ratio")),
+        "complete_analysis": package_coverage.get("complete_analysis", False),
+        "limitations": package_coverage.get("limitations", []),
     })
     storage.save_analysis(scan_id, analysis)
     scan["analysis"] = statistics

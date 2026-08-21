@@ -996,7 +996,10 @@ function renderSummary(
     const ratio = scopeCoverage.parsed_file_ratio == null
       ? '—'
       : `${Math.round(scopeCoverage.parsed_file_ratio * 10000) / 100}%`;
-    html += `<p class="coverage-card"><strong>该节点分析覆盖：</strong>${escapeHtml(scopeCoverage.status || scopeCoverage.mode || '—')}；已分析 ${scopeCoverage.parsed_files ?? scopeCoverage.sampled_files ?? 0}/${scopeCoverage.inventory_files ?? scopeCoverage.total_files ?? 0}（${ratio}），待处理 ${scopeCoverage.pending_files || 0}，失败 ${scopeCoverage.failed_files || 0}</p>`;
+    html += `<p class="coverage-card"><strong>该节点分析覆盖：</strong>${escapeHtml(scopeCoverage.status || scopeCoverage.mode || '—')}；已解析 ${scopeCoverage.parsed_files ?? 0}/${scopeCoverage.inventory_files ?? scopeCoverage.total_files ?? 0}（${ratio}），抽样 ${scopeCoverage.sampled_files ?? scopeCoverage.sampled_overview_files ?? 0}，深度分析 ${scopeCoverage.deep_analyzed_files ?? 0}，待处理 ${scopeCoverage.pending_files || 0}，失败 ${scopeCoverage.failed_files || 0}；${scopeCoverage.complete_analysis ? '可视为完整分析' : '当前为部分覆盖，不能视为全文分析'}</p>`;
+    if (scopeCoverage.limitations?.length) {
+      html += `<p class="coverage-card"><strong>覆盖限制：</strong>${escapeHtml(scopeCoverage.limitations.join('；'))}</p>`;
+    }
   }
 
   if (data.statistics) {
@@ -1170,6 +1173,8 @@ function renderSummary(
         )
       }</p>`;
 
+    html += `<p class="coverage-card"><strong>优先级：</strong>${escapeHtml(d.priority || '—')}；<strong>评分：</strong>${escapeHtml(d.score ?? '—')}；<strong>证据状态：</strong>${escapeHtml(d.evidence_status || (d.evidence_chain?.length ? 'supported' : 'insufficient'))}</p>`;
+
     if (
       questions?.length
     ) {
@@ -1183,6 +1188,24 @@ function renderSummary(
             .join('')
         }</ol>`;
     }
+    if (d.methods?.length) {
+      html += `<p><strong>建议方法：</strong>${escapeHtml(d.methods.join('；'))}</p>`;
+    }
+    html += d.evidence_chain?.length
+      ? evidenceHtml(d.evidence_chain)
+      : `<p class="coverage-card"><strong>证据状态：</strong>当前没有达到质量门槛的正文证据，建议先补充解析后再下结论。</p>`;
+  }
+
+  const qa = data.question_answer_evidence;
+  if (qa) {
+    html += `<h3>问题—回答—证据</h3><section class="conclusion-evidence">` +
+      `<p><strong>问题：</strong>${escapeHtml(qa.question || data.question || '—')}</p>` +
+      `<p><strong>价值：</strong>${escapeHtml(qa.value || data.value || '—')}</p>` +
+      `<p><strong>回答：</strong>${escapeHtml(qa.answer || data.answer || '—')}</p>` +
+      `<p><strong>证据状态：</strong>${escapeHtml(data.evidence_status || (qa.evidence?.length ? 'supported' : 'insufficient'))}</p>` +
+      (qa.claims?.length ? `<ul>${qa.claims.map(claim => `<li>${escapeHtml(claim.statement || '')}（${escapeHtml(claim.support_status || 'insufficient')}）${claim.evidence_ids?.length ? ` · ${escapeHtml(claim.evidence_ids.join(', '))}` : ''}</li>`).join('')}</ul>` : '') +
+      (qa.evidence?.length ? evidenceHtml(qa.evidence) : `<p class="coverage-card">没有有效正文证据支撑当前回答。</p>`) +
+      `</section>`;
   }
 
   if (
@@ -1315,8 +1338,17 @@ function updateStats() {
   if (coverage.inventory_files != null) {
     $('scanStats').innerHTML +=
       `<div class="coverage-card"><strong>分析覆盖：${escapeHtml(coverage.status || '—')}</strong> · 已分析 ${coverage.parsed_files || 0}/${coverage.inventory_files || 0}（${ratio}）` +
+      `；抽样 ${coverage.sampled_files ?? coverage.sampled_overview_files ?? 0}；深度分析 ${coverage.deep_analyzed_files ?? 0}` +
       `；待处理 ${coverage.pending_files || 0}；失败 ${coverage.failed_files || 0}` +
+      `；${coverage.complete_analysis ? '完整分析' : '部分覆盖'}` +
       `${coverage.large_package_notice ? `<br><small>${escapeHtml(coverage.large_package_notice)}</small>` : ''}</div>`;
+    if (coverage.limitations?.length) {
+      $('scanStats').innerHTML += `<div class="coverage-card"><strong>覆盖限制：</strong>${escapeHtml(coverage.limitations.join('；'))}</div>`;
+    }
+  }
+  if (judgment.dimensions) {
+    const labels = { readability: '可读性', completeness: '完整性', uniqueness: '独特性', topic_concentration: '主题集中度', evidence_density: '证据密度', structured_quality: '结构化质量' };
+    $('scanStats').innerHTML += `<div class="coverage-card"><strong>价值维度：</strong>${Object.entries(judgment.dimensions).map(([key, value]) => `${escapeHtml(labels[key] || key)} ${escapeHtml(value?.score ?? '—')}`).join(' · ')}</div>`;
   }
 }
 

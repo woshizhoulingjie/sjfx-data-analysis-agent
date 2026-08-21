@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -61,6 +62,18 @@ def _token_expiry(raw):
             return 0.0
 
 
+def _local_model_url(raw):
+    """Reject accidental remote model endpoints in the offline product."""
+    value = str(raw or "").strip().rstrip("/")
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or host not in {"127.0.0.1", "localhost", "::1"}:
+        raise RuntimeError(
+            "物理断网部署只允许本机 Ollama 地址（127.0.0.1/localhost/::1），拒绝远程模型地址"
+        )
+    return value
+
+
 class Config:
     BASE_DIR = BASE_DIR
     DATA_DIR = BASE_DIR / "data"
@@ -74,7 +87,7 @@ class Config:
     # The server already provides a local Ollama instance. Keep local mode as
     # the default so an absent .env can never send document text to the internet.
     ENABLE_SHARED_OLLAMA = os.getenv("ENABLE_SHARED_OLLAMA", "0").strip().lower() in {"1", "true", "yes"}
-    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
+    OLLAMA_BASE_URL = _local_model_url(os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"))
     OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen-agent:latest")
     OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "qwen-embed:latest")
     LLM_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1")))

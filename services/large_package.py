@@ -132,7 +132,10 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
     parsed_paths = set(documents)
 
     def for_paths(paths=None):
-        selected = set(paths or files)
+        # ``paths=[]`` is a legitimate empty scope (for example an empty
+        # virtual node).  Treating it as the package root silently inflated
+        # coverage and could make a node look fully analysed.
+        selected = set(files) if paths is None else set(paths)
         selected &= set(files)
         parsed = selected & parsed_paths
         failed = selected & failed_paths
@@ -153,24 +156,46 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             1 for path in parsed
             if not (documents.get(path, {}).get("coverage") or {}).get("complete")
         )
-        status = "完整" if not pending and not failed and partial == 0 else "部分覆盖"
+        deep_analyzed = len(parsed) - sampled
+        complete_analysis = bool(selected) and not pending and not failed and partial == 0
+        status = "完整" if complete_analysis else "部分覆盖"
         if not parsed and selected:
             status = "待分析"
+        limitations = []
+        if (policy or {}).get("enabled"):
+            limitations.append("大数据包采用代表性文件首轮概览，未抽中的文件需要按范围继续深化。")
+        if sampled:
+            limitations.append("{} 个文件当前为抽样/首轮概览，不能视为全文深度分析。".format(sampled))
+        if partial:
+            limitations.append("{} 个已解析文件存在正文截断、快速模式或其他不完整覆盖。".format(partial))
+        if pending:
+            limitations.append("{} 个文件尚未进入内容分析。".format(len(pending)))
+        if failed:
+            limitations.append("{} 个文件解析失败，可通过失败文件重试继续处理。".format(len(failed)))
         return {
             "mode": (policy or {}).get("mode", "standard"),
             "status": status,
             "inventory_files": len(selected),
+            "scanned_files": len(selected),
             "parsed_files": len(parsed),
+            "sampled_files": sampled,
             "complete_text_files": complete_text,
             "sampled_overview_files": sampled,
+            "deep_analyzed_files": max(0, deep_analyzed),
             "partial_text_files": partial,
             "failed_files": len(failed),
             "pending_files": len(pending),
             "parsed_file_ratio": round(len(parsed) / float(len(selected) or 1), 6),
+            "coverage_ratio": round(len(parsed) / float(len(selected) or 1), 6),
             "inventory_bytes": total_bytes,
+            "scanned_bytes": total_bytes,
             "inventory_size_human": human_size(total_bytes),
             "parsed_bytes": parsed_bytes,
             "parsed_byte_ratio": round(parsed_bytes / float(total_bytes or 1), 6),
+            "complete_analysis": complete_analysis,
+            "limitations": limitations,
+            "pending_paths": sorted(pending)[:200],
+            "failed_paths": sorted(failed)[:200],
             "large_package_notice": (
                 "首轮结果基于代表文件；未覆盖文件可在选中范围后继续补充分析。"
                 if (policy or {}).get("enabled") else None

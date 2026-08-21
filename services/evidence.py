@@ -119,7 +119,7 @@ def compact_evidence(item, max_chars=520):
 NAVIGATION_LABELS = {"title", "section_header", "heading"}
 WEAK_NAVIGATION_RE = re.compile(r"^(?:第?[一二三四五六七八九十\d]+[章节部分、.]?\s*)?.{1,80}[?？]$")
 FACTUAL_CUE_RE = re.compile(
-    r"(?:是|为|具有|通过|采用|支持|提供|实现|包括|导致|提升|降低|减少|增加|能够|可以|用于|依赖|需[要须]|应当|必须|表明|显示|发现|结果|优势|特点|机制|原因|影响|风险|限制|缺陷|许可|安全|成本|性能)"
+    r"(?:是|为|具有|通过|采用|支持|提供|实现|包括|导致|提升|降低|减少|增加|能够|可以|用于|依赖|需[要须]|应当|必须|表明|显示|发现|证明|说明|源于|结果|优势|特点|机制|原因|影响|风险|限制|缺陷|许可|安全|成本|性能)"
 )
 
 
@@ -139,7 +139,7 @@ def evidence_quality(item):
     # "港口关闭导致物流延误" can still be useful evidence when they carry a
     # factual/causal cue.  Reject bare labels, but do not reject every concise
     # sentence merely because a parser extracted one line from a page.
-    if len(normalized) < 10:
+    if len(normalized) < 6:
         return {"eligible": False, "reason": "正文过短，无法构成可验证陈述", "score": -80}
     if len(normalized) < 24 and not FACTUAL_CUE_RE.search(normalized):
         return {"eligible": False, "reason": "正文过短且缺少事实或解释", "score": -80}

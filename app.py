@@ -459,6 +459,24 @@ def _virtual_node_summary(scan_id, node, context=None):
         item for item in evidence
         if not (item.get("evidence_id") in seen or seen.add(item.get("evidence_id")))
     ]
+    primary = conclusions[0] if conclusions else {}
+    claims = list(primary.get("claims") or [])
+    if not claims and primary.get("answer"):
+        claims = [{
+            "statement": primary.get("answer"),
+            "type": "inference",
+            "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
+            "support_status": "supported" if evidence else "insufficient",
+        }]
+    qa = {
+        "question": primary.get("question") or primary.get("analysis_question") or "该节点主要包含哪些内容，哪些方向值得继续下钻？",
+        "value": primary.get("value") or primary.get("question_value") or "用于判断该主题是否值得继续深入分析。",
+        "answer": primary.get("answer") or node.get("summary") or "暂无足够证据形成回答。",
+        "claims": claims,
+        "evidence": evidence[:12],
+        "coverage": context.get("coverage", {}),
+        "limitations": list(context.get("coverage", {}).get("limitations") or []) + ([] if evidence else ["当前没有有效正文证据支撑该回答。"]),
+    }
     return {
         "schema_version": 4,
         "summary_type": "virtual_node",
@@ -471,6 +489,12 @@ def _virtual_node_summary(scan_id, node, context=None):
         "representative_documents": list(node.get("representative_documents") or [])[:5],
         "conclusion_evidence": conclusions,
         "evidence_chain": evidence[:12],
+        "question": qa["question"],
+        "value": qa["value"],
+        "answer": qa["answer"],
+        "claims": claims,
+        "evidence_status": "supported" if evidence else "insufficient",
+        "question_answer_evidence": qa,
         "statistics": {
             "file_count": context.get("total_files", 0),
             "degraded_document_count": 0,
