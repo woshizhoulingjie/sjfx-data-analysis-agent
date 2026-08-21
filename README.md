@@ -366,6 +366,8 @@ MAX_EXPORT_BYTES=5368709120
 # Docling/RapidOCR 默认只使用 CPU，给本地 Qwen/ Ollama 留出 GPU 显存。
 DOCLING_DEVICE=cpu
 DOCLING_CPU_THREADS=4
+# 仅控制 CPU 文档解析池；默认 2，硬上限 8。Ollama/Qwen 推理仍为 1。
+PARSE_MAX_CONCURRENCY=2
 
 # SQLite WAL 维护（Worker 启动和周期性执行 checkpoint）。
 SJFX_SQLITE_BUSY_TIMEOUT_MS=30000
@@ -381,6 +383,18 @@ LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE=30000
 ```
 
 修改这些数值前先用真实样本压测。提高首轮文件数会同时增加解析时间、内存、侧存空间和模型等待时间。
+
+### CPU 并行解析的边界
+
+系统可以同时解析多个独立文件，但并发只发生在 Docling、文本、表格和 OCR
+解析阶段。每个解析线程拥有独立的进程隔离解析器，并继续执行单文件超时和内存上限；
+SQLite 结果由主 Worker 统一提交。`PARSE_MAX_CONCURRENCY` 默认是 2，最高 8，不能
+简单改成“CPU 核心数减 2”，因为每个 Docling 进程可能加载数 GB 的运行时和模型。
+
+本地 Qwen/Ollama、embedding 和主题命名不参与这个并行池，仍由共享 GPU 的串行调度器
+保护。如果将 `DOCLING_DEVICE` 改为 `cuda` 或 `auto`，系统会自动把解析并发降为 1，
+避免解析器与本地模型争抢 3090 显存。任务状态中的“当前阶段/当前文件”会在前端显示，
+取消任务时会停止继续提交新文件，并终止正在等待的 CPU 解析子进程。
 
 ## 8. 安全配置
 

@@ -2,12 +2,15 @@ import hashlib
 import json
 import math
 import os
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 import re
+import threading
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from config import Config
 from services.scanner import human_size, resolve_under
 from services.evidence import evidence_quality, evidence_support, select_evidence
 from services.large_package import (
@@ -23,7 +26,7 @@ from services.large_package import (
 from services.retrieval import build_retrieval_manifest
 from services.unified_parser import compact_document
 from services.unified_parser import UnifiedDocumentParser
-from services.parse_isolation import ParseIsolationError, runner_for
+from services.parse_isolation import ParseIsolationCancelled, ParseIsolationError, runner_for
 
 
 SMALL_FILE_SUMMARY_BYTES = 16 * 1024
@@ -131,7 +134,7 @@ def _now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _parse_with_limits(parser, path, node_path, mode):
+def _parse_with_limits(parser, path, node_path, mode, cancel_check=None):
     """Apply per-file wall-clock and current-process-memory guards.
 
     ``resource.getrusage(...).ru_maxrss`` is a *lifetime high-water mark*,
@@ -176,6 +179,7 @@ def _parse_with_limits(parser, path, node_path, mode):
                 mode=mode,
                 timeout=timeout,
                 memory_mb=max(256, int(os.getenv("MAX_PARSE_PROCESS_MEMORY_MB", os.getenv("MAX_WORKER_MEMORY_MB", "8192")))),
+                cancel_check=cancel_check,
             )
         except ParseIsolationError:
             raise
@@ -183,7 +187,19 @@ def _parse_with_limits(parser, path, node_path, mode):
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(parser.parse, path, node_path, mode=mode)
     try:
-        return future.result(timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel_check is not None and cancel_check():
+                future.cancel()
+                raise ParseIsolationCancelled("任务已取消，当前解析已停止等待")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                future.cancel()
+                raise TimeoutError("单文件解析超过 {} 秒，已标记为可恢复失败".format(timeout))
+            try:
+                return future.result(timeout=min(0.2, remaining))
+            except FutureTimeoutError:
+                continue
     except FutureTimeoutError as exc:
         future.cancel()
         raise TimeoutError("单文件解析超过 {} 秒，已标记为可恢复失败".format(timeout)) from exc
@@ -192,6 +208,146 @@ def _parse_with_limits(parser, path, node_path, mode):
         # the worker while it unwinds; the next parser call remains serialized
         # by UnifiedDocumentParser's internal lock.
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+_PARSE_THREAD_LOCAL = threading.local()
+
+
+def _init_parallel_parser(template_parser, parser_registry, registry_lock):
+    """Create one parser configuration per orchestration thread.
+
+    The actual Docling/OCR runtime remains in a separately isolated child
+    process (``runner_for``).  A parser instance is therefore never shared by
+    concurrent threads, while each thread can reuse its child process for a
+    batch of files instead of paying model startup cost for every file.
+    """
+    if isinstance(template_parser, UnifiedDocumentParser):
+        parser = UnifiedDocumentParser(
+            template_parser.artifacts_path,
+            template_parser.rapidocr_model_dir,
+            template_parser.max_chars,
+            fast_office_ocr=template_parser.fast_office_ocr,
+        )
+    else:
+        parser = template_parser
+    _PARSE_THREAD_LOCAL.parser = parser
+    with registry_lock:
+        parser_registry.append(parser)
+
+
+def _parallel_parse_files(
+    parser,
+    candidates,
+    scan_root,
+    mode,
+    max_workers=1,
+    cancel_check=None,
+    on_complete=None,
+):
+    """Parse independent files concurrently while preserving hard limits.
+
+    This is intentionally a bounded orchestration pool, not unrestricted
+    model concurrency.  Each pool thread owns one process-isolated parser;
+    the local Ollama client is not involved in this stage and remains serial.
+    Results are committed by the caller in the parent Worker, so SQLite writes
+    and progress updates stay deterministic and transactional.
+    """
+    candidates = list(candidates or [])
+    if not candidates:
+        return []
+    workers = max(1, min(8, int(max_workers or 1), len(candidates)))
+
+    # Custom parser doubles and development extensions may not be safe to
+    # clone.  Keep their established serial behaviour while real Docling
+    # parsers use the bounded pool above.
+    if workers <= 1 or not isinstance(parser, UnifiedDocumentParser):
+        results = []
+        for index, file_node in enumerate(candidates):
+            if cancel_check is not None and cancel_check():
+                raise ParseIsolationCancelled("任务已取消，停止提交新的解析文件")
+            path = resolve_under(scan_root, file_node["path"])
+            try:
+                document = _parse_with_limits(parser, path, file_node["path"], mode, cancel_check=cancel_check)
+                item = (index, file_node, document, None)
+            except ParseIsolationCancelled:
+                raise
+            except Exception as exc:  # file-level failure is recoverable
+                item = (index, file_node, None, exc)
+            results.append(item)
+            if on_complete is not None:
+                on_complete(*item)
+        return results
+
+    parser_registry = []
+    registry_lock = threading.Lock()
+    executor = ThreadPoolExecutor(
+        max_workers=workers,
+        initializer=_init_parallel_parser,
+        initargs=(parser, parser_registry, registry_lock),
+        thread_name_prefix="sjfx-parse",
+    )
+    future_map = {}
+    results = [None] * len(candidates)
+    next_index = 0
+
+    def submit_one(index):
+        file_node = candidates[index]
+
+        def parse_task():
+            child_parser = getattr(_PARSE_THREAD_LOCAL, "parser", parser)
+            path = resolve_under(scan_root, file_node["path"])
+            try:
+                document = _parse_with_limits(
+                    child_parser,
+                    path,
+                    file_node["path"],
+                    mode,
+                    cancel_check=cancel_check,
+                )
+                return index, file_node, document, None
+            except ParseIsolationCancelled:
+                raise
+            except Exception as exc:
+                return index, file_node, None, exc
+
+        future_map[executor.submit(parse_task)] = index
+
+    try:
+        # Keep only a small queue ahead of the active workers.  This makes
+        # cancellation responsive and avoids holding a large batch of paths in
+        # native parser state when a user stops the job.
+        while next_index < len(candidates) and len(future_map) < workers * 2:
+            submit_one(next_index)
+            next_index += 1
+        while future_map:
+            if cancel_check is not None and cancel_check():
+                for future in future_map:
+                    future.cancel()
+                raise ParseIsolationCancelled("任务已取消，停止等待并行解析")
+            done, _pending = wait(tuple(future_map), timeout=0.25, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+            for future in done:
+                future_map.pop(future, None)
+                item = future.result()
+                index, file_node, document, error = item
+                results[index] = item
+                if on_complete is not None:
+                    on_complete(index, file_node, document, error)
+                if next_index < len(candidates):
+                    submit_one(next_index)
+                    next_index += 1
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        # Terminate idle parser children now rather than retaining one process
+        # per pool thread for the lifetime of the Worker.
+        for owned_parser in parser_registry:
+            if isinstance(owned_parser, UnifiedDocumentParser):
+                try:
+                    runner_for(owned_parser).close()
+                except Exception:
+                    pass
+    return [item for item in results if item is not None]
 
 
 def _walk_files(node):
@@ -2105,7 +2261,7 @@ def _semantic_adaptive_tree(
 
 
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
-                    large_options=None, target_paths=None):
+                    large_options=None, target_paths=None, cancel_check=None):
     progress = progress or (lambda percent, message: None)
     files = list(_walk_files(scan["tree"]))
     parse_mode = "fast" if scan.get("parse_mode") == "fast" else "accurate"
@@ -2139,6 +2295,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     actual_parse_mode = "fast" if policy.get("enabled") else parse_mode
     progress(2, "开始{}：{} 个文件".format(phase_label, len(candidates)))
+    parse_candidates = []
+    reusable_count = 0
     for index, file_node in enumerate(candidates, 1):
         node_path = file_node["path"]
         fingerprint = file_fingerprint(file_node)
@@ -2150,11 +2308,23 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             and existing_state.get("fingerprint") == fingerprint
             and existing
         ):
+            reusable_count += 1
             progress(2 + int(68 * index / max(1, len(candidates))), "复用检查点：{}/{} {}".format(index, len(candidates), node_path))
             continue
-        path = resolve_under(scan["root"], file_node["path"])
+
+        parse_candidates.append((file_node, fingerprint))
+
+    total_candidates = max(1, len(candidates))
+    completed_candidates = reusable_count
+
+    def commit_parse_result(_index, file_node, document, error):
+        nonlocal completed_candidates, failures
+        node_path = file_node["path"]
+        fingerprint = file_fingerprint(file_node)
+        completed_candidates += 1
         try:
-            document = _parse_with_limits(parser, path, node_path, mode=actual_parse_mode)
+            if error is not None:
+                raise error
             if policy.get("enabled"):
                 document = compact_overview_document(document, policy["overview_chars_per_file"])
             documents[node_path] = document
@@ -2168,8 +2338,29 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             failures.append({"path": node_path, "error": str(exc)})
             storage.set_file_state(scan_id, node_path, fingerprint, "failed", error=str(exc))
         progress(
-            2 + int(68 * index / max(1, len(candidates))),
-            "{}：{}/{} {}".format(phase_label, index, len(candidates), node_path),
+            2 + int(68 * completed_candidates / total_candidates),
+            "{}：{}/{} {}".format(phase_label, completed_candidates, len(candidates), node_path),
+        )
+
+    if parse_candidates:
+        # A separate CPU parser pool is safe because every pool thread owns a
+        # process-isolated Docling/OCR runner.  Ollama/model generation is not
+        # called here and remains bounded by its own single-request semaphore.
+        parse_workers = max(1, min(8, int(getattr(Config, "PARSE_MAX_CONCURRENCY", 1))))
+        # This pool is explicitly CPU-only.  If an operator opts Docling into
+        # CUDA/auto mode, do not create concurrent parser processes that could
+        # compete with the shared local Qwen model for the 3090 VRAM.
+        if str(getattr(parser, "docling_device", "cpu")).lower() != "cpu":
+            parse_workers = 1
+
+        _parallel_parse_files(
+            parser,
+            [item[0] for item in parse_candidates],
+            scan["root"],
+            actual_parse_mode,
+            max_workers=parse_workers,
+            cancel_check=cancel_check,
+            on_complete=commit_parse_result,
         )
 
     failed_paths = {item.get("path") for item in failures}

@@ -29,6 +29,10 @@ class ParseIsolationMemoryError(ParseIsolationError, MemoryError):
     """The isolated parser exceeded its configured RSS budget."""
 
 
+class ParseIsolationCancelled(ParseIsolationError):
+    """The owning analysis job requested cancellation while parsing."""
+
+
 def _rss_bytes(pid):
     """Return a child RSS estimate without requiring psutil."""
     try:
@@ -173,6 +177,7 @@ class IsolatedParserRunner:
         archive_depth=0,
         timeout=300,
         memory_mb=8192,
+        cancel_check=None,
     ):
         with self._lock:
             timeout = max(1.0, float(timeout))
@@ -185,6 +190,17 @@ class IsolatedParserRunner:
                 )
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
+                    if cancel_check is not None:
+                        try:
+                            cancelled = bool(cancel_check())
+                        except Exception:
+                            # A transient status read must not turn a healthy
+                            # parse into a false cancellation.  The outer job
+                            # progress checkpoint remains authoritative.
+                            cancelled = False
+                        if cancelled:
+                            self._terminate()
+                            raise ParseIsolationCancelled("任务已取消，当前解析子进程已终止")
                     if self._recv.poll(0.2):
                         message = self._recv.recv()
                         if message[0] == "ok":

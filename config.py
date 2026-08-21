@@ -1,4 +1,5 @@
 import os
+import multiprocessing
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -112,6 +113,17 @@ class Config:
         256,
         int(os.getenv("MAX_PARSE_PROCESS_MEMORY_MB", str(MAX_WORKER_MEMORY_MB))),
     )
+    # Parsing is CPU-bound and each isolated parser process may load Docling
+    # and OCR runtimes.  Keep the default deliberately conservative for a
+    # shared 32 GB host; operators can raise this after measuring RSS/IO.  A
+    # hard cap prevents an accidental CPU-count setting from starting dozens
+    # of multi-gigabyte parser processes.
+    _cpu_count = max(1, int(os.cpu_count() or multiprocessing.cpu_count() or 1))
+    PARSE_MAX_CONCURRENCY = max(
+        1,
+        min(8, int(os.getenv("PARSE_MAX_CONCURRENCY", "2"))),
+    )
+    PARSE_MAX_CONCURRENCY = min(PARSE_MAX_CONCURRENCY, max(1, _cpu_count - 2))
     ENABLE_PARSE_PROCESS_ISOLATION = os.getenv("ENABLE_PARSE_PROCESS_ISOLATION", "1").strip().lower() in {
         "1", "true", "yes", "on",
     }

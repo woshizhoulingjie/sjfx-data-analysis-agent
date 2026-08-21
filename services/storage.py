@@ -134,6 +134,8 @@ class Storage:
                     started_at REAL,
                     finished_at REAL,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    current_stage TEXT,
+                    current_file TEXT,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS file_analysis_states (
@@ -178,6 +180,8 @@ class Storage:
                 "started_at": "REAL",
                 "finished_at": "REAL",
                 "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+                "current_stage": "TEXT",
+                "current_file": "TEXT",
             }
             for name, definition in migrations.items():
                 if name not in columns:
@@ -652,10 +656,13 @@ class Storage:
             ).fetchone()["value"]
         return int(ahead) + 1
 
-    def update_job(self, job_id, status=None, progress=None, message=None, result=None, error=None, stage=None, heartbeat=False):
+    def update_job(self, job_id, status=None, progress=None, message=None, result=None, error=None, stage=None,
+                   heartbeat=False, current_stage=None, current_file=None):
         fields = ["updated_at=CURRENT_TIMESTAMP"]
         values = []
-        for name, value in (("status", status), ("stage", stage), ("progress", progress), ("message", message), ("result", result), ("error", error)):
+        if current_stage is None and stage is not None:
+            current_stage = stage
+        for name, value in (("status", status), ("stage", stage), ("progress", progress), ("message", message), ("result", result), ("error", error), ("current_stage", current_stage), ("current_file", current_file)):
             if value is not None:
                 fields.append(name + "=?")
                 values.append(json.dumps(value, ensure_ascii=False) if name == "result" else value)
@@ -671,6 +678,15 @@ class Storage:
             if status not in {"cancelled", "cancelling"}:
                 condition += " AND status NOT IN ('cancelled','cancelling')"
             conn.execute("UPDATE analysis_jobs SET {} WHERE {}".format(",".join(fields), condition), values)
+
+    def is_job_cancel_requested(self, job_id):
+        """Cheap cooperative cancellation probe for parser/model loops."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status, cancel_requested FROM analysis_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+        return bool(row and (row["cancel_requested"] or row["status"] in {"cancelled", "cancelling"}))
 
     def cancel_job(self, job_id):
         with self.lock, self._connect() as conn:

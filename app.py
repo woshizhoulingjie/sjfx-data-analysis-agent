@@ -900,11 +900,17 @@ def _run_claimed_analysis_job(job):
     storage.update_job(
         job_id, progress=max(1, int(job.get("progress") or 0)), stage="analyzing", heartbeat=True,
         message=("开始补充分析：{}".format(scope_label) if scope_label else "开始本地完整分析"),
+        current_stage="分析准备",
+        current_file=scope_label or "",
     )
 
     def progress(percent, message):
         _ensure_job_active(job_id)
-        storage.update_job(job_id, progress=percent, stage="analyzing", message=message, heartbeat=True)
+        storage.update_job(
+            job_id, progress=percent, stage="analyzing", message=message, heartbeat=True,
+            current_stage="解析与分析",
+            current_file=str(message or "")[-500:],
+        )
 
     analysis = analyze_package(
         scan_id, scan_result, storage, parser, progress,
@@ -912,6 +918,7 @@ def _run_claimed_analysis_job(job):
         llm=(llm if llm_generation_enabled else None),
         large_options=_package_large_options(),
         target_paths=options.get("target_paths"),
+        cancel_check=lambda: storage.is_job_cancel_requested(job_id),
     )
     _ensure_job_active(job_id)
     storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
@@ -938,9 +945,13 @@ def _run_claimed_scan_and_analyze_job(job):
         storage.update_job(
             job_id, progress=min(14, 2 + int(file_count / 1000)), stage="scanning",
             message="正在盘点目录：已发现 {} 个文件".format(file_count), heartbeat=True,
+            current_stage="目录扫描", current_file=root_path,
         )
 
-    storage.update_job(job_id, progress=1, stage="scanning", message="正在验证并扫描目录", heartbeat=True)
+    storage.update_job(
+        job_id, progress=1, stage="scanning", message="正在验证并扫描目录", heartbeat=True,
+        current_stage="目录扫描", current_file=root_path,
+    )
     scan_result = scan_directory(
         root_path, options.get("max_files", Config.MAX_SCAN_FILES),
         max_depth=options.get("max_depth", Config.MAX_SCAN_DEPTH),
@@ -1004,6 +1015,11 @@ def status():
             "max_worker_memory_mb": Config.MAX_WORKER_MEMORY_MB,
             "max_parse_process_memory_mb": Config.MAX_PARSE_PROCESS_MEMORY_MB,
             "parse_process_isolation": Config.ENABLE_PARSE_PROCESS_ISOLATION,
+            "parse_max_concurrency": Config.PARSE_MAX_CONCURRENCY,
+            "parse_parallel_scope": "CPU 解析进程；Ollama/Qwen 推理保持串行",
+            "parse_parallel_enabled": bool(
+                Config.ENABLE_PARSE_PROCESS_ISOLATION and str(Config.DOCLING_DEVICE).lower() == "cpu"
+            ),
             "max_archive_entries": Config.MAX_ARCHIVE_ENTRIES,
             "max_archive_member_bytes": Config.MAX_ARCHIVE_MEMBER_BYTES,
             "max_archive_uncompressed_bytes": Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,

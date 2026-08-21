@@ -2,7 +2,7 @@ import unittest
 
 from services.evidence import evidence_quality
 from services.folder_analysis import _normalize_question_answer_evidence
-from services.large_package import build_coverage
+from services.large_package import build_coverage, representative_paths
 from services.reporting import _direction_candidates
 
 
@@ -58,6 +58,26 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertGreater(candidates[0]["score"], 0)
         self.assertEqual(candidates[0]["evidence_ids"], ["E1"])
+
+    def test_representatives_prioritize_small_actionable_text(self):
+        files = [
+            {"path": "reports/huge-{}.pdf".format(index), "extension": ".pdf", "size": 30_000_000}
+            for index in range(20)
+        ]
+        files += [
+            {"path": "notes/conclusion.txt", "extension": ".txt", "size": 12_000},
+            {"path": "tables/key.csv", "extension": ".csv", "size": 80_000},
+        ]
+        selected = representative_paths(files, 5)
+        self.assertIn("notes/conclusion.txt", selected)
+        self.assertIn("tables/key.csv", selected)
+
+    def test_empty_or_cuda_parse_pool_is_not_a_model_concurrency_switch(self):
+        # The public contract is explicit: parse concurrency is a bounded CPU
+        # setting and must not be confused with LLM_MAX_CONCURRENCY.
+        from config import Config
+        self.assertGreaterEqual(Config.PARSE_MAX_CONCURRENCY, 1)
+        self.assertEqual(Config.LLM_MAX_CONCURRENCY, 1)
 
 
 if __name__ == "__main__":

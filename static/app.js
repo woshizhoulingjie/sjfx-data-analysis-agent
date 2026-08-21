@@ -1446,8 +1446,13 @@ async function pollJob(jobId) {
     $('progressBar').style.width =
       `${job.progress || 0}%`;
 
+    const currentStage = job.current_stage || job.stage || '';
+    const currentFile = job.current_file || '';
+    const activity = currentFile && currentFile !== currentStage
+      ? `${currentStage} · ${currentFile}`
+      : (currentStage || job.message || job.status);
     $('progressText').textContent =
-      `${job.progress || 0}% · ${job.message || job.status}`;
+      `${job.progress || 0}% · ${activity}`;
 
     // A scan-and-analyze job publishes its inventory before parsing begins.
     // Load and show the physical tree immediately instead of making the user

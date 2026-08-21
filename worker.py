@@ -214,8 +214,11 @@ def run_forever():
                     message="任务已完成", result=result, heartbeat=True,
                 )
             except Exception as exc:
-                if exc.__class__.__name__ == "JobCancelled":
-                    storage.update_job(job_id, status="cancelled", stage="cancelled", message="任务已取消", heartbeat=True)
+                if exc.__class__.__name__ in {"JobCancelled", "ParseIsolationCancelled"}:
+                    storage.update_job(
+                        job_id, status="cancelled", stage="cancelled", message="任务已取消",
+                        current_stage="已取消", current_file="", heartbeat=True,
+                    )
                     continue
                 logger.exception("Worker task failed id=%s type=%s", job_id, job.get("task_type"))
                 storage.update_job(

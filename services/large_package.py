@@ -42,10 +42,33 @@ def build_policy(scan, options=None):
 
 
 def representative_paths(files, limit):
-    """Choose deterministic, type-aware representatives across the package."""
+    """Choose deterministic representatives with information-density priority.
+
+    Small CSV/TXT/JSON files often contain the most actionable conclusions but
+    are easy to hide beside large media or generated archives.  They receive a
+    bounded priority quota; format coverage and deterministic spread still
+    guarantee that other extensions remain visible in the first pass.
+    """
     files = sorted(files, key=lambda item: item.get("path", ""))
     if len(files) <= limit:
         return [item.get("path") for item in files]
+    limit = max(1, int(limit))
+    text_extensions = {".csv", ".tsv", ".txt", ".json", ".jsonl", ".md", ".markdown"}
+    small_text_limit = 5 * 1024 * 1024
+
+    def is_priority(item):
+        extension = str(item.get("extension") or Path(item.get("path", "")).suffix).lower()
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        return extension in text_extensions and size < small_text_limit
+
+    priority_files = [item for item in files if is_priority(item)]
+    # Reserve at most 35% for dense small text so a directory containing many
+    # tiny logs cannot crowd out PDFs, spreadsheets and presentations.
+    priority_quota = min(len(priority_files), max(1, int(limit * 0.35)))
+    priority_files = sorted(priority_files, key=lambda item: (int(item.get("size") or 0), item.get("path", "")))
     by_extension = {}
     for item in files:
         by_extension.setdefault(item.get("extension") or "[无扩展名]", []).append(item)
@@ -57,6 +80,11 @@ def representative_paths(files, limit):
         if path and path not in selected_paths and len(selected) < limit:
             selected_paths.add(path)
             selected.append(path)
+
+    for item in priority_files[:priority_quota]:
+        add(item)
+        if len(selected) >= limit:
+            return sorted(selected)[:limit]
 
     # First guarantee that every observed format and its rough start/end are
     # visible.  This prevents a large CSV/PDF minority from disappearing.
@@ -72,8 +100,21 @@ def representative_paths(files, limit):
     if slots == 1:
         add(remaining[len(remaining) // 2])
     elif slots > 1:
-        for index in range(slots):
-            add(remaining[round(index * (len(remaining) - 1) / float(slots - 1))])
+        # Fill remaining slots by a stable blend of high-information files and
+        # evenly distributed representatives from the original inventory.
+        ranked = sorted(
+            remaining,
+            key=lambda item: (0 if is_priority(item) else 1, item.get("path", "")),
+        )
+        for item in ranked[:slots]:
+            add(item)
+        if len(selected) < limit:
+            for index in range(slots):
+                if not remaining:
+                    break
+                add(remaining[round(index * (len(remaining) - 1) / float(max(1, slots - 1)))])
+                if len(selected) >= limit:
+                    break
     return sorted(selected)
 
 
