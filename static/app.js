@@ -3,12 +3,14 @@ const state = {
   selected: null,
   summary: null,
   analysis: null,
+  analysisTreeOriginal: null,
   summaries: new Map(),
   activeTree: 'physical',
   jobId: null,
   modelGenerationEnabled: null,
   lastRetrievalId: null,
   selectedNodes: new Map(),
+  treeEdits: [],
   jobs: new Map(),
   jobsEndpointAvailable: null,
   taskCenterRefreshInFlight: false
@@ -222,6 +224,221 @@ function updateSelectionCart() {
 }
 
 
+let treeDragSource = null;
+let treeDropTarget = null;
+
+function closeTreeContextMenu() {
+  const menu = document.querySelector('.tree-context-menu');
+  if (menu) menu.remove();
+}
+
+function treeHistoryInfo() {
+  const active = [];
+  const undone = [];
+  (state.treeEdits || []).forEach((edit) => {
+    const operation = String(edit.operation || '').toLowerCase();
+    const id = String(edit.edit_id || '');
+    if (operation === 'undo' || operation === 'redo') {
+      const target = String(edit.payload?.edit_id || '');
+      if (operation === 'undo') {
+        const index = active.findIndex((item) => String(item.edit_id || '') === target);
+        if (index >= 0) undone.push(active.splice(index, 1)[0]);
+      } else {
+        const index = undone.findIndex((item) => String(item.edit_id || '') === target);
+        if (index >= 0) active.push(undone.splice(index, 1)[0]);
+      }
+      return;
+    }
+    if (id) active.push(edit);
+  });
+  return { undoTarget: active[active.length - 1] || null, redoTarget: undone[undone.length - 1] || null };
+}
+
+function ensureTreeHistoryControls() {
+  const tools = document.querySelector('.tree-tools');
+  if (!tools) return;
+  if (!$('treeUndoBtn')) {
+    const undo = document.createElement('button');
+    undo.id = 'treeUndoBtn'; undo.className = 'icon-button'; undo.type = 'button'; undo.textContent = '↶';
+    undo.title = '撤销上一次目录操作'; undo.setAttribute('aria-label', '撤销');
+    undo.onclick = async () => {
+      const target = treeHistoryInfo().undoTarget;
+      if (!target) return;
+      try { await submitTreeEdit('undo', { edit_id: target.edit_id }); } catch (error) { toast(error.message || '撤销失败', true); }
+    };
+    tools.appendChild(undo);
+  }
+  if (!$('treeRedoBtn')) {
+    const redo = document.createElement('button');
+    redo.id = 'treeRedoBtn'; redo.className = 'icon-button'; redo.type = 'button'; redo.textContent = '↷';
+    redo.title = '恢复已撤销的目录操作'; redo.setAttribute('aria-label', '恢复');
+    redo.onclick = async () => {
+      const target = treeHistoryInfo().redoTarget;
+      if (!target) return;
+      try { await submitTreeEdit('redo', { edit_id: target.edit_id }); } catch (error) { toast(error.message || '恢复失败', true); }
+    };
+    tools.appendChild(redo);
+  }
+}
+
+function updateTreeHistoryControls() {
+  ensureTreeHistoryControls();
+  const history = treeHistoryInfo();
+  const enabled = state.activeTree === 'analysis' && Boolean(state.analysis?.analysis_tree);
+  if ($('treeUndoBtn')) $('treeUndoBtn').disabled = !enabled || !history.undoTarget;
+  if ($('treeRedoBtn')) $('treeRedoBtn').disabled = !enabled || !history.redoTarget;
+}
+
+function closeSplitDialog() {
+  const dialog = document.querySelector('.split-dialog-backdrop');
+  if (dialog) dialog.remove();
+}
+
+function openSplitDialog(node) {
+  closeTreeContextMenu();
+  const files = (node.children || []).filter((item) => item.kind === 'file' && item.path).map((item) => ({ path: item.path, name: item.name || item.path }));
+  if (files.length < 2) { toast('当前主题至少需要两个已解析文件才能拆分', true); return; }
+  const draft = { source: files.slice(), groups: [{ name: (node.name || '主题') + ' A', paths: [] }, { name: (node.name || '主题') + ' B', paths: [] }] };
+  const backdrop = document.createElement('div');
+  backdrop.className = 'split-dialog-backdrop';
+  backdrop.innerHTML = '<section class="split-dialog" role="dialog" aria-modal="true" aria-label="可视化拆分主题"><header><div><span class="section-kicker">SPLIT TOPIC</span><h2>拖动文件拆分主题</h2><p>把左侧文件拖入不同子主题；每个子主题至少放一个文件。</p></div><button type="button" class="icon-button split-close" aria-label="关闭">×</button></header><div class="split-board"><div class="split-pool"><strong>待分配文件</strong><div class="split-drop-zone" data-zone="source"></div></div><div class="split-groups"></div></div><footer><button type="button" class="secondary split-add-group">＋ 添加子主题</button><span class="split-dialog-spacer"></span><button type="button" class="ghost split-cancel">取消</button><button type="button" class="primary split-save">保存拆分</button></footer></section>';
+  document.body.appendChild(backdrop);
+  const splitFileCard = (file) => {
+    const card = document.createElement('div');
+    card.className = 'split-file-card'; card.draggable = true; card.textContent = file.name; card.title = file.path; card.dataset.path = file.path;
+    card.ondragstart = (event) => event.dataTransfer.setData('text/plain', file.path);
+    return card;
+  };
+  const render = () => {
+    const source = backdrop.querySelector('[data-zone="source"]'); source.innerHTML = '';
+    draft.source.forEach((file) => source.appendChild(splitFileCard(file)));
+    const groups = backdrop.querySelector('.split-groups'); groups.innerHTML = '';
+    draft.groups.forEach((group, index) => {
+      const column = document.createElement('div'); column.className = 'split-group-column';
+      column.innerHTML = '<div class="split-group-title"><input aria-label="子主题名称"><button type="button" class="icon-button split-remove-group" title="删除子主题">×</button></div><div class="split-drop-zone" data-zone="group" data-index="' + index + '"></div>';
+      const input = column.querySelector('input'); input.value = group.name; input.oninput = (event) => { group.name = event.target.value; };
+      column.querySelector('.split-remove-group').onclick = () => {
+        if (draft.groups.length <= 2) { toast('至少保留两个子主题', true); return; }
+        group.paths.forEach((path) => { const file = files.find((item) => item.path === path); if (file) draft.source.push(file); });
+        draft.groups.splice(index, 1); render();
+      };
+      const zone = column.querySelector('[data-zone="group"]');
+      group.paths.forEach((path) => zone.appendChild(splitFileCard(files.find((file) => file.path === path) || { path, name: path })));
+      groups.appendChild(column);
+    });
+    backdrop.querySelectorAll('.split-drop-zone').forEach((zone) => {
+      zone.ondragover = (event) => { event.preventDefault(); zone.classList.add('is-over'); };
+      zone.ondragleave = () => zone.classList.remove('is-over');
+      zone.ondrop = (event) => {
+        event.preventDefault(); zone.classList.remove('is-over');
+        const path = event.dataTransfer.getData('text/plain'); if (!path) return;
+        draft.source = draft.source.filter((file) => file.path !== path);
+        draft.groups.forEach((item) => { item.paths = item.paths.filter((value) => value !== path); });
+        if (zone.dataset.zone === 'source') draft.source.push(files.find((file) => file.path === path));
+        else draft.groups[Number(zone.dataset.index)].paths.push(path);
+        render();
+      };
+    });
+  };
+  backdrop.querySelector('.split-close').onclick = closeSplitDialog;
+  backdrop.querySelector('.split-cancel').onclick = closeSplitDialog;
+  backdrop.querySelector('.split-add-group').onclick = () => { draft.groups.push({ name: '子主题 ' + (draft.groups.length + 1), paths: [] }); render(); };
+  backdrop.querySelector('.split-save').onclick = async () => {
+    const groups = draft.groups.map((group) => ({ name: group.name.trim(), paths: [...new Set(group.paths)] })).filter((group) => group.name && group.paths.length);
+    if (groups.length < 2) { toast('至少需要两个有文件的子主题', true); return; }
+    try { await submitTreeEdit('split', { node_id: node.node_id, groups }); closeSplitDialog(); } catch (error) { toast(error.message || '拆分主题失败', true); }
+  };
+  render();
+}
+
+function showTreeContextMenu(event, node) {
+  closeTreeContextMenu();
+  if (state.activeTree !== 'analysis' || !node) return;
+  const sourceRow = event.currentTarget;
+  const actions = [];
+  if (node.kind === 'group' && node.node_id) {
+    actions.push({ label: '重命名主题', run: async () => {
+      const name = window.prompt('新的主题名称：', node.name || '');
+      if (!name || !name.trim()) return;
+      await submitTreeEdit('rename', { node_id: node.node_id, name: name.trim() });
+    }});
+    actions.push({ label: '确认分类', run: async () => {
+      await submitTreeEdit('confirm', { node_id: node.node_id, confirmed: true });
+    }});
+    actions.push({ label: '拆分主题…', run: async () => {
+      openSplitDialog(node);
+    }});
+  } else if (node.kind === 'file') {
+    actions.push({ label: '选中文件', run: async () => selectNode(node, sourceRow) });
+    actions.push({ label: '拖到主题即可挂载', run: async () => toast('请将文件拖到右侧主题节点上') });
+  }
+  if (!actions.length) return;
+  const menu = document.createElement('div');
+  menu.className = 'tree-context-menu';
+  menu.addEventListener('click', (e) => e.stopPropagation());
+  actions.forEach((action) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = action.label;
+    button.onclick = async () => {
+      closeTreeContextMenu();
+      try { await action.run(); } catch (error) { toast(error.message || '目录操作失败', true); }
+    };
+    menu.appendChild(button);
+  });
+  document.body.appendChild(menu);
+  const left = Math.min(event.clientX, window.innerWidth - menu.offsetWidth - 12);
+  const top = Math.min(event.clientY, window.innerHeight - menu.offsetHeight - 12);
+  menu.style.left = Math.max(8, left) + 'px';
+  menu.style.top = Math.max(8, top) + 'px';
+}
+
+function setupTreeDrag(row, node) {
+  const canDrag = state.activeTree === 'analysis' && (node.kind === 'file' || node.kind === 'group') && Boolean(node.path || node.node_id);
+  if (!canDrag) return;
+  row.draggable = true;
+  row.addEventListener('dragstart', (event) => {
+    treeDragSource = node;
+    row.classList.add('dragging');
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('application/x-sjfx-tree-node', JSON.stringify({ node_id: node.node_id || null, path: node.path || null, kind: node.kind }));
+  });
+  row.addEventListener('dragend', () => {
+    row.classList.remove('dragging');
+    if (treeDropTarget) treeDropTarget.classList.remove('tree-drop-target');
+    treeDragSource = null;
+    treeDropTarget = null;
+  });
+  row.addEventListener('dragover', (event) => {
+    if (!treeDragSource || node.kind !== 'group' || treeDragSource === node) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    if (treeDropTarget && treeDropTarget !== row) treeDropTarget.classList.remove('tree-drop-target');
+    treeDropTarget = row;
+    row.classList.add('tree-drop-target');
+  });
+  row.addEventListener('dragleave', () => {
+    row.classList.remove('tree-drop-target');
+    if (treeDropTarget === row) treeDropTarget = null;
+  });
+  row.addEventListener('drop', async (event) => {
+    event.preventDefault();
+    row.classList.remove('tree-drop-target');
+    if (!treeDragSource || node.kind !== 'group' || treeDragSource === node) return;
+    const source = treeDragSource;
+    treeDragSource = null;
+    treeDropTarget = null;
+    try {
+      if (source.kind === 'file') {
+        await submitTreeEdit('mount', { node_id: node.node_id, path: source.path });
+      } else if (source.kind === 'group' && source.node_id && node.node_id) {
+        const name = window.prompt('合并后的主题名称：', node.name || source.name || '合并主题');
+        if (name && name.trim()) await submitTreeEdit('merge', { node_ids: [source.node_id, node.node_id], name: name.trim() });
+      }
+    } catch (error) { toast(error.message || '拖拽目录操作失败', true); }
+  });
+}
+
 function renderTreeNode(node) {
   const li =
     document.createElement('li');
@@ -239,6 +456,8 @@ function renderTreeNode(node) {
     row.dataset.nodeId =
       node.node_id;
   }
+
+  setupTreeDrag(row, node);
 
   const twisty =
     document.createElement('span');
@@ -294,7 +513,15 @@ function renderTreeNode(node) {
     const duplicateNote = node.duplicate_role === 'duplicate_alias'
       ? ` · 重复副本 → ${node.duplicate_of || node.canonical_path}`
       : (node.duplicate_aliases?.length ? ` · ${node.duplicate_aliases.length} 个副本` : '');
-    meta.textContent = `${node.size_human || ''}${duplicateNote}`;
+    const status = node.classification_status === 'unclassified' ? ' · 未分类'
+      : node.classification_status === 'failed' ? ' · 解析失败'
+      : node.classification_status === 'pending' ? ' · 待分析'
+      : node.manual_confirmed ? ' · 人工已确认' : '';
+    const confidence = node.classification_confidence != null
+      ? ` · 置信度 ${Math.round(Number(node.classification_confidence) * 100)}%` : '';
+    const memberships = node.topic_memberships?.length > 1
+      ? ` · ${node.topic_memberships.length} 个主题` : '';
+    meta.textContent = `${node.size_human || ''}${duplicateNote}${status}${confidence}${memberships}`;
   } else if (node.kind === 'evidence') {
     meta.textContent =
       node.evidence?.page
@@ -358,6 +585,19 @@ function renderTreeNode(node) {
       row
     );
 
+  row.ondblclick = (event) => {
+    event.stopPropagation();
+    if (state.activeTree !== 'analysis' || node.kind !== 'group' || !node.node_id) return;
+    const name = window.prompt('新的主题名称：', node.name || '');
+    if (!name || !name.trim()) return;
+    submitTreeEdit('rename', { node_id: node.node_id, name: name.trim() }).catch((error) => toast(error.message || '重命名失败', true));
+  };
+  row.oncontextmenu = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    showTreeContextMenu(event, node);
+  };
+
   return li;
 }
 
@@ -380,6 +620,56 @@ function renderTree(tree) {
   );
 
   host.appendChild(ul);
+}
+
+function updateTreeEditPanel() {
+  ensureTreeHistoryControls();
+  updateTreeHistoryControls();
+  const panel = $('treeEditPanel');
+  if (!panel) return;
+  const enabled = state.activeTree === 'analysis' && Boolean(state.analysis?.analysis_tree);
+  panel.hidden = !enabled;
+  if ($('treeFilter')) {
+    $('treeFilter').disabled = !enabled;
+  }
+  const group = state.selected?.kind === 'group';
+  const selectedGroups = [...state.selectedNodes.values()].filter((item) => item.kind === 'group' && item.node_id);
+  ['treeRenameBtn', 'treeConfirmBtn', 'treeSplitBtn'].forEach((id) => {
+    if ($(id)) $(id).disabled = !enabled || !group;
+  });
+  if ($('treeMountBtn')) $('treeMountBtn').disabled = !enabled || (!group && !(state.selected?.kind === 'file' && selectedGroups.length === 1));
+  if ($('treeMergeBtn')) {
+    const groups = [...state.selectedNodes.values()].filter((item) => item.kind === 'group');
+    $('treeMergeBtn').disabled = !enabled || groups.length < 2;
+  }
+}
+
+async function submitTreeEdit(operation, payload) {
+  if (!state.scan) return;
+  const data = await api(`/api/tree-edits/${state.scan.scan_id}`, {
+    method: 'POST', body: JSON.stringify({ operation, payload })
+  });
+  state.analysis = data.analysis;
+  state.treeEdits = data.edits || state.analysis.manual_tree_edits || state.treeEdits;
+  state.analysisTreeOriginal = state.analysis.analysis_tree;
+  renderTree(state.analysis.analysis_tree);
+  updateTreeEditPanel();
+  updateTreeHistoryControls();
+  toast('目录树人工修改已保存');
+}
+
+async function applyTreeFilter() {
+  if (!state.scan || state.activeTree !== 'analysis') return;
+  const value = $('treeFilter')?.value || 'all';
+  try {
+    const data = await api(`/api/analysis/${state.scan.scan_id}?filter=${encodeURIComponent(value)}`);
+    state.analysis = data.analysis;
+    state.treeEdits = data.edits || state.analysis.manual_tree_edits || state.treeEdits;
+    renderTree(state.analysis.analysis_tree || {});
+    updateTreeEditPanel();
+  } catch (error) {
+    toast(error.message || '目录筛选失败', true);
+  }
 }
 
 // Show a physical-tree placeholder immediately after a scan is submitted.
@@ -689,6 +979,7 @@ async function selectNode(
     $('summary').textContent =
       '该节点尚无本地摘要。';
   }
+  updateTreeEditPanel();
 }
 
 
@@ -1399,6 +1690,8 @@ async function refreshScan(scanId = state.scan?.scan_id) {
 
   state.analysis =
     data.analysis;
+  state.treeEdits = data.analysis?.manual_tree_edits || [];
+  state.analysisTreeOriginal = data.analysis?.analysis_tree || null;
 
   if (
     state.scan.parse_mode
@@ -1451,6 +1744,7 @@ async function refreshScan(scanId = state.scan?.scan_id) {
   }
 
   updateSelectionCart();
+  updateTreeEditPanel();
 }
 
 
@@ -2226,6 +2520,8 @@ $('physicalTreeBtn').onclick =
     renderTree(
       state.scan.tree
     );
+    if ($('treeFilter')) $('treeFilter').disabled = true;
+    updateTreeEditPanel();
   };
 
 
@@ -2257,7 +2553,54 @@ $('analysisTreeBtn').onclick =
       state.analysis
         .analysis_tree
     );
+    if ($('treeFilter')) {
+      $('treeFilter').disabled = false;
+      $('treeFilter').value = 'all';
+    }
+    updateTreeEditPanel();
   };
+
+if ($('treeFilter')) $('treeFilter').onchange = applyTreeFilter;
+document.addEventListener('click', closeTreeContextMenu);
+window.addEventListener('resize', closeTreeContextMenu);
+if ($('treeRenameBtn')) $('treeRenameBtn').onclick = async () => {
+  const node = state.selected;
+  if (!node?.node_id) return;
+  const name = window.prompt('输入新的主题名称：', node.name || '');
+  if (!name || !name.trim()) return;
+  try { await submitTreeEdit('rename', { node_id: node.node_id, name: name.trim() }); }
+  catch (error) { toast(error.message || '重命名失败', true); }
+};
+if ($('treeConfirmBtn')) $('treeConfirmBtn').onclick = async () => {
+  const node = state.selected;
+  if (!node?.node_id) return;
+  try { await submitTreeEdit('confirm', { node_id: node.node_id, confirmed: true }); }
+  catch (error) { toast(error.message || '确认分类失败', true); }
+};
+if ($('treeMountBtn')) $('treeMountBtn').onclick = async () => {
+  const node = state.selected;
+  const selectedGroups = [...state.selectedNodes.values()].filter((item) => item.kind === 'group' && item.node_id);
+  const target = node?.kind === 'group' ? node : selectedGroups[0];
+  if (!target?.node_id) return;
+  const defaultPath = node?.kind === 'file' ? node.path : '';
+  const path = window.prompt('输入要挂载到此主题的已解析文件相对路径：', defaultPath);
+  if (!path || !path.trim()) return;
+  try { await submitTreeEdit('mount', { node_id: target.node_id, path: path.trim() }); }
+  catch (error) { toast(error.message || '挂载主题失败', true); }
+};
+if ($('treeMergeBtn')) $('treeMergeBtn').onclick = async () => {
+  const groups = [...state.selectedNodes.values()].filter((item) => item.kind === 'group' && item.node_id);
+  if (groups.length < 2) return;
+  const name = window.prompt('输入合并后的主题名称：', '合并主题');
+  if (!name || !name.trim()) return;
+  try { await submitTreeEdit('merge', { node_ids: groups.map((item) => item.node_id), name: name.trim() }); }
+  catch (error) { toast(error.message || '合并主题失败', true); }
+};
+if ($('treeSplitBtn')) $('treeSplitBtn').onclick = async () => {
+  const node = state.selected;
+  if (!node?.node_id) return;
+  openSplitDialog(node);
+};
 
 
 $('testBtn').onclick =

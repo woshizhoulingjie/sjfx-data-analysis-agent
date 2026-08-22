@@ -1,6 +1,6 @@
 import unittest
 
-from services.evidence import evidence_quality, select_evidence
+from services.evidence import evidence_quality, select_evidence, verify_claim_evidence
 from services.package_analysis import _first_evidence
 
 
@@ -53,6 +53,26 @@ class EvidenceQualityRegressionTests(unittest.TestCase):
         selected = _first_evidence(document)
         self.assertEqual(selected["evidence_id"], "E-body")
         self.assertTrue(selected["evidence_quality"]["eligible"])
+
+    def test_numeric_claim_requires_the_same_number_in_evidence(self):
+        result = verify_claim_evidence(
+            "系统准确率达到95%",
+            {
+                "label": "paragraph",
+                "text": "实验结果显示系统准确率达到90%，并满足基本性能要求。",
+            },
+        )
+        self.assertEqual(result["support_status"], "insufficient")
+
+    def test_related_but_weak_paragraph_is_not_direct_support(self):
+        result = verify_claim_evidence(
+            "远程证明能够完全保证系统安全",
+            {
+                "label": "paragraph",
+                "text": "系统包含远程证明模块，并提供运行状态查询接口。",
+            },
+        )
+        self.assertNotEqual(result["support_status"], "supported")
 
 
 if __name__ == "__main__":

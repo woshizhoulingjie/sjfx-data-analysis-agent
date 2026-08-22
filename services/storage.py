@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from services.schema import normalize_summary
+from services.tree_editor import apply_tree_edits
 
 
 LOGGER = logging.getLogger(__name__)
@@ -184,6 +185,15 @@ class Storage:
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (scan_id, index_key)
                 );
+                CREATE TABLE IF NOT EXISTS tree_edits (
+                    scan_id TEXT NOT NULL,
+                    edit_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL DEFAULT 'legacy',
+                    operation TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, edit_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_documents_scan_path ON unified_documents(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_summaries_scan_path ON summaries(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_retrieval_sessions_scan_created ON retrieval_sessions(scan_id, created_at);
@@ -299,6 +309,14 @@ class Storage:
         projection["evidence"] = list(payload.get("evidence") or [])[:evidence_limit]
         projection["sidecar_projection"] = True
         return projection
+
+    def project_document(self, payload, text_limit=30000, evidence_limit=40):
+        """Return the bounded package-wide view while full text stays stored."""
+        return self._document_projection(
+            payload,
+            text_limit=text_limit,
+            evidence_limit=evidence_limit,
+        )
 
     def _store_document_payload(self, scan_id, node_path, payload):
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -746,7 +764,39 @@ class Storage:
     def get_analysis(self, scan_id):
         with self._connect() as conn:
             row = conn.execute("SELECT payload FROM package_analyses WHERE scan_id=?", (scan_id,)).fetchone()
-        return json.loads(row["payload"]) if row else None
+        if not row:
+            return None
+        analysis = json.loads(row["payload"])
+        return apply_tree_edits(analysis, self.list_tree_edits(scan_id))
+
+    def save_tree_edit(self, scan_id, edit_id, operation, payload, owner_id="legacy"):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO tree_edits(scan_id,edit_id,owner_id,operation,payload) VALUES (?,?,?,?,?)",
+                (str(scan_id), str(edit_id), str(owner_id or "legacy"), str(operation), json.dumps(payload or {}, ensure_ascii=False)),
+            )
+
+    def list_tree_edits(self, scan_id, owner_id=None):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT owner_id FROM scans WHERE id=?", (str(scan_id),)
+            ).fetchone()
+            if not row or (owner_id and (row["owner_id"] or "legacy") != owner_id):
+                return []
+            rows = conn.execute(
+                "SELECT edit_id,operation,payload,created_at FROM tree_edits WHERE scan_id=? ORDER BY created_at,edit_id",
+                (str(scan_id),),
+            ).fetchall()
+        return [{"edit_id": row["edit_id"], "operation": row["operation"], "payload": json.loads(row["payload"]), "created_at": row["created_at"]} for row in rows]
+
+    def delete_tree_edit(self, scan_id, edit_id, owner_id=None):
+        with self.lock, self._connect() as conn:
+            if owner_id:
+                row = conn.execute("SELECT owner_id FROM scans WHERE id=?", (str(scan_id),)).fetchone()
+                if not row or (row["owner_id"] or "legacy") != owner_id:
+                    return False
+            result = conn.execute("DELETE FROM tree_edits WHERE scan_id=? AND edit_id=?", (str(scan_id), str(edit_id)))
+        return bool(result.rowcount)
 
     @staticmethod
     def _job_priority(task_type):

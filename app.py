@@ -29,6 +29,7 @@ from services.reporting import (
 from services.retrieval import retrieve_evidence
 from services.scanner import folder_context, human_size, resolve_under, scan_directory
 from services.storage import Storage
+from services.tree_editor import filter_tree
 from services.structured_qa import answer_question
 from services.unified_parser import UnifiedDocumentParser
 from services.agent_runtime import PydanticAgentRuntime
@@ -799,6 +800,7 @@ def _package_large_options():
         "threshold_files": Config.LARGE_PACKAGE_THRESHOLD_FILES,
         "initial_parse_files": Config.LARGE_PACKAGE_INITIAL_PARSE_FILES,
         "deepen_batch_files": Config.LARGE_PACKAGE_DEEPEN_BATCH_FILES,
+        "batch_files": Config.LARGE_PACKAGE_BATCH_FILES,
         "overview_chars_per_file": Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE,
     }
 
@@ -1072,6 +1074,8 @@ def status():
                 "threshold_files": Config.LARGE_PACKAGE_THRESHOLD_FILES,
                 "initial_parse_files": Config.LARGE_PACKAGE_INITIAL_PARSE_FILES,
                 "deepen_batch_files": Config.LARGE_PACKAGE_DEEPEN_BATCH_FILES,
+                "batch_files": Config.LARGE_PACKAGE_BATCH_FILES,
+                "full_inventory_processing": True,
             },
         },
     })
@@ -1150,9 +1154,61 @@ def get_analysis(scan_id):
         analysis = storage.get_analysis(scan_id)
         if not analysis:
             return api_error("完整分析尚未完成", 404)
-        return jsonify({"ok": True, "analysis": analysis})
+        tree_filter = request.args.get("filter", "all")
+        if tree_filter and tree_filter.lower() not in {"all", "全部"}:
+            analysis["analysis_tree"] = filter_tree(analysis.get("analysis_tree") or {}, tree_filter)
+        return jsonify({"ok": True, "analysis": analysis, "tree_filter": tree_filter, "tree_edits": storage.list_tree_edits(scan_id, _request_owner_id())})
     except ValueError as exc:
         return api_error(str(exc), 404)
+
+
+@app.route("/api/tree-edits/<scan_id>", methods=["GET", "POST"])
+def tree_edits(scan_id):
+    """Read or persist human review operations for the smart content tree."""
+    try:
+        require_scan(scan_id)
+        owner_id = _request_owner_id() or "legacy"
+        if request.method == "GET":
+            return jsonify({"ok": True, "edits": storage.list_tree_edits(scan_id, owner_id)})
+        payload = request.get_json(silent=True) or {}
+        operation = str(payload.get("operation") or "").strip().lower()
+        edit_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+        allowed = {"rename", "confirm", "mount", "merge", "split", "undo", "redo"}
+        if operation not in allowed:
+            raise ValueError("不支持的目录树操作")
+        analysis = storage.get_analysis(scan_id)
+        if not analysis or not analysis.get("analysis_tree"):
+            raise ValueError("完整分析尚未完成")
+        tree = analysis["analysis_tree"]
+        if operation in {"undo", "redo"}:
+            target_id = str(edit_payload.get("edit_id") or "").strip()
+            edits = storage.list_tree_edits(scan_id, owner_id)
+            target = next((item for item in edits if str(item.get("edit_id") or "") == target_id), None)
+            if not target or target.get("operation") in {"undo", "redo"}:
+                raise ValueError("找不到可撤销或恢复的目录操作")
+        node_ids = {node.get("node_id") for node in _walk_analysis_nodes(tree) if node.get("node_id")}
+        documents = {item.get("path") for item in storage.list_documents(scan_id, hydrate=False)}
+        if operation in {"rename", "confirm", "mount", "split"} and str(edit_payload.get("node_id") or "") not in node_ids:
+            raise ValueError("目录树节点不存在")
+        if operation == "mount":
+            path = str(edit_payload.get("path") or "").replace("\\", "/")
+            if path not in documents:
+                raise ValueError("只能挂载已经完成解析的文件")
+        if operation == "merge":
+            ids = [str(value) for value in edit_payload.get("node_ids") or []]
+            if len(ids) < 2 or not set(ids).issubset(node_ids):
+                raise ValueError("合并至少需要两个有效主题节点")
+        if operation == "split":
+            groups = edit_payload.get("groups") or []
+            if not isinstance(groups, list) or len(groups) < 2:
+                raise ValueError("拆分至少需要两个子主题")
+        import uuid as _uuid
+        edit_id = str(payload.get("edit_id") or _uuid.uuid4().hex)
+        storage.save_tree_edit(scan_id, edit_id, operation, edit_payload, owner_id=owner_id)
+        updated = storage.get_analysis(scan_id)
+        return jsonify({"ok": True, "edit": {"edit_id": edit_id, "operation": operation, "payload": edit_payload}, "edits": storage.list_tree_edits(scan_id, owner_id), "analysis": updated})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
 
 
 @app.route("/api/document/<scan_id>")

@@ -12,7 +12,12 @@ from pathlib import Path
 
 from config import Config
 from services.scanner import human_size, resolve_under
-from services.evidence import evidence_quality, evidence_support, select_evidence
+from services.evidence import (
+    evidence_quality,
+    evidence_support,
+    select_evidence,
+    verify_claim_evidence,
+)
 from services.large_package import (
     attach_tree_coverage,
     build_coverage,
@@ -753,9 +758,22 @@ def _document_topics(document, limit=8):
 def _content_topics(document, limit=8):
     """Extract topics only from parsed content, never from file metadata."""
     structure = document.get("structure", {})
+    text = str(document.get("text") or "")
+    # A bounded head/middle/tail sample avoids classifying a long report only
+    # by its introduction while keeping package-wide topic extraction cheap.
+    if len(text) > 24000:
+        head = 10000
+        middle = 7000
+        tail = 7000
+        midpoint = max(head, (len(text) - middle) // 2)
+        text = "\n".join((
+            text[:head],
+            text[midpoint:midpoint + middle],
+            text[-tail:],
+        ))
     sample = " ".join([
-        " ".join(structure.get("headings", [])[:30]),
-        document.get("text", "")[:12000],
+        " ".join(structure.get("headings", [])[:80]),
+        text,
     ])
     return [word for word, _ in Counter(_tokens(sample)).most_common(limit)]
 
@@ -1048,13 +1066,16 @@ def _node_evidence(documents, member_paths, topics=None, max_items=6):
     candidates = []
     for path in member_paths:
         candidates.extend(documents[path].get("evidence", []))
-    return select_evidence(
+    selected = select_evidence(
         candidates,
         topics=topics or [],
         max_items=max_items,
         per_source=2,
         max_chars=520,
     )
+    if topics:
+        return [item for item in selected if item.get("support_status") == "supported"]
+    return selected
 
 
 def _subtopic_partitions(topic_name, member_paths, documents):
@@ -1423,8 +1444,44 @@ def _name_subtopic_nodes(tree, documents, llm):
                 if question:
                     unit["analysis_question"] = question
                 if answer:
-                    unit["answer"] = answer
-                    unit["statement"] = answer
+                    verified = []
+                    for evidence_item in unit.get("evidence") or []:
+                        verification = verify_claim_evidence(answer, evidence_item)
+                        if verification.get("support_status") == "supported":
+                            supported_item = dict(evidence_item)
+                            supported_item.update(verification)
+                            verified.append(supported_item)
+                    if verified:
+                        unit["answer"] = answer
+                        unit["statement"] = answer
+                        unit["evidence"] = verified
+                        unit["evidence_ids"] = [
+                            evidence_item.get("evidence_id")
+                            for evidence_item in verified
+                            if evidence_item.get("evidence_id")
+                        ]
+                        unit["evidence_status"] = "supported"
+                        unit["claims"] = [{
+                            "statement": answer,
+                            "type": "inference",
+                            "evidence_ids": unit["evidence_ids"],
+                            "support_status": "supported",
+                        }]
+                    else:
+                        unit["answer"] = "证据不足，模型生成的回答未通过原文支撑校验。"
+                        unit["statement"] = unit["answer"]
+                        unit["evidence_status"] = "insufficient"
+                        unit["evidence"] = []
+                        unit["evidence_ids"] = []
+                        unit["claims"] = [{
+                            "statement": unit["answer"],
+                            "type": "inference",
+                            "evidence_ids": [],
+                            "support_status": "insufficient",
+                        }]
+                        unit.setdefault("limitations", []).append(
+                            "模型回答没有找到真正支撑该表述的正文证据，已拒绝采用。"
+                        )
                 unit["basis"] = "该回答由本子方向的代表材料和下列可回查原文证据直接支撑。"
                 for topic_conclusion in topic.get("conclusion_evidence", []):
                     if topic_conclusion.get("evidence") == unit.get("evidence"):
@@ -1492,8 +1549,14 @@ def _adaptive_tree(scan, documents, node_summaries):
             "content_topics": _content_topics(doc, 5),
             "related_topics": _content_topics(doc, 10),
 
-            "classification_reason": classification.get(
-                "role_reason"
+            "primary_topic": classification.get("primary_topic"),
+            "topic_memberships": classification.get("topic_memberships", []),
+            "classification_confidence": classification.get("confidence"),
+            "classification_evidence_ids": classification.get("evidence_ids", []),
+
+            "classification_reason": (
+                classification.get("classification_reason")
+                or classification.get("role_reason")
             ),
         }
 
@@ -1592,11 +1655,54 @@ def _adaptive_tree(scan, documents, node_summaries):
         if candidates:
 
             selected_topic = max(candidates)[3]
-
-            assignments[selected_topic].append(path)
+            best_score = max(item[0] for item in candidates)
+            # A document may legitimately belong to more than one research
+            # topic.  Keep one primary topic for scoring, while mounting up to
+            # three strong related topics in the navigational tree.
+            memberships = [
+                item[3] for item in sorted(candidates, key=lambda item: (-item[0], item[3]))
+                if item[0] >= best_score * 0.55
+            ][:3]
+            if selected_topic not in memberships:
+                memberships.insert(0, selected_topic)
+            for membership in memberships:
+                assignments[membership].append(path)
+            alternatives = sorted((item[0] for item in candidates), reverse=True)
+            margin = (
+                (best_score - alternatives[1]) / float(max(1.0, best_score))
+                if len(alternatives) > 1 else 1.0
+            )
+            classification = documents[path].setdefault("classification", {})
+            classification.update({
+                "primary_topic": selected_topic,
+                "topic_memberships": memberships,
+                "confidence": round(min(0.98, max(0.45, 0.55 + 0.35 * margin)), 3),
+                "classification_status": "classified",
+                "classification_reason": (
+                    "主题来自标题、正文头中尾和跨文档频次；主主题在当前文件中的排序和跨文件覆盖率最高。"
+                ),
+                "evidence_ids": [
+                    item.get("evidence_id")
+                    for item in select_evidence(
+                        documents[path].get("evidence", []),
+                        topics=[selected_topic],
+                        max_items=2,
+                        per_source=1,
+                    )
+                    if item.get("support_status") == "supported" and item.get("evidence_id")
+                ],
+            })
 
         else:
             unassigned.append(path)
+        documents[path].setdefault("classification", {}).update({
+                "primary_topic": None,
+                "confidence": 0.0,
+                "classification_status": "unclassified",
+                "classification_reason": "当前正文没有形成稳定的跨文档共享主题。",
+                "evidence_ids": [],
+                "topic_memberships": [],
+            })
 
     # ---------------------------------------------------------
     # 4. 小数据包里避免制造大量单文件伪主题
@@ -1611,10 +1717,16 @@ def _adaptive_tree(scan, documents, node_summaries):
         ]
 
         for topic in singleton_topics:
-
-            unassigned.extend(
-                assignments.pop(topic)
-            )
+            singleton_paths = assignments.pop(topic)
+            unassigned.extend(singleton_paths)
+            for path in singleton_paths:
+                documents[path].setdefault("classification", {}).update({
+                    "primary_topic": None,
+                    "confidence": 0.0,
+                    "classification_status": "unclassified",
+                    "classification_reason": "主题只在单个文件出现，未形成稳定的跨文档分类。",
+                    "evidence_ids": [],
+                })
 
     # ---------------------------------------------------------
     # 5. 给关键词主题补充少量共同关键词
@@ -1705,6 +1817,7 @@ def _adaptive_tree(scan, documents, node_summaries):
             ),
 
             "dimension": "内容主题",
+            "classification_status": "classified",
 
             "name": visible_name,
 
@@ -1727,6 +1840,16 @@ def _adaptive_tree(scan, documents, node_summaries):
             ),
 
             "related_topics": related_topics,
+            "classification_confidence": round(
+                sum(float((documents[path].get("classification") or {}).get("confidence") or 0.0) for path in member_paths)
+                / float(len(member_paths) or 1),
+                3,
+            ),
+            "classification_evidence_ids": list(dict.fromkeys(
+                evidence_id
+                for path in member_paths
+                for evidence_id in ((documents[path].get("classification") or {}).get("evidence_ids") or [])
+            ))[:12],
 
             "children": [
                 file_leaf(p)
@@ -1769,6 +1892,7 @@ def _adaptive_tree(scan, documents, node_summaries):
             ),
 
             "dimension": "内容主题",
+            "classification_status": "unclassified",
 
             "name": fallback_name,
 
@@ -1790,6 +1914,8 @@ def _adaptive_tree(scan, documents, node_summaries):
             ),
 
             "related_topics": [],
+            "classification_confidence": 0.0,
+            "classification_evidence_ids": [],
 
             "children": [
                 file_leaf(p)
@@ -2543,6 +2669,10 @@ def _semantic_adaptive_tree(
                 document,
                 8,
             ),
+            "primary_topic": (document.get("classification") or {}).get("primary_topic"),
+            "topic_memberships": (document.get("classification") or {}).get("topic_memberships", []),
+            "classification_confidence": (document.get("classification") or {}).get("confidence"),
+            "classification_evidence_ids": (document.get("classification") or {}).get("evidence_ids", []),
             "evidence_ids": [
                 item.get("evidence_id")
                 for item in document.get(
@@ -2601,6 +2731,7 @@ def _semantic_adaptive_tree(
                 ).hexdigest()[:16]
             ),
             "dimension": "内容主题",
+            "classification_status": "classified",
             "name": name,
             "summary": (
                 cluster.get("summary")
@@ -2651,6 +2782,48 @@ def _semantic_adaptive_tree(
     return _enrich_analysis_tree(tree, documents)
 
 
+def _add_related_topic_mounts(tree, documents):
+    """Expose strong cross-topic relationships without moving primary files.
+
+    The generated tree keeps one primary placement for stable counts, then
+    mounts a file under at most two additional topic nodes when its extracted
+    content topics overlap that node's topic vocabulary.  Mounted leaves are
+    marked explicitly so exports and human edits can distinguish them.
+    """
+    groups = [item for item in tree.get("children") or [] if item.get("kind") == "group"]
+    if len(groups) < 2:
+        return tree
+    for path, document in documents.items():
+        doc_topics = set(_content_topics(document, 12))
+        if not doc_topics:
+            continue
+        mounted = 0
+        for group in groups:
+            members = set(group.get("member_paths") or [])
+            if path in members:
+                continue
+            group_terms = set(_tokens(group.get("name") or ""))
+            group_terms.update(str(value) for value in group.get("related_topics") or [])
+            overlap = len(doc_topics.intersection(group_terms))
+            if overlap < 2:
+                continue
+            source_leaf = next((leaf for leaf in (tree.get("children") or []) for leaf in leaf.get("children") or [] if leaf.get("kind") == "file" and leaf.get("path") == path), None)
+            if not source_leaf:
+                source_leaf = {"kind": "file", "path": path, "name": Path(path).name}
+            mounted_leaf = dict(source_leaf)
+            mounted_leaf["manual_membership"] = False
+            mounted_leaf["topic_mount"] = True
+            mounted_leaf["topic_mount_reason"] = "正文主题与该节点存在 {} 个共同主题词".format(overlap)
+            group.setdefault("children", []).append(mounted_leaf)
+            group.setdefault("member_paths", []).append(path)
+            group["member_paths"] = sorted(set(group["member_paths"]))
+            group["file_count"] = len(group["member_paths"])
+            mounted += 1
+            if mounted >= 2:
+                break
+    return tree
+
+
 
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
                     large_options=None, target_paths=None, cancel_check=None):
@@ -2675,17 +2848,18 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     if target_paths:
         candidates = [node for node in files if node.get("path") in target_paths]
-        if policy.get("enabled"):
-            candidates = [inventory[path] for path in representative_paths(candidates, policy["deepen_batch_files"])]
         phase_label = "补充分析"
     elif policy.get("enabled"):
-        candidates = [inventory[path] for path in representative_paths(files, policy["initial_parse_files"])]
-        phase_label = "大数据包首轮概览"
+        # Large-package mode is bounded by the parser queue and persistent
+        # checkpoints, not by a representative-file cap.  Every inventoried
+        # path gets a final completed or failed state.
+        candidates = files
+        phase_label = "大数据包分批全量分析"
     else:
         candidates = files
         phase_label = "完整分析"
 
-    actual_parse_mode = "fast" if policy.get("enabled") else parse_mode
+    actual_parse_mode = "accurate" if policy.get("enabled") else parse_mode
     progress(2, "开始{}：{} 个文件".format(phase_label, len(candidates)))
     parse_candidates = []
     reusable_count = 0
@@ -2727,13 +2901,18 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     "压缩包没有完成有效展开。{}。若文件正在复制，请等待完成后重新导入；"
                     "若文件已完整，请检查是否损坏、加密或属于分卷压缩包。".format(details or "未发现可解析成员")
                 )
-            if policy.get("enabled"):
-                document = compact_overview_document(document, policy["overview_chars_per_file"])
-            documents[node_path] = document
             storage.save_document(scan_id, node_path, document)
+            documents[node_path] = (
+                storage.project_document(
+                    document,
+                    text_limit=policy["overview_chars_per_file"],
+                    evidence_limit=40,
+                )
+                if policy.get("enabled") else document
+            )
             storage.set_file_state(
                 scan_id, node_path, fingerprint,
-                "overview" if policy.get("enabled") else "completed", document=document,
+                "completed", document=document,
             )
         except Exception as exc:
             failures = [item for item in failures if item.get("path") != node_path]
@@ -2755,32 +2934,40 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         if str(getattr(parser, "docling_device", "cpu")).lower() != "cpu":
             parse_workers = 1
 
+        batch_size = len(parse_candidates)
+        if policy.get("enabled"):
+            batch_size = max(1, int(policy.get("batch_files") or 200))
         parse_pulse = {"at": 0.0}
+        for batch_start in range(0, len(parse_candidates), batch_size):
+            current_batch = parse_candidates[batch_start:batch_start + batch_size]
+            batch_offset = batch_start
 
-        def parse_tick(done_count, total_count, active_paths):
-            now = time.monotonic()
-            if now - parse_pulse["at"] < 1.5:
-                return
-            parse_pulse["at"] = now
-            overall_done = min(len(candidates), reusable_count + int(done_count or 0))
-            active_text = "、".join(str(path) for path in (active_paths or [])[:2] if path)
-            progress(
-                2 + int(68 * overall_done / total_candidates),
-                "{}：已完成 {}/{}；正在解析 {}".format(
-                    phase_label, overall_done, len(candidates), active_text or "当前文件",
-                ),
+            def parse_tick(done_count, total_count, active_paths):
+                now = time.monotonic()
+                if now - parse_pulse["at"] < 1.5:
+                    return
+                parse_pulse["at"] = now
+                overall_done = min(
+                    len(candidates), reusable_count + batch_offset + int(done_count or 0)
+                )
+                active_text = "、".join(str(path) for path in (active_paths or [])[:2] if path)
+                progress(
+                    2 + int(68 * overall_done / total_candidates),
+                    "{}：已完成 {}/{}；正在解析 {}".format(
+                        phase_label, overall_done, len(candidates), active_text or "当前文件",
+                    ),
+                )
+
+            _parallel_parse_files(
+                parser,
+                [item[0] for item in current_batch],
+                scan["root"],
+                actual_parse_mode,
+                max_workers=parse_workers,
+                cancel_check=cancel_check,
+                on_complete=commit_parse_result,
+                on_tick=parse_tick,
             )
-
-        _parallel_parse_files(
-            parser,
-            [item[0] for item in parse_candidates],
-            scan["root"],
-            actual_parse_mode,
-            max_workers=parse_workers,
-            cancel_check=cancel_check,
-            on_complete=commit_parse_result,
-            on_tick=parse_tick,
-        )
 
     failed_paths = {item.get("path") for item in failures}
     pending_paths = all_paths - set(documents) - failed_paths
@@ -2795,8 +2982,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         classification["document_role"] = role
         classification["role_reason"] = details["reason"]
         classification["role_scores"] = details["scores"]
-        classified_batch.append((document_path, document))
-        if len(classified_batch) >= 250:
+        if not policy.get("enabled"):
+            classified_batch.append((document_path, document))
+        if not policy.get("enabled") and len(classified_batch) >= 250:
             storage.save_documents(scan_id, classified_batch)
             classified_batch = []
             progress(
@@ -2807,15 +2995,25 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         storage.save_documents(scan_id, classified_batch)
 
     progress(72, "执行精确去重与高相似文档聚类")
-    exact_groups = _group_exact(documents)
-    canonical_documents, canonical_by_path, aliases_by_canonical = _canonical_projection(
-        documents, exact_groups
-    )
+    if policy.get("enabled"):
+        # Large-package mode prioritizes full content coverage.  Do not spend
+        # the package budget on pairwise similarity or canonical projection;
+        # every parsed file remains available to the content topic tree.
+        exact_groups = []
+        canonical_documents = documents
+        canonical_by_path = {path: path for path in documents}
+        aliases_by_canonical = {}
+    else:
+        exact_groups = _group_exact(documents)
+        canonical_documents, canonical_by_path, aliases_by_canonical = _canonical_projection(
+            documents, exact_groups
+        )
     # Persist the canonical/alias relationship on every original path.  It is
     # visible in the physical tree and survives a Worker restart.
-    for document_path, document in documents.items():
-        storage.save_document(scan_id, document_path, document)
-    similar_groups = _group_similar(documents, exact_groups)
+    if not policy.get("enabled"):
+        for document_path, document in documents.items():
+            storage.save_document(scan_id, document_path, document)
+    similar_groups = [] if policy.get("enabled") else _group_similar(documents, exact_groups)
     topic_clusters = _topic_clusters(canonical_documents)
     retrieval = build_retrieval_manifest(canonical_documents, topic_clusters)
     evidence_index_count = storage.replace_evidence_index(
@@ -2980,13 +3178,54 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         aliases_by_canonical,
         node_summaries,
     )
+    adaptive_tree = _add_related_topic_mounts(adaptive_tree, canonical_documents)
+    # The content tree annotates documents with their primary topic,
+    # confidence and classification evidence.  Persist those annotations so a
+    # restart or later export sees the same auditable decision.
+    if policy.get("enabled"):
+        for document_path, document in documents.items():
+            stored_document = storage.get_document(scan_id, document_path)
+            if not stored_document:
+                continue
+            stored_document["classification"] = dict(document.get("classification") or {})
+            storage.save_document(scan_id, document_path, stored_document)
+    else:
+        classification_batch = []
+        for document_path, document in documents.items():
+            classification_batch.append((document_path, document))
+            if len(classification_batch) >= 250:
+                storage.save_documents(scan_id, classification_batch)
+                classification_batch = []
+        if classification_batch:
+            storage.save_documents(scan_id, classification_batch)
     scan["tree"] = _annotate_physical_tree_deduplication(
         scan["tree"], canonical_by_path, documents, node_summaries
     )
     if policy.get("enabled"):
         waiting = pending_group(pending_paths, inventory, policy)
         if waiting:
+            waiting["children"] = [{
+                "kind": "file", "name": Path(path).name, "path": path,
+                "size": int(inventory.get(path, {}).get("size") or 0),
+                "size_human": human_size(int(inventory.get(path, {}).get("size") or 0)),
+                "classification_status": "pending", "classification_reason": "尚未进入内容分析批次",
+            } for path in sorted(pending_paths)]
             adaptive_tree.setdefault("children", []).append(waiting)
+    if failed_paths:
+        failed_group = {
+            "kind": "group", "node_type": "failed_scope", "node_id": "failed-{}".format(hashlib.sha256("|".join(sorted(failed_paths)).encode("utf-8")).hexdigest()[:16]),
+            "dimension": "解析状态", "name": "解析失败（需重试）", "classification_status": "failed",
+            "summary": "该分支包含 {} 个解析失败文件，可在数据包管理中重试。".format(len(failed_paths)),
+            "member_paths": sorted(failed_paths), "file_count": len(failed_paths),
+            "children": [{
+                "kind": "file", "name": Path(path).name, "path": path,
+                "size": int(inventory.get(path, {}).get("size") or 0),
+                "size_human": human_size(int(inventory.get(path, {}).get("size") or 0)),
+                "classification_status": "failed", "classification_reason": next((item.get("error") for item in failures if item.get("path") == path), "解析失败"),
+            } for path in sorted(failed_paths)],
+            "evidence_chain": [], "conclusion_evidence": [], "coverage": {"status": "失败", "inventory_files": len(failed_paths), "parsed_files": 0, "failed_files": len(failed_paths)},
+        }
+        adaptive_tree.setdefault("children", []).append(failed_group)
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )

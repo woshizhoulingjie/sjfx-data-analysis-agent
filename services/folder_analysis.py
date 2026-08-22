@@ -1,7 +1,12 @@
 import json
 
 from services.ollama import LocalModelError
-from services.evidence import attach_claim_evidence, evidence_quality, evidence_support
+from services.evidence import (
+    attach_claim_evidence,
+    evidence_quality,
+    evidence_support,
+    verify_claim_evidence,
+)
 
 
 def _fallback(context, node_path, errors=None):
@@ -103,18 +108,29 @@ def _normalize_question_answer_evidence(summary, catalog, node_path, context=Non
             if not evidence_id or evidence_id in {str(value.get("evidence_id")) for value in valid}:
                 continue
             if evidence_quality(item).get("eligible"):
-                valid.append(item)
+                verification = verify_claim_evidence(statement, item)
+                if verification.get("support_status") in {"supported", "partially_supported"}:
+                    item = dict(item)
+                    item.update(verification)
+                    valid.append(item)
         for item in valid:
             key = str(item.get("evidence_id"))
             if key not in seen:
                 seen.add(key)
                 all_evidence.append(item)
         if statement:
+            claim_status = (
+                "supported"
+                if any(item.get("support_status") == "supported" for item in valid)
+                else "partially_supported"
+                if valid
+                else "insufficient"
+            )
             claims.append({
                 "statement": statement,
                 "type": raw.get("type") if isinstance(raw, dict) else "observation",
                 "evidence_ids": [item.get("evidence_id") for item in valid if item.get("evidence_id")],
-                "support_status": "supported" if valid else "insufficient",
+                "support_status": claim_status,
             })
     if not claims and answer:
         claims.append({
@@ -123,8 +139,13 @@ def _normalize_question_answer_evidence(summary, catalog, node_path, context=Non
             "evidence_ids": [item.get("evidence_id") for item in all_evidence if item.get("evidence_id")],
             "support_status": "supported" if all_evidence else "insufficient",
         })
-    supported = bool(claims) and all(item.get("support_status") == "supported" for item in claims)
-    if not supported:
+    supported = bool(claims) and all(
+        item.get("support_status") == "supported" for item in claims
+    )
+    partially_supported = bool(claims) and any(
+        item.get("support_status") == "partially_supported" for item in claims
+    )
+    if not supported and not partially_supported:
         answer = "证据不足，当前不能形成可靠回答。"
         all_evidence = []
     summary["question"] = question
@@ -133,7 +154,9 @@ def _normalize_question_answer_evidence(summary, catalog, node_path, context=Non
     summary["claims"] = claims
     summary["evidence"] = all_evidence
     summary["evidence_ids"] = [item.get("evidence_id") for item in summary["evidence"] if item.get("evidence_id")]
-    summary["evidence_status"] = "supported" if supported else "insufficient"
+    summary["evidence_status"] = (
+        "supported" if supported else "partially_supported" if partially_supported else "insufficient"
+    )
     summary["evidence_contract"] = "question-answer-evidence/2.0"
     summary["question_answer_evidence"] = {
         "question": question,
@@ -142,7 +165,13 @@ def _normalize_question_answer_evidence(summary, catalog, node_path, context=Non
         "claims": claims,
         "evidence": summary["evidence"],
         "coverage": context.get("coverage") or {},
-        "limitations": list(summary.get("limitations") or []) + ([] if supported else ["当前没有足够的有效正文证据支撑该回答。"]),
+          "limitations": list(summary.get("limitations") or []) + (
+              []
+              if supported
+              else ["部分结论只有间接证据支撑，建议人工复核。"]
+              if partially_supported
+              else ["当前没有足够的有效正文证据支撑该回答。"]
+          ),
     }
     summary["limitations"] = list(dict.fromkeys(summary["question_answer_evidence"]["limitations"]))
     return summary
@@ -617,13 +646,23 @@ def _attach_model_evidence(
             []
         )
 
-        direction[
-            "evidence_chain"
-        ] = [
-            by_id[str(item)]
-            for item in ids
-            if str(item) in by_id
-        ]
+        direction_claim = str(
+            direction.get("rationale")
+            or direction.get("title")
+            or ""
+        ).strip()
+        direction_evidence = []
+        for evidence_id in ids:
+            source = by_id.get(str(evidence_id))
+            if not source:
+                continue
+            verification = verify_claim_evidence(direction_claim, source)
+            if verification.get("support_status") != "supported":
+                continue
+            source = dict(source)
+            source.update(verification)
+            direction_evidence.append(source)
+        direction["evidence_chain"] = direction_evidence
 
         direction["evidence_status"] = (
             "supported" if direction["evidence_chain"] else "insufficient"

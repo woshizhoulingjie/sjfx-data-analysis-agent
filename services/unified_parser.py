@@ -386,7 +386,7 @@ class UnifiedDocumentParser:
         # Keep parser behaviour aligned with Config.MAX_SINGLE_FILE_BYTES and
         # the value shown by /api/status.  A deployment may explicitly raise
         # this limit in .env after evaluating its memory and time budget.
-        max_single_file_bytes = max(1, int(os.getenv("MAX_SINGLE_FILE_BYTES", str(1024 * 1024 * 1024))))
+        max_single_file_bytes = max(1, int(os.getenv("MAX_SINGLE_FILE_BYTES", str(10 * 1024 * 1024 * 1024))))
         max_archive_file_bytes = max(
             max_single_file_bytes,
             int(os.getenv("MAX_ARCHIVE_FILE_BYTES", str(5 * 1024 * 1024 * 1024))),

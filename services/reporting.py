@@ -2,7 +2,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from services.evidence import evidence_quality, select_evidence
+from services.evidence import evidence_quality, select_evidence, verify_claim_evidence
 
 
 DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx", ".md", ".txt", ".png", ".jpg", ".jpeg"}
@@ -56,7 +56,11 @@ def _cluster_evidence(cluster, analysis, topic, limit=8):
             continue
         candidates.extend(item.get("evidence") or [])
     selected = select_evidence(candidates, topics=[topic], max_items=limit, per_source=2, max_chars=620)
-    return [item for item in selected if evidence_quality(item).get("eligible")]
+    return [
+        item for item in selected
+        if evidence_quality(item).get("eligible")
+        and item.get("support_status") == "supported"
+    ]
 
 
 def _direction_candidates(scan, analysis, limit=8):
@@ -383,6 +387,10 @@ def _category_payload(node, analysis, document_index, scan_files):
     return {
         "name": node.get("name", "未命名分类"),
         "dimension": node.get("dimension", "内容类别"),
+        "classification_status": node.get(
+            "classification_status",
+            "classified",
+        ),
         "file_count": len(paths),
         "parsed_file_count": parsed_count,
         "unparsed_file_count": len(paths) - parsed_count,
@@ -407,6 +415,7 @@ def _unparsed_category(scan_files, document_index):
     return {
         "name": "未解析文件（待复核）",
         "dimension": "解析状态",
+        "classification_status": "unclassified",
         "file_count": len(paths),
         "parsed_file_count": 0,
         "unparsed_file_count": len(paths),
@@ -449,6 +458,7 @@ def _physical_directory_categories(scan, analysis):
     return [{
         "name": "数据包根节点（分类未完成）",
         "dimension": "扫描清单（降级）",
+        "classification_status": "unclassified",
         "file_count": scan.get("file_count", root.get("file_count", 0)),
         "parsed_file_count": len(_document_index(analysis)),
         "unparsed_file_count": max(0, scan.get("file_count", 0) - len(_document_index(analysis))),
@@ -493,14 +503,20 @@ def build_local_report(scan, summaries, analysis=None):
             "evidence_chain": root_summary.get("evidence_chain", []),
         }]
         classification_source = "root_fallback"
-    classified_file_count = sum(item.get("file_count", 0) for item in categories)
     parsed_file_count = stats.get("parsed_files", 0)
     scanned_file_count = scan.get("file_count", 0)
+    classified_file_count = sum(
+        item.get("file_count", 0)
+        for item in categories
+        if item.get("classification_status") == "classified"
+    )
+    unclassified_file_count = max(0, scanned_file_count - classified_file_count)
     classification_coverage = {
         "source": classification_source,
         "dimension_count": len(analysis.get("classification_dimensions", [])),
         "top_level_category_count": len(categories),
         "classified_file_count": classified_file_count,
+        "unclassified_file_count": unclassified_file_count,
         "parsed_file_count": parsed_file_count,
         "coverage_ratio": round(classified_file_count / float(scanned_file_count or 1), 6),
         "complete": classified_file_count == scanned_file_count,
@@ -597,7 +613,7 @@ def build_local_report(scan, summaries, analysis=None):
     }
 
 
-def _model_evidence_chain(evidence_catalog, evidence_ids, fallback):
+def _model_evidence_chain(evidence_catalog, evidence_ids, fallback, claim=None):
     by_id = {
         str(item.get("evidence_id")): item
         for item in evidence_catalog
@@ -607,6 +623,12 @@ def _model_evidence_chain(evidence_catalog, evidence_ids, fallback):
     for evidence_id in evidence_ids or []:
         item = by_id.get(str(evidence_id))
         if item and item not in selected:
+            if claim:
+                verification = verify_claim_evidence(claim, item)
+                if verification.get("support_status") != "supported":
+                    continue
+                item = dict(item)
+                item.update(verification)
             selected.append(item)
     return selected
 
@@ -627,7 +649,10 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
         recommendation["type"] = "推论"
         selected_ids = [str(value) for value in recommendation.get("evidence_ids", [])]
         recommendation["evidence_chain"] = _model_evidence_chain(
-            evidence_catalog, recommendation.pop("evidence_ids", []), fallback_evidence
+            evidence_catalog,
+            recommendation.pop("evidence_ids", []),
+            fallback_evidence,
+            claim=recommendation.get("rationale") or recommendation.get("title"),
         )
         recommendation["supports_evidence_ids"] = [
             item.get("evidence_id") for item in recommendation["evidence_chain"] if item.get("evidence_id") in selected_ids
@@ -654,7 +679,10 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
         if isinstance(direction, dict):
             direction["type"] = "推论"
             direction["evidence_chain"] = _model_evidence_chain(
-                evidence_catalog, direction.pop("evidence_ids", []), fallback_evidence
+                evidence_catalog,
+                direction.pop("evidence_ids", []),
+                fallback_evidence,
+                claim=direction.get("basis") or direction.get("direction") or direction.get("title"),
             )
             direction["supports_evidence_ids"] = [
                 item.get("evidence_id") for item in direction["evidence_chain"] if item.get("evidence_id")

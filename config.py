@@ -106,7 +106,7 @@ class Config:
     SCAN_ALLOWED_ROOTS = tuple(Path(item).expanduser().resolve() for item in _split_path_list(_allowed_roots))
     MAX_EXTRACT_CHARS = int(os.getenv("MAX_EXTRACT_CHARS", "60000"))
     MAX_FULL_DOCUMENT_CHARS = int(os.getenv("MAX_FULL_DOCUMENT_CHARS", "2000000"))
-    MAX_SINGLE_FILE_BYTES = int(os.getenv("MAX_SINGLE_FILE_BYTES", str(1024 * 1024 * 1024)))
+    MAX_SINGLE_FILE_BYTES = int(os.getenv("MAX_SINGLE_FILE_BYTES", str(10 * 1024 * 1024 * 1024)))
     MAX_PARSE_SECONDS = max(1, int(os.getenv("MAX_PARSE_SECONDS", "300")))
     # Large archives can become visible on a NAS before their copy finishes.
     # Observe them briefly so an incomplete ZIP is reported as changing input.
@@ -147,6 +147,7 @@ class Config:
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
     LARGE_PACKAGE_INITIAL_PARSE_FILES = int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "700"))
     LARGE_PACKAGE_DEEPEN_BATCH_FILES = int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "500"))
+    LARGE_PACKAGE_BATCH_FILES = max(1, min(1000, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "100"))))
     LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE = int(os.getenv("LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE", "30000"))
     MAX_ARCHIVE_ENTRIES = max(1, int(os.getenv("MAX_ARCHIVE_ENTRIES", "1500")))
     MAX_ARCHIVE_FILE_BYTES = int(os.getenv("MAX_ARCHIVE_FILE_BYTES", str(5 * 1024 * 1024 * 1024)))

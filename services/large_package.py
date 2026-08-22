@@ -1,9 +1,9 @@
-"""Bounded, recoverable first-pass analysis for genuinely large data packages.
+"""Bounded, recoverable processing for genuinely large data packages.
 
-The module intentionally keeps the first pass honest: it inventories every
-file, profiles a deterministic representative subset, and records everything
-that remains pending.  A later scoped run can reuse completed files and extend
-the same analysis without restarting from zero.
+Large-package mode still uses bounded batches and checkpoint reuse, but it no
+longer stops after a representative sample.  Every inventoried file enters the
+same parse pipeline; expensive deduplication and embedding clustering remain
+optional statistics and never gate the content classification tree.
 """
 import hashlib
 from pathlib import Path
@@ -23,8 +23,11 @@ def build_policy(scan, options=None):
     total_size = int(scan.get("total_size") or 0)
     threshold_bytes = int(options.get("threshold_bytes") or 1024 * 1024 * 1024)
     threshold_files = int(options.get("threshold_files") or 3000)
+    # Kept for backwards-compatible configuration display.  They are no longer
+    # used as a hard cap in full large-package mode.
     initial_limit = max(1, int(options.get("initial_parse_files") or 700))
     deepen_limit = max(1, int(options.get("deepen_batch_files") or 500))
+    batch_files = max(1, min(1000, int(options.get("batch_files") or 100)))
     overview_chars = max(4000, int(options.get("overview_chars_per_file") or 30000))
     enabled = total_size >= threshold_bytes or file_count >= threshold_files
     return {
@@ -34,6 +37,9 @@ def build_policy(scan, options=None):
         "threshold_files": threshold_files,
         "initial_parse_files": initial_limit,
         "deepen_batch_files": deepen_limit,
+        "batch_files": batch_files,
+        "full_inventory_processing": True,
+        "classification_scope": "all_parsed_files",
         "overview_chars_per_file": overview_chars,
         "inventory_files": file_count,
         "inventory_bytes": total_size,
@@ -220,8 +226,8 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         if not parsed and selected:
             status = "待分析"
         limitations = []
-        if (policy or {}).get("enabled"):
-            limitations.append("大数据包采用代表性文件首轮概览，未抽中的文件需要按范围继续深化。")
+        if (policy or {}).get("enabled") and pending:
+            limitations.append("大数据包采用有限批次持续处理；仍有文件待进入后续批次。")
         if sampled:
             limitations.append("{} 个文件当前为抽样/首轮概览，不能视为全文深度分析。".format(sampled))
         if partial:
@@ -274,7 +280,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "pending_paths": sorted(pending)[:200],
             "failed_paths": sorted(failed)[:200],
             "large_package_notice": (
-                "首轮结果基于代表文件；未覆盖文件可在选中范围后继续补充分析。"
+                "大数据包按有限批次持续处理，直到所有文件进入完成或失败状态。"
                 if (policy or {}).get("enabled") else None
             ),
         }
@@ -306,7 +312,7 @@ def pending_group(paths, inventory, policy):
         "node_id": "pending-{}".format(hashlib.sha256("|".join(paths).encode("utf-8")).hexdigest()[:16]),
         "dimension": "分析进度",
         "name": "待按需深度分析",
-        "summary": "该分支包含 {} 个尚未进入首轮内容分析的文件。可选中物理目录后使用“补充分析当前范围”分批处理。".format(len(paths)),
+        "summary": "该分支包含 {} 个尚未进入内容分析的文件，将在后续批次继续处理。".format(len(paths)),
         "member_paths": paths,
         "file_count": len(paths),
         "total_size": total_size,

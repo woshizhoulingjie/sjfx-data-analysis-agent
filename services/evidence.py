@@ -17,6 +17,11 @@ QUERY_STOPWORDS = STOPWORDS | {
     "问题", "哪些", "什么", "为何", "为什么", "如何", "是否", "怎么", "怎样",
     "请问", "请分析", "一下", "可以", "能够", "需要", "有关", "这个", "该",
 }
+NEGATION_RE = re.compile(
+    r"(?:未|无|没有|不能|无法|不可|并非|尚未|避免|缺乏|"
+    r"不(?:是|能|可|会|应|得|具有|存在|支持|符合|包含|包括|采用|提供|实现|导致))"
+)
+ABSOLUTE_CUE_RE = re.compile(r"(?:完全|绝对|全部|必然|彻底|始终|永久|百分之百|100%)")
 INDIRECT_SIGNALS = {
     "经济影响": ("吞吐", "收入", "产量", "就业", "价格", "增长", "下降", "成本"),
     "冲突": ("伤亡", "袭击", "攻击", "停火", "战斗", "流离失所"),
@@ -98,6 +103,21 @@ def _claim_terms(values):
     }
 
 
+def _strong_terms(values):
+    """Terms strong enough to establish a substantive claim match."""
+    return {
+        term for term in _claim_terms(values)
+        if len(term) >= 3 or bool(re.fullmatch(r"[a-z0-9_.-]+", term))
+    }
+
+
+def _claim_numbers(text):
+    return set(re.findall(
+        r"\d+(?:\.\d+)?\s*(?:%|％|万|亿|吨|元|天|次|例|倍|项|种)?",
+        str(text or ""),
+    ))
+
+
 def compact_evidence(item, max_chars=520):
     """Copy an evidence item as a bounded excerpt without losing provenance."""
     result = {
@@ -105,6 +125,8 @@ def compact_evidence(item, max_chars=520):
         for key in (
             "evidence_id", "source_path", "page", "section", "label", "bbox",
             "parser", "source_sha256", "content_sha256", "score", "retrieval_score",
+            "archive_source_path", "archive_member", "paragraph_index", "block_index",
+            "char_start", "char_end", "parser_version",
         )
         if item.get(key) is not None
     }
@@ -204,15 +226,20 @@ def _claim_match(item, topics, semantic_score=0.0, indirect_signals=None):
         {term for term in terms if term.lower() in lowered},
         key=lambda value: (-len(value), value),
     )[:8]
+    strong_matched = sorted(
+        {term for term in _strong_terms([topic_text]) if term.lower() in lowered},
+        key=lambda value: (-len(value), value),
+    )[:8]
+    factual_body = bool(FACTUAL_CUE_RE.search(text))
     indirect = sorted({
         signal for signal in (indirect_signals or set())
         if str(signal).lower() in lowered
     })[:6]
-    if matched:
+    if strong_matched or (len(matched) >= 2 and factual_body):
         return {
             "supports_claim": True,
             "support_type": "直接证据",
-            "support_reason": "正文直接回应问题中的关键概念：{}。".format("、".join(matched[:4])),
+            "support_reason": "正文直接回应问题中的关键概念：{}。".format("、".join((strong_matched or matched)[:4])),
             "matched_terms": matched,
         }
     if indirect:
@@ -234,6 +261,82 @@ def _claim_match(item, topics, semantic_score=0.0, indirect_signals=None):
         "support_type": "不构成支撑",
         "support_reason": "未找到能直接或可靠间接回答该问题的依据。",
         "matched_terms": [],
+    }
+
+
+def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexical-fallback"):
+    """Verify that one source unit actually supports one concrete claim."""
+    quality = evidence_quality(item)
+    if not quality.get("eligible"):
+        return {
+            "support_status": "insufficient",
+            "support_score": 0.0,
+            "support_reason": quality.get("reason") or "证据质量不合格",
+        }
+    claim_text = " ".join(str(claim or "").split())
+    text = " ".join(str(item.get("text") or "").split())
+    if not claim_text:
+        return {
+            "support_status": "insufficient",
+            "support_score": 0.0,
+            "support_reason": "结论为空，无法验证证据关系",
+        }
+
+    claim_numbers = _claim_numbers(claim_text)
+    evidence_numbers = _claim_numbers(text)
+    if claim_numbers and not claim_numbers.issubset(evidence_numbers):
+        return {
+            "support_status": "insufficient",
+            "support_score": 0.0,
+            "support_reason": "结论中的数字或量化单位未在原文证据中一致出现",
+        }
+
+    if ABSOLUTE_CUE_RE.search(claim_text) and not ABSOLUTE_CUE_RE.search(text):
+        return {
+            "support_status": "partially_supported",
+            "support_score": 0.3,
+            "support_reason": "结论使用了绝对化表述，但原文证据没有支持相同强度",
+        }
+
+    if bool(NEGATION_RE.search(claim_text)) != bool(NEGATION_RE.search(text)):
+        return {
+            "support_status": "partially_supported",
+            "support_score": 0.35,
+            "support_reason": "结论与证据的否定范围不一致，需要人工复核",
+        }
+
+    match = _claim_match(item, [claim_text], semantic_score=semantic_score)
+    matched_terms = set(match.get("matched_terms") or [])
+    strong_count = len(matched_terms & _strong_terms([claim_text]))
+    semantic = float(semantic_score or 0.0)
+    if match.get("support_type") == "直接证据" and (
+        strong_count >= 1 or (len(matched_terms) >= 2 and quality.get("factual"))
+    ):
+        score = min(1.0, 0.65 + 0.08 * strong_count + (0.12 if quality.get("factual") else 0.0))
+        return {
+            "support_status": "supported",
+            "support_score": round(score, 3),
+            "support_reason": match.get("support_reason"),
+            "support_relation": "direct",
+        }
+    if match.get("support_type") == "间接证据":
+        return {
+            "support_status": "partially_supported",
+            "support_score": 0.55,
+            "support_reason": match.get("support_reason"),
+            "support_relation": "indirect",
+        }
+    if semantic >= 0.78:
+        return {
+            "support_status": "partially_supported",
+            "support_score": round(min(0.75, semantic), 3),
+            "support_reason": "语义高度相关但缺少关键术语字面支撑，需要人工复核",
+            "support_relation": "semantic",
+        }
+    return {
+        "support_status": "insufficient",
+        "support_score": 0.0,
+        "support_reason": "原文没有直接或可靠间接支撑该结论的内容",
     }
 
 
@@ -310,6 +413,18 @@ def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=52
         compact["supporting_quote"] = _supporting_quote(item.get("text"), terms, max_chars=min(280, max_chars))
         compact["evidence_quality"] = evidence_quality(item)
         compact.update(claim_match)
+        compact.update(
+            verify_claim_evidence(
+                topic_text,
+                item,
+                semantic_score=semantic,
+                relevance_mode=mode,
+            ) if topics else {
+                "support_status": "supported",
+                "support_score": 0.5,
+                "support_reason": "未指定具体结论，仅作为可回查正文",
+            }
+        )
         compact["semantic_score"] = round(semantic, 6)
         compact["relevance_mode"] = mode
         selected.append(compact)
@@ -563,15 +678,12 @@ def attach_claim_evidence(summary, items, fields=None, max_items=3):
             )
 
             supported = [
-                item
-                for item in selected
-                if (
-                    item.get("matched_terms")
-                    or float(
-                        item.get("semantic_score")
-                        or 0.0
-                    ) >= 0.55
-                )
+                item for item in selected
+                if item.get("support_status") == "supported"
+            ]
+            partial = [
+                item for item in selected
+                if item.get("support_status") == "partially_supported"
             ]
 
             if any(
@@ -580,7 +692,7 @@ def attach_claim_evidence(summary, items, fields=None, max_items=3):
             ):
                 status = "direct"
 
-            elif supported:
+            elif partial:
                 status = "semantic"
 
             else:
@@ -595,7 +707,7 @@ def attach_claim_evidence(summary, items, fields=None, max_items=3):
                 ),
                 "claim_index": index,
                 "support_status": status,
-                "evidence_chain": supported[:max_items],
+                "evidence_chain": (supported or partial)[:max_items],
             })
 
     if isinstance(summary, dict):

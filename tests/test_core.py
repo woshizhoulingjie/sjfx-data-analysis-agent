@@ -14,6 +14,7 @@ from services.package_analysis import (
     _assert_source_stable,
     _source_has_open_writer,
     _document_role,
+    _content_topics,
     _group_similar,
     _hamming,
     _topic_clusters,
@@ -584,7 +585,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertFalse(archive_path.with_name(archive_path.name + ".part").exists())
             self.assertEqual(calls[-1][0], 1)
 
-    def test_large_package_first_pass_is_bounded_and_coverage_is_honest(self):
+    def test_large_package_processes_all_files_in_bounded_batches(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             for index in range(4):
@@ -602,11 +603,58 @@ class CoreRegressionTests(unittest.TestCase):
             coverage = analysis["coverage"]
             self.assertTrue(analysis["policy"]["large_package"]["enabled"])
             self.assertEqual(coverage["inventory_files"], 4)
-            self.assertEqual(coverage["parsed_files"], 2)
-            self.assertEqual(coverage["pending_files"], 2)
-            self.assertTrue(any(node.get("node_type") == "pending_scope" for node in analysis["analysis_tree"]["children"]))
+            self.assertEqual(coverage["parsed_files"], 4)
+            self.assertEqual(coverage["pending_files"], 0)
+            self.assertFalse(any(node.get("node_type") == "pending_scope" for node in analysis["analysis_tree"]["children"]))
             stored = storage.list_documents(scan_id)
-            self.assertTrue(all(item["payload"]["coverage"].get("overview_sampled") for item in stored))
+            self.assertEqual(len(stored), 4)
+            self.assertTrue(all(not item["payload"]["coverage"].get("overview_sampled") for item in stored))
+
+    def test_ten_gb_package_uses_bounded_batches_but_processes_every_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for index in range(7):
+                (root / "doc{}.txt".format(index)).write_text(
+                    "远程证明通过硬件信任根验证运行环境状态。" * 1000,
+                    encoding="utf-8",
+                )
+            scan = scan_directory(root)
+            scan["total_size"] = 10 * 1024 * 1024 * 1024
+            storage = Storage(str(root / "analysis.db"))
+            scan_id = storage.save_scan(scan)
+            import services.package_analysis as package_analysis
+            original = package_analysis._parallel_parse_files
+            batch_sizes = []
+
+            def record_batch(*args, **kwargs):
+                batch_sizes.append(len(args[1]))
+                return original(*args, **kwargs)
+
+            with patch("services.package_analysis._parallel_parse_files", side_effect=record_batch):
+                analysis = analyze_package(
+                    scan_id,
+                    scan,
+                    storage,
+                    UnifiedDocumentParser(max_chars=12000),
+                    large_options={
+                        "threshold_bytes": 1,
+                        "batch_files": 3,
+                        "overview_chars_per_file": 4000,
+                    },
+                )
+            self.assertEqual(batch_sizes, [3, 3, 1])
+            self.assertEqual(analysis["coverage"]["parsed_files"], 7)
+            self.assertEqual(analysis["coverage"]["pending_files"], 0)
+            self.assertEqual(analysis["policy"]["large_package"]["inventory_bytes"], 10 * 1024 * 1024 * 1024)
+            self.assertGreater(len(storage.get_document(scan_id, "doc0.txt")["text"]), 4000)
+
+    def test_content_topics_include_the_end_of_long_documents(self):
+        document = {
+            "structure": {"headings": ["项目背景", "技术结论"]},
+            "text": ("项目背景 通用介绍 " * 3000) + ("远程证明 硬件信任根 " * 2000),
+        }
+        topics = _content_topics(document, 12)
+        self.assertIn("远程证明", topics)
 
     def test_large_package_scope_resume_reuses_checkpoint_and_extends_coverage(self):
         with tempfile.TemporaryDirectory() as folder:
