@@ -21,6 +21,7 @@ const state = {
 
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running', 'cancelling']);
 const TASK_REGISTRY_KEY = 'sjfx_task_registry_v1';
+const CURRENT_SCAN_KEY = 'sjfx_current_scan_id_v1';
 
 const $ = (id) => document.getElementById(id);
 
@@ -206,6 +207,29 @@ function updateSelectionCart() {
     cart.innerHTML = `<strong>已勾选 ${values.length} 个节点</strong> · 组合导出将按源文件去重<br><small>${escapeHtml(values.slice(0, 5).map(x => x.name || x.path).join('、'))}${values.length > 5 ? '…' : ''}</small>`;
   }
   $('exportBtn').disabled = !state.scan || (!values.length && !canExportNode(state.selected));
+}
+
+
+function rememberCurrentScan(scanId) {
+  const value = String(scanId || '').trim();
+  if (!value) return;
+  try {
+    window.localStorage.setItem(CURRENT_SCAN_KEY, value);
+  } catch (_) {
+    // The current page remains usable when browser storage is unavailable.
+  }
+}
+
+
+function forgetCurrentScan(scanId = '') {
+  try {
+    const stored = window.localStorage.getItem(CURRENT_SCAN_KEY) || '';
+    if (!scanId || stored === String(scanId)) {
+      window.localStorage.removeItem(CURRENT_SCAN_KEY);
+    }
+  } catch (_) {
+    // There is nothing else to clean up when browser storage is unavailable.
+  }
 }
 
 
@@ -1683,10 +1707,18 @@ function updateStats() {
     return;
   }
 
-  // A retry/deepening run can coexist with the previous final analysis.
-  // Prefer the live compact card while it exists so coverage and pending/error
-  // counts never appear frozen at the previous run.
-  const displayedAnalysis = state.progressiveAnalysis || state.analysis || {};
+  // A retry/deepening run can coexist with the previous final analysis. Only
+  // prefer its live card while that exact task is still active; persisted
+  // progress rows may otherwise remain at 95% after the final result is saved.
+  const currentJob = state.jobId ? state.jobs.get(state.jobId) : null;
+  const useProgressiveAnalysis = Boolean(
+    state.progressiveAnalysis
+    && currentJob
+    && ACTIVE_JOB_STATUSES.has(currentJob.status)
+  );
+  const displayedAnalysis = useProgressiveAnalysis
+    ? state.progressiveAnalysis
+    : (state.analysis || state.progressiveAnalysis || {});
   const a =
     displayedAnalysis
       ?.statistics
@@ -1788,6 +1820,7 @@ async function refreshScan(scanId = state.scan?.scan_id) {
 
   state.scan =
     data.scan;
+  rememberCurrentScan(state.scan?.scan_id || scanId);
 
   state.analysis =
     data.analysis;
@@ -1842,6 +1875,13 @@ async function refreshScan(scanId = state.scan?.scan_id) {
     !state.analysis;
   if ($('numericQuestionBtn')) {
     $('numericQuestionBtn').disabled = !state.analysis;
+  }
+
+  const requestedRoute = window.SJFXShell?.route;
+  if (requestedRoute === 'analysis' && state.analysis?.analysis_tree) {
+    await $('analysisTreeBtn').onclick();
+  } else if (requestedRoute === 'physical' && state.scan?.tree) {
+    $('physicalTreeBtn').onclick();
   }
 
   updateSelectionCart();
@@ -2035,6 +2075,9 @@ function renderTaskCenter() {
     const heartbeatHtml = status === 'running' || status === 'cancelling'
       ? `<span class="task-heartbeat${heartbeat.stale ? ' stale' : ''}">${escapeHtml(heartbeat.label)}</span>`
       : '';
+    const canOpenResult = status === 'completed'
+      && ['scan_and_analyze', 'analyze_package'].includes(job.task_type)
+      && Boolean(job.result?.scan_id || job.scan_id || job.id);
     return `<article class="task-list-item status-${escapeHtml(status || 'unknown')}" data-task-id="${escapeHtml(job.id)}">`
       + '<div class="task-list-heading">'
       + `<div><strong>${escapeHtml(jobTaskLabel(job.task_type))}</strong><span class="task-id">#${escapeHtml(String(job.id).slice(0, 12))}</span></div>`
@@ -2046,6 +2089,7 @@ function renderTaskCenter() {
       + (job.error && status === 'failed' ? `<p class="task-error-detail">${escapeHtml(job.error)}</p>` : '')
       + '<div class="task-list-actions">'
       + (active ? `<button type="button" class="text-button" data-job-watch="${escapeHtml(job.id)}">查看实时进度</button>` : '')
+      + (canOpenResult ? `<button type="button" class="text-button" data-job-open="${escapeHtml(job.id)}">打开分析结果</button>` : '')
       + (active ? `<button type="button" class="danger compact" data-job-cancel="${escapeHtml(job.id)}" ${cancelling ? 'disabled' : ''}>${cancelling ? '正在取消…' : (status === 'queued' ? '取消排队' : '取消任务')}</button>` : '')
       + '</div></article>';
   }).join('');
@@ -2084,7 +2128,7 @@ async function refreshTaskCenter() {
     let listedIds = null;
     if (state.jobsEndpointAvailable !== false) {
       try {
-        const data = await api('/api/jobs?status=active&limit=50');
+        const data = await api('/api/jobs?status=active&limit=50&compact=1');
         if (!Array.isArray(data.jobs)) throw new Error('任务列表响应格式错误');
         state.jobsEndpointAvailable = true;
         listedIds = new Set();
@@ -2116,11 +2160,68 @@ async function refreshTaskCenter() {
 }
 
 
-function startTaskCenterRefresh() {
+async function startTaskCenterRefresh() {
   loadTaskRegistry();
   renderTaskCenter();
-  refreshTaskCenter();
+  await refreshTaskCenter();
   window.setInterval(refreshTaskCenter, 3000);
+}
+
+
+function scanJobCandidate(jobs) {
+  const scanJobs = jobs.filter((job) =>
+    ['scan_and_analyze', 'analyze_package'].includes(job.task_type)
+    && job.status !== 'failed'
+    && job.status !== 'cancelled'
+  );
+  return scanJobs.find((job) => ACTIVE_JOB_STATUSES.has(job.status))
+    || scanJobs.find((job) => job.status === 'completed')
+    || null;
+}
+
+
+async function restoreWorkspace() {
+  let storedScanId = '';
+  try {
+    storedScanId = window.localStorage.getItem(CURRENT_SCAN_KEY) || '';
+  } catch (_) {
+    storedScanId = '';
+  }
+
+  if (storedScanId) {
+    try {
+      await refreshScan(storedScanId);
+      return;
+    } catch (error) {
+      if ([403, 404].includes(error.status)) forgetCurrentScan(storedScanId);
+    }
+  }
+
+  let candidate = scanJobCandidate([...state.jobs.values()]);
+  if (!candidate) {
+    try {
+      const data = await api('/api/jobs?status=all&limit=50&compact=1');
+      (data.jobs || []).forEach((job) => rememberJob(job));
+      candidate = scanJobCandidate(data.jobs || []);
+    } catch (_) {
+      return;
+    }
+  }
+  if (!candidate) return;
+
+  const jobId = jobIdOf(candidate);
+  if (ACTIVE_JOB_STATUSES.has(candidate.status) && jobId) {
+    pollJob(jobId).catch((error) => toast(error.message || '任务恢复失败', true));
+    return;
+  }
+
+  const scanId = candidate.result?.scan_id || candidate.scan_id || jobId;
+  if (!scanId) return;
+  try {
+    await refreshScan(scanId);
+  } catch (_) {
+    forgetCurrentScan(scanId);
+  }
 }
 
 
@@ -2182,6 +2283,21 @@ async function cancelCurrentJob() {
 }
 
 
+async function openJobResult(jobId) {
+  let job = state.jobs.get(String(jobId || '')) || null;
+  if (!job) {
+    const data = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+    job = rememberJob(data.job || {}, jobId);
+  }
+  const scanId = job?.result?.scan_id || job?.scan_id || jobId;
+  if (!scanId) throw new Error('该任务没有可打开的分析结果');
+  await refreshScan(scanId);
+  const route = state.analysis?.analysis_tree ? 'analysis' : 'physical';
+  if (window.SJFXShell) window.SJFXShell.activate(route);
+  toast(route === 'analysis' ? '已恢复智能分析目录' : '已恢复原始目录');
+}
+
+
 document.addEventListener('click', (event) => {
   const cancelButton = event.target.closest('#cancelJobBtn, #taskCenterCancelBtn, [data-job-cancel]');
   if (cancelButton) {
@@ -2199,6 +2315,13 @@ document.addEventListener('click', (event) => {
     if (!job || !ACTIVE_JOB_STATUSES.has(job.status)) return;
     if (window.SJFXShell) window.SJFXShell.activate('tasks');
     pollJob(jobId).catch((error) => toast(error.message || '任务轮询失败', true));
+    return;
+  }
+  const openButton = event.target.closest('[data-job-open]');
+  if (openButton) {
+    event.preventDefault();
+    openJobResult(openButton.dataset.jobOpen)
+      .catch((error) => toast(error.message || '无法打开分析结果', true));
     return;
   }
   const refreshButton = event.target.closest('#taskCenterRefreshBtn');
@@ -2293,6 +2416,7 @@ async function pollJob(jobId) {
         const existingTree = state.scan?.tree || null;
         const firstInventoryLoad = !existingTree;
         state.scan = partial.scan;
+        rememberCurrentScan(partialScanId);
         if (existingTree) state.scan.tree = existingTree;
         state.analysis = partial.analysis;
         state.progressiveAnalysis = partial.progressive_analysis || null;
@@ -3347,11 +3471,16 @@ async function refreshModelStatus() {
 }
 
 
-refreshModelStatus();
-startTaskCenterRefresh();
-
 window.addEventListener('online', refreshTaskCenter);
 window.SJFXTasks = {
   refresh: refreshTaskCenter,
   cancel: cancelJob
 };
+
+async function initializeApp() {
+  await refreshModelStatus();
+  await startTaskCenterRefresh();
+  await restoreWorkspace();
+}
+
+initializeApp().catch((error) => toast(error.message || '工作区恢复失败', true));

@@ -23,7 +23,7 @@ class FrontendTaskContractTests(unittest.TestCase):
 
     def test_task_client_keeps_queue_and_retry_contracts(self):
         script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("/api/jobs?status=active&limit=50", script)
+        self.assertIn("/api/jobs?status=active&limit=50&compact=1", script)
         self.assertIn("data-job-cancel", script)
         self.assertIn("queue_position", script)
         self.assertIn("blocking_job", script)
@@ -60,6 +60,22 @@ class FrontendTaskContractTests(unittest.TestCase):
         self.assertIn(r"/研究潜力\s*([^·；\n]+)/", shell)
         self.assertNotIn(r"/已分析\s*", shell)
         self.assertNotIn("价值判断：", shell)
+
+    def test_completed_analysis_can_restore_the_workspace_and_requested_tree(self):
+        script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        html = (PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        app_source = (PROJECT_ROOT / "app.py").read_text(encoding="utf-8")
+        self.assertIn("CURRENT_SCAN_KEY", script)
+        self.assertIn("restoreWorkspace", script)
+        self.assertIn("/api/jobs?status=all&limit=50&compact=1", script)
+        self.assertIn("window.SJFXShell?.route", script)
+        self.assertIn("await $('analysisTreeBtn').onclick()", script)
+        self.assertIn("useProgressiveAnalysis", script)
+        self.assertIn("data-job-open", script)
+        self.assertIn("打开分析结果", script)
+        self.assertIn('/static/app.js?v=19', html)
+        self.assertIn("allowed_result_fields", app_source)
+        self.assertIn("_job_api_view(job, compact=compact)", app_source)
 
     def test_python_runtime_contract_is_version_aware(self):
         app_source = (PROJECT_ROOT / "app.py").read_text(encoding="utf-8")

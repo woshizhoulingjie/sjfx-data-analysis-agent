@@ -1875,8 +1875,22 @@ def ask_numeric():
         return api_error(str(exc), 400)
 
 
-def _job_api_view(source, include_blocker=True):
+def _job_api_view(source, include_blocker=True, compact=False):
     job = dict(source or {})
+    if compact:
+        result = job.get("result")
+        if isinstance(result, dict):
+            allowed_result_fields = {
+                "scan_id", "scan_available", "file_name", "download_url",
+                "source_file_count", "selection_count",
+            }
+            job["result"] = {
+                key: value for key, value in result.items()
+                if key in allowed_result_fields
+            }
+        elif result is not None:
+            job["result"] = None
+        job.pop("options", None)
     now = time.time()
     heartbeat_at = job.get("heartbeat_at")
     started_at = job.get("started_at")
@@ -1925,6 +1939,7 @@ def _job_api_view(source, include_blocker=True):
 @app.route("/api/jobs")
 def list_jobs():
     status_filter = str(request.args.get("status", "active") or "active").strip().lower()
+    compact = str(request.args.get("compact", "")).strip().lower() in {"1", "true", "yes"}
     if status_filter == "active":
         statuses = ["queued", "running", "cancelling"]
     elif status_filter in {"queued", "running", "cancelling", "completed", "failed", "cancelled"}:
@@ -1938,7 +1953,7 @@ def list_jobs():
     jobs = storage.list_jobs(owner_id=_request_owner_id(), statuses=statuses, limit=limit)
     return jsonify({
         "ok": True,
-        "jobs": [_job_api_view(job) for job in jobs],
+        "jobs": [_job_api_view(job, compact=compact) for job in jobs],
         "server_time": time.time(),
     })
 
