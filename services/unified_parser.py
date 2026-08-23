@@ -1,4 +1,5 @@
 import hashlib
+import errno
 import gzip
 import io
 import bz2
@@ -11,21 +12,53 @@ import zipfile
 import tarfile
 import tempfile
 import shutil
+import struct
 import time
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree
 
-from services.scanner import extract_text
+from config import Config, content_byte_limit
+from services.scanner import extract_text, is_sensitive_file
 from services.structured_profile import profile_path
 
 
 ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".tar.gz", ".tar.bz2", ".rar", ".7z"}
-ARCHIVE_MAX_ENTRIES = max(1, int(os.getenv("MAX_ARCHIVE_ENTRIES", "1500")))
-ARCHIVE_MAX_MEMBER_BYTES = int(os.getenv("MAX_ARCHIVE_MEMBER_BYTES", str(128 * 1024 * 1024)))
-ARCHIVE_MAX_TOTAL_BYTES = int(os.getenv("MAX_ARCHIVE_UNCOMPRESSED_BYTES", str(2 * 1024 * 1024 * 1024)))
+ARCHIVE_MAX_ENTRIES = Config.MAX_ARCHIVE_ENTRIES
+ARCHIVE_MAX_MEMBER_BYTES = Config.MAX_ARCHIVE_MEMBER_BYTES
+ARCHIVE_MAX_TOTAL_BYTES = Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES
 ARCHIVE_MAX_DEPTH = max(0, int(os.getenv("MAX_ARCHIVE_DEPTH", "1")))
+ARCHIVE_MAX_COMPRESSION_RATIO = Config.MAX_ARCHIVE_COMPRESSION_RATIO
+ARCHIVE_MAX_MEMBER_PATH_DEPTH = Config.MAX_ARCHIVE_MEMBER_PATH_DEPTH
+ZIP_MAX_CENTRAL_DIRECTORY_ENTRIES = Config.MAX_ZIP_CENTRAL_DIRECTORY_ENTRIES
+# A forged EOCD count must not make ZipFile read an arbitrarily large central
+# directory into memory. Keep the byte budget independent from the entry count:
+# names/comments/extras can otherwise make a small number of entries enormous.
+ZIP_MAX_CENTRAL_DIRECTORY_BYTES = max(
+    1024 * 1024,
+    min(
+        256 * 1024 * 1024,
+        int(os.getenv("MAX_ZIP_CENTRAL_DIRECTORY_BYTES", str(64 * 1024 * 1024))),
+    ),
+)
+OFFICE_XML_MEMBER_MAX_BYTES = max(
+    1024 * 1024,
+    min(16 * 1024 * 1024, int(os.getenv("MAX_OFFICE_XML_MEMBER_BYTES", str(8 * 1024 * 1024)))),
+)
+OFFICE_MEDIA_MEMORY_BYTES = max(
+    1024 * 1024,
+    min(256 * 1024 * 1024, int(os.getenv("MAX_OFFICE_MEDIA_MEMORY_BYTES", str(64 * 1024 * 1024)))),
+)
+OFFICE_OCR_TOTAL_BYTES = max(
+    1024 * 1024,
+    min(512 * 1024 * 1024, int(os.getenv("MAX_OFFICE_OCR_TOTAL_BYTES", str(256 * 1024 * 1024)))),
+)
+PARSE_TEMP_DISK_RESERVE_BYTES = Config.PARSE_TEMP_DISK_RESERVE_BYTES
+PARSE_TEMP_STALE_SECONDS = Config.PARSE_TEMP_STALE_SECONDS
+
+_PARSE_TEMP_PREFIX = "sjfx-"
+_OWNED_TEMP_RE = re.compile(r"^sjfx-(?:archive|pdf-repair)-p([0-9]+)-")
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".xlsm",
@@ -88,6 +121,334 @@ def _open_archive_target(path):
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(str(path), flags, 0o600)
     return os.fdopen(descriptor, "wb")
+
+
+def _unlink_quietly(path):
+    """Path.unlink(missing_ok=True) compatible with the Python 3.7 host."""
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _zip_eocd_metadata(path):
+    """Read bounded EOCD/ZIP64 metadata without constructing ``ZipInfo`` objects."""
+    path = Path(path)
+    size = path.stat().st_size
+    tail_size = min(size, 65535 + 22 + 20)
+    with path.open("rb") as stream:
+        stream.seek(size - tail_size)
+        tail = stream.read(tail_size)
+        search_end = len(tail)
+        eocd_index = -1
+        while search_end > 0:
+            candidate = tail.rfind(b"PK\x05\x06", 0, search_end)
+            if candidate < 0:
+                break
+            if candidate + 22 <= len(tail):
+                comment_length = struct.unpack_from("<H", tail, candidate + 20)[0]
+                if candidate + 22 + comment_length == len(tail):
+                    eocd_index = candidate
+                    break
+            search_end = candidate
+        if eocd_index < 0:
+            return None
+        eocd_offset = size - tail_size + eocd_index
+        total_entries = struct.unpack_from("<H", tail, eocd_index + 10)[0]
+        directory_size = struct.unpack_from("<I", tail, eocd_index + 12)[0]
+        directory_offset = struct.unpack_from("<I", tail, eocd_index + 16)[0]
+        zip64_required = (
+            total_entries == 0xFFFF
+            or directory_size == 0xFFFFFFFF
+            or directory_offset == 0xFFFFFFFF
+        )
+        if not zip64_required:
+            return {
+                "declared_entries": int(total_entries),
+                "directory_size": int(directory_size),
+                "directory_offset": int(directory_offset),
+                "directory_end": int(eocd_offset),
+                "zip64": False,
+            }
+
+        if eocd_offset < 20:
+            return None
+        stream.seek(eocd_offset - 20)
+        locator = stream.read(20)
+        if len(locator) != 20 or locator[:4] != b"PK\x06\x07":
+            return None
+
+        # ZIP64 permits an extensible data sector. Locate the record by scanning
+        # a bounded footer window ending immediately before the locator instead
+        # of trusting its relative offset (which changes for prepended archives).
+        locator_offset = eocd_offset - 20
+        search_size = min(locator_offset, 1024 * 1024)
+        stream.seek(locator_offset - search_size)
+        footer = stream.read(search_size)
+        search_end = len(footer)
+        while search_end > 0:
+            candidate = footer.rfind(b"PK\x06\x06", 0, search_end)
+            if candidate < 0:
+                return None
+            if candidate + 56 <= len(footer):
+                record_size = struct.unpack_from("<Q", footer, candidate + 4)[0]
+                if candidate + 12 + record_size == len(footer):
+                    zip64 = footer[candidate:candidate + 56]
+                    zip64_offset = locator_offset - search_size + candidate
+                    return {
+                        "declared_entries": int(struct.unpack_from("<Q", zip64, 32)[0]),
+                        "directory_size": int(struct.unpack_from("<Q", zip64, 40)[0]),
+                        "directory_offset": int(struct.unpack_from("<Q", zip64, 48)[0]),
+                        "directory_end": int(zip64_offset),
+                        "zip64": True,
+                    }
+            search_end = candidate
+    return None
+
+
+def _zip_declared_entry_count(path):
+    """Compatibility helper backed by the hardened EOCD reader."""
+    metadata = _zip_eocd_metadata(path)
+    return metadata["declared_entries"] if metadata else None
+
+
+def _zip_central_directory_preflight(path):
+    """Stream-validate the central directory before ``ZipFile`` materialises it.
+
+    The EOCD count is attacker-controlled. We therefore enforce a byte cap,
+    walk every fixed central-directory header without retaining names/comments,
+    and compare the observed count with the declaration.
+    """
+    metadata = _zip_eocd_metadata(path)
+    if metadata is None:
+        return {
+            "safe": False, "reason": "central_directory_invalid",
+            "declared_entries": 0, "observed_entries": 0, "directory_size": 0,
+        }
+    result = dict(metadata)
+    result.update({"safe": False, "reason": None, "observed_entries": 0})
+    directory_size = int(metadata["directory_size"])
+    directory_end = int(metadata["directory_end"])
+    directory_start = directory_end - directory_size
+    if directory_size < 0 or directory_size > ZIP_MAX_CENTRAL_DIRECTORY_BYTES:
+        result["reason"] = "central_directory_byte_limit"
+        return result
+    if directory_start < 0 or directory_end > Path(path).stat().st_size:
+        result["reason"] = "central_directory_invalid"
+        return result
+
+    observed = 0
+    try:
+        with Path(path).open("rb") as stream:
+            stream.seek(directory_start)
+            cursor = directory_start
+            while cursor < directory_end:
+                fixed = stream.read(46)
+                if len(fixed) != 46 or fixed[:4] != b"PK\x01\x02":
+                    result["reason"] = "central_directory_invalid"
+                    return result
+                name_length, extra_length, comment_length = struct.unpack_from("<HHH", fixed, 28)
+                variable_size = int(name_length) + int(extra_length) + int(comment_length)
+                cursor += 46 + variable_size
+                if cursor > directory_end:
+                    result["reason"] = "central_directory_invalid"
+                    return result
+                stream.seek(variable_size, os.SEEK_CUR)
+                observed += 1
+                result["observed_entries"] = observed
+                if observed > ZIP_MAX_CENTRAL_DIRECTORY_ENTRIES:
+                    result["reason"] = "central_directory_entry_limit"
+                    return result
+    except (OSError, OverflowError, struct.error):
+        result["reason"] = "central_directory_invalid"
+        return result
+
+    if cursor != directory_end:
+        result["reason"] = "central_directory_invalid"
+    elif observed != int(metadata["declared_entries"]):
+        result["reason"] = "central_directory_count_mismatch"
+    else:
+        result["safe"] = True
+    return result
+
+
+def _normalised_bounded_member_name(raw_name):
+    name = posixpath.normpath(str(raw_name or "").replace("\\", "/")).lstrip("/")
+    if not name or name == "." or name.startswith("../") or "/../" in name:
+        return None
+    parts = [part for part in name.split("/") if part not in {"", "."}]
+    if max(0, len(parts) - 1) > ARCHIVE_MAX_MEMBER_PATH_DEPTH:
+        return None
+    return name
+
+
+def _bounded_office_zip_inventory(path, archive, expected_count):
+    """Return safe OOXML members under the same budgets as normal archives."""
+    materialized_count = len(archive.filelist)
+    if materialized_count != int(expected_count):
+        raise ValueError("Office ZIP 中央目录在预检后发生变化")
+    if materialized_count > ZIP_MAX_CENTRAL_DIRECTORY_ENTRIES:
+        raise ValueError("Office ZIP 成员数量超过安全上限")
+
+    ratio_limit = max(1, int(Path(path).stat().st_size * ARCHIVE_MAX_COMPRESSION_RATIO))
+    total_limit = min(ARCHIVE_MAX_TOTAL_BYTES, ratio_limit, OFFICE_OCR_TOTAL_BYTES)
+    total_declared = 0
+    safe = {}
+    warnings = []
+    duplicate_names = set()
+    for info in archive.filelist:
+        if info.is_dir():
+            continue
+        name = _normalised_bounded_member_name(info.filename)
+        if name is None:
+            warnings.append("已跳过路径不安全或过深的 Office 成员：{}".format(str(info.filename)[:160]))
+            continue
+        if name in safe:
+            duplicate_names.add(name)
+            safe.pop(name, None)
+            warnings.append("已跳过名称重复的 Office 成员：{}".format(name))
+            continue
+        if name in duplicate_names:
+            continue
+        if info.flag_bits & 0x1:
+            warnings.append("已跳过需要密码的加密 Office 成员：{}".format(name))
+            continue
+        declared_size = int(info.file_size)
+        compressed_size = int(info.compress_size)
+        ratio = float("inf") if declared_size > 0 and compressed_size <= 0 else (
+            declared_size / float(compressed_size or 1)
+        )
+        if declared_size < 0 or declared_size > ARCHIVE_MAX_MEMBER_BYTES:
+            warnings.append("已跳过超过成员大小上限的 Office 成员：{}".format(name))
+            continue
+        if declared_size > 0 and ratio > ARCHIVE_MAX_COMPRESSION_RATIO:
+            warnings.append("已跳过压缩比超过安全上限的 Office 成员：{}".format(name))
+            continue
+        if total_declared + declared_size > total_limit:
+            warnings.append("已跳过超过累计解压预算的 Office 成员：{}".format(name))
+            continue
+        total_declared += declared_size
+        safe[name] = info
+    return safe, warnings, total_limit
+
+
+def _read_zip_info_bounded(archive, info, per_member_limit, remaining_total):
+    """Read one already-validated ZIP member without an unbounded ``read()``."""
+    allowed = min(
+        ARCHIVE_MAX_MEMBER_BYTES,
+        max(0, int(per_member_limit)),
+        max(0, int(remaining_total)),
+    )
+    if int(info.file_size) > allowed:
+        raise ValueError("成员声明大小超过内存读取预算")
+    payload = bytearray()
+    with archive.open(info) as source:
+        while True:
+            chunk = source.read(min(1024 * 1024, allowed - len(payload) + 1))
+            if not chunk:
+                break
+            if len(payload) + len(chunk) > allowed:
+                raise ValueError("成员实际解压大小超过内存读取预算")
+            payload.extend(chunk)
+    return bytes(payload)
+
+
+def _preflight_office_package(path):
+    """Reject unsafe OOXML containers before Docling/openpyxl sees them."""
+    central_directory = _zip_central_directory_preflight(path)
+    if not central_directory.get("safe"):
+        raise ValueError(
+            "Office ZIP 中央目录预检失败：{}".format(
+                central_directory.get("reason") or "central_directory_invalid"
+            )
+        )
+    with zipfile.ZipFile(str(path)) as archive:
+        safe, warnings, _total_limit = _bounded_office_zip_inventory(
+            path, archive, central_directory.get("observed_entries") or 0,
+        )
+        file_count = sum(1 for info in archive.filelist if not info.is_dir())
+        if warnings or len(safe) != file_count:
+            raise ValueError((warnings or ["Office ZIP 成员未通过安全预算"])[0])
+    return central_directory
+
+
+def _configured_parse_temp_root():
+    """Return the private, configurable parsing scratch root."""
+    root = Path(os.getenv("SJFX_PARSE_TEMP_DIR", str(Config.PARSE_TEMP_DIR))).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            root.chmod(0o700)
+        except OSError:
+            pass
+    return root
+
+
+def _pid_is_alive(pid):
+    if pid == os.getpid():
+        return True
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        return exc.errno not in {errno.ESRCH, errno.EINVAL}
+
+
+def cleanup_stale_parse_temp_dirs(temp_root=None, stale_seconds=None):
+    """Remove abandoned parser scratch objects without touching live workers.
+
+    Parser subprocesses include their PID in every scratch name. A parent or a
+    later worker can therefore clean objects left by a hard timeout immediately
+    after the owner exits. Legacy scratch names are removed only after the
+    configured age threshold. Only children below the configured root and with
+    an application-owned prefix are ever considered.
+    """
+    root = Path(temp_root or _configured_parse_temp_root()).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        return 0
+    threshold = PARSE_TEMP_STALE_SECONDS if stale_seconds is None else max(0, float(stale_seconds))
+    now = time.time()
+    removed = 0
+    try:
+        with os.scandir(str(root)) as iterator:
+            for entry in iterator:
+                child = Path(entry.path)
+                if not child.name.startswith(_PARSE_TEMP_PREFIX):
+                    continue
+                try:
+                    child.resolve(strict=False).relative_to(root)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                owner = _OWNED_TEMP_RE.match(child.name)
+                try:
+                    age = max(0.0, now - child.lstat().st_mtime)
+                except OSError:
+                    continue
+                if owner:
+                    should_remove = not _pid_is_alive(int(owner.group(1)))
+                else:
+                    should_remove = age >= threshold
+                if not should_remove:
+                    continue
+                try:
+                    if child.is_symlink() or not child.is_dir():
+                        child.unlink()
+                    else:
+                        shutil.rmtree(str(child))
+                    removed += 1
+                except OSError:
+                    continue
+    except OSError:
+        return removed
+    return removed
 
 
 def _get_value(obj, name, default=None):
@@ -176,6 +537,11 @@ class UnifiedDocumentParser:
         self._converter_error = None
         self._ocr_engine = None
         self._lock = threading.Lock()
+        self.parse_temp_root = _configured_parse_temp_root()
+        # A SIGKILL/timeout cannot run a child's finally block. Reaping dead
+        # PID-owned objects on each parser construction gives the parent and
+        # the next worker a deterministic recovery path.
+        cleanup_stale_parse_temp_dirs(self.parse_temp_root)
         # These flags also cover direct use outside app.py/config.py.
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -350,7 +716,11 @@ class UnifiedDocumentParser:
         except Exception as original_error:
             reason = "PDF 结构校验失败：{}".format(str(original_error)[:300])
 
-        fd, temp_name = tempfile.mkstemp(prefix="sjfx-pdf-repair-", suffix=".pdf")
+        fd, temp_name = tempfile.mkstemp(
+            prefix="sjfx-pdf-repair-p{}-".format(os.getpid()),
+            suffix=".pdf",
+            dir=str(self.parse_temp_root),
+        )
         os.close(fd)
         repaired = Path(temp_name)
         try:
@@ -371,10 +741,10 @@ class UnifiedDocumentParser:
                     return repaired, "检测到损坏 PDF，已使用 pikepdf 恢复副本后解析。"
             except Exception:
                 pass
-            repaired.unlink(missing_ok=True)
+            _unlink_quietly(repaired)
             return None, reason + "；本地恢复工具未能重建该文件。请重新获取或重新导出原始 PDF。"
         except (OSError, subprocess.SubprocessError) as exc:
-            repaired.unlink(missing_ok=True)
+            _unlink_quietly(repaired)
             return None, reason + "；PDF 恢复尝试失败：{}".format(str(exc)[:200])
 
     def parse(self, path, relative_path=None, mode="accurate", _archive_depth=0):
@@ -383,18 +753,19 @@ class UnifiedDocumentParser:
         ext = path.suffix.lower()
         archive_name = path.name.lower()
         is_archive = ext in ARCHIVE_EXTENSIONS or archive_name.endswith(".tar.gz") or archive_name.endswith(".tar.bz2")
-        # Keep parser behaviour aligned with Config.MAX_SINGLE_FILE_BYTES and
-        # the value shown by /api/status.  A deployment may explicitly raise
-        # this limit in .env after evaluating its memory and time budget.
-        max_single_file_bytes = max(1, int(os.getenv("MAX_SINGLE_FILE_BYTES", str(10 * 1024 * 1024 * 1024))))
-        max_archive_file_bytes = max(
-            max_single_file_bytes,
-            int(os.getenv("MAX_ARCHIVE_FILE_BYTES", str(5 * 1024 * 1024 * 1024))),
-        )
+        sensitive_content = is_sensitive_file(path.name)
+        # Resolve the budgets at parse time so tests and supervised workers may
+        # lower them without restarting. Both remain bounded by the central
+        # 10 GiB product contract in config.content_byte_limit().
+        max_single_file_bytes = content_byte_limit("MAX_SINGLE_FILE_BYTES")
+        max_archive_file_bytes = content_byte_limit("MAX_ARCHIVE_FILE_BYTES")
         effective_file_limit = max_archive_file_bytes if is_archive else max_single_file_bytes
         relative_path = str(relative_path or path.name).replace("\\", "/")
         mode = "fast" if str(mode).lower() == "fast" else "accurate"
-        source_hash = sha256_file(path)
+        over_size_limit = file_size > effective_file_limit
+        # Reject by inventory size before a 10+ GiB sequential read.  Accepted
+        # inputs are hashed as part of the authoritative parse contract.
+        source_hash = "" if over_size_limit else sha256_file(path)
         base = {
             "schema_version": "unified-document/1.0",
             "source": {
@@ -405,6 +776,8 @@ class UnifiedDocumentParser:
                 "size": file_size,
                 "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
                 "sha256": source_hash,
+                "sensitive": sensitive_content,
+                "content_policy": "metadata_only_sensitive" if sensitive_content else "parse_if_supported",
             },
             "parsed_at": utc_now(),
             "parser": {},
@@ -423,16 +796,47 @@ class UnifiedDocumentParser:
             "evidence": [],
             "warnings": [],
         }
-        if file_size > effective_file_limit:
+        if over_size_limit:
             base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
             base["coverage"].update({"complete": False, "coverage_ratio": 0.0, "limited_by_size": True})
             limit_label = "压缩容器" if is_archive else "单文件"
-            base["warnings"].append("文件超过{}解析上限（{} 字节），仅保留元数据和哈希。".format(limit_label, effective_file_limit))
+            base["warnings"].append("文件超过{}解析上限（{} 字节），已在读取正文或计算哈希前拒绝。".format(limit_label, effective_file_limit))
+            return base
+        if sensitive_content:
+            base["parser"] = {"name": "metadata-only", "degraded": False, "ocr": False}
+            base["coverage"].update({
+                "complete": False,
+                "coverage_ratio": 0.0,
+                "content_restricted": True,
+                "restriction_reason": "sensitive_metadata_only",
+            })
+            base["warnings"].append("敏感文件已纳入物理清单，但依据安全策略仅保留元数据和完整性哈希，不读取正文、不送入模型。")
             return base
         if ext not in SUPPORTED_EXTENSIONS:
             base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
             base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
             return base
+
+        # OOXML files are ZIP containers even though users perceive them as
+        # documents. Validate their complete member inventory before any
+        # third-party parser can materialise an oversized/deceptive member.
+        if ext in {".docx", ".pptx", ".xlsx", ".xlsm"}:
+            try:
+                _preflight_office_package(path)
+            except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile) as exc:
+                base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
+                base["coverage"].update({
+                    "complete": False,
+                    "coverage_ratio": 0.0,
+                    "content_restricted": True,
+                    "restriction_reason": "unsafe_office_archive",
+                })
+                base["warnings"].append(
+                    "Office 文档未通过压缩容器安全预检，未读取正文或送入模型：{}".format(
+                        str(exc)[:300]
+                    )
+                )
+                return base
 
         # A surprising number of field PDFs are interrupted copies: their page
         # streams may still be present, but the xref/trailer is missing.  Do
@@ -503,7 +907,7 @@ class UnifiedDocumentParser:
 
         if repaired_path:
             try:
-                repaired_path.unlink(missing_ok=True)
+                _unlink_quietly(repaired_path)
             except OSError:
                 pass
         if ext == ".pdf" and not base["text"].strip() and _looks_like_corrupt_pdf_warning(base["warnings"]):
@@ -549,12 +953,7 @@ class UnifiedDocumentParser:
         return base
 
     def _parse_archive(self, path, base, mode="accurate", archive_depth=0):
-        """Parse supported members without writing into the user's data root.
-
-        Every member is size/path checked before extraction. The archive remains
-        one source document in the inventory, while its member paths and
-        evidence are visible in the generated summary.
-        """
+        """Parse supported archive members inside a private, bounded scratch root."""
         base["parser"] = {"name": "archive-members", "degraded": False, "archive": True, "mode": mode}
         base["structure"]["archive_member_count"] = 0
         base["structure"]["archive_members"] = []
@@ -570,41 +969,161 @@ class UnifiedDocumentParser:
             "skip_reasons": {},
             "member_records": [],
             "member_records_truncated": False,
+            "encrypted_members": 0,
+            "inventory_truncated": False,
+            "limits": {
+                "max_entries": ARCHIVE_MAX_ENTRIES,
+                "max_zip_central_directory_entries": ZIP_MAX_CENTRAL_DIRECTORY_ENTRIES,
+                "max_member_bytes": ARCHIVE_MAX_MEMBER_BYTES,
+                "max_uncompressed_bytes": ARCHIVE_MAX_TOTAL_BYTES,
+                "max_compression_ratio": ARCHIVE_MAX_COMPRESSION_RATIO,
+                "max_member_path_depth": ARCHIVE_MAX_MEMBER_PATH_DEPTH,
+            },
         }
         if archive_depth >= ARCHIVE_MAX_DEPTH:
             base["parser"]["degraded"] = True
             base["warnings"].append("压缩包嵌套层级达到安全上限，未继续展开。")
             return
-        total_uncompressed = 0
-        member_index = 0
-        temp_root = Path(tempfile.mkdtemp(prefix="sjfx-archive-"))
+
+        cleanup_stale_parse_temp_dirs(self.parse_temp_root)
+        temp_root = Path(tempfile.mkdtemp(
+            prefix="sjfx-archive-p{}-".format(os.getpid()),
+            dir=str(self.parse_temp_root),
+        ))
+        if os.name != "nt":
+            try:
+                temp_root.chmod(0o700)
+            except OSError:
+                pass
         try:
-            entries = []
             name = path.name.lower()
             if name.endswith(".zip"):
+                central_directory = _zip_central_directory_preflight(path)
+                declared_hint = int(central_directory.get("declared_entries") or 0)
+                observed_hint = int(central_directory.get("observed_entries") or 0)
+                if not central_directory.get("safe"):
+                    manifest = base["archive_manifest"]
+                    total_hint = max(declared_hint, observed_hint)
+                    reason = central_directory.get("reason") or "central_directory_invalid"
+                    manifest["declared_total_members"] = declared_hint
+                    manifest["observed_central_directory_members"] = observed_hint
+                    manifest["central_directory_bytes"] = int(central_directory.get("directory_size") or 0)
+                    manifest["total_members"] = total_hint
+                    manifest["skipped_members"] = total_hint
+                    manifest["inventory_truncated"] = True
+                    manifest["member_records_truncated"] = True
+                    manifest["skip_reasons"][reason] = max(1, total_hint)
+                    base["parser"]["degraded"] = True
+                    base["warnings"].append(
+                        "ZIP 中央目录预检失败（声明 {} 个、观察 {} 个、{} 字节、原因 {}），"
+                        "已在加载条目清单前拒绝。".format(
+                            declared_hint, observed_hint,
+                            int(central_directory.get("directory_size") or 0), reason,
+                        )
+                    )
+                    return
                 with zipfile.ZipFile(str(path)) as archive:
-                    entries = [(info.filename, int(info.file_size), lambda info=info: archive.open(info)) for info in archive.infolist() if not info.is_dir()]
-                    self._parse_archive_entries(path, base, entries, temp_root, mode, archive_depth)
+                    # Revalidate after the standard library has parsed the
+                    # directory. This catches a file replacement/mutation
+                    # between preflight and open without creating another list.
+                    materialized_count = len(archive.filelist)
+                    if (
+                        materialized_count > ZIP_MAX_CENTRAL_DIRECTORY_ENTRIES
+                        or materialized_count != observed_hint
+                    ):
+                        manifest = base["archive_manifest"]
+                        manifest["declared_total_members"] = declared_hint
+                        manifest["observed_central_directory_members"] = observed_hint
+                        manifest["materialized_central_directory_members"] = materialized_count
+                        manifest["total_members"] = max(declared_hint, observed_hint, materialized_count)
+                        manifest["skipped_members"] = manifest["total_members"]
+                        manifest["inventory_truncated"] = True
+                        manifest["member_records_truncated"] = True
+                        reason = (
+                            "central_directory_entry_limit"
+                            if materialized_count > ZIP_MAX_CENTRAL_DIRECTORY_ENTRIES
+                            else "central_directory_changed"
+                        )
+                        manifest["skip_reasons"][reason] = max(1, manifest["total_members"])
+                        base["parser"]["degraded"] = True
+                        base["warnings"].append("ZIP 中央目录在预检后发生变化，已拒绝解析。")
+                        return
+                    # ZipFile necessarily reads its central directory on open.
+                    # Do not create a second unbounded list via infolist();
+                    # retain only the bounded prefix plus one sentinel.
+                    entries = []
+                    declared_total = 0
+                    for info in archive.filelist:
+                        if info.is_dir():
+                            continue
+                        declared_total += 1
+                        if len(entries) <= ARCHIVE_MAX_ENTRIES:
+                            entries.append({
+                                "name": info.filename,
+                                "declared_size": int(info.file_size),
+                                "compressed_size": int(info.compress_size),
+                                "encrypted": bool(info.flag_bits & 0x1),
+                                "opener": lambda info=info: archive.open(info),
+                            })
+                    truncated = declared_total > ARCHIVE_MAX_ENTRIES
+                    base["archive_manifest"]["inventory_truncated"] = truncated
+                    base["archive_manifest"]["declared_total_members"] = declared_total
+                    self._parse_archive_entries(
+                        path, base, entries, temp_root, mode, archive_depth,
+                        declared_total_members=declared_total,
+                    )
                     return
             if name.endswith(".gz") and not name.endswith((".tar.gz", ".tgz")):
-                with gzip.open(str(path), "rb") as source:
-                    blob = source.read(ARCHIVE_MAX_MEMBER_BYTES + 1)
-                self._parse_archive_entries(path, base, [(Path(path.stem).name + ".txt", len(blob), lambda blob=blob: io.BytesIO(blob))], temp_root, mode, archive_depth)
+                self._parse_archive_entries(
+                    path, base,
+                    [{
+                        "name": Path(path.stem).name + ".txt",
+                        "declared_size": 0,
+                        "compressed_size": int(path.stat().st_size),
+                        "encrypted": False,
+                        "opener": lambda: gzip.open(str(path), "rb"),
+                    }],
+                    temp_root, mode, archive_depth,
+                )
                 return
             if name.endswith(".bz2") and not name.endswith((".tar.bz2", ".tbz")):
-                with bz2.open(str(path), "rb") as source:
-                    blob = source.read(ARCHIVE_MAX_MEMBER_BYTES + 1)
-                self._parse_archive_entries(path, base, [(Path(path.stem).name + ".txt", len(blob), lambda blob=blob: io.BytesIO(blob))], temp_root, mode, archive_depth)
+                self._parse_archive_entries(
+                    path, base,
+                    [{
+                        "name": Path(path.stem).name + ".txt",
+                        "declared_size": 0,
+                        "compressed_size": int(path.stat().st_size),
+                        "encrypted": False,
+                        "opener": lambda: bz2.open(str(path), "rb"),
+                    }],
+                    temp_root, mode, archive_depth,
+                )
                 return
             if name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz")):
-                tar_mode = "r:*"
-                with tarfile.open(str(path), tar_mode) as archive:
-                    entries = [(info.name, int(info.size), lambda info=info, archive=archive: archive.extractfile(info)) for info in archive.getmembers() if info.isfile()]
+                with tarfile.open(str(path), "r:*") as archive:
+                    # getmembers() materialises an unbounded TAR inventory.
+                    # Stop after the cap plus one sentinel and mark the count as
+                    # a lower bound when more members exist.
+                    entries = []
+                    for info in archive:
+                        if not info.isfile():
+                            continue
+                        entries.append({
+                            "name": info.name,
+                            "declared_size": int(info.size),
+                            "compressed_size": None,
+                            "encrypted": False,
+                            "opener": lambda info=info, archive=archive: archive.extractfile(info),
+                        })
+                        if len(entries) > ARCHIVE_MAX_ENTRIES:
+                            base["archive_manifest"]["inventory_truncated"] = True
+                            base["archive_manifest"]["total_members_is_lower_bound"] = True
+                            break
                     self._parse_archive_entries(path, base, entries, temp_root, mode, archive_depth)
                     return
             base["parser"]["degraded"] = True
             base["warnings"].append("当前环境未安装 RAR/7z 解包组件；仅保留压缩包元数据。")
-        except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as exc:
+        except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile, tarfile.TarError) as exc:
             base["parser"]["degraded"] = True
             if isinstance(exc, zipfile.BadZipFile):
                 base["warnings"].append(
@@ -615,12 +1134,25 @@ class UnifiedDocumentParser:
         finally:
             shutil.rmtree(str(temp_root), ignore_errors=True)
 
-    def _parse_archive_entries(self, path, base, entries, temp_root, mode, archive_depth):
+    def _parse_archive_entries(self, path, base, entries, temp_root, mode, archive_depth,
+                               declared_total_members=None):
         total_uncompressed = 0
         manifest = base["archive_manifest"]
-        manifest["total_members"] = len(entries)
+        declared_total = len(entries) if declared_total_members is None else max(0, int(declared_total_members))
+        manifest["total_members"] = max(len(entries), declared_total)
+        ratio_total_limit = max(1, int(path.stat().st_size * ARCHIVE_MAX_COMPRESSION_RATIO))
+        effective_total_limit = min(ARCHIVE_MAX_TOTAL_BYTES, ratio_total_limit)
+        archive_warning_count = 0
 
-        def record(member_name, status, reason=None):
+        def warn(message):
+            nonlocal archive_warning_count
+            archive_warning_count += 1
+            if archive_warning_count <= 200:
+                base["warnings"].append(message)
+            elif archive_warning_count == 201:
+                base["warnings"].append("压缩包成员告警超过 200 条，后续同类告警已折叠到清单统计。")
+
+        def record(member_name, status, reason=None, detail=None):
             key = "{}_members".format(status)
             if key in manifest:
                 manifest[key] += 1
@@ -628,54 +1160,124 @@ class UnifiedDocumentParser:
                 reasons = manifest["skip_reasons"]
                 reasons[reason] = int(reasons.get(reason) or 0) + 1
             if len(manifest["member_records"]) < 500:
-                manifest["member_records"].append({
-                    "member": str(member_name)[:500], "status": status, "reason": reason,
-                })
+                item = {
+                    "member": str(member_name)[:500],
+                    "status": status,
+                    "reason": reason,
+                }
+                if detail:
+                    item["error"] = str(detail)[:300]
+                manifest["member_records"].append(item)
             else:
                 manifest["member_records_truncated"] = True
 
-        for entry_index, (raw_name, declared_size, opener) in enumerate(entries):
-            if len(base["structure"]["archive_members"]) >= ARCHIVE_MAX_ENTRIES:
-                base["warnings"].append("压缩包成员超过 {} 个，仅保留前部成员。".format(ARCHIVE_MAX_ENTRIES))
-                for remaining_name, _size, _opener in entries[entry_index:]:
-                    record(remaining_name, "skipped", "member_count_limit")
+        for entry_index, entry in enumerate(entries):
+            raw_name = entry.get("name")
+            declared_size = int(entry.get("declared_size") or 0)
+            compressed_size = entry.get("compressed_size")
+            opener = entry.get("opener")
+            if entry_index >= ARCHIVE_MAX_ENTRIES:
+                warn("压缩包成员超过 {} 个，仅解析有界前缀。".format(ARCHIVE_MAX_ENTRIES))
+                for remaining in entries[entry_index:]:
+                    record(remaining.get("name"), "skipped", "member_count_limit")
                 break
+
             member_name = posixpath.normpath(str(raw_name).replace("\\", "/")).lstrip("/")
             if not member_name or member_name == "." or member_name.startswith("../") or "/../" in member_name:
-                base["warnings"].append("已跳过越界压缩包成员：{}".format(raw_name))
+                warn("已跳过越界压缩包成员：{}".format(raw_name))
                 record(raw_name, "skipped", "unsafe_path")
                 continue
-            if declared_size < 0 or declared_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + declared_size > ARCHIVE_MAX_TOTAL_BYTES:
-                base["warnings"].append("已跳过超过安全大小限制的压缩包成员：{}".format(member_name))
-                record(member_name, "skipped", "size_limit")
+            member_parts = [part for part in member_name.split("/") if part not in {"", "."}]
+            if max(0, len(member_parts) - 1) > ARCHIVE_MAX_MEMBER_PATH_DEPTH:
+                warn("已跳过目录层级超过安全上限的压缩包成员：{}".format(member_name))
+                record(member_name, "skipped", "member_path_depth_limit")
                 continue
+            if entry.get("encrypted"):
+                manifest["encrypted_members"] += 1
+                warn("已跳过需要密码的加密压缩包成员：{}".format(member_name))
+                record(member_name, "skipped", "encrypted_member", "password required")
+                continue
+            if compressed_size is not None and declared_size > 0:
+                ratio = float("inf") if int(compressed_size) <= 0 else declared_size / float(compressed_size)
+                if ratio > ARCHIVE_MAX_COMPRESSION_RATIO:
+                    warn("已跳过压缩比超过安全上限的成员：{}".format(member_name))
+                    record(member_name, "skipped", "compression_ratio_limit")
+                    continue
+            if (
+                declared_size < 0
+                or declared_size > ARCHIVE_MAX_MEMBER_BYTES
+                or total_uncompressed + declared_size > effective_total_limit
+            ):
+                reason = (
+                    "compression_ratio_limit"
+                    if total_uncompressed + declared_size > ratio_total_limit
+                    else "size_limit"
+                )
+                warn("已跳过超过安全大小或压缩比限制的成员：{}".format(member_name))
+                record(member_name, "skipped", reason)
+                continue
+
             destination = _safe_archive_destination(temp_root, member_name)
             if destination is None:
-                base["warnings"].append("已跳过解析后越界或含符号链接的压缩包成员：{}".format(raw_name))
+                warn("已跳过解析后越界或含符号链接的压缩包成员：{}".format(raw_name))
                 record(raw_name, "skipped", "unsafe_path")
                 continue
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                # A parent could have changed between the first resolve and
-                # mkdir (for example, when another process touches the temp
-                # directory).  Re-check the fully resolved path immediately
-                # before opening it.
                 destination = _safe_archive_destination(temp_root, member_name)
                 if destination is None or destination.is_symlink():
                     raise ValueError("extraction target escaped temporary root")
                 destination.parent.mkdir(parents=True, exist_ok=True)
             except (OSError, ValueError) as exc:
-                base["warnings"].append("已跳过不安全的压缩包成员 {}：{}".format(member_name, str(exc)[:160]))
-                record(member_name, "skipped", "unsafe_path")
+                warn("已跳过不安全的压缩包成员 {}：{}".format(member_name, str(exc)[:160]))
+                record(member_name, "skipped", "unsafe_path", exc)
                 continue
-            source = opener()
+
+            try:
+                free_for_parse = max(
+                    0,
+                    int(shutil.disk_usage(str(temp_root)).free) - PARSE_TEMP_DISK_RESERVE_BYTES,
+                )
+            except OSError:
+                free_for_parse = 0
+            if declared_size > 0 and declared_size > free_for_parse:
+                warn("临时解析空间不足，已跳过压缩包成员：{}".format(member_name))
+                record(member_name, "skipped", "temporary_space_limit")
+                continue
+
+            try:
+                source = opener()
+            except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile) as exc:
+                message = str(exc).lower()
+                encrypted = isinstance(exc, RuntimeError) and ("password" in message or "encrypted" in message)
+                if encrypted:
+                    manifest["encrypted_members"] += 1
+                    warn("已跳过需要密码的加密压缩包成员：{}".format(member_name))
+                    record(member_name, "skipped", "encrypted_member", exc)
+                else:
+                    warn("压缩包成员无法读取 {}：{}".format(member_name, str(exc)[:160]))
+                    record(member_name, "failed", "member_unreadable", exc)
+                continue
             if source is None:
                 record(member_name, "failed", "member_unreadable")
                 continue
-            allowed_member_bytes = min(
-                ARCHIVE_MAX_MEMBER_BYTES,
-                max(0, ARCHIVE_MAX_TOTAL_BYTES - total_uncompressed),
-            )
+
+            remaining_limits = [
+                (ARCHIVE_MAX_MEMBER_BYTES, "size_limit"),
+                (max(0, ARCHIVE_MAX_TOTAL_BYTES - total_uncompressed), "size_limit"),
+                (max(0, ratio_total_limit - total_uncompressed), "compression_ratio_limit"),
+                (free_for_parse, "temporary_space_limit"),
+            ]
+            allowed_member_bytes, stream_limit_reason = min(remaining_limits, key=lambda item: item[0])
+            if allowed_member_bytes <= 0:
+                try:
+                    source.close()
+                except Exception:
+                    pass
+                warn("安全预算不足，已跳过压缩包成员：{}".format(member_name))
+                record(member_name, "skipped", stream_limit_reason)
+                continue
+
             copied_bytes = 0
             exceeded_stream_limit = False
             try:
@@ -689,42 +1291,63 @@ class UnifiedDocumentParser:
                             break
                         target.write(chunk)
                         copied_bytes += len(chunk)
-            except (OSError, ValueError) as exc:
-                destination.unlink(missing_ok=True)
-                base["warnings"].append("压缩包成员 {} 写入失败：{}".format(member_name, str(exc)[:160]))
-                record(member_name, "failed", "extraction_error")
+            except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile) as exc:
+                _unlink_quietly(destination)
+                message = str(exc).lower()
+                encrypted = isinstance(exc, RuntimeError) and ("password" in message or "encrypted" in message)
+                if encrypted:
+                    manifest["encrypted_members"] += 1
+                    warn("已跳过需要密码的加密压缩包成员：{}".format(member_name))
+                    record(member_name, "skipped", "encrypted_member", exc)
+                else:
+                    warn("压缩包成员 {} 写入失败：{}".format(member_name, str(exc)[:160]))
+                    record(member_name, "failed", "extraction_error", exc)
                 continue
             if exceeded_stream_limit:
-                destination.unlink(missing_ok=True)
-                base["warnings"].append("已中止实际解压后超过限制的压缩包成员：{}".format(member_name))
-                record(member_name, "skipped", "stream_size_limit")
+                _unlink_quietly(destination)
+                warn("已中止实际解压后超过限制的压缩包成员：{}".format(member_name))
+                record(member_name, "skipped", stream_limit_reason)
                 continue
-            # Resolve once more after writing.  This catches a symlink race and
-            # prevents a later parser from reading a path outside the sandbox.
             if _safe_archive_destination(temp_root, member_name) != destination:
-                destination.unlink(missing_ok=True)
-                base["warnings"].append("已丢弃写入后越界的压缩包成员：{}".format(member_name))
+                _unlink_quietly(destination)
+                warn("已丢弃写入后越界的压缩包成员：{}".format(member_name))
                 record(member_name, "skipped", "unsafe_path")
                 continue
+
             actual_size = copied_bytes
-            if actual_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + actual_size > ARCHIVE_MAX_TOTAL_BYTES:
-                destination.unlink(missing_ok=True)
-                base["warnings"].append("已跳过实际解压后超过限制的成员：{}".format(member_name))
-                record(member_name, "skipped", "size_limit")
+            if actual_size > ARCHIVE_MAX_MEMBER_BYTES or total_uncompressed + actual_size > effective_total_limit:
+                _unlink_quietly(destination)
+                reason = (
+                    "compression_ratio_limit"
+                    if total_uncompressed + actual_size > ratio_total_limit
+                    else "size_limit"
+                )
+                warn("已跳过实际解压后超过限制的成员：{}".format(member_name))
+                record(member_name, "skipped", reason)
                 continue
+
             total_uncompressed += actual_size
             base["structure"]["archive_members"].append(member_name)
             base["structure"]["archive_member_count"] += 1
             child_ext = destination.suffix.lower()
             if child_ext not in SUPPORTED_EXTENSIONS or child_ext in ARCHIVE_EXTENSIONS:
                 record(member_name, "skipped", "unsupported_or_nested_type")
+                _unlink_quietly(destination)
                 continue
             try:
-                child = self.parse(destination, relative_path=member_name, mode=mode, _archive_depth=archive_depth + 1)
+                child = self.parse(
+                    destination,
+                    relative_path=member_name,
+                    mode=mode,
+                    _archive_depth=archive_depth + 1,
+                )
             except Exception as exc:
-                base["warnings"].append("成员 {} 解析失败：{}".format(member_name, exc))
-                record(member_name, "failed", "parse_error")
+                _unlink_quietly(destination)
+                warn("成员 {} 解析失败：{}".format(member_name, exc))
+                record(member_name, "failed", "parse_error", exc)
                 continue
+            _unlink_quietly(destination)
+
             record(member_name, "parsed")
             if not (child.get("coverage") or {}).get("complete", True):
                 manifest["truncated_members"] += 1
@@ -743,18 +1366,25 @@ class UnifiedDocumentParser:
                 if len(base["evidence"]) >= 3000:
                     break
             if child.get("data_profile"):
-                base.setdefault("data_profiles", []).append({"member": member_name, "profile": child["data_profile"]})
+                base.setdefault("data_profiles", []).append({
+                    "member": member_name,
+                    "profile": child["data_profile"],
+                })
             if len(base["evidence"]) >= 3000:
                 remaining = max(0, len(entries) - entry_index - 1)
-                for remaining_name, _size, _opener in entries[entry_index + 1:]:
-                    record(remaining_name, "skipped", "evidence_limit")
+                for remaining_entry in entries[entry_index + 1:]:
+                    record(remaining_entry.get("name"), "skipped", "evidence_limit")
                 if remaining:
-                    base["warnings"].append("证据数量达到上限，后续 {} 个成员未继续解析。".format(remaining))
+                    warn("证据数量达到上限，后续 {} 个成员未继续解析。".format(remaining))
                 break
+
         handled = manifest["parsed_members"] + manifest["skipped_members"] + manifest["failed_members"]
         if handled < manifest["total_members"]:
-            manifest["skipped_members"] += manifest["total_members"] - handled
-            manifest["skip_reasons"]["not_processed"] = manifest["total_members"] - handled
+            remainder = manifest["total_members"] - handled
+            reason = "member_count_limit" if manifest.get("inventory_truncated") else "not_processed"
+            manifest["skipped_members"] += remainder
+            manifest["skip_reasons"][reason] = int(manifest["skip_reasons"].get(reason) or 0) + remainder
+            manifest["member_records_truncated"] = True
         manifest["member_coverage_ratio"] = round(
             manifest["parsed_members"] / float(manifest["total_members"] or 1), 6
         )
@@ -765,6 +1395,7 @@ class UnifiedDocumentParser:
             and not manifest["failed_members"]
             and not manifest["skipped_members"]
             and not manifest["truncated_members"]
+            and not manifest.get("inventory_truncated")
             and not base["coverage"].get("truncated_by_limit")
             else "partial"
         )
@@ -815,7 +1446,7 @@ class UnifiedDocumentParser:
         base["parser"]["fast_preview"] = bool(base["coverage"].get("limited_by_fast_mode"))
 
     @staticmethod
-    def _office_image_contexts(archive, ext):
+    def _office_image_contexts(archive, ext, names, read_member):
         """Return media path -> best available Office location metadata.
 
         DOCX has no stable page number before pagination, so the nearest heading
@@ -824,12 +1455,12 @@ class UnifiedDocumentParser:
         cannot be resolved without executing Office.
         """
         contexts = {}
-        names = set(archive.namelist())
+        names = set(names)
         if ext == ".docx" and "word/document.xml" in names:
             rels = {}
             rel_path = "word/_rels/document.xml.rels"
             if rel_path in names:
-                root = ElementTree.fromstring(archive.read(rel_path))
+                root = ElementTree.fromstring(read_member(rel_path))
                 for rel in root:
                     rel_id = rel.attrib.get("Id")
                     target = rel.attrib.get("Target", "")
@@ -840,7 +1471,7 @@ class UnifiedDocumentParser:
                 "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
                 "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
             }
-            root = ElementTree.fromstring(archive.read("word/document.xml"))
+            root = ElementTree.fromstring(read_member("word/document.xml"))
             current_heading = None
             paragraph_no = 0
             for paragraph in root.findall(".//w:body/w:p", ns):
@@ -870,10 +1501,10 @@ class UnifiedDocumentParser:
                 slide_name = "ppt/slides/slide{}.xml".format(slide_no)
                 title = ""
                 if slide_name in names:
-                    slide_root = ElementTree.fromstring(archive.read(slide_name))
+                    slide_root = ElementTree.fromstring(read_member(slide_name))
                     text_values = [node.text.strip() for node in slide_root.findall(".//a:t", ns) if node.text and node.text.strip()]
                     title = text_values[0][:120] if text_values else ""
-                rel_root = ElementTree.fromstring(archive.read(name))
+                rel_root = ElementTree.fromstring(read_member(name))
                 for rel in rel_root:
                     target = rel.attrib.get("Target", "")
                     if "media/" not in target:
@@ -898,16 +1529,50 @@ class UnifiedDocumentParser:
         if not prefix:
             return
         try:
+            central_directory = _zip_central_directory_preflight(path)
+            if not central_directory.get("safe"):
+                raise ValueError(
+                    "Office ZIP 中央目录预检失败：{}".format(
+                        central_directory.get("reason") or "central_directory_invalid"
+                    )
+                )
             with zipfile.ZipFile(str(path)) as archive:
-                media = [name for name in archive.namelist() if name.startswith(prefix) and not name.endswith("/")]
+                infos, inventory_warnings, total_limit = _bounded_office_zip_inventory(
+                    path, archive, central_directory.get("observed_entries") or 0,
+                )
+                base["warnings"].extend(inventory_warnings[:200])
+                consumed = {"bytes": 0}
+
+                def read_member(name, per_member_limit=OFFICE_XML_MEMBER_MAX_BYTES):
+                    info = infos.get(name)
+                    if info is None:
+                        raise ValueError("Office 成员不存在或未通过安全预算：{}".format(name))
+                    payload = _read_zip_info_bounded(
+                        archive,
+                        info,
+                        per_member_limit,
+                        total_limit - consumed["bytes"],
+                    )
+                    consumed["bytes"] += len(payload)
+                    return payload
+
+                media = [name for name in infos if name.startswith(prefix) and not name.endswith("/")]
                 if not media:
                     return
-                contexts = self._office_image_contexts(archive, ext)
+                contexts = self._office_image_contexts(archive, ext, infos.keys(), read_member)
                 seen_hashes = set()
                 recognized_assets = 0
                 ocr_characters = 0
                 for ordinal, name in enumerate(sorted(media), 1):
-                    blob = archive.read(name)
+                    try:
+                        blob = read_member(name, OFFICE_MEDIA_MEMORY_BYTES)
+                    except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile) as exc:
+                        base["warnings"].append(
+                            "已跳过无法在安全预算内读取的 Office 内嵌媒体 {}：{}".format(
+                                name, str(exc)[:160],
+                            )
+                        )
+                        continue
                     image_hash = hashlib.sha256(blob).hexdigest()
                     if image_hash in seen_hashes:
                         continue
@@ -960,7 +1625,7 @@ class UnifiedDocumentParser:
                     base["coverage"]["embedded_ocr_characters"] += ocr_characters
                 if len(base["text"]) >= self.max_chars:
                     base["warnings"].append("统一正文达到本地字符上限；内嵌图片证据仍已独立保留。")
-        except (OSError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
             base["warnings"].append("Office 内嵌图片 OCR 检查失败：{}".format(exc))
 
     def _extract_docling_items(self, document, base):

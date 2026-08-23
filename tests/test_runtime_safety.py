@@ -103,6 +103,38 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertFalse(result["coverage"]["complete"])
         self.assertEqual(result["confidence"], "中")
 
+    def test_windows_hard_stop_targets_the_complete_process_tree(self):
+        import worker
+
+        class FakeProcess:
+            pid = 4321
+
+            def __init__(self):
+                self.running = True
+
+            def is_alive(self):
+                return self.running
+
+            def join(self, timeout=None):
+                self.running = False
+
+            def terminate(self):
+                self.running = False
+
+        class Completed:
+            returncode = 0
+
+        process = FakeProcess()
+        with patch.object(worker.os, "name", "nt"), patch(
+            "worker.subprocess.run", return_value=Completed()
+        ) as taskkill:
+            worker._stop_process(process)
+        command = taskkill.call_args[0][0]
+        self.assertEqual(command[:2], ["taskkill", "/PID"])
+        self.assertIn("/T", command)
+        self.assertIn("/F", command)
+        self.assertFalse(process.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,14 +3,20 @@ import hashlib
 import hmac
 import logging
 import logging.handlers
+import os
 import re
+import sys
 import time
 import uuid
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
-from web_compat import SJFXFastAPI, has_request_context, jsonify, render_template, request, send_from_directory
+from web_compat import (
+    InternalExecutionCapability, SJFXFastAPI, has_request_context, jsonify,
+    render_template, request, send_from_directory,
+)
 
 from config import Config
 from services.ollama import LocalModelError, OllamaClient, OllamaEmbeddingClient
@@ -18,8 +24,11 @@ from services.document_analysis import analyze_document
 from services.evidence import embedding_mode, select_evidence, set_embedding_provider
 from services.exporter import create_report_docx, export_node, safe_name
 from services.folder_analysis import analyze_folder
-from services.package_analysis import analyze_package, refresh_package_coverage, _parse_with_limits
-from services.large_package import file_fingerprint, inventory_by_path
+from services.package_analysis import (
+    analyze_package, checkpoint_fingerprint, refresh_package_coverage, _parse_with_limits,
+    _restore_source_provenance, _secure_source_snapshot,
+)
+from services.large_package import inventory_by_path
 from services.reporting import (
     build_local_report,
     build_report_analysis_prompt,
@@ -27,7 +36,7 @@ from services.reporting import (
     merge_model_report,
 )
 from services.retrieval import retrieve_evidence
-from services.scanner import folder_context, human_size, resolve_under, scan_directory
+from services.scanner import IGNORED_DIRS, IGNORED_FILES, human_size, resolve_under, scan_directory
 from services.storage import Storage
 from services.tree_editor import filter_tree
 from services.structured_qa import answer_question
@@ -35,7 +44,28 @@ from services.unified_parser import UnifiedDocumentParser
 from services.agent_runtime import PydanticAgentRuntime
 
 
-app = SJFXFastAPI(title="SJFX Data Analysis Agent", version="2.1")
+MINIMUM_PYTHON_VERSION = (3, 10)
+
+
+def _python_runtime_status(version_info=None):
+    """Describe the interpreter against the documented runtime baseline."""
+    current = tuple(version_info or sys.version_info)
+    parts = tuple(int(value) for value in current[:3])
+    parts += (0,) * (3 - len(parts))
+    minimum = MINIMUM_PYTHON_VERSION
+    return {
+        "version": "{}.{}.{}".format(*parts),
+        "minimum": "{}.{}".format(*minimum),
+        "supported": parts[:2] >= minimum,
+    }
+
+
+app = SJFXFastAPI(
+    title="SJFX Data Analysis Agent",
+    version="2.1",
+    max_content_length=4 * 1024 * 1024,
+    security_headers=True,
+)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("sjfx")
 
@@ -65,18 +95,20 @@ for _handler in logging.getLogger().handlers:
 logging.getLogger("docling").setLevel(logging.WARNING)
 logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 app.config["JSON_AS_ASCII"] = False
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 storage = Storage(Config.DB_PATH, Config.DOCUMENT_CACHE_DIR, Config.SIDECAR_PAYLOAD_BYTES)
 # Bind historical pre-authentication records to the configured token before
 # serving requests.  This closes the legacy "first caller claims the record"
 # loophole while keeping existing demo links usable for the project owner.
-_configured_owner_id = (
+_configured_owner_id = Config.OWNER_ID
+_token_owner_alias = (
     hashlib.sha256(Config.API_ACCESS_TOKEN.encode("utf-8")).hexdigest()[:24]
-    if Config.AUTH_REQUIRED and Config.API_ACCESS_TOKEN else None
+    if Config.API_ACCESS_TOKEN else None
 )
-if _configured_owner_id:
-    storage.migrate_legacy_ownership(_configured_owner_id)
-    storage.register_existing_outputs(Config.OUTPUT_DIR, _configured_owner_id)
+storage.migrate_legacy_ownership(
+    _configured_owner_id,
+    aliases=["legacy", "default", _token_owner_alias],
+)
+storage.register_existing_outputs(Config.OUTPUT_DIR, _configured_owner_id)
 # The deployment is intentionally local-only: all generation uses Ollama on this host.
 llm_transport = OllamaClient(
     base_url=Config.OLLAMA_BASE_URL,
@@ -110,6 +142,15 @@ else:
     _embedding_client = None
     set_embedding_provider(None)
 parser = UnifiedDocumentParser(Config.DOCLING_ARTIFACTS_DIR, Config.RAPIDOCR_MODEL_DIR, Config.MAX_FULL_DOCUMENT_CHARS)
+
+# This capability is deliberately process-local and cannot be supplied in an
+# HTTP JSON document.  The dedicated Worker invokes the established summary
+# implementation directly, so it needs a narrow way to cross the async queue
+# gate without turning a request field into an execution-control primitive.
+_summary_worker_execution = InternalExecutionCapability("sjfx_summary_worker_execution")
+_summary_worker_execution_context = _summary_worker_execution.activate
+
+
 if not logger.handlers:
     _file_handler = logging.handlers.RotatingFileHandler(
         str(Config.LOG_DIR / "app.log"), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
@@ -132,6 +173,11 @@ def _access_guard():
     if request.path.startswith("/static/") or request.path == "/":
         return None
     if not (request.path.startswith("/api/") or request.path.startswith("/outputs/")):
+        return None
+    # A normal browser navigation cannot attach X-SJFX-Token. The output
+    # handler atomically validates and burns this short-lived ticket before it
+    # opens any artifact.
+    if request.path.startswith("/outputs/") and request.args.get("ticket"):
         return None
     configured = Config.API_ACCESS_TOKEN
     supplied = request.headers.get("X-SJFX-Token", "")
@@ -184,16 +230,12 @@ def api_error(message, status=400, details=None):
 
 
 def _request_owner_id():
-    if not Config.AUTH_REQUIRED or not has_request_context():
+    if not has_request_context():
         return None
-    supplied = request.headers.get("X-SJFX-Token", "")
-    if not supplied:
-        authorization = request.headers.get("Authorization", "")
-        if authorization.lower().startswith("bearer "):
-            supplied = authorization[7:].strip()
-    if not supplied:
-        return "anonymous"
-    return hashlib.sha256(supplied.encode("utf-8")).hexdigest()[:24]
+    # The guard has already authenticated the single configured token. Keep
+    # ownership independent from that secret so token rotation cannot orphan
+    # historical scans, jobs, summaries or exports.
+    return Config.OWNER_ID
 
 def require_scan(scan_id):
     scan = storage.get_scan(scan_id, owner_id=_request_owner_id())
@@ -646,8 +688,7 @@ def _documents_context(scan_id, node_path, scan_result, max_files=30, max_chars=
             "warnings": document.get("warnings", []),
             "evidence": document.get("evidence", [])[:3],
         })
-    selected_path = resolve_under(scan_result["root"], node_path)
-    fallback_stats = folder_context(selected_path, scan_result["root"], max_files=1, max_chars=1)
+    fallback_stats = _physical_scope_stats(scan_result, node_path)
     return {
         "inventory": [{"path": item["path"], "extension": item["payload"].get("source", {}).get("extension"), "size": item["payload"].get("source", {}).get("size", 0)} for item in documents],
         "excerpts": "\n\n".join("### {}\n{}".format(item["path"], item["payload"].get("text", "")[:per_file]) for item in selected)[:max_chars],
@@ -668,6 +709,28 @@ def _documents_context(scan_id, node_path, scan_result, max_files=30, max_chars=
             "sampled_character_ratio": round(sampled_text_characters / float(total_text_characters or 1), 6),
         },
         "documents": samples,
+    }
+
+
+def _physical_inventory_node(scan_result, node_path):
+    stack = [scan_result.get("tree") or {}]
+    while stack:
+        node = stack.pop()
+        if node.get("path") == (node_path or "."):
+            return node
+        stack.extend(reversed(node.get("children") or []))
+    return None
+
+
+def _physical_scope_stats(scan_result, node_path):
+    """Read folder totals from the immutable inventory, never live source paths."""
+    target = _physical_inventory_node(scan_result, node_path)
+    if not target:
+        return {"total_dirs": 0, "total_size_human": "0.0 B", "type_counts": {}}
+    return {
+        "total_dirs": int(target.get("directory_count") or 0),
+        "total_size_human": target.get("size_human") or human_size(target.get("total_size") or target.get("size") or 0),
+        "type_counts": dict(target.get("type_counts") or {}),
     }
 
 
@@ -802,7 +865,96 @@ def _package_large_options():
         "deepen_batch_files": Config.LARGE_PACKAGE_DEEPEN_BATCH_FILES,
         "batch_files": Config.LARGE_PACKAGE_BATCH_FILES,
         "overview_chars_per_file": Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE,
+        "overview_evidence_per_file": Config.LARGE_PACKAGE_OVERVIEW_EVIDENCE_PER_FILE,
     }
+
+
+def _publish_analysis_progress(scan_id, scan_result, percent, message, stage="analyzing"):
+    """Publish a small, honest overview while the final analysis is running."""
+    counts = storage.file_state_counts(scan_id)
+    metrics = storage.file_state_metrics(scan_id)
+    inventory_files = max(0, int(scan_result.get("file_count") or 0))
+    parsed_files = int(counts.get("completed") or 0) + int(counts.get("overview") or 0)
+    failed_files = int(counts.get("failed") or 0)
+    accounted_files = min(inventory_files, parsed_files + failed_files)
+    pending_files = max(0, inventory_files - accounted_files)
+    parse_ratio = round(parsed_files / float(inventory_files or 1), 6)
+    inventory_error_count = int(
+        scan_result.get("scan_error_count", len(scan_result.get("errors") or [])) or 0
+    )
+    depth_limited = int(scan_result.get("depth_limited_directory_count") or 0)
+    ignored_files = int(scan_result.get("ignored_file_count") or 0)
+    ignored_directories = int(scan_result.get("ignored_directory_count") or 0)
+    inventory_complete = bool(
+        not scan_result.get("truncated")
+        and inventory_error_count == 0
+        and depth_limited == 0
+        and ignored_files == 0
+        and ignored_directories == 0
+    )
+    limitations = []
+    if scan_result.get("truncated"):
+        limitations.append("目录清点触及安全边界，清单之外仍可能存在对象。")
+    if inventory_error_count:
+        limitations.append("目录清点发生 {} 个读取错误。".format(inventory_error_count))
+    if depth_limited:
+        limitations.append("{} 个目录触及扫描深度上限。".format(depth_limited))
+    if ignored_files or ignored_directories:
+        limitations.append(
+            "显式排除规则跳过 {} 个文件、{} 个目录。".format(
+                ignored_files, ignored_directories
+            )
+        )
+    limitations.append("主题聚类、深度分析覆盖率和最终证据统计将在流水线完成后发布。")
+    storage.save_analysis_progress(scan_id, {
+        "schema_version": "analysis-progress/1.0",
+        "status": "running",
+        "stage": str(stage or "analyzing"),
+        "progress": max(0, min(99, int(percent or 0))),
+        "message": str(message or "正在分析"),
+        "coverage": {
+            "status": "分析进行中",
+            "coverage_level_label": (
+                "完整清点 + 渐进内容解析" if inventory_complete
+                else "不完整清点 + 渐进内容解析"
+            ),
+            "inventory_files": inventory_files,
+            "inventory_coverage_ratio": 1.0 if inventory_complete else None,
+            "inventory_complete": inventory_complete,
+            "inventory_error_count": inventory_error_count,
+            "depth_limited_directory_count": depth_limited,
+            "ignored_file_count": ignored_files,
+            "ignored_directory_count": ignored_directories,
+            "parsed_files": parsed_files,
+            "content_parse_ratio": parse_ratio,
+            "failed_files": failed_files,
+            "pending_files": pending_files,
+            "deep_analyzed_files": 0,
+            "deep_analysis_finalized": False,
+            "complete_analysis": False,
+            "limitations": limitations,
+        },
+        "overview": {
+            "file_count": inventory_files,
+            "directory_count": int(scan_result.get("directory_count") or 0),
+            "total_size": int(scan_result.get("total_size") or 0),
+            "total_size_human": scan_result.get("total_size_human"),
+            "parsed_files": parsed_files,
+            "failed_files": failed_files,
+            "pending_files": pending_files,
+            "stored_text_characters": metrics["stored_characters"],
+            "evidence_count": metrics["evidence_items"],
+            "format_counts": scan_result.get("type_counts") or {},
+        },
+        "statistics": {
+            "scanned_files": inventory_files,
+            "parsed_files": parsed_files,
+            "failed_files": failed_files,
+            "pending_files": pending_files,
+            "evidence_items": metrics["evidence_items"],
+            "stored_text_characters": metrics["stored_characters"],
+        },
+    })
 
 
 def _run_claimed_report_job(job):
@@ -820,7 +972,10 @@ def _run_claimed_summary_job(job):
     """Run an uncached model-backed node/document summary outside Flask HTTP."""
     job_id = job["id"]
     payload = dict(job.get("options") or {})
-    payload["_worker_execution"] = True
+    # Ignore a historical client-controlled field if it was persisted by an
+    # older API process. Internal execution authority lives only in the
+    # ContextVar below.
+    payload.pop("_worker_execution", None)
     scan_id = job["scan_id"]
     storage.update_job(job_id, progress=5, stage="generating_summary", message="正在生成当前节点深度摘要", heartbeat=True)
     _ensure_job_active(job_id)
@@ -829,13 +984,14 @@ def _run_claimed_summary_job(job):
     # The route enforces scan ownership.  A Worker has no browser request, so
     # explicitly carry the job's owner token into this internal request rather
     # than letting the task fail as an anonymous caller.
-    with app.test_request_context(
-        "/api/summary",
-        method="POST",
-        json=payload,
-        headers={"X-SJFX-Token": Config.API_ACCESS_TOKEN} if Config.AUTH_REQUIRED else {},
-    ):
-        response = summarize()
+    with _summary_worker_execution_context():
+        with app.test_request_context(
+            "/api/summary",
+            method="POST",
+            json=payload,
+            headers={"X-SJFX-Token": Config.API_ACCESS_TOKEN} if Config.AUTH_REQUIRED else {},
+        ):
+            response = summarize()
     status_code = 200
     if isinstance(response, tuple):
         response, status_code = response[0], response[1]
@@ -863,6 +1019,12 @@ def _run_claimed_export_job(job):
     _ensure_job_active(job_id)
     analysis = storage.get_analysis(scan_id) or {}
     documents = _package_documents(scan_id)
+    known_hashes = {
+        str(item.get("path") or ""): str((item.get("payload") or {}).get("source", {}).get("sha256") or "")
+        for item in documents
+        if item.get("path")
+    }
+    large_export = bool(((analysis.get("policy") or {}).get("large_package") or {}).get("enabled"))
     context = _combined_export_context(scan_id, scan_result, analysis, options)
     selected = Path(scan_result["root"])
     state_by_path = {item.get("node_path"): item for item in storage.list_file_states(scan_id)}
@@ -903,6 +1065,9 @@ def _run_claimed_export_job(job):
         file_states=state_by_path,
         progress_callback=export_progress,
         cancel_check=export_cancel_check,
+        content_deduplication=not large_export,
+        known_hashes=known_hashes,
+        disk_reserve_bytes=Config.EXPORT_DISK_RESERVE_BYTES,
     )
     _ensure_job_active(job_id)
     storage.save_artifact(archive.name, job.get("owner_id"), scan_id=scan_id, job_id=job_id, kind="handoff_export")
@@ -939,14 +1104,35 @@ def _run_claimed_analysis_job(job):
         current_stage="分析准备",
         current_file=scope_label or "",
     )
+    try:
+        _publish_analysis_progress(
+            scan_id, scan_result, mapped_progress(1),
+            "开始补充分析：{}".format(scope_label) if scope_label else "目录清点完成，开始内容解析",
+            stage="analysis_preparing",
+        )
+    except Exception:
+        logger.warning("发布渐进分析概览失败 scan_id=%s", scan_id, exc_info=True)
+
+    progress_state = {"bucket": -1}
 
     def progress(percent, message):
         _ensure_job_active(job_id)
+        visible_percent = mapped_progress(percent)
         storage.update_job(
-            job_id, progress=mapped_progress(percent), stage="analyzing", message=message, heartbeat=True,
+            job_id, progress=visible_percent, stage="analyzing", message=message, heartbeat=True,
             current_stage="解析与分析",
             current_file=str(message or "")[-500:],
         )
+        bucket = max(0, int(visible_percent) // 5)
+        if bucket != progress_state["bucket"]:
+            progress_state["bucket"] = bucket
+            try:
+                _publish_analysis_progress(
+                    scan_id, scan_result, visible_percent, message,
+                    stage="parsing" if int(percent or 0) < 72 else "semantic_analysis",
+                )
+            except Exception:
+                logger.warning("刷新渐进分析概览失败 scan_id=%s", scan_id, exc_info=True)
 
     analysis = analyze_package(
         scan_id, scan_result, storage, parser, progress,
@@ -955,6 +1141,7 @@ def _run_claimed_analysis_job(job):
         large_options=_package_large_options(),
         target_paths=options.get("target_paths"),
         cancel_check=lambda: storage.is_job_cancel_requested(job_id),
+        parse_mode_override=options.get("parse_mode"),
     )
     _ensure_job_active(job_id)
     storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
@@ -976,6 +1163,18 @@ def _run_claimed_scan_and_analyze_job(job):
     if not root_path:
         raise ValueError("扫描任务缺少目录路径")
 
+    # A supervised 24-hour slice may end after inventory was committed.  On
+    # the next slice, continue from file checkpoints instead of rescanning a
+    # potentially slow NAS tree.
+    existing_scan = storage.get_scan(job_id, owner_id=options.get("owner_id") or job.get("owner_id"))
+    if existing_scan:
+        return _run_claimed_analysis_job({
+            "id": job_id, "scan_id": job_id, "options": {},
+            "owner_id": options.get("owner_id") or job.get("owner_id"),
+            "progress": job.get("progress") or 15,
+            "_progress_start": 15, "_progress_end": 95,
+        })
+
     def scan_progress(file_count, directory_count=0, current_path=""):
         _ensure_job_active(job_id)
         activity_count = max(0, int(file_count or 0)) + max(0, int(directory_count or 0))
@@ -994,12 +1193,23 @@ def _run_claimed_scan_and_analyze_job(job):
     scan_result = scan_directory(
         resolved_root, options.get("max_files", Config.MAX_SCAN_FILES),
         max_depth=options.get("max_depth", Config.MAX_SCAN_DEPTH),
+        max_directories=Config.MAX_SCAN_DIRECTORIES,
+        max_nodes=Config.MAX_SCAN_NODES,
+        max_entries_per_directory=Config.MAX_SCAN_ENTRIES_PER_DIRECTORY,
         activity_callback=scan_progress,
         cancel_check=lambda: _ensure_job_active(job_id),
     )
     scan_result["parse_mode"] = "accurate" if options.get("parse_mode") == "accurate" else "fast"
     scan_result["scan_id"] = job_id
     storage.save_scan(scan_result, scan_id=job_id, owner_id=options.get("owner_id") or "legacy")
+    try:
+        _publish_analysis_progress(
+            job_id, scan_result, 15,
+            "目录盘点完成，后台继续解析正文并建立证据索引",
+            stage="inventory_ready",
+        )
+    except Exception:
+        logger.warning("发布目录盘点概览失败 scan_id=%s", job_id, exc_info=True)
     # Make the physical inventory available to the browser immediately after
     # scanning, while the longer parse/cluster/report stages continue in the
     # same background job.  Only the id is stored here; the tree is fetched via
@@ -1033,6 +1243,7 @@ def index():
 
 @app.route("/api/status")
 def status():
+    runtime = _python_runtime_status()
     return jsonify({
         "ok": True,
         "configured": llm.configured,
@@ -1043,14 +1254,29 @@ def status():
         "model_generation_enabled": llm_generation_enabled,
         "model": llm.model,
         "base_url": llm.base_url,
-        "python_compatible": True,
+        # Keep the old key for clients that already read it, but make it
+        # truthful and expose an explicit, versioned runtime contract.
+        "python_compatible": runtime["supported"],
+        "runtime_supported": runtime["supported"],
+        "python_version": runtime["version"],
+        "minimum_python_version": runtime["minimum"],
         "output_dir": str(Config.OUTPUT_DIR),
+        "state_dir": str(Config.DATA_DIR),
+        "sqlite_network_filesystem_allowed": os.getenv("SJFX_ALLOW_NETWORK_SQLITE", "0").strip().lower() in {"1", "true", "yes"},
         "document_parser": parser.status(),
         "supported_inputs": ["PDF", "Word", "PowerPoint", "Excel", "CSV/XLSX/JSON 数据画像", "图片 OCR", "文本/Markdown/HTML", "ZIP/TAR/TAR.GZ/TAR.BZ2 压缩包"],
         "local_features": ["Office 内嵌图片 OCR", "SHA-256 去重", "SimHash+LSH 聚类", "BM25+TF-IDF 本地证据检索", "自适应分析树", "自动概览 Word"],
         "limits": {
             "max_scan_files": Config.MAX_SCAN_FILES,
+            "max_scan_directories": Config.MAX_SCAN_DIRECTORIES,
+            "max_scan_nodes": Config.MAX_SCAN_NODES,
+            "max_scan_depth": Config.MAX_SCAN_DEPTH,
+            "max_scan_entries_per_directory": Config.MAX_SCAN_ENTRIES_PER_DIRECTORY,
+            "scan_ignored_directories": sorted(IGNORED_DIRS),
+            "scan_ignored_files": sorted(IGNORED_FILES),
+            "scan_default_full_inventory": not IGNORED_DIRS and not IGNORED_FILES,
             "max_document_characters": Config.MAX_FULL_DOCUMENT_CHARS,
+            "max_content_bytes": Config.MAX_CONTENT_BYTES,
             "max_single_file_bytes": Config.MAX_SINGLE_FILE_BYTES,
             "max_parse_seconds": Config.MAX_PARSE_SECONDS,
             "source_stability_seconds": Config.SOURCE_STABILITY_SECONDS,
@@ -1066,9 +1292,14 @@ def status():
             "max_archive_file_bytes": Config.MAX_ARCHIVE_FILE_BYTES,
             "max_archive_member_bytes": Config.MAX_ARCHIVE_MEMBER_BYTES,
             "max_archive_uncompressed_bytes": Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+            "max_archive_compression_ratio": Config.MAX_ARCHIVE_COMPRESSION_RATIO,
+            "max_archive_member_path_depth": Config.MAX_ARCHIVE_MEMBER_PATH_DEPTH,
+            "parse_temp_dir": str(Config.PARSE_TEMP_DIR),
+            "parse_temp_disk_reserve_bytes": Config.PARSE_TEMP_DISK_RESERVE_BYTES,
             "max_analysis_jobs": Config.MAX_ANALYSIS_JOBS,
             "llm_max_concurrency": Config.LLM_MAX_CONCURRENCY,
             "max_export_bytes": Config.MAX_EXPORT_BYTES,
+            "download_ticket_ttl_seconds": Config.DOWNLOAD_TICKET_TTL_SECONDS,
             "large_package": {
                 "threshold_bytes": Config.LARGE_PACKAGE_THRESHOLD_BYTES,
                 "threshold_files": Config.LARGE_PACKAGE_THRESHOLD_FILES,
@@ -1140,6 +1371,38 @@ def scan():
 @app.route("/api/scan/<scan_id>")
 def get_scan(scan_id):
     try:
+        compact_value = str(request.args.get("compact", "")).strip().lower()
+        full_requested = str(request.args.get("full", "")).strip().lower() in {"1", "true", "yes"}
+        bounded_response = not full_requested and compact_value not in {"0", "false", "no"}
+        if bounded_response:
+            scan_result = storage.get_scan_overview(scan_id, owner_id=_request_owner_id())
+            if not scan_result:
+                raise ValueError("扫描任务不存在、已失效或不属于当前访问用户")
+            try:
+                summary_limit = max(1, min(500, int(request.args.get("summary_limit", 100))))
+            except (TypeError, ValueError):
+                summary_limit = 100
+            summary_page = storage.list_summaries_page(scan_id, limit=summary_limit)
+            physical_tree = storage.get_tree_page(scan_id, "physical", limit=200)
+            if physical_tree:
+                scan_result["tree"] = physical_tree
+            analysis = storage.get_analysis_overview(scan_id)
+            if analysis:
+                analysis["analysis_tree"] = storage.get_tree_page(scan_id, "analysis", limit=100)
+            return jsonify({
+                "ok": True,
+                "scan": scan_result,
+                "summaries": summary_page["items"],
+                "summaries_page": {
+                    key: summary_page[key]
+                    for key in ("offset", "limit", "total", "next_offset")
+                },
+                "analysis": analysis,
+                "progressive_analysis": storage.get_analysis_progress(scan_id),
+                "tree_edits": storage.list_tree_edits(scan_id, _request_owner_id(), limit=500),
+                "tree_edits_total": storage.tree_edit_count(scan_id, _request_owner_id()),
+                "response_mode": "bounded",
+            })
         scan_result = require_scan(scan_id)
         scan_result["scan_id"] = scan_id
         return jsonify({"ok": True, "scan": scan_result, "summaries": storage.list_summaries(scan_id), "analysis": storage.get_analysis(scan_id)})
@@ -1147,9 +1410,108 @@ def get_scan(scan_id):
         return api_error(str(exc), 404)
 
 
+@app.route("/api/tree/<scan_id>")
+def get_tree_page(scan_id):
+    """Load only one tree level so very large inventories never flood the UI."""
+    if not storage.scan_owned(scan_id, owner_id=_request_owner_id()):
+        return api_error("扫描任务不存在、已失效或不属于当前访问用户", 404)
+    tree_kind = str(request.args.get("kind", "physical") or "physical").strip().lower()
+    try:
+        if tree_kind not in {"physical", "analysis"}:
+            raise ValueError("未知目录树类型")
+        offset = max(0, int(request.args.get("offset", 0)))
+        limit = max(1, min(500, int(request.args.get("limit", 200))))
+        node_key = request.args.get("node_key") or None
+        tree_filter = str(request.args.get("filter", "all") or "all").strip().lower()
+        indexed_kind = tree_kind
+        if tree_kind == "analysis" and tree_filter not in {"all", "全部"}:
+            if tree_filter not in {"low_confidence", "unclassified", "failed", "confirmed"}:
+                raise ValueError("未知智能目录筛选条件")
+            indexed_kind = "analysis:{}".format(tree_filter)
+            if not node_key and not storage.tree_index_exists(scan_id, indexed_kind):
+                full_analysis = storage.get_analysis(scan_id)
+                if not full_analysis:
+                    return api_error("智能目录尚未生成", 404)
+                filtered_tree = filter_tree(full_analysis.get("analysis_tree") or {}, tree_filter)
+                storage.refresh_tree_index(scan_id, indexed_kind, filtered_tree)
+        node = storage.get_tree_page(
+            scan_id, tree_kind=indexed_kind,
+            node_key=node_key,
+            offset=offset, limit=limit,
+        )
+        if not node:
+            return api_error("目录节点不存在或尚未生成", 404)
+        return jsonify({
+            "ok": True, "tree_kind": tree_kind, "tree_filter": tree_filter, "node": node,
+            "page": {
+                "offset": node.get("_children_offset", offset),
+                "limit": limit,
+                "total": node.get("_children_total", 0),
+                "next_offset": node.get("_children_next_offset"),
+            },
+        })
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/summaries/<scan_id>")
+def get_summaries_page(scan_id):
+    if not storage.scan_owned(scan_id, owner_id=_request_owner_id()):
+        return api_error("扫描任务不存在、已失效或不属于当前访问用户", 404)
+    try:
+        page = storage.list_summaries_page(
+            scan_id,
+            offset=request.args.get("offset", 0),
+            limit=request.args.get("limit", 200),
+            node_path=request.args.get("path") if "path" in request.args else None,
+            summary_type=request.args.get("type") or None,
+        )
+        return jsonify({"ok": True, **page})
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/analysis-node-members/<scan_id>")
+def get_analysis_node_members(scan_id):
+    """Return a bounded complete member list for safe visual tree editing."""
+    if not storage.scan_owned(scan_id, owner_id=_request_owner_id()):
+        return api_error("扫描任务不存在、已失效或不属于当前访问用户", 404)
+    try:
+        node = _find_analysis_node(scan_id, request.args.get("node_id"))
+        paths = sorted(set(str(value) for value in node.get("member_paths") or [] if value))
+        limit = max(1, min(500, int(request.args.get("limit", 500))))
+        if len(paths) > limit:
+            return api_error(
+                "该主题包含 {} 个文件，超过可视化拆分上限 {}；请先缩小主题范围。".format(len(paths), limit),
+                409,
+                {"member_count": len(paths), "visual_split_limit": limit},
+            )
+        return jsonify({
+            "ok": True, "node_id": node.get("node_id"), "member_count": len(paths),
+            "members": [{"path": path, "name": Path(path).name or path} for path in paths],
+        })
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+
 @app.route("/api/analysis/<scan_id>")
 def get_analysis(scan_id):
     try:
+        compact_value = str(request.args.get("compact", "")).strip().lower()
+        full_requested = str(request.args.get("full", "")).strip().lower() in {"1", "true", "yes"}
+        if not full_requested and compact_value not in {"0", "false", "no"}:
+            if not storage.scan_owned(scan_id, owner_id=_request_owner_id()):
+                raise ValueError("扫描任务不存在、已失效或不属于当前访问用户")
+            analysis = storage.get_analysis_overview(scan_id)
+            if not analysis:
+                return api_error("完整分析尚未完成", 404)
+            analysis["analysis_tree"] = storage.get_tree_page(scan_id, "analysis", limit=100)
+            return jsonify({
+                "ok": True, "analysis": analysis, "tree_filter": "all",
+                "tree_edits": storage.list_tree_edits(scan_id, _request_owner_id(), limit=500),
+                "tree_edits_total": storage.tree_edit_count(scan_id, _request_owner_id()),
+                "response_mode": "bounded",
+            })
         require_scan(scan_id)
         analysis = storage.get_analysis(scan_id)
         if not analysis:
@@ -1169,7 +1531,16 @@ def tree_edits(scan_id):
         require_scan(scan_id)
         owner_id = _request_owner_id() or "legacy"
         if request.method == "GET":
-            return jsonify({"ok": True, "edits": storage.list_tree_edits(scan_id, owner_id)})
+            try:
+                edit_limit = max(1, min(500, int(request.args.get("limit", 500))))
+            except (TypeError, ValueError):
+                edit_limit = 500
+            total = storage.tree_edit_count(scan_id, owner_id)
+            edits = storage.list_tree_edits(scan_id, owner_id, limit=edit_limit)
+            return jsonify({
+                "ok": True, "edits": edits, "total": total,
+                "truncated": total > len(edits), "limit": edit_limit,
+            })
         payload = request.get_json(silent=True) or {}
         operation = str(payload.get("operation") or "").strip().lower()
         edit_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
@@ -1196,17 +1567,60 @@ def tree_edits(scan_id):
                 raise ValueError("只能挂载已经完成解析的文件")
         if operation == "merge":
             ids = [str(value) for value in edit_payload.get("node_ids") or []]
-            if len(ids) < 2 or not set(ids).issubset(node_ids):
+            unique_ids = set(ids)
+            if len(unique_ids) < 2 or not unique_ids.issubset(node_ids):
                 raise ValueError("合并至少需要两个有效主题节点")
+            same_parent = any(
+                unique_ids.issubset({
+                    str(child.get("node_id"))
+                    for child in node.get("children") or []
+                    if child.get("kind") == "group" and child.get("node_id")
+                })
+                for node in _walk_analysis_nodes(tree)
+            )
+            if not same_parent:
+                raise ValueError("只能合并同一层级、同一父主题下的主题节点")
         if operation == "split":
             groups = edit_payload.get("groups") or []
             if not isinstance(groups, list) or len(groups) < 2:
                 raise ValueError("拆分至少需要两个子主题")
+            target = next(
+                (node for node in _walk_analysis_nodes(tree) if node.get("node_id") == str(edit_payload.get("node_id") or "")),
+                None,
+            )
+            original_paths = set(str(value) for value in (target or {}).get("member_paths") or [] if value)
+            submitted_paths = [
+                str(value)
+                for group in groups if isinstance(group, dict)
+                for value in group.get("paths") or [] if value
+            ]
+            if len(original_paths) > 500:
+                raise ValueError("该主题文件过多，不能在可视化界面一次拆分；请先缩小范围")
+            if len(submitted_paths) != len(set(submitted_paths)):
+                raise ValueError("同一文件不能同时放入多个拆分主题")
+            if set(submitted_paths) != original_paths:
+                raise ValueError("拆分必须覆盖当前主题全部文件，不能遗漏或加入范围外文件")
         import uuid as _uuid
         edit_id = str(payload.get("edit_id") or _uuid.uuid4().hex)
         storage.save_tree_edit(scan_id, edit_id, operation, edit_payload, owner_id=owner_id)
         updated = storage.get_analysis(scan_id)
-        return jsonify({"ok": True, "edit": {"edit_id": edit_id, "operation": operation, "payload": edit_payload}, "edits": storage.list_tree_edits(scan_id, owner_id), "analysis": updated})
+        if updated and updated.get("analysis_tree"):
+            storage.refresh_tree_index(scan_id, "analysis", updated["analysis_tree"])
+        compact = bool(payload.get("compact")) or str(request.args.get("compact", "")).lower() in {"1", "true", "yes"}
+        response_analysis = updated
+        if compact:
+            response_analysis = storage.get_analysis_overview(scan_id) or {}
+            response_analysis["analysis_tree"] = storage.get_tree_page(scan_id, "analysis", limit=100)
+        edit_total = storage.tree_edit_count(scan_id, owner_id)
+        edit_window = storage.list_tree_edits(scan_id, owner_id, limit=500)
+        return jsonify({
+            "ok": True,
+            "edit": {"edit_id": edit_id, "operation": operation, "payload": edit_payload},
+            "edits": edit_window,
+            "tree_edits_total": edit_total,
+            "tree_edits_truncated": edit_total > len(edit_window),
+            "analysis": response_analysis,
+        })
     except ValueError as exc:
         return api_error(str(exc), 400)
 
@@ -1268,10 +1682,13 @@ def retrieve():
             scan_id
         )
 
-        documents = _package_documents(scan_id, canonical_only=True)
-        indexed_chunks = storage.list_evidence_index(scan_id)
+        evidence_index_count = storage.count_evidence_index(scan_id)
+        # The normal path searches SQLite first.  Loading every projected
+        # document remains only a compatibility fallback for pre-index data.
+        documents = [] if evidence_index_count else _package_documents(scan_id, canonical_only=True)
+        indexed_chunks = None
 
-        if not documents:
+        if not documents and not evidence_index_count:
             return api_error(
                 "完整解析尚未完成，暂时没有可检索证据。",
                 409
@@ -1298,20 +1715,8 @@ def retrieve():
                 )
 
             # 只留下这个主题节点里的文件
-            documents = [
-                item
-                for item in documents
-                if item.get("path")
-                in member_paths
-            ]
-            indexed_chunks = [
-                item for item in indexed_chunks
-                if str(item.get("archive_source_path") or item.get("source_path") or "") in member_paths
-                or any(
-                    str(item.get("source_path") or "").startswith(path + "::")
-                    for path in member_paths
-                )
-            ]
+            if documents:
+                documents = [item for item in documents if item.get("path") in member_paths]
 
             # 保存检索结果时使用这个作用域标识
             scope_key = (
@@ -1379,6 +1784,16 @@ def retrieve():
                 []
             )
 
+        if evidence_index_count:
+            indexed_chunks = storage.search_evidence_index(
+                scan_id,
+                query,
+                scope=retrieval_scope,
+                source_paths=member_paths if node_id else None,
+                candidate_evidence_ids=candidate_ids,
+                limit=2500,
+            )
+
         result = retrieve_evidence(
             documents,
             query,
@@ -1388,7 +1803,7 @@ def retrieve():
                 10
             ),
             candidate_evidence_ids=candidate_ids,
-            indexed_chunks=indexed_chunks or None,
+            indexed_chunks=indexed_chunks if evidence_index_count else None,
         )
 
         # 返回前端真正的逻辑范围
@@ -1608,6 +2023,7 @@ def analyze_scope():
         job_id, created = _start_analysis_job(scan_id, {
             "target_paths": member_paths,
             "scope_label": label,
+            "parse_mode": "accurate" if payload.get("parse_mode") != "fast" else "fast",
         })
         return jsonify({
             "ok": True, "job_id": job_id, "reused_active_job": not created,
@@ -1631,7 +2047,7 @@ def summarize():
 
         # Cache hits and local-only fallbacks stay synchronous. Any uncached
         # model-backed request is persisted and handled by the dedicated Worker.
-        if llm_generation_enabled and not payload.get("_worker_execution"):
+        if llm_generation_enabled and not _summary_worker_execution.get():
             if node_id:
                 node = _find_analysis_node(scan_id, node_id)
                 if node.get("kind") != "group":
@@ -1648,8 +2064,10 @@ def summarize():
                         "status_url": "/api/jobs/{}".format(job_id),
                     }), 202
             else:
-                selected = resolve_under(scan_result["root"], node_path)
-                summary_type = "folder" if selected.is_dir() or kind == "directory" else "file"
+                physical_node = _physical_inventory_node(scan_result, node_path)
+                if not physical_node:
+                    raise ValueError("节点不在本次安全清点范围内")
+                summary_type = "folder" if physical_node.get("kind") == "directory" or kind == "directory" else "file"
                 cached = storage.get_summary(scan_id, node_path, summary_type)
                 if force or not (cached and cached.get("schema_version") == 3 and not bool(cached.get("parser_info", {}).get("degraded"))):
                     require_local_model_enabled()
@@ -1703,8 +2121,11 @@ def summarize():
             storage.save_summary(scan_id, cache_path, "folder", summary)
             return jsonify({"ok": True, "summary": summary, "cached": False, "degraded": bool(summary.get("parser_info", {}).get("degraded"))})
 
-        selected = resolve_under(scan_result["root"], node_path)
-        summary_type = "folder" if selected.is_dir() or kind == "directory" else "file"
+        physical_node = _physical_inventory_node(scan_result, node_path)
+        if not physical_node:
+            raise ValueError("节点不在本次安全清点范围内")
+        selected = Path(scan_result["root"]) / node_path
+        summary_type = "folder" if physical_node.get("kind") == "directory" or kind == "directory" else "file"
         local_only = not llm_generation_enabled
         if not local_only:
             require_local_model_enabled()
@@ -1714,7 +2135,7 @@ def summarize():
             return jsonify({"ok": True, "summary": cached, "cached": True, "degraded": degraded})
         if summary_type == "folder" and local_only:
             from services.folder_analysis import _fallback as folder_fallback
-            context = _folder_summary_context(scan_id, node_path, scan_result) if _package_documents(scan_id) else folder_context(selected, scan_result["root"])
+            context = _folder_summary_context(scan_id, node_path, scan_result)
             summary = folder_fallback(context, node_path, ["模型生成未启用，已返回本地证据摘要。"])
             result = {"model": None, "usage": {}}
             batch_errors = ["模型生成未启用"]
@@ -1726,7 +2147,7 @@ def summarize():
                 "batch_errors": batch_errors, "degraded": True,
             }
         elif summary_type == "folder":
-            context = _folder_summary_context(scan_id, node_path, scan_result) if _package_documents(scan_id) else folder_context(selected, scan_result["root"])
+            context = _folder_summary_context(scan_id, node_path, scan_result)
             summary, result, batch_errors = analyze_folder(llm, context, node_path)
             summary["parser_info"] = {
                 "total_files": context["total_files"],
@@ -1742,19 +2163,35 @@ def summarize():
                 "degraded": bool(batch_errors or not result.get("model")),
             }
         else:
-            if not selected.exists() or not selected.is_file():
-                raise ValueError("文件不存在")
             unified_document = storage.get_document(scan_id, node_path)
             # In large-package mode the first pass stores a bounded projection.
             # A deliberate file-level deep read upgrades only this file, keeps
             # the package responsive, and immediately refreshes coverage.
-            if (unified_document or {}).get("coverage", {}).get("overview_sampled"):
-                deep_mode = "fast" if scan_result.get("parse_mode") == "fast" else "accurate"
-                unified_document = _parse_with_limits(parser, selected, node_path, mode=deep_mode)
+            package_analysis = storage.get_analysis(scan_id) or {}
+            is_large_package = bool(
+                (((package_analysis.get("policy") or {}).get("large_package") or {}).get("enabled"))
+            )
+            document_parser = (unified_document or {}).get("parser") or {}
+            document_coverage = (unified_document or {}).get("coverage") or {}
+            needs_deep_parse = is_large_package and (
+                document_parser.get("mode") == "fast"
+                or document_parser.get("fast_preview")
+                or document_coverage.get("limited_by_fast_mode")
+                or document_coverage.get("overview_sampled")
+            )
+            source_node = inventory_by_path(scan_result).get(node_path)
+            if not source_node:
+                raise ValueError("文件不在本次安全清点范围内")
+            if needs_deep_parse or not unified_document:
+                deep_mode = "accurate"
+                with _secure_source_snapshot(scan_result["root"], source_node) as snapshot:
+                    unified_document = _parse_with_limits(parser, snapshot, node_path, mode=deep_mode)
+                _restore_source_provenance(unified_document, scan_result["root"], source_node)
                 storage.save_document(scan_id, node_path, unified_document)
-                source_node = inventory_by_path(scan_result).get(node_path, {})
                 storage.set_file_state(
-                    scan_id, node_path, file_fingerprint(source_node), "completed",
+                    scan_id, node_path,
+                    checkpoint_fingerprint(source_node, parser, deep_mode, unified_document),
+                    "completed",
                     document=unified_document,
                 )
                 refresh_package_coverage(scan_id, scan_result, storage)
@@ -1860,15 +2297,40 @@ def export():
         return api_error(str(exc), 400)
 
 
+@app.route("/api/download-ticket", methods=["POST"])
+def create_download_ticket():
+    """Create a one-use URL so large files stream through browser navigation."""
+    payload = request.get_json(silent=True) or {}
+    filename = str(payload.get("filename") or "").strip()
+    if not filename or Path(filename).name != filename:
+        return api_error("非法输出文件路径", 400)
+    output_path = Config.OUTPUT_DIR / filename
+    if output_path.is_symlink() or not output_path.is_file():
+        return api_error("输出文件不存在或已被清理", 404)
+    owner_id = _request_owner_id() or Config.OWNER_ID
+    if storage.artifact_owner(filename) != owner_id:
+        return api_error("输出文件不存在或不属于当前访问用户", 404)
+    ticket = storage.create_download_ticket(
+        filename, owner_id, ttl_seconds=Config.DOWNLOAD_TICKET_TTL_SECONDS
+    )
+    return jsonify({
+        "ok": True,
+        "download_url": "/outputs/{}?ticket={}".format(
+            quote(filename, safe=""), quote(ticket, safe="")
+        ),
+        "expires_in_seconds": Config.DOWNLOAD_TICKET_TTL_SECONDS,
+    })
+
+
 @app.route("/outputs/<path:filename>")
 def outputs(filename):
     # Output artifacts may contain original user资料; require an ownership
     # record in addition to the global API token and reject path tricks.
     if Path(filename).name != filename:
         return api_error("非法输出文件路径", 404)
-    owner_id = _request_owner_id()
+    owner_id = _request_owner_id() or Config.OWNER_ID
     output_path = Config.OUTPUT_DIR / filename
-    if not output_path.is_file():
+    if output_path.is_symlink() or not output_path.is_file():
         return api_error("输出文件不存在或已被清理", 404)
     registered_owner = storage.artifact_owner(filename)
     # Older reports may predate output_artifacts registration. In this
@@ -1880,6 +2342,10 @@ def outputs(filename):
         registered_owner = owner_id
     if registered_owner != owner_id:
         return api_error("输出文件不存在或不属于当前访问用户", 404)
+    ticket = str(request.args.get("ticket") or "")
+    if ticket:
+        if not storage.consume_download_ticket(ticket, filename, owner_id):
+            return api_error("下载票据无效、已使用或已过期，请重新发起下载", 401)
     return send_from_directory(str(Config.OUTPUT_DIR), filename, as_attachment=True)
 
 

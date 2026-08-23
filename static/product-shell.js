@@ -30,14 +30,19 @@
   function syncDashboard() {
     const stats = $('scanStats');
     const text = stats?.textContent || '';
-    const file = text.match(/(\d+)\s*递归文件/);
-    const size = text.match(/([^；\n]+)\s*总大小/);
-    const coverage = text.match(/已分析\s*(\d+\/\d+)（(\d+(?:\.\d+)?)%）/);
-    const value = text.match(/价值判断：([^（;；]+)/);
-    if ($('dashboardFileCount') && file) $('dashboardFileCount').textContent = file[1];
-    if ($('dashboardSize') && size) $('dashboardSize').textContent = size[1].trim();
-    if ($('dashboardCoverage') && coverage) $('dashboardCoverage').textContent = coverage[2] + '%';
-    if ($('dashboardValue') && value) $('dashboardValue').textContent = value[1].trim();
+    const metricValue = (label) => {
+      const row = [...(stats?.querySelectorAll('.metric-grid > div') || [])]
+        .find((item) => item.querySelector('span')?.textContent.trim() === label);
+      return row?.querySelector('b')?.textContent.trim() || '';
+    };
+    const file = metricValue('递归文件');
+    const size = metricValue('总大小');
+    const coverage = (text.match(/内容解析\s*(\d+(?:\.\d+)?%|—)/) || [])[1] || '';
+    const value = ((text.match(/研究潜力\s*([^·；\n]+)/) || [])[1] || '').trim();
+    if ($('dashboardFileCount') && file) $('dashboardFileCount').textContent = file;
+    if ($('dashboardSize') && size) $('dashboardSize').textContent = size;
+    if ($('dashboardCoverage') && coverage) $('dashboardCoverage').textContent = coverage;
+    if ($('dashboardValue') && value) $('dashboardValue').textContent = value;
     const root = $('rootPath');
     if ($('workspaceName') && root?.value) {
       const parts = root.value.replace(/[\\/]+$/, '').split(/[\\/]/);
@@ -124,7 +129,7 @@
     $('rootPath')?.addEventListener('input', syncDashboard);
     $('scanBtn')?.addEventListener('click', syncDashboard, true);
     $('mobileMenuBtn')?.addEventListener('click', () => document.querySelector('.sidebar')?.classList.toggle('open'));
-    const resetToken = () => { window.localStorage.removeItem('sjfx_api_token'); window.location.reload(); };
+    const resetToken = () => { window.sessionStorage.removeItem('sjfx_api_token'); window.location.reload(); };
     $('headerTokenBtn')?.addEventListener('click', resetToken);
     $('headerTokenBtnSecondary')?.addEventListener('click', resetToken);
     const stats = $('scanStats');

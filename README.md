@@ -15,7 +15,7 @@ SJFX 用来处理“一批拿回来但还不知道里面有什么”的本地资
 - 支持人工整理主题目录：文件可挂载到多个主题，主题可合并、拆分、改名和确认，并可撤销/恢复。
 - 提供低置信度、未分类、解析失败和人工已确认的筛选视图，方便优先处理需要复核的资料。
 - 对 CSV/XLSX/JSON 等结构化数据生成字段类型、缺失值、重复值、异常值、时间范围和质量评分。
-- 对结构化数据执行带字段、表名和来源定位的合计、平均、最大、最小、数量问答。
+- 对同构 CSV/XLSX/JSON 执行跨文件合计、加权平均、最大、最小和总行数问答，返回全部参与及排除来源；同名字段但结构不兼容时拒绝静默混算。
 - 勾选多个主题、目录、文档或证据组合导出；相同源文件自动去重。
 - 生成概览 Word 和包含原始资料、分析成果、覆盖率及交接说明的 ZIP 包。
 - 小于 500 份规范文档使用自适应平均链接聚类；更大规模自动切换 MiniBatchKMeans，并按内容哈希持久化复用本地 Embedding 和规范证据索引。
@@ -41,6 +41,27 @@ SJFX 用来处理“一批拿回来但还不知道里面有什么”的本地资
 - 原文片段与最关键的“支撑原句”；
 - 直接证据、间接证据或语义证据类型；
 - 入选原因及内容哈希。
+
+### 容量与三类覆盖率
+
+资料包总量和单个内容对象上限是两个不同概念：资料包总量可以达到数十或数百 GiB，由
+大量目录和文件组成；普通单文件、压缩包容器、压缩包单成员、单个压缩包累计实际解压内容
+以及一次导出原始内容的硬上限统一为 10 GiB（`10737418240` 字节）。数百 GiB 资料不会
+一次性装入内存或模型，而是按批清点、解析、保存检查点，并对用户选中范围按需深入。
+
+页面和报告分别显示：
+
+- **清点覆盖率**：约定扫描范围内是否 100% 发现；任何读取错误或文件、目录、节点、深度
+  上限命中都会明确标记为不完整；
+- **内容解析覆盖率**：完整解析、部分解析、失败和待处理文件各有多少；
+- **语义分析覆盖率**：全文深度分析、有限语义投影和尚未深入文件各有多少。
+
+因此“清点完成”不能写成“全文分析完成”。大资料包的首轮目标是完整清点、所有文件进入
+明确终态并快速形成有界概览，重点文件再执行高精度深挖。
+
+完整清点不能依赖默认忽略目录来“减少数量”。扫描范围内的普通、隐藏、不支持格式和敏感
+扩展名文件都进入元数据清单；敏感或不支持内容可以不解析，但必须显示原因。符号链接按安全
+策略不跟随并单独计数，不把链接目标偷偷算入 100%。
 
 ## 3. 运行架构
 
@@ -164,16 +185,32 @@ HOST=0.0.0.0
 PORT=18000
 AUTH_REQUIRED=1
 SJFX_API_ACCESS_TOKEN=替换为刚才生成的随机Token
+# 稳定的数据归属标识。以后轮换访问 Token 时不要随意修改。
+SJFX_OWNER_ID=primary
 
 # 只能分析这些目录及其子目录。Linux 多个根目录使用冒号分隔。
 SCAN_ALLOWED_ROOTS=/data/incoming:/home/your-user/datasets
+
+# SQLite/WAL 和解析临时文件放在专用本地卷，不要使用容量很小的系统 /tmp。
+SJFX_STATE_DIR=/var/lib/sjfx-data-analysis-agent
+SJFX_PARSE_TEMP_DIR=/var/tmp/sjfx-data-analysis-agent-parse
+PARSE_TEMP_DISK_RESERVE_BYTES=1073741824
+
+# 每个普通文件、归档容器/成员/累计解压内容和一次导出的统一 10 GiB 硬上限。
+MAX_CONTENT_BYTES=10737418240
 ```
 
 重要说明：
 
 - 浏览器填写的是服务器上的绝对路径，不是你自己电脑上的路径。
 - `SCAN_ALLOWED_ROOTS` 必须覆盖待分析目录，否则页面会提示路径不在白名单。
+- 非回环 `HOST`（例如 `0.0.0.0`）必须显式设置 `SCAN_ALLOWED_ROOTS`，否则服务拒绝启动；只授权
+  具体数据入口，如 `/data/incoming:/data/research`，不要配置整个 `/home` 或文件系统根目录。
 - 绑定 `0.0.0.0` 时必须开启鉴权并设置强 Token。
+- `SJFX_OWNER_ID` 是历史扫描、任务和成果的稳定归属；可以轮换访问 Token，但不要随 Token
+  一起修改该值。需要迁移归属时应先备份状态库并按迁移流程处理。
+- `SJFX_PARSE_TEMP_DIR` 所在卷应至少容纳一次接近 10 GiB 的受控展开和保留空间；解析器超时、
+  取消或崩溃后由父进程和陈旧目录清理机制回收项目自有临时项。
 - `.env` 修改后需要重启 Web 和 Worker 才会生效。
 
 ### 第四步：检查 Ollama（需要模型增强时）
@@ -242,7 +279,9 @@ http://服务器IP:18000
 - 加强 OCR、TableFormer 表格识别和 Office 内嵌图片识别；
 - 耗时和内存占用明显更高。
 
-大包模式默认采用高精度解析并按批落盘。对于扫描件比例很高的 10 GB 数据包，应控制 `LARGE_PACKAGE_BATCH_FILES` 和 OCR 并发，避免同时占满 CPU、显存和临时磁盘。
+大包首轮固定采用快速解析并按批落盘，以便尽快形成完整清点和有限语义概览；高精度
+Docling/OCR 留给用户选中的主题、目录或文件范围。对于扫描件比例很高的资料包，应控制
+`LARGE_PACKAGE_BATCH_FILES` 和 OCR 并发，避免同时占满 CPU、内存和专用临时磁盘。
 
 ### 6.3 查看原始目录和主题目录
 
@@ -250,6 +289,14 @@ http://服务器IP:18000
 - 点击“主题目录”：按内容浏览主题、子方向、文档和证据。
 - 点击任意节点：右侧显示本地摘要、成员文件、覆盖率和证据。
 - 勾选节点：加入组合导出清单；点击节点本身只负责查看，不等于勾选。
+
+原始目录和主题目录都按节点分页读取。首次接口只返回根节点和一页直接子项，展开节点时才
+继续取下一页；摘要和证据也独立分页。因此浏览十万级目录时不需要让接口返回一个超大 JSON，
+也不会让浏览器一次创建全部 DOM 节点。页内显示的数量不能替代清点总数，应以清点覆盖率为准。
+
+`GET /api/scan/<id>` 和 `GET /api/analysis/<id>` 默认就是 bounded 概览与浅层树；目录使用
+`GET /api/tree/<id>`、摘要使用 `GET /api/summaries/<id>` 继续分页。`?full=1` 只为受控诊断
+兼容旧载荷，不供前端日常调用，也不应用于大资料包。
 
 ### 6.3.1 人工整理主题目录
 
@@ -301,7 +348,10 @@ http://服务器IP:18000
 
 ### 6.7 结构化数据精确统计
 
-该入口不是通用聊天，只针对已经生成画像的 CSV/XLSX/JSON 数值字段。
+该入口不是通用聊天，只针对已经生成画像的 CSV/XLSX/JSON 数值字段。系统会在当前范围内
+寻找字段结构兼容的所有数据表并进行跨文件聚合，而不是只取第一个文件；结果会列出参与文件、
+排除文件、行数/有效数和覆盖状态。结构不兼容、单位不明或某个参与表缺少计算所需统计量时，
+系统会拒绝猜测。
 
 可使用的问题示例：
 
@@ -344,34 +394,44 @@ http://服务器IP:18000
 - 文档索引、重复组和聚类清单；
 - 本地检索结果及分析成果。
 
-## 7. 最高约 10 GB 数据包怎么使用
+## 7. 数十/数百 GiB 资料包与单项 10 GiB 怎么使用
 
-达到 1 GB 或 3000 个文件时，系统默认进入大数据包模式：
+达到 1 GiB 或 3000 个文件时，系统默认进入大数据包模式：
 
-- 全量文件进入解析队列，默认每批 100 个，直到所有文件完成或失败；
+- 扫描器先在配置的文件、目录、节点、单目录条目和深度安全边界内完成清点；任何边界命中
+  都会设置 `truncated` 或相应计数，本次清点不得宣称 100%；
+- 已清点文件进入快速解析队列，默认每批 100 个，直到所有文件完成、部分完成或明确失败；
 - 完整解析结果逐文件写入 sidecar，包级内存只保留有限内容画像；
 - 大包默认跳过高相似度和 embedding 语义聚类，但仍根据全部已解析文件的正文头、中、尾和章节生成内容主题树；
 - 可通过 `LARGE_PACKAGE_BATCH_FILES` 调整批量大小，建议保持 50-200。
 
 ```text
-全量盘点
+安全边界内的完整盘点
   ↓
-有限批次全量解析
+有限批次快速解析
   ↓
 逐文件保存检查点和内容画像
   ↓
-根据正文生成内容主题树
+分页展示物理树 + 有限投影生成主题树
   ↓
-组合导出
+按需高精度深挖 + 不超过 10 GiB 的组合导出
 ```
 
-它的目标是稳定完成约 10 GB 数据包的全量文件处理和透明覆盖。单个文件可能因正文上限、损坏、加密或格式不支持而标记为部分覆盖或失败；实际耗时主要受文件数量、扫描件比例、OCR 页数、复杂表格、Office 图片和磁盘 IO 影响。
+它的目标是让数十或数百 GiB 总资料包也能用稳定内存完成清点、渐进概览和断点续跑，
+不是把数百 GiB 正文一次性送入模型。单个文件、归档容器、归档成员、单归档累计解压内容和
+一次导出的硬上限统一为 10 GiB。单个文件可能因正文长度、损坏、加密或格式能力而标记为
+部分覆盖或失败；实际耗时主要受文件数量、扫描件比例、OCR 页数、复杂表格、Office 图片和
+磁盘 IO 影响。
 
 常用边界配置：
 
 ```env
 MAX_SCAN_FILES=50000
 MAX_SCAN_DEPTH=32
+MAX_SCAN_DIRECTORIES=50000
+MAX_SCAN_NODES=100001
+MAX_SCAN_ENTRIES_PER_DIRECTORY=50000
+MAX_CONTENT_BYTES=10737418240
 MAX_SINGLE_FILE_BYTES=10737418240
 MAX_PARSE_SECONDS=300
 SOURCE_STABILITY_SECONDS=2
@@ -383,7 +443,21 @@ MAX_STRUCTURED_PROFILE_ROWS=100000
 MAX_STRUCTURED_PROFILE_BYTES=268435456
 MAX_STRUCTURED_JSON_RECORD_BYTES=16777216
 MAX_STRUCTURED_JSON_RECORD_CHARS=16777216
-MAX_EXPORT_BYTES=5368709120
+MAX_EXPORT_BYTES=10737418240
+EXPORT_DISK_RESERVE_BYTES=1073741824
+
+# 大归档必须使用专用本地临时卷；超时/取消/崩溃后的项目临时项会被回收。
+SJFX_PARSE_TEMP_DIR=/var/tmp/sjfx-data-analysis-agent-parse
+PARSE_TEMP_DISK_RESERVE_BYTES=1073741824
+PARSE_TEMP_STALE_SECONDS=21600
+
+# 归档对象上限统一为 10 GiB，同时保留成员数、压缩比和路径深度防护。
+MAX_ARCHIVE_ENTRIES=5000
+MAX_ARCHIVE_FILE_BYTES=10737418240
+MAX_ARCHIVE_MEMBER_BYTES=10737418240
+MAX_ARCHIVE_UNCOMPRESSED_BYTES=10737418240
+MAX_ARCHIVE_COMPRESSION_RATIO=200
+MAX_ARCHIVE_MEMBER_PATH_DEPTH=32
 
 # Docling/RapidOCR 默认只使用 CPU，给本地 Qwen/ Ollama 留出 GPU 显存。
 DOCLING_DEVICE=cpu
@@ -401,10 +475,13 @@ LARGE_PACKAGE_THRESHOLD_BYTES=1073741824
 LARGE_PACKAGE_THRESHOLD_FILES=3000
 LARGE_PACKAGE_INITIAL_PARSE_FILES=700
 LARGE_PACKAGE_DEEPEN_BATCH_FILES=500
-LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE=30000
+LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE=4000
+LARGE_PACKAGE_OVERVIEW_EVIDENCE_PER_FILE=6
 ```
 
-修改这些数值前先用真实样本压测。提高首轮文件数会同时增加解析时间、内存、侧存空间和模型等待时间。
+修改这些数值前先用真实样本压测。扫描安全边界可以根据机器和资料规模提高，但命中任何边界
+都必须保持“清点不完整”标记；不能为了显示 100% 而取消所有保护。提高批量、并发或每文件
+投影大小会同时增加解析时间、内存、侧存空间和模型等待时间。
 
 ### CPU 并行解析的边界
 
@@ -423,17 +500,23 @@ SQLite 结果由主 Worker 统一提交。`PARSE_MAX_CONCURRENCY` 默认是 2，
 ### Token 与访问隔离
 
 - API 支持 `X-SJFX-Token` 或 `Authorization: Bearer ...`。
-- 扫描、任务、结果和下载按 Token 的不可逆指纹隔离。
-- 浏览器把 Token 保存在当前浏览器的 localStorage 中，下载时也会自动携带请求头。
-- 不同 Token 无法读取彼此的扫描和成果。
+- 扫描、任务、结果和下载按稳定的 `SJFX_OWNER_ID` 隔离；Token 只负责证明访问权限。
+- 浏览器只把 Token 保存在当前标签会话的 sessionStorage 中，关闭标签后不长期保留；下载时
+  先换取 30–600 秒有效的一次性票据，再由浏览器导航直接流式落盘，不会把 10 GiB 成果
+  整体缓冲成内存 Blob。票据默认 120 秒，可用 `DOWNLOAD_TICKET_TTL_SECONDS` 调整。
+- 不同 owner 无法读取彼此的扫描和成果。
 - 可选设置 `SJFX_API_TOKEN_EXPIRES_AT`（UTC epoch 或 ISO-8601 时间）让泄露的 Token
   自动失效；修改 Token 或过期时间后必须重启 Web 和 Worker。未设置时仍建议定期更换
   `.env` 中的 Token。
 
-如果浏览器保存了错误 Token，按 `F12` 打开控制台并执行：
+轮换 `SJFX_API_ACCESS_TOKEN` 时保持 `SJFX_OWNER_ID` 不变，历史扫描、任务和导出仍属于同一
+逻辑用户。不要把 Token 哈希或每次生成的新随机值用作永久 owner；确需改变 owner 时先备份
+SQLite/sidecar，并执行明确的数据归属迁移。
+
+如果当前标签保存了错误 Token，按 `F12` 打开控制台并执行：
 
 ```javascript
-localStorage.removeItem('sjfx_api_token')
+sessionStorage.removeItem('sjfx_api_token')
 ```
 
 刷新页面后重新输入正确 Token。
@@ -446,9 +529,17 @@ localStorage.removeItem('sjfx_api_token')
 SCAN_ALLOWED_ROOTS=/data/incoming:/data/research
 ```
 
+对外绑定 `0.0.0.0` 时该配置是强制项；不要使用 `/`、整个 `/home` 或包含其他用户私有目录的
+上层路径。回环开发模式虽可使用项目父目录默认值，正式部署仍建议显式给出最小授权范围。
+
+`SCAN_IGNORED_DIRS` 和 `SCAN_IGNORED_FILES` 默认必须为空。只有经过审批的已知噪声才应显式
+排除；一旦实际命中，系统会记录排除数量并把 `inventory_coverage.complete` 标为 false，
+不能在验收时仍宣称 100% 清点。
+
 Windows 使用分号分隔（例如 `C:\data;D:\research`），不会把盘符中的冒号误当成分隔符。
 
-系统不会跟随符号链接，并限制目录深度、文件总数、单文件体积、解析时间和 Worker 内存。
+系统登记符号链接自身但不会跟随链接目标，并限制目录深度、文件总数、单文件体积、解析时间
+和 Worker 内存。
 每个真实文档默认在独立解析进程中执行；超过 `MAX_PARSE_SECONDS` 或
 `MAX_PARSE_PROCESS_MEMORY_MB` 会终止该子进程并把文件标记为可重试失败，主 Worker
 不会被损坏的 PDF/OCR 调用永久卡住。需要排查兼容性时可临时设
@@ -459,13 +550,22 @@ Linux 默认使用 `fork` 以减少子进程启动成本；如果未来在 Worke
 ### 压缩包边界
 
 ```env
-MAX_ARCHIVE_ENTRIES=1500
-MAX_ARCHIVE_FILE_BYTES=5368709120
-MAX_ARCHIVE_MEMBER_BYTES=134217728
-MAX_ARCHIVE_UNCOMPRESSED_BYTES=2147483648
+MAX_CONTENT_BYTES=10737418240
+MAX_ARCHIVE_ENTRIES=5000
+MAX_ARCHIVE_FILE_BYTES=10737418240
+MAX_ARCHIVE_MEMBER_BYTES=10737418240
+MAX_ARCHIVE_UNCOMPRESSED_BYTES=10737418240
+MAX_ARCHIVE_COMPRESSION_RATIO=200
+MAX_ARCHIVE_MEMBER_PATH_DEPTH=32
+SJFX_PARSE_TEMP_DIR=/var/tmp/sjfx-data-analysis-agent-parse
+PARSE_TEMP_DISK_RESERVE_BYTES=1073741824
 ```
 
-这些限制用于降低路径穿越和压缩炸弹风险。压缩容器本身可到 5GB，但单成员仍限制为 128MB、累计实际解压预算为 2GB；超过边界时会被标记为受限或失败，不应随意把上限改成无限。普通单文件仍使用 `MAX_SINGLE_FILE_BYTES`，不会随压缩包上限一起放宽。
+普通源文件、压缩容器、单个成员和单个归档累计实际解压内容都受统一 10 GiB 硬上限保护；
+组件环境变量只能进一步降低自己的预算。10 GiB 不是“全部直接解压到内存”，解析器会逐成员
+复制到项目专用临时根并同时检查成员数、声明/实际大小、压缩比、路径深度和剩余磁盘。加密成员
+会单独标记为失败或跳过，不会让同一归档中其他安全成员一起失败。达到任一边界时必须显示部分
+覆盖，不能把限制改成无限。
 
 每个压缩包都会生成成员级覆盖清单，记录成员总数、已解析、跳过、失败、截断及原因。只要一个成员未完成，压缩包和上层节点就会显示“部分覆盖”；外层节点检索仍可正确命中 `archive.zip::member.pdf` 形式的成员证据。
 
@@ -481,7 +581,7 @@ MAX_ARCHIVE_UNCOMPRESSED_BYTES=2147483648
 
 扫描完成后的分析进度映射到后续区间并保持单调，不会从 15%倒退到 2%。长时间的单文件解析、模型生成和报告阶段由父 Worker 独立刷新心跳，因此“百分比暂时不变”不再等于 Worker 失联。
 
-### 1GB / 5GB / 10GB 性能验收
+### 真实 1 / 5 / 10 GiB 性能验收
 
 项目将覆盖范围分为“全量盘点、内容解析、全文深度分析”三档，不再用一个完成状态混淆不同分析深度。真实负载的固定测试矩阵、资源指标、验收门槛和命令见 [docs/PERFORMANCE_ACCEPTANCE.md](docs/PERFORMANCE_ACCEPTANCE.md)。
 
@@ -641,7 +741,19 @@ python -m unittest discover -s tests -v
 7. 正文证据显示支撑原句、证据类型、入选原因和来源位置；
 8. 相同内容的重复文件在组合导出中只保留一个规范副本；
 9. 导出清单记录被合并路径和覆盖率；
-10. 重启服务后历史任务与结果仍可从 SQLite 恢复。
+10. 重启服务后历史任务与结果仍可从 SQLite 恢复；轮换 Token 且保持 `SJFX_OWNER_ID` 后历史数据仍可访问；
+11. 首次扫描/分析接口返回分页树，展开节点才能继续加载子项，分析过程中可见首版概览；
+12. 清点、内容解析、语义分析三类覆盖率分别显示，不把有限投影写成全文完成；
+13. 两个同构数据表可以跨文件正确求和/加权平均，异构同名字段被拒绝；
+14. 加密归档成员、损坏文件和超限成员只影响自身，专用解析临时目录在失败后可回收；
+15. 使用真实 1/5/10 GiB 样本完成性能、检索、检查点重入和导出验收。
+
+完整容量验收命令、阈值和 JSON 字段见
+[真实 1 / 5 / 10 GiB 性能与恢复验收](docs/PERFORMANCE_ACCEPTANCE.md)。测试脚本会独立复算
+文件实际字节并拒绝稀疏样本，不允许用修改 size 元数据的方式冒充 10 GiB。
+
+本轮代码落点、已完成项与仍待服务器实测的边界见
+[V1–V3 改修结果与交付边界](docs/V1-V3改修结果.md)。
 
 ## 12. 目录与数据位置
 
@@ -656,10 +768,12 @@ python -m unittest discover -s tests -v
 │   ├── evidence.py                # 证据质量、问题匹配和结论绑定
 │   ├── retrieval.py               # 本地证据检索
 │   ├── structured_profile.py      # 结构化数据画像
+│   ├── structured_qa.py           # 同构数据表的跨文件精确统计
 │   ├── exporter.py                # Word/ZIP 导出与内容去重
 │   └── storage.py                 # SQLite WAL 和压缩侧存
 ├── static/ 与 templates/          # 浏览器界面
 ├── tests/                         # 自动回归测试
+├── scripts/benchmark_package.py   # 真实 1/5/10 GiB 性能与恢复验收
 ├── deploy/                        # systemd 示例
 ├── data/agent.db                  # 本地任务与结果数据库（不提交）
 ├── data/document_payloads/        # 大正文压缩侧存（不提交）
@@ -670,7 +784,12 @@ python -m unittest discover -s tests -v
 ## 13. 当前边界
 
 - 复杂扫描件、低清图片、超大表格和大量 Office 内嵌图片会显著增加耗时。
-- 大数据包会全量分批处理文件；单个超长文档仍受解析器正文上限和格式能力约束，覆盖率会明确标记截断、失败和不支持项。
+- 大数据包会在配置的扫描安全边界内完整清点并分批处理；命中任何文件、目录、节点、单目录
+  条目或深度上限都会明确标记清点不完整。单个超长文档仍受正文投影和格式能力约束。
+- 普通单文件、归档容器、归档成员、单归档累计实际解压内容和一次导出原始内容均不超过
+  10 GiB；总资料包可以更大，但必须分批分析并分范围导出。
+- 大包首轮是有限语义投影，不等同于全部正文深度分析；三类覆盖率会分别标记完整、部分、
+  失败和按需深入状态。
 - 自动主题、价值判断和语义证据需要人工复核；精确数字结果也应核对字段含义和单位。
 - 系统聚焦资料理解和分析交接，不替代最终报告责任人对事实、版权、保密和引用的审查。
 

@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -12,6 +13,8 @@ from services.exporter import export_node
 from services.package_analysis import (
     SourceFileChangedError,
     _assert_source_stable,
+    _parallel_parse_files,
+    _secure_source_snapshot,
     _source_has_open_writer,
     _document_role,
     _content_topics,
@@ -674,6 +677,60 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertGreaterEqual(analysis["coverage"]["parsed_files"], 3)
             self.assertLessEqual(analysis["coverage"]["pending_files"], 1)
 
+    def test_retry_success_removes_the_historical_failure_for_the_same_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "retry.txt").write_text("重试后成功的正文", encoding="utf-8")
+            scan = scan_directory(root)
+            scan["parse_mode"] = "fast"
+            storage = Storage(root / "analysis.db")
+            scan_id = storage.save_scan(scan)
+            storage.set_file_state(scan_id, "retry.txt", "obsolete", "failed", error="旧错误")
+
+            analysis = analyze_package(
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000)
+            )
+
+            self.assertEqual(analysis["coverage"]["failed_files"], 0)
+            self.assertFalse(any(item.get("path") == "retry.txt" for item in analysis["failures"]))
+            self.assertEqual(storage.get_file_state(scan_id, "retry.txt")["status"], "completed")
+            self.assertIn("重试后成功", storage.get_document(scan_id, "retry.txt")["text"])
+
+    def test_retry_failure_deletes_the_old_document_and_its_text(self):
+        class AlwaysFailParser:
+            docling_device = "cpu"
+
+            def parse(self, *_args, **_kwargs):
+                raise ValueError("本次解析失败")
+
+            def status(self):
+                return {"available": True}
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "retry.txt").write_text("当前文件", encoding="utf-8")
+            scan = scan_directory(root)
+            scan["parse_mode"] = "fast"
+            storage = Storage(root / "analysis.db", sidecar_threshold=32768)
+            scan_id = storage.save_scan(scan)
+            storage.save_document(scan_id, "retry.txt", {
+                "source": {"path": "retry.txt", "sha256": "0" * 64},
+                "text": "不应泄漏的旧正文" * 5000,
+                "evidence": [{"source_path": "retry.txt", "text": "旧证据"}],
+                "coverage": {"complete": True},
+            })
+            self.assertTrue(list((root / "document_payloads" / scan_id).glob("*.json.gz")))
+            storage.set_file_state(scan_id, "retry.txt", "obsolete", "failed", error="旧错误")
+
+            analysis = analyze_package(scan_id, scan, storage, AlwaysFailParser())
+
+            self.assertEqual(analysis["coverage"]["parsed_files"], 0)
+            self.assertEqual(analysis["coverage"]["failed_files"], 1)
+            self.assertIsNone(storage.get_document(scan_id, "retry.txt"))
+            self.assertFalse(list((root / "document_payloads" / scan_id).glob("*.json.gz")))
+            self.assertEqual(storage.get_file_state(scan_id, "retry.txt")["status"], "failed")
+            self.assertNotIn("不应泄漏的旧正文", json.dumps(analysis, ensure_ascii=False))
+
     def test_large_document_payload_is_stored_in_sidecar_not_sqlite_blob(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -685,6 +742,48 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(projection["sidecar_stored"])
             self.assertLess(len(projection["text"]), len(payload["text"]))
             self.assertTrue(list((root / "sidecars" / "scan-1").glob("*.json.gz")))
+
+    def test_nonhydrated_inline_documents_are_projected_and_iterated_in_batches(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            storage = Storage(
+                root / "analysis.db", root / "sidecars",
+                sidecar_threshold=2 * 1024 * 1024,
+            )
+            long_text = "内联正文" * 62500
+            profiles = [{
+                "member": "sheet-{}.csv".format(profile_index),
+                "profile": {
+                    "status": "completed",
+                    "coverage": {"complete": True},
+                    "columns": {"金额": {"sum": profile_index}},
+                },
+            } for profile_index in range(40)]
+            for index in range(3):
+                storage.save_document("scan-1", "{}.txt".format(index), {
+                    "source": {"path": "{}.txt".format(index)},
+                    "text": long_text,
+                    "evidence": [],
+                    "coverage": {"complete": True},
+                    "data_profiles": profiles,
+                })
+
+            projected = list(storage.iter_documents(
+                "scan-1", hydrate=False, batch_size=1
+            ))
+            hydrated = storage.list_documents("scan-1", hydrate=True)
+
+            self.assertEqual([item["path"] for item in projected], ["0.txt", "1.txt", "2.txt"])
+            self.assertTrue(all(len(item["payload"]["text"]) < len(long_text) for item in projected))
+            self.assertTrue(all(item["payload"]["coverage"]["semantic_projection"] for item in projected))
+            self.assertTrue(all(item["payload"]["data_profiles_total"] == 40 for item in projected))
+            self.assertTrue(all(item["payload"]["data_profiles_projected_count"] == 30 for item in projected))
+            self.assertTrue(all(item["payload"]["data_profiles_omitted_count"] == 10 for item in projected))
+            self.assertEqual(
+                projected[0]["payload"]["data_profiles"][0]["profile"]["columns"]["金额"]["sum"],
+                0,
+            )
+            self.assertTrue(all(item["payload"]["text"] == long_text for item in hydrated))
 
     def test_path_escape_is_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -702,13 +801,89 @@ class CoreRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(SourceFileChangedError, "仍在复制|扫描后发生变化"):
                 _assert_source_stable(path, file_node)
 
+    def test_parse_uses_a_verified_private_snapshot_and_restores_provenance(self):
+        class RecordingParser:
+            def __init__(self):
+                self.paths = []
+
+            def parse(self, path, relative_path, mode="fast"):
+                self.paths.append(Path(path))
+                return {"source": {}, "text": Path(path).read_text(encoding="utf-8")}
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "inside.txt"
+            source.write_text("受保护正文", encoding="utf-8")
+            file_node = next(_walk_files(scan_directory(root)["tree"]))
+            scratch = root / "scratch"
+            parser = RecordingParser()
+            with patch("services.package_analysis.Config.PARSE_TEMP_DIR", scratch), patch(
+                "services.package_analysis.Config.PARSE_TEMP_DISK_RESERVE_BYTES", 0
+            ):
+                result = _parallel_parse_files(parser, [file_node], root, "fast")
+            document = result[0][2]
+            self.assertEqual(document["text"], "受保护正文")
+            self.assertEqual(document["source"]["path"], "inside.txt")
+            self.assertTrue(document["source"]["source_snapshot_verified"])
+            self.assertNotEqual(parser.paths[0], source)
+            self.assertFalse(parser.paths[0].exists())
+
+    def test_secure_snapshot_rejects_a_file_replaced_by_symlink(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("当前平台不支持符号链接")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "inside.txt"
+            outside = root.parent / (root.name + "-outside.txt")
+            source.write_text("诱饵", encoding="utf-8")
+            outside.write_text("根外秘密", encoding="utf-8")
+            file_node = next(_walk_files(scan_directory(root)["tree"]))
+            source.unlink()
+            try:
+                os.symlink(str(outside), str(source))
+            except OSError as exc:
+                outside.unlink()
+                self.skipTest("无法创建测试符号链接：{}".format(exc))
+            scratch = root / "scratch"
+            try:
+                with patch("services.package_analysis.Config.PARSE_TEMP_DIR", scratch), patch(
+                    "services.package_analysis.Config.PARSE_TEMP_DISK_RESERVE_BYTES", 0
+                ):
+                    with self.assertRaises((SourceFileChangedError, OSError)):
+                        with _secure_source_snapshot(root, file_node):
+                            pass
+            finally:
+                outside.unlink()
+
+    def test_secure_snapshot_preserves_sensitive_filename_policy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / ".env"
+            source.write_text("TOP_SECRET=must-not-enter-model", encoding="utf-8")
+            file_node = next(_walk_files(scan_directory(root)["tree"]))
+            scratch = root / "scratch"
+            with patch("services.package_analysis.Config.PARSE_TEMP_DIR", scratch), patch(
+                "services.package_analysis.Config.PARSE_TEMP_DISK_RESERVE_BYTES", 0
+            ):
+                result = _parallel_parse_files(
+                    UnifiedDocumentParser(max_chars=1000), [file_node], root, "fast"
+                )
+            document = result[0][2]
+            self.assertTrue(document["source"]["sensitive"])
+            self.assertEqual(document["source"]["content_policy"], "metadata_only_sensitive")
+            self.assertEqual(document["text"], "")
+            self.assertTrue(document["coverage"]["content_restricted"])
+
     def test_bad_zip_warning_explains_incomplete_copy(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "broken.zip"
             path.write_bytes(b"PK\x03\x04incomplete")
             document = UnifiedDocumentParser(max_chars=1000).parse(path, "broken.zip")
             self.assertTrue(document["parser"]["degraded"])
-            self.assertTrue(any("仍在复制" in item and "ZIP 中央目录" in item for item in document["warnings"]))
+            self.assertTrue(any(
+                "ZIP 中央目录" in item and ("预检失败" in item or "仍在复制" in item)
+                for item in document["warnings"]
+            ))
 
     def test_archive_container_has_separate_size_limit(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -3,6 +3,8 @@ const state = {
   selected: null,
   summary: null,
   analysis: null,
+  progressiveAnalysis: null,
+  progressiveRefreshKey: null,
   analysisTreeOriginal: null,
   summaries: new Map(),
   activeTree: 'physical',
@@ -13,7 +15,8 @@ const state = {
   treeEdits: [],
   jobs: new Map(),
   jobsEndpointAvailable: null,
-  taskCenterRefreshInFlight: false
+  taskCenterRefreshInFlight: false,
+  selectionRequestId: 0
 };
 
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running', 'cancelling']);
@@ -44,15 +47,16 @@ function toast(message, error = false) {
 
 async function api(url, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
-  let token = window.localStorage.getItem('sjfx_api_token') || '';
+  let token = window.sessionStorage.getItem('sjfx_api_token') || '';
   if (token) headers['X-SJFX-Token'] = token;
   let response = await fetch(url, { ...options, headers });
   if (response.status === 401) {
-    token = window.localStorage.getItem('sjfx_api_token')
-      || window.prompt('请输入 SJFX API Token（首次访问输入一次即可）', '')
+    window.sessionStorage.removeItem('sjfx_api_token');
+    delete headers['X-SJFX-Token'];
+    token = window.prompt('访问凭据已失效，请重新输入 SJFX API Token', '')
       || '';
     if (token) {
-      window.localStorage.setItem('sjfx_api_token', token);
+      window.sessionStorage.setItem('sjfx_api_token', token);
       headers['X-SJFX-Token'] = token;
       response = await fetch(url, { ...options, headers });
     }
@@ -73,42 +77,23 @@ async function api(url, options = {}) {
   return data;
 }
 
-// Downloads cannot use a plain <a href> when API-token authentication is on:
-// browsers do not attach the X-SJFX-Token header to a normal navigation.
-// Fetch the artifact with the same authenticated header as other API calls,
-// then save the returned Blob locally.
+// Downloads cannot attach X-SJFX-Token to a plain navigation. Ask the API for
+// a short-lived one-use URL, then let the browser stream the response directly
+// to disk. Never buffer a multi-gigabyte export as an in-memory Blob.
 async function authenticatedDownload(url) {
-  const headers = {};
-  let token = window.localStorage.getItem('sjfx_api_token') || '';
-  if (token) headers['X-SJFX-Token'] = token;
-  let response = await fetch(url, { headers });
-  if (response.status === 401) {
-    token = window.localStorage.getItem('sjfx_api_token')
-      || window.prompt('请输入 SJFX API Token（首次访问输入一次即可）', '')
-      || '';
-    if (token) {
-      window.localStorage.setItem('sjfx_api_token', token);
-      headers['X-SJFX-Token'] = token;
-      response = await fetch(url, { headers });
-    }
-  }
-  if (!response.ok) {
-    let message = '下载失败';
-    try { message = (await response.json()).error || message; } catch (_) {}
-    throw new Error(message);
-  }
-  const disposition = response.headers.get('Content-Disposition') || '';
-  const encoded = (disposition.match(/filename\*=UTF-8''([^;]+)/i) || [])[1];
-  const quoted = (disposition.match(/filename="?([^";]+)"?/i) || [])[1];
-  const filename = encoded ? decodeURIComponent(encoded) : (quoted || 'sjfx-download');
-  const blobUrl = URL.createObjectURL(await response.blob());
+  const path = String(url || '').split('?', 1)[0];
+  const encodedName = path.split('/').pop() || '';
+  const filename = decodeURIComponent(encodedName);
+  if (!filename) throw new Error('下载文件名无效');
+  const ticket = await api('/api/download-ticket', {
+    method: 'POST', body: JSON.stringify({ filename })
+  });
   const anchor = document.createElement('a');
-  anchor.href = blobUrl;
-  anchor.download = filename;
+  anchor.href = ticket.download_url;
+  anchor.style.display = 'none';
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(blobUrl);
 }
 
 function downloadLink(url, label) {
@@ -294,9 +279,21 @@ function closeSplitDialog() {
   if (dialog) dialog.remove();
 }
 
-function openSplitDialog(node) {
+async function openSplitDialog(node) {
   closeTreeContextMenu();
-  const files = (node.children || []).filter((item) => item.kind === 'file' && item.path).map((item) => ({ path: item.path, name: item.name || item.path }));
+  let files = (node.children || []).filter((item) => item.kind === 'file' && item.path).map((item) => ({ path: item.path, name: item.name || item.path }));
+  const expectedMembers = Number(node.member_count ?? node.file_count ?? (node.member_paths || []).length);
+  if (state.scan && expectedMembers > files.length) {
+    try {
+      const data = await api(
+        `/api/analysis-node-members/${state.scan.scan_id}?node_id=${encodeURIComponent(node.node_id)}&limit=500`
+      );
+      files = data.members || [];
+    } catch (error) {
+      toast(error.message || '无法加载主题完整成员，已阻止不完整拆分', true);
+      return;
+    }
+  }
   if (files.length < 2) { toast('当前主题至少需要两个已解析文件才能拆分', true); return; }
   const draft = { source: files.slice(), groups: [{ name: (node.name || '主题') + ' A', paths: [] }, { name: (node.name || '主题') + ' B', paths: [] }] };
   const backdrop = document.createElement('div');
@@ -439,6 +436,63 @@ function setupTreeDrag(row, node) {
   });
 }
 
+function appendTreePageControl(node, childList, twisty) {
+  childList.querySelectorAll(':scope > .tree-load-more').forEach((item) => item.remove());
+  if (node._children_next_offset == null) return;
+  const item = document.createElement('li');
+  item.className = 'tree-load-more';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'text-button';
+  const loaded = Number(node._children_next_offset || 0);
+  const total = Number(node._children_total || node.child_count || 0);
+  button.textContent = `继续加载（${loaded}/${total}）`;
+  button.onclick = async (event) => {
+    event.stopPropagation();
+    button.disabled = true;
+    try {
+      await loadTreeChildren(node, childList, twisty, true);
+    } catch (error) {
+      toast(error.message || '目录下一页加载失败', true);
+      button.disabled = false;
+    }
+  };
+  item.appendChild(button);
+  childList.appendChild(item);
+}
+
+
+async function loadTreeChildren(node, childList, twisty, append = false) {
+  if (!state.scan?.scan_id || !node?._tree_key) return;
+  const treeKind = state.activeTree === 'analysis' ? 'analysis' : 'physical';
+  const treeFilter = treeKind === 'analysis' ? ($('treeFilter')?.value || 'all') : 'all';
+  const offset = append ? Number(node._children_next_offset || 0) : 0;
+  const data = await api(
+    `/api/tree/${state.scan.scan_id}?kind=${treeKind}`
+    + `&filter=${encodeURIComponent(treeFilter)}`
+    + `&node_key=${encodeURIComponent(node._tree_key)}&offset=${offset}&limit=200`
+  );
+  const pageNode = data.node || {};
+  const children = pageNode.children || [];
+  if (!append) {
+    childList.innerHTML = '';
+    node.children = [];
+  } else {
+    childList.querySelectorAll(':scope > .tree-load-more').forEach((item) => item.remove());
+  }
+  children.forEach((child) => {
+    node.children.push(child);
+    childList.appendChild(renderTreeNode(child));
+  });
+  node._children_total = pageNode._children_total;
+  node._children_next_offset = pageNode._children_next_offset;
+  node._children_loaded = true;
+  childList.style.display = '';
+  twisty.textContent = '▾';
+  appendTreePageControl(node, childList, twisty);
+}
+
+
 function renderTreeNode(node) {
   const li =
     document.createElement('li');
@@ -484,14 +538,12 @@ function renderTreeNode(node) {
     row.appendChild(picker);
   }
 
-  const hasChildren =
-    Boolean(
-      node.children?.length
-    );
+  const loadedChildren = Array.isArray(node.children) ? node.children : [];
+  const hasChildren = Boolean(node.has_children || loadedChildren.length);
 
   twisty.textContent =
     hasChildren
-      ? '▾'
+      ? (loadedChildren.length ? '▾' : '▸')
       : '';
 
   const label =
@@ -549,33 +601,42 @@ function renderTreeNode(node) {
     childList =
       document.createElement('ul');
 
-    node.children.forEach(
+    loadedChildren.forEach(
       child =>
         childList.appendChild(
           renderTreeNode(child)
         )
     );
 
+    node.children = loadedChildren;
+    node._children_loaded = loadedChildren.length > 0;
+    if (!loadedChildren.length) childList.style.display = 'none';
+    appendTreePageControl(node, childList, twisty);
+
     li.appendChild(
       childList
     );
 
-    twisty.onclick = (event) => {
+    twisty.onclick = async (event) => {
       event.stopPropagation();
-
-      const hidden =
-        childList.style.display
-        === 'none';
-
-      childList.style.display =
-        hidden
-          ? ''
-          : 'none';
-
-      twisty.textContent =
-        hidden
-          ? '▾'
-          : '▸';
+      const hidden = childList.style.display === 'none';
+      if (!hidden) {
+        childList.style.display = 'none';
+        twisty.textContent = '▸';
+        return;
+      }
+      if (!node._children_loaded && node._tree_key) {
+        twisty.textContent = '…';
+        try {
+          await loadTreeChildren(node, childList, twisty, false);
+        } catch (error) {
+          twisty.textContent = '▸';
+          toast(error.message || '目录加载失败', true);
+        }
+        return;
+      }
+      childList.style.display = '';
+      twisty.textContent = '▾';
     };
   }
 
@@ -646,8 +707,8 @@ function updateTreeEditPanel() {
 
 async function submitTreeEdit(operation, payload) {
   if (!state.scan) return;
-  const data = await api(`/api/tree-edits/${state.scan.scan_id}`, {
-    method: 'POST', body: JSON.stringify({ operation, payload })
+  const data = await api(`/api/tree-edits/${state.scan.scan_id}?compact=1`, {
+    method: 'POST', body: JSON.stringify({ operation, payload, compact: true })
   });
   state.analysis = data.analysis;
   state.treeEdits = data.edits || state.analysis.manual_tree_edits || state.treeEdits;
@@ -662,9 +723,11 @@ async function applyTreeFilter() {
   if (!state.scan || state.activeTree !== 'analysis') return;
   const value = $('treeFilter')?.value || 'all';
   try {
-    const data = await api(`/api/analysis/${state.scan.scan_id}?filter=${encodeURIComponent(value)}`);
-    state.analysis = data.analysis;
-    state.treeEdits = data.edits || state.analysis.manual_tree_edits || state.treeEdits;
+    const data = await api(
+      `/api/tree/${state.scan.scan_id}?kind=analysis&filter=${encodeURIComponent(value)}&limit=100`
+    );
+    state.analysis.analysis_tree = data.node || {};
+    state.analysisTreeOriginal = value === 'all' ? state.analysis.analysis_tree : state.analysisTreeOriginal;
     renderTree(state.analysis.analysis_tree || {});
     updateTreeEditPanel();
   } catch (error) {
@@ -795,6 +858,11 @@ async function selectNode(
   node,
   row
 ) {
+  const requestId = ++state.selectionRequestId;
+  const selectionStillCurrent = () =>
+    requestId === state.selectionRequestId
+    && state.selected === node;
+
   document
     .querySelectorAll(
       '.tree-row.selected'
@@ -924,8 +992,26 @@ async function selectNode(
     $('numericQuestionBtn').disabled = !state.scan;
   }
 
-  const local =
-    localSummaryFor(node);
+  let local = localSummaryFor(node);
+  if (!local && state.scan && (node.kind === 'directory' || isVirtualGroup)) {
+    const summaryPath = isVirtualGroup ? `node:${node.node_id}` : (node.path || '.');
+    try {
+      const page = await api(
+        `/api/summaries/${state.scan.scan_id}?path=${encodeURIComponent(summaryPath)}&type=folder&limit=1`
+      );
+      if (!selectionStillCurrent()) return;
+      const item = (page.items || [])[0];
+      if (item) {
+        state.summaries.set(summaryKey(item.path, item.type), item.payload);
+        local = item.payload;
+      }
+    } catch (_) {
+      // A missing local summary is valid while analysis is still running.
+      if (!selectionStillCurrent()) return;
+    }
+  }
+
+  if (!selectionStillCurrent()) return;
 
   if (local) {
     renderSummary(
@@ -960,11 +1046,14 @@ async function selectNode(
           `/api/document/${state.scan.scan_id}?path=${encodeURIComponent(node.path)}`
         );
 
+      if (!selectionStillCurrent()) return;
+
       renderDocument(
         data.document
       );
 
     } catch (e) {
+      if (!selectionStillCurrent()) return;
       $('summary').className =
         'summary empty';
 
@@ -1594,20 +1683,30 @@ function updateStats() {
     return;
   }
 
+  // A retry/deepening run can coexist with the previous final analysis.
+  // Prefer the live compact card while it exists so coverage and pending/error
+  // counts never appear frozen at the previous run.
+  const displayedAnalysis = state.progressiveAnalysis || state.analysis || {};
   const a =
-    state.analysis
+    displayedAnalysis
       ?.statistics
     ||
     state.scan.analysis
     ||
     {};
   const coverage =
-    state.analysis?.coverage
+    displayedAnalysis?.coverage
     || {};
   const ratio =
-    coverage.parsed_file_ratio == null
+    (coverage.parsed_file_ratio ?? coverage.content_parse_ratio) == null
       ? '—'
-      : `${Math.round(coverage.parsed_file_ratio * 10000) / 100}%`;
+      : `${Math.round((coverage.parsed_file_ratio ?? coverage.content_parse_ratio) * 10000) / 100}%`;
+  const inventoryRatio = coverage.inventory_coverage_ratio == null
+    ? (coverage.inventory_coverage?.complete ? '100%' : '待确认')
+    : `${Math.round(coverage.inventory_coverage_ratio * 10000) / 100}%`;
+  const deepRatio = coverage.deep_analysis_ratio == null
+    ? (coverage.inventory_files ? `${Math.round((coverage.deep_analyzed_files || 0) / coverage.inventory_files * 10000) / 100}%` : '—')
+    : `${Math.round(coverage.deep_analysis_ratio * 10000) / 100}%`;
 
   $('scanStats')
     .classList
@@ -1641,8 +1740,8 @@ function updateStats() {
     `语义主题：${a.semantic_topic_clusters ?? a.topic_clusters ?? '—'}`
     +
     `</p>`;
-  const overview = state.analysis?.overview || {};
-  const judgment = state.analysis?.value_judgment || {};
+  const overview = displayedAnalysis?.overview || {};
+  const judgment = displayedAnalysis?.value_judgment || {};
   if (overview.file_count != null || judgment.level) {
     const usability = judgment.data_usability || {};
     const richness = judgment.information_richness || {};
@@ -1656,7 +1755,9 @@ function updateStats() {
   }
   if (coverage.inventory_files != null) {
     $('scanStats').innerHTML +=
-      `<div class="coverage-card"><strong>分析覆盖：${escapeHtml(coverage.status || '—')}</strong> · ${escapeHtml(coverage.coverage_level_label || '覆盖等级未标注')} · 已分析 ${coverage.parsed_files || 0}/${coverage.inventory_files || 0}（${ratio}）` +
+      `<div class="coverage-card"><strong>分析覆盖：${escapeHtml(coverage.status || '—')}</strong> · ${escapeHtml(coverage.coverage_level_label || '覆盖等级未标注')}<br>` +
+      `清点覆盖 ${inventoryRatio} · 内容解析 ${ratio} · 全文深度分析 ${deepRatio}<br>` +
+      `已解析 ${coverage.parsed_files || 0}/${coverage.inventory_files || 0}` +
       `；抽样 ${coverage.sampled_files ?? coverage.sampled_overview_files ?? 0}；深度分析 ${coverage.deep_analyzed_files ?? 0}` +
       `；待处理 ${coverage.pending_files || 0}；失败 ${coverage.failed_files || 0}` +
       `；${coverage.complete_analysis ? '完整分析' : '部分覆盖'}` +
@@ -1682,7 +1783,7 @@ async function refreshScan(scanId = state.scan?.scan_id) {
   }
   const data =
     await api(
-      `/api/scan/${scanId}`
+      `/api/scan/${scanId}?compact=1&summary_limit=100`
     );
 
   state.scan =
@@ -1690,7 +1791,8 @@ async function refreshScan(scanId = state.scan?.scan_id) {
 
   state.analysis =
     data.analysis;
-  state.treeEdits = data.analysis?.manual_tree_edits || [];
+  state.progressiveAnalysis = data.progressive_analysis || null;
+  state.treeEdits = data.tree_edits || data.analysis?.manual_tree_edits || [];
   state.analysisTreeOriginal = data.analysis?.analysis_tree || null;
 
   if (
@@ -1725,8 +1827,7 @@ async function refreshScan(scanId = state.scan?.scan_id) {
 
   updateStats();
 
-  $('analysisTreeBtn').disabled =
-    !state.analysis?.analysis_tree;
+  $('analysisTreeBtn').disabled = !state.analysis?.analysis_tree;
   // The physical inventory remains available after semantic analysis.
   $('physicalTreeBtn').disabled = false;
 
@@ -2183,20 +2284,30 @@ async function pollJob(jobId) {
     const partialScanId = job.result?.scan_available
       ? (job.result.scan_id || job.scan_id)
       : null;
-    if (partialScanId && !state.scan?.tree) {
+    const progressiveRefreshKey = partialScanId
+      ? `${partialScanId}:${Math.floor(Number(job.progress || 0) / 5)}`
+      : null;
+    if (partialScanId && progressiveRefreshKey !== state.progressiveRefreshKey) {
       try {
-        const partial = await api(`/api/scan/${partialScanId}`);
+        const partial = await api(`/api/scan/${partialScanId}?compact=1&summary_limit=100`);
+        const existingTree = state.scan?.tree || null;
+        const firstInventoryLoad = !existingTree;
         state.scan = partial.scan;
+        if (existingTree) state.scan.tree = existingTree;
         state.analysis = partial.analysis;
+        state.progressiveAnalysis = partial.progressive_analysis || null;
+        state.progressiveRefreshKey = progressiveRefreshKey;
         state.summaries = new Map((partial.summaries || []).map(item => [summaryKey(item.path, item.type), item.payload]));
-        state.activeTree = 'physical';
         $('physicalTreeBtn').disabled = false;
-        $('physicalTreeBtn').classList.add('active');
-        $('analysisTreeBtn').classList.remove('active');
-        renderTree(state.scan.tree);
+        if (firstInventoryLoad) {
+          state.activeTree = 'physical';
+          $('physicalTreeBtn').classList.add('active');
+          $('analysisTreeBtn').classList.remove('active');
+          renderTree(state.scan.tree);
+          $('tree').classList.remove('empty');
+          toast('原始目录已加载，后台继续进行深度分析。');
+        }
         updateStats();
-        $('tree').classList.remove('empty');
-        toast('原始目录已加载，后台继续进行深度分析。');
       } catch (partialError) {
         // The main job status remains authoritative; a transient fetch error
         // should not abort polling.
@@ -2384,6 +2495,8 @@ $('scanBtn').onclick =
     // A new scan starts a new UI session; clear selections from the prior package.
     state.scan = null;
     state.analysis = null;
+    state.progressiveAnalysis = null;
+    state.progressiveRefreshKey = null;
     state.summary = null;
     state.summaries = new Map();
     state.selected = null;
@@ -2410,9 +2523,6 @@ $('scanBtn').onclick =
             body: JSON.stringify({
               path:
                 $('rootPath').value,
-
-              max_files:
-                50000,
 
               parse_mode:
                 $('parseMode').value
@@ -2526,7 +2636,7 @@ $('physicalTreeBtn').onclick =
 
 
 $('analysisTreeBtn').onclick =
-  () => {
+  async () => {
     if (
       !state.analysis
         ?.analysis_tree
@@ -2549,14 +2659,17 @@ $('analysisTreeBtn').onclick =
         'active'
       );
 
-    renderTree(
-      state.analysis
-        .analysis_tree
-    );
     if ($('treeFilter')) {
       $('treeFilter').disabled = false;
       $('treeFilter').value = 'all';
     }
+    try {
+      const data = await api(`/api/tree/${state.scan.scan_id}?kind=analysis&filter=all&limit=100`);
+      state.analysis.analysis_tree = data.node || state.analysis.analysis_tree;
+    } catch (_) {
+      // Keep the already loaded root if a transient page request fails.
+    }
+    renderTree(state.analysis.analysis_tree);
     updateTreeEditPanel();
   };
 
@@ -3139,7 +3252,7 @@ $('numericQuestionBtn').onclick =
     if (!state.scan) return;
     const question = $('numericQuestion').value.trim();
     if (!question) {
-      toast('请输入精确数字问题', true);
+      toast('请输入数字统计问题', true);
       return;
     }
     const btn = $('numericQuestionBtn');
@@ -3157,17 +3270,21 @@ $('numericQuestionBtn').onclick =
       });
       const answer = data.answer || {};
       const answerCoverage = answer.coverage || {};
+      const exactResult = answerCoverage.complete !== false;
+      const aggregationScope = answer.aggregation_scope || {};
       $('summary').className = 'summary';
       $('summary').innerHTML =
-        `<div class="summary-kicker">可验证精确数字问答</div>` +
+        `<div class="summary-kicker">${exactResult ? '可验证精确统计' : '可验证部分覆盖统计'}</div>` +
         `<h2>${escapeHtml(answer.question || question)}</h2>` +
         `<div class="metric-grid"><div><b>${escapeHtml(answer.value ?? '—')}</b><span>${escapeHtml(answer.operation || '结果')}</span></div>` +
         `<div><b>${escapeHtml(answer.column || '记录数')}</b><span>字段</span></div>` +
         `<div><b>${escapeHtml(answer.confidence || '—')}</b><span>置信度</span></div></div>` +
         `<p>来源：${escapeHtml(answer.source_path || '当前范围')}；表/成员：${escapeHtml(answer.table || '—')}</p>` +
+        `<p>参与 ${escapeHtml(aggregationScope.participating_source_count ?? answer.source_paths?.length ?? 1)} 个文件、${escapeHtml(aggregationScope.participating_profile_count ?? 1)} 张表` +
+        `${answer.calculation ? `；计算口径：${escapeHtml(answer.calculation)}` : ''}</p>` +
         `${answerCoverage.complete === false ? `<p class="coverage-card"><strong>覆盖提示：</strong>${escapeHtml(answerCoverage.warning || '结果基于有界采样，请回原表复核。')}</p>` : ''}` +
         evidenceHtml(answer.evidence || []);
-      toast('已返回带来源定位的精确统计结果');
+      toast(exactResult ? '已返回带来源定位的精确统计结果' : '已返回部分覆盖统计，结论中已标明采样限制');
     } catch (e) {
       toast(e.message, true);
     } finally {

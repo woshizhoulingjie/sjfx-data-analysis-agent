@@ -6,15 +6,35 @@ same parse pipeline; expensive deduplication and embedding clustering remain
 optional statistics and never gate the content classification tree.
 """
 import hashlib
+import json
 from pathlib import Path
 
 from services.scanner import human_size
 
 
-def file_fingerprint(node):
-    return "{}|{}|{}".format(
-        node.get("path", ""), node.get("size", 0), node.get("modified_at", ""),
-    )
+PARSER_CHECKPOINT_SCHEMA = "large-package-checkpoint/2"
+
+
+def file_fingerprint(node, parse_mode="accurate", parser_contract=None, source_sha256=None):
+    """Hash every input that can change a parse result.
+
+    The source digest is mandatory for reuse decisions.  Metadata remains in
+    the fingerprint as a cheap diagnostic and to invalidate old checkpoints.
+    """
+    payload = {
+        "schema": PARSER_CHECKPOINT_SCHEMA,
+        "path": str(node.get("path") or ""),
+        "size": int(node.get("size") or 0),
+        "modified_at_ns": int(node.get("modified_at_ns") or 0),
+        "device": node.get("device"),
+        "inode": node.get("inode"),
+        "source_sha256": str(source_sha256 or ""),
+        "parse_mode": "fast" if str(parse_mode).lower() == "fast" else "accurate",
+        "parser_contract": parser_contract or {},
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def build_policy(scan, options=None):
@@ -28,7 +48,8 @@ def build_policy(scan, options=None):
     initial_limit = max(1, int(options.get("initial_parse_files") or 700))
     deepen_limit = max(1, int(options.get("deepen_batch_files") or 500))
     batch_files = max(1, min(1000, int(options.get("batch_files") or 100)))
-    overview_chars = max(4000, int(options.get("overview_chars_per_file") or 30000))
+    overview_chars = max(1000, min(12000, int(options.get("overview_chars_per_file") or 4000)))
+    overview_evidence = max(1, min(20, int(options.get("overview_evidence_per_file") or 6)))
     enabled = total_size >= threshold_bytes or file_count >= threshold_files
     return {
         "mode": "large_package" if enabled else "standard",
@@ -41,6 +62,7 @@ def build_policy(scan, options=None):
         "full_inventory_processing": True,
         "classification_scope": "all_parsed_files",
         "overview_chars_per_file": overview_chars,
+        "overview_evidence_per_file": overview_evidence,
         "inventory_files": file_count,
         "inventory_bytes": total_size,
         "inventory_size_human": human_size(total_size),
@@ -177,6 +199,19 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
     failed_paths = {item.get("path") for item in failures if item.get("path")}
     pending_paths = set(pending_paths or [])
     parsed_paths = set(documents)
+    inventory_errors = list(scan.get("errors") or [])
+    inventory_error_count = int(scan.get("scan_error_count", len(inventory_errors)) or 0)
+    inventory_truncated = bool(scan.get("truncated"))
+    depth_limited = int(scan.get("depth_limited_directory_count") or 0)
+    ignored_files = int(scan.get("ignored_file_count") or 0)
+    ignored_directories = int(scan.get("ignored_directory_count") or 0)
+    inventory_complete_globally = (
+        not inventory_truncated
+        and inventory_error_count == 0
+        and depth_limited == 0
+        and ignored_files == 0
+        and ignored_directories == 0
+    )
 
     def for_paths(paths=None):
         # ``paths=[]`` is a legitimate empty scope (for example an empty
@@ -191,20 +226,36 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         pending |= selected - parsed - failed
         total_bytes = sum(int(files[path].get("size") or 0) for path in selected)
         parsed_bytes = sum(int(files[path].get("size") or 0) for path in parsed)
-        complete_text = sum(
-            1 for path in parsed
-            if (documents.get(path, {}).get("coverage") or {}).get("complete")
-        )
+        def parse_is_complete(path):
+            coverage = documents.get(path, {}).get("coverage") or {}
+            return bool(coverage.get("parse_complete", coverage.get("complete", False)))
+
+        def semantic_is_complete(path):
+            document = documents.get(path, {})
+            coverage = document.get("coverage") or {}
+            if document.get("sidecar_projection") or coverage.get("semantic_projection"):
+                return False
+            return bool(coverage.get("semantic_complete", coverage.get("complete", False)))
+
+        parse_complete_paths = {path for path in parsed if parse_is_complete(path)}
+        semantic_complete_paths = {path for path in parsed if semantic_is_complete(path)}
+        complete_text = len(parse_complete_paths)
         sampled = sum(
             1 for path in parsed
-            if (documents.get(path, {}).get("coverage") or {}).get("overview_sampled")
+            if documents.get(path, {}).get("sidecar_projection")
+            or (documents.get(path, {}).get("coverage") or {}).get("semantic_projection")
+            or (documents.get(path, {}).get("coverage") or {}).get("overview_sampled")
         )
-        partial = sum(
-            1 for path in parsed
-            if not (documents.get(path, {}).get("coverage") or {}).get("complete")
+        parse_partial = len(parsed - parse_complete_paths)
+        semantic_partial = len(parsed - semantic_complete_paths)
+        deep_analyzed = len(semantic_complete_paths)
+        inventory_complete = inventory_complete_globally
+        parse_complete = bool(selected) and not pending and not failed and parse_partial == 0
+        semantic_complete = (
+            inventory_complete and parse_complete and bool(selected)
+            and semantic_partial == 0
         )
-        deep_analyzed = len(parsed) - sampled
-        complete_analysis = bool(selected) and not pending and not failed and partial == 0
+        complete_analysis = semantic_complete
         archive_manifests = []
         for path in sorted(parsed):
             manifest = documents.get(path, {}).get("archive_manifest")
@@ -216,22 +267,34 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         archive_parsed_members = sum(int(item.get("parsed_members") or 0) for item in archive_manifests)
         archive_skipped_members = sum(int(item.get("skipped_members") or 0) for item in archive_manifests)
         archive_failed_members = sum(int(item.get("failed_members") or 0) for item in archive_manifests)
-        if complete_analysis:
+        if semantic_complete:
             coverage_level = "full_text_analysis"
         elif parsed:
             coverage_level = "representative_overview"
         else:
-            coverage_level = "inventory_complete"
+            coverage_level = "inventory_complete" if inventory_complete else "inventory_partial"
         status = "完整" if complete_analysis else "部分覆盖"
         if not parsed and selected:
             status = "待分析"
         limitations = []
+        if inventory_truncated:
+            limitations.append("扫描达到文件数量上限；清单之外仍可能存在文件，inventory_coverage 不完整。")
+        if depth_limited:
+            limitations.append("{} 个目录达到深度上限，未继续扫描其后代。".format(depth_limited))
+        if inventory_error_count:
+            limitations.append("扫描期间发生 {} 个读取错误，清单覆盖率不能视为完整。".format(inventory_error_count))
+        if ignored_files or ignored_directories:
+            limitations.append(
+                "显式扫描排除规则跳过 {} 个文件、{} 个目录；这些对象不在清单基数内，inventory_coverage 不完整。".format(
+                    ignored_files, ignored_directories
+                )
+            )
         if (policy or {}).get("enabled") and pending:
             limitations.append("大数据包采用有限批次持续处理；仍有文件待进入后续批次。")
         if sampled:
             limitations.append("{} 个文件当前为抽样/首轮概览，不能视为全文深度分析。".format(sampled))
-        if partial:
-            limitations.append("{} 个已解析文件存在正文截断、快速模式或其他不完整覆盖。".format(partial))
+        if parse_partial:
+            limitations.append("{} 个已解析文件本身存在截断、快速模式或其他解析不完整。".format(parse_partial))
         if pending:
             limitations.append("{} 个文件尚未进入内容分析。".format(len(pending)))
         if failed:
@@ -242,6 +305,44 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
                     archive_parsed_members, archive_total_members, archive_skipped_members, archive_failed_members
                 )
             )
+        inventory_coverage = {
+            "complete": inventory_complete,
+            "enumerated_files": len(selected),
+            "enumerated_bytes": total_bytes,
+            "scan_truncated": inventory_truncated,
+            "scan_error_count": inventory_error_count,
+            "depth_limited_directory_count": depth_limited,
+            "ignored_file_count": ignored_files,
+            "ignored_directory_count": ignored_directories,
+            "symlink_count": int(scan.get("symlink_count", scan.get("skipped_symlink_count", 0)) or 0),
+            "symlink_policy": "inventory_entry_only_target_not_followed",
+            "max_files": scan.get("max_files"),
+            "max_depth": scan.get("max_depth"),
+        }
+        parse_coverage = {
+            "complete": parse_complete,
+            "inventory_files": len(selected),
+            "parsed_files": len(parsed),
+            "complete_files": len(parse_complete_paths),
+            "partial_files": parse_partial,
+            "pending_files": len(pending),
+            "failed_files": len(failed),
+            "parsed_bytes": parsed_bytes,
+            "parsed_file_ratio": round(len(parsed) / float(len(selected) or 1), 6),
+            "parsed_byte_ratio": round(parsed_bytes / float(total_bytes or 1), 6),
+        }
+        semantic_analysis_coverage = {
+            "complete": semantic_complete,
+            "full_text_files": len(semantic_complete_paths),
+            "projected_or_partial_files": semantic_partial,
+            "projected_files": sampled,
+            "analyzed_files": len(parsed),
+            "full_text_file_ratio": round(len(semantic_complete_paths) / float(len(selected) or 1), 6),
+            "projection_character_limit": (policy or {}).get("overview_chars_per_file"),
+            "projection_evidence_limit": (policy or {}).get("overview_evidence_per_file"),
+        }
+        content_parse_ratio = round(len(parsed) / float(len(selected) or 1), 6)
+        deep_analysis_ratio = round(len(semantic_complete_paths) / float(len(selected) or 1), 6)
         return {
             "mode": (policy or {}).get("mode", "standard"),
             "status": status,
@@ -252,20 +353,33 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "complete_text_files": complete_text,
             "sampled_overview_files": sampled,
             "deep_analyzed_files": max(0, deep_analyzed),
-            "partial_text_files": partial,
+            "partial_text_files": parse_partial,
             "failed_files": len(failed),
             "pending_files": len(pending),
-            "parsed_file_ratio": round(len(parsed) / float(len(selected) or 1), 6),
-            "coverage_ratio": round(len(parsed) / float(len(selected) or 1), 6),
+            "parsed_file_ratio": content_parse_ratio,
+            "coverage_ratio": content_parse_ratio,
+            "inventory_coverage_ratio": 1.0 if inventory_complete else None,
+            "content_parse_ratio": content_parse_ratio,
+            "deep_analysis_ratio": deep_analysis_ratio,
             "inventory_bytes": total_bytes,
             "scanned_bytes": total_bytes,
             "inventory_size_human": human_size(total_bytes),
             "parsed_bytes": parsed_bytes,
             "parsed_byte_ratio": round(parsed_bytes / float(total_bytes or 1), 6),
             "complete_analysis": complete_analysis,
+            "full_text_analysis": semantic_complete,
+            "inventory_coverage": inventory_coverage,
+            "parse_coverage": parse_coverage,
+            "semantic_analysis_coverage": semantic_analysis_coverage,
+            "coverage_contract": {
+                "inventory": "文件和目录清点覆盖；只有未截断、无扫描错误、无显式排除且未触及深度上限时才是100%。符号链接登记自身但不跟随目标。",
+                "content_parse": "成功生成统一解析结果的文件占清点文件比例，允许快速模式或截断结果。",
+                "deep_analysis": "完成全文语义分析且不是有界投影的文件占清点文件比例。",
+            },
             "coverage_level": coverage_level,
             "coverage_level_label": {
                 "inventory_complete": "全量盘点",
+                "inventory_partial": "不完整盘点",
                 "representative_overview": "代表性概览",
                 "full_text_analysis": "全文深度分析",
             }[coverage_level],

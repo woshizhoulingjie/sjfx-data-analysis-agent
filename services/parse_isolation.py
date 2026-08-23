@@ -256,6 +256,16 @@ class IsolatedParserRunner:
                 process.join(timeout=2)
         else:
             process.join(timeout=1)
+        # A hard timeout can bypass UnifiedDocumentParser's ``finally`` block.
+        # Scratch names carry the parser PID, so after join it is safe to reap
+        # only application-owned objects whose owner is no longer alive.
+        try:
+            from services.unified_parser import cleanup_stale_parse_temp_dirs
+            cleanup_stale_parse_temp_dirs(stale_seconds=0)
+        except Exception:
+            # Cleanup is best effort; parser termination must remain reliable
+            # even if the scratch filesystem itself is unavailable.
+            pass
 
     def close(self):
         with self._lock:

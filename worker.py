@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import time
 import traceback
 from pathlib import Path
@@ -196,6 +197,44 @@ def _task_runtime_limit(job):
 def _stop_process(process):
     if not process or not process.is_alive():
         return
+    if os.name == "nt":
+        # multiprocessing.terminate() only targets the direct child on
+        # Windows. taskkill /T closes the complete supervised tree, including
+        # Docling/OCR parser grandchildren, so cancellation and timeout cannot
+        # leave invisible CPU/RAM/temp-disk consumers behind.
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(int(process.pid)), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(5, int(Config.WORKER_TERMINATE_GRACE_SECONDS) + 2),
+                check=False,
+            )
+            process.join(timeout=2)
+            if result.returncode == 0 and not process.is_alive():
+                return
+        except (OSError, subprocess.SubprocessError, ValueError):
+            # Fall through to the direct-process fallback. A deployment with
+            # psutil gets one additional recursive attempt before that.
+            pass
+        try:
+            import psutil
+
+            parent = psutil.Process(int(process.pid))
+            descendants = parent.children(recursive=True)
+            for child in reversed(descendants):
+                child.terminate()
+            parent.terminate()
+            _gone, alive = psutil.wait_procs(
+                descendants + [parent], timeout=max(1, Config.WORKER_TERMINATE_GRACE_SECONDS)
+            )
+            for remaining in alive:
+                remaining.kill()
+            process.join(timeout=2)
+            if not process.is_alive():
+                return
+        except Exception:
+            pass
     group_signalled = False
     if os.name != "nt" and hasattr(os, "killpg"):
         try:
@@ -415,8 +454,41 @@ def run_forever():
                 storage.finalize_job(job_id, result=result)
             except Exception as exc:
                 if isinstance(exc, JobCancelled) or exc.__class__.__name__ == "ParseIsolationCancelled":
+                    if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
+                        storage.update_analysis_progress_status(
+                            job.get("scan_id"), "cancelled", "分析已取消；已完成的文件检查点仍保留。", "cancelled"
+                        )
                     storage.finalize_job(job_id)
                     continue
+                if isinstance(exc, JobExecutionTimeout) and job.get("task_type") in {"scan_and_analyze", "analyze_package"}:
+                    attempts = int(job.get("attempt_count") or 1)
+                    if attempts < Config.MAX_JOB_RESUME_ATTEMPTS:
+                        requeued = storage.requeue_job_slice(
+                            job_id,
+                            "本轮运行达到时间上限；已保存检查点，自动续建下一批（第 {} 轮）。".format(attempts + 1),
+                        )
+                        if requeued and storage.scan_owned(job.get("scan_id")):
+                            storage.update_analysis_progress_status(
+                                job.get("scan_id"), "queued",
+                                "本轮达到运行时限，已保存检查点并等待自动续批。", "checkpoint_requeued",
+                            )
+                        if requeued:
+                            logger.warning(
+                                "Worker task slice timed out and was requeued id=%s attempt=%s/%s",
+                                job_id, attempts, Config.MAX_JOB_RESUME_ATTEMPTS,
+                            )
+                            continue
+                        # Cancellation can win between the timeout and the
+                        # guarded requeue UPDATE. Resolve that race now instead
+                        # of leaving a task permanently in ``cancelling``.
+                        if storage.is_job_cancel_requested(job_id):
+                            if storage.scan_owned(job.get("scan_id")):
+                                storage.update_analysis_progress_status(
+                                    job.get("scan_id"), "cancelled",
+                                    "分析已取消；已完成的文件检查点仍保留。", "cancelled",
+                                )
+                            storage.finalize_job(job_id)
+                            continue
                 if isinstance(exc, RemoteJobError) and exc.remote_traceback:
                     logger.error(
                         "Worker task failed id=%s type=%s\n%s",
@@ -424,6 +496,11 @@ def run_forever():
                     )
                 else:
                     logger.exception("Worker task failed id=%s type=%s", job_id, job.get("task_type"))
+                if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
+                    storage.update_analysis_progress_status(
+                        job.get("scan_id"), "failed",
+                        "分析失败：{}".format(str(exc)[:500]), "failed",
+                    )
                 storage.finalize_job(job_id, error=exc)
     finally:
         try:

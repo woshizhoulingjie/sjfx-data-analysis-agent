@@ -18,6 +18,15 @@ def _find(root, node_id):
     return next((item for item in _walk(root) if item.get("node_id") == node_id), None)
 
 
+def _find_parent(root, node_id):
+    """Return the direct parent and child position for a semantic node."""
+    for parent in _walk(root):
+        for index, child in enumerate(parent.get("children") or []):
+            if child.get("node_id") == node_id:
+                return parent, index
+    return None, None
+
+
 def _file_leaf(path, source=None, status="manual"):
     source = source or {}
     return {
@@ -102,10 +111,20 @@ def apply_tree_edits(analysis, edits):
             node["file_count"] = len(node["member_paths"])
             node["manual_membership"] = True
         elif operation == "merge":
-            ids = [str(value) for value in payload.get("node_ids") or []]
-            selected = [item for item in (tree.get("children") or []) if item.get("node_id") in ids and item.get("kind") == "group"]
-            if len(selected) < 2:
+            ids = list(dict.fromkeys(str(value) for value in payload.get("node_ids") or [] if value))
+            if len(ids) < 2:
                 continue
+            parent, _position = _find_parent(tree, ids[0])
+            if parent is None:
+                continue
+            children = parent.get("children") or []
+            selected = [
+                item for item in children
+                if item.get("node_id") in ids and item.get("kind") == "group"
+            ]
+            if len(selected) != len(ids):
+                continue
+            position = min(children.index(item) for item in selected)
             members = sorted(set(path for item in selected for path in item.get("member_paths") or []))
             merged = deepcopy(selected[0])
             merged["node_id"] = _manual_id("merge", ids)
@@ -118,13 +137,24 @@ def apply_tree_edits(analysis, edits):
                 merged["children"].append(_clone_for_path(path, source, merged["name"]))
             merged["manual_merged"] = True
             merged["classification_source"] = "human"
-            tree["children"] = [item for item in tree.get("children") or [] if item not in selected] + [merged]
+            parent["children"] = [item for item in children if item not in selected]
+            parent["children"][position:position] = [merged]
         elif operation == "split":
             node = _find(tree, payload.get("node_id"))
             groups = payload.get("groups") or []
             if not node or node.get("kind") != "group" or not isinstance(groups, list) or len(groups) < 2:
                 continue
             original = set(node.get("member_paths") or [])
+            requested = [
+                str(path)
+                for group in groups if isinstance(group, dict)
+                for path in group.get("paths") or [] if path
+            ]
+            # A partial/stale browser projection must never make unassigned
+            # files disappear from the derived tree. Invalid historical edits
+            # are ignored even if they predate the API-side validation.
+            if len(requested) != len(set(requested)) or set(requested) != original:
+                continue
             replacements = []
             used = set()
             for index, spec in enumerate(groups, 1):
@@ -141,10 +171,15 @@ def apply_tree_edits(analysis, edits):
                     "summary": "人工拆分主题，共 {} 个文件。".format(len(paths)), "evidence_chain": [], "conclusion_evidence": [],
                 })
             if len(replacements) >= 2:
-                children = tree.get("children") or []
-                position = next((index for index, item in enumerate(children) if item.get("node_id") == node.get("node_id")), len(children))
-                tree["children"] = [item for item in children if item.get("node_id") != node.get("node_id")]
-                tree["children"][position:position] = replacements
+                parent, position = _find_parent(tree, node.get("node_id"))
+                if parent is None:
+                    continue
+                children = parent.get("children") or []
+                parent["children"] = [
+                    item for item in children
+                    if item.get("node_id") != node.get("node_id")
+                ]
+                parent["children"][position:position] = replacements
     result["manual_tree_edits"] = edits
     return result
 
@@ -155,27 +190,43 @@ def filter_tree(tree, status="all"):
     if wanted in {"", "all", "全部"}:
         return deepcopy(tree or {})
 
+    def file_matches(node):
+        state = str(node.get("classification_status") or "classified").lower()
+        confidence = node.get("classification_confidence")
+        if wanted in {"low_confidence", "低置信度"}:
+            try:
+                return state not in {"failed", "unclassified"} and float(confidence or 0) < 0.65
+            except (TypeError, ValueError):
+                return False
+        if wanted in {"unclassified", "未分类"}:
+            return state in {"unclassified", "pending"}
+        if wanted in {"failed", "解析失败"}:
+            return state == "failed"
+        if wanted in {"confirmed", "人工确认"}:
+            return bool(node.get("manual_confirmed"))
+        return state == wanted
+
+    def count_files(node):
+        if node.get("kind") == "file":
+            return 1
+        return sum(count_files(child) for child in node.get("children") or [])
+
     def matches(node):
         if node.get("kind") == "file":
-            state = str(node.get("classification_status") or "classified").lower()
-            confidence = node.get("classification_confidence")
-            if wanted in {"low_confidence", "低置信度"}:
-                try:
-                    return state not in {"failed", "unclassified"} and float(confidence or 0) < 0.65
-                except (TypeError, ValueError):
-                    return False
-            if wanted in {"unclassified", "未分类"}:
-                return state in {"unclassified", "pending"}
-            if wanted in {"failed", "解析失败"}:
-                return state == "failed"
-            if wanted in {"confirmed", "人工确认"}:
-                return bool(node.get("manual_confirmed"))
-            return state == wanted
-        children = [child for child in node.get("children") or [] if matches(child)]
+            return deepcopy(node) if file_matches(node) else None
+        # Confirming a topic is an explicit review decision about the whole
+        # topic. Keep that topic and all of its descendants in this view.
+        if wanted in {"confirmed", "人工确认"} and node.get("manual_confirmed"):
+            return deepcopy(node)
+        children = []
+        for child in node.get("children") or []:
+            matched = matches(child)
+            if matched:
+                children.append(matched)
         if children:
             clone = deepcopy(node)
             clone["children"] = children
-            clone["file_count"] = sum(1 for child in children if child.get("kind") == "file") if node.get("kind") == "group" else clone.get("file_count", 0)
+            clone["file_count"] = sum(count_files(child) for child in children)
             return clone
         return None
 

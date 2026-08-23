@@ -609,6 +609,7 @@ def profile_path(path, max_rows=None, max_bytes=None):
     if path.stat().st_size > max_bytes and ext in {".xlsx", ".xlsm"}:
         return {"schema_version": "structured-profile/1.1", "status": "skipped", "reason": "文件超过结构化画像大小上限", "limits": {"sampled": False, "source_bytes": path.stat().st_size, "max_bytes": max_bytes, "truncated": True, "truncation_reasons": ["byte_limit"]}, "coverage": {"complete": False, "truncated": True, "sampled_rows": 0, "truncation_reasons": ["byte_limit"]}, "value_judgment": {"usable": False, "value_level": "待治理"}}
     metadata = {"encoding": None, "source_bytes": path.stat().st_size, "sampled_bytes": 0, "truncated": False, "truncation_reasons": [], "parse_errors": 0}
+    book = None
     try:
         if ext in {".csv", ".tsv"}:
             rows, names, consumed, metadata = _iter_csv(path, max_rows, max_bytes)
@@ -617,21 +618,90 @@ def profile_path(path, max_rows=None, max_bytes=None):
         else:
             from openpyxl import load_workbook
             book = load_workbook(str(path), read_only=True, data_only=True)
-            sheet = book.active
-            iterator = sheet.iter_rows(values_only=True)
-            header = next(iterator, None)
-            names = [str(value or "column_{}".format(index + 1)).strip() for index, value in enumerate(header or [])]
             rows = []
-            for values in iterator:
-                if len(rows) >= max_rows:
-                    metadata["truncated"] = True
-                    metadata["truncation_reasons"].append("row_limit")
-                    break
-                rows.append(dict(zip(names, values)))
+            names = []
+            processed_sheets = []
+            skipped_sheets = []
+            sheet_row_counts = {}
+            worksheets = list(book.worksheets)
+            budget_exhausted = False
+            for sheet_index, sheet in enumerate(worksheets):
+                if budget_exhausted:
+                    skipped_sheets.append({
+                        "name": sheet.title,
+                        "state": getattr(sheet, "sheet_state", "visible"),
+                        "reason": "global_row_limit",
+                    })
+                    continue
+                iterator = None
+                try:
+                    # Read at most the header, the remaining global budget and
+                    # one sentinel row.  Exhausting this bounded generator is
+                    # important: openpyxl closes the worksheet ZipExtFile only
+                    # when iteration naturally reaches StopIteration.
+                    remaining_budget = max(0, max_rows - len(rows))
+                    iterator = sheet.iter_rows(
+                        values_only=True,
+                        max_row=remaining_budget + 2,
+                    )
+                    header = next(iterator, None)
+                    sheet_names = _column_names(header)
+                    processed = {
+                        "name": sheet.title,
+                        "state": getattr(sheet, "sheet_state", "visible"),
+                        "column_count": len(sheet_names),
+                        "row_count": 0,
+                    }
+                    processed_sheets.append(processed)
+                    sheet_row_counts[sheet.title] = 0
+                    for name in sheet_names:
+                        if name not in names:
+                            names.append(name)
+                    if not sheet_names:
+                        continue
+                    for values in iterator:
+                        if len(rows) >= max_rows:
+                            metadata["truncated"] = True
+                            if "row_limit" not in metadata["truncation_reasons"]:
+                                metadata["truncation_reasons"].append("row_limit")
+                            processed["truncated"] = True
+                            budget_exhausted = True
+                            # Keep advancing through the one-row sentinel so
+                            # the bounded generator closes its archive member.
+                            continue
+                        rows.append(dict(zip(sheet_names, values)))
+                        processed["row_count"] += 1
+                        sheet_row_counts[sheet.title] += 1
+                except Exception as exc:
+                    metadata["parse_errors"] += 1
+                    skipped_sheets.append({
+                        "name": sheet.title,
+                        "state": getattr(sheet, "sheet_state", "visible"),
+                        "reason": "worksheet_read_error",
+                        "error": str(exc)[:160],
+                    })
+                finally:
+                    # read_only worksheets keep a ZipExtFile open while their
+                    # row generator is alive.  Explicitly close it when a
+                    # global budget stops iteration early (notably on Windows).
+                    close_iterator = getattr(iterator, "close", None)
+                    if callable(close_iterator):
+                        close_iterator()
+            metadata.update({
+                "worksheet_count": len(worksheets),
+                "processed_worksheet_count": len(processed_sheets),
+                "skipped_worksheet_count": len(skipped_sheets),
+                "processed_worksheets": processed_sheets,
+                "skipped_worksheets": skipped_sheets,
+                "worksheet_row_counts": sheet_row_counts,
+                "global_row_budget": max_rows,
+            })
             consumed = path.stat().st_size
-            book.close()
     except Exception as exc:
         return {"schema_version": "structured-profile/1.1", "status": "failed", "error": str(exc)[:300], "coverage": {"complete": False, "truncated": False, "sampled_rows": 0, "truncation_reasons": []}, "value_judgment": {"usable": False, "value_level": "待治理"}}
+    finally:
+        if book is not None:
+            book.close()
     columns = defaultdict(list)
     duplicate_counter = Counter()
     for row in rows:
@@ -656,6 +726,13 @@ def profile_path(path, max_rows=None, max_bytes=None):
         "truncation_reasons": list(dict.fromkeys(metadata.get("truncation_reasons") or [])),
         "parse_errors": int(metadata.get("parse_errors") or 0),
         "streaming": bool(metadata.get("streaming", False)),
+        "worksheet_count": metadata.get("worksheet_count"),
+        "processed_worksheet_count": metadata.get("processed_worksheet_count"),
+        "skipped_worksheet_count": metadata.get("skipped_worksheet_count"),
+        "processed_worksheets": metadata.get("processed_worksheets"),
+        "skipped_worksheets": metadata.get("skipped_worksheets"),
+        "worksheet_row_counts": metadata.get("worksheet_row_counts"),
+        "global_row_budget": metadata.get("global_row_budget"),
     }, status=status)
     profile["source"] = {"path": str(path), "extension": ext, "size": path.stat().st_size, "encoding": metadata.get("encoding")}
     if metadata.get("parse_error"):

@@ -2,13 +2,17 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import stat as stat_module
+import tempfile
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 import re
 import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from config import Config
 from services.scanner import human_size, resolve_under
@@ -28,13 +32,39 @@ from services.large_package import (
     pending_group,
     representative_paths,
 )
-from services.retrieval import build_retrieval_manifest, evidence_corpus
+from services.retrieval import build_retrieval_manifest, evidence_corpus, retrieve_evidence
 from services.unified_parser import compact_document
 from services.unified_parser import UnifiedDocumentParser
-from services.parse_isolation import ParseIsolationCancelled, ParseIsolationError, runner_for
+from services.parse_isolation import (
+    ParseIsolationCancelled,
+    ParseIsolationError,
+    ParseIsolationTimeout,
+    runner_for,
+)
 
 
 PROFILE_USABLE_STATUSES = {"completed", "partial"}
+
+
+def _temp_disk_worker_limit(requested_workers):
+    """Bound concurrent parsers by worst-case scratch-disk reservations.
+
+    A parser may temporarily materialise one content object up to the central
+    limit.  Without this gate, two archive/PDF workers could both pass their
+    individual free-space preflight and exhaust the same scratch volume.
+    """
+    requested = max(1, int(requested_workers or 1))
+    try:
+        free_bytes = int(shutil.disk_usage(str(Config.PARSE_TEMP_DIR)).free)
+        usable_bytes = max(0, free_bytes - int(Config.PARSE_TEMP_DISK_RESERVE_BYTES or 0))
+        # A verified source snapshot and an archive/repair materialisation may
+        # coexist for one parser. Reserve both before enabling concurrency.
+        per_worker = max(1, int(Config.MAX_CONTENT_BYTES or 1) * 2)
+        disk_workers = max(1, usable_bytes // per_worker)
+        return max(1, min(requested, int(disk_workers)))
+    except (OSError, TypeError, ValueError):
+        # Unknown capacity must fail conservatively to serial execution.
+        return 1
 
 
 def _canonical_projection(documents, exact_groups):
@@ -235,7 +265,7 @@ class SourceFileChangedError(RuntimeError):
 
 def _stat_signature(path):
     stat = Path(path).stat()
-    return int(stat.st_size), int(stat.st_mtime_ns)
+    return int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_dev), int(stat.st_ino)
 
 
 def _inventory_mtime_seconds(file_node):
@@ -292,8 +322,15 @@ def _assert_source_stable(path, file_node, previous_signature=None, cancel_check
     current = _stat_signature(path)
     expected_size = int(file_node.get("size") or 0)
     expected_mtime = _inventory_mtime_seconds(file_node)
-    current_mtime = int(Path(path).stat().st_mtime)
-    if current[0] != expected_size or (expected_mtime is not None and current_mtime != expected_mtime):
+    current_mtime = int(current[1] // 1_000_000_000)
+    expected_device = file_node.get("device")
+    expected_inode = file_node.get("inode")
+    identity_changed = (
+        expected_device not in {None, 0, "0"} and int(expected_device) != current[2]
+    ) or (
+        expected_inode not in {None, 0, "0"} and int(expected_inode) != current[3]
+    )
+    if current[0] != expected_size or (expected_mtime is not None and current_mtime != expected_mtime) or identity_changed:
         raise SourceFileChangedError(
             "源文件在目录扫描后发生变化（扫描时 {} 字节，当前 {} 字节）。"
             "文件可能仍在复制；请等待复制完成后重新导入数据包。".format(expected_size, current[0])
@@ -324,7 +361,238 @@ def _assert_source_stable(path, file_node, previous_signature=None, cancel_check
     return current
 
 
-def _parse_with_limits(parser, path, node_path, mode, cancel_check=None):
+def _relative_source_parts(relative_path):
+    value = str(relative_path or "").replace("\\", "/")
+    relative = PurePosixPath(value)
+    parts = tuple(part for part in relative.parts if part not in {"", "."})
+    if (
+        not parts
+        or relative.is_absolute()
+        or any(part == ".." for part in parts)
+        or (parts and ":" in parts[0])
+    ):
+        raise SourceFileChangedError("源文件相对路径无效或超出扫描根目录")
+    return parts
+
+
+def _opened_handle_path(fd):
+    """Best-effort canonical path for an already-open file descriptor."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows deployment
+        try:
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            handle = wintypes.HANDLE(msvcrt.get_osfhandle(fd))
+            get_name = ctypes.windll.kernel32.GetFinalPathNameByHandleW
+            get_name.argtypes = [
+                wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+            ]
+            get_name.restype = wintypes.DWORD
+            size = int(get_name(handle, None, 0, 0))
+            if size:
+                buffer = ctypes.create_unicode_buffer(size + 1)
+                if get_name(handle, buffer, len(buffer), 0):
+                    value = buffer.value
+                    if value.startswith("\\\\?\\UNC\\"):
+                        value = "\\\\" + value[8:]
+                    elif value.startswith("\\\\?\\"):
+                        value = value[4:]
+                    return Path(value).resolve()
+        except Exception:
+            return None
+    proc_link = Path("/proc/self/fd") / str(fd)
+    try:
+        if proc_link.exists():
+            return Path(os.path.realpath(str(proc_link))).resolve()
+    except OSError:
+        pass
+    return None
+
+
+def _open_inventory_source(scan_root, file_node):
+    """Open exactly the inventoried regular file without following links."""
+    root = Path(scan_root).expanduser().resolve()
+    parts = _relative_source_parts(file_node.get("path"))
+    source_fd = None
+    directory_fds = []
+    try:
+        if os.name != "nt" and os.open in getattr(os, "supports_dir_fd", set()):
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            current_fd = os.open(str(root), directory_flags)
+            directory_fds.append(current_fd)
+            for component in parts[:-1]:
+                current_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                directory_fds.append(current_fd)
+            source_fd = os.open(
+                parts[-1],
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=current_fd,
+            )
+        else:
+            candidate = root.joinpath(*parts)
+            cursor = root
+            for component in parts:
+                cursor = cursor / component
+                if cursor.is_symlink():
+                    raise SourceFileChangedError("源路径包含符号链接或重解析点，已拒绝读取")
+            source_fd = os.open(
+                str(candidate),
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened_path = _opened_handle_path(source_fd)
+            if opened_path is None:
+                raise SourceFileChangedError("当前平台无法安全验证源文件句柄范围")
+            try:
+                opened_path.relative_to(root)
+            except ValueError as exc:
+                raise SourceFileChangedError("源文件句柄已指向扫描根目录之外") from exc
+
+        opened = os.fstat(source_fd)
+        if not stat_module.S_ISREG(opened.st_mode):
+            raise SourceFileChangedError("清点项已不再是普通文件")
+        expected_size = int(file_node.get("size") or 0)
+        expected_mtime_ns = int(file_node.get("modified_at_ns") or 0)
+        if int(opened.st_size) != expected_size:
+            raise SourceFileChangedError("源文件在清点后发生大小变化")
+        if expected_mtime_ns and int(opened.st_mtime_ns) != expected_mtime_ns:
+            raise SourceFileChangedError("源文件在清点后发生修改")
+        expected_device = file_node.get("device")
+        expected_inode = file_node.get("inode")
+        if expected_device not in {None, 0, "0"} and int(opened.st_dev) != int(expected_device):
+            raise SourceFileChangedError("源文件设备标识与清点记录不一致")
+        if expected_inode not in {None, 0, "0"} and int(opened.st_ino) != int(expected_inode):
+            raise SourceFileChangedError("源文件对象与清点记录不一致")
+        return source_fd, opened
+    except Exception:
+        if source_fd is not None:
+            os.close(source_fd)
+        raise
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def _restore_source_provenance(document, scan_root, file_node):
+    if not isinstance(document, dict):
+        return document
+    source = document.setdefault("source", {})
+    source.update({
+        "path": str(file_node.get("path") or ""),
+        "absolute_path": str(Path(scan_root) / str(file_node.get("path") or "")),
+        "name": str(file_node.get("name") or Path(str(file_node.get("path") or "")).name),
+        "extension": str(file_node.get("extension") or Path(str(file_node.get("path") or "")).suffix.lower()),
+        "size": int(file_node.get("size") or 0),
+        "modified_at": file_node.get("modified_at"),
+        "source_snapshot_verified": True,
+        "device": file_node.get("device"),
+        "inode": file_node.get("inode"),
+        "sensitive": bool(file_node.get("sensitive")),
+        "content_policy": file_node.get("content_policy") or source.get("content_policy"),
+    })
+    return document
+
+
+@contextmanager
+def _secure_source_snapshot(scan_root, file_node, cancel_check=None):
+    """Copy a verified source handle into private scratch before parsing.
+
+    Third-party parsers reopen paths internally, so a safe descriptor alone
+    is insufficient. Parsing a private snapshot closes the allow-list/open
+    race and gives deterministic bytes for hashing and evidence generation.
+    """
+    expected_size = int(file_node.get("size") or 0)
+    if expected_size > int(Config.MAX_CONTENT_BYTES):
+        raise SourceFileChangedError("源文件超过中央 10 GiB 内容上限")
+    Config.PARSE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    free_bytes = int(shutil.disk_usage(str(Config.PARSE_TEMP_DIR)).free)
+    required = expected_size + int(Config.PARSE_TEMP_DISK_RESERVE_BYTES or 0)
+    if free_bytes < required:
+        raise OSError("解析临时卷剩余空间不足，无法创建安全源快照")
+
+    source_fd = None
+    scratch = Path(tempfile.mkdtemp(
+        prefix="sjfx-source-p{}-".format(os.getpid()), dir=str(Config.PARSE_TEMP_DIR)
+    ))
+    original_name = str(file_node.get("name") or Path(str(file_node.get("path") or "")).name)
+    if not original_name or Path(original_name).name != original_name or original_name in {".", ".."}:
+        suffixes = "".join(Path(original_name or "source").suffixes[-2:])
+        original_name = "source" + suffixes
+    # Preserve the basename: format dispatch depends on compound extensions,
+    # and sensitive-name policy must still recognise names such as `.env`.
+    snapshot = scratch / original_name
+    try:
+        source_fd, opened_before = _open_inventory_source(scan_root, file_node)
+        source_path = Path(scan_root) / str(file_node.get("path") or "")
+        if _is_archive_node(file_node) and _source_has_open_writer(source_path):
+            raise SourceFileChangedError(
+                "压缩包仍被上传或复制程序以写入方式打开，请等待写入完成后重试"
+            )
+        observe_seconds = float(getattr(Config, "SOURCE_STABILITY_SECONDS", 0.0) or 0.0)
+        if _is_archive_node(file_node) and observe_seconds > 0:
+            deadline = time.monotonic() + observe_seconds
+            while time.monotonic() < deadline:
+                if cancel_check is not None and cancel_check():
+                    raise ParseIsolationCancelled("任务已取消，停止检查源文件稳定性")
+                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+            observed = os.fstat(source_fd)
+            if (
+                int(observed.st_dev), int(observed.st_ino),
+                int(observed.st_size), int(observed.st_mtime_ns),
+            ) != (
+                int(opened_before.st_dev), int(opened_before.st_ino),
+                int(opened_before.st_size), int(opened_before.st_mtime_ns),
+            ):
+                raise SourceFileChangedError("压缩包仍在写入，尚不能安全创建快照")
+        copied = 0
+        with os.fdopen(source_fd, "rb", closefd=True) as source, snapshot.open("xb") as target:
+            source_fd = None
+            while True:
+                if cancel_check is not None and cancel_check():
+                    raise ParseIsolationCancelled("任务已取消，停止创建安全源快照")
+                chunk = source.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > expected_size:
+                    raise SourceFileChangedError("源文件在快照期间增长，结果已拒绝")
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+            opened_after = os.fstat(source.fileno())
+        before_signature = (
+            int(opened_before.st_dev), int(opened_before.st_ino),
+            int(opened_before.st_size), int(opened_before.st_mtime_ns),
+        )
+        after_signature = (
+            int(opened_after.st_dev), int(opened_after.st_ino),
+            int(opened_after.st_size), int(opened_after.st_mtime_ns),
+        )
+        if copied != expected_size or before_signature != after_signature:
+            raise SourceFileChangedError("源文件在快照期间发生变化，结果已拒绝")
+        yield snapshot
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        shutil.rmtree(str(scratch), ignore_errors=True)
+
+
+def _parse_with_limits(
+    parser,
+    path,
+    node_path,
+    mode,
+    cancel_check=None,
+    timeout_seconds=None,
+):
     """Apply per-file wall-clock and current-process-memory guards.
 
     ``resource.getrusage(...).ru_maxrss`` is a *lifetime high-water mark*,
@@ -333,7 +601,14 @@ def _parse_with_limits(parser, path, node_path, mode, cancel_check=None):
     using it as a preflight check would then reject every later file instantly.
     On Linux read /proc/self/statm instead, which reports the current RSS.
     """
-    timeout = max(1, int(os.getenv("MAX_PARSE_SECONDS", "300")))
+    timeout = max(
+        1,
+        int(
+            timeout_seconds
+            if timeout_seconds is not None
+            else os.getenv("MAX_PARSE_SECONDS", "300")
+        ),
+    )
     memory_limit = max(256, int(os.getenv("MAX_WORKER_MEMORY_MB", "8192"))) * 1024 * 1024
     rss = None
     try:
@@ -397,7 +672,43 @@ def _parse_with_limits(parser, path, node_path, mode, cancel_check=None):
         # A native OCR call cannot always be force-killed safely. Do not block
         # the worker while it unwinds; the next parser call remains serialized
         # by UnifiedDocumentParser's internal lock.
-        executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # Compatibility with older maintenance runtimes.
+            executor.shutdown(wait=False)
+
+
+def _parse_with_timeout_fallback(parser, path, node_path, mode, cancel_check=None):
+    """Parse deeply first and degrade only after a hard deep-parse timeout."""
+    try:
+        return _parse_with_limits(
+            parser, path, node_path, mode, cancel_check=cancel_check
+        )
+    except ParseIsolationTimeout as timeout_error:
+        if mode == "fast" or not isinstance(parser, UnifiedDocumentParser):
+            raise
+        fallback_timeout = max(
+            30, int(os.getenv("MAX_PARSE_FALLBACK_SECONDS", "300"))
+        )
+        document = _parse_with_limits(
+            parser,
+            path,
+            node_path,
+            "fast",
+            cancel_check=cancel_check,
+            timeout_seconds=fallback_timeout,
+        )
+        document.setdefault("warnings", []).append(
+            "深度解析超过 {} 秒，已自动切换快速解析器；结果可用但未包含全部版面增强。".format(
+                int(os.getenv("MAX_PARSE_SECONDS", "300"))
+            )
+        )
+        parser_meta = document.setdefault("parser", {})
+        parser_meta["degraded"] = True
+        parser_meta["mode"] = "fast-timeout-fallback"
+        parser_meta["fallback_reason"] = "deep_parse_timeout"
+        parser_meta["deep_parse_timeout"] = str(timeout_error)[:300]
+        return document
 
 
 _PARSE_THREAD_LOCAL = threading.local()
@@ -458,11 +769,12 @@ def _parallel_parse_files(
                 raise ParseIsolationCancelled("任务已取消，停止提交新的解析文件")
             if on_tick is not None:
                 on_tick(index, len(candidates), [file_node.get("path") or ""])
-            path = resolve_under(scan_root, file_node["path"])
             try:
-                source_signature = _assert_source_stable(path, file_node, cancel_check=cancel_check)
-                document = _parse_with_limits(parser, path, file_node["path"], mode, cancel_check=cancel_check)
-                _assert_source_stable(path, file_node, previous_signature=source_signature, cancel_check=cancel_check)
+                with _secure_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
+                    document = _parse_with_timeout_fallback(
+                        parser, snapshot, file_node["path"], mode, cancel_check=cancel_check
+                    )
+                _restore_source_provenance(document, scan_root, file_node)
                 item = (index, file_node, document, None)
             except ParseIsolationCancelled:
                 raise
@@ -491,17 +803,16 @@ def _parallel_parse_files(
 
         def parse_task():
             child_parser = getattr(_PARSE_THREAD_LOCAL, "parser", parser)
-            path = resolve_under(scan_root, file_node["path"])
             try:
-                source_signature = _assert_source_stable(path, file_node, cancel_check=cancel_check)
-                document = _parse_with_limits(
-                    child_parser,
-                    path,
-                    file_node["path"],
-                    mode,
-                    cancel_check=cancel_check,
-                )
-                _assert_source_stable(path, file_node, previous_signature=source_signature, cancel_check=cancel_check)
+                with _secure_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
+                    document = _parse_with_timeout_fallback(
+                        child_parser,
+                        snapshot,
+                        file_node["path"],
+                        mode,
+                        cancel_check=cancel_check,
+                    )
+                _restore_source_provenance(document, scan_root, file_node)
                 return index, file_node, document, None
             except ParseIsolationCancelled:
                 raise
@@ -624,8 +935,7 @@ def _feature_containment(left_text, right_text):
 
 
 def _hamming(left, right):
-    # Keep the demo runnable on the project's Python 3.7 baseline, which does
-    # not yet provide int.bit_count().
+    # Portable popcount; the supported project runtime baseline is Python 3.10+.
     return bin(left ^ right).count("1")
 
 
@@ -2824,9 +3134,193 @@ def _add_related_topic_mounts(tree, documents):
     return tree
 
 
+def _parser_checkpoint_contract(parser):
+    """Return parse-affecting configuration for checkpoint invalidation."""
+    return {
+        "unified_document_schema": "unified-document/1.0",
+        "parser_class": parser.__class__.__name__,
+        "max_chars": int(getattr(parser, "max_chars", Config.MAX_FULL_DOCUMENT_CHARS)),
+        "fast_office_ocr": bool(getattr(parser, "fast_office_ocr", True)),
+        "docling_device": str(getattr(parser, "docling_device", Config.DOCLING_DEVICE)),
+        "docling_cpu_threads": int(getattr(parser, "docling_cpu_threads", Config.DOCLING_CPU_THREADS)),
+        "max_single_file_bytes": int(Config.MAX_SINGLE_FILE_BYTES),
+        "max_archive_file_bytes": int(Config.MAX_ARCHIVE_FILE_BYTES),
+        "max_archive_entries": int(Config.MAX_ARCHIVE_ENTRIES),
+        "max_archive_member_bytes": int(Config.MAX_ARCHIVE_MEMBER_BYTES),
+        "max_archive_uncompressed_bytes": int(Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES),
+        "max_archive_depth": int(os.getenv("MAX_ARCHIVE_DEPTH", "1")),
+    }
+
+
+def checkpoint_fingerprint(node, parser, parse_mode, document):
+    return file_fingerprint(
+        node,
+        parse_mode=parse_mode,
+        parser_contract=_parser_checkpoint_contract(parser),
+        source_sha256=(document.get("source") or {}).get("sha256"),
+    )
+
+
+def _verified_source_sha256(root, file_node, cancel_check=None):
+    """Hash the exact inventoried handle without reopening a mutable path."""
+    source_fd, before = _open_inventory_source(root, file_node)
+    digest = hashlib.sha256()
+    with os.fdopen(source_fd, "rb", closefd=True) as stream:
+        while True:
+            if cancel_check is not None and cancel_check():
+                raise ParseIsolationCancelled("任务已取消，停止检查解析缓存")
+            block = stream.read(4 * 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        after = os.fstat(stream.fileno())
+    if (
+        int(before.st_dev), int(before.st_ino), int(before.st_size), int(before.st_mtime_ns)
+    ) != (
+        int(after.st_dev), int(after.st_ino), int(after.st_size), int(after.st_mtime_ns)
+    ):
+        raise SourceFileChangedError("源文件在检查点校验期间发生变化")
+    return digest.hexdigest()
+
+
+def _structured_profile_complete(profile):
+    coverage = profile.get("coverage") or {}
+    limits = profile.get("limits") or {}
+    return bool(
+        profile.get("status") == "completed"
+        and coverage.get("complete", True)
+        and not coverage.get("truncated")
+        and not limits.get("truncated")
+    )
+
+
+def _build_structured_overview(documents):
+    """Aggregate bounded profiles without presenting samples/top-K as totals."""
+    structured_profiles = []
+    omitted_profile_count = 0
+    unavailable_profile_count = 0
+    for document_path, document in documents.items():
+        profile = document.get("data_profile")
+        if profile and profile.get("status") in PROFILE_USABLE_STATUSES:
+            structured_profiles.append({"path": document_path, "profile": profile})
+        elif isinstance(profile, dict):
+            unavailable_profile_count += 1
+        nested_items = list(document.get("data_profiles") or [])
+        represented_nested = 0
+        for item in nested_items:
+            if not isinstance(item, dict):
+                continue
+            nested = item.get("profile")
+            if not isinstance(nested, dict):
+                continue
+            represented_nested += 1
+            if nested.get("status") in PROFILE_USABLE_STATUSES:
+                structured_profiles.append({
+                    "path": "{}::{}".format(document_path, item.get("member")),
+                    "profile": nested,
+                })
+            else:
+                unavailable_profile_count += 1
+        declared_nested = max(
+            len(nested_items),
+            int(document.get("data_profiles_total") or 0),
+        )
+        omitted_profile_count += max(0, declared_nested - represented_nested)
+
+    complete_profiles = sum(
+        1 for item in structured_profiles
+        if _structured_profile_complete(item["profile"])
+    )
+    partial_profiles = len(structured_profiles) - complete_profiles
+    sampled_rows = sum(
+        int(item["profile"].get("row_count") or 0)
+        for item in structured_profiles
+    )
+    aggregate_complete = bool(structured_profiles) and not (
+        partial_profiles or omitted_profile_count or unavailable_profile_count
+    )
+    profile_scores = [
+        float(item["profile"].get("quality_score", 0))
+        for item in structured_profiles
+        if item["profile"].get("quality_score") is not None
+    ]
+    entity_statistics = {}
+    for category in ("person", "location", "event"):
+        merged = Counter()
+        columns = set()
+        category_complete = aggregate_complete
+        participating = 0
+        for item in structured_profiles:
+            profile = item["profile"]
+            category_columns = (profile.get("entity_columns") or {}).get(category, [])
+            local = (profile.get("entity_statistics") or {}).get(category) or {}
+            if not category_columns and not local:
+                continue
+            participating += 1
+            columns.update(category_columns)
+            values = [value for value in (local.get("top_values") or []) if isinstance(value, dict)]
+            for value in values:
+                merged[str(value.get("value") or "")] += int(value.get("count") or 0)
+            local_distinct = int(local.get("distinct_count") or 0)
+            if (
+                not _structured_profile_complete(profile)
+                or local.get("distinct_count") is None
+                or local_distinct > len(values)
+            ):
+                category_complete = False
+        if columns or merged:
+            observed = [
+                {"value": key, "count": count}
+                for key, count in merged.most_common(20)
+            ]
+            entity_statistics[category] = {
+                "columns": sorted(columns),
+                "distinct_count": len(merged) if category_complete else None,
+                "observed_distinct_count": len(merged),
+                "top_values": observed,
+                "observed_top_values": observed,
+                "participating_profiles": participating,
+                "coverage": {
+                    "complete": category_complete,
+                    "reason": None if category_complete else (
+                        "仅合并各画像保留的 top-K/有界样本，不能据此计算全局 distinct_count。"
+                    ),
+                },
+            }
+
+    recommendation_questions = []
+    for item in structured_profiles:
+        recommendation_questions.extend(item["profile"].get("recommendation_questions") or [])
+    return {
+        "profiled_files": len(structured_profiles),
+        "total_rows": sampled_rows if aggregate_complete else None,
+        "sampled_rows": sampled_rows,
+        "row_count_kind": "exact" if aggregate_complete else "sampled",
+        "average_quality_score": round(sum(profile_scores) / len(profile_scores), 2) if profile_scores else None,
+        "missing_value_columns": sorted(set(
+            name for item in structured_profiles
+            for name in item["profile"].get("missing_columns", [])
+        )),
+        "sensitive_columns": sorted(set(
+            name for item in structured_profiles
+            for name in item["profile"].get("sensitive_columns", [])
+        )),
+        "entity_statistics": entity_statistics,
+        "recommendation_questions": list(dict.fromkeys(recommendation_questions))[:12],
+        "coverage": {
+            "complete": aggregate_complete,
+            "complete_profiles": complete_profiles,
+            "partial_profiles": partial_profiles,
+            "omitted_projected_profiles": omitted_profile_count,
+            "unavailable_profiles": unavailable_profile_count,
+        },
+        "profiles": structured_profiles[:200],
+    }
+
+
 
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
-                    large_options=None, target_paths=None, cancel_check=None):
+                    large_options=None, target_paths=None, cancel_check=None, parse_mode_override=None):
     progress = progress or (lambda percent, message: None)
     files = list(_walk_files(scan["tree"]))
     parse_mode = "fast" if scan.get("parse_mode") == "fast" else "accurate"
@@ -2834,12 +3328,20 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     inventory = inventory_by_path(scan)
     all_paths = set(inventory)
     target_paths = set(target_paths or []) & all_paths
-    prior_states = {item.get("node_path"): item for item in storage.list_file_states(scan_id)}
-    documents = {
-        item["path"]: item["payload"]
-        for item in storage.list_documents(scan_id, hydrate=not policy.get("enabled"))
-        if item.get("path") in all_paths
-    }
+    prior_states = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
+    documents = {}
+    for item in storage.iter_documents(scan_id, hydrate=not policy.get("enabled")):
+        if item.get("path") not in all_paths:
+            continue
+        payload = item["payload"]
+        documents[item["path"]] = (
+            storage.project_document(
+                payload,
+                text_limit=policy["overview_chars_per_file"],
+                evidence_limit=policy["overview_evidence_per_file"],
+            )
+            if policy.get("enabled") else payload
+        )
     failures = [
         {"path": path, "error": state.get("error") or "历史解析失败"}
         for path, state in prior_states.items()
@@ -2859,26 +3361,53 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         candidates = files
         phase_label = "完整分析"
 
-    actual_parse_mode = "accurate" if policy.get("enabled") else parse_mode
+    if parse_mode_override is not None:
+        actual_parse_mode = "fast" if str(parse_mode_override).lower() == "fast" else "accurate"
+    elif policy.get("enabled") and not target_paths:
+        # A 10 GiB first pass must finish predictably.  Accurate OCR/Docling is
+        # reserved for explicit follow-up scopes and can reuse this fast pass.
+        actual_parse_mode = "fast"
+    else:
+        actual_parse_mode = parse_mode
+    parser_contract = _parser_checkpoint_contract(parser)
     progress(2, "开始{}：{} 个文件".format(phase_label, len(candidates)))
     parse_candidates = []
     reusable_count = 0
     for index, file_node in enumerate(candidates, 1):
         node_path = file_node["path"]
-        fingerprint = file_fingerprint(file_node)
         existing_state = prior_states.get(node_path)
         existing = documents.get(node_path)
-        if (
-            existing_state
-            and existing_state.get("status") in {"completed", "overview"}
-            and existing_state.get("fingerprint") == fingerprint
-            and existing
-        ):
+        reusable = False
+        if existing_state and existing_state.get("status") in {"completed", "overview"} and existing:
+            stored_sha256 = str((existing.get("source") or {}).get("sha256") or "")
+            if stored_sha256:
+                try:
+                    current_sha256 = _verified_source_sha256(scan["root"], file_node, cancel_check)
+                    acceptable_modes = [actual_parse_mode]
+                    stored_mode = str((existing.get("parser") or {}).get("mode") or "").lower()
+                    if actual_parse_mode == "fast" and stored_mode.startswith("accurate"):
+                        # Accurate is a strict upgrade of the fast first pass;
+                        # never downgrade an explicitly deep-parsed sidecar.
+                        acceptable_modes.append("accurate")
+                    expected = {
+                        file_fingerprint(
+                            file_node, parse_mode=mode, parser_contract=parser_contract,
+                            source_sha256=current_sha256,
+                        )
+                        for mode in acceptable_modes
+                    }
+                    reusable = (
+                        current_sha256 == stored_sha256
+                        and existing_state.get("fingerprint") in expected
+                    )
+                except OSError:
+                    reusable = False
+        if reusable:
             reusable_count += 1
-            progress(2 + int(68 * index / max(1, len(candidates))), "复用检查点：{}/{} {}".format(index, len(candidates), node_path))
+            progress(2 + int(68 * index / max(1, len(candidates))), "复用已校验检查点：{}/{} {}".format(index, len(candidates), node_path))
             continue
 
-        parse_candidates.append((file_node, fingerprint))
+        parse_candidates.append((file_node, None))
 
     total_candidates = max(1, len(candidates))
     completed_candidates = reusable_count
@@ -2886,7 +3415,6 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     def commit_parse_result(_index, file_node, document, error):
         nonlocal completed_candidates, failures
         node_path = file_node["path"]
-        fingerprint = file_fingerprint(file_node)
         completed_candidates += 1
         try:
             if error is not None:
@@ -2902,21 +3430,42 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     "若文件已完整，请检查是否损坏、加密或属于分卷压缩包。".format(details or "未发现可解析成员")
                 )
             storage.save_document(scan_id, node_path, document)
+            fingerprint = file_fingerprint(
+                file_node,
+                parse_mode=actual_parse_mode,
+                parser_contract=parser_contract,
+                source_sha256=(document.get("source") or {}).get("sha256"),
+            )
             documents[node_path] = (
                 storage.project_document(
                     document,
                     text_limit=policy["overview_chars_per_file"],
-                    evidence_limit=40,
+                    evidence_limit=policy["overview_evidence_per_file"],
                 )
                 if policy.get("enabled") else document
             )
+            if policy.get("enabled"):
+                storage.replace_document_evidence_index(
+                    scan_id, node_path, evidence_corpus({node_path: document})
+                )
             storage.set_file_state(
                 scan_id, node_path, fingerprint,
                 "completed", document=document,
             )
+            failures = [item for item in failures if item.get("path") != node_path]
         except Exception as exc:
+            fingerprint = file_fingerprint(
+                file_node, parse_mode=actual_parse_mode, parser_contract=parser_contract,
+            )
             failures = [item for item in failures if item.get("path") != node_path]
             failures.append({"path": node_path, "error": str(exc)})
+            # A failed current attempt invalidates any payload left by an older
+            # successful parse.  Otherwise old text leaks into classification,
+            # retrieval and parsed coverage while this same path is failed.
+            documents.pop(node_path, None)
+            storage.delete_document(scan_id, node_path)
+            if policy.get("enabled"):
+                storage.replace_document_evidence_index(scan_id, node_path, [])
             storage.set_file_state(scan_id, node_path, fingerprint, "failed", error=str(exc))
         progress(
             2 + int(68 * completed_candidates / total_candidates),
@@ -2933,6 +3482,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         # compete with the shared local Qwen model for the 3090 VRAM.
         if str(getattr(parser, "docling_device", "cpu")).lower() != "cpu":
             parse_workers = 1
+        parse_workers = _temp_disk_worker_limit(parse_workers)
 
         batch_size = len(parse_candidates)
         if policy.get("enabled"):
@@ -3015,16 +3565,47 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             storage.save_document(scan_id, document_path, document)
     similar_groups = [] if policy.get("enabled") else _group_similar(documents, exact_groups)
     topic_clusters = _topic_clusters(canonical_documents)
-    retrieval = build_retrieval_manifest(canonical_documents, topic_clusters)
-    evidence_index_count = storage.replace_evidence_index(
-        scan_id, evidence_corpus(canonical_documents)
-    )
+    if policy.get("enabled"):
+        # Rebuild the durable catalog one document at a time: one complete
+        # evidence scan, no 300k-object corpus allocation and no repeated BM25.
+        storage.clear_evidence_index(scan_id)
+        evidence_index_count = 0
+        for indexed_path, indexed_document in canonical_documents.items():
+            evidence_index_count += storage.replace_document_evidence_index(
+                scan_id, indexed_path, evidence_corpus({indexed_path: indexed_document})
+            )
+        manifest_queries = [
+            {"query": str(item.get("topic") or ""), "results": [], "deferred": True}
+            for item in topic_clusters[:5] if str(item.get("topic") or "").strip()
+        ]
+        retrieval = {
+            "schema_version": "local-retrieval/2.0",
+            "method": "SQLite FTS5 候选召回 + 有界本地 BM25/TF-IDF",
+            "evidence_chunks": evidence_index_count,
+            "queries": manifest_queries,
+            "remote_services_enabled": False,
+            "persistent_index": True,
+            "package_queries_deferred": True,
+        }
+    else:
+        retrieval = build_retrieval_manifest(canonical_documents, topic_clusters)
+        evidence_index_count = storage.replace_evidence_index(
+            scan_id, evidence_corpus(canonical_documents)
+        )
     research_documents = {
         path: document for path, document in canonical_documents.items()
         if document.get("classification", {}).get("document_role") not in {"要求与说明材料", "派生概览材料"}
     } or canonical_documents
-    research_topic_clusters = _topic_clusters(research_documents)
-    research_retrieval = build_retrieval_manifest(research_documents, research_topic_clusters)
+    if policy.get("enabled"):
+        # The first-pass package tree already excludes role noise where it is
+        # consumed.  A second full clustering/index pass is deferred until an
+        # explicit research scope is selected.
+        research_topic_clusters = topic_clusters
+        research_retrieval = dict(retrieval)
+        research_retrieval["scope"] = "research_documents_on_demand"
+    else:
+        research_topic_clusters = _topic_clusters(research_documents)
+        research_retrieval = build_retrieval_manifest(research_documents, research_topic_clusters)
 
     # ---------------------------------------------------------
     # 文档级语义聚类：正式目录的数据来源
@@ -3132,6 +3713,16 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     retrieved_evidence = []
     retrieved_ids = set()
+    if policy.get("enabled"):
+        for search in retrieval.get("queries", []):
+            candidates = storage.search_evidence_index(
+                scan_id, search.get("query") or "核心主题", limit=200
+            )
+            search["results"] = retrieve_evidence(
+                {}, search.get("query") or "核心主题", top_k=6,
+                indexed_chunks=candidates,
+            ).get("results", [])
+            search["deferred"] = False
     for search in retrieval.get("queries", []):
         for item in search.get("results", []):
             key = item.get("evidence_id") or (item.get("source_path"), item.get("content_sha256"), item.get("text"))
@@ -3231,45 +3822,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     )
     adaptive_tree = attach_tree_coverage(adaptive_tree, coverage_for_paths, all_paths)
     exact_duplicate_files = sum(group["duplicate_count"] for group in exact_groups)
-    structured_profiles = []
-    for profile_path, document in documents.items():
-        profile = document.get("data_profile")
-        if profile and profile.get("status") in PROFILE_USABLE_STATUSES:
-            structured_profiles.append({"path": profile_path, "profile": profile})
-        for item in document.get("data_profiles", []) or []:
-            nested = item.get("profile") or {}
-            if nested.get("status") in PROFILE_USABLE_STATUSES:
-                structured_profiles.append({"path": "{}::{}".format(profile_path, item.get("member")), "profile": nested})
-    profile_scores = [float(item["profile"].get("quality_score", 0)) for item in structured_profiles if item["profile"].get("quality_score") is not None]
-    entity_statistics = {}
-    recommendation_questions = []
-    for category in ("person", "location", "event"):
-        merged = Counter()
-        columns = set()
-        for item in structured_profiles:
-            profile = item["profile"]
-            columns.update((profile.get("entity_columns") or {}).get(category, []))
-            for value in ((profile.get("entity_statistics") or {}).get(category, {}).get("top_values") or []):
-                if isinstance(value, dict):
-                    merged[str(value.get("value") or "")] += int(value.get("count") or 0)
-        if columns or merged:
-            entity_statistics[category] = {
-                "columns": sorted(columns),
-                "distinct_count": len(merged),
-                "top_values": [{"value": key, "count": count} for key, count in merged.most_common(20)],
-            }
-    for item in structured_profiles:
-        recommendation_questions.extend(item["profile"].get("recommendation_questions") or [])
-    structured_overview = {
-        "profiled_files": len(structured_profiles),
-        "total_rows": sum(int(item["profile"].get("row_count") or 0) for item in structured_profiles),
-        "average_quality_score": round(sum(profile_scores) / len(profile_scores), 2) if profile_scores else None,
-        "missing_value_columns": sorted(set(name for item in structured_profiles for name in item["profile"].get("missing_columns", []))),
-        "sensitive_columns": sorted(set(name for item in structured_profiles for name in item["profile"].get("sensitive_columns", []))),
-        "entity_statistics": entity_statistics,
-        "recommendation_questions": list(dict.fromkeys(recommendation_questions))[:12],
-        "profiles": structured_profiles[:200],
-    }
+    structured_overview = _build_structured_overview(documents)
     parsed_ratio = float(package_coverage.get("parsed_file_ratio") or 0)
     evidence_count = sum(len(document.get("evidence", [])) for document in canonical_documents.values())
     overview = {
@@ -3346,7 +3899,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "office_embedded_image_ocr_files": sum(1 for document in documents.values() if document.get("parser", {}).get("office_embedded_image_ocr")),
             "retrieval_evidence_chunks": retrieval.get("evidence_chunks", 0),
             "persistent_evidence_index_chunks": evidence_index_count,
-            "parse_mode": parse_mode,
+            "parse_mode": actual_parse_mode,
             "folder_summary_count": sum(1 for item in node_summaries.values() if item.get("summary_type") == "folder"),
             "local_file_summary_count": local_file_summary_count,
             "metadata_file_summary_count": len(all_paths - set(documents)),
@@ -3381,7 +3934,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "canonical_document_index": [compact_document(document) for document in canonical_documents.values()],
         "failures": failures,
         "policy": {
-            "parse_mode": parse_mode,
+            "requested_parse_mode": parse_mode,
+            "parse_mode": actual_parse_mode,
             "analysis_mode": policy.get("mode"),
             "large_package": policy,
             "all_nodes_have_local_summary": True,
@@ -3404,40 +3958,47 @@ def refresh_package_coverage(scan_id, scan, storage):
     analysis = storage.get_analysis(scan_id) or {}
     if not analysis:
         return None
-    documents = {item["path"]: item["payload"] for item in storage.list_documents(scan_id, hydrate=False)}
-    states = storage.list_file_states(scan_id)
+    policy = (analysis.get("policy") or {}).get("large_package") or build_policy(scan)
+    documents = {}
+    for item in storage.iter_documents(scan_id, hydrate=False):
+        payload = item["payload"]
+        documents[item["path"]] = (
+            storage.project_document(
+                payload,
+                text_limit=policy.get("overview_chars_per_file", Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE),
+                evidence_limit=policy.get("overview_evidence_per_file", Config.LARGE_PACKAGE_OVERVIEW_EVIDENCE_PER_FILE),
+            )
+            if policy.get("enabled") else payload
+        )
+    states = storage.iter_file_states(scan_id)
     failures = [
         {"path": item.get("node_path"), "error": item.get("error")}
         for item in states if item.get("status") == "failed"
     ]
     all_paths = set(inventory_by_path(scan))
     pending_paths = all_paths - set(documents) - {item["path"] for item in failures}
-    policy = (analysis.get("policy") or {}).get("large_package") or build_policy(scan)
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )
-    exact_groups = _group_exact(documents)
-    canonical_documents, _canonical_by_path, _aliases = _canonical_projection(documents, exact_groups)
+    if policy.get("enabled"):
+        exact_groups = []
+        canonical_documents = documents
+    else:
+        exact_groups = _group_exact(documents)
+        canonical_documents, _canonical_by_path, _aliases = _canonical_projection(documents, exact_groups)
     analysis["exact_duplicate_groups"] = exact_groups
-    storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))
+    if policy.get("enabled"):
+        storage.clear_evidence_index(scan_id)
+        for document_path, document in canonical_documents.items():
+            storage.replace_document_evidence_index(
+                scan_id, document_path, evidence_corpus({document_path: document})
+            )
+    else:
+        storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))
     tree = attach_tree_coverage(analysis.get("analysis_tree") or {}, coverage_for_paths, all_paths)
     analysis["analysis_tree"] = tree
     analysis["coverage"] = package_coverage
-    structured = []
-    for path, document in canonical_documents.items():
-        if (document.get("data_profile") or {}).get("status") in PROFILE_USABLE_STATUSES:
-            structured.append({"path": path, "profile": document["data_profile"]})
-        for item in document.get("data_profiles", []) or []:
-            if (item.get("profile") or {}).get("status") in PROFILE_USABLE_STATUSES:
-                structured.append({"path": "{}::{}".format(path, item.get("member")), "profile": item["profile"]})
-    scores = [float(item["profile"].get("quality_score", 0)) for item in structured if item["profile"].get("quality_score") is not None]
-    analysis["structured_data_overview"] = {
-        "profiled_files": len(structured), "total_rows": sum(int(item["profile"].get("row_count") or 0) for item in structured),
-        "average_quality_score": round(sum(scores) / len(scores), 2) if scores else None,
-        "missing_value_columns": sorted(set(name for item in structured for name in item["profile"].get("missing_columns", []))),
-        "sensitive_columns": sorted(set(name for item in structured for name in item["profile"].get("sensitive_columns", []))),
-        "profiles": structured[:200],
-    }
+    analysis["structured_data_overview"] = _build_structured_overview(canonical_documents)
     statistics = analysis.setdefault("statistics", {})
     statistics.update({
         "parsed_files": len(documents), "failed_files": len(failures),

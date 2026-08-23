@@ -1,15 +1,48 @@
 [Unit]
 Description=SJFX Data Analysis Agent Local Worker
-After=network.target
+Wants=network-online.target
+After=network-online.target sjfx-web.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=zhoulingjie
+Group=gpuuser
 WorkingDirectory=/home/nas511/zhoulingjie/sjfx
+EnvironmentFile=/var/lib/sjfx-data-analysis-agent/.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/nas511/zhoulingjie/sjfx/.venv/bin/python -u worker.py
 Restart=on-failure
 RestartSec=5
-Environment=PYTHONUNBUFFERED=1
+TimeoutStopSec=45
+KillMode=control-group
+
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+StateDirectory=sjfx-data-analysis-agent
+StateDirectoryMode=0700
+ReadWritePaths=/home/nas511/zhoulingjie/sjfx/outputs
+MemoryMax=24G
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target

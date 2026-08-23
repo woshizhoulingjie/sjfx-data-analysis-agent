@@ -1,8 +1,14 @@
 import unittest
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from services.evidence import evidence_quality
 from services.folder_analysis import _normalize_question_answer_evidence
-from services.large_package import build_coverage, representative_paths
+from services.large_package import build_coverage, file_fingerprint, representative_paths
+from services.package_analysis import _build_structured_overview
+from services.storage import Storage
 from services.reporting import _direction_candidates
 
 
@@ -78,6 +84,110 @@ class AnalysisContractTests(unittest.TestCase):
         from config import Config
         self.assertGreaterEqual(Config.PARSE_MAX_CONCURRENCY, 1)
         self.assertEqual(Config.LLM_MAX_CONCURRENCY, 1)
+
+    def test_parse_pool_reserves_worst_case_temp_disk_per_worker(self):
+        from config import Config
+        from services.package_analysis import _temp_disk_worker_limit
+        gib = 1024 ** 3
+        with patch.object(Config, "MAX_CONTENT_BYTES", 10 * gib), patch.object(
+            Config, "PARSE_TEMP_DISK_RESERVE_BYTES", gib
+        ), patch("services.package_analysis.shutil.disk_usage", return_value=SimpleNamespace(free=15 * gib)):
+            self.assertEqual(_temp_disk_worker_limit(4), 1)
+        with patch.object(Config, "MAX_CONTENT_BYTES", 10 * gib), patch.object(
+            Config, "PARSE_TEMP_DISK_RESERVE_BYTES", gib
+        ), patch("services.package_analysis.shutil.disk_usage", return_value=SimpleNamespace(free=45 * gib)):
+            self.assertEqual(_temp_disk_worker_limit(4), 2)
+
+    def test_sidecar_projection_never_claims_full_text_analysis(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "agent.db")
+            document = {
+                "source": {"path": "a.txt", "sha256": "abc"},
+                "text": "正文" * 10000,
+                "evidence": [{"evidence_id": "E{}".format(index), "text": "证据"} for index in range(50)],
+                "coverage": {"complete": True, "coverage_ratio": 1.0},
+            }
+            projection = storage.project_document(document, text_limit=1000, evidence_limit=4)
+            self.assertTrue(projection["coverage"]["parse_complete"])
+            self.assertFalse(projection["coverage"]["semantic_complete"])
+            self.assertFalse(projection["coverage"]["complete"])
+            _for_paths, coverage = build_coverage(
+                self.scan, {"a.txt": projection}, pending_paths={"b.txt"},
+                policy={"mode": "large_package", "enabled": True},
+            )
+            self.assertFalse(coverage["full_text_analysis"])
+            self.assertEqual(coverage["coverage_level"], "representative_overview")
+            self.assertEqual(coverage["inventory_coverage_ratio"], 1.0)
+            self.assertEqual(coverage["content_parse_ratio"], 0.5)
+            self.assertEqual(coverage["deep_analysis_ratio"], 0.0)
+            self.assertIn("deep_analysis", coverage["coverage_contract"])
+
+    def test_inventory_truncation_blocks_full_text_label(self):
+        scan = dict(self.scan)
+        scan["truncated"] = True
+        documents = {
+            path: {"coverage": {"complete": True}, "text": "完整正文"}
+            for path in ("a.txt", "b.txt")
+        }
+        _for_paths, coverage = build_coverage(scan, documents)
+        self.assertFalse(coverage["inventory_coverage"]["complete"])
+        self.assertIsNone(coverage["inventory_coverage_ratio"])
+        self.assertTrue(coverage["parse_coverage"]["complete"])
+        self.assertFalse(coverage["semantic_analysis_coverage"]["complete"])
+        self.assertFalse(coverage["complete_analysis"])
+
+    def test_checkpoint_fingerprint_binds_content_mode_and_parser_contract(self):
+        node = {"path": "a.txt", "size": 10, "modified_at_ns": 123}
+        baseline = file_fingerprint(node, "fast", {"version": 1}, "a" * 64)
+        self.assertNotEqual(baseline, file_fingerprint(node, "accurate", {"version": 1}, "a" * 64))
+        self.assertNotEqual(baseline, file_fingerprint(node, "fast", {"version": 2}, "a" * 64))
+        self.assertNotEqual(baseline, file_fingerprint(node, "fast", {"version": 1}, "b" * 64))
+
+    def test_structured_overview_marks_samples_and_top_k_as_incomplete(self):
+        profile = {
+            "status": "partial",
+            "row_count": 100000,
+            "quality_score": 80,
+            "coverage": {"complete": False, "truncated": True},
+            "limits": {"truncated": True},
+            "entity_columns": {"person": ["姓名"]},
+            "entity_statistics": {"person": {
+                "distinct_count": 100,
+                "top_values": [{"value": "张三", "count": 5}],
+            }},
+        }
+        overview = _build_structured_overview({"people.csv": {"data_profile": profile}})
+        self.assertIsNone(overview["total_rows"])
+        self.assertEqual(overview["sampled_rows"], 100000)
+        self.assertEqual(overview["row_count_kind"], "sampled")
+        self.assertFalse(overview["coverage"]["complete"])
+        people = overview["entity_statistics"]["person"]
+        self.assertIsNone(people["distinct_count"])
+        self.assertEqual(people["observed_distinct_count"], 1)
+        self.assertFalse(people["coverage"]["complete"])
+
+    def test_structured_overview_exposes_omitted_and_unavailable_profiles(self):
+        complete = {
+            "status": "completed",
+            "row_count": 2,
+            "coverage": {"complete": True},
+            "limits": {"truncated": False},
+        }
+        failed = {"status": "failed", "row_count": 0, "coverage": {"complete": False}}
+        overview = _build_structured_overview({
+            "archive.zip": {
+                "data_profiles_total": 3,
+                "data_profiles": [
+                    {"member": "good.csv", "profile": complete},
+                    {"member": "bad.csv", "profile": failed},
+                ],
+            }
+        })
+
+        self.assertIsNone(overview["total_rows"])
+        self.assertFalse(overview["coverage"]["complete"])
+        self.assertEqual(overview["coverage"]["omitted_projected_profiles"], 1)
+        self.assertEqual(overview["coverage"]["unavailable_profiles"], 1)
 
 
 if __name__ == "__main__":

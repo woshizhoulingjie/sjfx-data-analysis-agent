@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import re
+import stat as stat_module
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,19 +15,40 @@ TEXT_EXTENSIONS = {
     ".xml", ".html", ".htm", ".log", ".ini", ".cfg", ".yaml", ".yml",
     ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".sql",
 }
-IGNORED_DIRS = {
-    ".git", ".venv", ".venv_py37_unused", "__pycache__", "node_modules",
-    ".idea", ".vscode", "vendor_packages", "work",
-}
-IGNORED_FILES = {".env", "agent.db", "agent.db-shm", "agent.db-wal"}
+def _configured_names(variable):
+    """Return an explicit, case-insensitive scan exclusion set.
+
+    A forensic inventory must not silently drop hidden, generated, unsupported
+    or sensitive entries.  Operators may still exclude known-noise paths, but
+    doing so is an explicit policy decision that is surfaced in coverage.
+    """
+    raw = str(os.getenv(variable, "") or "")
+    # The host path separator is the documented delimiter.  Commas and
+    # newlines are accepted as a convenience for simple deployment files.
+    for delimiter in ("\r", "\n", ","):
+        raw = raw.replace(delimiter, os.pathsep)
+    return {item.strip().casefold() for item in raw.split(os.pathsep) if item.strip()}
+
+
+IGNORED_DIRS = _configured_names("SCAN_IGNORED_DIRS")
+IGNORED_FILES = _configured_names("SCAN_IGNORED_FILES")
 SENSITIVE_EXTENSIONS = {".key", ".pem", ".p12", ".pfx", ".keystore"}
+SENSITIVE_FILENAMES = {
+    ".env", ".netrc", ".npmrc", ".pypirc", "credentials", "credentials.json",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+}
 
 
 def should_ignore_file(name):
-    lower_name = name.lower()
+    return str(name or "").casefold() in IGNORED_FILES
+
+
+def is_sensitive_file(name):
+    """Identify files whose presence is inventoried but content is restricted."""
+    lower_name = str(name or "").casefold()
     return (
-        lower_name in IGNORED_FILES
-        or lower_name.startswith("~$")
+        lower_name in SENSITIVE_FILENAMES
+        or lower_name.startswith(".env.")
         or Path(lower_name).suffix in SENSITIVE_EXTENSIONS
     )
 
@@ -64,11 +86,14 @@ def resolve_under(root, requested):
     return candidate
 
 
-def _file_metadata(path, root):
-    stat = path.stat()
+def _file_metadata(path, root, stat_result=None):
+    # The caller normally supplies DirEntry.lstat() data. Reopening a path
+    # here would create a type-check/open race if a writable NAS entry is
+    # swapped for a symlink between directory enumeration and metadata read.
+    stat = stat_result if stat_result is not None else path.stat()
     mime, _ = mimetypes.guess_type(str(path))
     rel = str(path.relative_to(root)).replace("\\", "/")
-    return {
+    metadata = {
         "id": path_id(path),
         "name": path.name,
         "path": rel,
@@ -78,33 +103,97 @@ def _file_metadata(path, root):
         "size": stat.st_size,
         "size_human": human_size(stat.st_size),
         "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
+        # Nanosecond precision is part of the checkpoint precondition.  The
+        # ISO timestamp is intentionally human-friendly and loses precision.
+        "modified_at_ns": int(stat.st_mtime_ns),
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+    }
+    if is_sensitive_file(path.name):
+        metadata.update({
+            "sensitive": True,
+            "content_analysis_allowed": False,
+            "content_policy": "metadata_only_sensitive",
+        })
+    return metadata
+
+
+def _symlink_metadata(entry, root, item_path=None):
+    """Inventory a link itself without resolving or following its target."""
+    # ``os.scandir(directory_fd)`` returns entries whose ``path`` is only the
+    # basename on POSIX. Use the caller's absolute lexical path so inventory
+    # IDs and relative paths remain anchored to the scan root.
+    path = Path(item_path) if item_path is not None else Path(entry.path)
+    stat = entry.stat(follow_symlinks=False)
+    rel = str(path.relative_to(root)).replace("\\", "/")
+    return {
+        "id": path_id(path),
+        "name": entry.name,
+        "path": rel,
+        "kind": "symlink",
+        "extension": path.suffix.lower(),
+        "size": 0,
+        "link_metadata_size": int(stat.st_size),
+        "size_human": human_size(0),
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
+        "modified_at_ns": int(stat.st_mtime_ns),
+        "content_analysis_allowed": False,
+        "content_policy": "inventory_only_symlink_target_not_followed",
     }
 
 
 def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
-                   activity_callback=None, cancel_check=None):
+                   activity_callback=None, cancel_check=None,
+                   max_directories=None, max_nodes=None,
+                   max_entries_per_directory=None):
     """Build a bounded physical inventory without following symbolic links.
 
-    ``max_depth`` protects the web/worker process from pathological directory
-    structures.  Reaching the bound is visible in the result instead of being
-    silently treated as a complete scan.  The optional callbacks let the worker
-    publish progress and honour cancellation without coupling this module to
-    Flask or the task database.
+    File, directory, total-node, depth and per-directory entry bounds protect
+    the web/worker process from pathological media. Reaching any bound is
+    visible in the result instead of being silently treated as complete. The
+    optional callbacks let the worker publish progress and honour cancellation
+    without coupling this module to the task database.
     """
     root = Path(root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError("目录不存在或不是文件夹")
-    max_files = max(1, min(int(max_files), 50000))
+    max_files = max(1, min(int(max_files), 1_000_000))
     max_depth = max(1, min(int(max_depth), 256))
+    max_directories = max(
+        1,
+        min(1_000_000, int(
+            os.getenv("MAX_SCAN_DIRECTORIES", "50000")
+            if max_directories is None else max_directories
+        )),
+    )
+    max_nodes = max(
+        2,
+        min(2_000_000, int(
+            os.getenv("MAX_SCAN_NODES", "100001")
+            if max_nodes is None else max_nodes
+        )),
+    )
+    max_entries_per_directory = max(
+        1,
+        min(250000, int(
+            os.getenv("MAX_SCAN_ENTRIES_PER_DIRECTORY", "50000")
+            if max_entries_per_directory is None else max_entries_per_directory
+        )),
+    )
     count = 0
     total_size = 0
     type_counts = {}
     errors = []
     truncated = False
     ignored_file_count = 0
+    ignored_directory_count = 0
     skipped_symlink_count = 0
     depth_limited_directory_count = 0
     visited_directory_count = 0
+    scanned_node_count = 0
+    directory_limited_count = 0
+    node_limited_count = 0
+    entry_limited_directory_count = 0
     last_activity_at = 0.0
 
     def publish_activity(current_path, force=False):
@@ -116,10 +205,13 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
             activity_callback(count, visited_directory_count, str(current_path))
             last_activity_at = now
 
-    def walk(folder, depth=0):
-        nonlocal count, total_size, truncated, ignored_file_count
+    def walk(folder, depth=0, folder_fd=None, folder_stat=None):
+        nonlocal count, total_size, truncated, ignored_file_count, ignored_directory_count
         nonlocal skipped_symlink_count, depth_limited_directory_count, visited_directory_count
+        nonlocal scanned_node_count, directory_limited_count, node_limited_count
+        nonlocal entry_limited_directory_count
         visited_directory_count += 1
+        scanned_node_count += 1
         publish_activity(folder, force=visited_directory_count == 1)
         node = {
             "id": path_id(folder),
@@ -135,6 +227,9 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
             "type_counts": {},
             "scan_depth": depth,
         }
+        if folder_stat is not None:
+            node["device"] = int(folder_stat.st_dev)
+            node["inode"] = int(folder_stat.st_ino)
         if cancel_check:
             cancel_check()
         if depth >= max_depth:
@@ -144,10 +239,20 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
             return node
         try:
             entries = []
-            with os.scandir(str(folder)) as iterator:
+            # On POSIX, scan an already-open directory object. Child
+            # directories are opened relative to this descriptor with
+            # O_NOFOLLOW, so renaming an entry to a symlink cannot redirect
+            # traversal outside the imported root.
+            scan_target = folder_fd if folder_fd is not None else str(folder)
+            with os.scandir(scan_target) as iterator:
                 for entry_index, entry in enumerate(iterator, 1):
                     if cancel_check:
                         cancel_check()
+                    if entry_index > max_entries_per_directory:
+                        truncated = True
+                        entry_limited_directory_count += 1
+                        node["entry_limited"] = True
+                        break
                     entries.append(entry)
                     if entry_index % 64 == 0:
                         publish_activity(folder)
@@ -162,18 +267,58 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
         for entry in entries:
             if cancel_check:
                 cancel_check()
-            if entry.name in IGNORED_DIRS:
+            if entry.name.casefold() in IGNORED_DIRS:
+                ignored_directory_count += 1
                 continue
             if count >= max_files:
                 truncated = True
                 break
+            if scanned_node_count >= max_nodes:
+                truncated = True
+                node_limited_count += 1
+                node["node_limited"] = True
+                break
             try:
+                item_path = folder / entry.name
                 if entry.is_symlink():
                     skipped_symlink_count += 1
+                    node["children"].append(_symlink_metadata(entry, root, item_path))
+                    scanned_node_count += 1
                     continue
-                item_path = Path(entry.path)
-                if entry.is_dir(follow_symlinks=False):
-                    child = walk(item_path, depth + 1)
+                entry_stat = entry.stat(follow_symlinks=False)
+                if stat_module.S_ISDIR(entry_stat.st_mode):
+                    if visited_directory_count >= max_directories:
+                        truncated = True
+                        directory_limited_count += 1
+                        node["directory_limited"] = True
+                        continue
+                    child_fd = None
+                    try:
+                        if folder_fd is not None:
+                            directory_flags = (
+                                os.O_RDONLY
+                                | getattr(os, "O_DIRECTORY", 0)
+                                | getattr(os, "O_NOFOLLOW", 0)
+                                | getattr(os, "O_CLOEXEC", 0)
+                            )
+                            child_fd = os.open(entry.name, directory_flags, dir_fd=folder_fd)
+                            opened_stat = os.fstat(child_fd)
+                            if (
+                                int(opened_stat.st_dev) != int(entry_stat.st_dev)
+                                or int(opened_stat.st_ino) != int(entry_stat.st_ino)
+                            ):
+                                raise OSError("目录项在扫描期间发生替换")
+                            child = walk(item_path, depth + 1, child_fd, opened_stat)
+                        else:
+                            # Windows fallback: reject a reparse/symlink at the
+                            # last possible point; parse-time handle validation
+                            # provides the authoritative containment check.
+                            if item_path.is_symlink():
+                                raise OSError("目录项在扫描期间变为符号链接")
+                            child = walk(item_path, depth + 1, None, entry_stat)
+                    finally:
+                        if child_fd is not None:
+                            os.close(child_fd)
                     node["children"].append(child)
                     node["direct_directory_count"] += 1
                     node["directory_count"] += 1 + child["directory_count"]
@@ -181,12 +326,13 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
                     node["total_size"] += child["total_size"]
                     for ext, value in child["type_counts"].items():
                         node["type_counts"][ext] = node["type_counts"].get(ext, 0) + value
-                elif entry.is_file(follow_symlinks=False):
+                elif stat_module.S_ISREG(entry_stat.st_mode):
                     if should_ignore_file(entry.name):
                         ignored_file_count += 1
                         continue
-                    meta = _file_metadata(item_path, root)
+                    meta = _file_metadata(item_path, root, entry_stat)
                     node["children"].append(meta)
+                    scanned_node_count += 1
                     count += 1
                     total_size += meta["size"]
                     node["file_count"] += 1
@@ -199,7 +345,7 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
                         progress_callback(count)
                     publish_activity(item_path)
             except (OSError, PermissionError) as exc:
-                errors.append({"path": entry.path, "error": str(exc)})
+                errors.append({"path": str(folder / entry.name), "error": str(exc)})
         node["size_human"] = human_size(node["total_size"])
         node["type_counts"] = dict(sorted(node["type_counts"].items(), key=lambda item: (-item[1], item[0])))
         top_types = list(node["type_counts"].items())[:4]
@@ -218,7 +364,24 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
         publish_activity(folder)
         return node
 
-    tree = walk(root)
+    root_fd = None
+    root_stat = None
+    try:
+        if os.name != "nt" and os.open in getattr(os, "supports_dir_fd", set()):
+            root_fd = os.open(
+                str(root),
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            root_stat = os.fstat(root_fd)
+        elif root.exists():
+            root_stat = root.stat()
+        tree = walk(root, folder_fd=root_fd, folder_stat=root_stat)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
     publish_activity(root, force=True)
     return {
         "root": str(root),
@@ -226,14 +389,30 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
         "file_count": count,
         "directory_count": tree["directory_count"],
         "ignored_file_count": ignored_file_count,
+        "ignored_directory_count": ignored_directory_count,
+        "ignore_policy": {
+            "directories": sorted(IGNORED_DIRS),
+            "files": sorted(IGNORED_FILES),
+            "default_is_full_inventory": not IGNORED_DIRS and not IGNORED_FILES,
+        },
+        "symlink_count": skipped_symlink_count,
         "skipped_symlink_count": skipped_symlink_count,
         "depth_limited_directory_count": depth_limited_directory_count,
+        "directory_limited_count": directory_limited_count,
+        "node_limited_count": node_limited_count,
+        "entry_limited_directory_count": entry_limited_directory_count,
         "scanned_directory_count": visited_directory_count,
+        "scanned_node_count": scanned_node_count,
         "max_depth": max_depth,
+        "max_files": max_files,
+        "max_directories": max_directories,
+        "max_nodes": max_nodes,
+        "max_entries_per_directory": max_entries_per_directory,
         "total_size": total_size,
         "total_size_human": human_size(total_size),
         "type_counts": dict(sorted(type_counts.items(), key=lambda item: (-item[1], item[0]))),
         "truncated": truncated,
+        "scan_error_count": len(errors),
         "errors": errors[:100],
         "tree": tree,
     }
@@ -378,7 +557,7 @@ def folder_context(folder, root, max_files=30, max_chars=50000, max_depth=32):
         depth = max(0, len(current.resolve().parts) - root_depth)
         dirs[:] = [
             d for d in dirs
-            if d not in IGNORED_DIRS and not (current / d).is_symlink()
+            if d.casefold() not in IGNORED_DIRS and not (current / d).is_symlink()
         ]
         if depth >= max(1, int(max_depth)):
             dirs[:] = []

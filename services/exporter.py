@@ -2,20 +2,39 @@ import json
 import logging
 import os
 import re
+import shutil
 import zipfile
 import hashlib
 import time
 import uuid
 from contextlib import contextmanager, suppress
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from services.scanner import IGNORED_DIRS, should_ignore_file
 from services.evidence import select_evidence
 from services.unified_parser import SUPPORTED_EXTENSIONS
 
 
 LOGGER = logging.getLogger(__name__)
+
+# Handoff exports intentionally keep the historical secret/noise exclusions.
+# Scanner inventory uses a different, explicit policy and must never inherit
+# these defaults, otherwise excluded entries disappear from coverage.
+EXPORT_IGNORED_DIRS = {
+    ".git", ".venv", ".venv_py37_unused", "__pycache__", "node_modules",
+    ".idea", ".vscode", "vendor_packages", "work",
+}
+EXPORT_IGNORED_FILES = {".env", "agent.db", "agent.db-shm", "agent.db-wal"}
+EXPORT_SENSITIVE_EXTENSIONS = {".key", ".pem", ".p12", ".pfx", ".keystore"}
+
+
+def _should_ignore_export_file(name):
+    lower_name = str(name or "").casefold()
+    return (
+        lower_name in EXPORT_IGNORED_FILES
+        or lower_name.startswith("~$")
+        or Path(lower_name).suffix in EXPORT_SENSITIVE_EXTENSIONS
+    )
 
 
 def xml_safe_text(value):
@@ -64,15 +83,56 @@ def collect_files(path):
         return [path]
     files = []
     for current_root, dirs, names in os.walk(str(path)):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not (Path(current_root) / d).is_symlink()]
+        dirs[:] = [d for d in dirs if d.casefold() not in EXPORT_IGNORED_DIRS and not (Path(current_root) / d).is_symlink()]
         for name in names:
-            if should_ignore_file(name):
+            if _should_ignore_export_file(name):
                 continue
             candidate = Path(current_root) / name
             if candidate.is_symlink():
                 continue
             files.append(candidate)
     return files
+
+
+def _collect_inventoried_files(root, selected, inventory_metadata):
+    """Return lexical source paths from the immutable scan inventory.
+
+    A live ``os.walk`` silently skips a regular file that has been replaced by
+    a symlink. Building the export set from the recorded inventory ensures the
+    handle-level opener sees that replacement and rejects the export.
+    """
+    root = Path(root).resolve()
+    selected = Path(selected)
+    try:
+        selected_relative = selected.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("导出范围超出扫描根目录") from exc
+    selected_key = str(selected_relative).replace("\\", "/") or "."
+    selected_prefix = "" if selected_key == "." else selected_key.rstrip("/") + "/"
+    files = []
+    excluded = []
+    for metadata_key, raw_node in sorted(
+        (inventory_metadata or {}).items(), key=lambda item: str(item[0])
+    ):
+        node = raw_node if isinstance(raw_node, dict) else {}
+        if node.get("kind") != "file":
+            continue
+        relative = str(node.get("path") or metadata_key or "").replace("\\", "/").strip("/")
+        parts = PurePosixPath(relative).parts
+        if not relative or relative == "." or ".." in parts or PurePosixPath(relative).is_absolute():
+            raise ValueError("清点记录包含非法导出路径")
+        if selected_key != "." and relative != selected_key and not relative.startswith(selected_prefix):
+            continue
+        candidate = root.joinpath(*parts)
+        ignored = (
+            any(part.casefold() in EXPORT_IGNORED_DIRS for part in parts[:-1])
+            or _should_ignore_export_file(parts[-1])
+        )
+        if ignored:
+            excluded.append(candidate)
+        else:
+            files.append(candidate)
+    return files, excluded
 
 
 def _sha256_file(path, block_size=1024 * 1024):
@@ -87,7 +147,51 @@ def _sha256_file(path, block_size=1024 * 1024):
     return digest.hexdigest()
 
 
-def _deduplicate_files(files, root):
+def _inventory_node_for_source(root, path, inventory_metadata=None):
+    root = Path(root).resolve()
+    path = Path(path)
+    try:
+        relative_path = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("导出源文件超出扫描根目录") from exc
+    if ".." in relative_path.parts:
+        raise ValueError("导出源文件路径包含越界分量")
+    relative = str(relative_path).replace("\\", "/")
+    node = dict((inventory_metadata or {}).get(relative) or {})
+    if node:
+        return relative, node
+    # Compatibility for direct library callers: create a one-shot inventory
+    # record with lstat, then the handle-level opener below verifies it again.
+    stat = path.lstat()
+    if path.is_symlink():
+        raise ValueError("导出源文件不能是符号链接")
+    return relative, {
+        "path": relative,
+        "name": path.name,
+        "extension": path.suffix.lower(),
+        "size": int(stat.st_size),
+        "modified_at_ns": int(stat.st_mtime_ns),
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+    }
+
+
+@contextmanager
+def _open_verified_export_source(root, path, inventory_metadata=None):
+    from services.package_analysis import _open_inventory_source
+
+    relative, node = _inventory_node_for_source(root, path, inventory_metadata)
+    descriptor, opened = _open_inventory_source(root, node)
+    try:
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+    except Exception:
+        os.close(descriptor)
+        raise
+    with stream:
+        yield relative, node, opened, stream
+
+
+def _deduplicate_files(files, root, cancel_check=None, inventory_metadata=None):
     """Keep one stable canonical source per identical byte stream.
 
     UI selections are path based, but a handoff package must not contain two
@@ -96,7 +200,25 @@ def _deduplicate_files(files, root):
     """
     groups = {}
     for path in sorted(set(files), key=lambda item: str(item.relative_to(root)).replace("\\", "/")):
-        digest = _sha256_file(path)
+        if cancel_check:
+            cancel_check()
+        digest_builder = hashlib.sha256()
+        with _open_verified_export_source(root, path, inventory_metadata) as (_relative, _node, before, stream):
+            while True:
+                if cancel_check:
+                    cancel_check()
+                block = stream.read(4 * 1024 * 1024)
+                if not block:
+                    break
+                digest_builder.update(block)
+            after = os.fstat(stream.fileno())
+        if (
+            int(before.st_dev), int(before.st_ino), int(before.st_size), int(before.st_mtime_ns)
+        ) != (
+            int(after.st_dev), int(after.st_ino), int(after.st_size), int(after.st_mtime_ns)
+        ):
+            raise ValueError("源文件在导出去重期间发生变化：{}".format(path.name))
+        digest = digest_builder.hexdigest()
         groups.setdefault(digest, []).append(path)
 
     unique_files = []
@@ -110,7 +232,9 @@ def _deduplicate_files(files, root):
                 "canonical": str(canonical.relative_to(root)).replace("\\", "/"),
                 "omitted": [str(item.relative_to(root)).replace("\\", "/") for item in members[1:]],
             })
-    return unique_files, duplicates
+    return unique_files, duplicates, {
+        member: digest for digest, members in groups.items() for member in members
+    }
 
 
 @contextmanager
@@ -123,6 +247,8 @@ def _atomic_zip(temporary_path, final_path):
         with zipfile.ZipFile(str(temporary_path), "w", compression=zipfile.ZIP_DEFLATED,
                              allowZip64=True) as archive:
             yield archive
+        if os.name != "nt":
+            temporary_path.chmod(0o600)
         # Ensure the directory entry is durable before publishing the name.
         # A crash can therefore leave only a harmless .part file, never a
         # half-valid final archive.
@@ -172,7 +298,8 @@ def cleanup_stale_part_files(output_dir, max_age_seconds=24 * 60 * 60):
 def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, documents=None, task_topic=None,
                 member_paths=None, node_name=None, node_id=None, selection_metadata=None,
                 selected_evidence_ids=None, inventory_metadata=None, file_states=None,
-                progress_callback=None, cancel_check=None):
+                progress_callback=None, cancel_check=None, content_deduplication=True,
+                known_hashes=None, disk_reserve_bytes=1024 * 1024 * 1024):
     root = Path(root).resolve()
     selected = Path(selected).resolve()
     documents = documents or []
@@ -190,12 +317,14 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
         files = []
         excluded_files = []
         for relative_path in virtual_paths:
-            candidate = (root / relative_path).resolve()
+            candidate = root / relative_path
             try:
                 candidate.relative_to(root)
             except ValueError:
                 raise ValueError("主题节点包含越界文件，已拒绝导出")
-            if not candidate.exists() or candidate.is_symlink():
+            if ".." in candidate.relative_to(root).parts or (
+                inventory_metadata and str(relative_path).replace("\\", "/") not in inventory_metadata
+            ):
                 excluded_files.append(candidate)
             else:
                 # Handoff packages preserve every selected source file. Parsing
@@ -204,11 +333,16 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
         selected_documents = [item for item in documents if item.get("path") in set(virtual_paths)]
         export_label = node_name or "主题节点"
     else:
-        all_files = collect_files(selected)
+        if inventory_metadata:
+            all_files, excluded_files = _collect_inventoried_files(
+                root, selected, inventory_metadata
+            )
+        else:
+            all_files = collect_files(selected)
+            excluded_files = []
         # Export all original files, including formats the parser cannot read.
         # Unsupported files remain visible in the coverage manifest as metadata-only.
         files = all_files
-        excluded_files = []
         selected_rel = str(selected.relative_to(root)).replace("\\", "/") if selected != root else "."
         if selected_rel == ".":
             selected_documents = documents
@@ -217,19 +351,50 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
             selected_documents = [item for item in documents if item.get("path") == selected_rel or item.get("path", "").startswith(prefix)]
         export_label = selected.name
     selected_file_count = len(files)
-    try:
-        files, content_duplicates = _deduplicate_files(files, root)
-    except (OSError, PermissionError) as exc:
-        raise ValueError("导出前无法计算源文件去重指纹：{}".format(exc))
-    source_sizes = {}
+    # Cheap metadata and capacity gates must run before any SHA-256 pass.  This
+    # prevents a doomed 10 GiB export from reading the NAS twice merely to
+    # report that it is too large or the destination is full.
+    source_stats = {}
     try:
         for path in files:
-            source_sizes[path] = path.stat().st_size
+            with _open_verified_export_source(root, path, inventory_metadata) as (relative, node, stat, _stream):
+                source_stats[path] = {
+                    "relative": relative,
+                    "node": node,
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                }
     except (OSError, PermissionError) as exc:
         raise ValueError("导出前无法读取源文件：{}".format(exc))
-    total_size = sum(source_sizes.values())
+    total_size = sum(item["size"] for item in source_stats.values())
     if total_size > max_bytes:
-        raise ValueError("导出内容为 {:.1f} MB，超过演示版上限 {:.1f} MB".format(total_size / 1048576, max_bytes / 1048576))
+        raise ValueError("导出内容为 {:.2f} GB，超过 {:.2f} GB 上限".format(total_size / 1073741824, max_bytes / 1073741824))
+    try:
+        free_bytes = int(shutil.disk_usage(str(output_dir)).free)
+    except OSError as exc:
+        raise ValueError("无法检查导出磁盘剩余空间：{}".format(exc))
+    required_bytes = total_size + max(0, int(disk_reserve_bytes or 0))
+    if free_bytes < required_bytes:
+        raise ValueError(
+            "导出磁盘空间不足：最坏情况需要 {:.2f} GB（含保留空间），当前可用 {:.2f} GB".format(
+                required_bytes / 1073741824, free_bytes / 1073741824,
+            )
+        )
+    expected_hashes = {}
+    content_duplicates = []
+    if content_deduplication:
+        try:
+            files, content_duplicates, expected_hashes = _deduplicate_files(
+                files, root, cancel_check=cancel_check,
+                inventory_metadata=inventory_metadata,
+            )
+        except (OSError, PermissionError) as exc:
+            raise ValueError("导出前无法计算源文件去重指纹：{}".format(exc))
+    known_hashes = {str(key).replace("\\", "/"): str(value) for key, value in (known_hashes or {}).items() if value}
+    for path in files:
+        relative = str(path.relative_to(root)).replace("\\", "/")
+        expected_hashes.setdefault(path, known_hashes.get(relative))
+    total_size = sum(source_stats[path]["size"] for path in files)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     # A random suffix prevents two same-second exports from sharing the same
     # final or .part pathname.  The human-readable prefix remains unchanged.
@@ -277,7 +442,12 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
         "selected_nodes": selection_metadata,
         "unique_source_file_count": len(files),
         "deduplication": {
-            "method": "先按相对路径合并重叠选择，再按 SHA-256 精确去重；相同字节的源文件仅导出规范副本。",
+            "method": (
+                "先按相对路径合并重叠选择，再按 SHA-256 精确去重；写入时再次校验摘要。"
+                if content_deduplication else
+                "10GB/大包流式导出跳过内容去重；按路径去重，写入 ZIP 时单遍计算 SHA-256。"
+            ),
+            "content_deduplication_enabled": bool(content_deduplication),
             "source_selection_count": len(selection_metadata),
             "selected_evidence_count": len(selected_evidence_ids),
             "selected_file_count_before_content_deduplication": selected_file_count,
@@ -287,28 +457,65 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
         },
     }
     written_size = 0
+    source_manifest = []
     with _atomic_zip(temporary_archive_path, archive_path) as archive:
         for index, path in enumerate(files, 1):
             if cancel_check:
                 cancel_check()
-            expected_size = source_sizes[path]
-            try:
-                current_size = path.stat().st_size
-            except (OSError, PermissionError) as exc:
-                raise ValueError("导出过程中源文件不可访问：{}".format(exc))
-            if current_size != expected_size:
-                raise ValueError("源文件在导出过程中发生变化：{}".format(path.name))
-            if written_size + current_size > max_bytes:
+            expected_stat = source_stats[path]
+            expected_size = expected_stat["size"]
+            if written_size + expected_size > max_bytes:
                 raise ValueError("源文件总大小超过导出上限，已停止写入")
-            archive.write(str(path), arcname=str(path.relative_to(root)).replace("\\", "/"))
-            written_size += current_size
+            digest = hashlib.sha256()
+            copied = 0
+            with _open_verified_export_source(root, path, inventory_metadata) as (relative, _node, before, source):
+                if int(before.st_size) != expected_size or int(before.st_mtime_ns) != expected_stat["mtime_ns"]:
+                    raise ValueError("源文件在导出过程中发生变化：{}".format(path.name))
+                info = zipfile.ZipInfo(relative, time.localtime(before.st_mtime)[:6])
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = (int(before.st_mode) & 0xFFFF) << 16
+                with archive.open(info, "w", force_zip64=True) as target:
+                    while True:
+                        if cancel_check:
+                            cancel_check()
+                        block = source.read(4 * 1024 * 1024)
+                        if not block:
+                            break
+                        copied += len(block)
+                        if written_size + copied > max_bytes:
+                            raise ValueError("源文件总大小超过导出上限，已停止写入")
+                        digest.update(block)
+                        target.write(block)
+                after = os.fstat(source.fileno())
+            actual_sha256 = digest.hexdigest()
+            if (
+                copied != expected_size
+                or int(after.st_size) != expected_size
+                or int(after.st_mtime_ns) != expected_stat["mtime_ns"]
+            ):
+                raise ValueError("源文件在导出过程中发生变化：{}".format(path.name))
+            expected_sha256 = expected_hashes.get(path)
+            if expected_sha256 and actual_sha256 != expected_sha256:
+                raise ValueError("源文件内容与分析/去重摘要不一致：{}".format(path.name))
+            written_size += copied
+            source_manifest.append({
+                "path": relative, "size": copied, "sha256": actual_sha256,
+                "modified_at_ns": expected_stat["mtime_ns"],
+            })
             if progress_callback:
                 progress_callback(index, len(files), written_size, total_size)
+        handoff["source_manifest_file"] = "源文件SHA-256清单.json"
+        handoff["source_manifest_count"] = len(source_manifest)
         archive.writestr(
             "节点摘要.json",
             json.dumps(summary or {"message": "尚未生成摘要"}, ensure_ascii=False, indent=2),
         )
         archive.writestr("整编任务说明.json", json.dumps(handoff, ensure_ascii=False, indent=2))
+        archive.writestr("源文件SHA-256清单.json", json.dumps({
+            "schema_version": "source-manifest/1.0",
+            "total_bytes": written_size,
+            "files": source_manifest,
+        }, ensure_ascii=False, indent=2))
         archive.writestr("结论-证据链.json", json.dumps({
             "schema_version": "question-answer-evidence/2.0",
             "selected_path": selected_rel,
@@ -392,7 +599,7 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 "excluded_files": [str(path.relative_to(root)).replace("\\", "/") for path in excluded_files[:100]],
                 "total_size": total_size,
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
-                "contents": ["所选范围全部原始文件（相对路径和 SHA-256 精确去重）", "节点摘要.json", "整编任务说明.json", "结论-证据链.json", "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json"],
+                "contents": ["所选范围全部原始文件", "源文件SHA-256清单.json", "节点摘要.json", "整编任务说明.json", "结论-证据链.json", "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json"],
             }, ensure_ascii=False, indent=2),
         )
     return archive_path
