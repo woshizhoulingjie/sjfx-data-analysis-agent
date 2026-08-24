@@ -135,6 +135,57 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertGreater(candidates[0]["score"], 0)
         self.assertEqual(candidates[0]["evidence_ids"], ["E1"])
 
+    def test_direction_candidates_use_official_tree_evidence(self):
+        evidence = {
+            "evidence_id": "E-market", "source_path": "市场经营简报.md",
+            "source_sha256": "market-source", "label": "paragraph",
+            "text": "新客户转化率从18%提升至21%，但平均交付周期由7.2天延长至8.1天。",
+        }
+        analysis = {
+            "statistics": {"parsed_files": 2},
+            "coverage": {"parsed_file_ratio": 1.0, "complete_analysis": True},
+            # Semantic metadata intentionally has no evidence. This was the
+            # production failure: it shadowed the official evidenced tree.
+            "semantic_topic_clusters": [{
+                "name": "区域市场经营数据分析与风险预警",
+                "members": ["区域经营数据.csv", "市场经营简报.md"],
+            }],
+            "analysis_tree": {"children": [{
+                "kind": "group", "node_type": "topic", "classification_status": "classified",
+                "node_id": "group-market", "name": "区域市场经营数据分析与风险预警",
+                "member_paths": ["区域经营数据.csv", "市场经营简报.md"],
+                "related_topics": ["销售分析", "交付周期", "风险预警"],
+                "representative_documents": ["市场经营简报.md"],
+                "evidence_chain": [evidence],
+            }]},
+            "document_index": [
+                {"source": {"path": "区域经营数据.csv", "extension": ".csv"}, "classification": {"document_role": "结构化数据"}},
+                {"source": {"path": "市场经营简报.md", "extension": ".md"}, "classification": {"document_role": "一般资料"}},
+            ],
+        }
+        candidates = _direction_candidates({}, analysis)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["title"], "区域市场经营数据分析与风险预警")
+        self.assertEqual(candidates[0]["evidence_ids"], ["E-market"])
+        self.assertEqual(candidates[0]["candidate_source"], "official_analysis_tree")
+        self.assertEqual(candidates[0]["evidence_status"], "supported")
+        self.assertIn("交付周期", candidates[0]["research_questions"][0])
+
+    def test_unclassified_tree_bucket_is_not_recommended(self):
+        analysis = {
+            "statistics": {"parsed_files": 1},
+            "analysis_tree": {"children": [{
+                "kind": "group", "classification_status": "unclassified",
+                "name": "其他内容", "member_paths": ["unknown.txt"],
+                "evidence_chain": [{
+                    "evidence_id": "E1", "source_path": "unknown.txt", "label": "paragraph",
+                    "text": "该材料提供了一段较长的事实性正文，但尚未形成稳定主题。",
+                }],
+            }]},
+            "semantic_topic_clusters": [], "research_topic_clusters": [], "topic_clusters": [],
+        }
+        self.assertEqual(_direction_candidates({}, analysis), [])
+
     def test_representatives_prioritize_small_actionable_text(self):
         files = [
             {"path": "reports/huge-{}.pdf".format(index), "extension": ".pdf", "size": 30_000_000}

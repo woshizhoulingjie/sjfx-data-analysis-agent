@@ -58,7 +58,14 @@ def _cluster_evidence(cluster, analysis, topic, limit=8):
         if path not in member_paths:
             continue
         candidates.extend(item.get("evidence") or [])
-    selected = select_evidence(candidates, topics=[topic], max_items=limit, per_source=2, max_chars=620)
+    evidence_topics = [topic] + list(cluster.get("related_topics") or cluster.get("keywords") or [])[:8]
+    selected = select_evidence(
+        candidates,
+        topics=[value for value in evidence_topics if value],
+        max_items=limit,
+        per_source=2,
+        max_chars=620,
+    )
     return [
         item for item in selected
         if evidence_quality(item).get("eligible")
@@ -76,6 +83,39 @@ def _score01(value, default=0.0):
         return default
 
 
+def _analysis_tree_direction_clusters(analysis):
+    """Project official top-level analysis nodes into recommendation candidates.
+
+    The analysis tree is the authoritative content partition and already owns
+    the evidence selected for each topic. Semantic clustering metadata alone
+    does not carry that evidence, so using it first can incorrectly erase every
+    recommendation even when the UI tree has a valid evidence chain.
+    """
+    clusters = []
+    for node in (analysis.get("analysis_tree") or {}).get("children") or []:
+        if node.get("kind") != "group":
+            continue
+        if node.get("classification_status") != "classified":
+            continue
+        members = list(dict.fromkeys(node.get("member_paths") or []))
+        name = str(node.get("name") or "").strip()
+        if not name or not members:
+            continue
+        clusters.append({
+            "topic": name,
+            "name": name,
+            "members": members,
+            "representative_documents": list(node.get("representative_documents") or members[:5]),
+            "evidence_chain": list(node.get("evidence_chain") or []),
+            "related_topics": list(node.get("related_topics") or []),
+            "mean_similarity": node.get("mean_similarity"),
+            "classification_confidence": node.get("classification_confidence"),
+            "node_id": node.get("node_id"),
+            "source": "official_analysis_tree",
+        })
+    return clusters
+
+
 def _direction_candidates(scan, analysis, limit=5):
     """Rank explainable local directions before optional model wording.
 
@@ -87,7 +127,8 @@ def _direction_candidates(scan, analysis, limit=5):
     coverage = analysis.get("coverage") or {}
     document_index = _document_index(analysis)
     clusters = (
-        analysis.get("semantic_topic_clusters")
+        _analysis_tree_direction_clusters(analysis)
+        or analysis.get("semantic_topic_clusters")
         or analysis.get("research_topic_clusters")
         or analysis.get("topic_clusters")
         or []
@@ -151,7 +192,10 @@ def _direction_candidates(scan, analysis, limit=5):
 
         dimensions = {
             "scale": min(1.0, math.log1p(len(members)) / math.log1p(max(2, parsed))),
-            "concentration": _score01(cluster.get("mean_similarity"), min(1.0, len(members) / float(parsed))),
+            "concentration": _score01(
+                cluster.get("mean_similarity"),
+                _score01(cluster.get("classification_confidence"), min(1.0, len(members) / float(parsed))),
+            ),
             "information_richness": min(1.0, evidence_count / 6.0),
             "independent_sources": min(1.0, independent_sources / 4.0),
             "recency": (max(0.0, 1.0 - age_days / 1095.0) if age_days is not None else 0.35),
@@ -179,6 +223,11 @@ def _direction_candidates(scan, analysis, limit=5):
         limitations = list(coverage.get("limitations") or [])
         if not evidence:
             limitations.append("当前主题没有达到正文证据门槛，不能据此形成可靠结论。")
+        related_topics = [
+            str(value).strip() for value in cluster.get("related_topics") or []
+            if str(value).strip() and str(value).strip() != topic
+        ][:4]
+        focus = "、".join(related_topics[:2]) or "关键结论与指标"
         directions.append({
             "title": topic,
             "direction": topic,
@@ -199,13 +248,17 @@ def _direction_candidates(scan, analysis, limit=5):
             "rationale": "该方向包含 {} 个已解析成员、{} 条合格证据和 {} 个独立来源；综合规模、集中度、丰富度、时效、异常、技术影响、可成稿性、新颖性与任务相关性后得分 {:.1f}。".format(len(members), evidence_count, independent_sources, score),
             "basis": "优先级由十维可解释评分计算；所有正文判断均回链到证据，时效仅以源文件修改时间为代理。",
             "research_questions": [
-                "该方向的代表性文档之间有哪些共同结论和差异？",
-                "该方向的关键结论能否由多个独立来源直接支撑？",
+                "围绕“{}”，不同资料对{}给出了哪些一致结论、差异和适用条件？".format(topic, focus),
+                "“{}”方向的关键判断能否由多个独立来源和可复核指标共同支撑？".format(topic),
             ],
             "methods": ["先阅读代表性文档并核对原文证据", "按时间、来源和版本关系进行交叉比较"],
             "representative_documents": list(cluster.get("representative_documents") or members[:5])[:5],
             "evidence_chain": evidence,
             "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
+            "evidence_status": "supported",
+            "unique_evidence_count": len({item.get("evidence_id") for item in evidence if item.get("evidence_id")}),
+            "independent_source_count": independent_sources,
+            "candidate_source": cluster.get("source") or "legacy_cluster_projection",
             "limitations": list(dict.fromkeys(limitations)),
             "confidence": confidence,
             "confidence_score": round(confidence_score, 3),
