@@ -1469,6 +1469,9 @@ def _localized_subtopic_term(term):
         "sidechannel": "侧信道安全", "side-channel": "侧信道安全",
         "enclave": "可信执行环境", "tee": "可信执行环境", "sgx": "SGX安全",
         "protocol": "协议安全", "adversarial": "对抗安全", "blockchain": "区块链安全",
+        "amd": "AMD机密计算", "sev-snp": "SEV-SNP安全", "stackwarp": "栈安全",
+        "pointer": "指针安全", "computing": "机密计算", "confidential": "机密计算",
+        "trusted": "可信计算", "attestation": "可信证明", "gpu": "GPU安全",
     }.get(value.lower(), "专题（{}）".format(value[:12].upper() or "待命名"))
 
 
@@ -2815,6 +2818,8 @@ def _fallback_semantic_name(cluster, documents):
         "introduction",
         "using",
         "based",
+        "acm",
+        "pages",
     }
 
     words = [
@@ -2840,6 +2845,9 @@ def _fallback_semantic_name(cluster, documents):
         "sidechannel": "侧信道安全", "side-channel": "侧信道安全",
         "enclave": "可信执行环境", "tee": "可信执行环境", "sgx": "SGX安全",
         "protocol": "协议安全", "adversarial": "对抗安全", "blockchain": "区块链安全",
+        "amd": "AMD机密计算", "sev-snp": "SEV-SNP安全", "stackwarp": "栈安全",
+        "pointer": "指针安全", "computing": "机密计算", "confidential": "机密计算",
+        "trusted": "可信计算", "attestation": "可信证明", "gpu": "GPU安全",
     }
     translated = []
     for word in words:
