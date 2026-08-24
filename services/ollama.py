@@ -173,6 +173,12 @@ class OllamaClient(LocalModelClient):
                 "completion_tokens": data.get("eval_count", 0),
             },
             "finish_reason": data.get("done_reason") or ("stop" if data.get("done") else None),
+            "timing": {
+                "total_seconds": float(data.get("total_duration") or 0) / 1e9,
+                "load_seconds": float(data.get("load_duration") or 0) / 1e9,
+                "prefill_seconds": float(data.get("prompt_eval_duration") or 0) / 1e9,
+                "decode_seconds": float(data.get("eval_duration") or 0) / 1e9,
+            },
         }
 
     def _stream_request(self, payload, timeout=None, retries=2):
@@ -210,6 +216,7 @@ class OllamaClient(LocalModelClient):
             model = self.model
             usage = {}
             finish_reason = None
+            timing = {}
             try:
                 with self._semaphore:
                     with urllib.request.urlopen(request, timeout=effective_timeout) as response:
@@ -232,6 +239,12 @@ class OllamaClient(LocalModelClient):
                                 reasoning_parts.append(reasoning)
                             if data.get("done"):
                                 finish_reason = data.get("done_reason") or "stop"
+                                timing = {
+                                    "total_seconds": float(data.get("total_duration") or 0) / 1e9,
+                                    "load_seconds": float(data.get("load_duration") or 0) / 1e9,
+                                    "prefill_seconds": float(data.get("prompt_eval_duration") or 0) / 1e9,
+                                    "decode_seconds": float(data.get("eval_duration") or 0) / 1e9,
+                                }
                                 break
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
@@ -251,6 +264,7 @@ class OllamaClient(LocalModelClient):
                         "model": model,
                         "usage": usage,
                         "finish_reason": finish_reason,
+                        "timing": timing,
                     }
                 reasoning = "".join(reasoning_parts).strip()
                 message = (

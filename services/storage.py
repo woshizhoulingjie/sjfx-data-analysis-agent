@@ -969,9 +969,10 @@ class Storage:
         keys = (
             "schema_version", "scan_id", "root", "status", "started_from_scan_at",
             "completed_at", "parser_status", "statistics", "coverage", "overview",
-            "value_judgment", "structured_data_overview", "policy",
+            "value_judgment", "structured_data_overview", "model_telemetry", "policy",
             "classification_dimensions", "semantic_cluster_threshold",
             "semantic_naming_model", "subtopic_naming_model", "semantic_cluster_error",
+            "analysis_tree_version", "analysis_tree_identity_contract",
         )
         result = {key: source.get(key) for key in keys if key in source}
         if "coverage" in result:

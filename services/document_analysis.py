@@ -1,5 +1,6 @@
 import json
 import math
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from services.ollama import LocalModelError
@@ -7,21 +8,102 @@ from services.evidence import select_evidence
 from services.scanner import extract_text
 
 
-def _split_text(text, max_chunks=12, preferred_chars=32000):
+def _estimated_tokens(text):
+    """Conservative tokenizer-free estimate used only for prompt budgeting."""
+    value = str(text or "")
+    cjk = len(re.findall(r"[\u3400-\u9fff]", value))
+    remainder = max(0, len(value) - cjk)
+    return cjk + int(math.ceil(remainder / 3.5))
+
+
+def _split_text(text, max_chunks=64, preferred_chars=42000, max_input_tokens=14000, overlap_chars=320):
+    """Split the complete text on structural boundaries under a token budget.
+
+    ``max_chunks`` is a warning threshold, not a truncation switch. If a long
+    document needs more chunks to preserve the full text, every chunk is kept.
+    """
     if not text:
         return []
-    chunk_size = max(preferred_chars, int(math.ceil(len(text) / float(max(1, max_chunks)))))
+    preferred_chars = max(512, int(preferred_chars))
+    max_input_tokens = max(1000, int(max_input_tokens))
     chunks = []
     start = 0
     while start < len(text):
-        end = min(len(text), start + chunk_size)
+        end = min(len(text), start + preferred_chars)
+        while end > start + 256 and _estimated_tokens(text[start:end]) > max_input_tokens:
+            end = start + max(256, int((end - start) * 0.85))
         if end < len(text):
-            boundary = text.rfind("\n", start + int(chunk_size * 0.75), end)
+            search_from = start + int((end - start) * 0.65)
+            boundaries = [
+                text.rfind("\n#", search_from, end),
+                text.rfind("\n\n", search_from, end),
+                text.rfind("\n", search_from, end),
+                text.rfind("。", search_from, end),
+            ]
+            boundary = max(boundaries)
             if boundary > start:
-                end = boundary
-        chunks.append({"index": len(chunks) + 1, "start": start, "end": end, "text": text[start:end]})
-        start = end
+                end = boundary + (1 if text[boundary:boundary + 1] == "。" else 0)
+        chunk_text = text[start:end]
+        chunks.append({
+            "index": len(chunks) + 1, "start": start, "end": end,
+            "text": chunk_text, "estimated_input_tokens": _estimated_tokens(chunk_text),
+            "overlap_chars": 0 if not chunks else min(overlap_chars, start),
+        })
+        if end >= len(text):
+            break
+        next_start = max(start + 1, end - max(0, int(overlap_chars)))
+        start = next_start
     return chunks
+
+
+def _is_output_truncated(result, max_tokens):
+    usage = (result or {}).get("usage") or {}
+    count = int(usage.get("completion_tokens") or 0)
+    reason = str((result or {}).get("finish_reason") or "").lower()
+    return reason in {"length", "max_tokens"} or (count and count >= int(max_tokens) * 0.98)
+
+
+def _model_call_profile(stage, result, max_tokens, context_window_tokens, chunk_index=None):
+    usage = (result or {}).get("usage") or {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    context_tokens = prompt_tokens + completion_tokens
+    timing = (result or {}).get("timing") or {}
+    prefill_seconds = float(timing.get("prefill_seconds") or 0)
+    decode_seconds = float(timing.get("decode_seconds") or 0)
+    return {
+        "stage": stage,
+        "chunk_index": chunk_index,
+        "usage": usage,
+        "context_tokens": context_tokens,
+        "context_window_tokens": int(context_window_tokens),
+        "context_occupancy": round(context_tokens / float(max(1, context_window_tokens)), 6),
+        "finish_reason": (result or {}).get("finish_reason"),
+        "output_truncated": _is_output_truncated(result, max_tokens),
+        "timing": timing,
+        "prefill_tokens_per_second": round(prompt_tokens / prefill_seconds, 3) if prefill_seconds else None,
+        "decode_tokens_per_second": round(completion_tokens / decode_seconds, 3) if decode_seconds else None,
+    }
+
+
+def _p95(values):
+    ordered = sorted(float(value) for value in values if value is not None)
+    if not ordered:
+        return None
+    position = 0.95 * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _attach_call_statistics(coverage):
+    calls = coverage.get("model_calls") or []
+    coverage["context_p95_tokens"] = round(_p95(item.get("context_tokens") for item in calls) or 0, 3)
+    coverage["context_occupancy_p95"] = round(_p95(item.get("context_occupancy") for item in calls) or 0, 6)
+    coverage["model_call_count"] = len(calls)
+    return coverage
 
 
 def _dedupe(values, limit=40):
@@ -69,6 +151,28 @@ def _compact_chunk_result(item):
     return compact
 
 
+def _fit_reduce_items(items, budget_chars=36000):
+    """Keep a trace from every map chunk while bounding the final prompt."""
+    compact = [_compact_chunk_result(item) for item in items]
+    if len(json.dumps(compact, ensure_ascii=False)) <= budget_chars:
+        return compact
+    per_item = max(280, int(budget_chars / max(1, len(compact))))
+    fitted = []
+    for item in compact:
+        summary_budget = max(120, int(per_item * 0.48))
+        fact_budget = max(60, int(per_item * 0.18))
+        fitted.append({
+            "chunk_index": item.get("chunk_index"),
+            "range": item.get("range"),
+            "section_summary": str(item.get("section_summary") or "")[:summary_budget],
+            "key_facts": [str(value)[:fact_budget] for value in item.get("key_facts", [])[:2]],
+            "conclusions": [str(value)[:fact_budget] for value in item.get("conclusions", [])[:1]],
+            "limitations": [str(value)[:fact_budget] for value in item.get("limitations", [])[:1]],
+            "error": str(item.get("error") or "")[:fact_budget] or None,
+        })
+    return fitted
+
+
 def _local_merge(node_path, chunks, chunk_results, warnings):
     facts = []
     sections = []
@@ -111,7 +215,9 @@ def _local_merge(node_path, chunks, chunk_results, warnings):
     }
 
 
-def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, unified_document=None):
+def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
+                     unified_document=None, preferred_chunk_chars=42000,
+                     context_window_tokens=65536):
     if unified_document:
         raw_text = unified_document.get("text", "")
         unified_coverage = dict(unified_document.get("coverage", {}))
@@ -133,17 +239,12 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
         raise ValueError("未能从该文件提取正文。{}".format("；".join(extracted["warnings"])))
 
     text = extracted["text"]
-    # Use map-reduce only when the document is genuinely long. Shared Ollama
-    # requests are especially sensitive to unnecessary chunk/merge calls.
-    if len(text) <= 50000:
-        effective_chunks = 1
-    elif len(text) <= 180000:
-        effective_chunks = min(max_chunks, 4)
-    elif len(text) <= 600000:
-        effective_chunks = min(max_chunks, 6)
-    else:
-        effective_chunks = min(max_chunks, 10)
-    chunks = _split_text(text, max_chunks=effective_chunks)
+    chunks = _split_text(
+        text,
+        max_chunks=max_chunks,
+        preferred_chars=preferred_chunk_chars,
+        max_input_tokens=max(4000, int(preferred_chunk_chars / 3.5)),
+    )
     coverage = {
         "parser": extracted["parser"],
         "extracted_chars": extracted["char_count"],
@@ -151,6 +252,11 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
         "local_limit_truncated": extracted["truncated"],
         "metadata": extracted["metadata"],
         "warnings": extracted["warnings"],
+        "complete_text_chars": len(text),
+        "estimated_input_tokens": sum(item["estimated_input_tokens"] for item in chunks),
+        "chunk_soft_limit": max_chunks,
+        "chunk_soft_limit_exceeded": len(chunks) > max_chunks,
+        "chunking_strategy": "token-budgeted-structure-aware-with-overlap",
     }
     if len(chunks) <= 1:
         prompt = """请完整分析以下文档正文。正文已全部放在本请求中。
@@ -169,7 +275,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
         result = llm.chat_json(
             "你是严谨的全文文献分析助手，需要覆盖研究问题、方法、主要论点、结论和局限。",
             prompt,
-            max_tokens=2600,
+            max_tokens=3200,
             strict=True,
             retries=1,
             timeout=150,
@@ -177,6 +283,12 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
             output_context="全文文档分析",
         )
         summary = result["json"]
+        coverage["model_calls"] = [_model_call_profile(
+            "full_document_analysis", result, 3200, context_window_tokens, 1,
+        )]
+        if coverage["model_calls"][0]["output_truncated"]:
+            coverage["warnings"].append("全文分析输出达到模型预算上限，结论可能不完整，建议继续生成或缩小分析范围。")
+        _attach_call_statistics(coverage)
         if unified_document:
             summary["evidence_chain"] = select_evidence(
                 unified_document.get("evidence", []),
@@ -196,7 +308,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
         result = llm.chat_json(
             "你正在进行全文分块阅读。不要猜测其他块内容，只提取当前块的事实和论证。",
             prompt,
-            max_tokens=1100,
+            max_tokens=1800,
             strict=True,
             retries=1,
             timeout=150,
@@ -206,7 +318,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
         data = result["json"]
         data["chunk_index"] = chunk["index"]
         data["range"] = "{}-{}".format(chunk["start"], chunk["end"])
-        return data
+        return data, result
 
     results = {}
     with ThreadPoolExecutor(max_workers=min(getattr(llm, "max_concurrency", 1), len(chunks))) as executor:
@@ -214,12 +326,22 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
         for future in as_completed(futures):
             chunk = futures[future]
             try:
-                results[chunk["index"]] = future.result()
+                data, call_result = future.result()
+                data["model_call"] = _model_call_profile(
+                    "document_chunk_analysis", call_result, 1800,
+                    context_window_tokens, chunk["index"],
+                )
+                if data["model_call"]["output_truncated"]:
+                    data.setdefault("limitations", []).append("本块输出达到模型预算上限，已标记为可能不完整。")
+                results[chunk["index"]] = data
             except Exception as exc:
                 results[chunk["index"]] = _chunk_fallback(chunk, exc)
     ordered = [results[index] for index in sorted(results)]
+    coverage["model_calls"] = [item["model_call"] for item in ordered if item.get("model_call")]
 
-    compact_chunks = [_compact_chunk_result(item) for item in ordered]
+    compact_chunks = _fit_reduce_items(ordered)
+    coverage["reduce_input_chars"] = len(json.dumps(compact_chunks, ensure_ascii=False))
+    coverage["reduce_preserved_chunk_count"] = len(compact_chunks)
     merge_prompt = """你已获得文档“{path}”全部 {count} 个连续正文块的压缩分析结果。请合并成全文级结论，不能遗漏后半部分，也不要把分块处理说成原文不完整。
 解析元数据：{metadata}
 各块分析（每块的事实、论点、方法和结论均已限量保留）：{chunks}
@@ -237,7 +359,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
         final_result = llm.chat_json(
             "你是全文文献综合分析助手。必须综合所有分块，区分作者结论、事实和局限。",
             merge_prompt,
-            max_tokens=2200,
+            max_tokens=3200,
             strict=True,
             retries=1,
             timeout=180,
@@ -248,6 +370,14 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=12, uni
     except LocalModelError as exc:
         summary = _local_merge(node_path, chunks, ordered, extracted["warnings"] + ["最终本地模型汇总失败：{}".format(exc)])
         final_result = {"model": None, "usage": {}, "content": ""}
+
+    reduce_call = _model_call_profile(
+        "document_chunk_reduce", final_result, 3200, context_window_tokens,
+    )
+    coverage["model_calls"].append(reduce_call)
+    if reduce_call["output_truncated"]:
+        coverage["warnings"].append("全文汇总输出达到模型预算上限，已标记为可能不完整。")
+    _attach_call_statistics(coverage)
 
     failed_chunks = [item["chunk_index"] for item in ordered if item.get("error")]
     coverage["failed_chunks"] = failed_chunks

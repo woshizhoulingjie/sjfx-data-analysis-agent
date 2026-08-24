@@ -22,6 +22,7 @@ const state = {
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running', 'cancelling']);
 const TASK_REGISTRY_KEY = 'sjfx_task_registry_v1';
 const CURRENT_SCAN_KEY = 'sjfx_current_scan_id_v1';
+const SELECTIONS_KEY_PREFIX = 'sjfx_export_selections_v1:';
 
 const $ = (id) => document.getElementById(id);
 
@@ -207,6 +208,35 @@ function updateSelectionCart() {
     cart.innerHTML = `<strong>已勾选 ${values.length} 个节点</strong> · 组合导出将按源文件去重<br><small>${escapeHtml(values.slice(0, 5).map(x => x.name || x.path).join('、'))}${values.length > 5 ? '…' : ''}</small>`;
   }
   $('exportBtn').disabled = !state.scan || (!values.length && !canExportNode(state.selected));
+  persistNodeSelections();
+}
+
+
+function persistNodeSelections() {
+  const scanId = state.scan?.scan_id;
+  if (!scanId) return;
+  try {
+    window.localStorage.setItem(
+      `${SELECTIONS_KEY_PREFIX}${scanId}`,
+      JSON.stringify([...state.selectedNodes.values()])
+    );
+  } catch (_) {
+    // Selection remains usable for this browser session.
+  }
+}
+
+
+function restoreNodeSelections(scanId) {
+  try {
+    const values = JSON.parse(window.localStorage.getItem(`${SELECTIONS_KEY_PREFIX}${scanId}`) || '[]');
+    state.selectedNodes = new Map(
+      (Array.isArray(values) ? values : [])
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => [exportSelectionKey(item), item])
+    );
+  } catch (_) {
+    state.selectedNodes = new Map();
+  }
 }
 
 
@@ -309,10 +339,15 @@ async function openSplitDialog(node) {
   const expectedMembers = Number(node.member_count ?? node.file_count ?? (node.member_paths || []).length);
   if (state.scan && expectedMembers > files.length) {
     try {
-      const data = await api(
-        `/api/analysis-node-members/${state.scan.scan_id}?node_id=${encodeURIComponent(node.node_id)}&limit=500`
-      );
-      files = data.members || [];
+      files = [];
+      let offset = 0;
+      do {
+        const data = await api(
+          `/api/analysis-node-members/${state.scan.scan_id}?node_id=${encodeURIComponent(node.node_id)}&offset=${offset}&limit=500`
+        );
+        files.push(...(data.members || []));
+        offset = data.page?.next_offset;
+      } while (offset != null);
     } catch (error) {
       toast(error.message || '无法加载主题完整成员，已阻止不完整拆分', true);
       return;
@@ -1821,6 +1856,7 @@ async function refreshScan(scanId = state.scan?.scan_id) {
   state.scan =
     data.scan;
   rememberCurrentScan(state.scan?.scan_id || scanId);
+  restoreNodeSelections(state.scan?.scan_id || scanId);
 
   state.analysis =
     data.analysis;
@@ -2449,7 +2485,10 @@ async function pollJob(jobId) {
           `<strong>待整编数据包已生成</strong>`
           + `<p>已合并 ${escapeHtml(result.selection_count || 0)} 个选择，去重后包含 ${escapeHtml(result.source_file_count || 0)} 个源文件。</p>`
           + (result.download_url
-            ? `<p>${downloadLink(result.download_url, '下载待整编数据包')}</p>`
+            ? `<p>${downloadLink(result.download_url, result.segmented ? '下载分卷索引与校验清单' : '下载待整编数据包')}</p>`
+            : '')
+          + (result.volumes?.length
+            ? `<p><strong>共 ${escapeHtml(result.volumes.length)} 个独立 ZIP 分卷：</strong><br>${result.volumes.map((item) => downloadLink(item.download_url, `下载分卷 ${item.index}`)).join(' · ')}</p>`
             : '');
         toast('待整编数据包已生成，可下载。');
         state.jobId = null;

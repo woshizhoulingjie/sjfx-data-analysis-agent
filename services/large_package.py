@@ -7,6 +7,8 @@ optional statistics and never gate the content classification tree.
 """
 import hashlib
 import json
+import math
+from collections import Counter
 from pathlib import Path
 
 from services.scanner import human_size
@@ -66,6 +68,9 @@ def build_policy(scan, options=None):
         "inventory_files": file_count,
         "inventory_bytes": total_size,
         "inventory_size_human": human_size(total_size),
+        "checkpoint_resume": True,
+        "pause_behavior": "安全停止后保留逐文件检查点；再次启动同一扫描可续跑",
+        "deep_analysis_strategy": "首轮全量快速解析与索引，代表性概览；用户选择范围后准确解析和全文语义分析",
     }
 
 
@@ -343,6 +348,25 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         }
         content_parse_ratio = round(len(parsed) / float(len(selected) or 1), 6)
         deep_analysis_ratio = round(len(semantic_complete_paths) / float(len(selected) or 1), 6)
+        batch_size = max(1, int((policy or {}).get("batch_files") or 100))
+        remaining_batches = int(math.ceil((len(pending) + len(failed)) / float(batch_size)))
+        extension_inventory = Counter(
+            str(files[path].get("extension") or Path(path).suffix.lower() or "[无扩展名]")
+            for path in selected
+        )
+        extension_parsed = Counter(
+            str(files[path].get("extension") or Path(path).suffix.lower() or "[无扩展名]")
+            for path in parsed
+        )
+        format_coverage = []
+        for extension, count in sorted(extension_inventory.items(), key=lambda item: (-item[1], item[0])):
+            parsed_count = extension_parsed.get(extension, 0)
+            format_coverage.append({
+                "extension": extension,
+                "inventory_files": count,
+                "parsed_files": parsed_count,
+                "coverage_ratio": round(parsed_count / float(count or 1), 6),
+            })
         return {
             "mode": (policy or {}).get("mode", "standard"),
             "status": status,
@@ -393,8 +417,16 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "limitations": limitations,
             "pending_paths": sorted(pending)[:200],
             "failed_paths": sorted(failed)[:200],
+            "format_coverage": format_coverage,
+            "batch_progress": {
+                "batch_size": batch_size,
+                "estimated_remaining_batches": remaining_batches,
+                "checkpoint_resume": bool((policy or {}).get("checkpoint_resume", True)),
+                "eta_seconds": None,
+                "eta_note": "尚无稳定的同类文件吞吐基线，完成首个批次后再按格式估算 ETA。" if remaining_batches else "已无待处理批次。",
+            },
             "large_package_notice": (
-                "大数据包按有限批次持续处理，直到所有文件进入完成或失败状态。"
+                "大数据包按有限批次处理并逐文件保存检查点；可安全停止并续跑。首轮概览不等同于全文深度分析。"
                 if (policy or {}).get("enabled") else None
             ),
         }

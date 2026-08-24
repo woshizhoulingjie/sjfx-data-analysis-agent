@@ -1,5 +1,8 @@
 import json
+import math
+import re
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 from services.evidence import evidence_quality, select_evidence, verify_claim_evidence
@@ -63,7 +66,17 @@ def _cluster_evidence(cluster, analysis, topic, limit=8):
     ]
 
 
-def _direction_candidates(scan, analysis, limit=8):
+def _score01(value, default=0.0):
+    try:
+        number = float(value)
+        if number > 1:
+            number /= 100.0
+        return max(0.0, min(1.0, number))
+    except (TypeError, ValueError):
+        return default
+
+
+def _direction_candidates(scan, analysis, limit=5):
     """Rank explainable local directions before optional model wording.
 
     The model may improve prose later, but it cannot invent the candidate,
@@ -72,14 +85,36 @@ def _direction_candidates(scan, analysis, limit=8):
     statistics = analysis.get("statistics", {})
     parsed = max(1, int(statistics.get("parsed_files") or 0))
     coverage = analysis.get("coverage") or {}
-    clusters = analysis.get("research_topic_clusters") or analysis.get("topic_clusters") or []
+    document_index = _document_index(analysis)
+    clusters = (
+        analysis.get("semantic_topic_clusters")
+        or analysis.get("research_topic_clusters")
+        or analysis.get("topic_clusters")
+        or []
+    )
+    task_relevance = _score01(
+        ((analysis.get("value_judgment") or {}).get("task_relevance") or {}).get("score"),
+        0.5,
+    )
+    technical_terms = {
+        "漏洞", "攻击", "恶意", "威胁", "利用", "检测", "响应", "溯源", "认证", "加密",
+        "vulnerability", "exploit", "attack", "malware", "threat", "detection", "cve", "cvss",
+    }
+    anomaly_terms = {"异常", "突增", "冲突", "失效", "失败", "高危", "critical", "anomaly", "outlier"}
     directions = []
     for cluster in clusters:
         topic = str(cluster.get("topic") or cluster.get("name") or "").strip()
-        members = list(dict.fromkeys(cluster.get("members") or []))
+        members = [
+            path for path in dict.fromkeys(cluster.get("members") or [])
+            if path not in document_index or (
+                (document_index.get(path, {}).get("classification") or {}).get("document_role")
+                not in {"要求与说明材料", "派生概览材料"}
+            )
+        ]
         if not topic or not members:
             continue
-        evidence = _cluster_evidence(cluster, analysis, topic)
+        scoped_cluster = dict(cluster, members=members)
+        evidence = _cluster_evidence(scoped_cluster, analysis, topic)
         evidence_count = len(evidence)
         if not evidence:
             # An evidence-free classification may remain visible in the
@@ -90,17 +125,57 @@ def _direction_candidates(scan, analysis, limit=8):
             for item in evidence
             if item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path")
         })
-        concentration = min(1.0, len(members) / float(parsed))
-        unique_signal = min(1.0, len(set(members)) / float(len(members) or 1))
-        evidence_signal = min(1.0, evidence_count / 6.0)
-        score = round(100 * (0.35 * min(1.0, concentration * 3) + 0.25 * evidence_signal + 0.20 * unique_signal + 0.20 * float(coverage.get("parsed_file_ratio") or 0)), 1)
+        member_documents = [document_index[path] for path in members if path in document_index]
+        member_text = " ".join(
+            " ".join(str(value) for value in (
+                list((item.get("classification") or {}).get("topic_memberships") or [])
+                + list((item.get("structure") or {}).get("headings") or [])[:5]
+            ))
+            for item in member_documents
+        ).lower()
+        formats = {
+            (item.get("source") or {}).get("extension")
+            for item in member_documents if (item.get("source") or {}).get("extension")
+        }
+        modified_values = []
+        for item in member_documents:
+            raw = str((item.get("source") or {}).get("modified_at") or "")
+            try:
+                modified_values.append(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+            except ValueError:
+                continue
+        newest = max(modified_values) if modified_values else None
+        if newest and newest.tzinfo is None:
+            newest = newest.replace(tzinfo=timezone.utc)
+        age_days = max(0, (datetime.now(timezone.utc) - newest).days) if newest else None
+
+        dimensions = {
+            "scale": min(1.0, math.log1p(len(members)) / math.log1p(max(2, parsed))),
+            "concentration": _score01(cluster.get("mean_similarity"), min(1.0, len(members) / float(parsed))),
+            "information_richness": min(1.0, evidence_count / 6.0),
+            "independent_sources": min(1.0, independent_sources / 4.0),
+            "recency": (max(0.0, 1.0 - age_days / 1095.0) if age_days is not None else 0.35),
+            "anomaly_signal": min(1.0, sum(member_text.count(term) for term in anomaly_terms) / 6.0),
+            "technical_impact": min(1.0, sum(member_text.count(term) for term in technical_terms) / 10.0),
+            "reportability": min(1.0, 0.45 * min(1.0, evidence_count / 4.0) + 0.35 * min(1.0, independent_sources / 3.0) + 0.20 * min(1.0, len(formats) / 3.0)),
+            "novelty": min(1.0, 0.55 * (1.0 - len(members) / float(parsed)) + 0.45 * (max(0.0, 1.0 - age_days / 1095.0) if age_days is not None else 0.35)),
+            "user_relevance": task_relevance,
+        }
+        weights = {
+            "scale": 0.12, "concentration": 0.10, "information_richness": 0.15,
+            "independent_sources": 0.12, "recency": 0.08, "anomaly_signal": 0.08,
+            "technical_impact": 0.12, "reportability": 0.10, "novelty": 0.07,
+            "user_relevance": 0.06,
+        }
+        score = round(100 * sum(dimensions[key] * weight for key, weight in weights.items()), 1)
         if score >= 70 and evidence_count >= 3 and independent_sources >= 2:
             priority = "高"
         elif score >= 45:
             priority = "中"
         else:
             priority = "低"
-        confidence = "高" if evidence_count >= 3 and independent_sources >= 2 and coverage.get("complete_analysis") else "中"
+        confidence_score = min(1.0, 0.45 * dimensions["information_richness"] + 0.35 * dimensions["independent_sources"] + 0.20 * _score01(coverage.get("parsed_file_ratio")))
+        confidence = "高" if confidence_score >= 0.78 else ("中" if confidence_score >= 0.42 else "低")
         limitations = list(coverage.get("limitations") or [])
         if not evidence:
             limitations.append("当前主题没有达到正文证据门槛，不能据此形成可靠结论。")
@@ -112,14 +187,17 @@ def _direction_candidates(scan, analysis, limit=8):
             "score": score,
             "score_breakdown": {
                 "document_count": len(members),
-                "topic_concentration": round(concentration, 6),
+                "topic_concentration": round(dimensions["concentration"], 6),
                 "evidence_count": evidence_count,
                 "independent_source_count": independent_sources,
-                "unique_signal": round(unique_signal, 6),
+                "dimensions": {key: round(value, 6) for key, value in dimensions.items()},
+                "weights": weights,
                 "coverage_ratio": coverage.get("parsed_file_ratio"),
+                "newest_source_modified_at": newest.isoformat() if newest else None,
+                "recency_basis": "源文件修改时间，仅作时效代理，不等同于资料形成时间",
             },
-            "rationale": "该方向包含 {} 个已解析成员，形成 {} 条符合正文质量门槛的证据；主题集中度为 {:.1%}。".format(len(members), evidence_count, concentration),
-            "basis": "优先级由成员数量、主题集中度、独特内容信号、证据数量和当前覆盖率共同计算；属于本地分析推论。",
+            "rationale": "该方向包含 {} 个已解析成员、{} 条合格证据和 {} 个独立来源；综合规模、集中度、丰富度、时效、异常、技术影响、可成稿性、新颖性与任务相关性后得分 {:.1f}。".format(len(members), evidence_count, independent_sources, score),
+            "basis": "优先级由十维可解释评分计算；所有正文判断均回链到证据，时效仅以源文件修改时间为代理。",
             "research_questions": [
                 "该方向的代表性文档之间有哪些共同结论和差异？",
                 "该方向的关键结论能否由多个独立来源直接支撑？",
@@ -130,9 +208,21 @@ def _direction_candidates(scan, analysis, limit=8):
             "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
             "limitations": list(dict.fromkeys(limitations)),
             "confidence": confidence,
+            "confidence_score": round(confidence_score, 3),
         })
     directions.sort(key=lambda item: (-float(item.get("score") or 0), item.get("title") or ""))
-    return directions[:max(1, limit)]
+    deduplicated = []
+    seen_titles = set()
+    for item in directions:
+        key = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", item.get("title", "").lower())
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        item["rank"] = len(deduplicated) + 1
+        deduplicated.append(item)
+        if len(deduplicated) >= max(1, min(5, limit)):
+            break
+    return deduplicated
 
 
 def _research_direction(_scan, _summaries, analysis):
@@ -199,6 +289,7 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
 2. “推荐研究方向”和“深入方向”都是推论，必须列出支撑它的 evidence_ids。证据不足时明确写出不足，不得强行给高置信度。
 3. 优先发现资料之间的共同主题、分歧、版本关系、证据缺口、可验证问题及合适的研究方法。
 4. 本地分类是确定性结构，不能重写或新增分类。
+5. 推荐方向必须使用本地十维评分候选的第 1 名；你只能改善理由、研究问题和方法，不能改名、换序或另造方向。
 
 输出一个合法 JSON 对象：
 {{
@@ -224,6 +315,7 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
 
 扫描统计：{scan}
 本地内容分类：{categories}
+本地十维评分候选（排序不可更改）：{candidates}
 已有节点摘要：{summaries}
 证据目录：{evidence}""".format(
         scan=json.dumps({
@@ -235,6 +327,12 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
             "read_errors": len(scan.get("errors", [])),
         }, ensure_ascii=False),
         categories=json.dumps(categories, ensure_ascii=False),
+        candidates=json.dumps([{
+            "rank": item.get("rank"), "title": item.get("title"),
+            "score": item.get("score"), "priority": item.get("priority"),
+            "confidence": item.get("confidence"), "score_breakdown": item.get("score_breakdown"),
+            "evidence_ids": item.get("evidence_ids", []),
+        } for item in local_report.get("direction_candidates", [])[:5]], ensure_ascii=False),
         summaries=json.dumps(summaries_context, ensure_ascii=False),
         evidence=json.dumps(catalog, ensure_ascii=False),
     )
@@ -392,6 +490,7 @@ def _category_payload(node, analysis, document_index, scan_files):
             "classified",
         ),
         "file_count": len(paths),
+        "member_paths": paths,
         "parsed_file_count": parsed_count,
         "unparsed_file_count": len(paths) - parsed_count,
         "total_size": total_size,
@@ -505,10 +604,20 @@ def build_local_report(scan, summaries, analysis=None):
         classification_source = "root_fallback"
     parsed_file_count = stats.get("parsed_files", 0)
     scanned_file_count = scan.get("file_count", 0)
-    classified_file_count = sum(
-        item.get("file_count", 0)
-        for item in categories
-        if item.get("classification_status") == "classified"
+    classified_paths = set()
+    for item in categories:
+        if item.get("classification_status") == "classified":
+            classified_paths.update(item.get("member_paths") or [])
+    # Older stored analyses may not expose member_paths. Their sum is still
+    # bounded by the physical inventory so reports can never claim >100%.
+    classified_file_count = (
+        len(classified_paths)
+        if classified_paths
+        else min(scanned_file_count, sum(
+            int(item.get("file_count") or 0)
+            for item in categories
+            if item.get("classification_status") == "classified"
+        ))
     )
     unclassified_file_count = max(0, scanned_file_count - classified_file_count)
     classification_coverage = {
@@ -518,6 +627,7 @@ def build_local_report(scan, summaries, analysis=None):
         "classified_file_count": classified_file_count,
         "unclassified_file_count": unclassified_file_count,
         "parsed_file_count": parsed_file_count,
+        "scanned_file_count": scanned_file_count,
         "coverage_ratio": round(classified_file_count / float(scanned_file_count or 1), 6),
         "complete": classified_file_count == scanned_file_count,
     }
@@ -549,8 +659,36 @@ def build_local_report(scan, summaries, analysis=None):
     if classification_source != "adaptive_analysis_tree":
         findings.append("自适应内容分类未完成，报告已降级为单一扫描清单类别；未按目录或文件逐项展开，避免产生误导性海量类别。")
 
-    direction = _research_direction(scan, summaries, analysis)
+    direction_candidates = _direction_candidates(scan, analysis)
+    direction = direction_candidates[0] if direction_candidates else _research_direction(scan, summaries, analysis)
     dimensions = analysis.get("classification_dimensions", [])
+    structured = analysis.get("structured_data_overview") or stats.get("structured_data") or {}
+    intelligence_overview = {
+        "schema_version": "intelligence-overview/1.0",
+        "temporal": {
+            "source_modified_time_range": _time_range(analysis),
+            "document_content_time_range": None,
+            "limitation": "源文件修改时间与正文事件时间分开记录；当前没有可靠正文时间字段时不做替代推断。",
+        },
+        "entities": structured.get("entity_statistics") or {},
+        "structured_anomaly_questions": list(structured.get("recommendation_questions") or [])[:12],
+        "version_and_duplicates": {
+            "exact_duplicate_groups": stats.get("exact_duplicate_groups", 0),
+            "exact_duplicate_files": stats.get("exact_duplicate_files", 0),
+            "similar_document_clusters": stats.get("similar_document_clusters", 0),
+            "note": "精确重复可视为同内容副本；高相似簇仅是版本/关联候选，需人工核验后才能认定版本关系。",
+        },
+        "ocr_and_parse_quality": {
+            "office_embedded_image_ocr_files": stats.get("office_embedded_image_ocr_files", 0),
+            "truncated_text_files": stats.get("truncated_text_files", 0),
+            "failed_files": stats.get("failed_files", 0),
+            "structured_average_quality_score": stats.get("structured_average_quality_score"),
+        },
+        "incremental_reuse": {
+            "reused_parse_checkpoints": stats.get("reused_parse_checkpoints", 0),
+            "newly_processed_files": stats.get("newly_processed_files", stats.get("parsed_files", 0)),
+        },
+    }
     return {
         "schema_version": 5,
         "title": "数据包情况概览报告",
@@ -581,26 +719,28 @@ def build_local_report(scan, summaries, analysis=None):
         ],
         "coverage": coverage,
         "value_judgment": value_judgment,
+        "intelligence_overview": intelligence_overview,
         "global_categories": categories,
         "classification_coverage": classification_coverage,
         "key_findings": findings,
         "recommended_research_direction": direction,
         "directions": [{
-            "direction": direction["title"],
+            "direction": candidate["title"],
             "type": "推论",
-            "question": (direction.get("research_questions") or [None])[0],
-            "value": direction.get("rationale"),
-            "answer": direction.get("rationale"),
-            "confidence": direction["confidence"],
-            "priority": direction.get("priority"),
-            "representative_documents": direction.get("representative_documents", []),
-            "evidence_ids": direction.get("evidence_ids", []),
-            "evidence_chain": direction["evidence_chain"],
-            "basis": direction.get("basis") or direction["rationale"],
-            "limitations": direction.get("limitations", []),
+            "question": (candidate.get("research_questions") or [None])[0],
+            "value": candidate.get("rationale"),
+            "answer": candidate.get("rationale"),
+            "confidence": candidate["confidence"],
+            "priority": candidate.get("priority"),
+            "score": candidate.get("score"),
+            "representative_documents": candidate.get("representative_documents", []),
+            "evidence_ids": candidate.get("evidence_ids", []),
+            "evidence_chain": candidate["evidence_chain"],
+            "basis": candidate.get("basis") or candidate["rationale"],
+            "limitations": candidate.get("limitations", []),
             "confidence_note": "置信度由跨文档主题覆盖与可引用证据数量决定；建议在正式研究前复核代表文档原文。",
-        }],
-        "direction_candidates": _direction_candidates(scan, analysis),
+        } for candidate in direction_candidates[1:5]],
+        "direction_candidates": direction_candidates,
         "analysis_method": {
             "parse": "Docling 统一文档模型；图片和扫描 PDF 使用 RapidOCR；失败项显式降级",
             "deduplication": "SHA-256 规范文档投影；主题、检索、证据独立来源和价值评分排除精确重复副本，原始路径仍完整保留",
@@ -640,12 +780,20 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
     # Free-form model findings without evidence ids must never replace the
     # deterministic local overview.  Directions are validated below.
     evidence_catalog = evidence_catalog or []
-    fallback_evidence = local_report.get("recommended_research_direction", {}).get("evidence_chain", [])
+    local_primary = dict(local_report.get("recommended_research_direction") or {})
+    fallback_evidence = local_primary.get("evidence_chain", [])
     recommendation = model_report.get("recommended_research_direction")
     if isinstance(recommendation, dict) and recommendation.get("title"):
         # The local model may improve language and questions, but it must not erase
         # locally generated traceability or the inference label.
         recommendation = dict(recommendation)
+        recommendation["model_proposed_title"] = recommendation.get("title")
+        # Ranking and scope are deterministic. The model may improve wording
+        # and questions, but cannot replace the top-ranked local candidate.
+        recommendation["title"] = local_primary.get("title") or recommendation.get("title")
+        for key in ("direction", "rank", "score", "score_breakdown", "priority", "confidence_score", "representative_documents"):
+            if key in local_primary:
+                recommendation[key] = local_primary[key]
         recommendation["type"] = "推论"
         selected_ids = [str(value) for value in recommendation.get("evidence_ids", [])]
         recommendation["evidence_chain"] = _model_evidence_chain(
@@ -698,7 +846,7 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
             if direction["evidence_status"] == "supported":
                 validated_directions.append(direction)
     if validated_directions:
-        merged["directions"] = validated_directions
+        merged["model_suggested_directions"] = validated_directions
     merged["generation_mode"] = "model_analyzed"
     return merged
 

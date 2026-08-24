@@ -299,7 +299,8 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 member_paths=None, node_name=None, node_id=None, selection_metadata=None,
                 selected_evidence_ids=None, inventory_metadata=None, file_states=None,
                 progress_callback=None, cancel_check=None, content_deduplication=True,
-                known_hashes=None, disk_reserve_bytes=1024 * 1024 * 1024):
+                known_hashes=None, disk_reserve_bytes=1024 * 1024 * 1024,
+                _allow_segmented=True):
     root = Path(root).resolve()
     selected = Path(selected).resolve()
     documents = documents or []
@@ -367,8 +368,8 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
     except (OSError, PermissionError) as exc:
         raise ValueError("导出前无法读取源文件：{}".format(exc))
     total_size = sum(item["size"] for item in source_stats.values())
-    if total_size > max_bytes:
-        raise ValueError("导出内容为 {:.2f} GB，超过 {:.2f} GB 上限".format(total_size / 1073741824, max_bytes / 1073741824))
+    if total_size > max_bytes and not _allow_segmented:
+        raise ValueError("单个分卷内容超过 {:.2f} GB 上限".format(max_bytes / 1073741824))
     try:
         free_bytes = int(shutil.disk_usage(str(output_dir)).free)
     except OSError as exc:
@@ -380,6 +381,74 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 required_bytes / 1073741824, free_bytes / 1073741824,
             )
         )
+    if total_size > max_bytes:
+        volumes = []
+        current = []
+        current_size = 0
+        for path in sorted(files, key=lambda item: str(item.relative_to(root)).replace("\\", "/")):
+            size = source_stats[path]["size"]
+            if size > max_bytes:
+                raise ValueError("单文件 {} 为 {:.2f} GB，超过单卷上限，无法安全分卷".format(path.name, size / 1073741824))
+            if current and current_size + size > max_bytes:
+                volumes.append(current)
+                current = []
+                current_size = 0
+            current.append(path)
+            current_size += size
+        if current:
+            volumes.append(current)
+
+        generated_parts = []
+        completed_files = 0
+        for index, volume in enumerate(volumes, 1):
+            if cancel_check:
+                cancel_check()
+            relative_paths = [str(path.relative_to(root)).replace("\\", "/") for path in volume]
+            part_path = export_node(
+                root, selected, summary, output_dir, max_bytes,
+                analysis=analysis, documents=documents, task_topic=task_topic,
+                member_paths=relative_paths,
+                node_name="{}_分卷{:03d}".format(export_label, index),
+                node_id="{}-part-{:03d}".format(node_id or safe_name(export_label), index),
+                selection_metadata=selection_metadata,
+                selected_evidence_ids=selected_evidence_ids,
+                inventory_metadata=inventory_metadata, file_states=file_states,
+                progress_callback=None, cancel_check=cancel_check,
+                content_deduplication=content_deduplication,
+                known_hashes=known_hashes, disk_reserve_bytes=disk_reserve_bytes,
+                _allow_segmented=False,
+            )
+            generated_parts.append({
+                "index": index, "file_name": part_path.name,
+                "size": part_path.stat().st_size, "sha256": _sha256_file(part_path),
+                "source_file_count": len(volume), "source_paths": relative_paths,
+            })
+            completed_files += len(volume)
+            if progress_callback:
+                progress_callback(completed_files, len(files), sum(item["size"] for item in generated_parts), total_size)
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        index_path = Path(output_dir) / "待整编数据包_{}_{}_{}_分卷索引.zip".format(
+            safe_name(export_label), stamp, uuid.uuid4().hex[:8]
+        )
+        manifest = {
+            "schema_version": "segmented-export/1.0",
+            "task_topic": str(task_topic or ""),
+            "source_total_bytes": total_size,
+            "source_file_count": len(files),
+            "volume_limit_bytes": max_bytes,
+            "volume_count": len(generated_parts),
+            "parts": generated_parts,
+            "instructions": "逐个下载所有分卷；每个分卷都是可独立打开的 ZIP，分卷清单中的 SHA-256 用于完整性核验。",
+        }
+        with _atomic_zip(index_path.with_name(index_path.name + ".part"), index_path) as archive:
+            archive.writestr("分卷清单.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            archive.writestr("README.txt", manifest["instructions"])
+        sidecar = index_path.with_name(index_path.name + ".parts.json")
+        sidecar.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        if os.name != "nt":
+            sidecar.chmod(0o600)
+        return index_path
     expected_hashes = {}
     content_duplicates = []
     if content_deduplication:
@@ -685,6 +754,25 @@ def create_report_docx(report, scan, output_path):
                     style="List Bullet",
                 )
 
+    def add_table(headers, rows, widths=None):
+        table = doc.add_table(rows=1, cols=len(headers))
+        table.style = "Table Grid"
+        table.autofit = True
+        for index, value in enumerate(headers):
+            cell = table.rows[0].cells[index]
+            cell.text = xml_safe_text(value)
+            for run in cell.paragraphs[0].runs:
+                set_font(run, size=9, bold=True, color=(31, 77, 120))
+        for values in rows:
+            cells = table.add_row().cells
+            for index, value in enumerate(values):
+                cells[index].text = xml_safe_text(value)
+                for paragraph in cells[index].paragraphs:
+                    for run in paragraph.runs:
+                        set_font(run, size=8.5)
+        doc.add_paragraph().paragraph_format.space_after = Pt(1)
+        return table
+
     doc = Document()
     section = doc.sections[0]
     section.page_width = Inches(8.5)
@@ -743,11 +831,21 @@ def create_report_docx(report, scan, output_path):
         value_run = add_run(paragraph, value)
         set_font(value_run, size=10.5)
 
+    doc.add_page_break()
     add_heading("一、数据包基本信息", level=1)
     add_items(report.get("basic_information"))
     coverage = report.get("coverage") or {}
     if coverage:
         add_heading("覆盖等级与限制", level=2)
+        add_table(
+            ["指标", "已完成", "总量", "占比/状态"],
+            [
+                ["目录清点", coverage.get("scanned_files", 0), coverage.get("inventory_files", 0), "完整" if (coverage.get("inventory_coverage") or {}).get("complete") else "存在限制"],
+                ["内容解析", coverage.get("parsed_files", 0), coverage.get("inventory_files", 0), "{:.1%}".format(float(coverage.get("content_parse_ratio") or 0))],
+                ["全文深度分析", coverage.get("deep_analyzed_files", 0), coverage.get("inventory_files", 0), "{:.1%}".format(float(coverage.get("deep_analysis_ratio") or 0))],
+                ["失败/待处理", coverage.get("failed_files", 0), coverage.get("pending_files", 0), coverage.get("status", "待分析")],
+            ],
+        )
         add_paragraph(
             "{}（{}）：已解析 {}/{} 个文件；抽样 {} 个；待处理 {} 个；失败 {} 个。".format(
                 coverage.get("coverage_level_label", "覆盖等级未标注"),
@@ -795,6 +893,30 @@ def create_report_docx(report, scan, output_path):
             )
         )
         add_items(judgment.get("limitations"), empty_text="当前没有额外价值判断限制。")
+    intelligence = report.get("intelligence_overview") or {}
+    if intelligence:
+        add_heading("情报概览指标", level=2)
+        temporal = intelligence.get("temporal") or {}
+        versions = intelligence.get("version_and_duplicates") or {}
+        quality = intelligence.get("ocr_and_parse_quality") or {}
+        reuse = intelligence.get("incremental_reuse") or {}
+        add_table(
+            ["维度", "结果", "边界说明"],
+            [
+                ["来源时间", temporal.get("source_modified_time_range", "未知"), temporal.get("limitation", "")],
+                ["重复/近似版本", "精确组 {}；重复文件 {}；相似簇 {}".format(versions.get("exact_duplicate_groups", 0), versions.get("exact_duplicate_files", 0), versions.get("similar_document_clusters", 0)), versions.get("note", "")],
+                ["OCR/解析质量", "Office 图片 OCR {}；截断 {}；失败 {}".format(quality.get("office_embedded_image_ocr_files", 0), quality.get("truncated_text_files", 0), quality.get("failed_files", 0)), "结构化质量分 {}".format(quality.get("structured_average_quality_score", "—"))],
+                ["增量复用", "复用检查点 {}；本轮处理 {}".format(reuse.get("reused_parse_checkpoints", 0), reuse.get("newly_processed_files", 0)), "配置与源文件指纹一致时复用"],
+            ],
+        )
+        entities = intelligence.get("entities") or {}
+        if entities:
+            add_paragraph("实体概览：{}。".format("；".join(
+                "{} 已观察 {} 个不同值".format(name, (item or {}).get("observed_distinct_count", 0))
+                for name, item in entities.items()
+            )))
+        add_items(intelligence.get("structured_anomaly_questions"), empty_text="当前结构化数据未形成可靠异常核查问题。")
+    doc.add_page_break()
     add_heading("二、全局分类", level=1)
     categories = report.get("global_categories") or []
     classification_coverage = report.get("classification_coverage", {})
@@ -809,13 +931,19 @@ def create_report_docx(report, scan, output_path):
                 source_label,
                 classification_coverage.get("top_level_category_count", 0),
                 classification_coverage.get("classified_file_count", 0),
-                classification_coverage.get("parsed_file_count", 0),
+                classification_coverage.get("scanned_file_count", classification_coverage.get("parsed_file_count", 0)),
                 "完整" if classification_coverage.get("complete") else "需复核未归类或重复归类文件",
             )
         )
     if not categories:
         add_paragraph("暂无可用分类。")
-    for item in categories:
+    if categories:
+        add_table(
+            ["序号", "一级主题", "文件数", "已解析", "状态"],
+            [[index, item.get("name", "未命名分类"), item.get("file_count", 0), item.get("parsed_file_count", 0), item.get("classification_status", "classified")]
+             for index, item in enumerate(categories[:15], 1)],
+        )
+    for item in categories[:12]:
         if isinstance(item, dict):
             add_heading(
                 "{}（{}：{} 个文件）".format(
@@ -836,7 +964,7 @@ def create_report_docx(report, scan, output_path):
             if item.get("conclusion_evidence"):
                 add_paragraph("关键结论—证据链：")
                 add_conclusion_evidence(item["conclusion_evidence"])
-            for subcategory in item.get("subcategories", []):
+            for subcategory in item.get("subcategories", [])[:5]:
                 if not isinstance(subcategory, dict):
                     continue
                 add_heading(
@@ -876,9 +1004,21 @@ def create_report_docx(report, scan, output_path):
                     )
         else:
             add_paragraph(item, style="List Bullet")
+    if len(categories) > 12:
+        add_paragraph("其余 {} 个低规模类别已保留在系统交互目录和分类清单中，本概览不逐项展开。".format(len(categories) - 12))
+    doc.add_page_break()
     add_heading("三、关键发现", level=1)
     add_items(report.get("key_findings"))
 
+    candidates = report.get("direction_candidates") or []
+    if candidates:
+        add_heading("候选方向排序", level=2)
+        add_table(
+            ["排名", "候选方向", "综合分", "优先级", "置信度", "证据/独立来源"],
+            [[item.get("rank", index), item.get("title", "待命名"), item.get("score", 0), item.get("priority", "—"), item.get("confidence", "—"), "{}/{}".format((item.get("score_breakdown") or {}).get("evidence_count", 0), (item.get("score_breakdown") or {}).get("independent_source_count", 0))]
+             for index, item in enumerate(candidates[:5], 1)],
+        )
+    doc.add_page_break()
     add_heading("四、推荐研究方向", level=1)
     recommendation = report.get("recommended_research_direction") or {}
     add_heading(recommendation.get("title") or "待进一步确定研究方向", level=2)
@@ -904,6 +1044,7 @@ def create_report_docx(report, scan, output_path):
     else:
         add_paragraph("当前未形成可引用正文证据，方向置信度应下调并优先人工复核。")
 
+    doc.add_page_break()
     add_heading("五、其他深入方向建议", level=1)
     for item in report.get("directions", []):
         if isinstance(item, dict):
@@ -922,6 +1063,7 @@ def create_report_docx(report, scan, output_path):
             add_paragraph(item, style="List Bullet")
     if not report.get("directions"):
         add_paragraph("暂无其他深入方向建议。")
+    doc.add_page_break()
     add_heading("六、分析方法与边界", level=1)
     method = report.get("analysis_method", {})
     for key, label in (("parse", "统一解析"), ("deduplication", "精确去重"), ("similarity", "相似聚类"), ("retrieval", "本地证据检索"), ("classification", "自适应分类"), ("traceability", "证据回溯")):

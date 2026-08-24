@@ -76,6 +76,12 @@ def _default_state_dir():
     project_state = BASE_DIR / "data"
     filesystem = _mount_filesystem(project_state)
     if filesystem and (filesystem.startswith("nfs") or filesystem in {"cifs", "smbfs"}):
+        durable_home_state = Path.home() / ".local" / "state" / "sjfx-data-analysis-agent"
+        home_filesystem = _mount_filesystem(durable_home_state)
+        if not home_filesystem or not (
+            home_filesystem.startswith("nfs") or home_filesystem in {"cifs", "smbfs"}
+        ):
+            return durable_home_state
         user = re.sub(r"[^A-Za-z0-9_.-]+", "-", os.getenv("USER", "sjfx")) or "sjfx"
         uid = str(os.getuid()) if hasattr(os, "getuid") else user
         return Path("/var/tmp") / "sjfx-data-analysis-agent-{}".format(uid)
@@ -191,6 +197,7 @@ class Config:
     ENABLE_SHARED_OLLAMA_EMBEDDINGS = os.getenv("ENABLE_SHARED_OLLAMA_EMBEDDINGS", "0").strip().lower() in {"1", "true", "yes"}
     SHARED_OLLAMA_REQUEST_TIMEOUT = max(60, int(os.getenv("SHARED_OLLAMA_REQUEST_TIMEOUT", "600")))
     SHARED_OLLAMA_MAX_CHARS = max(4000, int(os.getenv("SHARED_OLLAMA_MAX_CHARS", "48000")))
+    LLM_CONTEXT_TOKENS = max(8192, int(os.getenv("LLM_CONTEXT_TOKENS", "65536")))
     HOST = os.getenv("HOST", "127.0.0.1")
     PORT = int(os.getenv("PORT", "8000"))
     API_ACCESS_TOKEN = os.getenv("SJFX_API_ACCESS_TOKEN", "").strip()
@@ -238,7 +245,7 @@ class Config:
     if DOCLING_DEVICE not in {"cpu", "cuda", "auto"}:
         DOCLING_DEVICE = "cpu"
     DOCLING_CPU_THREADS = max(1, min(64, int(os.getenv("DOCLING_CPU_THREADS", "4"))))
-    MAX_DOCUMENT_CHUNKS = int(os.getenv("MAX_DOCUMENT_CHUNKS", "12"))
+    MAX_DOCUMENT_CHUNKS = max(4, min(256, int(os.getenv("MAX_DOCUMENT_CHUNKS", "64"))))
     # ZIP64 and streaming writes support a complete 10 GiB handoff without
     # loading the source package into memory.
     MAX_EXPORT_BYTES = content_byte_limit("MAX_EXPORT_BYTES")

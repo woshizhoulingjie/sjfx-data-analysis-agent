@@ -58,7 +58,34 @@ PARSE_TEMP_DISK_RESERVE_BYTES = Config.PARSE_TEMP_DISK_RESERVE_BYTES
 PARSE_TEMP_STALE_SECONDS = Config.PARSE_TEMP_STALE_SECONDS
 
 _PARSE_TEMP_PREFIX = "sjfx-"
-_OWNED_TEMP_RE = re.compile(r"^sjfx-(?:archive|pdf-repair)-p([0-9]+)-")
+_OWNED_TEMP_RE = re.compile(r"^sjfx-(?:archive|pdf-repair|source)-p([0-9]+)-")
+
+
+def _scratch_is_leased(child):
+    """Return True while another live process owns a parser scratch lease.
+
+    PID checks alone are racy: a cleanup pass may observe a short-lived helper
+    process as dead while its parent is still parsing the copied snapshot.  A
+    kernel lock survives for exactly as long as the owning file descriptor and
+    therefore gives cleanup a reliable, process-independent liveness signal.
+    """
+    lease_path = child / ".lease"
+    if os.name == "nt" or not lease_path.exists():
+        return False
+    try:
+        import fcntl
+        handle = lease_path.open("a+b")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            handle.close()
+    except (ImportError, OSError):
+        # On an uncertain filesystem, retain rather than delete active data.
+        return True
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".xlsm",
@@ -436,6 +463,8 @@ def cleanup_stale_parse_temp_dirs(temp_root=None, stale_seconds=None):
                     should_remove = not _pid_is_alive(int(owner.group(1)))
                 else:
                     should_remove = age >= threshold
+                if should_remove and child.is_dir() and _scratch_is_leased(child):
+                    should_remove = False
                 if not should_remove:
                     continue
                 try:

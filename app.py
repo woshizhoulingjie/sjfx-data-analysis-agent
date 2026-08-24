@@ -1071,12 +1071,30 @@ def _run_claimed_export_job(job):
     )
     _ensure_job_active(job_id)
     storage.save_artifact(archive.name, job.get("owner_id"), scan_id=scan_id, job_id=job_id, kind="handoff_export")
+    volume_downloads = []
+    volume_sidecar = archive.with_name(archive.name + ".parts.json")
+    if volume_sidecar.exists():
+        try:
+            volume_manifest = json.loads(volume_sidecar.read_text(encoding="utf-8"))
+            for item in volume_manifest.get("parts") or []:
+                filename = str(item.get("file_name") or "")
+                candidate = Config.OUTPUT_DIR / filename
+                if not filename or candidate.parent.resolve() != Config.OUTPUT_DIR.resolve() or not candidate.is_file():
+                    continue
+                storage.save_artifact(filename, job.get("owner_id"), scan_id=scan_id, job_id=job_id, kind="handoff_export_volume")
+                volume_downloads.append({
+                    **item, "download_url": "/outputs/{}".format(filename),
+                })
+        except (OSError, ValueError, TypeError):
+            logger.warning("读取分卷导出清单失败：%s", volume_sidecar, exc_info=True)
     return {
         "scan_id": scan_id,
         "file_name": archive.name,
         "download_url": "/outputs/{}".format(archive.name),
         "source_file_count": len(context["member_paths"]),
         "selection_count": len(context["selection_metadata"]),
+        "segmented": bool(volume_downloads),
+        "volumes": volume_downloads,
     }
 
 
@@ -1227,6 +1245,7 @@ def _run_claimed_scan_and_analyze_job(job):
     # throughout the complete unknown-package workflow.
     return _run_claimed_analysis_job({
         "id": job_id, "scan_id": job_id, "options": {}, "progress": 15,
+        "owner_id": options.get("owner_id") or job.get("owner_id") or "legacy",
         "_progress_start": 15, "_progress_end": 95,
     })
 
@@ -1265,7 +1284,13 @@ def status():
         "sqlite_network_filesystem_allowed": os.getenv("SJFX_ALLOW_NETWORK_SQLITE", "0").strip().lower() in {"1", "true", "yes"},
         "document_parser": parser.status(),
         "supported_inputs": ["PDF", "Word", "PowerPoint", "Excel", "CSV/XLSX/JSON 数据画像", "图片 OCR", "文本/Markdown/HTML", "ZIP/TAR/TAR.GZ/TAR.BZ2 压缩包"],
-        "local_features": ["Office 内嵌图片 OCR", "SHA-256 去重", "SimHash+LSH 聚类", "BM25+TF-IDF 本地证据检索", "自适应分析树", "自动概览 Word"],
+        "local_features": [
+            "Office 内嵌图片 OCR", "SHA-256 去重", "SimHash+LSH 聚类",
+            "BM25/FTS 候选召回 + {} + 证据质量重排".format(
+                "本地语义向量" if embedding_mode() != "lexical-fallback" else "TF-IDF 词法相关度"
+            ),
+            "自适应分析树", "自动概览 Word",
+        ],
         "limits": {
             "max_scan_files": Config.MAX_SCAN_FILES,
             "max_scan_directories": Config.MAX_SCAN_DIRECTORIES,
@@ -1473,22 +1498,26 @@ def get_summaries_page(scan_id):
 
 @app.route("/api/analysis-node-members/<scan_id>")
 def get_analysis_node_members(scan_id):
-    """Return a bounded complete member list for safe visual tree editing."""
+    """Page through a node's complete members for safe large-node editing."""
     if not storage.scan_owned(scan_id, owner_id=_request_owner_id()):
         return api_error("扫描任务不存在、已失效或不属于当前访问用户", 404)
     try:
         node = _find_analysis_node(scan_id, request.args.get("node_id"))
         paths = sorted(set(str(value) for value in node.get("member_paths") or [] if value))
+        offset = max(0, int(request.args.get("offset", 0)))
         limit = max(1, min(500, int(request.args.get("limit", 500))))
-        if len(paths) > limit:
-            return api_error(
-                "该主题包含 {} 个文件，超过可视化拆分上限 {}；请先缩小主题范围。".format(len(paths), limit),
-                409,
-                {"member_count": len(paths), "visual_split_limit": limit},
-            )
+        page = paths[offset:offset + limit]
+        next_offset = offset + len(page)
         return jsonify({
             "ok": True, "node_id": node.get("node_id"), "member_count": len(paths),
-            "members": [{"path": path, "name": Path(path).name or path} for path in paths],
+            "members": [{"path": path, "name": Path(path).name or path} for path in page],
+            "page": {
+                "offset": offset,
+                "limit": limit,
+                "returned": len(page),
+                "next_offset": next_offset if next_offset < len(paths) else None,
+                "has_more": next_offset < len(paths),
+            },
         })
     except (TypeError, ValueError) as exc:
         return api_error(str(exc), 400)
@@ -1882,7 +1911,7 @@ def _job_api_view(source, include_blocker=True, compact=False):
         if isinstance(result, dict):
             allowed_result_fields = {
                 "scan_id", "scan_available", "file_name", "download_url",
-                "source_file_count", "selection_count",
+                "source_file_count", "selection_count", "segmented", "volumes",
             }
             job["result"] = {
                 key: value for key, value in result.items()
@@ -2084,7 +2113,7 @@ def summarize():
                     raise ValueError("节点不在本次安全清点范围内")
                 summary_type = "folder" if physical_node.get("kind") == "directory" or kind == "directory" else "file"
                 cached = storage.get_summary(scan_id, node_path, summary_type)
-                if force or not (cached and cached.get("schema_version") == 3 and not bool(cached.get("parser_info", {}).get("degraded"))):
+                if force or not (cached and cached.get("schema_version") in {3, 4} and not bool(cached.get("parser_info", {}).get("degraded"))):
                     require_local_model_enabled()
                     job_id, created = storage.create_or_get_typed_job(
                         scan_id, "generate_summary", options=payload, owner_id=_request_owner_id() or "legacy"
@@ -2145,7 +2174,7 @@ def summarize():
         if not local_only:
             require_local_model_enabled()
         cached = storage.get_summary(scan_id, node_path, summary_type)
-        if cached and cached.get("schema_version") == 3 and not force and not bool(cached.get("parser_info", {}).get("degraded")):
+        if cached and cached.get("schema_version") in {3, 4} and not force and not bool(cached.get("parser_info", {}).get("degraded")):
             degraded = bool(cached.get("parser_info", {}).get("degraded"))
             return jsonify({"ok": True, "summary": cached, "cached": True, "degraded": degraded})
         if summary_type == "folder" and local_only:
@@ -2210,9 +2239,9 @@ def summarize():
                     document=unified_document,
                 )
                 refresh_package_coverage(scan_id, scan_result, storage)
+            # Preserve the complete parsed text. Shared-model limits apply to
+            # each token-budgeted chunk, never by truncating the document head.
             model_max_chars = Config.MAX_FULL_DOCUMENT_CHARS
-            if isinstance(llm_transport, OllamaClient):
-                model_max_chars = min(model_max_chars, Config.SHARED_OLLAMA_MAX_CHARS)
             try:
                 if local_only:
                     raise LocalModelError("模型生成未启用")
@@ -2223,6 +2252,8 @@ def summarize():
                     max_chars=model_max_chars,
                     max_chunks=Config.MAX_DOCUMENT_CHUNKS,
                     unified_document=unified_document,
+                    preferred_chunk_chars=min(42000, Config.SHARED_OLLAMA_MAX_CHARS),
+                    context_window_tokens=Config.LLM_CONTEXT_TOKENS,
                 )
             except LocalModelError as exc:
                 summary = _local_document_fallback(unified_document, node_path, str(exc))
@@ -2250,11 +2281,16 @@ def summarize():
                 "coverage": coverage.get("metadata", {}).get("coverage", {}),
                 "local_model": result["model"],
                 "usage": result["usage"],
-                "degraded": bool(coverage.get("failed_chunks") or not result.get("model")),
+                "model_calls": coverage.get("model_calls", []),
+                "degraded": bool(
+                    coverage.get("failed_chunks")
+                    or any(item.get("output_truncated") for item in coverage.get("model_calls", []))
+                    or not result.get("model")
+                ),
             }
         summary["node_path"] = node_path
         summary["summary_type"] = summary_type
-        summary["schema_version"] = 3
+        summary["schema_version"] = 4
         summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
         storage.save_summary(scan_id, node_path, summary_type, summary)
         degraded = bool(summary.get("parser_info", {}).get("degraded"))

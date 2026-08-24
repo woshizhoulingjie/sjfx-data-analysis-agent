@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from config import Config
 from services.scanner import human_size, resolve_under
 from services.evidence import (
+    embedding_mode,
     evidence_quality,
     evidence_support,
     select_evidence,
@@ -522,6 +523,16 @@ def _secure_source_snapshot(scan_root, file_node, cancel_check=None):
     scratch = Path(tempfile.mkdtemp(
         prefix="sjfx-source-p{}-".format(os.getpid()), dir=str(Config.PARSE_TEMP_DIR)
     ))
+    lease_handle = None
+    if os.name != "nt":
+        try:
+            import fcntl
+            lease_handle = (scratch / ".lease").open("a+b")
+            fcntl.flock(lease_handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            if lease_handle is not None:
+                lease_handle.close()
+            lease_handle = None
     original_name = str(file_node.get("name") or Path(str(file_node.get("path") or "")).name)
     if not original_name or Path(original_name).name != original_name or original_name in {".", ".."}:
         suffixes = "".join(Path(original_name or "source").suffixes[-2:])
@@ -582,6 +593,13 @@ def _secure_source_snapshot(scan_root, file_node, cancel_check=None):
     finally:
         if source_fd is not None:
             os.close(source_fd)
+        if lease_handle is not None:
+            try:
+                import fcntl
+                fcntl.flock(lease_handle.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            lease_handle.close()
         shutil.rmtree(str(scratch), ignore_errors=True)
 
 
@@ -1358,9 +1376,10 @@ def _stable_group_node_id(dimension, name, member_paths):
     后面用户点击“某个主题”时，
     后端可以通过这个 node_id 找到对应节点。
     """
-    payload = "{}|{}|{}".format(
+    # Display names are model-enhanced and may legitimately improve between
+    # runs. They must not invalidate selections, locks or edit history.
+    payload = "{}|{}".format(
         dimension or "",
-        name or "",
         "|".join(sorted(member_paths or [])),
     )
 
@@ -1386,6 +1405,18 @@ def _node_evidence(documents, member_paths, topics=None, max_items=6):
     if topics:
         return [item for item in selected if item.get("support_status") == "supported"]
     return selected
+
+
+def _localized_subtopic_term(term):
+    value = str(term or "").strip()
+    if re.search(r"[\u4e00-\u9fff]", value):
+        return value
+    return {
+        "vulnerability": "漏洞", "exploit": "漏洞利用", "attack": "攻击技术",
+        "malware": "恶意软件", "threat": "威胁情报", "detection": "威胁检测",
+        "privacy": "隐私保护", "network": "网络安全", "firmware": "固件安全",
+        "authentication": "身份认证", "memory": "内存安全", "cloud": "云安全",
+    }.get(value.lower(), "专题（{}）".format(value[:12].upper() or "待命名"))
 
 
 def _subtopic_partitions(topic_name, member_paths, documents):
@@ -1424,7 +1455,7 @@ def _subtopic_partitions(topic_name, member_paths, documents):
         if len(paths) < 2:
             continue
         partitions.append({
-            "name": "{}相关资料".format(term),
+            "name": "{}研究资料".format(_localized_subtopic_term(term)),
             "paths": paths,
             "topics": [term],
         })
@@ -1565,6 +1596,9 @@ def _enrich_analysis_tree(tree, documents):
                 "node_id": _stable_group_node_id("子方向", "{}|{}".format(topic_name, subtopic_name), paths),
                 "dimension": "研究方向",
                 "name": subtopic_name,
+                "naming_source": "local_fallback",
+                "naming_status": "degraded",
+                "naming_degradation_reason": "尚未获得通过中文质量校验的模型命名",
                 "summary": "“{}”是“{}”下可独立下钻的子方向，包含 {} 个文件。".format(
                     subtopic_name, topic_name, len(paths)
                 ),
@@ -1741,9 +1775,14 @@ def _name_subtopic_nodes(tree, documents, llm):
         }
         for node_id, item in named.items():
             topic, subtopic = nodes[node_id]
-            name = str(item.get("name") or subtopic["name"]).strip()[:40]
+            name = _valid_semantic_name(item.get("name"))
             if name:
                 subtopic["name"] = name
+                subtopic["naming_source"] = "local_model"
+                subtopic["naming_status"] = "enhanced"
+                subtopic.pop("naming_degradation_reason", None)
+            else:
+                subtopic["naming_degradation_reason"] = "模型子方向名称未通过中文质量校验，已保留本地名称"
             summary = str(item.get("summary") or subtopic.get("summary") or "").strip()[:300]
             if summary:
                 subtopic["summary"] = summary
@@ -1810,15 +1849,7 @@ def _adaptive_tree(scan, documents, node_summaries):
     """
 
     def stable_group_id(name, member_paths):
-        payload = "内容主题|{}|{}".format(
-            name or "",
-            "|".join(sorted(member_paths or [])),
-        )
-        return "group-{}".format(
-            hashlib.sha256(
-                payload.encode("utf-8", errors="replace")
-            ).hexdigest()[:16]
-        )
+        return _stable_group_node_id("内容主题", name, member_paths)
 
     def file_leaf(path):
         doc = documents[path]
@@ -2714,8 +2745,25 @@ def _fallback_semantic_name(cluster, documents):
         if word.lower() not in generic
     ][:3]
 
-    if words:
-        return " / ".join(words)
+    chinese_words = [word for word in words if re.search(r"[\u4e00-\u9fff]", word)]
+    if chinese_words:
+        return "与".join(chinese_words[:3])[:20] + "研究"
+
+    terminology = {
+        "vulnerability": "漏洞", "vulnerabilities": "漏洞", "exploit": "漏洞利用",
+        "malware": "恶意软件", "threat": "威胁情报", "attack": "攻击技术",
+        "privacy": "隐私保护", "network": "网络安全", "firmware": "固件安全",
+        "kernel": "内核安全", "memory": "内存安全", "cloud": "云安全",
+        "authentication": "身份认证", "cryptography": "密码技术",
+        "ransomware": "勒索软件", "detection": "威胁检测",
+    }
+    translated = []
+    for word in words:
+        value = terminology.get(str(word).lower())
+        if value and value not in translated:
+            translated.append(value)
+    if translated:
+        return "与".join(translated[:3]) + "研究"
 
     representative = (
         cluster.get(
@@ -2733,9 +2781,11 @@ def _fallback_semantic_name(cluster, documents):
         )
 
         if headings:
-            return str(headings[0])[:28]
+            heading_name = _valid_semantic_name(str(headings[0])[:28])
+            if heading_name:
+                return heading_name
 
-    return "主题{}".format(
+    return "主题{}（待智能命名）".format(
         cluster.get(
             "cluster_id",
             "",
@@ -2743,10 +2793,21 @@ def _fallback_semantic_name(cluster, documents):
     )
 
 
+def _valid_semantic_name(value):
+    name = re.sub(r"\s+", "", str(value or "")).strip("/|,，。；;：:")
+    if not (4 <= len(name) <= 28) or not re.search(r"[\u4e00-\u9fff]", name):
+        return None
+    forbidden = ("未知文档", "未知资料", "其他资料", "综合内容", "未分类", "miscellaneous")
+    if any(word.lower() in name.lower() for word in forbidden):
+        return None
+    return name.replace("/", "与").replace("|", "与")
+
+
 def _name_semantic_clusters(
     clusters,
     documents,
     llm=None,
+    cached_names=None,
 ):
     """
     Name all semantic clusters in one bounded model call.
@@ -2754,6 +2815,7 @@ def _name_semantic_clusters(
     if not clusters:
         return clusters, None
 
+    cached_names = cached_names or {}
     for cluster in clusters:
         cluster["name"] = _fallback_semantic_name(
             cluster,
@@ -2766,13 +2828,31 @@ def _name_semantic_clusters(
         ).format(
             len(cluster.get("members", []))
         )
+        cluster["naming_source"] = "local_fallback"
+        cluster["naming_status"] = "degraded"
+        cluster["naming_confidence"] = 0.35
+        cluster["naming_degradation_reason"] = "尚未获得通过中文质量校验的模型命名"
+        cached = cached_names.get(_stable_group_node_id("内容主题", cluster["name"], cluster.get("members") or [])) or {}
+        cached_name = _valid_semantic_name(cached.get("name"))
+        if cached_name:
+            cluster.update({
+                "name": cached_name,
+                "summary": str(cached.get("summary") or cluster["summary"])[:300],
+                "keywords": list(cached.get("keywords") or [])[:6],
+                "naming_source": "persistent_cache",
+                "naming_status": "enhanced",
+                "naming_confidence": cached.get("confidence", 0.82),
+            })
+            cluster.pop("naming_degradation_reason", None)
 
-    if llm is None:
+    if llm is None or all(cluster.get("naming_status") == "enhanced" for cluster in clusters):
         return clusters, None
 
     lines = []
 
     for cluster in clusters:
+        if cluster.get("naming_status") == "enhanced":
+            continue
         lines.append(
             "\n[{}]".format(
                 cluster["cluster_id"]
@@ -2882,15 +2962,16 @@ def _name_semantic_clusters(
         used_names = Counter()
 
         for cluster in clusters:
+            if cluster.get("naming_source") == "persistent_cache":
+                used_names[cluster["name"]] += 1
+                continue
             item = named.get(
                 cluster["cluster_id"],
                 {},
             )
 
-            name = str(
-                item.get("name")
-                or cluster["name"]
-            ).strip()[:32]
+            proposed = _valid_semantic_name(item.get("name"))
+            name = proposed or cluster["name"]
 
             used_names[name] += 1
 
@@ -2901,6 +2982,13 @@ def _name_semantic_clusters(
                 )
 
             cluster["name"] = name
+            if proposed:
+                cluster["naming_source"] = "local_model"
+                cluster["naming_status"] = "enhanced"
+                cluster["naming_confidence"] = 0.82
+                cluster.pop("naming_degradation_reason", None)
+            else:
+                cluster["naming_degradation_reason"] = "模型名称缺少中文信息、过于宽泛或格式不合格，已使用本地回退"
 
             cluster["summary"] = str(
                 item.get("summary")
@@ -2920,9 +3008,11 @@ def _name_semantic_clusters(
 
         return clusters, result
 
-    except Exception:
+    except Exception as exc:
         # 命名失败不能让完整分析失败；
         # 保留本地聚类和本地回退名称。
+        for cluster in clusters:
+            cluster["naming_degradation_reason"] = "模型命名失败：{}".format(str(exc)[:180])
         return clusters, None
 
 
@@ -3014,12 +3104,6 @@ def _semantic_adaptive_tree(
             )
         )
 
-        node_payload = (
-            name
-            + "|"
-            + "|".join(member_paths)
-        )
-
         total_size = sum(
             int(
                 documents[path]
@@ -3032,14 +3116,7 @@ def _semantic_adaptive_tree(
 
         children.append({
             "kind": "group",
-            "node_id": "group-{}".format(
-                hashlib.sha256(
-                    node_payload.encode(
-                        "utf-8",
-                        errors="replace",
-                    )
-                ).hexdigest()[:16]
-            ),
+            "node_id": _stable_group_node_id("内容主题", name, member_paths),
             "dimension": "内容主题",
             "classification_status": "classified",
             "name": name,
@@ -3063,6 +3140,10 @@ def _semantic_adaptive_tree(
             "semantic_cluster_id": cluster.get(
                 "cluster_id"
             ),
+            "naming_source": cluster.get("naming_source", "local_fallback"),
+            "naming_status": cluster.get("naming_status", "degraded"),
+            "naming_confidence": cluster.get("naming_confidence"),
+            "naming_degradation_reason": cluster.get("naming_degradation_reason"),
             "children": [
                 file_leaf(path)
                 for path in member_paths
@@ -3093,12 +3174,12 @@ def _semantic_adaptive_tree(
 
 
 def _add_related_topic_mounts(tree, documents):
-    """Expose strong cross-topic relationships without moving primary files.
+    """Add non-counting cross-topic references without duplicating leaves.
 
-    The generated tree keeps one primary placement for stable counts, then
-    mounts a file under at most two additional topic nodes when its extracted
-    content topics overlap that node's topic vocabulary.  Mounted leaves are
-    marked explicitly so exports and human edits can distinguish them.
+    Every physical file has exactly one primary group. Related classifications
+    are metadata references, never additional children/member_paths. This keeps
+    coverage, export sizes and report percentages mathematically valid while
+    still exposing useful cross-topic relationships to the UI.
     """
     groups = [item for item in tree.get("children") or [] if item.get("kind") == "group"]
     if len(groups) < 2:
@@ -3117,20 +3198,27 @@ def _add_related_topic_mounts(tree, documents):
             overlap = len(doc_topics.intersection(group_terms))
             if overlap < 2:
                 continue
-            source_leaf = next((leaf for leaf in (tree.get("children") or []) for leaf in leaf.get("children") or [] if leaf.get("kind") == "file" and leaf.get("path") == path), None)
-            if not source_leaf:
-                source_leaf = {"kind": "file", "path": path, "name": Path(path).name}
-            mounted_leaf = dict(source_leaf)
-            mounted_leaf["manual_membership"] = False
-            mounted_leaf["topic_mount"] = True
-            mounted_leaf["topic_mount_reason"] = "正文主题与该节点存在 {} 个共同主题词".format(overlap)
-            group.setdefault("children", []).append(mounted_leaf)
-            group.setdefault("member_paths", []).append(path)
-            group["member_paths"] = sorted(set(group["member_paths"]))
-            group["file_count"] = len(group["member_paths"])
+            reference = {
+                "path": path,
+                "name": Path(path).name,
+                "overlap": overlap,
+                "reason": "正文主题与该节点存在 {} 个共同主题词".format(overlap),
+            }
+            group.setdefault("related_file_refs", []).append(reference)
             mounted += 1
             if mounted >= 2:
                 break
+    for group in groups:
+        references = sorted(
+            group.get("related_file_refs") or [],
+            key=lambda item: (-int(item.get("overlap") or 0), item.get("path") or ""),
+        )
+        group["related_file_refs"] = references
+        group["related_file_count"] = len(references)
+    tree["membership_contract"] = {
+        "primary_membership": "exactly_one",
+        "related_membership": "non_counting_reference",
+    }
     return tree
 
 
@@ -3580,7 +3668,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         ]
         retrieval = {
             "schema_version": "local-retrieval/2.0",
-            "method": "SQLite FTS5 候选召回 + 有界本地 BM25/TF-IDF",
+            "method": "SQLite FTS5/BM25 候选召回 + {} + 证据质量重排".format(
+                "本地语义向量" if embedding_mode() != "lexical-fallback" else "TF-IDF 词法相关度"
+            ),
             "evidence_chunks": evidence_index_count,
             "queries": manifest_queries,
             "remote_services_enabled": False,
@@ -3613,9 +3703,10 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     semantic_clusters = []
     semantic_threshold = None
     semantic_naming_model = None
+    naming_result = None
     semantic_error = None
 
-    if embedding_client is not None and canonical_documents and not policy.get("enabled"):
+    if embedding_client is not None and canonical_documents:
         try:
             progress(74, "生成文档级语义向量")
 
@@ -3646,23 +3737,43 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 "生成语义主题名称",
             )
 
-            if llm is not None and _optional_llm_enrichment_enabled():
+            if llm is not None:
+                naming_cache = {}
+                for cluster in semantic_clusters:
+                    cache_id = _stable_group_node_id("内容主题", "", cluster.get("members") or [])
+                    cached = storage.get_summary(scan_id, "naming:{}".format(cache_id), "semantic_naming")
+                    if cached and cached.get("schema_version") == 1:
+                        naming_cache[cache_id] = cached
                 semantic_clusters, naming_result = (
                     _name_semantic_clusters(
                         semantic_clusters,
                         canonical_documents,
                         llm=llm,
+                        cached_names=naming_cache,
                     )
                 )
+
+                for cluster in semantic_clusters:
+                    if cluster.get("naming_status") != "enhanced":
+                        continue
+                    cache_id = _stable_group_node_id("内容主题", "", cluster.get("members") or [])
+                    storage.save_summary(scan_id, "naming:{}".format(cache_id), "semantic_naming", {
+                        "schema_version": 1,
+                        "name": cluster.get("name"),
+                        "summary": cluster.get("summary"),
+                        "keywords": cluster.get("keywords") or [],
+                        "confidence": cluster.get("naming_confidence"),
+                    })
 
                 if naming_result:
                     semantic_naming_model = (
                         naming_result.get("model")
                     )
             else:
-                semantic_error = (
-                    "可选模型增强已跳过；保留 embedding 聚类和本地规则命名"
+                semantic_clusters, _unused = _name_semantic_clusters(
+                    semantic_clusters, canonical_documents, llm=None,
                 )
+                semantic_error = "本地模型不可用；目录已显式标记为待智能命名"
 
         except Exception as exc:
             semantic_error = str(exc)
@@ -3754,7 +3865,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         )
     )
     progress(88, "生成可下钻子方向名称")
-    if llm is not None and _optional_llm_enrichment_enabled():
+    if llm is not None:
         adaptive_tree, subtopic_naming_result = _name_subtopic_nodes(
             adaptive_tree,
             canonical_documents,
@@ -3821,6 +3932,21 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )
     adaptive_tree = attach_tree_coverage(adaptive_tree, coverage_for_paths, all_paths)
+    tree_version_rows = []
+    tree_stack = [adaptive_tree]
+    while tree_stack:
+        tree_node = tree_stack.pop()
+        if tree_node.get("kind") == "group":
+            tree_version_rows.append({
+                "node_id": tree_node.get("node_id"),
+                "members": sorted(set(tree_node.get("member_paths") or [])),
+                "manual_identity_safe": True,
+            })
+        tree_stack.extend(reversed(tree_node.get("children") or []))
+    analysis_tree_version = hashlib.sha256(json.dumps(
+        sorted(tree_version_rows, key=lambda item: str(item.get("node_id") or "")),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()[:20]
     exact_duplicate_files = sum(group["duplicate_count"] for group in exact_groups)
     structured_overview = _build_structured_overview(documents)
     parsed_ratio = float(package_coverage.get("parsed_file_ratio") or 0)
@@ -3854,6 +3980,30 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         failures,
         pending_paths,
         structured_overview,
+    )
+    package_model_calls = []
+    for stage_name, call_result in (
+        ("semantic_cluster_naming", naming_result),
+        ("subtopic_naming", subtopic_naming_result),
+    ):
+        if not call_result:
+            continue
+        usage = call_result.get("usage") or {}
+        context_tokens = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
+        package_model_calls.append({
+            "stage": stage_name,
+            "model": call_result.get("model"),
+            "usage": usage,
+            "context_tokens": context_tokens,
+            "context_window_tokens": Config.LLM_CONTEXT_TOKENS,
+            "context_occupancy": round(context_tokens / float(Config.LLM_CONTEXT_TOKENS), 6),
+            "finish_reason": call_result.get("finish_reason"),
+            "timing": call_result.get("timing") or {},
+        })
+    ordered_contexts = sorted(item["context_tokens"] for item in package_model_calls)
+    context_p95 = (
+        ordered_contexts[int(math.ceil(0.95 * len(ordered_contexts))) - 1]
+        if ordered_contexts else 0
     )
     analysis = {
         "schema_version": "package-analysis/2.0",
@@ -3900,6 +4050,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "retrieval_evidence_chunks": retrieval.get("evidence_chunks", 0),
             "persistent_evidence_index_chunks": evidence_index_count,
             "parse_mode": actual_parse_mode,
+            "reused_parse_checkpoints": reusable_count,
+            "newly_processed_files": max(0, len(candidates) - reusable_count),
             "folder_summary_count": sum(1 for item in node_summaries.values() if item.get("summary_type") == "folder"),
             "local_file_summary_count": local_file_summary_count,
             "metadata_file_summary_count": len(all_paths - set(documents)),
@@ -3925,10 +4077,18 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "semantic_cluster_error": semantic_error,
         "classification_dimensions": adaptive_tree["dimensions"],
         "analysis_tree": adaptive_tree,
+        "analysis_tree_version": analysis_tree_version,
+        "analysis_tree_identity_contract": "节点名称变化不改变ID；成员集合变化生成新版本，人工编辑按稳定ID重放",
         "coverage": package_coverage,
         "overview": overview,
         "value_judgment": value_judgment,
         "structured_data_overview": structured_overview,
+        "model_telemetry": {
+            "calls": package_model_calls,
+            "call_count": len(package_model_calls),
+            "context_p95_tokens": context_p95,
+            "context_occupancy_p95": round(context_p95 / float(Config.LLM_CONTEXT_TOKENS), 6),
+        },
         "node_summaries": node_summaries,
         "document_index": [compact_document(document) for document in documents.values()],
         "canonical_document_index": [compact_document(document) for document in canonical_documents.values()],
