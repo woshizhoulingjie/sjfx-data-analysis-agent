@@ -252,6 +252,12 @@ def _optional_llm_enrichment_enabled():
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}")
 ENGLISH_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
 CHINESE_TEXT_RE = re.compile(r"[\u4e00-\u9fff]+")
+CHINESE_DOMAIN_TERMS = (
+    "威胁情报", "漏洞利用", "入侵检测", "攻击技术", "恶意软件", "勒索软件",
+    "网络安全", "物联网安全", "车联网安全", "车载网络", "可信执行环境",
+    "侧信道攻击", "远程证明", "身份认证", "访问控制", "隐私保护", "密码技术",
+    "供应链安全", "数据泄露", "安全事件", "应急响应", "安全评估", "风险分析",
+)
 STOPWORDS = {
     "the", "and", "for", "with", "from", "this", "that", "研究", "分析", "报告",
     "文档", "文件", "资料", "进行", "一种", "基于", "相关", "情况", "数据", "方法",
@@ -260,12 +266,7 @@ STOPWORDS = {
 try:
     import jieba
     jieba.setLogLevel(30)
-    for _domain_term in (
-        "威胁情报", "漏洞利用", "入侵检测", "攻击技术", "恶意软件", "勒索软件",
-        "网络安全", "物联网安全", "车联网安全", "车载网络", "可信执行环境",
-        "侧信道攻击", "远程证明", "身份认证", "访问控制", "隐私保护", "密码技术",
-        "供应链安全", "数据泄露", "安全事件", "应急响应", "安全评估", "风险分析",
-    ):
+    for _domain_term in CHINESE_DOMAIN_TERMS:
         jieba.add_word(_domain_term, freq=2_000_000)
 except ImportError:  # The deterministic regex fallback keeps offline maintenance usable.
     jieba = None
@@ -932,6 +933,8 @@ def _tokens(text):
             if 2 <= len(token.strip()) <= 16
         )
     else:
+        for term in CHINESE_DOMAIN_TERMS:
+            tokens.extend([term] * min(8, value.count(term)))
         tokens.extend(token for token in WORD_RE.findall(value) if CHINESE_TEXT_RE.fullmatch(token))
     return [token for token in tokens if token not in STOPWORDS]
 
