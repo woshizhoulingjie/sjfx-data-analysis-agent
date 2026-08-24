@@ -49,7 +49,7 @@ def build_policy(scan, options=None):
     # used as a hard cap in full large-package mode.
     initial_limit = max(1, int(options.get("initial_parse_files") or 700))
     deepen_limit = max(1, int(options.get("deepen_batch_files") or 500))
-    batch_files = max(1, min(1000, int(options.get("batch_files") or 100)))
+    batch_files = max(1, min(1000, int(options.get("batch_files") or 500)))
     overview_chars = max(1000, min(12000, int(options.get("overview_chars_per_file") or 4000)))
     overview_evidence = max(1, min(20, int(options.get("overview_evidence_per_file") or 6)))
     enabled = total_size >= threshold_bytes or file_count >= threshold_files
@@ -69,6 +69,8 @@ def build_policy(scan, options=None):
         "inventory_bytes": total_size,
         "inventory_size_human": human_size(total_size),
         "checkpoint_resume": True,
+        "batch_completion": "continue_until_inventory_exhausted",
+        "batch_checkpoint_scope": "per_file",
         "pause_behavior": "安全停止后保留逐文件检查点；再次启动同一扫描可续跑",
         "deep_analysis_strategy": "首轮全量快速解析与索引，代表性概览；用户选择范围后准确解析和全文语义分析",
     }
@@ -348,7 +350,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         }
         content_parse_ratio = round(len(parsed) / float(len(selected) or 1), 6)
         deep_analysis_ratio = round(len(semantic_complete_paths) / float(len(selected) or 1), 6)
-        batch_size = max(1, int((policy or {}).get("batch_files") or 100))
+        batch_size = max(1, int((policy or {}).get("batch_files") or 500))
         remaining_batches = int(math.ceil((len(pending) + len(failed)) / float(batch_size)))
         extension_inventory = Counter(
             str(files[path].get("extension") or Path(path).suffix.lower() or "[无扩展名]")
@@ -420,13 +422,15 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "format_coverage": format_coverage,
             "batch_progress": {
                 "batch_size": batch_size,
+                "completion_policy": "continue_until_inventory_exhausted",
+                "checkpoint_scope": "per_file",
                 "estimated_remaining_batches": remaining_batches,
                 "checkpoint_resume": bool((policy or {}).get("checkpoint_resume", True)),
                 "eta_seconds": None,
                 "eta_note": "尚无稳定的同类文件吞吐基线，完成首个批次后再按格式估算 ETA。" if remaining_batches else "已无待处理批次。",
             },
             "large_package_notice": (
-                "大数据包按有限批次处理并逐文件保存检查点；可安全停止并续跑。首轮概览不等同于全文深度分析。"
+                "大数据包按每批 {} 个文件连续处理，直到清点文件全部完成或明确失败；逐文件保存检查点，可安全停止并续跑。首轮概览不等同于全文深度分析。".format(batch_size)
                 if (policy or {}).get("enabled") else None
             ),
         }

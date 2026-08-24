@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from services.evidence import evidence_quality
 from services.folder_analysis import _normalize_question_answer_evidence
-from services.large_package import build_coverage, file_fingerprint, representative_paths
+from services.large_package import build_coverage, build_policy, file_fingerprint, representative_paths
 from services.package_analysis import _build_structured_overview
 from services.storage import Storage
 from services.reporting import _direction_candidates
@@ -33,6 +33,13 @@ class AnalysisContractTests(unittest.TestCase):
         result = coverage_for_paths([])
         self.assertEqual(result["inventory_files"], 0)
         self.assertEqual(result["parsed_files"], 0)
+
+    def test_large_package_default_is_500_file_batches_until_exhausted(self):
+        policy = build_policy({"file_count": 3000, "total_size": 1})
+        self.assertTrue(policy["enabled"])
+        self.assertEqual(policy["batch_files"], 500)
+        self.assertEqual(policy["batch_completion"], "continue_until_inventory_exhausted")
+        self.assertEqual(policy["batch_checkpoint_scope"], "per_file")
 
     def test_question_contract_rejects_navigation_evidence(self):
         title = {"evidence_id": "E-title", "label": "title", "text": "开源软件的特点"}

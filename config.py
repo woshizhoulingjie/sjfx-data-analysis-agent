@@ -272,7 +272,10 @@ class Config:
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
     LARGE_PACKAGE_INITIAL_PARSE_FILES = int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "700"))
     LARGE_PACKAGE_DEEPEN_BATCH_FILES = int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "500"))
-    LARGE_PACKAGE_BATCH_FILES = max(1, min(1000, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "100"))))
+    # A large import advances in durable 500-file units.  Individual results
+    # are still checkpointed as soon as they finish, so a stop in the middle of
+    # a unit never discards the files that have already completed.
+    LARGE_PACKAGE_BATCH_FILES = max(1, min(1000, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "500"))))
     # The full payload stays in a sidecar. Package-wide structures retain only
     # a head/middle/tail semantic sketch, giving a strict 50k-file memory bound.
     LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE = max(
