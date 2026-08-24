@@ -141,6 +141,11 @@ class AnalysisContractTests(unittest.TestCase):
             "source_sha256": "market-source", "label": "paragraph",
             "text": "新客户转化率从18%提升至21%，但平均交付周期由7.2天延长至8.1天。",
         }
+        table_evidence = {
+            "evidence_id": "E-table", "source_path": "区域经营数据.csv",
+            "source_sha256": "table-source", "label": "table",
+            "text": "区域销售数据表明华东销售额为1280万元，环比增长12%，新客户数为46。",
+        }
         analysis = {
             "statistics": {"parsed_files": 2},
             "coverage": {"parsed_file_ratio": 1.0, "complete_analysis": True},
@@ -158,6 +163,7 @@ class AnalysisContractTests(unittest.TestCase):
                 "representative_documents": ["市场经营简报.md"],
                 "evidence_chain": [evidence],
             }]},
+            "retrieval": {"queries": [{"results": [table_evidence]}]},
             "document_index": [
                 {"source": {"path": "区域经营数据.csv", "extension": ".csv"}, "classification": {"document_role": "结构化数据"}},
                 {"source": {"path": "市场经营简报.md", "extension": ".md"}, "classification": {"document_role": "一般资料"}},
@@ -166,7 +172,8 @@ class AnalysisContractTests(unittest.TestCase):
         candidates = _direction_candidates({}, analysis)
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["title"], "区域市场经营数据分析与风险预警")
-        self.assertEqual(candidates[0]["evidence_ids"], ["E-market"])
+        self.assertEqual(set(candidates[0]["evidence_ids"]), {"E-market", "E-table"})
+        self.assertEqual(candidates[0]["independent_source_count"], 2)
         self.assertEqual(candidates[0]["candidate_source"], "official_analysis_tree")
         self.assertEqual(candidates[0]["evidence_status"], "supported")
         self.assertIn("交付周期", candidates[0]["research_questions"][0])

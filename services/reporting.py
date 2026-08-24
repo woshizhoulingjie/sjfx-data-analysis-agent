@@ -53,11 +53,32 @@ def _cluster_evidence(cluster, analysis, topic, limit=8):
     """Collect only claim-eligible正文 evidence belonging to one topic."""
     candidates = list(cluster.get("evidence_chain") or [])
     member_paths = set(cluster.get("members") or [])
+
+    def in_member_scope(item):
+        source_path = str(item.get("source_path") or "")
+        archive_source = str(item.get("archive_source_path") or "")
+        return any(
+            source_path == member
+            or source_path.startswith(str(member) + "::")
+            or archive_source == member
+            for member in member_paths
+        )
+
     for item in analysis.get("document_index", []) or []:
         path = (item.get("source") or {}).get("path") or item.get("path")
         if path not in member_paths:
             continue
         candidates.extend(item.get("evidence") or [])
+    # Persistent retrieval results are a bounded projection of the complete
+    # evidence index. Compact document rows intentionally omit evidence, so the
+    # recommender must also consume these scoped results or it undercounts the
+    # independent sources already available elsewhere in the report.
+    for retrieval_key in ("research_retrieval", "retrieval"):
+        for search in (analysis.get(retrieval_key) or {}).get("queries") or []:
+            candidates.extend(
+                item for item in search.get("results") or []
+                if isinstance(item, dict) and in_member_scope(item)
+            )
     evidence_topics = [topic] + list(cluster.get("related_topics") or cluster.get("keywords") or [])[:8]
     selected = select_evidence(
         candidates,
