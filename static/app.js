@@ -1157,6 +1157,18 @@ function evidenceHtml(items) {
               : '',
 
             item.section || ''
+
+            ,item.paragraph_index != null
+              ? `第 ${Number(item.paragraph_index) + 1} 段`
+              : ''
+
+            ,item.block_index != null
+              ? `块 ${Number(item.block_index) + 1}`
+              : ''
+
+            ,item.char_start != null
+              ? `字符 ${item.char_start}-${item.char_end != null ? item.char_end : '?'}`
+              : ''
           ]
             .filter(Boolean)
             .join(' · ');
@@ -1189,6 +1201,12 @@ function evidenceHtml(items) {
           const supportType =
             item.support_type
             || '';
+
+          const supportStatus = ({
+            supported: '已核验支撑',
+            partially_supported: '部分支撑，需复核',
+            insufficient: '证据不足'
+          })[item.support_status] || '';
 
           return (
             `<article class="evidence-card">`
@@ -1226,6 +1244,12 @@ function evidenceHtml(items) {
             (
               supportType
                 ? `<small>证据类型：${escapeHtml(supportType)}</small><br>`
+                : ''
+            )
+            +
+            (
+              supportStatus
+                ? `<small>核验状态：${escapeHtml(supportStatus)}</small><br>`
                 : ''
             )
             +

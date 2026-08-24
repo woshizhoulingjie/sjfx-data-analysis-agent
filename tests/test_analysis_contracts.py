@@ -4,12 +4,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from services.evidence import evidence_quality
+from services.evidence import evidence_quality, verify_claim_evidence
 from services.folder_analysis import _normalize_question_answer_evidence
 from services.large_package import build_coverage, build_policy, file_fingerprint, representative_paths
 from services.package_analysis import _build_structured_overview
 from services.storage import Storage
 from services.reporting import _direction_candidates
+from services.retrieval import evidence_corpus
 
 
 class AnalysisContractTests(unittest.TestCase):
@@ -51,6 +52,68 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertEqual(summary["evidence_status"], "supported")
         self.assertEqual([item["evidence_id"] for item in summary["evidence"]], ["E-body"])
         self.assertEqual(summary["claims"][0]["evidence_ids"], ["E-body"])
+
+    def test_relation_negation_scope_is_not_a_false_positive(self):
+        result = verify_claim_evidence(
+            "系统不支持加密",
+            {"label": "paragraph", "text": "系统支持加密，但不支持压缩；该结论已经经过完整测试。"},
+        )
+        self.assertEqual(result["support_status"], "insufficient")
+        self.assertEqual(result["support_relation"], "polarity_mismatch")
+        self.assertEqual(result["verification_contract"], "claim-evidence/3.0")
+
+    def test_relation_direction_is_not_a_false_positive(self):
+        result = verify_claim_evidence(
+            "组织甲攻击了组织乙",
+            {"label": "paragraph", "text": "组织乙攻击了组织甲，调查结果已经完成并确认该事件。"},
+        )
+        self.assertEqual(result["support_status"], "insufficient")
+        self.assertEqual(result["support_relation"], "direction_mismatch")
+
+    def test_matching_relation_frame_is_supported(self):
+        result = verify_claim_evidence(
+            "系统支持加密",
+            {"label": "paragraph", "text": "测试结果表明，系统支持加密并已经通过完整验证。"},
+        )
+        self.assertEqual(result["support_status"], "supported")
+        self.assertEqual(result["support_relation"], "direct_frame")
+
+    def test_mixed_claim_support_is_partial_and_keeps_valid_evidence(self):
+        good = {
+            "evidence_id": "E-good", "label": "paragraph", "source_path": "a.pdf",
+            "text": "测试结果表明，系统支持加密并已经通过完整验证。",
+        }
+        bad = {
+            "evidence_id": "E-bad", "label": "paragraph", "source_path": "b.pdf",
+            "text": "组织乙攻击了组织甲，调查结果已经完成并确认该事件。",
+        }
+        summary = _normalize_question_answer_evidence({
+            "answer": "现有材料形成两项判断。",
+            "claims": [
+                {"statement": "系统支持加密", "evidence": [good]},
+                {"statement": "组织甲攻击了组织乙", "evidence": [bad]},
+            ],
+        }, [good, bad], ".")
+        self.assertEqual(summary["evidence_status"], "partially_supported")
+        self.assertEqual(summary["evidence_contract"], "question-answer-evidence/3.0")
+        self.assertEqual(summary["evidence_ids"], ["E-good"])
+        self.assertEqual(summary["claim_status_counts"]["insufficient"], 1)
+
+    def test_retrieval_corpus_preserves_exact_source_locators(self):
+        document = {
+            "source": {"path": "a.pdf", "sha256": "source-hash"},
+            "evidence": [{
+                "evidence_id": "E1", "source_path": "a.pdf", "label": "paragraph",
+                "text": "该系统通过硬件信任根实现远程证明并降低伪造风险。",
+                "page": 3, "paragraph_index": 7, "block_index": 2,
+                "char_start": 120, "char_end": 148, "parser_version": "2.0",
+            }],
+        }
+        item = evidence_corpus({"a.pdf": document})[0]
+        self.assertEqual(item["paragraph_index"], 7)
+        self.assertEqual(item["block_index"], 2)
+        self.assertEqual((item["char_start"], item["char_end"]), (120, 148))
+        self.assertEqual(item["parser_version"], "2.0")
 
     def test_direction_candidates_have_evidence_and_score(self):
         analysis = {

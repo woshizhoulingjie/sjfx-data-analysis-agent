@@ -21,7 +21,7 @@ from web_compat import (
 from config import Config
 from services.ollama import LocalModelError, OllamaClient, OllamaEmbeddingClient
 from services.document_analysis import analyze_document
-from services.evidence import embedding_mode, select_evidence, set_embedding_provider
+from services.evidence import embedding_mode, select_evidence, set_embedding_provider, verify_claim_evidence
 from services.exporter import create_report_docx, export_node, safe_name
 from services.folder_analysis import analyze_folder
 from services.package_analysis import (
@@ -526,22 +526,84 @@ def _virtual_node_summary(scan_id, node, context=None):
         if not (item.get("evidence_id") in seen or seen.add(item.get("evidence_id")))
     ]
     primary = conclusions[0] if conclusions else {}
-    claims = list(primary.get("claims") or [])
-    if not claims and primary.get("answer"):
-        claims = [{
+    raw_claims = list(primary.get("claims") or [])
+    if not raw_claims and primary.get("answer"):
+        raw_claims = [{
             "statement": primary.get("answer"),
             "type": "inference",
             "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
-            "support_status": "supported" if evidence else "insufficient",
         }]
+    evidence_by_id = {item.get("evidence_id"): item for item in evidence if item.get("evidence_id")}
+    claims = []
+    verified_evidence = []
+    verified_seen = set()
+    for raw in raw_claims:
+        raw = raw if isinstance(raw, dict) else {"statement": str(raw), "type": "observation"}
+        statement = str(raw.get("statement") or raw.get("claim") or "").strip()
+        candidate_ids = list(raw.get("evidence_ids") or evidence_by_id.keys())
+        statuses = []
+        accepted_ids = []
+        for evidence_id in candidate_ids:
+            item = evidence_by_id.get(evidence_id)
+            if not item:
+                continue
+            verification = verify_claim_evidence(statement, item)
+            status = verification.get("support_status")
+            statuses.append(status)
+            if status in {"supported", "partially_supported"}:
+                accepted_ids.append(evidence_id)
+                if evidence_id not in verified_seen:
+                    verified_seen.add(evidence_id)
+                    verified_item = dict(item)
+                    verified_item.update(verification)
+                    verified_evidence.append(verified_item)
+        claim_status = (
+            "supported" if "supported" in statuses
+            else "partially_supported" if "partially_supported" in statuses
+            else "insufficient"
+        )
+        claims.append({
+            **raw,
+            "statement": statement,
+            "evidence_ids": accepted_ids,
+            "support_status": claim_status,
+        })
+    supported_claims = sum(1 for item in claims if item.get("support_status") == "supported")
+    partial_claims = sum(1 for item in claims if item.get("support_status") == "partially_supported")
+    if claims and supported_claims == len(claims):
+        evidence_status = "supported"
+    elif supported_claims or partial_claims:
+        evidence_status = "partially_supported"
+    else:
+        evidence_status = "insufficient"
+    answer = primary.get("answer") or node.get("summary") or "暂无足够证据形成回答。"
+    if evidence_status == "insufficient":
+        answer = "证据不足，当前不能形成可靠回答。"
     qa = {
+        "contract": "question-answer-evidence/3.0",
         "question": primary.get("question") or primary.get("analysis_question") or "该节点主要包含哪些内容，哪些方向值得继续下钻？",
         "value": primary.get("value") or primary.get("question_value") or "用于判断该主题是否值得继续深入分析。",
-        "answer": primary.get("answer") or node.get("summary") or "暂无足够证据形成回答。",
+        "answer": answer,
         "claims": claims,
-        "evidence": evidence[:12],
+        "evidence": verified_evidence[:12],
+        "evidence_status": evidence_status,
         "coverage": context.get("coverage", {}),
-        "limitations": list(context.get("coverage", {}).get("limitations") or []) + ([] if evidence else ["当前没有有效正文证据支撑该回答。"]),
+        "limitations": list(context.get("coverage", {}).get("limitations") or []) + (
+            [] if evidence_status == "supported"
+            else ["部分结论尚未得到直接证据支撑，建议人工复核。"] if evidence_status == "partially_supported"
+            else ["当前没有有效正文证据支撑该回答。"]
+        ),
+    }
+    verified_conclusion = {
+        **primary,
+        "answer": answer,
+        "statement": answer,
+        "claims": claims,
+        "evidence": verified_evidence[:12],
+        "evidence_ids": [item.get("evidence_id") for item in verified_evidence if item.get("evidence_id")],
+        "evidence_status": evidence_status,
+        "evidence_contract": "question-answer-evidence/3.0",
+        "limitations": qa["limitations"],
     }
     return {
         "schema_version": 4,
@@ -553,13 +615,20 @@ def _virtual_node_summary(scan_id, node, context=None):
         "file_count": context.get("total_files", 0),
         "member_paths": context.get("member_paths", []),
         "representative_documents": list(node.get("representative_documents") or [])[:5],
-        "conclusion_evidence": conclusions,
-        "evidence_chain": evidence[:12],
+        "conclusion_evidence": [verified_conclusion] if primary or claims else [],
+        "evidence_chain": verified_evidence[:12],
         "question": qa["question"],
         "value": qa["value"],
-        "answer": qa["answer"],
+        "answer": answer,
         "claims": claims,
-        "evidence_status": "supported" if evidence else "insufficient",
+        "evidence_status": evidence_status,
+        "evidence_contract": "question-answer-evidence/3.0",
+        "unique_evidence_count": len(verified_seen),
+        "independent_source_count": len({
+            item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path")
+            for item in verified_evidence
+            if item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path")
+        }),
         "question_answer_evidence": qa,
         "statistics": {
             "file_count": context.get("total_files", 0),
@@ -2078,6 +2147,17 @@ def analyze_scope():
         return api_error(str(exc), 400)
 
 
+def _summary_cache_valid(summary, summary_type, require_healthy=False):
+    """Reject stale folder evidence contracts while preserving file caches."""
+    if not summary or summary.get("schema_version") not in {3, 4}:
+        return False
+    if require_healthy and bool((summary.get("parser_info") or {}).get("degraded")):
+        return False
+    if summary_type == "folder":
+        return summary.get("evidence_contract") == "question-answer-evidence/3.0"
+    return True
+
+
 @app.route("/api/summary", methods=["POST"])
 def summarize():
     payload = request.get_json(silent=True) or {}
@@ -2097,7 +2177,7 @@ def summarize():
                 if node.get("kind") != "group":
                     raise ValueError("只有主题或子方向节点可以生成节点摘要")
                 cached = storage.get_summary(scan_id, "node:{}".format(node_id), "folder")
-                if force or not (cached and cached.get("schema_version") in {3, 4}):
+                if force or not _summary_cache_valid(cached, "folder"):
                     require_local_model_enabled()
                     job_id, created = storage.create_or_get_typed_job(
                         scan_id, "generate_summary", options=payload, owner_id=_request_owner_id() or "legacy"
@@ -2113,7 +2193,7 @@ def summarize():
                     raise ValueError("节点不在本次安全清点范围内")
                 summary_type = "folder" if physical_node.get("kind") == "directory" or kind == "directory" else "file"
                 cached = storage.get_summary(scan_id, node_path, summary_type)
-                if force or not (cached and cached.get("schema_version") in {3, 4} and not bool(cached.get("parser_info", {}).get("degraded"))):
+                if force or not _summary_cache_valid(cached, summary_type, require_healthy=True):
                     require_local_model_enabled()
                     job_id, created = storage.create_or_get_typed_job(
                         scan_id, "generate_summary", options=payload, owner_id=_request_owner_id() or "legacy"
@@ -2130,7 +2210,7 @@ def summarize():
                 raise ValueError("只有主题或子方向节点可以生成节点摘要")
             cache_path = "node:{}".format(node_id)
             cached = storage.get_summary(scan_id, cache_path, "folder")
-            if cached and cached.get("schema_version") in {3, 4} and not force:
+            if _summary_cache_valid(cached, "folder") and not force:
                 return jsonify({"ok": True, "summary": cached, "cached": True, "degraded": bool(cached.get("parser_info", {}).get("degraded"))})
 
             context = _virtual_node_context(scan_id, node)
@@ -2174,7 +2254,7 @@ def summarize():
         if not local_only:
             require_local_model_enabled()
         cached = storage.get_summary(scan_id, node_path, summary_type)
-        if cached and cached.get("schema_version") in {3, 4} and not force and not bool(cached.get("parser_info", {}).get("degraded")):
+        if _summary_cache_valid(cached, summary_type, require_healthy=True) and not force:
             degraded = bool(cached.get("parser_info", {}).get("degraded"))
             return jsonify({"ok": True, "summary": cached, "cached": True, "degraded": degraded})
         if summary_type == "folder" and local_only:

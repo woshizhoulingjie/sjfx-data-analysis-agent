@@ -89,6 +89,11 @@ def evidence_corpus(documents, scope="."):
                 "content_sha256": item.get("content_sha256"),
                 "archive_source_path": item.get("archive_source_path"),
                 "archive_member": item.get("archive_member"),
+                "paragraph_index": item.get("paragraph_index"),
+                "block_index": item.get("block_index"),
+                "char_start": item.get("char_start"),
+                "char_end": item.get("char_end"),
+                "parser_version": item.get("parser_version"),
                 "evidence_quality": quality,
             })
     return chunks

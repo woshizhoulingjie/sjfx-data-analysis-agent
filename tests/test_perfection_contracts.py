@@ -7,8 +7,11 @@ from services.document_analysis import _split_text
 from services.exporter import export_node
 from services.package_analysis import (
     _add_related_topic_mounts,
+    _adaptive_tree,
+    _name_lexical_topic_nodes,
     _stable_group_node_id,
 )
+from unittest.mock import patch
 
 
 class PerfectionContractTests(unittest.TestCase):
@@ -34,6 +37,30 @@ class PerfectionContractTests(unittest.TestCase):
         self.assertEqual(sum(group["file_count"] for group in result["children"]), 2)
         self.assertEqual(sum(len(group["member_paths"]) for group in result["children"]), 2)
         self.assertEqual(result["membership_contract"]["related_membership"], "non_counting_reference")
+        self.assertTrue(result["membership_validation"]["valid"])
+
+    def test_lexical_tree_has_one_primary_parent_and_keeps_classification(self):
+        documents = {}
+        for index in range(8):
+            primary = "attack" if index < 4 else "detection"
+            documents["{}.txt".format(index)] = {
+                "topics": [primary, "security", "shared"],
+                "text": (primary + " security analysis ") * 20,
+                "source": {"path": "{}.txt".format(index), "size": 100},
+                "structure": {"headings": []},
+                "evidence": [],
+            }
+        with patch("services.package_analysis._content_topics", side_effect=lambda doc, limit=10: doc["topics"][:limit]):
+            tree = _adaptive_tree({"root": "/tmp/demo"}, documents, {}, enrich=False)
+            tree, result = _name_lexical_topic_nodes(tree, documents, llm=None)
+            tree = _add_related_topic_mounts(tree, documents)
+        self.assertIsNone(result)
+        self.assertTrue(tree["membership_validation"]["valid"])
+        self.assertEqual(sum(len(group["member_paths"]) for group in tree["children"]), 8)
+        self.assertTrue(all(doc["classification"]["classification_status"] == "classified" for doc in documents.values()))
+        self.assertTrue(all(doc["classification"]["primary_topic"] for doc in documents.values()))
+        self.assertTrue(all("topic_memberships" in doc["classification"] for doc in documents.values()))
+        self.assertTrue(all(any("\u4e00" <= char <= "\u9fff" for char in group["name"]) for group in tree["children"]))
 
     def test_token_budgeted_chunks_preserve_document_tail(self):
         text = ("第一节\n漏洞分析结论。\n\n" * 2000) + "全文最后的核验标记"

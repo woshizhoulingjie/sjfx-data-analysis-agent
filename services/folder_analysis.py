@@ -3,10 +3,25 @@ import json
 from services.ollama import LocalModelError
 from services.evidence import (
     attach_claim_evidence,
+    compact_evidence,
     evidence_quality,
     evidence_support,
     verify_claim_evidence,
 )
+
+
+def _catalog_evidence_item(evidence, source_path=None):
+    """Normalize an evidence card while retaining exact source locators."""
+    item = compact_evidence(evidence, max_chars=900)
+    item["source_path"] = evidence.get("source_path") or source_path
+    for key in (
+        "matched_terms", "supporting_quote", "support_type", "support_reason",
+        "support_status", "support_score", "support_relation", "verification_contract",
+        "semantic_score", "relevance_mode",
+    ):
+        if evidence.get(key) is not None:
+            item[key] = evidence.get(key)
+    return item
 
 
 def _fallback(context, node_path, errors=None):
@@ -133,19 +148,36 @@ def _normalize_question_answer_evidence(summary, catalog, node_path, context=Non
                 "support_status": claim_status,
             })
     if not claims and answer:
+        answer_evidence = []
+        for item in by_id.values():
+            verification = verify_claim_evidence(answer, item)
+            if verification.get("support_status") in {"supported", "partially_supported"}:
+                verified_item = dict(item)
+                verified_item.update(verification)
+                answer_evidence.append(verified_item)
+        answer_evidence = answer_evidence[:6]
+        all_evidence.extend(answer_evidence)
         claims.append({
             "statement": answer,
             "type": "summary",
-            "evidence_ids": [item.get("evidence_id") for item in all_evidence if item.get("evidence_id")],
-            "support_status": "supported" if all_evidence else "insufficient",
+            "evidence_ids": [item.get("evidence_id") for item in answer_evidence if item.get("evidence_id")],
+            "support_status": (
+                "supported"
+                if any(item.get("support_status") == "supported" for item in answer_evidence)
+                else "partially_supported" if answer_evidence else "insufficient"
+            ),
         })
-    supported = bool(claims) and all(
-        item.get("support_status") == "supported" for item in claims
-    )
-    partially_supported = bool(claims) and any(
-        item.get("support_status") == "partially_supported" for item in claims
-    )
-    if not supported and not partially_supported:
+    status_counts = {
+        status: sum(1 for item in claims if item.get("support_status") == status)
+        for status in ("supported", "partially_supported", "insufficient")
+    }
+    if claims and status_counts["supported"] == len(claims):
+        overall_status = "supported"
+    elif status_counts["supported"] or status_counts["partially_supported"]:
+        overall_status = "partially_supported"
+    else:
+        overall_status = "insufficient"
+    if overall_status == "insufficient":
         answer = "证据不足，当前不能形成可靠回答。"
         all_evidence = []
     summary["question"] = question
@@ -154,11 +186,18 @@ def _normalize_question_answer_evidence(summary, catalog, node_path, context=Non
     summary["claims"] = claims
     summary["evidence"] = all_evidence
     summary["evidence_ids"] = [item.get("evidence_id") for item in summary["evidence"] if item.get("evidence_id")]
-    summary["evidence_status"] = (
-        "supported" if supported else "partially_supported" if partially_supported else "insufficient"
-    )
-    summary["evidence_contract"] = "question-answer-evidence/2.0"
+    summary["evidence_status"] = overall_status
+    summary["evidence_contract"] = "question-answer-evidence/3.0"
+    summary["claim_status_counts"] = status_counts
+    summary["unique_evidence_count"] = len({item.get("evidence_id") for item in all_evidence if item.get("evidence_id")})
+    summary["independent_source_count"] = len({
+        item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path")
+        for item in all_evidence
+        if item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path")
+    })
     summary["question_answer_evidence"] = {
+        "contract": "question-answer-evidence/3.0",
+        "evidence_status": overall_status,
         "question": question,
         "value": value,
         "answer": answer,
@@ -167,9 +206,9 @@ def _normalize_question_answer_evidence(summary, catalog, node_path, context=Non
         "coverage": context.get("coverage") or {},
           "limitations": list(summary.get("limitations") or []) + (
               []
-              if supported
+              if overall_status == "supported"
               else ["部分结论只有间接证据支撑，建议人工复核。"]
-              if partially_supported
+              if overall_status == "partially_supported"
               else ["当前没有足够的有效正文证据支撑该回答。"]
           ),
     }
@@ -329,47 +368,7 @@ def _evidence_catalog(
                 evidence_id
             )
 
-            item = {
-                "evidence_id": evidence_id,
-
-                "source_path": source_path,
-
-                "page": evidence.get(
-                    "page"
-                ),
-
-                "section": evidence.get(
-                    "section"
-                ),
-
-                "text": " ".join(
-                    str(
-                        evidence.get(
-                            "text"
-                        )
-                        or ""
-                    ).split()
-                )[:900],
-
-                "matched_terms": evidence.get(
-                    "matched_terms",
-                    []
-                ),
-
-                "supporting_quote": evidence.get(
-                    "supporting_quote"
-                ),
-
-                "support_type": evidence.get(
-                    "support_type"
-                ),
-
-                "support_reason": evidence.get(
-                    "support_reason"
-                ),
-                "archive_source_path": evidence.get("archive_source_path"),
-                "archive_member": evidence.get("archive_member"),
-            }
+            item = _catalog_evidence_item(evidence, source_path)
 
             # =================================================
             # 保留原有证据支持判断能力
@@ -467,47 +466,7 @@ def _evidence_catalog(
                         evidence_id
                     )
 
-                    item = {
-                        "evidence_id": evidence_id,
-
-                        "source_path": source_path,
-
-                        "page": evidence.get(
-                            "page"
-                        ),
-
-                        "section": evidence.get(
-                            "section"
-                        ),
-
-                        "text": " ".join(
-                            str(
-                                evidence.get(
-                                    "text"
-                                )
-                                or ""
-                            ).split()
-                        )[:900],
-
-                        "matched_terms": evidence.get(
-                            "matched_terms",
-                            []
-                        ),
-
-                        "supporting_quote": evidence.get(
-                            "supporting_quote"
-                        ),
-
-                        "support_type": evidence.get(
-                            "support_type"
-                        ),
-
-                        "support_reason": evidence.get(
-                            "support_reason"
-                        ),
-                        "archive_source_path": evidence.get("archive_source_path"),
-                        "archive_member": evidence.get("archive_member"),
-                    }
+                    item = _catalog_evidence_item(evidence, source_path)
 
                     item.update(
                         evidence_support(

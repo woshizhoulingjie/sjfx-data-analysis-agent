@@ -250,10 +250,25 @@ def _optional_llm_enrichment_enabled():
 
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}")
+ENGLISH_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+CHINESE_TEXT_RE = re.compile(r"[\u4e00-\u9fff]+")
 STOPWORDS = {
     "the", "and", "for", "with", "from", "this", "that", "研究", "分析", "报告",
     "文档", "文件", "资料", "进行", "一种", "基于", "相关", "情况", "数据", "方法",
 }
+
+try:
+    import jieba
+    jieba.setLogLevel(30)
+    for _domain_term in (
+        "威胁情报", "漏洞利用", "入侵检测", "攻击技术", "恶意软件", "勒索软件",
+        "网络安全", "物联网安全", "车联网安全", "车载网络", "可信执行环境",
+        "侧信道攻击", "远程证明", "身份认证", "访问控制", "隐私保护", "密码技术",
+        "供应链安全", "数据泄露", "安全事件", "应急响应", "安全评估", "风险分析",
+    ):
+        jieba.add_word(_domain_term, freq=2_000_000)
+except ImportError:  # The deterministic regex fallback keeps offline maintenance usable.
+    jieba = None
 
 
 def _now():
@@ -908,7 +923,17 @@ def _walk_directories(node):
 
 
 def _tokens(text):
-    return [token.lower() for token in WORD_RE.findall(text or "") if token.lower() not in STOPWORDS]
+    value = str(text or "")
+    tokens = [token.lower() for token in ENGLISH_WORD_RE.findall(value)]
+    if jieba is not None:
+        chinese = " ".join(CHINESE_TEXT_RE.findall(value))
+        tokens.extend(
+            token.strip() for token in jieba.cut(chinese, cut_all=False)
+            if 2 <= len(token.strip()) <= 16
+        )
+    else:
+        tokens.extend(token for token in WORD_RE.findall(value) if CHINESE_TEXT_RE.fullmatch(token))
+    return [token for token in tokens if token not in STOPWORDS]
 
 
 def _features(text):
@@ -1407,6 +1432,25 @@ def _node_evidence(documents, member_paths, topics=None, max_items=6):
     return selected
 
 
+def _evidence_diversity_metrics(items):
+    """Expose real evidence diversity instead of an inflated reference count."""
+    evidence_ids = {
+        str(item.get("evidence_id")) for item in items or []
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+    sources = {
+        str(item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path"))
+        for item in items or []
+        if isinstance(item, dict)
+        and (item.get("source_sha256") or item.get("archive_source_path") or item.get("source_path"))
+    }
+    return {
+        "evidence_reference_count": len(list(items or [])),
+        "unique_evidence_count": len(evidence_ids),
+        "independent_source_count": len(sources),
+    }
+
+
 def _localized_subtopic_term(term):
     value = str(term or "").strip()
     if re.search(r"[\u4e00-\u9fff]", value):
@@ -1416,6 +1460,12 @@ def _localized_subtopic_term(term):
         "malware": "恶意软件", "threat": "威胁情报", "detection": "威胁检测",
         "privacy": "隐私保护", "network": "网络安全", "firmware": "固件安全",
         "authentication": "身份认证", "memory": "内存安全", "cloud": "云安全",
+        "cve": "漏洞情报", "intrusion": "入侵检测", "encryption": "加密技术",
+        "cryptography": "密码技术", "iot": "物联网安全", "android": "移动端安全",
+        "vehicle": "车联网安全", "automotive": "车联网安全", "can": "车载CAN安全",
+        "sidechannel": "侧信道安全", "side-channel": "侧信道安全",
+        "enclave": "可信执行环境", "tee": "可信执行环境", "sgx": "SGX安全",
+        "protocol": "协议安全", "adversarial": "对抗安全", "blockchain": "区块链安全",
     }.get(value.lower(), "专题（{}）".format(value[:12].upper() or "待命名"))
 
 
@@ -1511,6 +1561,7 @@ def _enrich_analysis_tree(tree, documents):
             topics=[topic_name] + list(topic_node.get("related_topics", [])),
             max_items=8,
         )
+        topic_node.update(_evidence_diversity_metrics(topic_node["evidence_chain"]))
 
         subtopic_nodes = []
         conclusion_evidence = []
@@ -1540,6 +1591,22 @@ def _enrich_analysis_tree(tree, documents):
                 if supporting_quotes
                 else "证据不足，当前不能形成可靠回答。"
             )
+            claim_statement = supporting_quotes[0][:420] if supporting_quotes else ""
+            verified_evidence = []
+            for evidence_item in evidence:
+                verification = verify_claim_evidence(claim_statement, evidence_item)
+                if verification.get("support_status") in {"supported", "partially_supported"}:
+                    verified_item = dict(evidence_item)
+                    verified_item.update(verification)
+                    verified_evidence.append(verified_item)
+            evidence = verified_evidence
+            claim_status = (
+                "supported"
+                if any(item.get("support_status") == "supported" for item in evidence)
+                else "partially_supported" if evidence else "insufficient"
+            )
+            if claim_status == "insufficient":
+                answer = "证据不足，当前不能形成可靠回答。"
             conclusion = {
                 # A traceable analysis unit is a valuable question, its answer,
                 # and the evidence that directly supports that answer.
@@ -1548,20 +1615,25 @@ def _enrich_analysis_tree(tree, documents):
                 "question": analysis_question,
                 "value": question_value,
                 "answer": answer,
-                "statement": answer,
+                "statement": claim_statement or answer,
                 "type": "问题—回答—证据",
                 "confidence": confidence,
                 "basis": "回答来自该子方向内文件的正文主题聚合，并由下列可回查原文证据直接支撑。",
                 "evidence": evidence,
                 "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
                 "claims": [{
-                    "statement": answer,
+                    "statement": claim_statement or answer,
                     "type": "inference",
                     "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
-                    "support_status": "supported" if evidence else "insufficient",
+                    "support_status": claim_status,
                 }],
-                "evidence_status": "supported" if evidence else "insufficient",
-                "limitations": [] if evidence else ["当前子方向没有达到有效正文证据门槛，不能据此形成可靠结论。"],
+                "evidence_status": claim_status,
+                "evidence_contract": "question-answer-evidence/3.0",
+                "limitations": (
+                    [] if claim_status == "supported"
+                    else ["当前子方向只有部分证据支撑，需要人工复核。"] if claim_status == "partially_supported"
+                    else ["当前子方向没有达到有效正文证据门槛，不能据此形成可靠结论。"]
+                ),
             }
             conclusion_evidence.append(conclusion)
 
@@ -1590,7 +1662,7 @@ def _enrich_analysis_tree(tree, documents):
                 ]
                 file_nodes.append(file_node)
 
-            subtopic_nodes.append({
+            subtopic_node = {
                 "kind": "group",
                 "node_type": "subtopic",
                 "node_id": _stable_group_node_id("子方向", "{}|{}".format(topic_name, subtopic_name), paths),
@@ -1611,7 +1683,9 @@ def _enrich_analysis_tree(tree, documents):
                 "evidence_chain": evidence,
                 "conclusion_evidence": [conclusion],
                 "children": file_nodes,
-            })
+            }
+            subtopic_node.update(_evidence_diversity_metrics(evidence))
+            subtopic_nodes.append(subtopic_node)
 
         topic_node["conclusion_evidence"] = conclusion_evidence
         topic_node["children"] = subtopic_nodes
@@ -1840,7 +1914,7 @@ def _name_subtopic_nodes(tree, documents, llm):
         return tree, None
 
 
-def _adaptive_tree(scan, documents, node_summaries):
+def _adaptive_tree(scan, documents, node_summaries, enrich=True):
     """
     Theme-first adaptive analysis tree.
 
@@ -1997,17 +2071,16 @@ def _adaptive_tree(scan, documents, node_summaries):
 
             selected_topic = max(candidates)[3]
             best_score = max(item[0] for item in candidates)
-            # A document may legitimately belong to more than one research
-            # topic.  Keep one primary topic for scoring, while mounting up to
-            # three strong related topics in the navigational tree.
+            # A document may legitimately relate to more than one research
+            # topic, but the primary tree is a partition: exactly one counting
+            # parent.  Secondary topics remain non-counting metadata/refs.
             memberships = [
                 item[3] for item in sorted(candidates, key=lambda item: (-item[0], item[3]))
                 if item[0] >= best_score * 0.55
             ][:3]
             if selected_topic not in memberships:
                 memberships.insert(0, selected_topic)
-            for membership in memberships:
-                assignments[membership].append(path)
+            assignments[selected_topic].append(path)
             alternatives = sorted((item[0] for item in candidates), reverse=True)
             margin = (
                 (best_score - alternatives[1]) / float(max(1.0, best_score))
@@ -2036,7 +2109,7 @@ def _adaptive_tree(scan, documents, node_summaries):
 
         else:
             unassigned.append(path)
-        documents[path].setdefault("classification", {}).update({
+            documents[path].setdefault("classification", {}).update({
                 "primary_topic": None,
                 "confidence": 0.0,
                 "classification_status": "unclassified",
@@ -2063,6 +2136,7 @@ def _adaptive_tree(scan, documents, node_summaries):
             for path in singleton_paths:
                 documents[path].setdefault("classification", {}).update({
                     "primary_topic": None,
+                    "topic_memberships": [],
                     "confidence": 0.0,
                     "classification_status": "unclassified",
                     "classification_reason": "主题只在单个文件出现，未形成稳定的跨文档分类。",
@@ -2159,6 +2233,7 @@ def _adaptive_tree(scan, documents, node_summaries):
 
             "dimension": "内容主题",
             "classification_status": "classified",
+            "topic_key": topic,
 
             "name": visible_name,
 
@@ -2291,7 +2366,7 @@ def _adaptive_tree(scan, documents, node_summaries):
 
         "children": children,
     }
-    return _enrich_analysis_tree(tree, documents)
+    return _enrich_analysis_tree(tree, documents) if enrich else tree
 
 def _cluster_label(primary_topic, paths, documents):
     """Use a small co-occurring keyword set instead of a bare token label."""
@@ -2756,6 +2831,12 @@ def _fallback_semantic_name(cluster, documents):
         "kernel": "内核安全", "memory": "内存安全", "cloud": "云安全",
         "authentication": "身份认证", "cryptography": "密码技术",
         "ransomware": "勒索软件", "detection": "威胁检测",
+        "cve": "漏洞情报", "intrusion": "入侵检测", "encryption": "加密技术",
+        "iot": "物联网安全", "android": "移动端安全", "vehicle": "车联网安全",
+        "automotive": "车联网安全", "can": "车载CAN安全",
+        "sidechannel": "侧信道安全", "side-channel": "侧信道安全",
+        "enclave": "可信执行环境", "tee": "可信执行环境", "sgx": "SGX安全",
+        "protocol": "协议安全", "adversarial": "对抗安全", "blockchain": "区块链安全",
     }
     translated = []
     for word in words:
@@ -3016,6 +3097,114 @@ def _name_semantic_clusters(
         return clusters, None
 
 
+def _name_lexical_topic_nodes(tree, documents, llm=None):
+    """Give lexical-fallback top-level groups readable Chinese names.
+
+    The deterministic partition and stable node ids are never changed here.
+    One bounded model call may improve all labels; a deterministic Chinese
+    fallback is always present when the shared model is disabled or busy.
+    """
+    nodes = {}
+    descriptors = []
+    fallback_names = Counter()
+    for index, node in enumerate(tree.get("children") or [], 1):
+        if node.get("kind") != "group" or node.get("classification_status") != "classified":
+            continue
+        members = [path for path in node.get("member_paths") or [] if path in documents]
+        if not members:
+            continue
+        old_name = str(node.get("name") or "")
+        cluster = {
+            "cluster_id": "LEX-{:04d}".format(index),
+            "members": members,
+            "representative_documents": sorted(
+                members, key=lambda path: len(documents[path].get("text", "")), reverse=True
+            )[:3],
+        }
+        fallback = _fallback_semantic_name(cluster, documents)
+        fallback_names[fallback] += 1
+        if fallback_names[fallback] > 1:
+            fallback = "{}（{}）".format(fallback, fallback_names[fallback])
+        node.update({
+            "name": fallback,
+            "naming_source": "local_fallback",
+            "naming_status": "degraded",
+            "naming_confidence": 0.45,
+            "naming_degradation_reason": "语义向量不可用，已根据正文主题词生成中文回退名称",
+            "lexical_source_name": old_name,
+        })
+        node["summary"] = "根据正文主题词形成“{}”，共包含 {} 个文件。".format(fallback, len(members))
+        node_id = node.get("node_id")
+        if not node_id:
+            continue
+        nodes[node_id] = node
+        samples = [
+            _semantic_document_profile(path, documents[path], max_chars=650)
+            for path in cluster["representative_documents"]
+        ]
+        descriptors.append({
+            "node_id": node_id,
+            "current_name": fallback,
+            "source_terms": [node.get("topic_key")] + list(node.get("related_topics") or [])[:6],
+            "file_count": len(members),
+            "representative_material": samples,
+        })
+
+    if not descriptors or llm is None:
+        return tree, None
+
+    prompt = """请为以下由本地算法确定成员的资料主题生成中文目录名。你只能改善名称和一句话说明，不能改变 node_id、成员或编造材料外事实。
+要求：名称 4-22 个字，准确体现研究对象或问题；可保留 CVE、TEE、RISC-V 等术语；禁止使用“未知资料”“综合内容”等空泛名称。
+
+输入：
+{}
+
+输出 JSON：
+{{"topics":[{{"node_id":"group-...","name":"中文主题名","summary":"一句话说明"}}]}}""".format(
+        json.dumps(descriptors, ensure_ascii=False)
+    )
+    try:
+        result = llm.chat_json(
+            "你是严谨的中文情报资料目录组织助手，只根据给定正文材料命名。",
+            prompt,
+            max_tokens=1400,
+            strict=True,
+            retries=0,
+            timeout=180,
+            required_fields=("topics",),
+            output_context="词法主题中文命名",
+        )
+        named = {
+            item.get("node_id"): item
+            for item in result.get("json", {}).get("topics", [])
+            if isinstance(item, dict) and item.get("node_id") in nodes
+        }
+        used_names = Counter()
+        for node_id, node in nodes.items():
+            item = named.get(node_id) or {}
+            proposed = _valid_semantic_name(item.get("name"))
+            name = proposed or node["name"]
+            used_names[name] += 1
+            if used_names[name] > 1:
+                name = "{}（{}）".format(name, used_names[name])
+            node["name"] = name
+            if proposed:
+                node.update({
+                    "naming_source": "local_model",
+                    "naming_status": "enhanced",
+                    "naming_confidence": 0.82,
+                })
+                node.pop("naming_degradation_reason", None)
+            summary = str(item.get("summary") or node.get("summary") or "").strip()[:300]
+            if summary:
+                node["summary"] = summary
+        return tree, result
+    except Exception as exc:
+        for node in nodes.values():
+            node["naming_degradation_reason"] = "词法主题模型命名失败，保留中文回退名称：{}".format(str(exc)[:140])
+        return tree, None
+
+
 def _semantic_adaptive_tree(
     scan,
     documents,
@@ -3104,6 +3293,17 @@ def _semantic_adaptive_tree(
             )
         )
 
+        for path in member_paths:
+            selected = _node_evidence(documents, [path], topics=[name], max_items=2)
+            documents[path].setdefault("classification", {}).update({
+                "primary_topic": name,
+                "topic_memberships": [name],
+                "confidence": round(float(cluster.get("mean_similarity") or 0.8), 3),
+                "classification_status": "classified",
+                "classification_reason": "文档通过本地语义向量聚类归入该唯一主主题。",
+                "evidence_ids": [item.get("evidence_id") for item in selected if item.get("evidence_id")],
+            })
+
         total_size = sum(
             int(
                 documents[path]
@@ -3119,6 +3319,7 @@ def _semantic_adaptive_tree(
             "node_id": _stable_group_node_id("内容主题", name, member_paths),
             "dimension": "内容主题",
             "classification_status": "classified",
+            "topic_key": name,
             "name": name,
             "summary": (
                 cluster.get("summary")
@@ -3173,6 +3374,30 @@ def _semantic_adaptive_tree(
     return _enrich_analysis_tree(tree, documents)
 
 
+def _primary_membership_validation(tree, expected_paths):
+    """Measure the top-level partition without trusting declared counts."""
+    expected = {str(path) for path in expected_paths or []}
+    counts = Counter()
+    for group in tree.get("children") or []:
+        if group.get("kind") != "group" or group.get("classification_status") in {"pending", "failed"}:
+            continue
+        counts.update(str(path) for path in dict.fromkeys(group.get("member_paths") or []))
+    duplicates = sorted(path for path in expected if counts.get(path, 0) > 1)
+    missing = sorted(path for path in expected if counts.get(path, 0) == 0)
+    unexpected = sorted(path for path in counts if path not in expected)
+    return {
+        "valid": not duplicates and not missing,
+        "expected_file_count": len(expected),
+        "covered_file_count": sum(1 for path in expected if counts.get(path, 0) >= 1),
+        "duplicate_primary_count": len(duplicates),
+        "missing_primary_count": len(missing),
+        "unexpected_path_count": len(unexpected),
+        "duplicate_primary_paths": duplicates[:20],
+        "missing_primary_paths": missing[:20],
+        "unexpected_paths": unexpected[:20],
+    }
+
+
 def _add_related_topic_mounts(tree, documents):
     """Add non-counting cross-topic references without duplicating leaves.
 
@@ -3182,10 +3407,12 @@ def _add_related_topic_mounts(tree, documents):
     still exposing useful cross-topic relationships to the UI.
     """
     groups = [item for item in tree.get("children") or [] if item.get("kind") == "group"]
-    if len(groups) < 2:
-        return tree
+    for group in groups:
+        group["related_file_refs"] = []
     for path, document in documents.items():
         doc_topics = set(_content_topics(document, 12))
+        memberships = list((document.get("classification") or {}).get("topic_memberships") or [])
+        primary_topic = (document.get("classification") or {}).get("primary_topic")
         if not doc_topics:
             continue
         mounted = 0
@@ -3193,16 +3420,22 @@ def _add_related_topic_mounts(tree, documents):
             members = set(group.get("member_paths") or [])
             if path in members:
                 continue
+            topic_key = group.get("topic_key")
             group_terms = set(_tokens(group.get("name") or ""))
             group_terms.update(str(value) for value in group.get("related_topics") or [])
             overlap = len(doc_topics.intersection(group_terms))
-            if overlap < 2:
+            declared_related = bool(topic_key and topic_key != primary_topic and topic_key in memberships)
+            if not declared_related and overlap < 2:
                 continue
             reference = {
                 "path": path,
                 "name": Path(path).name,
                 "overlap": overlap,
-                "reason": "正文主题与该节点存在 {} 个共同主题词".format(overlap),
+                "reason": (
+                    "该方向是文档分类结果中的次要主题"
+                    if declared_related
+                    else "正文主题与该节点存在 {} 个共同主题词".format(overlap)
+                ),
             }
             group.setdefault("related_file_refs", []).append(reference)
             mounted += 1
@@ -3215,9 +3448,14 @@ def _add_related_topic_mounts(tree, documents):
         )
         group["related_file_refs"] = references
         group["related_file_count"] = len(references)
+    validation = _primary_membership_validation(tree, documents.keys())
+    tree["membership_validation"] = validation
     tree["membership_contract"] = {
         "primary_membership": "exactly_one",
         "related_membership": "non_counting_reference",
+        "enforced": validation["valid"],
+        "contract_version": "analysis-tree-membership/2.0",
+        "scope": "all_parsed_physical_files",
     }
     return tree
 
@@ -3850,20 +4088,25 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         node_summaries["."]["retrieval_method"] = retrieval.get("method")
         storage.save_summary(scan_id, ".", "folder", node_summaries["."])
 
-    adaptive_tree = (
-        _semantic_adaptive_tree(
+    if semantic_clusters:
+        adaptive_tree = _semantic_adaptive_tree(
             scan,
             canonical_documents,
             node_summaries,
             semantic_clusters,
         )
-        if semantic_clusters
-        else _adaptive_tree(
+        lexical_naming_result = None
+    else:
+        adaptive_tree = _adaptive_tree(
             scan,
             canonical_documents,
             node_summaries,
+            enrich=False,
         )
-    )
+        adaptive_tree, lexical_naming_result = _name_lexical_topic_nodes(
+            adaptive_tree, canonical_documents, llm,
+        )
+        adaptive_tree = _enrich_analysis_tree(adaptive_tree, canonical_documents)
     progress(88, "生成可下钻子方向名称")
     if llm is not None:
         adaptive_tree, subtopic_naming_result = _name_subtopic_nodes(
@@ -3880,7 +4123,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         aliases_by_canonical,
         node_summaries,
     )
-    adaptive_tree = _add_related_topic_mounts(adaptive_tree, canonical_documents)
+    adaptive_tree = _add_related_topic_mounts(adaptive_tree, documents)
     # The content tree annotates documents with their primary topic,
     # confidence and classification evidence.  Persist those annotations so a
     # restart or later export sees the same auditable decision.
@@ -3984,6 +4227,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     package_model_calls = []
     for stage_name, call_result in (
         ("semantic_cluster_naming", naming_result),
+        ("lexical_topic_naming", lexical_naming_result),
         ("subtopic_naming", subtopic_naming_result),
     ):
         if not call_result:
@@ -4073,6 +4317,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "semantic_topic_clusters": semantic_clusters,
         "semantic_cluster_threshold": semantic_threshold,
         "semantic_naming_model": semantic_naming_model,
+        "lexical_topic_naming_model": (lexical_naming_result or {}).get("model") if lexical_naming_result else None,
         "subtopic_naming_model": (subtopic_naming_result or {}).get("model") if subtopic_naming_result else None,
         "semantic_cluster_error": semantic_error,
         "classification_dimensions": adaptive_tree["dimensions"],

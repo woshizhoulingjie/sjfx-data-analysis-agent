@@ -28,6 +28,21 @@ INDIRECT_SIGNALS = {
     "风险": ("损失", "故障", "异常", "事故", "暴露", "攻击"),
     "效果": ("提升", "下降", "准确率", "召回率", "对照", "实验结果"),
 }
+RELATION_VERBS = (
+    "不支持", "无法支持", "不能支持", "尚未支持", "未支持", "支持",
+    "攻击", "入侵", "导致", "造成", "引发", "影响", "依赖", "包含",
+    "采用", "提供", "实现", "提升", "提高", "增加", "降低", "减少",
+    "阻止", "检测", "修复", "披露", "利用", "访问", "控制",
+)
+RELATION_CANONICAL = {
+    "不支持": "支持", "无法支持": "支持", "不能支持": "支持",
+    "尚未支持": "支持", "未支持": "支持", "支持": "支持",
+    "攻击": "攻击", "入侵": "攻击",
+    "导致": "导致", "造成": "导致", "引发": "导致",
+    "提升": "增加", "提高": "增加", "增加": "增加",
+    "降低": "减少", "减少": "减少",
+}
+NEGATIVE_RELATIONS = {"不支持", "无法支持", "不能支持", "尚未支持", "未支持", "阻止"}
 _EMBEDDING_PROVIDER = None
 _EMBEDDING_CACHE = {}
 _EMBEDDING_CACHE_LIMIT = 512
@@ -116,6 +131,107 @@ def _claim_numbers(text):
         r"\d+(?:\.\d+)?\s*(?:%|％|万|亿|吨|元|天|次|例|倍|项|种)?",
         str(text or ""),
     ))
+
+
+def _relation_entity(value, side="left"):
+    """Return a conservative subject/object anchor around a relation verb."""
+    text = re.sub(r"\s+", "", str(value or ""))
+    text = re.sub(
+        r"^(?:但是|然而|同时|其中|并且|而且|调查结果|研究结果|分析结果|证据|报告|研究|数据)?"
+        r"(?:明确)?(?:显示|表明|指出|发现|证明|说明)?[，,:：]*",
+        "",
+        text,
+    )
+    text = re.split(r"(?:但是|然而|同时|其中|并且|而且|并|且|但|而|因此|从而|由于|因为)", text)[0]
+    text = text.strip("，,。；;：:了的将对向把被已")
+    if not text:
+        return ""
+    matches = re.findall(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,20}", text)
+    if not matches:
+        return text[-20:] if side == "left" else text[:20]
+    value = matches[-1] if side == "left" else matches[0]
+    return value[-20:] if side == "left" else value[:20]
+
+
+def _relation_frames(text):
+    """Extract bounded subject-relation-object frames for direction checks."""
+    frames = []
+    pattern = re.compile("|".join(re.escape(item) for item in sorted(RELATION_VERBS, key=len, reverse=True)))
+    clauses = [item for item in re.split(r"[。！？；;，,\n]+", str(text or "")) if item.strip()]
+    for clause in clauses:
+        for match in pattern.finditer(clause):
+            verb = match.group(0)
+            left = _relation_entity(clause[:match.start()], "left")
+            right = _relation_entity(clause[match.end():], "right")
+            if not left or not right:
+                continue
+            prefix = clause[max(0, match.start() - 3):match.start()]
+            negative = verb in NEGATIVE_RELATIONS or bool(re.search(r"(?:不|未|无|无法|不能|尚未)$", prefix))
+            frames.append({
+                "subject": left,
+                "relation": RELATION_CANONICAL.get(verb, verb),
+                "object": right,
+                "negative": negative,
+                "text": clause.strip(),
+            })
+    return frames
+
+
+def _entity_matches(left, right):
+    left = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]", "", str(left or "")).lower()
+    right = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]", "", str(right or "")).lower()
+    if not left or not right:
+        return False
+    return left == right or (min(len(left), len(right)) >= 3 and (left.endswith(right) or right.endswith(left)))
+
+
+def _verify_relation_frames(claim, evidence):
+    """Reject reversed entities and relation-specific negation mismatches."""
+    claim_frames = _relation_frames(claim)
+    if not claim_frames:
+        return None
+    evidence_frames = _relation_frames(evidence)
+    matched_quotes = []
+    for expected in claim_frames:
+        same_relation = [item for item in evidence_frames if item["relation"] == expected["relation"]]
+        exact = [
+            item for item in same_relation
+            if _entity_matches(item["subject"], expected["subject"])
+            and _entity_matches(item["object"], expected["object"])
+        ]
+        if exact:
+            same_polarity = [item for item in exact if item["negative"] == expected["negative"]]
+            if not same_polarity:
+                return {
+                    "support_status": "insufficient", "support_score": 0.0,
+                    "support_reason": "证据讨论了相同主客体关系，但否定范围与结论相反",
+                    "support_relation": "polarity_mismatch",
+                }
+            matched_quotes.append(same_polarity[0]["text"])
+            continue
+        reversed_frames = [
+            item for item in same_relation
+            if _entity_matches(item["subject"], expected["object"])
+            and _entity_matches(item["object"], expected["subject"])
+        ]
+        if reversed_frames:
+            return {
+                "support_status": "insufficient", "support_score": 0.0,
+                "support_reason": "证据中的主语和宾语方向与结论相反",
+                "support_relation": "direction_mismatch",
+            }
+        return {
+            "support_status": "insufficient", "support_score": 0.0,
+            "support_reason": "没有找到主语、关系和宾语一致的原文陈述",
+            "support_relation": "relation_unverified",
+        }
+    return {
+        "support_status": "verified_relation",
+        "support_score": 0.85,
+        "support_reason": "证据中的主语、关系、宾语和否定范围与结论一致",
+        "support_relation": "direct_frame",
+        "matched_quote": matched_quotes[0][:280] if matched_quotes else "",
+    }
 
 
 def compact_evidence(item, max_chars=520):
@@ -266,44 +382,55 @@ def _claim_match(item, topics, semantic_score=0.0, indirect_signals=None):
 
 def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexical-fallback"):
     """Verify that one source unit actually supports one concrete claim."""
+    def result(payload):
+        payload["verification_contract"] = "claim-evidence/3.0"
+        return payload
+
     quality = evidence_quality(item)
     if not quality.get("eligible"):
-        return {
+        return result({
             "support_status": "insufficient",
             "support_score": 0.0,
             "support_reason": quality.get("reason") or "证据质量不合格",
-        }
+        })
     claim_text = " ".join(str(claim or "").split())
     text = " ".join(str(item.get("text") or "").split())
     if not claim_text:
-        return {
+        return result({
             "support_status": "insufficient",
             "support_score": 0.0,
             "support_reason": "结论为空，无法验证证据关系",
-        }
+        })
 
     claim_numbers = _claim_numbers(claim_text)
     evidence_numbers = _claim_numbers(text)
     if claim_numbers and not claim_numbers.issubset(evidence_numbers):
-        return {
+        return result({
             "support_status": "insufficient",
             "support_score": 0.0,
             "support_reason": "结论中的数字或量化单位未在原文证据中一致出现",
-        }
+        })
 
     if ABSOLUTE_CUE_RE.search(claim_text) and not ABSOLUTE_CUE_RE.search(text):
-        return {
+        return result({
             "support_status": "partially_supported",
             "support_score": 0.3,
             "support_reason": "结论使用了绝对化表述，但原文证据没有支持相同强度",
-        }
+        })
+
+    relation = _verify_relation_frames(claim_text, text)
+    if relation:
+        if relation.get("support_status") == "verified_relation":
+            relation["support_status"] = "supported"
+            return result(relation)
+        return result(relation)
 
     if bool(NEGATION_RE.search(claim_text)) != bool(NEGATION_RE.search(text)):
-        return {
+        return result({
             "support_status": "partially_supported",
             "support_score": 0.35,
             "support_reason": "结论与证据的否定范围不一致，需要人工复核",
-        }
+        })
 
     match = _claim_match(item, [claim_text], semantic_score=semantic_score)
     matched_terms = set(match.get("matched_terms") or [])
@@ -313,31 +440,31 @@ def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexic
         strong_count >= 1 or (len(matched_terms) >= 2 and quality.get("factual"))
     ):
         score = min(1.0, 0.65 + 0.08 * strong_count + (0.12 if quality.get("factual") else 0.0))
-        return {
+        return result({
             "support_status": "supported",
             "support_score": round(score, 3),
             "support_reason": match.get("support_reason"),
             "support_relation": "direct",
-        }
+        })
     if match.get("support_type") == "间接证据":
-        return {
+        return result({
             "support_status": "partially_supported",
             "support_score": 0.55,
             "support_reason": match.get("support_reason"),
             "support_relation": "indirect",
-        }
+        })
     if semantic >= 0.78:
-        return {
+        return result({
             "support_status": "partially_supported",
             "support_score": round(min(0.75, semantic), 3),
             "support_reason": "语义高度相关但缺少关键术语字面支撑，需要人工复核",
             "support_relation": "semantic",
-        }
-    return {
+        })
+    return result({
         "support_status": "insufficient",
         "support_score": 0.0,
         "support_reason": "原文没有直接或可靠间接支撑该结论的内容",
-    }
+    })
 
 
 def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=520):
