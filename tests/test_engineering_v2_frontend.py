@@ -18,9 +18,17 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         ids = re.findall(r'\bid="([^"]+)"', self.html)
         self.assertEqual(len(ids), len(set(ids)), "HTML element ids must remain unique")
         self.assertIn('/static/engineering-v2.css?v=2', self.html)
-        self.assertIn('/static/engineering-v2.js?v=2', self.html)
+        self.assertIn('/static/engineering-v2.js?v=3', self.html)
         self.assertNotRegex(self.script, r'https?://|\bcdn\b')
         self.assertNotRegex(self.style, r'@import|https?://')
+
+    def test_api_token_is_normalized_before_becoming_a_request_header(self):
+        app_script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('/static/app.js?v=20', self.html)
+        for script in (app_script, self.script):
+            self.assertIn('normalizeApiToken', script)
+            self.assertIn("removeItem('sjfx_api_token')", script)
+            self.assertIn(r'/^[\x21-\x7e]+$/', script)
 
     def test_shell_exposes_dedicated_chat_translation_and_package_overview_routes(self):
         for route in ("chat", "translation", "overview"):

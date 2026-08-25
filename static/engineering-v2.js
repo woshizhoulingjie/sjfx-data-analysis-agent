@@ -50,13 +50,15 @@
   async function api(url, options) {
     options = options || {};
     const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
-    let token = window.sessionStorage.getItem('sjfx_api_token') || '';
+    const storedToken = window.sessionStorage.getItem('sjfx_api_token') || '';
+    let token = normalizeApiToken(storedToken);
+    if (storedToken && !token) window.sessionStorage.removeItem('sjfx_api_token');
     if (token) headers['X-SJFX-Token'] = token;
     let response = await window.fetch(url, Object.assign({}, options, { headers }));
     if (response.status === 401) {
       window.sessionStorage.removeItem('sjfx_api_token');
       delete headers['X-SJFX-Token'];
-      token = window.prompt('访问凭据已失效，请重新输入 SJFX API Token', '') || '';
+      token = normalizeApiToken(window.prompt('访问凭据已失效，请重新输入 SJFX API Token', '') || '');
       if (token) {
         window.sessionStorage.setItem('sjfx_api_token', token);
         headers['X-SJFX-Token'] = token;
@@ -71,6 +73,11 @@
       throw error;
     }
     return payload;
+  }
+
+  function normalizeApiToken(value) {
+    const token = String(value || '').trim();
+    return /^[\x21-\x7e]+$/.test(token) ? token : '';
   }
 
   function formatBytes(value) {
