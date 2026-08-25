@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#102d27">
   <title>SJFX · 数据分析工作台</title>
   <link rel="stylesheet" href="/static/style.css?v=20">
+  <link rel="stylesheet" href="/static/engineering-v2.css?v=1">
 </head>
 <body>
   <div class="app-shell">
@@ -18,8 +19,10 @@
         <button class="nav-item" data-route="packages"><span class="nav-icon">▣</span>数据包</button>
         <button class="nav-item" data-route="physical"><span class="nav-icon">⌘</span>原始目录</button>
         <button class="nav-item" data-route="analysis"><span class="nav-icon">✦</span>智能分析</button>
+        <button class="nav-item" data-route="chat"><span class="nav-icon">◌</span>资料问答</button>
+        <button class="nav-item" data-route="translation"><span class="nav-icon">文</span>全文翻译</button>
         <button class="nav-item" data-route="evidence"><span class="nav-icon">⌕</span>证据问答</button>
-        <button class="nav-item" data-route="overview"><span class="nav-icon">▤</span>情况概览</button>
+        <button class="nav-item" data-route="overview"><span class="nav-icon">▤</span>数据包概览</button>
         <button class="nav-item" data-route="exports"><span class="nav-icon">⇩</span>导出中心</button>
         <button class="nav-item" data-route="tasks"><span class="nav-icon">◷</span>任务中心</button>
         <div class="nav-label nav-label-spaced">系统</div>
@@ -44,7 +47,65 @@
 
         <section class="app-view evidence-view" data-view="evidence"><div class="page-heading compact"><div><div class="eyebrow">EVIDENCE / QUESTIONS</div><h1>证据与问答</h1><p>提出一个有价值的问题，检索能够直接解释它的正文证据。</p></div></div><div class="evidence-layout"><article class="surface question-card"><div class="surface-heading"><div><span class="section-kicker">LOCAL RETRIEVAL</span><h2>从资料中提问</h2></div><span class="round-icon">⌕</span></div><label for="retrievalQuery">问题</label><div class="input-row"><input id="retrievalQuery" placeholder="例如：哪些资料支持该研究方向？" autocomplete="off"><button id="retrievalBtn" disabled class="primary">检索证据</button></div><small class="help-text">使用本地 BM25 与 TF-IDF 字符向量，检索过程不调用生成模型。</small><div class="question-divider"></div><label for="numericQuestion">结构化数据统计</label><div class="input-row"><input id="numericQuestion" placeholder="例如：销售额的总和是多少？" autocomplete="off"><button id="numericQuestionBtn" disabled>计算</button></div><small class="help-text">对 CSV/XLSX/JSON 画像跨同构文件计算合计、平均、最大、最小和记录数；覆盖完整时为精确结果，采样画像会明确标注部分覆盖并返回参与文件与行范围。</small></article><article class="surface evidence-result-card"><div class="surface-heading"><div><span class="section-kicker">TRACEABLE ANSWER</span><h2>问题—回答—证据</h2></div><button class="text-button" data-go-route="analysis">回到智能目录 →</button></div><div id="evidenceSummary" class="evidence-summary-note">检索结果和当前节点的证据链会在这里显示。每条证据都应能回到原始文件的位置。</div><div id="evidenceResultMount"></div></article></div></section>
 
-        <section class="app-view overview-view" data-view="overview"><div class="page-heading compact"><div><div class="eyebrow">REPORT / INSIGHT</div><h1>情况概览</h1><p>集中查看数据包价值判断、关键发现、研究方向和覆盖率边界。</p></div><button class="primary" data-go-route="packages" id="overviewReportAction">生成或刷新概览</button></div><div class="overview-grid"><article class="surface overview-main"><div class="overview-placeholder"><div class="placeholder-icon">▤</div><h2>概览结果会显示在这里</h2><p>完成一次分析后，系统会把自动生成的 Word 概览、推荐研究方向和覆盖率限制集中呈现。</p><button class="secondary" data-go-route="packages">前往数据包管理开始分析</button></div><div id="overviewResultMount"></div></article><aside class="surface overview-side"><span class="section-kicker">WHAT TO CHECK</span><h3>阅读概览时关注</h3><ul class="check-list"><li><span>01</span>数据是否完成全量分析</li><li><span>02</span>推荐方向是否有有效证据</li><li><span>03</span>哪些文件仍待处理或失败</li><li><span>04</span>结论是否需要人工核验</li></ul></aside></div></section>
+        <section class="app-view overview-view" data-view="overview">
+          <div class="page-heading compact"><div><div class="eyebrow">PACKAGE / CONTENT MAP</div><h1>数据包概览</h1><p>只呈现数据包自身的规模、构成、时间、主题、实体与文件联系，不混入任务进度或模型运行信息。</p></div><button class="secondary" id="packageOverviewRefreshBtn" disabled>刷新数据概览</button></div>
+          <div id="packageOverviewState" class="v2-inline-state" role="status" aria-live="polite">导入数据包后生成内容概览。</div>
+          <div id="packageOverviewMetrics" class="v2-overview-metrics" aria-label="数据包规模"></div>
+          <div class="v2-overview-grid">
+            <article class="surface v2-chart-card v2-wide"><div class="surface-heading"><div><span class="section-kicker">DIRECTORIES</span><h2>目录规模</h2></div></div><div id="packageOverviewDirectories" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">FORMATS</span><h2>文件格式</h2></div></div><div id="packageOverviewFormats" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">DOCUMENT TYPES</span><h2>文档类型</h2></div></div><div id="packageOverviewTypes" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">LANGUAGES</span><h2>语言分布</h2></div></div><div id="packageOverviewLanguages" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card v2-wide"><div class="surface-heading"><div><span class="section-kicker">TIMELINE</span><h2>资料时间分布</h2></div></div><div id="packageOverviewTimeline" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">TOPICS</span><h2>主要主题</h2></div></div><div id="packageOverviewTopics" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">ENTITIES</span><h2>人物与机构</h2></div></div><div id="packageOverviewEntities" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card v2-wide"><div class="surface-heading"><div><span class="section-kicker">RELATIONSHIPS</span><h2>文件关系</h2></div></div><div id="packageOverviewRelationships" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">DUPLICATES</span><h2>重复文件</h2></div></div><div id="packageOverviewDuplicates" class="v2-chart-mount"></div></article>
+            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">OUTLIERS</span><h2>异常与孤立文件</h2></div></div><div id="packageOverviewOutliers" class="v2-chart-mount"></div></article>
+          </div>
+        </section>
+
+        <section class="app-view v2-chat-view" data-view="chat">
+          <div class="page-heading compact"><div><div class="eyebrow">CONVERSATION / EVIDENCE</div><h1>与资料持续对话</h1><p>围绕整个数据包或指定范围提问、追问；回答保留原文引用，证据不足时自动提交补充深析。</p></div><button class="primary" id="conversationNewBtn" disabled>＋ 新建会话</button></div>
+          <div class="v2-chat-layout">
+            <aside class="surface v2-chat-sidebar">
+              <span class="section-kicker">QUESTION SCOPE</span><h2>问答范围</h2>
+              <label for="conversationScopeKind">范围类型</label>
+              <select id="conversationScopeKind"><option value="package">整个数据包</option><option value="topic">主题</option><option value="directory">目录</option><option value="entity">人物或机构</option><option value="time">时间范围</option><option value="file_type">文件类型</option><option value="files">指定文件</option></select>
+              <div id="conversationScopeFields"></div>
+              <label class="v2-check"><input id="conversationPersistScope" type="checkbox" checked><span>后续追问沿用此范围</span></label>
+              <div class="v2-divider"></div>
+              <div class="v2-list-heading"><span>历史会话</span><button class="text-button" id="conversationListRefreshBtn">刷新</button></div>
+              <div id="conversationList" class="v2-session-list" aria-label="历史会话"></div>
+            </aside>
+            <article class="surface v2-chat-main">
+              <div class="v2-chat-header"><div><span class="section-kicker">TRACEABLE CHAT</span><h2 id="conversationTitle">尚未开始会话</h2><small id="conversationScopeSummary">请选择范围并新建会话</small></div><div id="conversationDeepeningState" class="v2-job-state" role="status" aria-live="polite"></div></div>
+              <div id="conversationMessages" class="v2-message-list" aria-live="polite"><div class="v2-empty"><strong>从资料中提出第一个问题</strong><span>例如：这批资料主要讲了什么？哪些文件相互关联？</span></div></div>
+              <div id="conversationSuggestions" class="v2-suggestions" aria-label="问题建议"><button type="button">这批资料主要讲了什么？</button><button type="button">哪些人物和机构最重要？</button><button type="button">资料中有哪些关键时间节点？</button></div>
+              <form id="conversationForm" class="v2-composer"><label class="sr-only" for="conversationQuestion">输入问题</label><textarea id="conversationQuestion" rows="3" maxlength="8000" placeholder="输入问题，Enter 发送，Shift + Enter 换行" disabled></textarea><div><small id="conversationComposerHint">新建会话后即可提问</small><button class="primary" id="conversationSendBtn" type="submit" disabled>发送问题</button></div></form>
+            </article>
+          </div>
+        </section>
+
+        <section class="app-view v2-translation-view" data-view="translation">
+          <div class="page-heading compact"><div><div class="eyebrow">TRANSLATION / ORIGINAL PRESERVED</div><h1>外文资料翻译</h1><p>译文默认以中文呈现，同时始终保留原文；大数据包先翻译预览和重点文件，再在后台补齐全文。</p></div><div class="button-row wrap"><button class="secondary" id="translatePriorityBtn" disabled>翻译预览与重点文件</button><button class="primary" id="translateBackfillBtn" disabled>后台补齐全部外文</button></div></div>
+          <div id="translationPackageState" class="v2-translation-summary" role="status" aria-live="polite"></div>
+          <div class="v2-translation-layout">
+            <aside class="surface v2-translation-sidebar">
+              <div class="surface-heading"><div><span class="section-kicker">DOCUMENTS</span><h2>翻译资料</h2></div><button class="text-button" id="translationListRefreshBtn">刷新</button></div>
+              <label for="translationPath">文件相对路径</label><div class="input-row"><input id="translationPath" autocomplete="off" placeholder="例如 letters/report.pdf"><button id="translationOpenBtn">打开</button></div>
+              <label for="translationFilter">列表筛选</label><select id="translationFilter"><option value="all">全部翻译记录</option><option value="completed">已完成</option><option value="partial">部分完成</option><option value="failed">失败</option><option value="not_started">未开始</option></select>
+              <div id="translationList" class="v2-translation-list"></div>
+            </aside>
+            <article class="surface v2-document-panel">
+              <div class="v2-document-header"><div><span class="section-kicker">DOCUMENT VIEW</span><h2 id="translationDocumentTitle">选择文件查看原文与译文</h2><small id="translationDocumentMeta"></small></div><button class="primary" id="translateDocumentBtn" disabled>翻译当前文件</button></div>
+              <div class="segmented v2-view-switch" role="group" aria-label="文档显示方式"><button data-translation-view="translated" class="active">中文</button><button data-translation-view="original">原文</button><button data-translation-view="bilingual">双语对照</button></div>
+              <div id="translationDocumentState" class="v2-inline-state" role="status" aria-live="polite">从左侧选择文件，或输入文件相对路径。</div>
+              <div id="translationDocumentContent" class="v2-document-content"></div>
+              <div class="v2-pager"><button id="translationPrevBtn" disabled>← 上一页</button><span id="translationPageInfo">—</span><button id="translationNextBtn" disabled>下一页 →</button></div>
+            </article>
+          </div>
+        </section>
 
         <section class="app-view utility-view" data-view="settings"><div class="page-heading compact"><div><div class="eyebrow">SYSTEM / LOCAL RUNTIME</div><h1>系统设置</h1><p>查看本地模型、解析边界和访问安全状态。</p></div></div><div class="settings-grid"><article class="surface settings-card"><span class="section-kicker">LOCAL MODEL</span><h2>本地模型服务</h2><div class="setting-line"><span>模型运行方式</span><b>服务器本机 Ollama</b></div><div class="setting-line"><span>数据是否出网</span><b class="safe-text">否 · 本地处理</b></div><div class="setting-line"><span>模型并发</span><b>1（GPU 安全模式）</b></div><button id="settingsTestBtn" class="secondary" data-forward="testBtn">测试本地模型</button></article><article class="surface settings-card"><span class="section-kicker">ACCESS CONTROL</span><h2>访问与目录边界</h2><div class="setting-line"><span>API 访问 Token</span><b>已启用</b></div><div class="setting-line"><span>扫描目录白名单</span><b>服务端配置</b></div><div class="setting-line"><span>结果隔离</span><b>按用户权限隔离</b></div><button class="secondary" id="headerTokenBtnSecondary">重新设置 Token</button></article><article class="surface settings-card"><span class="section-kicker">PARSER LIMITS</span><h2>解析资源</h2><div class="setting-line"><span>CPU 解析并发</span><b>默认 2</b></div><div class="setting-line"><span>单文件超时</span><b>受配置限制</b></div><div class="setting-line"><span>压缩包安全</span><b>路径穿越防护</b></div></article></div></section>
 
@@ -57,5 +118,6 @@
   <div id="toast" class="toast" aria-live="polite"></div>
   <script src="/static/product-shell.js?v=3"></script>
   <script src="/static/app.js?v=19"></script>
+  <script src="/static/engineering-v2.js?v=1"></script>
 </body>
 </html>

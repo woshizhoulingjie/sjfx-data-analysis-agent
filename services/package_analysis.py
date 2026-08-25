@@ -34,6 +34,12 @@ from services.large_package import (
     representative_paths,
 )
 from services.retrieval import build_retrieval_manifest, evidence_corpus, retrieve_evidence
+from services.package_exploration import (
+    PreviewBudget,
+    build_content_map,
+    preview_as_document,
+    preview_file,
+)
 from services.unified_parser import compact_document
 from services.unified_parser import UnifiedDocumentParser
 from services.parse_isolation import (
@@ -3656,6 +3662,119 @@ def _build_structured_overview(documents):
 
 
 
+def _preview_matches_inventory(preview, file_node):
+    if not preview or preview.get("status") not in {"previewed", "restricted"}:
+        return False
+    return (
+        int(preview.get("size") or -1) == int(file_node.get("size") or 0)
+        and int(preview.get("modified_at_ns") or -1)
+        == int(file_node.get("modified_at_ns") or 0)
+    )
+
+
+def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=None,
+                           progress=None, cancel_check=None):
+    """Persist one bounded preview per inventory entry and build a content map."""
+    progress = progress or (lambda percent, message: None)
+    deep_paths = set(deep_paths or [])
+    # Resume validation needs only size/mtime/checkpoint columns.  Loading the
+    # full preview JSON here would retain up to 96 KiB of text per inventory
+    # entry (several GiB for a normal 50k-file package).
+    existing = {
+        item["path"]: item for item in storage.iter_file_preview_states(scan_id)
+    }
+    budget = PreviewBudget(policy.get("preview_total_bytes"))
+    pending_previews = []
+    pending_documents = []
+    pending_states = []
+    reused = 0
+    previewed = 0
+    total = max(1, len(files))
+    batch_size = max(1, min(500, int(policy.get("batch_files") or 200)))
+
+    def flush():
+        nonlocal pending_previews, pending_documents, pending_states
+        storage.save_exploration_batch(
+            scan_id, pending_previews, pending_documents, pending_states,
+        )
+        pending_previews = []
+        pending_documents = []
+        pending_states = []
+
+    for index, file_node in enumerate(files, 1):
+        if cancel_check is not None and cancel_check():
+            flush()
+            raise ParseIsolationCancelled("任务已取消，已保存完成的轻量预览检查点")
+        path = file_node.get("path")
+        prior = existing.get(path)
+        # A pre-v2 completed document without a preview checkpoint cannot be
+        # proven fresh.  Do not preserve it merely because metadata is absent.
+        preserve_deep = path in deep_paths and _preview_matches_inventory(prior, file_node)
+        if _preview_matches_inventory(prior, file_node):
+            reused += 1
+        else:
+            preview = preview_file(
+                scan.get("root"), file_node,
+                per_file_bytes=policy.get("preview_bytes_per_file"),
+                budget=budget,
+                zip_member_limit=policy.get("preview_zip_members"),
+                zip_member_bytes=policy.get("preview_zip_member_bytes"),
+            )
+            pending_previews.append((path, preview))
+            existing[path] = preview
+            previewed += 1
+            # A previous accurate parse is an upgrade and must never be
+            # overwritten by a lightweight projection.
+            if not preserve_deep and preview.get("status") in {"previewed", "restricted"}:
+                document = preview_as_document(preview)
+                pending_documents.append((path, document))
+                pending_states.append((
+                    path,
+                    "preview:{}".format(
+                        preview.get("preview_fingerprint") or preview.get("sample_sha256") or ""
+                    ),
+                    "previewed",
+                    document,
+                    None,
+                ))
+            elif preview.get("status") in {"failed", "deferred"} and not preserve_deep:
+                pending_states.append((
+                    path,
+                    "preview:{}".format(
+                        preview.get("preview_fingerprint") or preview.get("sample_sha256") or ""
+                    ),
+                    "preview_{}".format(preview.get("status")),
+                    None,
+                    "; ".join(preview.get("warnings") or []) or None,
+                ))
+        if index % batch_size == 0:
+            flush()
+            progress(
+                2 + int(18 * index / total),
+                "全量有界轻量预览：{}/{}（复用 {}）".format(index, len(files), reused),
+            )
+    flush()
+    progress(20, "轻量预览完成，正在发现主题、重复候选与文件关系")
+    content_map = build_content_map(
+        (item["payload"] for item in storage.iter_file_previews(scan_id)),
+        representative_limit=policy.get("initial_parse_files"),
+    )
+    content_map["policy"] = {
+        "preview_bytes_per_file": policy.get("preview_bytes_per_file"),
+        "preview_total_bytes": policy.get("preview_total_bytes"),
+        "representative_limit": policy.get("initial_parse_files"),
+        "selection_basis": "主题覆盖、格式/目录/语言覆盖、信息量、独特性与关系价值",
+    }
+    content_map["run"] = {
+        "new_previews": previewed,
+        "reused_previews": reused,
+        "budget_consumed_bytes": budget.consumed_bytes,
+        "budget_exhausted": budget.exhausted,
+    }
+    storage.save_content_map(scan_id, content_map)
+    return content_map
+
+
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
                     large_options=None, target_paths=None, cancel_check=None, parse_mode_override=None):
     progress = progress or (lambda percent, message: None)
@@ -3666,6 +3785,19 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     all_paths = set(inventory)
     target_paths = set(target_paths or []) & all_paths
     prior_states = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
+    content_map = storage.get_content_map(scan_id) if policy.get("enabled") else None
+    if policy.get("enabled") and not target_paths:
+        deep_paths = {
+            path for path, state in prior_states.items()
+            if path in all_paths and state.get("status") == "completed"
+        }
+        content_map = _explore_large_package(
+            scan_id, scan, files, storage, policy,
+            deep_paths=deep_paths,
+            progress=progress,
+            cancel_check=cancel_check,
+        )
+        prior_states = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
     documents = {}
     for item in storage.iter_documents(scan_id, hydrate=not policy.get("enabled")):
         if item.get("path") not in all_paths:
@@ -3679,6 +3811,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             )
             if policy.get("enabled") else payload
         )
+        if (
+            policy.get("enabled")
+            and (prior_states.get(item["path"]) or {}).get("status") == "completed"
+        ):
+            documents[item["path"]].setdefault("coverage", {})["deep_parse_complete"] = True
     failures = [
         {"path": path, "error": state.get("error") or "历史解析失败"}
         for path, state in prior_states.items()
@@ -3689,25 +3826,30 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         candidates = [node for node in files if node.get("path") in target_paths]
         phase_label = "补充分析"
     elif policy.get("enabled"):
-        # Large-package mode is bounded by the parser queue and persistent
-        # checkpoints, not by a representative-file cap.  Every inventoried
-        # path gets a final completed or failed state.
-        candidates = files
-        phase_label = "大数据包分批全量分析"
+        representative_set = set((content_map or {}).get("representative_paths") or [])
+        candidates = [node for node in files if node.get("path") in representative_set]
+        phase_label = "代表文件准确深析"
     else:
         candidates = files
         phase_label = "完整分析"
 
     if parse_mode_override is not None:
         actual_parse_mode = "fast" if str(parse_mode_override).lower() == "fast" else "accurate"
-    elif policy.get("enabled") and not target_paths:
-        # A 10 GiB first pass must finish predictably.  Accurate OCR/Docling is
-        # reserved for explicit follow-up scopes and can reuse this fast pass.
-        actual_parse_mode = "fast"
+    elif policy.get("enabled"):
+        # The all-file pass is handled by the bounded explorer above.  Files in
+        # this queue are representatives or user promotions and therefore get
+        # the accurate parser unless an operator explicitly overrides it.
+        actual_parse_mode = "accurate"
     else:
         actual_parse_mode = parse_mode
     parser_contract = _parser_checkpoint_contract(parser)
-    progress(2, "开始{}：{} 个文件".format(phase_label, len(candidates)))
+    parse_progress_start = 22 if policy.get("enabled") and not target_paths else 2
+    parse_progress_span = 48 if policy.get("enabled") and not target_paths else 68
+
+    def parse_progress(done, total):
+        return parse_progress_start + int(parse_progress_span * done / max(1, total))
+
+    progress(parse_progress_start, "开始{}：{} 个文件".format(phase_label, len(candidates)))
     parse_candidates = []
     reusable_count = 0
     for index, file_node in enumerate(candidates, 1):
@@ -3741,7 +3883,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     reusable = False
         if reusable:
             reusable_count += 1
-            progress(2 + int(68 * index / max(1, len(candidates))), "复用已校验检查点：{}/{} {}".format(index, len(candidates), node_path))
+            progress(parse_progress(index, len(candidates)), "复用已校验检查点：{}/{} {}".format(index, len(candidates), node_path))
             continue
 
         parse_candidates.append((file_node, None))
@@ -3782,6 +3924,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 if policy.get("enabled") else document
             )
             if policy.get("enabled"):
+                documents[node_path].setdefault("coverage", {})["deep_parse_complete"] = True
+            if policy.get("enabled"):
                 storage.replace_document_evidence_index(
                     scan_id, node_path, evidence_corpus({node_path: document})
                 )
@@ -3799,13 +3943,25 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             # A failed current attempt invalidates any payload left by an older
             # successful parse.  Otherwise old text leaks into classification,
             # retrieval and parsed coverage while this same path is failed.
-            documents.pop(node_path, None)
-            storage.delete_document(scan_id, node_path)
             if policy.get("enabled"):
-                storage.replace_document_evidence_index(scan_id, node_path, [])
+                preview = storage.get_file_preview(scan_id, node_path)
+                if preview and preview.get("status") in {"previewed", "restricted"}:
+                    preview_document = preview_as_document(preview)
+                    documents[node_path] = preview_document
+                    storage.save_document(scan_id, node_path, preview_document)
+                    storage.replace_document_evidence_index(
+                        scan_id, node_path, evidence_corpus({node_path: preview_document})
+                    )
+                else:
+                    documents.pop(node_path, None)
+                    storage.delete_document(scan_id, node_path)
+                    storage.replace_document_evidence_index(scan_id, node_path, [])
+            else:
+                documents.pop(node_path, None)
+                storage.delete_document(scan_id, node_path)
             storage.set_file_state(scan_id, node_path, fingerprint, "failed", error=str(exc))
         progress(
-            2 + int(68 * completed_candidates / total_candidates),
+            parse_progress(completed_candidates, total_candidates),
             "{}：{}/{} {}".format(phase_label, completed_candidates, len(candidates), node_path),
         )
 
@@ -3839,7 +3995,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 )
                 active_text = "、".join(str(path) for path in (active_paths or [])[:2] if path)
                 progress(
-                    2 + int(68 * overall_done / total_candidates),
+                    parse_progress(overall_done, total_candidates),
                     "{}：已完成 {}/{}；正在解析 {}".format(
                         phase_label, overall_done, len(candidates), active_text or "当前文件",
                     ),
@@ -3858,6 +4014,16 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     failed_paths = {item.get("path") for item in failures}
     pending_paths = all_paths - set(documents) - failed_paths
+    deep_analyzed_paths = {
+        path for path, document in documents.items()
+        if (document.get("coverage") or {}).get("deep_parse_complete")
+        or (
+            not (document.get("coverage") or {}).get("preview_only")
+            and not document.get("sidecar_projection")
+            and not (document.get("coverage") or {}).get("semantic_projection")
+        )
+    }
+    deep_pending_paths = all_paths - deep_analyzed_paths
 
     classified_batch = []
     classified_total = max(1, len(documents))
@@ -3955,7 +4121,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     naming_result = None
     semantic_error = None
 
-    if embedding_client is not None and canonical_documents:
+    if embedding_client is not None and canonical_documents and not policy.get("enabled"):
         try:
             progress(74, "生成文档级语义向量")
 
@@ -4158,14 +4324,17 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         scan["tree"], canonical_by_path, documents, node_summaries
     )
     if policy.get("enabled"):
-        waiting = pending_group(pending_paths, inventory, policy)
+        waiting = pending_group(deep_pending_paths, inventory, policy)
         if waiting:
             waiting["children"] = [{
                 "kind": "file", "name": Path(path).name, "path": path,
                 "size": int(inventory.get(path, {}).get("size") or 0),
                 "size_human": human_size(int(inventory.get(path, {}).get("size") or 0)),
-                "classification_status": "pending", "classification_reason": "尚未进入内容分析批次",
-            } for path in sorted(pending_paths)]
+                "classification_status": "previewed",
+                "classification_reason": "已完成轻量预览，尚未进入准确深析；问答命中后自动晋升",
+            } for path in sorted(deep_pending_paths)[:500]]
+            waiting["children_truncated"] = len(deep_pending_paths) > 500
+            waiting["children_total"] = len(deep_pending_paths)
             adaptive_tree.setdefault("children", []).append(waiting)
     if failed_paths:
         failed_group = {
@@ -4185,6 +4354,18 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )
+    if policy.get("enabled"):
+        preview_counts = storage.file_preview_counts(scan_id)
+        package_coverage["preview_coverage"] = {
+            "previewed_files": int(preview_counts.get("previewed") or 0),
+            "restricted_files": int(preview_counts.get("restricted") or 0),
+            "deferred_files": int(preview_counts.get("deferred") or 0),
+            "failed_files": int(preview_counts.get("failed") or 0),
+            "inventory_files": len(all_paths),
+            "complete": not pending_paths,
+        }
+        package_coverage["deep_analysis_pending_files"] = len(deep_pending_paths)
+        package_coverage["deep_analysis_strategy"] = "representative_then_query_promotion"
     adaptive_tree = attach_tree_coverage(adaptive_tree, coverage_for_paths, all_paths)
     tree_version_rows = []
     tree_stack = [adaptive_tree]
@@ -4215,6 +4396,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "sampled_files": package_coverage.get("sampled_files", 0),
         "deep_analyzed_files": package_coverage.get("deep_analyzed_files", 0),
         "pending_files": len(pending_paths),
+        "deep_analysis_pending_files": len(deep_pending_paths),
         "failed_files": len(failures),
         "scanned_bytes": package_coverage.get("scanned_bytes", package_coverage.get("inventory_bytes", 0)),
         "parsed_bytes": package_coverage.get("parsed_bytes", 0),
@@ -4232,7 +4414,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         exact_groups,
         topic_clusters,
         failures,
-        pending_paths,
+        deep_pending_paths if policy.get("enabled") else pending_paths,
         structured_overview,
     )
     package_model_calls = []
@@ -4264,7 +4446,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "schema_version": "package-analysis/2.0",
         "scan_id": scan_id,
         "root": scan["root"],
-        "status": "completed_with_warnings" if failures or pending_paths else "completed",
+        "status": (
+            "exploration_ready_with_warnings" if failures or pending_paths else "exploration_ready"
+        ) if policy.get("enabled") else ("completed_with_warnings" if failures or pending_paths else "completed"),
         "started_from_scan_at": scan.get("scanned_at"),
         "completed_at": _now(),
         "parser_status": parser.status(),
@@ -4275,6 +4459,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "deep_analyzed_files": package_coverage.get("deep_analyzed_files", 0),
             "failed_files": len(failures),
             "pending_files": len(pending_paths),
+            "deep_analysis_pending_files": len(deep_pending_paths),
             "scanned_bytes": package_coverage.get("scanned_bytes", package_coverage.get("inventory_bytes", 0)),
             "parsed_bytes": package_coverage.get("parsed_bytes", 0),
             "parsed_file_ratio": package_coverage.get("parsed_file_ratio"),
@@ -4295,8 +4480,18 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "subtopic_nodes": sum(len(item.get("children", [])) for item in adaptive_tree.get("children", [])),
             "evidence_items": sum(len(document.get("evidence", [])) for document in canonical_documents.values()),
             "raw_evidence_items": sum(len(document.get("evidence", [])) for document in documents.values()),
-            "complete_text_files": sum(1 for document in documents.values() if document.get("coverage", {}).get("complete", True)),
-            "truncated_text_files": sum(1 for document in documents.values() if not document.get("coverage", {}).get("complete", True)),
+            "complete_text_files": sum(
+                1 for document in documents.values()
+                if (document.get("coverage") or {}).get(
+                    "parse_complete", (document.get("coverage") or {}).get("complete", False)
+                )
+            ),
+            "truncated_text_files": sum(
+                1 for document in documents.values()
+                if not (document.get("coverage") or {}).get(
+                    "parse_complete", (document.get("coverage") or {}).get("complete", False)
+                )
+            ),
             "fast_preview_paths": [
                 path for path, document in sorted(documents.items())
                 if document.get("coverage", {}).get("limited_by_fast_mode")
@@ -4336,6 +4531,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "analysis_tree_version": analysis_tree_version,
         "analysis_tree_identity_contract": "节点名称变化不改变ID；成员集合变化生成新版本，人工编辑按稳定ID重放",
         "coverage": package_coverage,
+        "content_map": content_map if policy.get("enabled") else None,
         "overview": overview,
         "value_judgment": value_judgment,
         "structured_data_overview": structured_overview,
@@ -4375,6 +4571,8 @@ def refresh_package_coverage(scan_id, scan, storage):
     if not analysis:
         return None
     policy = (analysis.get("policy") or {}).get("large_package") or build_policy(scan)
+    states = list(storage.iter_file_states(scan_id))
+    state_by_path = {item.get("node_path"): item for item in states}
     documents = {}
     for item in storage.iter_documents(scan_id, hydrate=False):
         payload = item["payload"]
@@ -4386,16 +4584,41 @@ def refresh_package_coverage(scan_id, scan, storage):
             )
             if policy.get("enabled") else payload
         )
-    states = storage.iter_file_states(scan_id)
+        if (
+            policy.get("enabled")
+            and (state_by_path.get(item["path"]) or {}).get("status") == "completed"
+        ):
+            documents[item["path"]].setdefault("coverage", {})["deep_parse_complete"] = True
     failures = [
         {"path": item.get("node_path"), "error": item.get("error")}
         for item in states if item.get("status") == "failed"
     ]
     all_paths = set(inventory_by_path(scan))
     pending_paths = all_paths - set(documents) - {item["path"] for item in failures}
+    deep_paths = {
+        path for path, document in documents.items()
+        if (document.get("coverage") or {}).get("deep_parse_complete")
+        or (
+            not (document.get("coverage") or {}).get("preview_only")
+            and not document.get("sidecar_projection")
+            and not (document.get("coverage") or {}).get("semantic_projection")
+        )
+    }
+    deep_pending_paths = all_paths - deep_paths
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )
+    if policy.get("enabled"):
+        preview_counts = storage.file_preview_counts(scan_id)
+        package_coverage["preview_coverage"] = {
+            "previewed_files": int(preview_counts.get("previewed") or 0),
+            "restricted_files": int(preview_counts.get("restricted") or 0),
+            "deferred_files": int(preview_counts.get("deferred") or 0),
+            "failed_files": int(preview_counts.get("failed") or 0),
+            "inventory_files": len(all_paths),
+            "complete": not pending_paths,
+        }
+        package_coverage["deep_analysis_pending_files"] = len(deep_pending_paths)
     if policy.get("enabled"):
         exact_groups = []
         canonical_documents = documents
@@ -4419,6 +4642,7 @@ def refresh_package_coverage(scan_id, scan, storage):
     statistics.update({
         "parsed_files": len(documents), "failed_files": len(failures),
         "pending_files": len(pending_paths),
+        "deep_analysis_pending_files": len(deep_pending_paths),
         "sampled_files": package_coverage.get("sampled_files", 0),
         "deep_analyzed_files": package_coverage.get("deep_analyzed_files", 0),
         "scanned_bytes": package_coverage.get("scanned_bytes", package_coverage.get("inventory_bytes", 0)),
@@ -4440,7 +4664,7 @@ def refresh_package_coverage(scan_id, scan, storage):
         exact_groups,
         analysis.get("topic_clusters", []),
         failures,
-        pending_paths,
+        deep_pending_paths if policy.get("enabled") else pending_paths,
         analysis.get("structured_data_overview", {}),
     )
     analysis.setdefault("overview", {}).update({
@@ -4448,6 +4672,7 @@ def refresh_package_coverage(scan_id, scan, storage):
         "sampled_files": package_coverage.get("sampled_files", 0),
         "deep_analyzed_files": package_coverage.get("deep_analyzed_files", 0),
         "pending_files": len(pending_paths),
+        "deep_analysis_pending_files": len(deep_pending_paths),
         "failed_files": len(failures),
         "scanned_bytes": package_coverage.get("scanned_bytes", package_coverage.get("inventory_bytes", 0)),
         "parsed_bytes": package_coverage.get("parsed_bytes", 0),

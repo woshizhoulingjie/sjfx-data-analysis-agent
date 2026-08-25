@@ -15,6 +15,7 @@ from pathlib import Path
 from config import Config, _mount_filesystem
 from services.schema import normalize_summary
 from services.tree_editor import apply_tree_edits
+from services.translation import document_translation_fingerprint
 
 
 LOGGER = logging.getLogger(__name__)
@@ -249,6 +250,65 @@ class Storage:
                     used_at REAL,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS file_previews (
+                    scan_id TEXT NOT NULL,
+                    node_path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    sample_sha256 TEXT,
+                    preview_fingerprint TEXT,
+                    source_size INTEGER,
+                    source_modified_at_ns INTEGER,
+                    language_code TEXT,
+                    document_type TEXT,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, node_path)
+                );
+                CREATE TABLE IF NOT EXISTS package_content_maps (
+                    scan_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS package_overviews (
+                    scan_id TEXT PRIMARY KEY,
+                    schema_version TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS document_translations (
+                    scan_id TEXT NOT NULL,
+                    node_path TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    source_language TEXT,
+                    provider_id TEXT,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, node_path)
+                );
+                CREATE TABLE IF NOT EXISTS translation_memory (
+                    memory_key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY,
+                    scan_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    title TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    payload TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS conversation_messages (
+                    session_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (session_id, message_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_documents_scan_path ON unified_documents(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_summaries_scan_path ON summaries(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_retrieval_sessions_scan_created ON retrieval_sessions(scan_id, created_at);
@@ -259,6 +319,16 @@ class Storage:
                     ON tree_nodes(scan_id, tree_kind, parent_key, position, node_key);
                 CREATE INDEX IF NOT EXISTS idx_download_tickets_expiry
                     ON download_tickets(expires_at, used_at);
+                CREATE INDEX IF NOT EXISTS idx_file_previews_scan_status
+                    ON file_previews(scan_id, status, node_path);
+                CREATE INDEX IF NOT EXISTS idx_file_previews_scan_language
+                    ON file_previews(scan_id, language_code, node_path);
+                CREATE INDEX IF NOT EXISTS idx_document_translations_scan_status
+                    ON document_translations(scan_id, status, node_path);
+                CREATE INDEX IF NOT EXISTS idx_conversations_scan_owner
+                    ON conversations(scan_id, owner_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_conversation_messages_session
+                    ON conversation_messages(session_id, created_at, message_id);
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_jobs)").fetchall()}
             migrations = {
@@ -288,6 +358,17 @@ class Storage:
             scan_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scans)").fetchall()}
             if "owner_id" not in scan_columns:
                 conn.execute("ALTER TABLE scans ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'")
+            preview_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(file_previews)").fetchall()
+            }
+            preview_migrations = {
+                "preview_fingerprint": "TEXT",
+                "source_size": "INTEGER",
+                "source_modified_at_ns": "INTEGER",
+            }
+            for name, definition in preview_migrations.items():
+                if name not in preview_columns:
+                    conn.execute("ALTER TABLE file_previews ADD COLUMN {} {}".format(name, definition))
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_analysis_jobs_queue "
                 "ON analysis_jobs(status, priority DESC, created_at)"
@@ -433,7 +514,13 @@ class Storage:
         evidence = Storage._sample_sequence(original_evidence, evidence_limit)
         projection = {
             key: Storage._bounded_projection_value(payload.get(key))
-            for key in ("schema_version", "source", "parsed_at", "parser", "structure", "coverage", "archive_manifest", "warnings", "classification", "deduplication", "content_sha256", "data_profile", "data_profiles")
+            for key in (
+                "schema_version", "source", "parsed_at", "parser", "structure", "coverage",
+                "archive_manifest", "warnings", "classification", "deduplication",
+                "content_sha256", "data_profile", "data_profiles", "preview", "language",
+                "languages", "entities", "named_entities", "temporal", "document_date",
+                "file_relationships", "related_files", "topics", "content_topics", "translation",
+            )
             if key in payload
         }
         projection["text"] = text
@@ -544,6 +631,134 @@ class Storage:
                 "text": "",
                 "evidence": [],
             }
+
+    @staticmethod
+    def _translation_projection(payload):
+        payload = dict(payload or {})
+        units = []
+        for unit in payload.get("units") or []:
+            units.append({
+                key: unit.get(key)
+                for key in (
+                    "unit_id", "kind", "start", "end", "source_language",
+                    "status", "attempts", "model", "qa", "error", "retryable",
+                )
+                if key in unit
+            })
+            if len(units) >= 200:
+                break
+        projection = {
+            key: payload.get(key)
+            for key in (
+                "schema_version", "contract_version", "source_fingerprint",
+                "source_path", "source_language", "language_detection",
+                "target_language", "provider_id", "glossary_fingerprint",
+                "status", "translation_required", "cancelled", "progress",
+                "errors", "updated_at", "translated_title", "source_level",
+                "full_translation",
+            )
+            if key in payload
+        }
+        projection.update({
+            "units": units,
+            "units_projected": len(units),
+            "units_total": len(payload.get("units") or []),
+            "sidecar_projection": True,
+            "original_text_available": payload.get("original_text") is not None,
+            "translated_text_available": payload.get("translated_text") is not None,
+        })
+        return projection
+
+    def _store_translation_payload(self, scan_id, node_path, payload):
+        raw = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(raw) <= self.sidecar_threshold:
+            return raw.decode("utf-8")
+        target = self._sidecar_path(scan_id, "translation:" + str(node_path))
+        temporary = target.with_suffix(".tmp")
+        with gzip.open(str(temporary), "wb") as stream:
+            stream.write(raw)
+        os.replace(str(temporary), str(target))
+        if os.name != "nt":
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+        return json.dumps({
+            "__translation_sidecar__": True,
+            "file": str(target.relative_to(self.sidecar_dir)).replace("\\", "/"),
+            "projection": self._translation_projection(payload),
+        }, ensure_ascii=False)
+
+    def _load_translation_payload(self, stored, hydrate=True):
+        payload = json.loads(stored)
+        if not payload.get("__translation_sidecar__"):
+            return payload if hydrate else self._translation_projection(payload)
+        if not hydrate:
+            return dict(payload.get("projection") or {})
+        target = (self.sidecar_dir / str(payload.get("file") or "")).resolve()
+        try:
+            target.relative_to(self.sidecar_dir.resolve())
+            with gzip.open(str(target), "rb") as stream:
+                return json.loads(stream.read().decode("utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            projection = dict(payload.get("projection") or {})
+            projection["status"] = "cache_unavailable"
+            projection["errors"] = list(projection.get("errors") or []) + [{
+                "code": "translation_cache_unavailable", "message": str(exc)[:300],
+            }]
+            return projection
+
+    def _invalidate_translation_if_changed(self, conn, scan_id, node_path, document):
+        """Atomically withdraw a translation when its parsed source changed."""
+        scan_id = str(scan_id)
+        node_path = str(node_path)
+        row = conn.execute(
+            "SELECT source_fingerprint,payload FROM document_translations "
+            "WHERE scan_id=? AND node_path=?",
+            (scan_id, node_path),
+        ).fetchone()
+        if not row:
+            return None
+        current_fingerprint = document_translation_fingerprint(document)
+        if str(row["source_fingerprint"] or "") == current_fingerprint:
+            return None
+
+        sidecar_relative = None
+        try:
+            wrapper = json.loads(row["payload"])
+            if wrapper.get("__translation_sidecar__"):
+                sidecar_relative = str(wrapper.get("file") or "") or None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            sidecar_relative = None
+
+        conn.execute(
+            "DELETE FROM document_translations WHERE scan_id=? AND node_path=?",
+            (scan_id, node_path),
+        )
+        conn.execute(
+            "DELETE FROM evidence_index WHERE scan_id=? AND source_path=? "
+            "AND index_key LIKE 'translation:%'",
+            (scan_id, node_path),
+        )
+        if self.evidence_fts_available:
+            conn.execute(
+                "DELETE FROM evidence_fts WHERE scan_id=? AND source_path=? "
+                "AND index_key LIKE 'translation:%'",
+                (scan_id, node_path),
+            )
+        return sidecar_relative
+
+    def _unlink_translation_sidecar(self, relative_path):
+        if not relative_path:
+            return
+        candidate = self.sidecar_dir / str(relative_path)
+        try:
+            candidate.resolve().relative_to(self.sidecar_dir.resolve())
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            LOGGER.warning("无法清理失效翻译 sidecar：file=%s", relative_path)
 
     def recover_stale_jobs(self, stale_after_seconds=900):
         """Requeue only abandoned work, never a healthy active worker."""
@@ -681,9 +896,19 @@ class Storage:
                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             ))
         with self.lock, self._connect() as conn:
-            conn.execute("DELETE FROM evidence_index WHERE scan_id=?", (str(scan_id),))
+            # Package-wide original-evidence rebuilds must not discard a valid
+            # completed translation index. Per-document deep re-parses use
+            # replace_document_evidence_index(), which removes both variants
+            # for that source before the new source fingerprint is translated.
+            conn.execute(
+                "DELETE FROM evidence_index WHERE scan_id=? AND index_key NOT LIKE 'translation:%'",
+                (str(scan_id),),
+            )
             if self.evidence_fts_available:
-                conn.execute("DELETE FROM evidence_fts WHERE scan_id=?", (str(scan_id),))
+                conn.execute(
+                    "DELETE FROM evidence_fts WHERE scan_id=? AND index_key NOT LIKE 'translation:%'",
+                    (str(scan_id),),
+                )
             if rows:
                 conn.executemany(
                     "INSERT INTO evidence_index(scan_id,index_key,source_path,archive_source_path,payload) VALUES (?,?,?,?,?)",
@@ -1099,6 +1324,7 @@ class Storage:
                 (scan_id, json.dumps(self._scan_overview_payload(payload), ensure_ascii=False)),
             )
             self._replace_tree_index(conn, scan_id, "physical", payload.get("tree") or {})
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
         return scan_id
 
     def migrate_legacy_ownership(self, owner_id, aliases=None):
@@ -1282,6 +1508,7 @@ class Storage:
             # deduplication metadata.  Keeping an existing index would pin the
             # paginated API to the original scan snapshot forever.
             self._replace_tree_index(conn, scan_id, "physical", payload.get("tree") or {})
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
 
     def save_summary(self, scan_id, node_path, summary_type, payload):
         with self.lock, self._connect() as conn:
@@ -1364,11 +1591,17 @@ class Storage:
 
     def save_document(self, scan_id, node_path, payload):
         stored = self._store_document_payload(scan_id, node_path, payload)
+        translation_sidecar = None
         with self.lock, self._connect() as conn:
+            translation_sidecar = self._invalidate_translation_if_changed(
+                conn, scan_id, node_path, payload
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO unified_documents(scan_id,node_path,payload) VALUES (?,?,?)",
                 (scan_id, node_path, stored),
             )
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
+        self._unlink_translation_sidecar(translation_sidecar)
 
     def save_documents(self, scan_id, documents):
         rows = []
@@ -1376,14 +1609,25 @@ class Storage:
             rows.append((
                 str(scan_id), str(node_path),
                 self._store_document_payload(scan_id, node_path, payload),
+                payload,
             ))
         if not rows:
             return 0
+        translation_sidecars = []
         with self.lock, self._connect() as conn:
+            for row_scan_id, row_node_path, _stored, payload in rows:
+                sidecar = self._invalidate_translation_if_changed(
+                    conn, row_scan_id, row_node_path, payload
+                )
+                if sidecar:
+                    translation_sidecars.append(sidecar)
             conn.executemany(
                 "INSERT OR REPLACE INTO unified_documents(scan_id,node_path,payload) VALUES (?,?,?)",
-                rows,
+                [row[:3] for row in rows],
             )
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
+        for sidecar in translation_sidecars:
+            self._unlink_translation_sidecar(sidecar)
         return len(rows)
 
     def get_document(self, scan_id, node_path):
@@ -1460,6 +1704,449 @@ class Storage:
         # Compatibility API: callers still receive the same ordered list.
         return list(self.iter_documents(scan_id, hydrate=hydrate))
 
+    def save_file_preview(self, scan_id, node_path, payload):
+        """Persist one bounded first-pass preview independently of deep parses."""
+        payload = dict(payload or {})
+        language = payload.get("language") or {}
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO file_previews("
+                "scan_id,node_path,status,sample_sha256,preview_fingerprint,source_size,"
+                "source_modified_at_ns,language_code,document_type,payload,updated_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                (
+                    str(scan_id), str(node_path), str(payload.get("status") or "unknown"),
+                    str(payload.get("sample_sha256") or ""),
+                    str(payload.get("preview_fingerprint") or ""),
+                    int(payload.get("size") or 0),
+                    int(payload.get("modified_at_ns") or 0),
+                    str(language.get("code") or "unknown"),
+                    str(payload.get("document_type") or "其他文件"),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
+
+    def save_exploration_batch(self, scan_id, previews, documents, states):
+        """Atomically publish one bounded exploration checkpoint batch.
+
+        Preview, projected document and file-state rows form one logical
+        checkpoint.  Publishing them in separate transactions can leave a
+        permanently incomplete resume state after a worker crash.
+        """
+        preview_rows = []
+        for node_path, payload in previews or []:
+            payload = dict(payload or {})
+            language = payload.get("language") or {}
+            preview_rows.append((
+                str(scan_id), str(node_path), str(payload.get("status") or "unknown"),
+                str(payload.get("sample_sha256") or ""),
+                str(payload.get("preview_fingerprint") or ""),
+                int(payload.get("size") or 0), int(payload.get("modified_at_ns") or 0),
+                str(language.get("code") or "unknown"),
+                str(payload.get("document_type") or "其他文件"),
+                json.dumps(payload, ensure_ascii=False),
+            ))
+        document_rows = [
+            (str(scan_id), str(node_path), self._store_document_payload(scan_id, node_path, payload))
+            for node_path, payload in (documents or [])
+        ]
+        state_rows = []
+        for node_path, fingerprint, status, document, error in states or []:
+            document = document or {}
+            state_rows.append((
+                str(scan_id), str(node_path), str(fingerprint or ""), str(status),
+                (document.get("parser") or {}).get("name"), len(document.get("text") or ""),
+                len(document.get("evidence") or []), str(error)[:2000] if error else None,
+            ))
+        if not (preview_rows or document_rows or state_rows):
+            return 0
+        with self.lock, self._connect() as conn:
+            if preview_rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO file_previews("
+                    "scan_id,node_path,status,sample_sha256,preview_fingerprint,source_size,"
+                    "source_modified_at_ns,language_code,document_type,payload,updated_at"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)", preview_rows,
+                )
+            if document_rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO unified_documents(scan_id,node_path,payload) VALUES (?,?,?)",
+                    document_rows,
+                )
+            if state_rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO file_analysis_states("
+                    "scan_id,node_path,fingerprint,status,parser,stored_characters,evidence_count,error,updated_at"
+                    ") VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)", state_rows,
+                )
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
+        return max(len(preview_rows), len(document_rows), len(state_rows))
+
+    def save_file_previews(self, scan_id, previews):
+        rows = []
+        for node_path, payload in previews or []:
+            payload = dict(payload or {})
+            language = payload.get("language") or {}
+            rows.append((
+                str(scan_id), str(node_path), str(payload.get("status") or "unknown"),
+                str(payload.get("sample_sha256") or ""),
+                str(payload.get("preview_fingerprint") or ""),
+                int(payload.get("size") or 0),
+                int(payload.get("modified_at_ns") or 0),
+                str(language.get("code") or "unknown"),
+                str(payload.get("document_type") or "其他文件"),
+                json.dumps(payload, ensure_ascii=False),
+            ))
+        if not rows:
+            return 0
+        with self.lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO file_previews("
+                "scan_id,node_path,status,sample_sha256,preview_fingerprint,source_size,"
+                "source_modified_at_ns,language_code,document_type,payload,updated_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                rows,
+            )
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
+        return len(rows)
+
+    def get_file_preview(self, scan_id, node_path):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM file_previews WHERE scan_id=? AND node_path=?",
+                (str(scan_id), str(node_path)),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def iter_file_previews(self, scan_id, statuses=None, batch_size=500):
+        batch_size = max(1, min(2000, int(batch_size or 500)))
+        values = [str(scan_id)]
+        where = "scan_id=?"
+        statuses = [str(value) for value in (statuses or []) if value]
+        if statuses:
+            where += " AND status IN ({})".format(",".join("?" for _ in statuses))
+            values.extend(statuses)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT node_path,payload FROM file_previews WHERE {} ORDER BY node_path".format(where),
+                values,
+            )
+            try:
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        yield {"path": row["node_path"], "payload": json.loads(row["payload"])}
+            finally:
+                cursor.close()
+
+    def iter_file_preview_states(self, scan_id, statuses=None, batch_size=500):
+        """Yield payload-free preview checkpoints in bounded SQLite batches.
+
+        Resume logic must never deserialize ``preview_text`` for every file.
+        These explicit columns are deliberately sufficient to validate the
+        inventory size/mtime checkpoint and to schedule language work.
+        """
+        batch_size = max(1, min(5000, int(batch_size or 500)))
+        values = [str(scan_id)]
+        where = "scan_id=?"
+        statuses = [str(value) for value in (statuses or []) if value]
+        if statuses:
+            where += " AND status IN ({})".format(",".join("?" for _ in statuses))
+            values.extend(statuses)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT node_path,status,sample_sha256,preview_fingerprint,source_size,"
+                "source_modified_at_ns,language_code,document_type "
+                "FROM file_previews WHERE {} ORDER BY node_path".format(where),
+                values,
+            )
+            try:
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        yield {
+                            "path": row["node_path"],
+                            "status": row["status"],
+                            "sample_sha256": row["sample_sha256"],
+                            "preview_fingerprint": row["preview_fingerprint"],
+                            "size": int(row["source_size"] or 0),
+                            "modified_at_ns": int(row["source_modified_at_ns"] or 0),
+                            "language_code": row["language_code"] or "unknown",
+                            "document_type": row["document_type"] or "其他文件",
+                        }
+            finally:
+                cursor.close()
+
+    def file_preview_counts(self, scan_id):
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status,COUNT(*) AS value FROM file_previews WHERE scan_id=? GROUP BY status",
+                (str(scan_id),),
+            ).fetchall()
+        return {row["status"]: int(row["value"]) for row in rows}
+
+    def save_content_map(self, scan_id, payload):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO package_content_maps(scan_id,payload,updated_at) "
+                "VALUES (?,?,CURRENT_TIMESTAMP)",
+                (str(scan_id), json.dumps(payload or {}, ensure_ascii=False)),
+            )
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
+
+    def get_content_map(self, scan_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM package_content_maps WHERE scan_id=?", (str(scan_id),)
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_package_overview(self, scan_id, payload):
+        payload = dict(payload or {})
+        schema_version = str(payload.get("schema_version") or "package-overview/1.0")
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO package_overviews(scan_id,schema_version,payload,updated_at) "
+                "VALUES (?,?,?,CURRENT_TIMESTAMP)",
+                (str(scan_id), schema_version, json.dumps(payload, ensure_ascii=False)),
+            )
+
+    def get_package_overview(self, scan_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM package_overviews WHERE scan_id=?", (str(scan_id),)
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def invalidate_package_overview(self, scan_id):
+        with self.lock, self._connect() as conn:
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
+
+    def iter_tree_records(self, scan_id, tree_kind="physical", batch_size=500):
+        """Stream flattened tree projections without hydrating the nested tree."""
+        if tree_kind not in {"physical", "analysis"} and not str(tree_kind).startswith("analysis:"):
+            raise ValueError("未知目录树类型")
+        batch_size = max(1, min(5000, int(batch_size or 500)))
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT payload FROM tree_nodes WHERE scan_id=? AND tree_kind=? ORDER BY node_key",
+                (str(scan_id), str(tree_kind)),
+            )
+            try:
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        yield json.loads(row["payload"])
+            finally:
+                cursor.close()
+
+    def save_translation(self, scan_id, node_path, payload):
+        payload = dict(payload or {})
+        stored = self._store_translation_payload(scan_id, node_path, payload)
+        scan_id = str(scan_id)
+        node_path = str(node_path)
+        index_rows = []
+        if payload.get("status") in {"completed", "not_required"}:
+            for unit in payload.get("units") or []:
+                if not isinstance(unit, dict) or unit.get("status") not in {"completed", "not_required"}:
+                    continue
+                original = str(unit.get("source_text") or "")
+                translated = str(unit.get("target_text") or "")
+                if not original.strip() or not translated.strip():
+                    continue
+                evidence_id = "TR-{}".format(unit.get("unit_id") or hashlib.sha256(
+                    original.encode("utf-8", errors="replace")
+                ).hexdigest()[:16])
+                indexed = {
+                    "evidence_id": evidence_id,
+                    "source_path": node_path,
+                    "section": unit.get("section") or unit.get("block_kind") or unit.get("kind"),
+                    "label": "translation_unit",
+                    "text": original,
+                    "original_text": original,
+                    "translated_text": translated,
+                    "source_language": unit.get("source_language") or payload.get("source_language"),
+                    "target_language": payload.get("target_language") or "zh-CN",
+                    "char_start": unit.get("start") if unit.get("kind") == "body" else None,
+                    "char_end": unit.get("end") if unit.get("kind") == "body" else None,
+                    "paragraph_index": unit.get("paragraph_index"),
+                    "block_kind": unit.get("block_kind") or unit.get("kind"),
+                    "index_kind": "translation",
+                    "translation_source_fingerprint": payload.get("source_fingerprint"),
+                    "content_sha256": hashlib.sha256(
+                        (original + "\0" + translated).encode("utf-8", errors="replace")
+                    ).hexdigest(),
+                }
+                index_key = "translation:" + hashlib.sha256(
+                    (node_path + "\0" + evidence_id).encode("utf-8", errors="replace")
+                ).hexdigest()
+                index_rows.append((
+                    scan_id, index_key, node_path, "",
+                    json.dumps(indexed, ensure_ascii=False, separators=(",", ":")),
+                    str(indexed.get("section") or ""),
+                    original + "\n" + translated,
+                ))
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO document_translations("
+                "scan_id,node_path,source_fingerprint,status,source_language,provider_id,payload,updated_at"
+                ") VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                (
+                    scan_id, node_path, str(payload.get("source_fingerprint") or ""),
+                    str(payload.get("status") or "unknown"),
+                    str(payload.get("source_language") or "unknown"),
+                    str(payload.get("provider_id") or ""), stored,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM evidence_index WHERE scan_id=? AND source_path=? "
+                "AND index_key LIKE 'translation:%'",
+                (scan_id, node_path),
+            )
+            if self.evidence_fts_available:
+                conn.execute(
+                    "DELETE FROM evidence_fts WHERE scan_id=? AND source_path=? "
+                    "AND index_key LIKE 'translation:%'",
+                    (scan_id, node_path),
+                )
+            if index_rows:
+                conn.executemany(
+                    "INSERT INTO evidence_index(scan_id,index_key,source_path,archive_source_path,payload) "
+                    "VALUES (?,?,?,?,?)",
+                    [row[:5] for row in index_rows],
+                )
+                if self.evidence_fts_available:
+                    conn.executemany(
+                        "INSERT INTO evidence_fts(scan_id,index_key,source_path,archive_source_path,section,text) "
+                        "VALUES (?,?,?,?,?,?)",
+                        [(row[0], row[1], row[2], row[3], row[5], row[6]) for row in index_rows],
+                    )
+
+    def get_translation(self, scan_id, node_path, hydrate=True):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM document_translations WHERE scan_id=? AND node_path=?",
+                (str(scan_id), str(node_path)),
+            ).fetchone()
+        return self._load_translation_payload(row["payload"], hydrate=hydrate) if row else None
+
+    def iter_translations(self, scan_id, statuses=None, hydrate=False, batch_size=200):
+        batch_size = max(1, min(1000, int(batch_size or 200)))
+        values = [str(scan_id)]
+        where = "scan_id=?"
+        statuses = [str(value) for value in (statuses or []) if value]
+        if statuses:
+            where += " AND status IN ({})".format(",".join("?" for _ in statuses))
+            values.extend(statuses)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT node_path,payload FROM document_translations WHERE {} ORDER BY node_path".format(where),
+                values,
+            )
+            try:
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        yield {
+                            "path": row["node_path"],
+                            "payload": self._load_translation_payload(row["payload"], hydrate=hydrate),
+                        }
+            finally:
+                cursor.close()
+
+    def translation_counts(self, scan_id):
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status,COUNT(*) AS value FROM document_translations "
+                "WHERE scan_id=? GROUP BY status", (str(scan_id),)
+            ).fetchall()
+        return {row["status"]: int(row["value"]) for row in rows}
+
+    def get_translation_memory(self, memory_key):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM translation_memory WHERE memory_key=?", (str(memory_key),)
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_translation_memory(self, memory_key, payload):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO translation_memory(memory_key,payload,updated_at) "
+                "VALUES (?,?,CURRENT_TIMESTAMP)",
+                (str(memory_key), json.dumps(payload or {}, ensure_ascii=False)),
+            )
+
+    def save_conversation(self, payload, owner_id):
+        payload = dict(payload or {})
+        session_id = str(payload.get("session_id") or "")
+        scan_id = str(payload.get("scan_id") or "")
+        if not session_id or not scan_id:
+            raise ValueError("会话必须包含 session_id 和 scan_id")
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO conversations(id,scan_id,owner_id,title,status,payload) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                "title=excluded.title,status=excluded.status,payload=excluded.payload,updated_at=CURRENT_TIMESTAMP "
+                "WHERE conversations.scan_id=excluded.scan_id AND conversations.owner_id=excluded.owner_id",
+                (
+                    session_id, scan_id, str(owner_id), str(payload.get("title") or "资料问答")[:200],
+                    str(payload.get("status") or "active"), json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            for message in payload.get("messages") or []:
+                message_id = str(message.get("message_id") or "")
+                if not message_id:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO conversation_messages(session_id,message_id,role,payload) "
+                    "VALUES (?,?,?,?)",
+                    (
+                        session_id, message_id, str(message.get("role") or "unknown"),
+                        json.dumps(message, ensure_ascii=False),
+                    ),
+                )
+        return session_id
+
+    def get_conversation(self, session_id, owner_id, scan_id=None):
+        clauses = ["id=?", "owner_id=?"]
+        values = [str(session_id), str(owner_id)]
+        if scan_id is not None:
+            clauses.append("scan_id=?")
+            values.append(str(scan_id))
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM conversations WHERE {}".format(" AND ".join(clauses)), values
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_conversations(self, scan_id, owner_id, limit=50):
+        limit = max(1, min(200, int(limit or 50)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,title,status,payload,created_at,updated_at FROM conversations "
+                "WHERE scan_id=? AND owner_id=? ORDER BY updated_at DESC LIMIT ?",
+                (str(scan_id), str(owner_id), limit),
+            ).fetchall()
+        items = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            items.append({
+                "session_id": row["id"], "title": row["title"], "status": row["status"],
+                "scope": payload.get("scope"), "message_count": len(payload.get("messages") or []),
+                "created_at": row["created_at"], "updated_at": row["updated_at"],
+            })
+        return items
+
     def set_file_state(self, scan_id, node_path, fingerprint, status, document=None, error=None):
         document = document or {}
         with self.lock, self._connect() as conn:
@@ -1475,6 +2162,28 @@ class Storage:
                     error,
                 ),
             )
+
+    def set_file_states(self, scan_id, states):
+        rows = []
+        for node_path, fingerprint, status, document, error in states or []:
+            document = document or {}
+            rows.append((
+                str(scan_id), str(node_path), str(fingerprint or ""), str(status),
+                (document.get("parser") or {}).get("name"),
+                len(document.get("text") or ""),
+                len(document.get("evidence") or []),
+                str(error)[:2000] if error else None,
+            ))
+        if not rows:
+            return 0
+        with self.lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO file_analysis_states("
+                "scan_id,node_path,fingerprint,status,parser,stored_characters,evidence_count,error,updated_at"
+                ") VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                rows,
+            )
+        return len(rows)
 
     def get_file_state(self, scan_id, node_path):
         with self._connect() as conn:
@@ -1723,8 +2432,10 @@ class Storage:
         # behind a long FIFO tail. A running task is never pre-empted.
         return {
             "scan_and_analyze": 100,
+            "translate_document": 90,
             "analyze_package": 80,
             "export_package": 60,
+            "translate_package": 35,
             "generate_summary": 40,
             "generate_report": 30,
         }.get(str(task_type or ""), 50)

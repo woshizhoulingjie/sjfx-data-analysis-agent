@@ -119,6 +119,7 @@ def execute(job):
         _run_claimed_report_job,
         _run_claimed_scan_and_analyze_job,
         _run_claimed_summary_job,
+        _run_claimed_translation_job,
     )
     task_type = job.get("task_type")
     if task_type == "scan_and_analyze":
@@ -131,6 +132,8 @@ def execute(job):
         return _run_claimed_summary_job(job)
     if task_type == "export_package":
         return _run_claimed_export_job(job)
+    if task_type in {"translate_document", "translate_package"}:
+        return _run_claimed_translation_job(job)
     raise ValueError("未知任务类型：{}".format(task_type))
 
 
@@ -185,6 +188,8 @@ def _task_runtime_limit(job):
         "generate_summary": Config.JOB_SUMMARY_TIMEOUT_SECONDS,
         "generate_report": Config.JOB_REPORT_TIMEOUT_SECONDS,
         "export_package": Config.JOB_EXPORT_TIMEOUT_SECONDS,
+        "translate_document": Config.JOB_TRANSLATION_TIMEOUT_SECONDS,
+        "translate_package": Config.JOB_TRANSLATION_PACKAGE_TIMEOUT_SECONDS,
     }
     limit = limits.get(job.get("task_type"), Config.JOB_DEFAULT_TIMEOUT_SECONDS)
     if job.get("task_type") == "generate_summary":

@@ -1,9 +1,8 @@
-"""Bounded, recoverable processing for genuinely large data packages.
+"""Policies and coverage contracts for genuinely large data packages.
 
-Large-package mode still uses bounded batches and checkpoint reuse, but it no
-longer stops after a representative sample.  Every inventoried file enters the
-same parse pipeline; expensive deduplication and embedding clustering remain
-optional statistics and never gate the content classification tree.
+Every file is inventoried and receives a bounded preview.  Accurate parsing is
+reserved for diverse representatives and for files promoted by user queries;
+the two coverage levels are never reported as if they were equivalent.
 """
 import hashlib
 import json
@@ -52,6 +51,13 @@ def build_policy(scan, options=None):
     batch_files = max(1, min(1000, int(options.get("batch_files") or 500)))
     overview_chars = max(1000, min(12000, int(options.get("overview_chars_per_file") or 4000)))
     overview_evidence = max(1, min(20, int(options.get("overview_evidence_per_file") or 6)))
+    preview_bytes = max(4096, min(1024 * 1024, int(options.get("preview_bytes_per_file") or 96 * 1024)))
+    preview_total_bytes = max(
+        preview_bytes,
+        int(options.get("preview_total_bytes") or 8 * 1024 * 1024 * 1024),
+    )
+    preview_zip_members = max(1, min(1000, int(options.get("preview_zip_members") or 80)))
+    preview_zip_member_bytes = max(256, min(64 * 1024, int(options.get("preview_zip_member_bytes") or 8192)))
     enabled = total_size >= threshold_bytes or file_count >= threshold_files
     return {
         "mode": "large_package" if enabled else "standard",
@@ -61,8 +67,13 @@ def build_policy(scan, options=None):
         "initial_parse_files": initial_limit,
         "deepen_batch_files": deepen_limit,
         "batch_files": batch_files,
-        "full_inventory_processing": True,
-        "classification_scope": "all_parsed_files",
+        "full_inventory_processing": False,
+        "full_inventory_preview": True,
+        "classification_scope": "all_bounded_previews",
+        "preview_bytes_per_file": preview_bytes,
+        "preview_total_bytes": preview_total_bytes,
+        "preview_zip_members": preview_zip_members,
+        "preview_zip_member_bytes": preview_zip_member_bytes,
         "overview_chars_per_file": overview_chars,
         "overview_evidence_per_file": overview_evidence,
         "inventory_files": file_count,
@@ -70,9 +81,10 @@ def build_policy(scan, options=None):
         "inventory_size_human": human_size(total_size),
         "checkpoint_resume": True,
         "batch_completion": "continue_until_inventory_exhausted",
+        "batch_work_kind": "bounded_preview_then_selected_deep_parse",
         "batch_checkpoint_scope": "per_file",
         "pause_behavior": "安全停止后保留逐文件检查点；再次启动同一扫描可续跑",
-        "deep_analysis_strategy": "首轮全量快速解析与索引，代表性概览；用户选择范围后准确解析和全文语义分析",
+        "deep_analysis_strategy": "全量有界轻量预览与内容地图；自动深析代表文件，用户问答命中后动态晋升准确解析",
     }
 
 
@@ -235,12 +247,20 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         parsed_bytes = sum(int(files[path].get("size") or 0) for path in parsed)
         def parse_is_complete(path):
             coverage = documents.get(path, {}).get("coverage") or {}
+            if coverage.get("deep_parse_complete"):
+                return True
             return bool(coverage.get("parse_complete", coverage.get("complete", False)))
 
         def semantic_is_complete(path):
             document = documents.get(path, {})
             coverage = document.get("coverage") or {}
-            if document.get("sidecar_projection") or coverage.get("semantic_projection"):
+            if coverage.get("deep_parse_complete"):
+                return True
+            if (
+                document.get("sidecar_projection")
+                or coverage.get("semantic_projection")
+                or coverage.get("preview_only")
+            ):
                 return False
             return bool(coverage.get("semantic_complete", coverage.get("complete", False)))
 
@@ -252,6 +272,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             if documents.get(path, {}).get("sidecar_projection")
             or (documents.get(path, {}).get("coverage") or {}).get("semantic_projection")
             or (documents.get(path, {}).get("coverage") or {}).get("overview_sampled")
+            or (documents.get(path, {}).get("coverage") or {}).get("preview_only")
         )
         parse_partial = len(parsed - parse_complete_paths)
         semantic_partial = len(parsed - semantic_complete_paths)
@@ -297,7 +318,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
                 )
             )
         if (policy or {}).get("enabled") and pending:
-            limitations.append("大数据包采用有限批次持续处理；仍有文件待进入后续批次。")
+            limitations.append("大数据包采用有限预览预算持续处理；仍有文件待进入后续轻量预览批次。")
         if sampled:
             limitations.append("{} 个文件当前为抽样/首轮概览，不能视为全文深度分析。".format(sampled))
         if parse_partial:
@@ -430,7 +451,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
                 "eta_note": "尚无稳定的同类文件吞吐基线，完成首个批次后再按格式估算 ETA。" if remaining_batches else "已无待处理批次。",
             },
             "large_package_notice": (
-                "大数据包按每批 {} 个文件连续处理，直到清点文件全部完成或明确失败；逐文件保存检查点，可安全停止并续跑。首轮概览不等同于全文深度分析。".format(batch_size)
+                "大数据包按每批 {} 个文件完成有界轻量预览并建立内容地图；仅代表文件和用户命中文件进入准确深析。逐文件保存检查点，可安全停止并续跑。轻量预览不等同于全文深度分析。".format(batch_size)
                 if (policy or {}).get("enabled") else None
             ),
         }
@@ -458,11 +479,11 @@ def pending_group(paths, inventory, policy):
     total_size = sum(int(inventory[path].get("size") or 0) for path in paths if path in inventory)
     return {
         "kind": "group",
-        "node_type": "pending_scope",
+        "node_type": "deep_pending_scope",
         "node_id": "pending-{}".format(hashlib.sha256("|".join(paths).encode("utf-8")).hexdigest()[:16]),
         "dimension": "分析进度",
         "name": "待按需深度分析",
-        "summary": "该分支包含 {} 个尚未进入内容分析的文件，将在后续批次继续处理。".format(len(paths)),
+        "summary": "该分支包含 {} 个已纳入清点、但尚未进入准确深度分析的文件；用户问答命中后可自动晋升。".format(len(paths)),
         "member_paths": paths,
         "file_count": len(paths),
         "total_size": total_size,

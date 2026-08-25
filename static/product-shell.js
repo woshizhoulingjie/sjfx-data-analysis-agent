@@ -5,11 +5,12 @@
   const routeNames = {
     dashboard: ['工作台', '数据概览'], packages: ['数据包', '导入与任务'],
     physical: ['原始目录', '物理资料树'], analysis: ['智能分析', '主题与证据'],
-    evidence: ['证据问答', '可追溯检索'], overview: ['情况概览', '价值与发现'],
+    chat: ['资料问答', '持续对话'], translation: ['全文翻译', '原文与中文'],
+    evidence: ['证据问答', '可追溯检索'], overview: ['数据包概览', '内容地图'],
     exports: ['导出中心', '交接成果'], tasks: ['任务中心', '运行状态'],
     settings: ['系统设置', '本地运行环境']
   };
-  const viewFor = { dashboard: 'dashboard', packages: 'packages', physical: 'explore', analysis: 'explore', evidence: 'evidence', overview: 'overview', exports: 'exports', tasks: 'tasks', settings: 'settings' };
+  const viewFor = { dashboard: 'dashboard', packages: 'packages', physical: 'explore', analysis: 'explore', chat: 'chat', translation: 'translation', evidence: 'evidence', overview: 'overview', exports: 'exports', tasks: 'tasks', settings: 'settings' };
   let activeRoute = 'dashboard';
 
   const $ = (id) => document.getElementById(id);
@@ -116,6 +117,7 @@
     if ($('exploreTitle')) $('exploreTitle').textContent = route === 'analysis' ? '智能分析目录' : '原始目录';
     if ($('exploreSubtitle')) $('exploreSubtitle').textContent = route === 'analysis' ? '从主题到子方向、文档和证据逐层下钻。' : '确认真实资料结构，原始目录不会被语义分类覆盖。';
     if (route === 'tasks') window.SJFXTasks?.refresh();
+    window.SJFXEngineering?.activate(route);
     syncDashboard();
     window.scrollTo({ top: 0, behavior: 'smooth' });
     document.querySelector('.sidebar')?.classList.remove('open');

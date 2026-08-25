@@ -198,6 +198,28 @@ class Config:
     SHARED_OLLAMA_REQUEST_TIMEOUT = max(60, int(os.getenv("SHARED_OLLAMA_REQUEST_TIMEOUT", "600")))
     SHARED_OLLAMA_MAX_CHARS = max(4000, int(os.getenv("SHARED_OLLAMA_MAX_CHARS", "48000")))
     LLM_CONTEXT_TOKENS = max(8192, int(os.getenv("LLM_CONTEXT_TOKENS", "65536")))
+    ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "1").strip().lower() in {"1", "true", "yes", "on"}
+    ENABLE_TRANSLATION_REVIEW = os.getenv("ENABLE_TRANSLATION_REVIEW", "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    TRANSLATION_OLLAMA_BASE_URL = _local_model_url(
+        os.getenv("TRANSLATION_OLLAMA_BASE_URL", OLLAMA_BASE_URL)
+    )
+    TRANSLATION_OLLAMA_MODEL = os.getenv("TRANSLATION_OLLAMA_MODEL", OLLAMA_MODEL).strip()
+    TRANSLATION_MAX_UNIT_CHARS = max(
+        128, min(12000, int(os.getenv("TRANSLATION_MAX_UNIT_CHARS", "2400")))
+    )
+    TRANSLATION_MAX_ATTEMPTS = max(1, min(6, int(os.getenv("TRANSLATION_MAX_ATTEMPTS", "3"))))
+    TRANSLATION_TIMEOUT_SECONDS = max(10, min(1800, int(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "180"))))
+    TRANSLATION_PACKAGE_BATCH_FILES = max(
+        1, min(500, int(os.getenv("TRANSLATION_PACKAGE_BATCH_FILES", "50")))
+    )
+    TRANSLATION_FOREGROUND_MAX_UNITS = max(
+        1, min(200, int(os.getenv("TRANSLATION_FOREGROUND_MAX_UNITS", "24")))
+    )
+    AUTO_TRANSLATE_PACKAGES = os.getenv("AUTO_TRANSLATE_PACKAGES", "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
     HOST = os.getenv("HOST", "127.0.0.1")
     PORT = int(os.getenv("PORT", "8000"))
     API_ACCESS_TOKEN = os.getenv("SJFX_API_ACCESS_TOKEN", "").strip()
@@ -272,12 +294,26 @@ class Config:
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
     LARGE_PACKAGE_INITIAL_PARSE_FILES = int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "700"))
     LARGE_PACKAGE_DEEPEN_BATCH_FILES = int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "500"))
-    # A large import advances in durable 500-file units.  Individual results
-    # are still checkpointed as soon as they finish, so a stop in the middle of
-    # a unit never discards the files that have already completed.
+    # Unknown large packages are first explored with deterministic bounded
+    # samples.  At the current 50k-file default the 8 GiB slice is sufficient
+    # for every file at 96 KiB while still providing a hard operator budget.
+    LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE = max(
+        4096, min(1024 * 1024, int(os.getenv("LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE", str(96 * 1024))))
+    )
+    LARGE_PACKAGE_PREVIEW_TOTAL_BYTES = max(
+        LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE,
+        int(os.getenv("LARGE_PACKAGE_PREVIEW_TOTAL_BYTES", str(8 * 1024 * 1024 * 1024))),
+    )
+    LARGE_PACKAGE_PREVIEW_ZIP_MEMBERS = max(
+        1, min(1000, int(os.getenv("LARGE_PACKAGE_PREVIEW_ZIP_MEMBERS", "80")))
+    )
+    LARGE_PACKAGE_PREVIEW_ZIP_MEMBER_BYTES = max(
+        256, min(64 * 1024, int(os.getenv("LARGE_PACKAGE_PREVIEW_ZIP_MEMBER_BYTES", "8192")))
+    )
+    # Both preview and selected deep-analysis work advance in durable bounded
+    # batches. Individual file results are checkpointed immediately.
     LARGE_PACKAGE_BATCH_FILES = max(1, min(1000, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "500"))))
-    # The full payload stays in a sidecar. Package-wide structures retain only
-    # a head/middle/tail semantic sketch, giving a strict 50k-file memory bound.
+    # Package-wide structures retain only a head/middle/tail semantic sketch.
     LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE = max(
         1000, min(12000, int(os.getenv("LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE", "4000")))
     )
@@ -322,6 +358,12 @@ class Config:
     )
     JOB_REPORT_TIMEOUT_SECONDS = max(60, int(os.getenv("JOB_REPORT_TIMEOUT_SECONDS", "900")))
     JOB_EXPORT_TIMEOUT_SECONDS = max(300, int(os.getenv("JOB_EXPORT_TIMEOUT_SECONDS", "21600")))
+    JOB_TRANSLATION_TIMEOUT_SECONDS = max(
+        60, int(os.getenv("JOB_TRANSLATION_TIMEOUT_SECONDS", "7200"))
+    )
+    JOB_TRANSLATION_PACKAGE_TIMEOUT_SECONDS = max(
+        300, int(os.getenv("JOB_TRANSLATION_PACKAGE_TIMEOUT_SECONDS", "86400"))
+    )
     MAX_JOB_RESUME_ATTEMPTS = max(1, min(256, int(os.getenv("MAX_JOB_RESUME_ATTEMPTS", "64"))))
 
 

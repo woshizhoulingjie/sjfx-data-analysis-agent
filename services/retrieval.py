@@ -169,7 +169,14 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
         }
     # File paths are metadata, not document content. Including them here lets
     # names such as "Q3" or "财报" contaminate BM25/TF-IDF ranking.
-    texts = ["{} {}".format(item.get("section") or "", item["text"][:5000]) for item in chunks]
+    texts = [
+        "{} {} {}".format(
+            item.get("section") or "",
+            item["text"][:5000],
+            str(item.get("translated_text") or "")[:5000],
+        )
+        for item in chunks
+    ]
     tokenized = [_tokens(text) for text in texts]
     bm25 = _bm25_scores(tokenized, _tokens(query))
     vectors, vector_ready = _tfidf_scores(texts, query)
