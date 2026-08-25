@@ -105,7 +105,7 @@
 
   function scopeAttributes(scope) {
     if (!scope) return '';
-    return ` data-overview-scope-kind="${escapeHtml(scope.kind)}" data-overview-scope-value="${escapeHtml(scope.value)}" data-overview-scope-label="${escapeHtml(scope.label || scope.value)}" data-overview-scope-dimension="${escapeHtml(scope.dimension || '')}"`;
+    return ` data-overview-scope-kind="${escapeHtml(scope.kind)}" data-overview-scope-value="${escapeHtml(scope.value)}" data-overview-scope-label="${escapeHtml(scope.label || scope.value)}" data-overview-scope-dimension="${escapeHtml(scope.dimension || '')}" data-overview-scope-paths="${escapeHtml(JSON.stringify(scope.source_paths || []))}"`;
   }
 
   function renderBars(hostId, section, labelKey, valueKey, valueLabel, scopeFactory) {
@@ -175,7 +175,9 @@
       const x = left + index * slot + slot * .22;
       const first = modifiedMap[period] || 0, second = documentedMap[period] || 0;
       const firstHeight = first / max * plotHeight, secondHeight = second / max * plotHeight;
-      const attrs = scopeAttributes({ kind: 'time', value: period, label: `${period} 年` });
+      const matching = modified.concat(documented).filter((item) => String(item.period) === String(period));
+      const sourcePaths = Array.from(new Set(matching.flatMap((item) => item.representative_files || [])));
+      const attrs = scopeAttributes({ kind: 'time', value: period, label: `${period} 年`, source_paths: sourcePaths });
       return `<g class="v2-overview-scope" role="button" tabindex="0"${attrs}><rect class="v2-bar" x="${x}" y="${base - firstHeight}" width="${Math.max(7, slot * .22)}" height="${firstHeight}"><title>文件修改时间 ${period}：${integer(first)}</title></rect><rect class="v2-bar-alt" x="${x + Math.max(9, slot * .25)}" y="${base - secondHeight}" width="${Math.max(7, slot * .22)}" height="${secondHeight}"><title>正文日期 ${period}：${integer(second)}</title></rect><text x="${left + index * slot + slot * .5}" y="${base + 18}" text-anchor="middle">${escapeHtml(period)}</text></g>`;
     }).join('');
     host.innerHTML = `<div class="v2-timeline-scroll"><svg class="v2-timeline-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="资料年份分布">${grid}${bars}<rect x="${left}" y="${height - 22}" width="9" height="9" class="v2-bar"></rect><text x="${left + 14}" y="${height - 14}">文件修改时间</text><rect x="${left + 112}" y="${height - 22}" width="9" height="9" class="v2-bar-alt"></rect><text x="${left + 126}" y="${height - 14}">正文识别日期</text></svg></div>`;
@@ -186,7 +188,7 @@
     if (!host) return;
     const people = itemsOf(overview.entities && overview.entities.people);
     const organisations = itemsOf(overview.entities && overview.entities.organizations);
-    const group = (title, items) => `<div class="v2-entity-group"><h3>${escapeHtml(title)}</h3>${items.length ? `<div class="v2-tag-cloud">${items.slice(0, 18).map((item) => `<button type="button" class="v2-entity-tag is-actionable" title="${escapeHtml(item.name)}"${scopeAttributes({ kind: 'entity', value: item.name, label: `${title} · ${item.name}` })}><span>${escapeHtml(item.name || '未知')}</span><b>${integer(item.file_count)}</b></button>`).join('')}</div>` : '<span class="muted">暂无</span>'}</div>`;
+    const group = (title, items) => `<div class="v2-entity-group"><h3>${escapeHtml(title)}</h3>${items.length ? `<div class="v2-tag-cloud">${items.slice(0, 18).map((item) => `<button type="button" class="v2-entity-tag is-actionable" title="${escapeHtml(item.name)}"${scopeAttributes({ kind: 'entity', value: item.name, label: `${title} · ${item.name}`, source_paths: item.representative_files || [] })}><span>${escapeHtml(item.name || '未知')}</span><b>${integer(item.file_count)}</b></button>`).join('')}</div>` : '<span class="muted">暂无</span>'}</div>`;
     host.innerHTML = `<div class="v2-entity-groups">${group('人物', people)}${group('机构', organisations)}</div>${disclosure(overview.entities && overview.entities.people, '人物')}${disclosure(overview.entities && overview.entities.organizations, '机构')}`;
   }
 
@@ -258,11 +260,11 @@
     ];
     $('packageOverviewMetrics').innerHTML = metrics.map((metric) => `<div class="v2-overview-metric"><span>${escapeHtml(metric[0])}</span><strong>${escapeHtml(metric[1])}</strong><small>${escapeHtml(metric[2])}</small></div>`).join('');
     renderBars('packageOverviewDirectories', overview.directories, (item) => item.path === '.' ? '数据包根目录' : item.path, 'recursive_file_count', (value, item) => `${integer(value)} 文件 · ${formatBytes(item.total_bytes)}`, (item, label) => item.path === '.' ? null : ({ kind: 'directory', value: item.path, label }));
-    renderDonut('packageOverviewFormats', overview.formats, 'format', 'file_count', (item, label) => ({ kind: 'file_type', value: item.format, label: `格式 · ${label}`, dimension: 'format' }));
-    renderDonut('packageOverviewTypes', overview.document_types, 'document_type', 'file_count', (item, label) => ({ kind: 'file_type', value: item.document_type, label: `文档类型 · ${label}`, dimension: 'document_type' }));
-    renderBars('packageOverviewLanguages', overview.languages, (item) => item.label || item.language, 'file_count', null, (item, label) => ({ kind: 'file_type', value: item.label || item.language, label: `语言 · ${label}`, dimension: 'language' }));
+    renderDonut('packageOverviewFormats', overview.formats, 'format', 'file_count', (item, label) => ({ kind: 'file_type', value: item.format, label: `格式 · ${label}`, dimension: 'format', source_paths: item.representative_files || [] }));
+    renderDonut('packageOverviewTypes', overview.document_types, 'document_type', 'file_count', (item, label) => ({ kind: 'file_type', value: item.document_type, label: `文档类型 · ${label}`, dimension: 'document_type', source_paths: item.representative_files || [] }));
+    renderBars('packageOverviewLanguages', overview.languages, (item) => item.label || item.language, 'file_count', null, (item, label) => ({ kind: 'file_type', value: item.label || item.language, label: `语言 · ${label}`, dimension: 'language', source_paths: item.representative_files || [] }));
     renderTimeline(overview);
-    renderBars('packageOverviewTopics', overview.topics, 'topic', 'file_count', null, (item, label) => ({ kind: 'topic', value: item.topic, label: `主题 · ${label}` }));
+    renderBars('packageOverviewTopics', overview.topics, 'topic', 'file_count', null, (item, label) => ({ kind: 'topic', value: item.topic, label: `主题 · ${label}`, source_paths: item.representative_files || [] }));
     renderEntities(overview);
     renderRelationships(overview);
     renderDuplicates(overview);
@@ -316,7 +318,10 @@
       const start = ($('conversationScopeStart').value || '').trim();
       const end = ($('conversationScopeEnd').value || '').trim();
       if (!start && !end) throw new Error('请至少填写开始或结束时间');
-      return { kind: 'time', value: Object.assign({}, start ? { start } : {}, end ? { end } : {}) };
+      const constraints = Object.assign({}, state.scopeConstraints || {});
+      const sourcePaths = Array.isArray(constraints.source_paths) ? constraints.source_paths : [];
+      delete constraints.source_paths;
+      return { kind: 'time', value: Object.assign({}, start ? { start } : {}, end ? { end } : {}), source_paths: sourcePaths, constraints };
     }
     const value = ($('conversationScopeValue').value || '').trim();
     if (!value) throw new Error(`请填写${scopeKindLabel(kind)}`);
@@ -325,7 +330,10 @@
       if (!paths.length) throw new Error('请至少填写一个文件路径');
       return { kind: 'files', value: paths, source_paths: paths };
     }
-    return { kind, value, constraints: Object.assign({}, state.scopeConstraints || {}) };
+    const constraints = Object.assign({}, state.scopeConstraints || {});
+    const sourcePaths = Array.isArray(constraints.source_paths) ? constraints.source_paths : [];
+    delete constraints.source_paths;
+    return { kind, value, source_paths: sourcePaths, constraints };
   }
 
   function applyOverviewScope(element) {
@@ -333,6 +341,12 @@
     const rawValue = element.dataset.overviewScopeValue || '';
     if (!kind || !rawValue) return;
     state.scopeConstraints = element.dataset.overviewScopeDimension ? { dimension: element.dataset.overviewScopeDimension } : {};
+    state.scopeConstraints.overview_drilldown = true;
+    try {
+      state.scopeConstraints.source_paths = JSON.parse(element.dataset.overviewScopePaths || '[]');
+    } catch (_error) {
+      state.scopeConstraints.source_paths = [];
+    }
     $('conversationScopeKind').value = kind;
     renderScopeFields();
     if (kind === 'time') {

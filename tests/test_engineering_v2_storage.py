@@ -196,6 +196,30 @@ class EngineeringV2StorageTests(unittest.TestCase):
             stale_hits = storage.search_evidence_index("scan", "绝密撤回方案", limit=50)
             self.assertFalse(any(item.get("source_path") == "changed.txt" for item in stale_hits))
 
+    def test_failed_reparse_deletes_stale_translation_and_index(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "state.db")
+            document = {
+                "source": {"path": "failed.txt", "name": "failed.txt", "sha256": "v1"},
+                "structure": {"title": "Failed"}, "text": "Original evidence.",
+            }
+            storage.save_document("scan", "failed.txt", document)
+            storage.save_translation("scan", "failed.txt", {
+                "source_fingerprint": document_translation_fingerprint(document),
+                "source_language": "en", "status": "completed",
+                "units": [{
+                    "unit_id": "U1", "kind": "body", "status": "completed",
+                    "source_text": "Original evidence.", "target_text": "过期机密证据。",
+                }],
+            })
+            self.assertTrue(storage.search_evidence_index("scan", "过期机密", limit=20))
+
+            storage.delete_document("scan", "failed.txt")
+
+            self.assertIsNone(storage.get_translation("scan", "failed.txt"))
+            stale = storage.search_evidence_index("scan", "过期机密", limit=20)
+            self.assertFalse(any(item.get("source_path") == "failed.txt" for item in stale))
+
     def test_conversation_is_owner_scoped_and_messages_are_idempotent(self):
         with tempfile.TemporaryDirectory() as folder:
             storage = Storage(Path(folder) / "state.db")

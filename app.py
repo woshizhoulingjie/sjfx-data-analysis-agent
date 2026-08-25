@@ -1283,19 +1283,29 @@ def _run_claimed_analysis_job(job):
     storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
     overview = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id)
     _ensure_job_active(job_id)
-    translation_job_id = None
-    if Config.AUTO_TRANSLATE_PACKAGES and not options.get("target_paths"):
-        translation_job_id, _translation_created = storage.create_or_get_typed_job(
-            scan_id, "translate_package",
-            options={"phase": "preview_and_priority", "cursor": 0},
-            owner_id=job.get("owner_id") or "legacy",
-        )
+    translation_job_ids = []
+    if Config.ENABLE_TRANSLATION:
+        for target_path in options.get("target_paths") or []:
+            translation_job_id, _translation_created = storage.create_or_get_typed_job(
+                scan_id, "translate_document",
+                options={"path": str(target_path), "require_full": True},
+                owner_id=job.get("owner_id") or "legacy",
+            )
+            translation_job_ids.append(translation_job_id)
+        if Config.AUTO_TRANSLATE_PACKAGES and not options.get("target_paths"):
+            translation_job_id, _translation_created = storage.create_or_get_typed_job(
+                scan_id, "translate_package",
+                options={"phase": "preview_and_priority", "cursor": 0},
+                owner_id=job.get("owner_id") or "legacy",
+            )
+            translation_job_ids.append(translation_job_id)
     return {
         "scan_id": scan_id,
         "analysis": analysis.get("statistics", {}),
         "classification_dimensions": analysis.get("classification_dimensions", []),
         "overview": overview,
-        "translation_job_id": translation_job_id,
+        "translation_job_id": translation_job_ids[0] if translation_job_ids else None,
+        "translation_job_ids": translation_job_ids,
         "conversation_continuation": conversation_continuation,
     }
 
@@ -1308,6 +1318,8 @@ def _translation_candidate_paths(scan_id, phase):
         candidates = []
         for item in storage.iter_file_previews(scan_id):
             preview = item.get("payload") or {}
+            if str(preview.get("status") or "") != "previewed":
+                continue
             language = str((preview.get("language") or {}).get("code") or "unknown")
             if language == "zh":
                 continue
@@ -1322,7 +1334,8 @@ def _translation_candidate_paths(scan_id, phase):
                     # will make a fresh attempt after the operator fixes it.
                     continue
             candidates.append(path)
-        return sorted(set(candidates)), large
+        representatives = set((storage.get_content_map(scan_id) or {}).get("representative_paths") or [])
+        return sorted(set(candidates), key=lambda path: (path not in representatives, path)), large
     return sorted(item.get("path") for item in storage.iter_documents(scan_id, hydrate=False)), large
 
 
@@ -1480,6 +1493,18 @@ def _run_claimed_translation_job(job):
             owner_id=job.get("owner_id") or "legacy",
         )
         next_cursor = 0
+    elif phase == "deep_backfill":
+        # A deep-backfill candidate disappears as soon as this slice promotes
+        # and fully translates it. Recompute the shrinking set instead of
+        # comparing the old cursor against the pre-slice list.
+        remaining, _large = _translation_candidate_paths(scan_id, phase)
+        if remaining:
+            continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
+                scan_id, "translate_package",
+                options={"phase": phase, "cursor": 0, "slice": slice_no + 1},
+                owner_id=job.get("owner_id") or "legacy",
+            )
+            next_cursor = 0
     elif next_cursor < len(paths):
         continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
             scan_id, "translate_package",
@@ -2201,6 +2226,87 @@ def _continue_conversation_after_promotion(job, analysis, scan_result):
     }
 
 
+def _scope_paths_from_storage(scan_id, scan_result, kind, value, constraints):
+    """Resolve a logical overview selection to every matching physical file."""
+    constraints = dict(constraints or {})
+    inventory = inventory_by_path(scan_result)
+    records = {path: dict(node or {}) for path, node in inventory.items()}
+    for item in storage.iter_file_previews(scan_id):
+        path = str(item.get("path") or "")
+        if path:
+            records.setdefault(path, {}).update(item.get("payload") or {})
+    for item in storage.iter_documents(scan_id, hydrate=False, batch_size=200):
+        path = str(item.get("path") or "")
+        if path:
+            records.setdefault(path, {}).update(item.get("payload") or {})
+
+    def values(source):
+        output = []
+        stack = [source]
+        while stack and len(output) < 512:
+            current = stack.pop()
+            if isinstance(current, dict):
+                stack.extend(current.values())
+            elif isinstance(current, (list, tuple, set)):
+                stack.extend(current)
+            elif current is not None:
+                output.append(str(current))
+        return output
+
+    language_aliases = {
+        "中文": "zh", "英语": "en", "日语": "ja", "韩语": "ko",
+        "法语": "fr", "德语": "de", "西班牙语": "es", "俄语": "ru",
+        "阿拉伯语": "ar",
+    }
+    expected = str(value or "").casefold()
+    dimension = str(constraints.get("dimension") or "")
+    if kind == "time":
+        start = str((value or {}).get("start") or "")[:4]
+        end = str((value or {}).get("end") or "")[:4]
+        start_year = int(start) if start.isdigit() else 0
+        end_year = int(end) if end.isdigit() else 9999
+
+    matched = []
+    for path, record in records.items():
+        classification = record.get("classification") or {}
+        if kind == "topic":
+            candidates = values([
+                record.get("keywords"), record.get("topics"), record.get("content_topics"),
+                classification.get("primary_topic"), classification.get("topic_memberships"),
+            ])
+            match = expected in {item.casefold() for item in candidates}
+        elif kind == "entity":
+            candidates = values([record.get("entities"), record.get("named_entities")])
+            match = expected in {item.casefold() for item in candidates}
+        elif kind == "time":
+            candidates = values([
+                record.get("modified_at"), record.get("dates"), record.get("document_date"),
+                record.get("temporal"), (record.get("metadata") or {}).get("document_date"),
+            ])
+            years = {
+                int(match.group(1)) for candidate in candidates
+                for match in [re.search(r"(?<!\d)(1[0-9]{3}|20[0-9]{2}|21[0-9]{2})(?!\d)", candidate)]
+                if match
+            }
+            match = any(start_year <= year <= end_year for year in years)
+        elif kind == "file_type" and dimension == "format":
+            extension = str(record.get("extension") or Path(path.split("::", 1)[0]).suffix).lower()
+            wanted = expected if expected.startswith(".") or expected == "[无扩展名]" else "." + expected
+            match = (extension or "[无扩展名]") == wanted
+        elif kind == "file_type" and dimension == "document_type":
+            candidate = str(record.get("document_type") or classification.get("document_type") or "")
+            match = candidate.casefold() == expected
+        elif kind == "file_type" and dimension == "language":
+            candidates = values([record.get("language"), record.get("languages")])
+            wanted = language_aliases.get(str(value or ""), str(value or "")).casefold()
+            match = wanted in {item.casefold() for item in candidates}
+        else:
+            match = False
+        if match:
+            matched.append(path)
+    return sorted(set(matched))
+
+
 def _resolved_conversation_scope(scan_id, scan_result, payload):
     payload = dict(payload or {})
     kind = str(payload.get("kind") or "package").lower()
@@ -2211,6 +2317,14 @@ def _resolved_conversation_scope(scan_id, scan_result, payload):
         source_paths = list(node.get("member_paths") or [])
         payload["label"] = payload.get("label") or node.get("name")
         payload["value"] = payload.get("value") or node.get("name")
+    elif kind in {"topic", "entity", "time", "file_type"} and (
+        not source_paths or constraints.get("overview_drilldown")
+    ):
+        source_paths = _scope_paths_from_storage(
+            scan_id, scan_result, kind, payload.get("value"), constraints
+        )
+        if not source_paths:
+            raise ValueError("所选范围没有可定位的资料，请刷新数据包概览后重试")
     for path in source_paths:
         resolve_under(scan_result["root"], path.split("::", 1)[0])
     if kind == "directory":
@@ -2302,6 +2416,10 @@ def conversation_message(session_id):
             coverage=analysis.get("coverage") or {},
             persist_scope=bool(payload.get("persist_scope")),
         )
+        # The continuation Worker must see the triggering exchange before a
+        # promotion job can become claimable. Saving again after enqueueing can
+        # overwrite a fast continuation with this older in-memory snapshot.
+        storage.save_conversation(session.as_dict(), _request_owner_id() or "legacy")
         promotion = turn.get("promotion_request") or {}
         promotion_job_id = None
         if promotion.get("required"):
@@ -2327,7 +2445,6 @@ def conversation_message(session_id):
                 )
                 turn["promotion_job_id"] = promotion_job_id
                 turn["status"] = "promotion_queued"
-        storage.save_conversation(session.as_dict(), _request_owner_id() or "legacy")
         return jsonify({
             "ok": True,
             "turn": turn,
@@ -2677,7 +2794,7 @@ def _job_api_view(source, include_blocker=True, compact=False):
             allowed_result_fields = {
                 "scan_id", "scan_available", "file_name", "download_url",
                 "source_file_count", "selection_count", "segmented", "volumes",
-                "translation_job_id", "translation_status", "source_level",
+                "translation_job_id", "translation_job_ids", "translation_status", "source_level",
                 "full_translation", "continuation_job_id", "phase",
             }
             job["result"] = {

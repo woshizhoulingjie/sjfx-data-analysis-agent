@@ -48,6 +48,8 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
 
     def test_overview_dimensions_drill_into_conversation_scope(self):
         self.assertIn("data-overview-scope-kind", self.script)
+        self.assertIn("data-overview-scope-paths", self.script)
+        self.assertIn("overview_drilldown", self.script)
         self.assertIn("applyOverviewScope", self.script)
         for kind in ("directory", "topic", "entity", "time", "file_type"):
             self.assertIn("kind: '{}'".format(kind), self.script)

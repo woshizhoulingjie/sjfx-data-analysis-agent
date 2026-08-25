@@ -8,6 +8,7 @@ the public API job-id/freshness contracts.  No test talks to Ollama.
 
 import importlib.util
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,7 +48,9 @@ class _VerifiedChineseProvider(TranslationProvider):
     def translate(self, text, source_language, target_language, glossary=None,
                   timeout=None, retries=0):
         # Keep protected tokens intact so the production QA path is exercised.
-        return ProviderResponse("这是经过验证的中文译文。" + str(text or ""), model="test")
+        source = str(text or "")
+        protected = " ".join(re.findall(r"__SJFX_(?:TERM|KEEP)_\d{4}__", source))
+        return ProviderResponse("这是经过验证的中文译文。" + protected, model="test")
 
 
 class DurableStorageIntegrationTests(unittest.TestCase):
@@ -353,6 +356,58 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
             "0.txt", "1.txt", "2.txt", "3.txt", "4.txt",
         })
 
+    def test_translation_candidates_prioritize_representatives_and_exclude_restricted(self):
+        scan_id, scan = self._save_scan_with_files(["ordinary.txt", "priority.txt", ".env"])
+        self.storage.save_analysis(scan_id, {
+            "scan_id": scan_id, "policy": {"large_package": {"enabled": True}},
+        })
+        for node in _inventory_files(scan):
+            path = node["path"]
+            self.storage.save_file_preview(scan_id, path, {
+                "path": path, "status": "restricted" if path == ".env" else "previewed",
+                "language": {"code": "unknown" if path == ".env" else "en"},
+            })
+        self.storage.save_content_map(scan_id, {
+            "representative_paths": ["priority.txt"],
+        })
+
+        paths, large = self.app_module._translation_candidate_paths(
+            scan_id, "preview_and_priority"
+        )
+
+        self.assertTrue(large)
+        self.assertEqual(paths, ["priority.txt", "ordinary.txt"])
+
+    def test_overview_topic_scope_excludes_out_of_scope_evidence(self):
+        scan_id, scan = self._save_scan_with_files(["north.txt", "south.txt"])
+        for path, topic, text in (
+            ("north.txt", "北区交付", "North-only approved evidence."),
+            ("south.txt", "南区预算", "South-only budget evidence."),
+        ):
+            self.storage.save_document(scan_id, path, {
+                "source": {"path": path, "name": path},
+                "classification": {"primary_topic": topic, "topic_memberships": [topic]},
+                "text": text,
+            })
+        scope = self.app_module._resolved_conversation_scope(scan_id, scan, {
+            "kind": "topic", "value": "北区交付",
+            "constraints": {"overview_drilldown": True},
+        })
+        self.assertEqual(scope.source_paths, ("north.txt",))
+
+        self.storage.replace_evidence_index(scan_id, [
+            {"evidence_id": "N1", "source_path": "north.txt", "text": "North evidence"},
+            {"evidence_id": "S1", "source_path": "south.txt", "text": "South evidence"},
+        ])
+        request_data = RetrievalRequest(
+            scan_id=scan_id, query="evidence", scope=scope, top_k=10,
+        )
+        result = self.app_module._conversation_retrieve(request_data)
+        self.assertEqual(
+            {item.get("source_path") for item in result.get("results") or []},
+            {"north.txt"},
+        )
+
     def test_archive_member_evidence_uses_container_state_for_coverage(self):
         scan_id, _scan = self._save_scan_with_files(["mail.zip"])
         self.storage.save_analysis(scan_id, {
@@ -456,6 +511,30 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
         self.assertNotEqual(payload.get("status"), "completed")
         translated = (payload.get("translated") or {}).get("text")
         self.assertFalse(translated)
+
+    def test_package_rebuild_preserves_completed_translation_index(self):
+        scan_id, _scan = self._save_scan_with_files(["letter.txt"])
+        self.storage.save_translation(scan_id, "letter.txt", {
+            "source_fingerprint": "source-v1", "source_language": "en",
+            "status": "completed", "full_translation": True,
+            "units": [{
+                "unit_id": "U1", "kind": "body", "status": "completed",
+                "source_text": "The confidential delivery was approved.",
+                "target_text": "机密交付已经批准。",
+            }],
+        })
+        self.assertTrue(self.storage.search_evidence_index(scan_id, "机密交付", limit=20))
+
+        self.storage.clear_evidence_index(scan_id, preserve_translations=True)
+        self.storage.replace_document_evidence_index(
+            scan_id, "letter.txt", [{
+                "evidence_id": "E1", "source_path": "letter.txt",
+                "label": "paragraph", "text": "Updated original evidence.",
+            }], preserve_translations=True,
+        )
+
+        translated = self.storage.search_evidence_index(scan_id, "机密交付", limit=20)
+        self.assertTrue(any(item.get("index_kind") == "translation" for item in translated))
 
 
 if __name__ == "__main__":

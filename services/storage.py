@@ -723,11 +723,22 @@ class Storage:
         if str(row["source_fingerprint"] or "") == current_fingerprint:
             return None
 
+        return self._delete_translation_state(conn, scan_id, node_path, row=row)
+
+    def _delete_translation_state(self, conn, scan_id, node_path, row=None):
+        scan_id = str(scan_id)
+        node_path = str(node_path)
+        if row is None:
+            row = conn.execute(
+                "SELECT payload FROM document_translations WHERE scan_id=? AND node_path=?",
+                (scan_id, node_path),
+            ).fetchone()
         sidecar_relative = None
         try:
-            wrapper = json.loads(row["payload"])
-            if wrapper.get("__translation_sidecar__"):
-                sidecar_relative = str(wrapper.get("file") or "") or None
+            if row:
+                wrapper = json.loads(row["payload"])
+                if wrapper.get("__translation_sidecar__"):
+                    sidecar_relative = str(wrapper.get("file") or "") or None
         except (TypeError, ValueError, json.JSONDecodeError):
             sidecar_relative = None
 
@@ -929,7 +940,9 @@ class Storage:
                     )
         return len(rows)
 
-    def replace_document_evidence_index(self, scan_id, node_path, chunks):
+    def replace_document_evidence_index(
+        self, scan_id, node_path, chunks, preserve_translations=False
+    ):
         """Replace one source's evidence so large parses can commit per file."""
         scan_id = str(scan_id)
         node_path = str(node_path)
@@ -947,9 +960,9 @@ class Storage:
                 scan_id, index_key, source_path, archive_source,
                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             ))
-        delete_sql = (
-            "scan_id=? AND (source_path=? OR archive_source_path=? OR source_path LIKE ?)"
-        )
+        delete_sql = "scan_id=? AND (source_path=? OR archive_source_path=? OR source_path LIKE ?)"
+        if preserve_translations:
+            delete_sql += " AND index_key NOT LIKE 'translation:%'"
         delete_values = (scan_id, node_path, node_path, node_path + "::%")
         with self.lock, self._connect() as conn:
             conn.execute("DELETE FROM evidence_index WHERE " + delete_sql, delete_values)
@@ -979,11 +992,18 @@ class Storage:
             ).fetchone()
         return int(row["value"] if row else 0)
 
-    def clear_evidence_index(self, scan_id):
+    def clear_evidence_index(self, scan_id, preserve_translations=False):
         with self.lock, self._connect() as conn:
-            conn.execute("DELETE FROM evidence_index WHERE scan_id=?", (str(scan_id),))
+            suffix = " AND index_key NOT LIKE 'translation:%'" if preserve_translations else ""
+            conn.execute(
+                "DELETE FROM evidence_index WHERE scan_id=?" + suffix,
+                (str(scan_id),),
+            )
             if self.evidence_fts_available:
-                conn.execute("DELETE FROM evidence_fts WHERE scan_id=?", (str(scan_id),))
+                conn.execute(
+                    "DELETE FROM evidence_fts WHERE scan_id=?" + suffix,
+                    (str(scan_id),),
+                )
 
     @staticmethod
     def _retrieval_terms(query):
@@ -1641,6 +1661,7 @@ class Storage:
     def delete_document(self, scan_id, node_path):
         """Remove a stale parsed payload after a later parse attempt fails."""
         sidecar_relative = None
+        translation_sidecar = None
         with self.lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT payload FROM unified_documents WHERE scan_id=? AND node_path=?",
@@ -1658,6 +1679,9 @@ class Storage:
                 (str(scan_id), str(node_path)),
             )
             deleted = cursor.rowcount == 1
+            translation_sidecar = self._delete_translation_state(
+                conn, scan_id, node_path
+            )
         if deleted and sidecar_relative:
             candidate = self.sidecar_dir / sidecar_relative
             try:
@@ -1670,6 +1694,7 @@ class Storage:
                     "无法清理失效文档 sidecar：scan_id=%s path=%s",
                     scan_id, node_path,
                 )
+        self._unlink_translation_sidecar(translation_sidecar)
         return deleted
 
     def iter_documents(self, scan_id, hydrate=True, batch_size=100):
