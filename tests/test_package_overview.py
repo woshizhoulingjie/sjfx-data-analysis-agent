@@ -244,6 +244,67 @@ class PackageOverviewTests(unittest.TestCase):
         self.assertTrue(exact["truncated"])
         self.assertEqual(exact["omitted_count"], 17)
 
+    def test_preview_dates_and_sample_duplicate_candidates_are_visible(self):
+        documents = iter([{
+            "path": "letters/a.txt",
+            "payload": {
+                "source": {"path": "letters/a.txt", "extension": ".txt", "size": 20},
+                "preview": {
+                    "dates": ["2025-04-03"],
+                    "entities": {"people": ["Alice"], "organizations": ["Acme"]},
+                },
+            },
+        }])
+        result = build_package_overview(
+            documents=documents,
+            analysis={"sample_duplicate_candidates": [{
+                "sample_sha256": "sample-1", "paths": ["a.txt", "copy.txt"],
+                "file_count": 2, "kind": "sample_candidate",
+            }]},
+        )
+
+        years = result["timeline"]["document_dates"]["items"]
+        self.assertEqual(years[0]["period"], "2025")
+        self.assertEqual(result["entities"]["people"]["items"][0]["name"], "Alice")
+        candidates = result["duplicates"]["sample_candidate_groups"]
+        self.assertEqual(candidates["group_count"], 1)
+        self.assertEqual(candidates["candidate_duplicate_file_count"], 1)
+        self.assertFalse(candidates["authoritative"])
+        self.assertFalse(result["duplicates"]["exact_groups"]["authoritative"])
+
+    def test_large_package_empty_exact_groups_are_not_claimed_as_verified(self):
+        result = build_package_overview(analysis={
+            "exact_duplicate_groups": [],
+            "policy": {"large_package": {"enabled": True}},
+        })
+        exact = result["duplicates"]["exact_groups"]
+        self.assertEqual(exact["duplicate_file_count"], 0)
+        self.assertFalse(exact["authoritative"])
+        self.assertEqual(exact["status"], "not_computed_for_entire_package")
+
+    def test_storage_adapter_ingests_content_map_entities_and_sample_duplicates(self):
+        class ContentMapStorage:
+            def get_scan(self, _scan_id):
+                return {"root": "/data", "file_count": 2, "directory_count": 0,
+                        "total_size": 20, "tree": {"kind": "directory", "path": ".", "children": []}}
+
+            def iter_documents(self, _scan_id, hydrate=True, batch_size=None):
+                return iter(())
+
+            def get_analysis(self, _scan_id):
+                return None
+
+            def get_content_map(self, _scan_id):
+                return {
+                    "entities": {"people": [{"name": "Alice", "file_count": 2}]},
+                    "duplicates": [{"sample_sha256": "x", "paths": ["a", "b"],
+                                    "file_count": 2, "kind": "sample_candidate"}],
+                }
+
+        result = build_package_overview_from_storage(ContentMapStorage(), "scan")
+        self.assertEqual(result["entities"]["people"]["items"][0]["file_count"], 2)
+        self.assertEqual(result["duplicates"]["sample_candidate_groups"]["group_count"], 1)
+
     def test_single_relationship_record_and_size_outlier_are_supported(self):
         files = [
             {"kind": "file", "path": "small-{}.txt".format(index), "size": 10}

@@ -27,8 +27,8 @@ from services.unified_parser import (
 )
 
 
-PREVIEW_SCHEMA = "file-preview/1.0"
-CONTENT_MAP_SCHEMA = "package-content-map/1.0"
+PREVIEW_SCHEMA = "file-preview/1.1"
+CONTENT_MAP_SCHEMA = "package-content-map/1.1"
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
@@ -57,7 +57,21 @@ DOCUMENT_TYPES = {
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}|[\u4e00-\u9fff]{2,10}")
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 ORG_RE = re.compile(
-    r"[\u4e00-\u9fffA-Za-z0-9·&（）()\-]{2,40}(?:公司|集团|大学|学院|研究院|研究所|委员会|办公室|机构|部门|银行|基金会|协会|政府|中心)"
+    r"(?:[\u4e00-\u9fffA-Za-z0-9·&（）()\-]{2,40}"
+    r"(?:公司|集团|大学|学院|研究院|研究所|委员会|办公室|机构|部门|银行|基金会|协会|政府|中心)"
+    r"|\b(?:[A-Z][A-Za-z0-9&'.\-]{1,30}\s+){1,5}"
+    r"(?:Company|Corporation|Corp\.?|Inc\.?|Ltd\.?|Limited|Group|University|Institute|"
+    r"Committee|Association|Foundation|Bank|Agency|Department|Office|Center|Centre)\b)"
+)
+PERSON_PATTERNS = (
+    re.compile(
+        r"(?i)\b(?:from|to|cc|sender|recipient|author|by|signed(?:\s+by)?|contact)\s*[:：]?\s*"
+        r"([A-Z][A-Za-z'\-]{1,30}(?:\s+[A-Z][A-Za-z'\-]{1,30}){1,3})\b"
+    ),
+    re.compile(
+        r"(?:姓名|联系人|负责人|作者|发件人|收件人|签署人|签字人)\s*[:：]\s*"
+        r"([\u4e00-\u9fff·]{2,12})"
+    ),
 )
 DATE_RE = re.compile(
     r"\b(?:19|20)\d{2}(?:[-/.年](?:0?[1-9]|1[0-2])(?:[-/.月](?:0?[1-9]|[12]\d|3[01])日?)?)?\b"
@@ -113,6 +127,16 @@ def _sample_windows(path, byte_limit, budget=None):
     granted = budget.claim(requested) if budget is not None else requested
     if granted <= 0:
         return b"", [], True
+    if granted >= size:
+        before = path.stat()
+        with path.open("rb", buffering=0) as handle:
+            payload = handle.read(size)
+        after = path.stat()
+        before_sig = (int(before.st_dev), int(before.st_ino), int(before.st_size), int(before.st_mtime_ns))
+        after_sig = (int(after.st_dev), int(after.st_ino), int(after.st_size), int(after.st_mtime_ns))
+        if before_sig != after_sig:
+            raise RuntimeError("源文件在轻量预览期间发生变化")
+        return payload, [[0, len(payload)]], False
     window = max(1, int(math.ceil(granted / 3.0)))
     offsets = [0]
     if size > window:
@@ -238,6 +262,23 @@ def _keywords(text, limit=12):
     return [item for item, _count in sorted(counter.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]]
 
 
+def _preview_entities(text):
+    """Extract conservative, bounded entity candidates from one preview."""
+    value = str(text or "")[:200000]
+    organizations = sorted({
+        re.sub(r"\s+", " ", match.group(0)).strip()[:80]
+        for match in ORG_RE.finditer(value)
+        if match.group(0).strip()
+    })[:20]
+    people = set()
+    for pattern in PERSON_PATTERNS:
+        for match in pattern.finditer(value):
+            name = re.sub(r"\s+", " ", match.group(1)).strip(" ,;\t\r\n")[:80]
+            if name and not any(name.casefold() in organisation.casefold() for organisation in organizations):
+                people.add(name)
+    return {"people": sorted(people)[:20], "organizations": organizations}
+
+
 def _document_type(path):
     path = Path(path)
     extension = path.suffix.lower()
@@ -349,7 +390,7 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
         "content_sample_sha256": content_sample_sha256,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     language = detect_language(text)
-    organizations = sorted(set(match.group(0)[:80] for match in ORG_RE.finditer(text)))[:20]
+    entities = _preview_entities(text)
     emails = sorted(set(EMAIL_RE.findall(text)))[:20]
     dates = sorted(set(DATE_RE.findall(text)))[:20]
     return {
@@ -373,7 +414,7 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
         "encoding": encoding,
         "language": language,
         "keywords": _keywords("{} {}".format(path.stem, text)),
-        "entities": {"organizations": organizations, "email_addresses": emails},
+        "entities": {**entities, "email_addresses": emails},
         "dates": dates,
         "archive_members": member_names[:200],
         "warnings": warning,
@@ -478,6 +519,7 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
                 key: list(values or [])[:20]
                 for key, values in (source.get("entities") or {}).items()
             },
+            "dates": list(source.get("dates") or [])[:20],
             "sample_sha256": source.get("content_sample_sha256") or source.get("sample_sha256"),
             "preview_characters": int(
                 source.get("preview_characters")
@@ -490,6 +532,24 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
     language_frequency = Counter(str((item.get("language") or {}).get("code") or "unknown") for item in previews)
     extension_frequency = Counter(str(item.get("extension") or "[无扩展名]") for item in previews)
     topic_frequency = Counter(topic for item in previews for topic in item.get("keywords") or [])
+    people_frequency = Counter(
+        person for item in previews for person in (item.get("entities") or {}).get("people", [])
+    )
+    organization_frequency = Counter(
+        organization
+        for item in previews
+        for organization in (item.get("entities") or {}).get("organizations", [])
+    )
+    date_frequency = Counter(
+        date for item in previews for date in item.get("dates") or [] if date
+    )
+    year_frequency = Counter(
+        match.group(0)
+        for item in previews
+        for date in item.get("dates") or []
+        for match in [re.search(r"(?:19|20)\d{2}", str(date))]
+        if match
+    )
     duplicate_frequency = Counter(str(item.get("sample_sha256") or "") for item in previews)
     directory_frequency = Counter(
         str(PurePosixPath(str(item.get("path"))).parent) for item in previews
@@ -593,6 +653,15 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
         "languages": [{"code": key, "file_count": value} for key, value in language_frequency.most_common()],
         "directories": [{"path": key, "file_count": value} for key, value in directory_frequency.most_common(500)],
         "topics": [{"name": key, "file_count": value} for key, value in topic_frequency.most_common(200)],
+        "entities": {
+            "people": [{"name": key, "file_count": value} for key, value in people_frequency.most_common(200)],
+            "organizations": [
+                {"name": key, "file_count": value}
+                for key, value in organization_frequency.most_common(200)
+            ],
+        },
+        "dates": [{"date": key, "file_count": value} for key, value in date_frequency.most_common(200)],
+        "years": [{"year": key, "file_count": value} for key, value in year_frequency.most_common()],
         "duplicates": duplicates[:500],
         "relationships": relationships,
         "isolated_paths": isolated[:500],

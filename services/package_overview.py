@@ -24,7 +24,7 @@ from itertools import islice
 from pathlib import Path
 
 
-SCHEMA_VERSION = "package-overview/1.0"
+SCHEMA_VERSION = "package-overview/1.1"
 NO_EXTENSION = "[no-extension]"
 UNKNOWN = "unknown"
 
@@ -421,6 +421,9 @@ class PackageOverviewAggregator:
         self._exact_duplicate_files_total = 0
         self._near_duplicate_files_total = 0
         self._duplicates_authoritative = False
+        self._sample_duplicate_groups = []
+        self._sample_duplicate_group_total = 0
+        self._sample_duplicate_files_total = 0
         self._explicit_anomalies = _RankedItems(self.limits.max_candidate_files)
         self._isolated_files = _RankedItems(self.limits.max_candidate_files)
         self._largest_files = _RankedItems(self.limits.max_candidate_files)
@@ -590,6 +593,7 @@ class PackageOverviewAggregator:
         for candidate in (
             document.get("document_date"), document.get("dates"), temporal.get("dates"),
             temporal.get("document_date"), (document.get("metadata") or {}).get("document_date"),
+            preview.get("dates"),
         ):
             date_values.extend(_values(candidate, 32))
         years = sorted({value for value in (_year(item) for item in date_values) if value})
@@ -717,8 +721,12 @@ class PackageOverviewAggregator:
 
         exact_groups = analysis.get("exact_duplicate_groups")
         near_groups = analysis.get("similar_document_clusters") or analysis.get("near_duplicate_groups")
+        sample_groups = analysis.get("sample_duplicate_candidates")
         if isinstance(exact_groups, list):
-            self._duplicates_authoritative = True
+            large_mode = bool(
+                ((analysis.get("policy") or {}).get("large_package") or {}).get("enabled")
+            )
+            self._duplicates_authoritative = bool(exact_groups) or not large_mode
             (
                 self._exact_groups,
                 self._exact_group_total,
@@ -730,6 +738,12 @@ class PackageOverviewAggregator:
                 self._near_group_total,
                 self._near_duplicate_files_total,
             ) = self._normalise_duplicate_groups(near_groups, exact=False)
+        if isinstance(sample_groups, list):
+            (
+                self._sample_duplicate_groups,
+                self._sample_duplicate_group_total,
+                self._sample_duplicate_files_total,
+            ) = self._normalise_duplicate_groups(sample_groups, exact=False)
 
         entity_data = analysis.get("entities") or analysis.get("named_entities")
         if isinstance(entity_data, dict):
@@ -759,10 +773,12 @@ class PackageOverviewAggregator:
             if not isinstance(group, dict):
                 continue
             group_count += 1
-            member_source = group.get("members") or ()
+            member_source = group.get("members") or group.get("paths") or ()
             members = [_path(item) for item in _values(member_source, self.limits.max_representative_files) if _path(item) != "."]
             declared_members = len(member_source) if hasattr(member_source, "__len__") else len(members)
-            member_count = _int(group.get("member_count"), declared_members) or declared_members
+            member_count = _int(
+                group.get("member_count") or group.get("file_count"), declared_members
+            ) or declared_members
             duplicate_file_count += max(0, member_count - 1)
             canonical = group.get("canonical") or group.get("representative") or (members[0] if members else None)
             item = {
@@ -772,6 +788,8 @@ class PackageOverviewAggregator:
                 "duplicate_file_count": max(0, member_count - 1),
                 "members": members[:self.limits.max_representative_files],
                 "content_hash": group.get("sha256") if exact else None,
+                "sample_hash": group.get("sample_sha256") if not exact else None,
+                "candidate_kind": group.get("kind") if not exact else None,
             }
             ranked.add(item["group_id"], item, (member_count,))
         return ranked.render(self.limits.max_items_per_section), group_count, duplicate_file_count
@@ -900,6 +918,12 @@ class PackageOverviewAggregator:
             "duplicate_file_count": self._exact_duplicate_files_total,
             "truncated": self._exact_group_total > self.limits.max_items_per_section,
             "omitted_count": max(0, self._exact_group_total - self.limits.max_items_per_section),
+            "authoritative": self._duplicates_authoritative,
+            "status": (
+                "verified_by_full_hash"
+                if self._duplicates_authoritative
+                else "not_computed_for_entire_package"
+            ),
         }
         near_groups = {
             "items": self._near_groups[:self.limits.max_items_per_section],
@@ -907,6 +931,17 @@ class PackageOverviewAggregator:
             "duplicate_file_count": self._near_duplicate_files_total,
             "truncated": self._near_group_total > self.limits.max_items_per_section,
             "omitted_count": max(0, self._near_group_total - self.limits.max_items_per_section),
+        }
+        sample_groups = {
+            "items": self._sample_duplicate_groups[:self.limits.max_items_per_section],
+            "group_count": self._sample_duplicate_group_total,
+            "candidate_duplicate_file_count": self._sample_duplicate_files_total,
+            "truncated": self._sample_duplicate_group_total > self.limits.max_items_per_section,
+            "omitted_count": max(
+                0, self._sample_duplicate_group_total - self.limits.max_items_per_section
+            ),
+            "status": "sample_candidates_require_full_hash_validation",
+            "authoritative": False,
         }
 
         anomalies = self._explicit_anomalies.render(self.limits.max_items_per_section)
@@ -948,6 +983,7 @@ class PackageOverviewAggregator:
             "duplicates": {
                 "exact_groups": exact_groups,
                 "near_duplicate_groups": near_groups,
+                "sample_candidate_groups": sample_groups,
             },
             "outliers": {
                 "anomalous_files": {
@@ -1026,6 +1062,8 @@ def build_package_overview_from_storage(storage, scan_id, *, limits=None, batch_
         analysis = dict(analysis or {})
         analysis.setdefault("relationships", content_map.get("relationships") or [])
         analysis.setdefault("isolated_files", content_map.get("isolated_paths") or [])
+        analysis.setdefault("sample_duplicate_candidates", content_map.get("duplicates") or [])
+        analysis.setdefault("entities", content_map.get("entities") or {})
         if not analysis.get("topic_clusters"):
             analysis["topic_clusters"] = [
                 {

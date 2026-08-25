@@ -44,6 +44,21 @@ class PackageExplorationTests(unittest.TestCase):
             self.assertIn("TAIL", preview["preview_text"])
             self.assertTrue(preview["coverage"]["preview_only"])
 
+    def test_preview_extracts_bounded_people_organizations_and_dates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "letter.txt").write_text(
+                "From: Alice Johnson\n发件人：张伟\nAcme Research Institute 研究院\n"
+                "Decision date: 2024-03-12.",
+                encoding="utf-8",
+            )
+            preview = preview_file(root, _files(scan_directory(root))[0], per_file_bytes=4096)
+
+            self.assertIn("Alice Johnson", preview["entities"]["people"])
+            self.assertIn("张伟", preview["entities"]["people"])
+            self.assertTrue(preview["entities"]["organizations"])
+            self.assertEqual(preview["dates"], ["2024-03-12"])
+
     def test_global_budget_defers_remaining_files_without_reading_them(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -57,6 +72,17 @@ class PackageExplorationTests(unittest.TestCase):
             self.assertEqual(first["sampled_bytes"], 1000)
             self.assertEqual(second["status"], "deferred")
             self.assertEqual(second["sampled_bytes"], 0)
+
+    def test_small_file_is_not_duplicated_by_overlapping_sample_windows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = "From: Alice Johnson\nDecision date: 2024-03-12."
+            (root / "small.txt").write_text(source, encoding="utf-8")
+
+            preview = preview_file(root, _files(scan_directory(root))[0], per_file_bytes=4096)
+
+            self.assertEqual(preview["preview_text"].splitlines(), source.splitlines())
+            self.assertEqual(preview["sampled_ranges"], [[0, (root / "small.txt").stat().st_size]])
 
     def test_zip_preview_lists_members_without_extracting(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -95,6 +121,7 @@ class PackageExplorationTests(unittest.TestCase):
                 "language": {"code": "en" if index < 4 else "zh"},
                 "keywords": ["topic{}".format(index % 4), "shared"],
                 "entities": {"organizations": ["机构{}".format(index % 3)]},
+                "dates": ["202{}-01-02".format(index % 4)],
                 "sample_sha256": "same" if index in {0, 1} else "hash{}".format(index),
                 "preview_text": "evidence " * (index + 1),
             })
@@ -103,6 +130,11 @@ class PackageExplorationTests(unittest.TestCase):
         self.assertEqual(len(content_map["representative_paths"]), 5)
         self.assertLessEqual(len(content_map["relationships"]), 8)
         self.assertEqual(content_map["duplicates"][0]["file_count"], 2)
+        self.assertEqual(content_map["entities"]["organizations"][0]["file_count"], 4)
+        self.assertEqual(
+            {item["year"]: item["file_count"] for item in content_map["years"]},
+            {"2020": 3, "2021": 3, "2022": 3, "2023": 3},
+        )
         promoted = promotion_paths(content_map, ["asked.txt"], limit=3)
         self.assertEqual(promoted[0], "asked.txt")
         self.assertEqual(len(promoted), 3)
@@ -178,6 +210,53 @@ class PackageExplorationTests(unittest.TestCase):
             content_map = {"schema_version": "package-content-map/1.0", "representative_paths": ["a.txt"]}
             storage.save_content_map("scan-1", content_map)
             self.assertEqual(storage.get_content_map("scan-1"), content_map)
+
+    def test_old_preview_contract_is_rebuilt_before_content_map_generation(self):
+        class CountingParser:
+            docling_device = "cpu"
+
+            def status(self):
+                return {"available": True}
+
+            def parse(self, path, relative_path=None, mode="accurate"):
+                source = Path(path)
+                return {
+                    "source": {"path": relative_path, "name": source.name,
+                               "size": source.stat().st_size,
+                               "sha256": hashlib.sha256(source.read_bytes()).hexdigest()},
+                    "parser": {"name": "counting", "mode": mode},
+                    "structure": {"title": source.stem, "headings": []},
+                    "text": source.read_text(encoding="utf-8"),
+                    "coverage": {"complete": True, "parse_complete": True},
+                    "evidence": [],
+                }
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "a.txt").write_text("From: Alice Johnson on 2024-03-12", encoding="utf-8")
+            scan = scan_directory(root)
+            storage = Storage(root / "state.db")
+            scan_id = storage.save_scan(scan)
+            node = _files(scan)[0]
+            old = {
+                "schema_version": "file-preview/1.0", "path": "a.txt", "name": "a.txt",
+                "extension": ".txt", "size": node["size"],
+                "modified_at_ns": node["modified_at_ns"], "status": "previewed",
+                "sample_sha256": "old", "preview_fingerprint": "old",
+                "language": {"code": "en"}, "document_type": "文本", "preview_text": "old",
+                "coverage": {"preview_only": True},
+            }
+            storage.save_file_preview(scan_id, "a.txt", old)
+            storage.save_content_map(scan_id, {"schema_version": "package-content-map/1.0"})
+
+            analysis = analyze_package(
+                scan_id, scan, storage, CountingParser(),
+                large_options={"threshold_bytes": 1, "initial_parse_files": 1},
+            )
+
+            refreshed = storage.get_file_preview(scan_id, "a.txt")
+            self.assertEqual(refreshed["schema_version"], "file-preview/1.1")
+            self.assertIn("Alice Johnson", analysis["content_map"]["entities"]["people"][0]["name"])
 
     def test_large_package_only_deep_parses_selected_representatives(self):
         class CountingParser:

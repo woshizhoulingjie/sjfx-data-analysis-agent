@@ -35,6 +35,8 @@ from services.large_package import (
 )
 from services.retrieval import build_retrieval_manifest, evidence_corpus, retrieve_evidence
 from services.package_exploration import (
+    CONTENT_MAP_SCHEMA,
+    PREVIEW_SCHEMA,
     PreviewBudget,
     build_content_map,
     preview_as_document,
@@ -3683,6 +3685,21 @@ def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=Non
     existing = {
         item["path"]: item for item in storage.iter_file_preview_states(scan_id)
     }
+    previous_map = storage.get_content_map(scan_id)
+    previous_map_stale = bool(
+        previous_map and previous_map.get("schema_version") != CONTENT_MAP_SCHEMA
+    )
+    if not previous_map_stale and existing:
+        first_path = min(existing)
+        first_preview = storage.get_file_preview(scan_id, first_path) or {}
+        previous_map_stale = bool(
+            first_preview and first_preview.get("schema_version") != PREVIEW_SCHEMA
+        )
+    if previous_map_stale:
+        # A preview contract upgrade changes the fields used by the content
+        # map. Re-read source windows instead of silently publishing an old
+        # map with missing analytical dimensions.
+        existing = {}
     budget = PreviewBudget(policy.get("preview_total_bytes"))
     pending_previews = []
     pending_documents = []
@@ -4075,7 +4092,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         evidence_index_count = 0
         for indexed_path, indexed_document in canonical_documents.items():
             evidence_index_count += storage.replace_document_evidence_index(
-                scan_id, indexed_path, evidence_corpus({indexed_path: indexed_document})
+                scan_id, indexed_path, evidence_corpus({indexed_path: indexed_document}),
             )
         manifest_queries = [
             {"query": str(item.get("topic") or ""), "results": [], "deferred": True}
@@ -4630,7 +4647,7 @@ def refresh_package_coverage(scan_id, scan, storage):
         storage.clear_evidence_index(scan_id)
         for document_path, document in canonical_documents.items():
             storage.replace_document_evidence_index(
-                scan_id, document_path, evidence_corpus({document_path: document})
+                scan_id, document_path, evidence_corpus({document_path: document}),
             )
     else:
         storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))
