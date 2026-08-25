@@ -860,12 +860,14 @@
     state.translationPage = page;
     const title = page.titles && (page.titles.translated || page.titles.original) || basename(page.path);
     $('translationDocumentTitle').textContent = title || page.path;
-    $('translationDocumentMeta').textContent = `${page.path} · ${translationStatusLabel(page.status)} · ${page.source_language || '语言待识别'} → ${page.target_language || 'zh-CN'}`;
+    const modeLabel = page.translation_mode === 'quality' ? '精细复核模式' : '快速翻译模式';
+    $('translationDocumentMeta').textContent = `${page.path} · ${translationStatusLabel(page.status)} · ${page.source_language || '语言待识别'} → ${page.target_language || 'zh-CN'} · ${modeLabel}`;
     const progress = page.progress || {};
     const details = [];
     if (progress.required_units) details.push(`已完成 ${integer(progress.completed_units)}/${integer(progress.required_units)} 个翻译段`);
     if (page.source_level) details.push(page.source_level === 'full' ? '全文来源' : '轻量预览来源');
     if (page.full_translation) details.push('全文译文已就绪');
+    if (page.performance && page.performance.paragraph_batching) details.push('短段落已合并加速');
     $('translationDocumentState').textContent = details.join(' · ') || (page.plan && page.plan.translation_required ? `需要翻译，共 ${integer(page.plan.required_unit_count)} 个外文段` : '文档已打开');
     $('translationDocumentState').className = 'v2-inline-state' + (page.status === 'failed' ? ' is-error' : ' is-ready');
     const original = page.original && page.original.text;
@@ -945,8 +947,8 @@
       const response = await api(`/api/translation/${encodeURIComponent(state.scanId)}`, {
         method: 'POST', body: JSON.stringify({ path, require_full: true })
       });
-      $('translationDocumentState').textContent = '当前文件已加入全文翻译队列。';
-      watchJob(response.job_id, 'translation-document', (job) => translationJobState(job, '当前文件翻译'));
+      $('translationDocumentState').textContent = '当前文件已加入快速翻译队列。';
+      watchJob(response.job_id, 'translation-document', (job) => translationJobState(job, '当前文件快速翻译'));
     } catch (error) {
       notify(error.message || '无法提交翻译', true);
       button.disabled = false;
@@ -961,7 +963,7 @@
       const response = await api(`/api/translate-package/${encodeURIComponent(state.scanId)}`, {
         method: 'POST', body: JSON.stringify({ phase })
       });
-      const label = phase === 'deep_backfill' ? '全部外文补齐' : '预览与重点文件翻译';
+      const label = phase === 'deep_backfill' ? '全部外文快速补齐' : '预览与重点文件快速翻译';
       $('translationDocumentState').textContent = `${label}已加入后台队列。`;
       watchJob(response.job_id, `translation-package-${phase}`, (job) => translationJobState(job, label));
       notify(`${label}已提交`);

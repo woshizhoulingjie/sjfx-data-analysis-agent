@@ -84,7 +84,7 @@
         </section>
 
         <section class="app-view v2-translation-view" data-view="translation">
-          <div class="page-heading compact"><div><div class="eyebrow">TRANSLATION / ORIGINAL PRESERVED</div><h1>外文资料翻译</h1><p>译文默认以中文呈现，同时始终保留原文；大数据包先翻译预览和重点文件，再在后台补齐全文。</p></div><div class="button-row wrap"><button class="secondary" id="translatePriorityBtn" disabled>翻译预览与重点文件</button><button class="primary" id="translateBackfillBtn" disabled>后台补齐全部外文</button></div></div>
+          <div class="page-heading compact"><div><div class="eyebrow">FAST TRANSLATION / ORIGINAL PRESERVED</div><h1>外文资料快速翻译</h1><p>使用服务器本地模型批量合并短段落，译为中文并始终保留原文；质量检查失败时才启动复核。</p></div><div class="button-row wrap"><button class="secondary" id="translatePriorityBtn" disabled>快速翻译预览与重点</button><button class="primary" id="translateBackfillBtn" disabled>后台快速补齐全文</button></div></div>
           <div id="translationPackageState" class="v2-translation-summary" role="status" aria-live="polite"></div>
           <div class="v2-translation-layout">
             <aside class="surface v2-translation-sidebar">
@@ -94,7 +94,7 @@
               <div id="translationList" class="v2-translation-list"></div>
             </aside>
             <article class="surface v2-document-panel">
-              <div class="v2-document-header"><div><span class="section-kicker">DOCUMENT VIEW</span><h2 id="translationDocumentTitle">选择文件查看原文与译文</h2><small id="translationDocumentMeta"></small></div><button class="primary" id="translateDocumentBtn" disabled>翻译当前文件</button></div>
+              <div class="v2-document-header"><div><span class="section-kicker">DOCUMENT VIEW</span><h2 id="translationDocumentTitle">选择文件查看原文与译文</h2><small id="translationDocumentMeta"></small></div><button class="primary" id="translateDocumentBtn" disabled>快速翻译当前文件</button></div>
               <div class="segmented v2-view-switch" role="group" aria-label="文档显示方式"><button data-translation-view="translated" class="active">中文</button><button data-translation-view="original">原文</button><button data-translation-view="bilingual">双语对照</button></div>
               <div id="translationDocumentState" class="v2-inline-state" role="status" aria-live="polite">从左侧选择文件，或输入文件相对路径。</div>
               <div id="translationDocumentContent" class="v2-document-content"></div>
@@ -114,6 +114,6 @@
   <div id="toast" class="toast" aria-live="polite"></div>
   <script src="/static/product-shell.js?v=3"></script>
   <script src="/static/app.js?v=20"></script>
-  <script src="/static/engineering-v2.js?v=3"></script>
+  <script src="/static/engineering-v2.js?v=4"></script>
 </body>
 </html>

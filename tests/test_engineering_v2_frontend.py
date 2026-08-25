@@ -18,7 +18,7 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         ids = re.findall(r'\bid="([^"]+)"', self.html)
         self.assertEqual(len(ids), len(set(ids)), "HTML element ids must remain unique")
         self.assertIn('/static/engineering-v2.css?v=2', self.html)
-        self.assertIn('/static/engineering-v2.js?v=3', self.html)
+        self.assertIn('/static/engineering-v2.js?v=4', self.html)
         self.assertNotRegex(self.script, r'https?://|\bcdn\b')
         self.assertNotRegex(self.style, r'@import|https?://')
 

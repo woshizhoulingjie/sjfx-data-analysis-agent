@@ -207,10 +207,16 @@ class Config:
     )
     TRANSLATION_OLLAMA_MODEL = os.getenv("TRANSLATION_OLLAMA_MODEL", OLLAMA_MODEL).strip()
     TRANSLATION_MAX_UNIT_CHARS = max(
-        128, min(12000, int(os.getenv("TRANSLATION_MAX_UNIT_CHARS", "2400")))
+        128, min(12000, int(os.getenv("TRANSLATION_MAX_UNIT_CHARS", "4800")))
     )
-    TRANSLATION_MAX_ATTEMPTS = max(1, min(6, int(os.getenv("TRANSLATION_MAX_ATTEMPTS", "3"))))
+    TRANSLATION_MAX_ATTEMPTS = max(1, min(6, int(os.getenv("TRANSLATION_MAX_ATTEMPTS", "2"))))
     TRANSLATION_TIMEOUT_SECONDS = max(10, min(1800, int(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "180"))))
+    TRANSLATION_COALESCE_PARAGRAPHS = os.getenv(
+        "TRANSLATION_COALESCE_PARAGRAPHS", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    TRANSLATION_REVIEW_COMPLEX_UNITS = os.getenv(
+        "TRANSLATION_REVIEW_COMPLEX_UNITS", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     TRANSLATION_PACKAGE_BATCH_FILES = max(
         1, min(500, int(os.getenv("TRANSLATION_PACKAGE_BATCH_FILES", "50")))
     )

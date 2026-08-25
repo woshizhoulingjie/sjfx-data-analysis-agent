@@ -154,6 +154,8 @@ translation_service = TranslationService(
         max_unit_chars=Config.TRANSLATION_MAX_UNIT_CHARS,
         max_attempts=Config.TRANSLATION_MAX_ATTEMPTS,
         timeout_seconds=Config.TRANSLATION_TIMEOUT_SECONDS,
+        coalesce_paragraphs=Config.TRANSLATION_COALESCE_PARAGRAPHS,
+        review_complex_units=Config.TRANSLATION_REVIEW_COMPLEX_UNITS,
     ),
     reviewer=(
         OllamaTranslationProvider(llm_transport)
@@ -1700,6 +1702,9 @@ def status():
                 "enabled": Config.ENABLE_TRANSLATION,
                 "provider": translation_provider.provider_id,
                 "max_unit_chars": Config.TRANSLATION_MAX_UNIT_CHARS,
+                "mode": "quality" if Config.TRANSLATION_REVIEW_COMPLEX_UNITS else "fast",
+                "paragraph_batching": Config.TRANSLATION_COALESCE_PARAGRAPHS,
+                "review_complex_units": Config.TRANSLATION_REVIEW_COMPLEX_UNITS,
                 "package_batch_files": Config.TRANSLATION_PACKAGE_BATCH_FILES,
                 "auto_translate_packages": Config.AUTO_TRANSLATE_PACKAGES,
             },
@@ -2554,6 +2559,10 @@ def document_translation(scan_id):
             "full_translation": bool((state or {}).get("full_translation")),
             "source_language": (state or {}).get("source_language"),
             "target_language": (state or {}).get("target_language") or "zh-CN",
+            "translation_mode": (state or {}).get("translation_mode") or (
+                "quality" if Config.TRANSLATION_REVIEW_COMPLEX_UNITS else "fast"
+            ),
+            "performance": (state or {}).get("performance") or {},
             "titles": {
                 "original": (state or {}).get("original_title") or (document.get("structure") or {}).get("title"),
                 "translated": (state or {}).get("translated_title"),
@@ -2567,7 +2576,11 @@ def document_translation(scan_id):
             response["translated"] = page(translated)
         if not state:
             response["plan"] = build_translation_plan(
-                storage.project_document(document, text_limit=Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE)
+                storage.project_document(
+                    document, text_limit=Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE
+                ),
+                max_unit_chars=Config.TRANSLATION_MAX_UNIT_CHARS,
+                coalesce_paragraphs=Config.TRANSLATION_COALESCE_PARAGRAPHS,
             )
         return jsonify(response)
     except (TypeError, ValueError) as exc:

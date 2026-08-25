@@ -73,6 +73,22 @@ class CopyProvider(TranslationProvider):
         return text
 
 
+class LayoutProvider(DeterministicProvider):
+    """Verified fake that preserves the exact number of internal newlines."""
+
+    def translate(self, text, source_language, target_language, glossary=None,
+                  timeout=None, retries=0):
+        self.calls += 1
+        self.inputs.append(text)
+        tokens = TOKEN_RE.findall(text)
+        unprotected = TOKEN_RE.sub("", text)
+        newline_count = unprotected.count("\n")
+        pieces = ["译" * max(4, len(unprotected.strip()) // max(2, newline_count + 2))]
+        pieces.extend("译译译译" for _index in range(newline_count))
+        translated = "\n".join(pieces)
+        return ProviderResponse(" ".join(tokens + [translated]), model="layout-model")
+
+
 class RecoveringProvider(DeterministicProvider):
     def __init__(self, unavailable_calls):
         super().__init__()
@@ -201,6 +217,55 @@ class TranslationCoreTests(unittest.TestCase):
         self.assertEqual(second_provider.calls, 0)
         reused = next(unit for unit in second["units"] if unit["translation_required"])
         self.assertIn(reused["reused_from"], {"checkpoint", "translation_memory"})
+
+    def test_fast_mode_batches_short_paragraphs_into_one_model_call(self):
+        body = (
+            "The first paragraph contains useful foreign research material.\n\n"
+            "The second paragraph continues the same research discussion.\n\n"
+            "The third paragraph records the final analysis result."
+        )
+        provider = LayoutProvider()
+        reviewer = LayoutProvider()
+        service = TranslationService(
+            provider, reviewer=reviewer,
+            policy=TranslationPolicy(
+                max_unit_chars=600,
+                coalesce_paragraphs=True,
+                review_complex_units=False,
+            ),
+        )
+
+        result = service.translate_document(foreign_document(body))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["translation_mode"], "fast")
+        self.assertEqual(result["progress"]["required_units"], 1)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(reviewer.calls, 0)
+        self.assertEqual(result["units"][-1]["block_kind"], "paragraph_batch")
+        self.assertEqual(
+            result["translated_text"].count("\n"),
+            result["original_text"].count("\n"),
+        )
+
+    def test_quality_mode_can_still_review_complex_batches(self):
+        body = (
+            "This long foreign paragraph should receive an optional second review. " * 15
+        )
+        provider = LayoutProvider()
+        reviewer = LayoutProvider()
+        result = TranslationService(
+            provider, reviewer=reviewer,
+            policy=TranslationPolicy(
+                max_unit_chars=1200,
+                coalesce_paragraphs=True,
+                review_complex_units=True,
+            ),
+        ).translate_document(foreign_document(body))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["translation_mode"], "quality")
+        self.assertGreaterEqual(reviewer.calls, 1)
 
     def test_failed_checkpoint_can_be_retried_after_provider_recovers(self):
         provider = RecoveringProvider(unavailable_calls=2)

@@ -545,19 +545,23 @@ class StorageTranslationMemory(TranslationMemory):
 
 @dataclass
 class TranslationPolicy:
-    max_unit_chars: int = 2400
-    max_attempts: int = 3
+    max_unit_chars: int = 4800
+    max_attempts: int = 2
     timeout_seconds: int = 180
     contract_version: str = TRANSLATION_CONTRACT_VERSION
+    coalesce_paragraphs: bool = True
+    review_complex_units: bool = False
     checkpoint_unit_interval: int = 16
     checkpoint_interval_seconds: float = 30.0
     max_intermediate_checkpoints: int = 32
 
     def __post_init__(self):
-        self.max_unit_chars = max(128, min(12000, int(self.max_unit_chars or 2400)))
-        self.max_attempts = max(1, min(6, int(self.max_attempts or 3)))
+        self.max_unit_chars = max(128, min(12000, int(self.max_unit_chars or 4800)))
+        self.max_attempts = max(1, min(6, int(self.max_attempts or 2)))
         self.timeout_seconds = max(10, min(1800, int(self.timeout_seconds or 180)))
         self.contract_version = str(self.contract_version or TRANSLATION_CONTRACT_VERSION)
+        self.coalesce_paragraphs = bool(self.coalesce_paragraphs)
+        self.review_complex_units = bool(self.review_complex_units)
         self.checkpoint_unit_interval = max(
             1, min(10000, int(self.checkpoint_unit_interval or 16))
         )
@@ -801,11 +805,16 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
 
 def build_translation_plan(document, max_unit_chars=2400, glossary=None,
                            target_language=TARGET_LANGUAGE,
-                           contract_version=TRANSLATION_CONTRACT_VERSION):
+                           contract_version=TRANSLATION_CONTRACT_VERSION,
+                           coalesce_paragraphs=False):
     units = build_translation_units(
         document, max_unit_chars=max_unit_chars, glossary=glossary,
         target_language=target_language, contract_version=contract_version,
     )
+    if coalesce_paragraphs:
+        units = _coalesce_fast_paragraph_units(
+            units, max_unit_chars, _normalise_glossary(glossary), contract_version,
+        )
     required = [unit for unit in units if unit["translation_required"]]
     detection = detect_language(
         (document.get("text") if isinstance(document, dict) else document) or ""
@@ -815,6 +824,7 @@ def build_translation_plan(document, max_unit_chars=2400, glossary=None,
         "language_detection": detection,
         "unit_count": len(units), "required_unit_count": len(required),
         "required_characters": sum(len(unit["source_text"]) for unit in required),
+        "paragraph_batching": bool(coalesce_paragraphs),
         "translation_required": bool(required),
         "units": [{
             "unit_id": unit["unit_id"], "kind": unit["kind"],
@@ -826,6 +836,52 @@ def build_translation_plan(document, max_unit_chars=2400, glossary=None,
             "memory_key": unit["memory_key"],
         } for unit in units],
     }
+
+
+def _coalesce_fast_paragraph_units(units, max_chars, glossary, contract_version):
+    """Pack adjacent prose paragraphs into fewer model requests.
+
+    Headings, tables and footnotes retain their own units because their layout
+    contracts are stricter. Only contiguous foreign prose in the same section
+    and language is combined, so joining translated units remains lossless.
+    """
+    output = []
+    for raw in units:
+        unit = copy.deepcopy(raw)
+        previous = output[-1] if output else None
+        can_merge = bool(
+            previous
+            and previous.get("kind") == unit.get("kind") == "body"
+            and previous.get("block_kind") in {"paragraph", "paragraph_batch"}
+            and unit.get("block_kind") == "paragraph"
+            and previous.get("translation_required")
+            and unit.get("translation_required")
+            and previous.get("source_language") == unit.get("source_language")
+            and previous.get("section") == unit.get("section")
+            and int(previous.get("end") or 0) == int(unit.get("start") or -1)
+            and len(str(previous.get("source_text") or ""))
+            + len(str(unit.get("source_text") or "")) <= int(max_chars)
+        )
+        if not can_merge:
+            unit["source_unit_ids"] = [unit.get("unit_id")]
+            output.append(unit)
+            continue
+
+        source = str(previous.get("source_text") or "") + str(unit.get("source_text") or "")
+        previous.update({
+            "end": unit["end"],
+            "source_text": source,
+            "block_kind": "paragraph_batch",
+            "paragraph_end_index": unit.get("paragraph_index"),
+            "unit_id": _unit_id("body", previous["start"], unit["end"], source),
+            "memory_key": translation_memory_key(
+                source, previous["source_language"], glossary=glossary,
+                target_language=TARGET_LANGUAGE, contract_version=contract_version,
+            ),
+            "source_unit_ids": list(previous.get("source_unit_ids") or [])
+            + [unit.get("unit_id")],
+        })
+    return output
 
 
 class TranslationService:
@@ -876,6 +932,17 @@ class TranslationService:
             "language_detection": language_detection,
             "target_language": TARGET_LANGUAGE,
             "provider_id": self.provider.provider_id,
+            "translation_mode": "fast" if not self.policy.review_complex_units else "quality",
+            "performance": {
+                "max_unit_chars": self.policy.max_unit_chars,
+                "paragraph_batching": self.policy.coalesce_paragraphs,
+                "review_strategy": (
+                    "quality_failure_and_complex_content"
+                    if self.policy.review_complex_units else "quality_failure_only"
+                ),
+                "provider_attempts": sum(int(unit.get("attempts") or 0) for unit in required),
+                "reviewed_units": sum(1 for unit in required if unit.get("reviewed_by")),
+            },
             "glossary_fingerprint": glossary_fingerprint(glossary),
             "status": status, "translation_required": bool(required),
             "cancelled": bool(cancelled),
@@ -991,7 +1058,12 @@ class TranslationService:
                     or unit.get("source_language") == "mixed"
                     or len(core) >= max(800, int(self.policy.max_unit_chars * 0.7))
                 )
-                if complex_unit and self.reviewer is not None and not unit.get("reviewed_by"):
+                if (
+                    complex_unit
+                    and self.policy.review_complex_units
+                    and self.reviewer is not None
+                    and not unit.get("reviewed_by")
+                ):
                     try:
                         reviewed = reviewed_response(response.text, ["complex_content_review"])
                         reviewed_core, reviewed_qa = validate_response(reviewed)
@@ -1052,6 +1124,11 @@ class TranslationService:
             target_language=TARGET_LANGUAGE,
             contract_version=self.policy.contract_version,
         )
+        if self.policy.coalesce_paragraphs:
+            units = _coalesce_fast_paragraph_units(
+                units, self.policy.max_unit_chars, glossary,
+                self.policy.contract_version,
+            )
         resume_lookup = self._resume_lookup(resume_state)
         for unit in units:
             if unit["translation_required"]:
