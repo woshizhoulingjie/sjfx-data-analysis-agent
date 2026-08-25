@@ -48,6 +48,13 @@ _EMBEDDING_CACHE = {}
 _EMBEDDING_CACHE_LIMIT = 512
 
 
+def _semantic_evidence_text(item):
+    """Use a verified local working translation for matching, never citation."""
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("translated_text") or item.get("text") or "")
+
+
 def set_embedding_provider(provider):
     """Install an optional batch provider returning one vector per text."""
     global _EMBEDDING_PROVIDER
@@ -248,6 +255,15 @@ def compact_evidence(item, max_chars=520):
     }
     text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
     result["text"] = text[:max_chars] + ("..." if len(text) > max_chars else "")
+    translated = re.sub(r"\s+", " ", str(item.get("translated_text") or "")).strip()
+    if translated:
+        result["original_text"] = result["text"]
+        result["translated_text"] = (
+            translated[:max_chars] + ("..." if len(translated) > max_chars else "")
+        )
+        result["source_language"] = item.get("source_language")
+        result["target_language"] = item.get("target_language") or "zh-CN"
+        result["translation_source"] = item.get("translation_source") or "import_working_translation"
     result["excerpt"] = len(text) > max_chars
     result.setdefault("evidence_role", "direct_source")
     result.setdefault("derived_from", [])
@@ -270,7 +286,7 @@ def evidence_quality(item):
     """
     if not isinstance(item, dict):
         return {"eligible": False, "reason": "证据项格式无效", "score": -100}
-    text = " ".join(str(item.get("text") or "").split())
+    text = " ".join(_semantic_evidence_text(item).split())
     label = str(item.get("label") or "").lower()
     normalized = text.strip(" \t\r\n：:;；。.")
     # Short, page-addressable statements such as "风险评估结论" or
@@ -335,7 +351,7 @@ def _claim_match(item, topics, semantic_score=0.0, indirect_signals=None):
             "support_reason": "未指定问题，展示可回查的代表性正文。",
             "matched_terms": [],
         }
-    text = " ".join(str(item.get("text") or "").split())
+    text = " ".join(_semantic_evidence_text(item).split())
     lowered = text.lower()
     terms = _claim_terms([topic_text])
     matched = sorted(
@@ -394,7 +410,7 @@ def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexic
             "support_reason": quality.get("reason") or "证据质量不合格",
         })
     claim_text = " ".join(str(claim or "").split())
-    text = " ".join(str(item.get("text") or "").split())
+    text = " ".join(_semantic_evidence_text(item).split())
     if not claim_text:
         return result({
             "support_status": "insufficient",
@@ -486,7 +502,7 @@ def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=52
         if key in seen:
             continue
         seen.add(key)
-        text = " ".join(str(item.get("text") or "").split())
+        text = " ".join(_semantic_evidence_text(item).split())
         quality = evidence_quality(item)
         if not quality["eligible"]:
             continue
@@ -508,7 +524,10 @@ def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=52
         ordered = sorted(candidates, key=lambda value: (-value[0], value[1]))
         pool_size = min(256, len(ordered))
         pool = ordered[:pool_size]
-        texts = [" ".join(str(value.get(key) or "") for key in ("section", "text"))[:1800] for _score, _order, value, _relevance, _provenance, _label in pool]
+        texts = [
+            "{} {}".format(value.get("section") or "", _semantic_evidence_text(value))[:1800]
+            for _score, _order, value, _relevance, _provenance, _label in pool
+        ]
         semantic_scores, relevance_mode = _embedding_scores(topic_text, texts, _EMBEDDING_PROVIDER)
         for pool_index, candidate in enumerate(pool):
             candidate[2]["_semantic_score"] = semantic_scores.get(pool_index, 0.0)
@@ -537,7 +556,13 @@ def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=52
         if source_counts[source] >= max(1, per_source):
             continue
         compact = compact_evidence(item, max_chars=max_chars)
-        compact["supporting_quote"] = _supporting_quote(item.get("text"), terms, max_chars=min(280, max_chars))
+        compact["supporting_quote"] = _supporting_quote(
+            _semantic_evidence_text(item), terms, max_chars=min(280, max_chars)
+        )
+        if item.get("translated_text"):
+            compact["supporting_quote_original"] = _supporting_quote(
+                item.get("text"), set(), max_chars=min(280, max_chars)
+            )
         compact["evidence_quality"] = evidence_quality(item)
         compact.update(claim_match)
         compact.update(
@@ -591,7 +616,7 @@ def evidence_support(
     )
 
     text = " ".join(
-        str(item.get("text") or "").split()
+        _semantic_evidence_text(item).split()
     )
 
     section = str(

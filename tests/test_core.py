@@ -659,6 +659,65 @@ class CoreRegressionTests(unittest.TestCase):
         topics = _content_topics(document, 12)
         self.assertIn("远程证明", topics)
 
+    def test_import_translation_drives_analysis_but_never_overwrites_source_document(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_text = (
+                "The source discusses an orbital logistics protocol and delivery evidence. " * 20
+            )
+            (root / "foreign-a.txt").write_text(source_text, encoding="utf-8")
+            (root / "foreign-b.txt").write_text(
+                source_text + " A second source records an independent verification result.",
+                encoding="utf-8",
+            )
+            scan = scan_directory(root)
+            scan["parse_mode"] = "fast"
+            storage = Storage(root / "analysis.db")
+            scan_id = storage.save_scan(scan)
+            callback_calls = []
+            parsed_source_texts = {}
+
+            def add_working_translation(**kwargs):
+                callback_calls.append(sorted(kwargs["documents"]))
+                for path, document in kwargs["documents"].items():
+                    parsed_source_texts[path] = document["text"]
+                    document["analysis_text"] = "轨道物流协议 交付证据 " * 80
+                    document["analysis_title"] = "轨道物流研究资料"
+                    document["analysis_translation"] = {
+                        "status": "completed", "original_preserved": True,
+                    }
+                    for evidence in document["evidence"]:
+                        evidence["translated_text"] = "轨道物流协议包含可核验的交付证据。"
+                        evidence["source_language"] = "en"
+                        evidence["target_language"] = "zh-CN"
+                        evidence["translation_source"] = "import_working_translation"
+                return {
+                    "enabled": True, "eligible_files": 2, "translated_files": 2,
+                    "partial_files": 0, "failed_files": 0, "skipped_files": 0,
+                    "translated_characters": sum(
+                        len(document["analysis_text"])
+                        for document in kwargs["documents"].values()
+                    ),
+                    "limitations": [],
+                    "original_evidence_preserved": True,
+                }
+
+            analysis = analyze_package(
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=10000),
+                analysis_translation=add_working_translation,
+            )
+
+            self.assertEqual(callback_calls, [["foreign-a.txt", "foreign-b.txt"]])
+            cluster_text = json.dumps(analysis["topic_clusters"], ensure_ascii=False)
+            self.assertIn("轨道物流", cluster_text)
+            self.assertEqual(analysis["statistics"]["import_translation_translated_files"], 2)
+            stored = storage.get_document(scan_id, "foreign-a.txt")
+            self.assertEqual(stored["text"], parsed_source_texts["foreign-a.txt"])
+            self.assertNotIn("analysis_text", stored)
+            self.assertNotIn("analysis_title", stored)
+            self.assertNotIn("analysis_translation", stored)
+            self.assertNotIn("translated_text", stored["evidence"][0])
+
     def test_large_package_scope_resume_reuses_checkpoint_and_extends_coverage(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

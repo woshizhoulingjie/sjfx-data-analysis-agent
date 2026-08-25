@@ -217,6 +217,24 @@ class Config:
     TRANSLATION_REVIEW_COMPLEX_UNITS = os.getenv(
         "TRANSLATION_REVIEW_COMPLEX_UNITS", "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
+    ENABLE_IMPORT_TRANSLATION = os.getenv(
+        "ENABLE_IMPORT_TRANSLATION", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    IMPORT_TRANSLATION_MAX_FILES = max(
+        1, min(500, int(os.getenv("IMPORT_TRANSLATION_MAX_FILES", "30")))
+    )
+    IMPORT_TRANSLATION_LARGE_MAX_FILES = max(
+        1, min(200, int(os.getenv("IMPORT_TRANSLATION_LARGE_MAX_FILES", "12")))
+    )
+    IMPORT_TRANSLATION_MAX_CHARS_PER_FILE = max(
+        1000, min(100000, int(os.getenv("IMPORT_TRANSLATION_MAX_CHARS_PER_FILE", "12000")))
+    )
+    IMPORT_TRANSLATION_MAX_TOTAL_CHARS = max(
+        10000, min(5000000, int(os.getenv("IMPORT_TRANSLATION_MAX_TOTAL_CHARS", "240000")))
+    )
+    IMPORT_TRANSLATION_MAX_UNITS_PER_FILE = max(
+        1, min(100, int(os.getenv("IMPORT_TRANSLATION_MAX_UNITS_PER_FILE", "8")))
+    )
     TRANSLATION_PACKAGE_BATCH_FILES = max(
         1, min(500, int(os.getenv("TRANSLATION_PACKAGE_BATCH_FILES", "50")))
     )

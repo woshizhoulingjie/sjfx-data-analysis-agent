@@ -300,6 +300,118 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertIsInstance(payload["job_id"], str)
 
+    def test_import_translation_is_bounded_prioritized_and_searchable(self):
+        class _ImportTranslationService:
+            def __init__(self):
+                self.paths = []
+
+            def translate_document(self, document, resume_state=None, max_units=None,
+                                   checkpoint_callback=None, cancel_check=None):
+                source = document["source"]
+                text = document["text"]
+                self.paths.append(source["path"])
+                state = {
+                    "source_fingerprint": "working-" + source["path"],
+                    "source_path": source["path"],
+                    "source_language": "en", "target_language": "zh-CN",
+                    "provider_id": "test:offline", "status": "completed",
+                    "translated_title": "中文工作标题",
+                    "translated_text": "轨道物流协议包含可核验的交付证据。",
+                    "working_title": "中文工作标题",
+                    "working_text": "轨道物流协议包含可核验的交付证据。",
+                    "progress": {
+                        "required_units": 1, "completed_units": 1,
+                        "failed_units": 0, "pending_units": 0, "ratio": 1.0,
+                    },
+                    "performance": {"provider_attempts": 1},
+                    "units": [{
+                        "unit_id": "U-" + source["path"], "kind": "body",
+                        "block_kind": "paragraph", "section": "body",
+                        "start": 0, "end": len(text), "status": "completed",
+                        "source_language": "en", "source_text": text,
+                        "target_text": "轨道物流协议包含可核验的交付证据。",
+                    }],
+                }
+                if checkpoint_callback:
+                    checkpoint_callback(state)
+                return state
+
+        def document(path, text, restricted=False):
+            return {
+                "source": {
+                    "path": path, "name": path,
+                    "sha256": (path.encode("utf-8").hex() + "0" * 64)[:64],
+                    "sensitive": restricted,
+                    "content_policy": "restricted" if restricted else "standard",
+                },
+                "structure": {"title": path},
+                "text": text,
+                "evidence": [{
+                    "evidence_id": "E-" + path, "source_path": path,
+                    "label": "paragraph", "text": text,
+                    "char_start": 0, "char_end": len(text),
+                }],
+            }
+
+        documents = {
+            "ordinary.txt": document(
+                "ordinary.txt", "An ordinary foreign report requires later translation. " * 8,
+            ),
+            "priority.txt": document(
+                "priority.txt", "A priority foreign report contains orbital logistics evidence. " * 8,
+            ),
+            "restricted.txt": document(
+                "restricted.txt", "Restricted foreign source content. " * 8, restricted=True,
+            ),
+        }
+        originals = {path: item["text"] for path, item in documents.items()}
+        service = _ImportTranslationService()
+        original_service = self.app_module.translation_service
+        self.app_module.translation_service = service
+        try:
+            with patch.object(self.app_module.Config, "IMPORT_TRANSLATION_MAX_FILES", 1), patch.object(
+                self.app_module.Config, "IMPORT_TRANSLATION_LARGE_MAX_FILES", 1
+            ), patch.object(
+                self.app_module.Config, "IMPORT_TRANSLATION_MAX_CHARS_PER_FILE", 5000
+            ), patch.object(
+                self.app_module.Config, "IMPORT_TRANSLATION_MAX_TOTAL_CHARS", 5000
+            ), patch.object(
+                self.app_module.Config, "IMPORT_TRANSLATION_MAX_UNITS_PER_FILE", 2
+            ):
+                summary = self.app_module._prepare_import_translations(
+                    "scan-import", "job-import", documents,
+                    policy={"enabled": False}, priority_paths={"priority.txt"},
+                    progress=lambda *_args: None, cancel_check=lambda: False,
+                )
+        finally:
+            self.app_module.translation_service = original_service
+
+        self.assertEqual(service.paths, ["priority.txt"])
+        self.assertEqual(summary["eligible_files"], 2)
+        self.assertEqual(summary["translated_files"], 1)
+        self.assertEqual(summary["skipped_files"], 1)
+        self.assertEqual(summary["restricted_files"], 1)
+        self.assertIn("轨道物流", documents["priority.txt"]["analysis_text"])
+        self.assertNotIn("analysis_text", documents["ordinary.txt"])
+        self.assertNotIn("analysis_text", documents["restricted.txt"])
+        self.assertEqual(
+            {path: item["text"] for path, item in documents.items()}, originals,
+        )
+        saved = self.storage.get_translation("scan-import", "priority.txt", hydrate=True)
+        self.assertEqual(saved["status"], "completed")
+        persisted = {
+            key: value for key, value in documents["priority.txt"].items()
+            if not key.startswith("analysis_")
+        }
+        self.storage.save_document("scan-import", "priority.txt", persisted)
+        self.assertIsNotNone(
+            self.storage.get_translation("scan-import", "priority.txt", hydrate=True),
+            "saving the complete source must not invalidate its bounded working translation",
+        )
+        hits = self.storage.search_evidence_index("scan-import", "轨道物流", limit=50)
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["original_text"], originals["priority.txt"])
+
     def test_package_overview_includes_bounded_research_brief_and_owned_report(self):
         scan_id, _scan = self._save_scan_with_files(["letter.txt"])
         self.storage.save_summary(scan_id, ".", "report", {

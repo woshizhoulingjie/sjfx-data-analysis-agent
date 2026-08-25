@@ -864,6 +864,12 @@ def _coalesce_fast_paragraph_units(units, max_chars, glossary, contract_version)
         )
         if not can_merge:
             unit["source_unit_ids"] = [unit.get("unit_id")]
+            unit["source_segments"] = [{
+                "unit_id": unit.get("unit_id"),
+                "start": unit.get("start"),
+                "end": unit.get("end"),
+                "source_text": unit.get("source_text"),
+            }]
             output.append(unit)
             continue
 
@@ -880,6 +886,13 @@ def _coalesce_fast_paragraph_units(units, max_chars, glossary, contract_version)
             ),
             "source_unit_ids": list(previous.get("source_unit_ids") or [])
             + [unit.get("unit_id")],
+            "source_segments": list(previous.get("source_segments") or [])
+            + [{
+                "unit_id": unit.get("unit_id"),
+                "start": unit.get("start"),
+                "end": unit.get("end"),
+                "source_text": unit.get("source_text"),
+            }],
         })
     return output
 
@@ -921,6 +934,15 @@ class TranslationService:
                 return None
             return "".join(unit["target_text"] for unit in selected)
 
+        def working(kind):
+            selected = [unit for unit in units if unit["kind"] == kind]
+            return "".join(
+                unit["target_text"]
+                if unit.get("target_text") is not None
+                else unit.get("source_text") or ""
+                for unit in selected
+            )
+
         source_fingerprint = document_translation_fingerprint(document)
         language_detection = detect_language(original_title + "\n" + original_text)
         return {
@@ -948,6 +970,7 @@ class TranslationService:
             "cancelled": bool(cancelled),
             "original_title": original_title, "translated_title": joined("title"),
             "original_text": original_text, "translated_text": joined("body"),
+            "working_title": working("title"), "working_text": working("body"),
             "progress": {
                 "total_units": len(units), "required_units": len(required),
                 "completed_units": len(completed), "failed_units": len(failed),

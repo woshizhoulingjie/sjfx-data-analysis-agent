@@ -67,7 +67,7 @@ class EngineeringV2StorageTests(unittest.TestCase):
             self.assertEqual(ranked["results"][0]["source_path"], "letters/decision.txt")
             self.assertEqual(ranked["results"][0]["paragraph_index"], 2)
 
-    def test_partial_translation_is_not_published_and_reparse_clears_old_index(self):
+    def test_partial_translation_publishes_completed_units_and_reparse_clears_index(self):
         with tempfile.TemporaryDirectory() as folder:
             storage = Storage(Path(folder) / "state.db")
             completed = {
@@ -84,7 +84,9 @@ class EngineeringV2StorageTests(unittest.TestCase):
             partial = dict(completed)
             partial["status"] = "partial"
             storage.save_translation("scan", "decision.txt", partial)
-            self.assertFalse(storage.search_evidence_index("scan", "独特决定", limit=50))
+            partial_hits = storage.search_evidence_index("scan", "独特决定", limit=50)
+            self.assertEqual(len(partial_hits), 1)
+            self.assertEqual(partial_hits[0]["translated_text"], "这项独特决定已获批准。")
 
             storage.save_translation("scan", "decision.txt", completed)
             storage.replace_document_evidence_index("scan", "decision.txt", [])

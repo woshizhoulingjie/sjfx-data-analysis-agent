@@ -73,7 +73,7 @@ class FrontendTaskContractTests(unittest.TestCase):
         self.assertIn("useProgressiveAnalysis", script)
         self.assertIn("data-job-open", script)
         self.assertIn("打开分析结果", script)
-        self.assertIn('/static/app.js?v=19', html)
+        self.assertIn('/static/app.js?v=20', html)
         self.assertIn("allowed_result_fields", app_source)
         self.assertIn("_job_api_view(job, compact=compact)", app_source)
 

@@ -316,6 +316,28 @@ class TranslationCoreTests(unittest.TestCase):
         self.assertEqual(second["original_text"], body)
         self.assertIsNotNone(second["translated_text"])
 
+    def test_partial_translation_exposes_a_mixed_working_copy_without_claiming_completion(self):
+        body = (
+            "The first foreign paragraph is translated during import. " * 5
+        ) + "\n\n" + (
+            "The second foreign paragraph remains in its original language. " * 5
+        )
+        service = TranslationService(
+            DeterministicProvider(),
+            policy=TranslationPolicy(max_unit_chars=300, coalesce_paragraphs=False),
+        )
+
+        result = service.translate_document(foreign_document(body), max_units=1)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertIsNone(result["translated_text"])
+        self.assertIn("译", result["working_text"])
+        self.assertIn("second foreign paragraph", result["working_text"])
+        self.assertEqual(len(result["working_text"]), sum(
+            len(unit.get("target_text") if unit.get("target_text") is not None else unit.get("source_text") or "")
+            for unit in result["units"] if unit.get("kind") == "body"
+        ))
+
     def test_long_document_uses_bounded_full_state_checkpoints(self):
         class CountingTranslationService(TranslationService):
             def __init__(self, *args, **kwargs):

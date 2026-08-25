@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from services.evidence import evidence_quality, verify_claim_evidence
+from services.evidence import compact_evidence, evidence_quality, verify_claim_evidence
 from services.folder_analysis import _normalize_question_answer_evidence
 from services.large_package import build_coverage, build_policy, file_fingerprint, representative_paths
 from services.package_analysis import _build_structured_overview
@@ -77,6 +77,24 @@ class AnalysisContractTests(unittest.TestCase):
         )
         self.assertEqual(result["support_status"], "supported")
         self.assertEqual(result["support_relation"], "direct_frame")
+
+    def test_chinese_claim_matches_working_translation_but_citation_keeps_original(self):
+        evidence = {
+            "evidence_id": "E-arabic", "source_path": "arabic.txt", "label": "paragraph",
+            "text": "يدعم النظام التشفير وتم التحقق منه بالكامل.",
+            "translated_text": "测试结果表明，系统支持加密并已经通过完整验证。",
+            "source_language": "ar", "target_language": "zh-CN",
+            "translation_source": "import_working_translation",
+        }
+
+        result = verify_claim_evidence("系统支持加密", evidence)
+        compact = compact_evidence(evidence)
+
+        self.assertEqual(result["support_status"], "supported")
+        self.assertEqual(compact["text"], evidence["text"])
+        self.assertEqual(compact["original_text"], evidence["text"])
+        self.assertEqual(compact["translated_text"], evidence["translated_text"])
+        self.assertEqual(compact["source_language"], "ar")
 
     def test_mixed_claim_support_is_partial_and_keeps_valid_evidence(self):
         good = {

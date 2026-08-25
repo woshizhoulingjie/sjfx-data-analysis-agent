@@ -49,6 +49,8 @@ from services.translation import (
     TranslationService,
     UnavailableTranslationProvider,
     build_translation_plan,
+    detect_language,
+    document_translation_fingerprint,
 )
 from services.conversation import (
     CallableEvidenceRetriever,
@@ -1277,6 +1279,11 @@ def _run_claimed_analysis_job(job):
         target_paths=options.get("target_paths"),
         cancel_check=lambda: storage.is_job_cancel_requested(job_id),
         parse_mode_override=options.get("parse_mode"),
+        analysis_translation=(
+            lambda **kwargs: _prepare_import_translations(
+                scan_id, job_id=job_id, **kwargs
+            )
+        ) if Config.ENABLE_TRANSLATION and Config.ENABLE_IMPORT_TRANSLATION else None,
     )
     _ensure_job_active(job_id)
     conversation_continuation = _continue_conversation_after_promotion(
@@ -1356,6 +1363,235 @@ def _translation_document(scan_id, node_path, source_level):
     document["text"] = str(document.get("text") or "")[:Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE]
     document.setdefault("coverage", {})["translation_source_level"] = "preview"
     return document
+
+
+def _apply_import_translation_overlay(document, state, source_char_limit=None):
+    """Attach a transient Chinese analysis view while preserving source text."""
+    if not isinstance(document, dict) or not isinstance(state, dict):
+        return False
+    body_units = [
+        unit for unit in state.get("units") or []
+        if isinstance(unit, dict)
+        and unit.get("kind") == "body"
+        and (
+            source_char_limit is None
+            or int(unit.get("start") or 0) < int(source_char_limit)
+        )
+    ]
+    completed = [
+        unit for unit in body_units
+        if unit.get("status") in {"completed", "not_required"}
+        and unit.get("target_text") is not None
+    ]
+    if not completed:
+        return False
+    working_text = "".join(
+        str(
+            unit.get("target_text")
+            if unit.get("target_text") is not None
+            else unit.get("source_text") or ""
+        )
+        for unit in body_units
+    )
+    if not working_text.strip():
+        return False
+    document["analysis_text"] = working_text
+    document["analysis_title"] = str(
+        state.get("translated_title") or state.get("working_title") or ""
+    )
+    progress = state.get("progress") or {}
+    document["analysis_translation"] = {
+        "source_language": state.get("source_language"),
+        "target_language": state.get("target_language") or "zh-CN",
+        "status": state.get("status"),
+        "completed_units": int(progress.get("completed_units") or 0),
+        "required_units": int(progress.get("required_units") or 0),
+        "coverage_ratio": float(progress.get("ratio") or 0.0),
+        "source_level": state.get("source_level"),
+        "original_preserved": True,
+    }
+
+    original = str(document.get("text") or "")
+    search_cursor = 0
+    for evidence in document.get("evidence") or []:
+        if not isinstance(evidence, dict) or not str(evidence.get("text") or "").strip():
+            continue
+        start = evidence.get("char_start")
+        end = evidence.get("char_end")
+        try:
+            start = int(start)
+            end = int(end)
+        except (TypeError, ValueError):
+            needle = str(evidence.get("text") or "")
+            start = original.find(needle, search_cursor)
+            if start < 0:
+                start = original.find(needle)
+            end = start + len(needle) if start >= 0 else -1
+            if start >= 0:
+                search_cursor = end
+        if start < 0 or end <= start:
+            continue
+        overlapping = [
+            unit for unit in completed
+            if int(unit.get("end") or 0) > start and int(unit.get("start") or 0) < end
+        ]
+        if not overlapping:
+            continue
+        translated = "\n".join(
+            str(unit.get("target_text") or "").strip()
+            for unit in overlapping if str(unit.get("target_text") or "").strip()
+        ).strip()
+        if not translated:
+            continue
+        evidence.update({
+            "translated_text": translated,
+            "source_language": state.get("source_language"),
+            "target_language": state.get("target_language") or "zh-CN",
+            "translation_source": "import_working_translation",
+            "translation_unit_ids": [unit.get("unit_id") for unit in overlapping],
+        })
+    return True
+
+
+def _prepare_import_translations(scan_id, job_id, documents, policy, priority_paths,
+                                 progress, cancel_check):
+    """Translate a bounded foreign working set before semantic analysis."""
+    large = bool((policy or {}).get("enabled"))
+    file_limit = (
+        Config.IMPORT_TRANSLATION_LARGE_MAX_FILES
+        if large else Config.IMPORT_TRANSLATION_MAX_FILES
+    )
+    per_file_limit = Config.IMPORT_TRANSLATION_MAX_CHARS_PER_FILE
+    total_limit = Config.IMPORT_TRANSLATION_MAX_TOTAL_CHARS
+    priority_paths = set(priority_paths or [])
+    candidates = []
+    restricted = 0
+    for path, document in documents.items():
+        source = document.get("source") or {}
+        if source.get("sensitive") or source.get("content_policy") == "restricted":
+            restricted += 1
+            continue
+        text = str(document.get("text") or "")
+        title = str((document.get("structure") or {}).get("title") or source.get("name") or "")
+        detection = detect_language(title + "\n" + text[:20000])
+        if not detection.get("needs_translation") or not text.strip():
+            continue
+        candidates.append((path not in priority_paths, path, document, detection))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+
+    result_summary = {
+        "enabled": True,
+        "mode": "fast_pre_analysis",
+        "target_language": "zh-CN",
+        "eligible_files": len(candidates),
+        "translated_files": 0,
+        "partial_files": 0,
+        "failed_files": 0,
+        "skipped_files": 0,
+        "restricted_files": restricted,
+        "reused_files": 0,
+        "translated_characters": 0,
+        "source_characters": 0,
+        "provider_attempts": 0,
+        "file_limit": file_limit,
+        "per_file_character_limit": per_file_limit,
+        "total_character_limit": total_limit,
+        "limitations": [],
+        "original_evidence_preserved": True,
+    }
+    consumed = 0
+    attempted = 0
+    for _priority, path, document, _detection in candidates:
+        if attempted >= file_limit or consumed >= total_limit:
+            break
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("任务已取消，停止导入期翻译")
+        available = min(per_file_limit, total_limit - consumed)
+        if available < 1000:
+            break
+        source_text = str(document.get("text") or "")
+        source_chars = min(len(source_text), available)
+        projection = storage.project_document(
+            document, text_limit=source_chars,
+            evidence_limit=Config.LARGE_PACKAGE_OVERVIEW_EVIDENCE_PER_FILE,
+        )
+        previous = storage.get_translation(scan_id, path, hydrate=True)
+        if previous and previous.get("full_translation") and previous.get("status") == "completed":
+            state = previous
+            result_summary["reused_files"] += 1
+        else:
+            source_level = "analysis" if large or len(source_text) > source_chars else "full"
+
+            def checkpoint(state):
+                state["source_level"] = source_level
+                state["analysis_working_translation"] = True
+                # The working copy may be built from a bounded projection, but
+                # its lifetime is governed by the complete parsed source.
+                # Otherwise the next source-document save would incorrectly
+                # invalidate a valid import translation as stale.
+                state["source_fingerprint"] = document_translation_fingerprint(document)
+                state["full_translation"] = bool(
+                    source_level == "full" and state.get("status") in {"completed", "not_required"}
+                )
+                storage.save_translation(scan_id, path, state)
+
+            state = translation_service.translate_document(
+                projection,
+                resume_state=previous,
+                max_units=Config.IMPORT_TRANSLATION_MAX_UNITS_PER_FILE,
+                checkpoint_callback=checkpoint,
+                cancel_check=cancel_check,
+            )
+            checkpoint(state)
+        attempted += 1
+        consumed += source_chars
+        result_summary["source_characters"] += source_chars
+        result_summary["provider_attempts"] += int(
+            (state.get("performance") or {}).get("provider_attempts") or 0
+        )
+        if _apply_import_translation_overlay(document, state, source_char_limit=source_chars):
+            translated_chars = sum(
+                len(str(unit.get("target_text") or ""))
+                for unit in state.get("units") or []
+                if isinstance(unit, dict)
+                and unit.get("kind") == "body"
+                and unit.get("status") in {"completed", "not_required"}
+                and int(unit.get("start") or 0) < source_chars
+            )
+            result_summary["translated_characters"] += translated_chars
+            if state.get("status") in {"completed", "not_required"}:
+                result_summary["translated_files"] += 1
+            else:
+                result_summary["partial_files"] += 1
+        else:
+            result_summary["failed_files"] += 1
+        progress(
+            70 + int(2 * attempted / max(1, min(len(candidates), file_limit))),
+            "导入期外语工作译本：{}/{} {}".format(
+                attempted, min(len(candidates), file_limit), path
+            ),
+        )
+
+    result_summary["skipped_files"] = max(0, len(candidates) - attempted)
+    if result_summary["skipped_files"]:
+        result_summary["limitations"].append(
+            "外语文件超过导入期预算，{} 个文件将在后台或点名分析时继续翻译。".format(
+                result_summary["skipped_files"]
+            )
+        )
+    if result_summary["partial_files"]:
+        result_summary["limitations"].append(
+            "{} 个文件仅生成部分中文工作译本，未翻译段落继续以原文参与分析。".format(
+                result_summary["partial_files"]
+            )
+        )
+    if result_summary["failed_files"]:
+        result_summary["limitations"].append(
+            "{} 个外语文件未能生成可用工作译本，已安全回退原文分析。".format(
+                result_summary["failed_files"]
+            )
+        )
+    return result_summary
 
 
 def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_units=None):
@@ -1705,6 +1941,11 @@ def status():
                 "mode": "quality" if Config.TRANSLATION_REVIEW_COMPLEX_UNITS else "fast",
                 "paragraph_batching": Config.TRANSLATION_COALESCE_PARAGRAPHS,
                 "review_complex_units": Config.TRANSLATION_REVIEW_COMPLEX_UNITS,
+                "import_translation_enabled": Config.ENABLE_IMPORT_TRANSLATION,
+                "import_translation_max_files": Config.IMPORT_TRANSLATION_MAX_FILES,
+                "import_translation_large_max_files": Config.IMPORT_TRANSLATION_LARGE_MAX_FILES,
+                "import_translation_max_chars_per_file": Config.IMPORT_TRANSLATION_MAX_CHARS_PER_FILE,
+                "import_translation_max_total_chars": Config.IMPORT_TRANSLATION_MAX_TOTAL_CHARS,
                 "package_batch_files": Config.TRANSLATION_PACKAGE_BATCH_FILES,
                 "auto_translate_packages": Config.AUTO_TRANSLATE_PACKAGES,
             },

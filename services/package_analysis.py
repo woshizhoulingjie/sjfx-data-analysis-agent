@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import math
@@ -53,6 +54,37 @@ from services.parse_isolation import (
 
 
 PROFILE_USABLE_STATUSES = {"completed", "partial"}
+
+
+def _analysis_text(document):
+    """Return translated working text when import translation produced it."""
+    return str((document or {}).get("analysis_text") or (document or {}).get("text") or "")
+
+
+def _analysis_title(document):
+    document = document or {}
+    return str(
+        document.get("analysis_title")
+        or (document.get("structure") or {}).get("title")
+        or (document.get("source") or {}).get("name")
+        or ""
+    )
+
+
+def _document_without_analysis_overlay(document):
+    """Remove in-memory working translations before saving the source document."""
+    stored = copy.deepcopy(document or {})
+    for key in ("analysis_text", "analysis_title", "analysis_translation"):
+        stored.pop(key, None)
+    for item in stored.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in (
+            "translated_text", "source_language", "target_language",
+            "translation_source", "translation_unit_ids",
+        ):
+            item.pop(key, None)
+    return stored
 
 
 def _temp_disk_worker_limit(requested_workers):
@@ -143,7 +175,7 @@ def _build_value_judgment(scan, documents, analysis_stats, coverage, exact_group
     ]
     evidence_count = len(valid_evidence)
     evidence_density = max(0.0, min(1.0, evidence_count / float(max(canonical_count, 1) * 3)))
-    text_characters = sum(len(str(document.get("text") or "")) for document in documents.values())
+    text_characters = sum(len(_analysis_text(document)) for document in documents.values())
     information_signal = min(1.0, text_characters / float(max(canonical_count, 1) * 8000))
     quality_score = structured_overview.get("average_quality_score")
     structured_quality = max(0.0, min(1.0, float(quality_score) / 100.0)) if quality_score is not None else None
@@ -1044,7 +1076,7 @@ def _group_similar(documents, exact_groups, max_distance=8):
     for path, doc in documents.items():
         if path in exact_duplicate_paths:
             continue
-        text = doc.get("text", "")
+        text = _analysis_text(doc)
         if len(text.strip()) < 120:
             continue
         value = simhash64(text)
@@ -1112,9 +1144,9 @@ def _document_topics(document, limit=8):
     source = document.get("source", {})
     structure = document.get("structure", {})
     sample = " ".join([
-        Path(source.get("name", "")).stem,
+        _analysis_title(document) or Path(source.get("name", "")).stem,
         " ".join(structure.get("headings", [])[:30]),
-        document.get("text", "")[:12000],
+        _analysis_text(document)[:12000],
     ])
     return [word for word, _ in Counter(_tokens(sample)).most_common(limit)]
 
@@ -1122,7 +1154,7 @@ def _document_topics(document, limit=8):
 def _content_topics(document, limit=8):
     """Extract topics only from parsed content, never from file metadata."""
     structure = document.get("structure", {})
-    text = str(document.get("text") or "")
+    text = _analysis_text(document)
     # A bounded head/middle/tail sample avoids classifying a long report only
     # by its introduction while keeping package-wide topic extraction cheap.
     if len(text) > 24000:
@@ -1164,7 +1196,7 @@ def _document_role_details(document):
     """Classify by several independent signals, not one incidental phrase."""
     structure = document.get("structure", {})
     headings = " ".join(structure.get("headings", [])[:20]).lower()
-    body = document.get("text", "")[:16000].lower()
+    body = _analysis_text(document)[:16000].lower()
     filename = Path(document.get("source", {}).get("name", "")).stem.lower()
     sample = " ".join((filename, headings, body))
     requirement_terms = ("交付要求", "验收标准", "产品定位", "用户故事", "环境约束", "实施要求", "功能要求", "需求规格", "招标文件")
@@ -1192,7 +1224,7 @@ def _document_role_details(document):
     weak_requirement_score, weak_requirement_hits = weighted_score(weak_requirement_terms)
     research_score, research_hits = weighted_score(research_terms)
     data_score, data_hits = weighted_score(data_terms)
-    structured = _looks_like_structured_content(document.get("text", ""))
+    structured = _looks_like_structured_content(str(document.get("text") or ""))
     if structured:
         data_score += 5
     scores = {
@@ -1237,6 +1269,10 @@ def _first_evidence(document):
                 "page": evidence.get("page"),
                 "section": evidence.get("section"),
                 "text": evidence.get("text", "")[:300],
+                "translated_text": str(evidence.get("translated_text") or "")[:300] or None,
+                "source_language": evidence.get("source_language"),
+                "target_language": evidence.get("target_language"),
+                "translation_source": evidence.get("translation_source"),
                 "source_sha256": evidence.get("source_sha256"),
                 "archive_source_path": evidence.get("archive_source_path"),
                 "archive_member": evidence.get("archive_member"),
@@ -1244,9 +1280,9 @@ def _first_evidence(document):
 
             topics = document.get("structure", {}).get("headings", [])[:8]
 
-            if document.get("structure", {}).get("title"):
+            if _analysis_title(document):
                 topics = [
-                    document["structure"]["title"]
+                    _analysis_title(document)
                 ] + topics
 
             result.update(
@@ -1291,7 +1327,7 @@ def _node_summary(node, documents):
         page_total += int(structure.get("page_count") or 0)
         table_total += int(structure.get("table_count") or 0)
         image_total += int(structure.get("picture_count") or 0)
-    representatives = sorted(node_docs, key=lambda doc: (len(doc.get("text", "")), doc.get("source", {}).get("size", 0)), reverse=True)[:3]
+    representatives = sorted(node_docs, key=lambda doc: (len(_analysis_text(doc)), doc.get("source", {}).get("size", 0)), reverse=True)[:3]
     topics = [item for item, _ in topic_counts.most_common(8)]
     summary = (
         "本节点递归包含 {files} 个文件、{dirs} 个子目录，总大小 {size}。"
@@ -1332,7 +1368,7 @@ def _file_summary(path, document):
     structure = document.get("structure", {})
     evidence = [item for item in document.get("evidence", []) if evidence_quality(item).get("eligible")][:3]
     headings = structure.get("headings", [])[:2]
-    first_text = next((item.get("text", "") for item in evidence if item.get("text")), "")
+    first_text = next((item.get("translated_text") or item.get("text", "") for item in evidence if item.get("text")), "")
     coverage = document.get("coverage") or {}
     summary = "{} 文件，大小 {}，解析器为 {}。".format(
         source.get("extension") or "未知格式",
@@ -1361,7 +1397,7 @@ def _file_summary(path, document):
         "coverage": coverage,
         "representative_evidence": evidence[:1],
         "deep_analysis_recommended": bool(
-            evidence and (not coverage.get("complete", True) or len(str(document.get("text") or "")) >= 8000)
+            evidence and (not coverage.get("complete", True) or len(_analysis_text(document)) >= 8000)
         ),
         "deduplication": duplicate,
         "representative_documents": [path],
@@ -1566,7 +1602,7 @@ def _enrich_analysis_tree(tree, documents):
         topic_node["node_type"] = "topic"
         topic_node["representative_documents"] = sorted(
             member_paths,
-            key=lambda path: len(documents[path].get("text", "")),
+            key=lambda path: len(_analysis_text(documents[path])),
             reverse=True,
         )[:5]
         topic_node["evidence_chain"] = _node_evidence(
@@ -1693,7 +1729,7 @@ def _enrich_analysis_tree(tree, documents):
                 "total_size": sum(int(documents[path].get("source", {}).get("size") or 0) for path in paths),
                 "total_size_human": human_size(sum(int(documents[path].get("source", {}).get("size") or 0) for path in paths)),
                 "related_topics": partition["topics"],
-                "representative_documents": sorted(paths, key=lambda path: len(documents[path].get("text", "")), reverse=True)[:3],
+                "representative_documents": sorted(paths, key=lambda path: len(_analysis_text(documents[path])), reverse=True)[:3],
                 "evidence_chain": evidence,
                 "conclusion_evidence": [conclusion],
                 "children": file_nodes,
@@ -2406,7 +2442,7 @@ def _topic_clusters(documents):
         if len(unique) < 2 or unique in used_sets:
             continue
         used_sets.add(unique)
-        representatives = sorted(unique, key=lambda path: len(documents[path].get("text", "")), reverse=True)[:3]
+        representatives = sorted(unique, key=lambda path: len(_analysis_text(documents[path])), reverse=True)[:3]
         clusters.append({
             "cluster_id": "TOPIC-{:04d}".format(len(clusters) + 1),
             "topic": _cluster_label(topic, unique, documents),
@@ -2431,15 +2467,10 @@ def _semantic_document_profile(path, document, max_chars=1700):
         if str(value or "").strip()
     ]
 
-    title = (
-        headings[0]
-        if headings
-        else structure.get("title")
-        or Path(path).stem
-    )
+    title = _analysis_title(document) or Path(path).stem
 
     body = " ".join(
-        str(document.get("text") or "").split()
+        _analysis_text(document).split()
     )
 
     parts = [
@@ -3137,7 +3168,7 @@ def _name_lexical_topic_nodes(tree, documents, llm=None):
             "cluster_id": "LEX-{:04d}".format(index),
             "members": members,
             "representative_documents": sorted(
-                members, key=lambda path: len(documents[path].get("text", "")), reverse=True
+                members, key=lambda path: len(_analysis_text(documents[path])), reverse=True
             )[:3],
         }
         fallback = _fallback_semantic_name(cluster, documents)
@@ -3793,7 +3824,8 @@ def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=Non
 
 
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
-                    large_options=None, target_paths=None, cancel_check=None, parse_mode_override=None):
+                    large_options=None, target_paths=None, cancel_check=None, parse_mode_override=None,
+                    analysis_translation=None):
     progress = progress or (lambda percent, message: None)
     files = list(_walk_files(scan["tree"]))
     parse_mode = "fast" if scan.get("parse_mode") == "fast" else "accurate"
@@ -4042,6 +4074,31 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     }
     deep_pending_paths = all_paths - deep_analyzed_paths
 
+    import_translation = {
+        "enabled": False, "eligible_files": 0, "translated_files": 0,
+        "partial_files": 0, "failed_files": 0, "skipped_files": 0,
+        "translated_characters": 0, "limitations": [],
+    }
+    if callable(analysis_translation) and documents:
+        try:
+            import_translation = analysis_translation(
+                documents=documents,
+                policy=policy,
+                priority_paths=set((content_map or {}).get("representative_paths") or []),
+                progress=progress,
+                cancel_check=cancel_check,
+            ) or import_translation
+        except ParseIsolationCancelled:
+            raise
+        except Exception as exc:
+            if cancel_check is not None and cancel_check():
+                raise ParseIsolationCancelled("任务已取消，停止导入期翻译") from exc
+            import_translation.update({
+                "enabled": True,
+                "failed_files": 1,
+                "limitations": ["导入期工作译本阶段异常，已回退原文分析：{}".format(str(exc)[:300])],
+            })
+
     classified_batch = []
     classified_total = max(1, len(documents))
     for classified_index, (document_path, document) in enumerate(documents.items(), 1):
@@ -4055,14 +4112,20 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         if not policy.get("enabled"):
             classified_batch.append((document_path, document))
         if not policy.get("enabled") and len(classified_batch) >= 250:
-            storage.save_documents(scan_id, classified_batch)
+            storage.save_documents(scan_id, [
+                (path, _document_without_analysis_overlay(document))
+                for path, document in classified_batch
+            ])
             classified_batch = []
             progress(
                 70 + int(2 * classified_index / classified_total),
                 "整理文档角色与质量：{}/{}".format(classified_index, len(documents)),
             )
     if classified_batch:
-        storage.save_documents(scan_id, classified_batch)
+        storage.save_documents(scan_id, [
+            (path, _document_without_analysis_overlay(document))
+            for path, document in classified_batch
+        ])
 
     progress(72, "执行精确去重与高相似文档聚类")
     if policy.get("enabled"):
@@ -4082,17 +4145,20 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     # visible in the physical tree and survives a Worker restart.
     if not policy.get("enabled"):
         for document_path, document in documents.items():
-            storage.save_document(scan_id, document_path, document)
+            storage.save_document(
+                scan_id, document_path, _document_without_analysis_overlay(document)
+            )
     similar_groups = [] if policy.get("enabled") else _group_similar(documents, exact_groups)
     topic_clusters = _topic_clusters(canonical_documents)
     if policy.get("enabled"):
         # Rebuild the durable catalog one document at a time: one complete
         # evidence scan, no 300k-object corpus allocation and no repeated BM25.
-        storage.clear_evidence_index(scan_id)
+        storage.clear_evidence_index(scan_id, preserve_translations=True)
         evidence_index_count = 0
         for indexed_path, indexed_document in canonical_documents.items():
             evidence_index_count += storage.replace_document_evidence_index(
                 scan_id, indexed_path, evidence_corpus({indexed_path: indexed_document}),
+                preserve_translations=True,
             )
         manifest_queries = [
             {"query": str(item.get("topic") or ""), "results": [], "deferred": True}
@@ -4333,10 +4399,16 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         for document_path, document in documents.items():
             classification_batch.append((document_path, document))
             if len(classification_batch) >= 250:
-                storage.save_documents(scan_id, classification_batch)
+                storage.save_documents(scan_id, [
+                    (path, _document_without_analysis_overlay(document))
+                    for path, document in classification_batch
+                ])
                 classification_batch = []
         if classification_batch:
-            storage.save_documents(scan_id, classification_batch)
+            storage.save_documents(scan_id, [
+                (path, _document_without_analysis_overlay(document))
+                for path, document in classification_batch
+            ])
     scan["tree"] = _annotate_physical_tree_deduplication(
         scan["tree"], canonical_by_path, documents, node_summaries
     )
@@ -4371,6 +4443,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
     )
+    if import_translation.get("limitations"):
+        package_coverage["limitations"] = list(dict.fromkeys(
+            list(package_coverage.get("limitations") or [])
+            + list(import_translation.get("limitations") or [])
+        ))
     if policy.get("enabled"):
         preview_counts = storage.file_preview_counts(scan_id)
         package_coverage["preview_coverage"] = {
@@ -4422,6 +4499,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "limitations": package_coverage.get("limitations", []),
         "evidence_count": evidence_count,
         "structured_data": structured_overview,
+        "import_translation": import_translation,
     }
     value_judgment = _build_value_judgment(
         scan,
@@ -4530,6 +4608,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "structured_sensitive_column_count": len(structured_overview["sensitive_columns"]),
             "structured_entity_category_count": len(structured_overview["entity_statistics"]),
             "structured_recommended_question_count": len(structured_overview["recommendation_questions"]),
+            "import_translation_eligible_files": int(import_translation.get("eligible_files") or 0),
+            "import_translation_translated_files": int(import_translation.get("translated_files") or 0),
+            "import_translation_partial_files": int(import_translation.get("partial_files") or 0),
+            "import_translation_failed_files": int(import_translation.get("failed_files") or 0),
+            "import_translation_characters": int(import_translation.get("translated_characters") or 0),
         },
         "exact_duplicate_groups": exact_groups,
         "similar_document_clusters": similar_groups,
@@ -4552,6 +4635,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "overview": overview,
         "value_judgment": value_judgment,
         "structured_data_overview": structured_overview,
+        "import_translation": import_translation,
         "model_telemetry": {
             "calls": package_model_calls,
             "call_count": len(package_model_calls),
@@ -4567,6 +4651,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "parse_mode": actual_parse_mode,
             "analysis_mode": policy.get("mode"),
             "large_package": policy,
+            "import_translation": import_translation,
             "all_nodes_have_local_summary": True,
             "docling_remote_services": False,
             "model_exception": "摘要增强仅调用已配置模型；解析、OCR、去重、聚类、建树均在本地执行。",
@@ -4644,10 +4729,11 @@ def refresh_package_coverage(scan_id, scan, storage):
         canonical_documents, _canonical_by_path, _aliases = _canonical_projection(documents, exact_groups)
     analysis["exact_duplicate_groups"] = exact_groups
     if policy.get("enabled"):
-        storage.clear_evidence_index(scan_id)
+        storage.clear_evidence_index(scan_id, preserve_translations=True)
         for document_path, document in canonical_documents.items():
             storage.replace_document_evidence_index(
                 scan_id, document_path, evidence_corpus({document_path: document}),
+                preserve_translations=True,
             )
     else:
         storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))

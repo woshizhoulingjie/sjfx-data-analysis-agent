@@ -1991,7 +1991,7 @@ class Storage:
         scan_id = str(scan_id)
         node_path = str(node_path)
         index_rows = []
-        if payload.get("status") in {"completed", "not_required"}:
+        if payload.get("status") in {"completed", "not_required", "partial"}:
             for unit in payload.get("units") or []:
                 if not isinstance(unit, dict) or unit.get("status") not in {"completed", "not_required"}:
                     continue
