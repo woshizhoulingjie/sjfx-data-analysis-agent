@@ -139,6 +139,22 @@ class PackageExplorationTests(unittest.TestCase):
         self.assertEqual(promoted[0], "asked.txt")
         self.assertEqual(len(promoted), 3)
 
+    def test_content_map_entity_and_year_counts_are_file_memberships(self):
+        content_map = build_content_map([{
+            "path": "a.txt", "status": "previewed", "extension": ".txt",
+            "document_type": "文本", "language": {"code": "en"},
+            "entities": {
+                "people": ["Alice", "Alice"],
+                "organizations": ["Acme", "Acme"],
+            },
+            "dates": ["2024-01-01", "2024-12-31"],
+            "sample_sha256": "a", "preview_characters": 10,
+        }])
+
+        self.assertEqual(content_map["entities"]["people"][0]["file_count"], 1)
+        self.assertEqual(content_map["entities"]["organizations"][0]["file_count"], 1)
+        self.assertEqual(content_map["years"], [{"year": "2024", "file_count": 1}])
+
     def test_zip_preview_preflights_and_never_calls_infolist(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

@@ -533,22 +533,27 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
     extension_frequency = Counter(str(item.get("extension") or "[无扩展名]") for item in previews)
     topic_frequency = Counter(topic for item in previews for topic in item.get("keywords") or [])
     people_frequency = Counter(
-        person for item in previews for person in (item.get("entities") or {}).get("people", [])
+        person
+        for item in previews
+        for person in set((item.get("entities") or {}).get("people", []))
     )
     organization_frequency = Counter(
         organization
         for item in previews
-        for organization in (item.get("entities") or {}).get("organizations", [])
+        for organization in set((item.get("entities") or {}).get("organizations", []))
     )
     date_frequency = Counter(
-        date for item in previews for date in item.get("dates") or [] if date
+        date for item in previews for date in set(item.get("dates") or []) if date
     )
     year_frequency = Counter(
-        match.group(0)
+        year
         for item in previews
-        for date in item.get("dates") or []
-        for match in [re.search(r"(?:19|20)\d{2}", str(date))]
-        if match
+        for year in {
+            match.group(0)
+            for date in item.get("dates") or []
+            for match in [re.search(r"(?:19|20)\d{2}", str(date))]
+            if match
+        }
     )
     duplicate_frequency = Counter(str(item.get("sample_sha256") or "") for item in previews)
     directory_frequency = Counter(
