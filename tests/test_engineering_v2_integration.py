@@ -54,6 +54,21 @@ class _VerifiedChineseProvider(TranslationProvider):
 
 
 class DurableStorageIntegrationTests(unittest.TestCase):
+    def test_latest_artifact_is_scoped_by_scan_owner_and_kind(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            storage = Storage(root / "state.db", root / "sidecars")
+            storage.save_artifact("wrong-owner.docx", "owner-b", scan_id="scan-1", kind="overview_report")
+            storage.save_artifact("wrong-kind.zip", "owner-a", scan_id="scan-1", kind="export")
+            storage.save_artifact("older.docx", "owner-a", scan_id="scan-1", kind="overview_report")
+            storage.save_artifact("latest.docx", "owner-a", scan_id="scan-1", kind="overview_report")
+
+            artifact = storage.latest_artifact("scan-1", "owner-a", kind="overview_report")
+
+            self.assertEqual(artifact["filename"], "latest.docx")
+            self.assertEqual(artifact["kind"], "overview_report")
+            self.assertIsNone(storage.latest_artifact("scan-1", "owner-b", kind="export"))
+
     def test_real_identical_files_form_one_duplicate_candidate_group(self):
         """A content fingerprint must not include path or modification time."""
         with tempfile.TemporaryDirectory() as folder:
@@ -284,6 +299,45 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(status, 202)
         self.assertIsInstance(payload["job_id"], str)
+
+    def test_package_overview_includes_bounded_research_brief_and_owned_report(self):
+        scan_id, _scan = self._save_scan_with_files(["letter.txt"])
+        self.storage.save_summary(scan_id, ".", "report", {
+            "title": "测试研究简报",
+            "basic_information": ["信息 {}".format(index) for index in range(20)],
+            "key_findings": ["发现 {}".format(index) for index in range(20)],
+            "coverage": {"coverage_ratio": 0.75},
+            "global_categories": [{"name": "信件"}],
+            "value_judgment": {"limitations": ["限制 {}".format(index) for index in range(20)]},
+            "recommended_research_direction": {
+                "title": "审批链条研究",
+                "research_questions": ["问题 {}".format(index) for index in range(20)],
+                "methods": ["方法 {}".format(index) for index in range(20)],
+                "representative_documents": ["letter.txt"] * 30,
+                "evidence_chain": [{"source_path": "letter.txt", "text": "原文"}] * 20,
+            },
+            "direction_candidates": [{"title": "方向 {}".format(index)} for index in range(20)],
+        })
+        owner = self.app_module.Config.OWNER_ID
+        self.storage.save_artifact(
+            "overview.docx", owner, scan_id=scan_id, kind="overview_report"
+        )
+
+        with self.app_module.app.test_request_context(
+            "/api/package-overview/{}".format(scan_id)
+        ):
+            response = self.app_module.package_overview(scan_id)
+        if isinstance(response, tuple):
+            response = response[0]
+        payload = response.get_json()
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["research_brief"]["title"], "测试研究简报")
+        self.assertEqual(payload["research_brief"]["coverage"]["coverage_ratio"], 0.75)
+        self.assertEqual(len(payload["research_brief"]["basic_information"]), 12)
+        self.assertEqual(len(payload["research_brief"]["key_findings"]), 8)
+        self.assertEqual(len(payload["research_brief"]["recommended_research_direction"]["methods"]), 8)
+        self.assertEqual(payload["report_artifact"]["filename"], "overview.docx")
 
     def test_deep_backfill_continuations_do_not_skip_a_shrinking_candidate_set(self):
         scan_id, scan = self._save_scan_with_files(

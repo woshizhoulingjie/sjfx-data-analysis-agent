@@ -2340,7 +2340,31 @@ def package_overview(scan_id):
     try:
         require_scan(scan_id)
         overview = build_package_overview_from_storage(storage, scan_id, batch_size=250)
-        return jsonify({"ok": True, "overview": overview})
+        report = storage.get_summary(scan_id, ".", "report") or {}
+        direction = dict(report.get("recommended_research_direction") or {})
+        direction["research_questions"] = list(direction.get("research_questions") or [])[:8]
+        direction["methods"] = list(direction.get("methods") or [])[:8]
+        direction["representative_documents"] = list(direction.get("representative_documents") or [])[:20]
+        direction["evidence_chain"] = list(direction.get("evidence_chain") or [])[:8]
+        brief = {
+            "title": report.get("title") or "数据包研究简报",
+            "basic_information": list(report.get("basic_information") or [])[:12],
+            "key_findings": list(report.get("key_findings") or [])[:8],
+            "coverage": report.get("coverage") or {},
+            "value_judgment": report.get("value_judgment") or {},
+            "global_categories": list(report.get("global_categories") or [])[:10],
+            "recommended_research_direction": direction,
+            "direction_candidates": list(report.get("direction_candidates") or [])[:6],
+            "limitations": list((report.get("value_judgment") or {}).get("limitations") or [])[:10],
+            "available": bool(report),
+        }
+        artifact = storage.latest_artifact(
+            scan_id, _request_owner_id() or "legacy", kind="overview_report"
+        )
+        return jsonify({
+            "ok": True, "overview": overview,
+            "research_brief": brief, "report_artifact": artifact,
+        })
     except KeyError:
         return api_error("数据包不存在", 404)
     except ValueError as exc:

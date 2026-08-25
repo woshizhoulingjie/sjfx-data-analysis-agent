@@ -1415,6 +1415,19 @@ class Storage:
             ).fetchone()
         return row["owner_id"] if row else None
 
+    def latest_artifact(self, scan_id, owner_id, kind=None):
+        clauses = ["scan_id=?", "owner_id=?"]
+        values = [str(scan_id), str(owner_id)]
+        if kind:
+            clauses.append("kind=?")
+            values.append(str(kind))
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT filename,scan_id,job_id,kind FROM output_artifacts WHERE {} "
+                "ORDER BY rowid DESC LIMIT 1".format(" AND ".join(clauses)), values,
+            ).fetchone()
+        return dict(row) if row else None
+
     def create_download_ticket(self, filename, owner_id, ttl_seconds=120):
         """Issue a short-lived one-use bearer for a browser navigation download."""
         if not filename or not owner_id:

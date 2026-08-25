@@ -105,6 +105,8 @@ class IntentRoutingTests(unittest.TestCase):
         self.assertEqual(router.route("销售额合计是多少？").name, "structured")
         self.assertEqual(router.route("概括这个目录主要讲了什么").name, "summary")
         self.assertEqual(router.route("Alice 在什么时候批准计划？").name, "retrieval")
+        self.assertEqual(router.route("你好").name, "casual")
+        self.assertEqual(router.route("有哪些值得研究的方向？").name, "analysis")
 
     def test_short_follow_up_inherits_previous_intent(self):
         decision = IntentRouter().route("后来呢？", previous_intent="relationship", is_follow_up=True)
@@ -174,6 +176,53 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(result["citations"], [])
         self.assertIn("不能可靠作答", result["answer"])
         self.assertEqual(model.calls, [])
+
+    def test_casual_chat_uses_model_without_retrieval_or_citations(self):
+        retrieval_calls = []
+        model = FakeModel("你好，我可以帮你梳理资料或讨论研究思路。")
+        engine = self.make_engine(
+            lambda request: retrieval_calls.append(request) or {"results": [evidence()]},
+            model=model,
+        )
+        session = engine.new_session("scan-1")
+
+        result = engine.ask(session, "你好")
+
+        self.assertEqual(result["intent"]["name"], "casual")
+        self.assertEqual(result["evidence_status"], "not_required")
+        self.assertEqual(result["citations"], [])
+        self.assertEqual(retrieval_calls, [])
+        self.assertEqual(len(model.calls), 1)
+        self.assertIn("不得声称数据包", model.calls[0]["system"])
+
+    def test_analysis_without_evidence_returns_labelled_advice(self):
+        model = FakeModel(
+            "直接回答\n可以先建立时间与人物矩阵。\n\n"
+            "进一步分析或建议\n把每个假设设定反证条件。"
+        )
+        engine = self.make_engine({"results": []}, model=model)
+        session = engine.new_session("scan-1")
+
+        result = engine.ask(session, "有哪些值得研究的方向？")
+
+        self.assertEqual(result["intent"]["name"], "analysis")
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual(result["evidence_status"], "insufficient")
+        self.assertEqual(result["citations"], [])
+        self.assertIn("资料依据", result["answer"])
+        self.assertIn("没有找到可直接支撑", result["answer"])
+
+    def test_analysis_with_evidence_keeps_citations_and_marks_reasoning(self):
+        model = FakeModel("资料直接说明计划已获批 [1]。\n\n进一步分析或建议\n可比较批准前后的版本。")
+        engine = self.make_engine({"results": [evidence()]}, model=model)
+        session = engine.new_session("scan-1")
+
+        result = engine.ask(session, "这可能意味着什么，有什么研究方向？")
+
+        self.assertEqual(result["intent"]["name"], "analysis")
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual(len(result["citations"]), 1)
+        self.assertIn("进一步分析", result["answer"])
 
     def test_answer_exposes_original_translation_and_precise_location(self):
         item = evidence(

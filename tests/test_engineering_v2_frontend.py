@@ -17,8 +17,8 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
     def test_page_ids_remain_unique_and_v2_assets_are_local(self):
         ids = re.findall(r'\bid="([^"]+)"', self.html)
         self.assertEqual(len(ids), len(set(ids)), "HTML element ids must remain unique")
-        self.assertIn('/static/engineering-v2.css?v=1', self.html)
-        self.assertIn('/static/engineering-v2.js?v=1', self.html)
+        self.assertIn('/static/engineering-v2.css?v=2', self.html)
+        self.assertIn('/static/engineering-v2.js?v=2', self.html)
         self.assertNotRegex(self.script, r'https?://|\bcdn\b')
         self.assertNotRegex(self.style, r'@import|https?://')
 
@@ -39,12 +39,21 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
             self.assertNotIn('id="{}"'.format(system_widget), overview_html)
         self.assertIn('/api/package-overview/', self.script)
         for intrinsic_mount in (
+            'packageOverviewTreemap', 'packageOverviewSummary',
             'packageOverviewDirectories', 'packageOverviewFormats', 'packageOverviewTypes',
             'packageOverviewLanguages', 'packageOverviewTimeline', 'packageOverviewTopics',
             'packageOverviewEntities', 'packageOverviewRelationships',
             'packageOverviewDuplicates', 'packageOverviewOutliers',
         ):
             self.assertIn('id="{}"'.format(intrinsic_mount), overview_html)
+        for brief_mount in (
+            'packageOverviewBriefSummary', 'packageOverviewFindings',
+            'packageOverviewDirection', 'packageOverviewResearchDetails',
+            'packageOverviewReportBtn', 'packageOverviewScopeFiles',
+        ):
+            self.assertIn('id="{}"'.format(brief_mount), overview_html)
+        self.assertIn('response.research_brief', self.script)
+        self.assertIn('renderResearchBrief', self.script)
 
     def test_overview_dimensions_drill_into_conversation_scope(self):
         self.assertIn("data-overview-scope-kind", self.script)
@@ -55,6 +64,8 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
             self.assertIn("kind: '{}'".format(kind), self.script)
         self.assertIn('<option value="file_type">文件类型</option>', self.html)
         self.assertIn("scopeConstraints", self.script)
+        self.assertIn("renderSelectedScope", self.script)
+        self.assertIn("carryScopeToConversation", self.script)
 
     def test_conversation_client_keeps_scope_follow_up_citation_and_promotion_contracts(self):
         self.assertIn("'/api/conversations'", self.script)
@@ -67,6 +78,11 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('watchPromotion', self.script)
         self.assertIn('promotion_job_id', self.script)
         self.assertIn('系统已自动重新检索并续写回答', self.script)
+        self.assertIn('conversationContextChip', self.script)
+        self.assertIn('safeMarkdown', self.script)
+        self.assertIn('escapeHtml(value)', self.script)
+        self.assertIn('data-copy-message', self.script)
+        self.assertIn('data-regenerate-message', self.script)
         for kind in ('package', 'topic', 'directory', 'entity', 'time', 'file_type', 'files'):
             self.assertIn('<option value="{}">'.format(kind), self.html)
 
@@ -88,7 +104,8 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('<svg class="v2-donut"', self.script)
         self.assertIn('<svg class="v2-timeline-svg"', self.script)
         self.assertIn('<svg class="v2-relationship-svg"', self.script)
-        self.assertIn('@media(max-width:760px)', self.style)
+        self.assertIn('class="v2-treemap-node', self.script)
+        self.assertIn('@media(max-width:780px)', self.style)
         self.assertIn('@media(prefers-reduced-motion:reduce)', self.style)
         self.assertIn(':focus-visible', self.style)
         self.assertIn('aria-live="polite"', self.html)

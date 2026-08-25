@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#102d27">
   <title>SJFX · 数据分析工作台</title>
   <link rel="stylesheet" href="/static/style.css?v=20">
-  <link rel="stylesheet" href="/static/engineering-v2.css?v=1">
+  <link rel="stylesheet" href="/static/engineering-v2.css?v=2">
 </head>
 <body>
   <div class="app-shell">
@@ -48,41 +48,37 @@
         <section class="app-view evidence-view" data-view="evidence"><div class="page-heading compact"><div><div class="eyebrow">EVIDENCE / QUESTIONS</div><h1>证据与问答</h1><p>提出一个有价值的问题，检索能够直接解释它的正文证据。</p></div></div><div class="evidence-layout"><article class="surface question-card"><div class="surface-heading"><div><span class="section-kicker">LOCAL RETRIEVAL</span><h2>从资料中提问</h2></div><span class="round-icon">⌕</span></div><label for="retrievalQuery">问题</label><div class="input-row"><input id="retrievalQuery" placeholder="例如：哪些资料支持该研究方向？" autocomplete="off"><button id="retrievalBtn" disabled class="primary">检索证据</button></div><small class="help-text">使用本地 BM25 与 TF-IDF 字符向量，检索过程不调用生成模型。</small><div class="question-divider"></div><label for="numericQuestion">结构化数据统计</label><div class="input-row"><input id="numericQuestion" placeholder="例如：销售额的总和是多少？" autocomplete="off"><button id="numericQuestionBtn" disabled>计算</button></div><small class="help-text">对 CSV/XLSX/JSON 画像跨同构文件计算合计、平均、最大、最小和记录数；覆盖完整时为精确结果，采样画像会明确标注部分覆盖并返回参与文件与行范围。</small></article><article class="surface evidence-result-card"><div class="surface-heading"><div><span class="section-kicker">TRACEABLE ANSWER</span><h2>问题—回答—证据</h2></div><button class="text-button" data-go-route="analysis">回到智能目录 →</button></div><div id="evidenceSummary" class="evidence-summary-note">检索结果和当前节点的证据链会在这里显示。每条证据都应能回到原始文件的位置。</div><div id="evidenceResultMount"></div></article></div></section>
 
         <section class="app-view overview-view" data-view="overview">
-          <div class="page-heading compact"><div><div class="eyebrow">PACKAGE / CONTENT MAP</div><h1>数据包概览</h1><p>只呈现数据包自身的规模、构成、时间、主题、实体与文件联系，不混入任务进度或模型运行信息。</p></div><button class="secondary" id="packageOverviewRefreshBtn" disabled>刷新数据概览</button></div>
+          <div class="page-heading compact"><div><div class="eyebrow">PACKAGE INTELLIGENCE</div><h1>数据包全景</h1><p>从规模、目录、时间、主题和关键实体理解这批资料，再进入文件和研究方向。</p></div><div class="button-row"><button class="secondary" id="packageOverviewRefreshBtn" disabled>刷新</button><button class="primary" id="packageOverviewAskAllBtn" disabled>围绕整个包对话</button></div></div>
           <div id="packageOverviewState" class="v2-inline-state" role="status" aria-live="polite">导入数据包后生成内容概览。</div>
-          <div id="packageOverviewMetrics" class="v2-overview-metrics" aria-label="数据包规模"></div>
-          <div class="v2-overview-grid">
-            <article class="surface v2-chart-card v2-wide"><div class="surface-heading"><div><span class="section-kicker">DIRECTORIES</span><h2>目录规模</h2></div></div><div id="packageOverviewDirectories" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">FORMATS</span><h2>文件格式</h2></div></div><div id="packageOverviewFormats" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">DOCUMENT TYPES</span><h2>文档类型</h2></div></div><div id="packageOverviewTypes" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">LANGUAGES</span><h2>语言分布</h2></div></div><div id="packageOverviewLanguages" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card v2-wide"><div class="surface-heading"><div><span class="section-kicker">TIMELINE</span><h2>资料时间分布</h2></div></div><div id="packageOverviewTimeline" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">TOPICS</span><h2>主要主题</h2></div></div><div id="packageOverviewTopics" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">ENTITIES</span><h2>人物与机构</h2></div></div><div id="packageOverviewEntities" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card v2-wide"><div class="surface-heading"><div><span class="section-kicker">RELATIONSHIPS</span><h2>文件关系</h2></div></div><div id="packageOverviewRelationships" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">DUPLICATES</span><h2>重复文件</h2></div></div><div id="packageOverviewDuplicates" class="v2-chart-mount"></div></article>
-            <article class="surface v2-chart-card"><div class="surface-heading"><div><span class="section-kicker">OUTLIERS</span><h2>异常与孤立文件</h2></div></div><div id="packageOverviewOutliers" class="v2-chart-mount"></div></article>
+          <section class="v2-overview-hero" aria-label="数据包核心指标"><div id="packageOverviewMetrics" class="v2-overview-metrics"></div><div id="packageOverviewSummary" class="v2-overview-summary"></div></section>
+          <div class="v2-overview-main-grid">
+            <article class="v2-visual-panel v2-treemap-panel"><div class="v2-panel-title"><div><span>DIRECTORY MAP</span><h2>资料分布在哪里</h2></div><small>面积代表文件体积，标签显示文件数量</small></div><div id="packageOverviewTreemap" class="v2-treemap" role="img" aria-label="目录矩形树图"></div><div id="packageOverviewDirectories" class="v2-compact-rank"></div></article>
+            <article class="v2-visual-panel"><div class="v2-panel-title"><div><span>TOPICS</span><h2>主要内容板块</h2></div><small>点击主题查看对应文件</small></div><div id="packageOverviewTopics" class="v2-chart-mount"></div></article>
           </div>
+          <section class="v2-visual-band"><div class="v2-panel-title"><div><span>TIMELINE</span><h2>资料时间脉络</h2></div><small>同时展示文件时间与正文识别日期</small></div><div id="packageOverviewTimeline" class="v2-chart-mount"></div></section>
+          <div class="v2-composition-grid">
+            <section><div class="v2-panel-title"><div><span>FORMATS</span><h2>文件格式</h2></div></div><div id="packageOverviewFormats" class="v2-chart-mount"></div></section>
+            <section><div class="v2-panel-title"><div><span>TYPES</span><h2>文档类型</h2></div></div><div id="packageOverviewTypes" class="v2-chart-mount"></div></section>
+            <section><div class="v2-panel-title"><div><span>LANGUAGES</span><h2>语言构成</h2></div></div><div id="packageOverviewLanguages" class="v2-chart-mount"></div></section>
+          </div>
+          <div class="v2-overview-main-grid v2-entity-row">
+            <article class="v2-visual-panel"><div class="v2-panel-title"><div><span>PEOPLE / ORGANISATIONS</span><h2>关键人物与机构</h2></div><small>点击实体进入资料范围</small></div><div id="packageOverviewEntities" class="v2-chart-mount"></div></article>
+            <article class="v2-visual-panel"><div class="v2-panel-title"><div><span>FILE RELATIONS</span><h2>文件关系网络</h2></div></div><div id="packageOverviewRelationships" class="v2-chart-mount"></div></article>
+          </div>
+          <section id="packageOverviewScopeDock" class="v2-scope-dock"><div><span class="section-kicker">SELECTED SCOPE</span><h2 id="packageOverviewScopeTitle">点击图表查看对应资料</h2><p id="packageOverviewScopeNote">主题、人物、机构、时间、格式和目录都可以成为独立问答范围。</p></div><button class="primary" id="packageOverviewAskBtn" disabled>带入对话</button><div id="packageOverviewScopeFiles" class="v2-scope-files"></div></section>
+          <section class="v2-research-brief"><div class="v2-brief-heading"><div><span class="section-kicker">RESEARCH BRIEF</span><h2 id="packageOverviewBriefTitle">数据包研究简报</h2><p>保留旧版情况概览中的关键发现、研究价值和推荐方向。</p></div><button class="secondary" id="packageOverviewReportBtn" disabled>下载概览 Word</button></div><div class="v2-brief-grid"><article><h3>总体内容与关键发现</h3><div id="packageOverviewBriefSummary"></div><div id="packageOverviewFindings"></div></article><article class="v2-direction-panel"><span class="v2-direction-label">RECOMMENDED DIRECTION</span><div id="packageOverviewDirection"></div></article></div><div id="packageOverviewResearchDetails" class="v2-research-details"></div></section>
+          <div class="v2-quality-grid"><section><div class="v2-panel-title"><div><span>DUPLICATES</span><h2>重复与版本候选</h2></div></div><div id="packageOverviewDuplicates"></div></section><section><div class="v2-panel-title"><div><span>QUALITY SIGNALS</span><h2>异常、孤立与限制</h2></div></div><div id="packageOverviewOutliers"></div></section></div>
         </section>
 
         <section class="app-view v2-chat-view" data-view="chat">
-          <div class="page-heading compact"><div><div class="eyebrow">CONVERSATION / EVIDENCE</div><h1>与资料持续对话</h1><p>围绕整个数据包或指定范围提问、追问；回答保留原文引用，证据不足时自动提交补充深析。</p></div><button class="primary" id="conversationNewBtn" disabled>＋ 新建会话</button></div>
+          <div class="page-heading compact"><div><div class="eyebrow">ASK / THINK / VERIFY</div><h1>与资料对话</h1><p>自然交流、讨论分析思路，或让回答回到原始文件。资料事实优先引用，但聊天不被证据门槛锁住。</p></div><button class="primary" id="conversationNewBtn" disabled>＋ 新对话</button></div>
           <div class="v2-chat-layout">
-            <aside class="surface v2-chat-sidebar">
-              <span class="section-kicker">QUESTION SCOPE</span><h2>问答范围</h2>
-              <label for="conversationScopeKind">范围类型</label>
-              <select id="conversationScopeKind"><option value="package">整个数据包</option><option value="topic">主题</option><option value="directory">目录</option><option value="entity">人物或机构</option><option value="time">时间范围</option><option value="file_type">文件类型</option><option value="files">指定文件</option></select>
-              <div id="conversationScopeFields"></div>
-              <label class="v2-check"><input id="conversationPersistScope" type="checkbox" checked><span>后续追问沿用此范围</span></label>
-              <div class="v2-divider"></div>
-              <div class="v2-list-heading"><span>历史会话</span><button class="text-button" id="conversationListRefreshBtn">刷新</button></div>
-              <div id="conversationList" class="v2-session-list" aria-label="历史会话"></div>
-            </aside>
-            <article class="surface v2-chat-main">
-              <div class="v2-chat-header"><div><span class="section-kicker">TRACEABLE CHAT</span><h2 id="conversationTitle">尚未开始会话</h2><small id="conversationScopeSummary">请选择范围并新建会话</small></div><div id="conversationDeepeningState" class="v2-job-state" role="status" aria-live="polite"></div></div>
+            <aside class="v2-chat-sidebar"><div class="v2-list-heading"><span>历史对话</span><button class="text-button" id="conversationListRefreshBtn">刷新</button></div><div id="conversationList" class="v2-session-list" aria-label="历史会话"></div></aside>
+            <article class="v2-chat-main">
+              <div class="v2-chat-header"><div><span class="section-kicker">LOCAL ASSISTANT</span><h2 id="conversationTitle">开始一个新对话</h2><small id="conversationScopeSummary">当前上下文：整个数据包</small></div><div id="conversationDeepeningState" class="v2-job-state" role="status" aria-live="polite"></div></div>
               <div id="conversationMessages" class="v2-message-list" aria-live="polite"><div class="v2-empty"><strong>从资料中提出第一个问题</strong><span>例如：这批资料主要讲了什么？哪些文件相互关联？</span></div></div>
-              <div id="conversationSuggestions" class="v2-suggestions" aria-label="问题建议"><button type="button">这批资料主要讲了什么？</button><button type="button">哪些人物和机构最重要？</button><button type="button">资料中有哪些关键时间节点？</button></div>
-              <form id="conversationForm" class="v2-composer"><label class="sr-only" for="conversationQuestion">输入问题</label><textarea id="conversationQuestion" rows="3" maxlength="8000" placeholder="输入问题，Enter 发送，Shift + Enter 换行" disabled></textarea><div><small id="conversationComposerHint">新建会话后即可提问</small><button class="primary" id="conversationSendBtn" type="submit" disabled>发送问题</button></div></form>
+              <div id="conversationSuggestions" class="v2-suggestions" aria-label="问题建议"><button type="button">概括这批资料</button><button type="button">有哪些值得研究的方向？</button><button type="button">帮我设计下一步分析思路</button></div>
+              <form id="conversationForm" class="v2-composer"><div class="v2-context-row"><span id="conversationContextChip" class="v2-context-chip">整个数据包</span><details class="v2-context-picker"><summary>更改范围</summary><div class="v2-context-popover"><label for="conversationScopeKind">范围类型</label><select id="conversationScopeKind"><option value="package">整个数据包</option><option value="topic">主题</option><option value="directory">目录</option><option value="entity">人物或机构</option><option value="time">时间范围</option><option value="file_type">文件类型</option><option value="files">指定文件</option></select><div id="conversationScopeFields"></div><label class="v2-check"><input id="conversationPersistScope" type="checkbox" checked><span>后续追问沿用</span></label></div></details></div><label class="sr-only" for="conversationQuestion">输入问题</label><textarea id="conversationQuestion" rows="3" maxlength="8000" placeholder="问资料内容，也可以讨论方法、思路或普通聊天" disabled></textarea><div><small id="conversationComposerHint">新建对话后即可开始</small><button class="primary" id="conversationSendBtn" type="submit" disabled>发送</button></div></form>
             </article>
           </div>
         </section>
@@ -118,6 +114,6 @@
   <div id="toast" class="toast" aria-live="polite"></div>
   <script src="/static/product-shell.js?v=3"></script>
   <script src="/static/app.js?v=19"></script>
-  <script src="/static/engineering-v2.js?v=1"></script>
+  <script src="/static/engineering-v2.js?v=2"></script>
 </body>
 </html>

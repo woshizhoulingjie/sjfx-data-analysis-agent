@@ -10,7 +10,7 @@
   const CURRENT_SCAN_KEY = 'sjfx_current_scan_id_v1';
   const LAST_DOCUMENT_KEY = 'sjfx_last_document_path_v2';
   const PAGE_SIZE = 6000;
-  const COLORS = ['#267657', '#d39247', '#397ab5', '#75a988', '#9b6eac', '#c05f55', '#637f72', '#c2a13e'];
+  const COLORS = ['#4169a1', '#d68a3a', '#508c78', '#a45f67', '#7667a8', '#b4a13d', '#5b7e94', '#8a7162'];
   const $ = (id) => document.getElementById(id);
   const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
   const escapeHtml = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (char) => ({
@@ -26,7 +26,8 @@
   };
 
   const state = {
-    scanId: '', overview: null, overviewLoading: false,
+    scanId: '', overview: null, researchBrief: null, reportArtifact: null,
+    selectedScope: null, overviewLoading: false,
     conversation: null, conversationList: [], turns: new Map(), conversationSending: false,
     translationItems: [], translationCounts: {}, translationPath: '', translationView: 'translated',
     translationOffset: 0, translationPage: null, translationLoading: false,
@@ -101,6 +102,76 @@
 
   function emptyMarkup(title, detail) {
     return `<div class="v2-empty"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail || '')}</span></div>`;
+  }
+
+  function listOf(value) {
+    if (Array.isArray(value)) return value.filter((item) => item != null);
+    return value == null || value === '' ? [] : [value];
+  }
+
+  function textOf(value) {
+    if (value == null) return '';
+    if (typeof value === 'string' || typeof value === 'number') return String(value);
+    return String(value.statement || value.summary || value.description || value.name || value.title || value.text || '');
+  }
+
+  function inlineMarkdown(value) {
+    return escapeHtml(value)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\[([0-9]+)\]/g, '<span class="v2-cite-ref">[$1]</span>');
+  }
+
+  function safeMarkdown(value) {
+    const lines = String(value || '').replace(/\r\n?/g, '\n').split('\n');
+    const output = [];
+    let list = '', code = false, codeLines = [];
+    const closeList = () => { if (list) { output.push(`</${list}>`); list = ''; } };
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (/^```/.test(line)) {
+        closeList();
+        if (code) { output.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`); codeLines = []; }
+        code = !code;
+        continue;
+      }
+      if (code) { codeLines.push(line); continue; }
+      const cells = line.split('|').map((cell) => cell.trim());
+      const next = lines[index + 1] || '';
+      if (line.includes('|') && /^\s*\|?\s*:?-{3,}/.test(next)) {
+        closeList();
+        const headers = cells.filter((cell, cellIndex) => cell || (cellIndex > 0 && cellIndex < cells.length - 1));
+        const rows = [];
+        index += 2;
+        while (index < lines.length && lines[index].includes('|')) {
+          rows.push(lines[index].split('|').map((cell) => cell.trim()).filter((cell, cellIndex, all) => cell || (cellIndex > 0 && cellIndex < all.length - 1)));
+          index += 1;
+        }
+        index -= 1;
+        output.push(`<div class="v2-md-table-wrap"><table><thead><tr>${headers.map((cell) => `<th>${inlineMarkdown(cell)}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${headers.map((_, cellIndex) => `<td>${inlineMarkdown(row[cellIndex] || '')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+        continue;
+      }
+      const heading = line.match(/^(#{1,3})\s+(.+)$/);
+      if (heading) { closeList(); output.push(`<h${heading[1].length + 2}>${inlineMarkdown(heading[2])}</h${heading[1].length + 2}>`); continue; }
+      const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+      const numbered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+      if (bullet || numbered) {
+        const wanted = bullet ? 'ul' : 'ol';
+        if (list !== wanted) { closeList(); list = wanted; output.push(`<${list}>`); }
+        output.push(`<li>${inlineMarkdown((bullet || numbered)[1])}</li>`);
+        continue;
+      }
+      closeList();
+      if (!line.trim()) { output.push(''); continue; }
+      if (/^(直接回答|资料依据|进一步分析或建议|初步分析|建议)\s*[：:]?$/.test(line.trim())) {
+        output.push(`<h3 class="v2-answer-section">${escapeHtml(line.trim().replace(/[：:]$/, ''))}</h3>`);
+      } else {
+        output.push(`<p>${inlineMarkdown(line)}</p>`);
+      }
+    }
+    closeList();
+    if (codeLines.length) output.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+    return output.join('');
   }
 
   function scopeAttributes(scope) {
@@ -250,16 +321,117 @@
     host.innerHTML = facts.length ? `<div class="v2-fact-list">${facts.join('')}</div>${disclosure(anomalous, '异常文件')}${disclosure(isolated, '孤立文件')}` : emptyMarkup('未发现异常或孤立文件', '当前数据包没有可展示的异常信号。');
   }
 
+  function directoryWeight(item) {
+    return Math.max(1, numeric(item.total_bytes) || numeric(item.recursive_file_count));
+  }
+
+  function renderTreemap(overview) {
+    const host = $('packageOverviewTreemap');
+    if (!host) return;
+    const directories = itemsOf(overview.directories)
+      .filter((item) => item.path && item.path !== '.')
+      .slice(0, 12);
+    if (!directories.length) {
+      host.innerHTML = emptyMarkup('当前数据包没有子目录', '文件直接位于数据包根目录。');
+      return;
+    }
+    const total = directories.reduce((sum, item) => sum + directoryWeight(item), 0);
+    const palette = ['blue', 'amber', 'teal', 'rose', 'violet', 'steel'];
+    host.innerHTML = directories.map((item, index) => {
+      const share = directoryWeight(item) / Math.max(1, total);
+      const basis = Math.max(16, share * 100);
+      const scope = { kind: 'directory', value: item.path, label: `目录 · ${item.path}`, source_paths: item.representative_files || [] };
+      return `<button type="button" class="v2-treemap-node is-${palette[index % palette.length]}" style="flex-grow:${directoryWeight(item)};flex-basis:${basis.toFixed(2)}%"${scopeAttributes(scope)} title="${escapeHtml(item.path)} · ${formatBytes(item.total_bytes)} · ${integer(item.recursive_file_count)} 个文件"><strong>${escapeHtml(item.path)}</strong><span>${formatBytes(item.total_bytes)}</span><small>${integer(item.recursive_file_count)} 个文件</small></button>`;
+    }).join('');
+  }
+
+  function overviewTimeSpan(overview) {
+    const periods = itemsOf(overview.timeline && overview.timeline.document_dates)
+      .concat(itemsOf(overview.timeline && overview.timeline.file_modified))
+      .map((item) => String(item.period || '')).filter(Boolean).sort();
+    return periods.length ? (periods[0] === periods[periods.length - 1] ? periods[0] : `${periods[0]}–${periods[periods.length - 1]}`) : '待识别';
+  }
+
+  function parseCoverage(brief) {
+    const value = brief && brief.value_judgment || {};
+    const coverage = brief && brief.coverage || value.coverage || value.analysis_coverage || {};
+    const raw = coverage.content_parse_ratio == null ? (coverage.coverage_ratio == null ? coverage.parsed_file_ratio : coverage.coverage_ratio) : coverage.content_parse_ratio;
+    if (raw == null) return '待评估';
+    const ratio = Number(raw);
+    return Number.isFinite(ratio) ? `${Math.round((ratio <= 1 ? ratio * 100 : ratio))}%` : String(raw);
+  }
+
+  function briefList(items, emptyText) {
+    const values = listOf(items).map(textOf).filter(Boolean);
+    return values.length ? `<ul>${values.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : `<p class="muted">${escapeHtml(emptyText || '暂无')}</p>`;
+  }
+
+  function evidenceBrief(item) {
+    const source = item.source_path || item.path || '未知来源';
+    const location = [item.page ? `第 ${item.page} 页` : '', item.section || item.heading || '', item.archive_member || ''].filter(Boolean).join(' · ');
+    return `<details class="v2-brief-evidence"><summary>${escapeHtml(source)}${location ? ` · ${escapeHtml(location)}` : ''}</summary><p>${escapeHtml(item.text || item.original_text || item.snippet || '该条证据暂无可展示原文。')}</p></details>`;
+  }
+
+  function renderResearchBrief(brief, artifact) {
+    brief = brief || {};
+    const direction = brief.recommended_research_direction || {};
+    $('packageOverviewBriefTitle').textContent = brief.title || '数据包研究简报';
+    $('packageOverviewBriefSummary').innerHTML = brief.available
+      ? briefList(brief.basic_information, '暂无总体信息')
+      : emptyMarkup('研究简报尚未生成', '完成数据包分析后，这里会形成可阅读和下载的情况概览。');
+    $('packageOverviewFindings').innerHTML = `<h4>关键发现</h4>${briefList(brief.key_findings, '当前没有形成稳定发现')}`;
+    $('packageOverviewDirection').innerHTML = direction.title
+      ? `<h3>${escapeHtml(direction.title)}</h3><div class="v2-direction-meta"><span>优先级 ${escapeHtml(direction.priority || '待评估')}</span><span>置信度 ${escapeHtml(direction.confidence || '待评估')}</span></div><p>${escapeHtml(direction.rationale || '该方向仍需结合代表性资料继续验证。')}</p>`
+      : `<p class="muted">当前尚未形成首选研究方向。</p>`;
+    const representative = listOf(direction.representative_documents).map(textOf).filter(Boolean);
+    const evidence = listOf(direction.evidence_chain).filter((item) => item && typeof item === 'object');
+    const candidates = listOf(brief.direction_candidates).filter((item) => item && typeof item === 'object');
+    const categories = listOf(brief.global_categories).filter((item) => item != null);
+    $('packageOverviewResearchDetails').innerHTML = `
+      <section><h3>可继续追问</h3>${briefList(direction.research_questions || direction.questions, '暂无建议问题')}</section>
+      <section><h3>建议研究方法</h3>${briefList(direction.methods, '暂无建议方法')}</section>
+      <section><h3>代表文件</h3>${representative.length ? `<div class="v2-brief-files">${representative.map((path) => `<button type="button" data-brief-file="${escapeHtml(path)}"><strong>${escapeHtml(basename(path))}</strong><small>${escapeHtml(path)}</small></button>`).join('')}</div>` : '<p class="muted">暂无代表文件</p>'}</section>
+      <section><h3>支撑原文</h3>${evidence.length ? evidence.map(evidenceBrief).join('') : '<p class="muted">当前方向尚无可展开的原文片段。</p>'}</section>
+      <section><h3>主要内容分类</h3>${categories.length ? `<div class="v2-category-list">${categories.map((item) => `<span>${escapeHtml(textOf(item))}</span>`).join('')}</div>` : '<p class="muted">暂无分类</p>'}</section>
+      <section><h3>其他候选方向</h3>${candidates.length ? `<ol class="v2-candidate-list">${candidates.map((item) => `<li><strong>${escapeHtml(item.title || textOf(item))}</strong><span>${escapeHtml(item.rationale || item.description || '')}</span></li>`).join('')}</ol>` : '<p class="muted">暂无其他候选方向</p>'}</section>
+      <section class="v2-limitations"><h3>当前限制与待补析</h3>${briefList(brief.limitations, '当前未记录额外限制')}</section>`;
+    const reportButton = $('packageOverviewReportBtn');
+    reportButton.disabled = !(artifact && artifact.filename);
+    reportButton.dataset.filename = artifact && artifact.filename || '';
+  }
+
+  function renderSelectedScope() {
+    const selected = state.selectedScope;
+    const button = $('packageOverviewAskBtn');
+    if (!selected) {
+      $('packageOverviewScopeTitle').textContent = '点击图表查看对应资料';
+      $('packageOverviewScopeNote').textContent = '主题、人物、机构、时间、格式和目录都可以成为独立问答范围。';
+      $('packageOverviewScopeFiles').innerHTML = '';
+      button.disabled = true;
+      return;
+    }
+    const paths = selected.source_paths || [];
+    $('packageOverviewScopeTitle').textContent = selected.label || selected.value;
+    $('packageOverviewScopeNote').textContent = paths.length ? `已定位 ${paths.length} 个代表文件，可直接带入对话继续检索。` : '已选定资料范围；对话时将按该维度继续检索。';
+    $('packageOverviewScopeFiles').innerHTML = paths.length ? paths.map((path) => `<button type="button" data-brief-file="${escapeHtml(path)}"><strong>${escapeHtml(basename(path))}</strong><small>${escapeHtml(path)}</small></button>`).join('') : '<span class="muted">该聚合项暂未返回代表文件，仍可按范围检索。</span>';
+    button.disabled = false;
+  }
+
   function renderOverview(overview) {
     const pkg = overview.package || {};
+    const languages = itemsOf(overview.languages);
+    const mainLanguage = languages.length ? (languages[0].label || languages[0].language || '待识别') : '待识别';
     const metrics = [
       ['文件总数', integer(pkg.file_count), '数据包中的物理文件'],
       ['数据规模', formatBytes(pkg.total_bytes), '全部文件总体积'],
-      ['目录数量', integer(pkg.directory_count), `最大深度 ${integer(pkg.max_depth)}`],
-      ['文件关系', integer(overview.file_relationships && overview.file_relationships.relationship_count), '内容或结构联系']
+      ['时间跨度', overviewTimeSpan(overview), '正文日期与文件时间'],
+      ['主要语言', mainLanguage, `${integer(languages[0] && languages[0].file_count)} 个已识别文件`],
+      ['解析覆盖', parseCoverage(state.researchBrief), '可检索正文覆盖情况']
     ];
     $('packageOverviewMetrics').innerHTML = metrics.map((metric) => `<div class="v2-overview-metric"><span>${escapeHtml(metric[0])}</span><strong>${escapeHtml(metric[1])}</strong><small>${escapeHtml(metric[2])}</small></div>`).join('');
-    renderBars('packageOverviewDirectories', overview.directories, (item) => item.path === '.' ? '数据包根目录' : item.path, 'recursive_file_count', (value, item) => `${integer(value)} 文件 · ${formatBytes(item.total_bytes)}`, (item, label) => item.path === '.' ? null : ({ kind: 'directory', value: item.path, label }));
+    $('packageOverviewSummary').innerHTML = `<span>PACKAGE PROFILE</span><strong>${escapeHtml(pkg.root || '当前数据包')}</strong><p>${integer(pkg.directory_count)} 个目录，最深 ${integer(pkg.max_depth)} 层；已识别 ${integer(overview.file_relationships && overview.file_relationships.relationship_count)} 条内容或结构联系。</p>`;
+    renderTreemap(overview);
+    renderBars('packageOverviewDirectories', overview.directories, (item) => item.path === '.' ? '数据包根目录' : item.path, 'recursive_file_count', (value, item) => `${integer(value)} 文件 · ${formatBytes(item.total_bytes)}`, (item, label) => item.path === '.' ? null : ({ kind: 'directory', value: item.path, label, source_paths: item.representative_files || [] }));
     renderDonut('packageOverviewFormats', overview.formats, 'format', 'file_count', (item, label) => ({ kind: 'file_type', value: item.format, label: `格式 · ${label}`, dimension: 'format', source_paths: item.representative_files || [] }));
     renderDonut('packageOverviewTypes', overview.document_types, 'document_type', 'file_count', (item, label) => ({ kind: 'file_type', value: item.document_type, label: `文档类型 · ${label}`, dimension: 'document_type', source_paths: item.representative_files || [] }));
     renderBars('packageOverviewLanguages', overview.languages, (item) => item.label || item.language, 'file_count', null, (item, label) => ({ kind: 'file_type', value: item.label || item.language, label: `语言 · ${label}`, dimension: 'language', source_paths: item.representative_files || [] }));
@@ -269,6 +441,8 @@
     renderRelationships(overview);
     renderDuplicates(overview);
     renderOutliers(overview);
+    renderResearchBrief(state.researchBrief, state.reportArtifact);
+    renderSelectedScope();
     setOverviewState(`正在查看 ${pkg.root || '当前数据包'} 的内容地图。`, 'ready');
   }
 
@@ -280,6 +454,8 @@
     try {
       const response = await api(`/api/package-overview/${encodeURIComponent(state.scanId)}`);
       state.overview = response.overview || {};
+      state.researchBrief = response.research_brief || {};
+      state.reportArtifact = response.report_artifact || null;
       renderOverview(state.overview);
     } catch (error) {
       setOverviewState(error.message || '无法加载数据包概览', 'error');
@@ -309,6 +485,17 @@
       const examples = { topic: '例如：项目交付', directory: '例如：letters/2024', entity: '例如：某某机构', file_type: '例如：.pdf 或 报告' };
       host.innerHTML = `<label for="conversationScopeValue">${escapeHtml(labels[kind])}</label><input id="conversationScopeValue" placeholder="${escapeHtml(examples[kind])}">`;
     }
+    updateContextChip();
+  }
+
+  function updateContextChip(scope) {
+    const chip = $('conversationContextChip');
+    if (!chip) return;
+    if (!scope) {
+      try { scope = conversationScope(); } catch (_error) { scope = { kind: $('conversationScopeKind').value || 'package' }; }
+    }
+    chip.textContent = scopeSummary(scope).replace(/^范围：/, '');
+    chip.title = scopeSummary(scope);
   }
 
   function conversationScope() {
@@ -340,24 +527,74 @@
     const kind = element.dataset.overviewScopeKind;
     const rawValue = element.dataset.overviewScopeValue || '';
     if (!kind || !rawValue) return;
-    state.scopeConstraints = element.dataset.overviewScopeDimension ? { dimension: element.dataset.overviewScopeDimension } : {};
-    state.scopeConstraints.overview_drilldown = true;
+    const constraints = element.dataset.overviewScopeDimension ? { dimension: element.dataset.overviewScopeDimension } : {};
+    constraints.overview_drilldown = true;
+    let sourcePaths = [];
     try {
-      state.scopeConstraints.source_paths = JSON.parse(element.dataset.overviewScopePaths || '[]');
+      sourcePaths = JSON.parse(element.dataset.overviewScopePaths || '[]');
     } catch (_error) {
-      state.scopeConstraints.source_paths = [];
+      sourcePaths = [];
     }
-    $('conversationScopeKind').value = kind;
+    state.selectedScope = {
+      kind, value: rawValue, label: element.dataset.overviewScopeLabel || rawValue,
+      dimension: element.dataset.overviewScopeDimension || '', source_paths: sourcePaths,
+      constraints
+    };
+    renderSelectedScope();
+    $('packageOverviewScopeDock').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    notify(`已选中${state.selectedScope.label}`);
+  }
+
+  function carryScopeToConversation(scope) {
+    scope = scope || state.selectedScope || { kind: 'package', value: '' };
+    state.scopeConstraints = Object.assign({}, scope.constraints || {});
+    state.scopeConstraints.source_paths = scope.source_paths || [];
+    $('conversationScopeKind').value = scope.kind || 'package';
     renderScopeFields();
-    if (kind === 'time') {
-      $('conversationScopeStart').value = `${rawValue}-01-01`;
-      $('conversationScopeEnd').value = `${rawValue}-12-31`;
+    if (scope.kind === 'time') {
+      $('conversationScopeStart').value = `${scope.value}-01-01`;
+      $('conversationScopeEnd').value = `${scope.value}-12-31`;
     } else if ($('conversationScopeValue')) {
-      $('conversationScopeValue').value = rawValue;
+      $('conversationScopeValue').value = scope.value || '';
     }
+    updateContextChip();
     window.SJFXShell && window.SJFXShell.activate('chat');
-    $('conversationQuestion').focus();
-    notify(`已进入${element.dataset.overviewScopeLabel || rawValue}资料范围`);
+    if (state.conversation) $('conversationQuestion').focus();
+    notify(`已带入${scope.label || scopeKindLabel(scope.kind)}资料范围`);
+  }
+
+  async function downloadReport() {
+    const filename = $('packageOverviewReportBtn').dataset.filename || '';
+    if (!filename) return;
+    try {
+      const ticket = await api('/api/download-ticket', {
+        method: 'POST', body: JSON.stringify({ filename })
+      });
+      const anchor = document.createElement('a');
+      anchor.href = ticket.download_url;
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      notify('研究简报已开始下载');
+    } catch (error) { notify(error.message || '简报下载失败', true); }
+  }
+
+  function openBriefFile(path) {
+    if (!path) return;
+    state.translationPath = path;
+    window.sessionStorage.setItem(LAST_DOCUMENT_KEY, path);
+    window.SJFXShell && window.SJFXShell.activate('translation');
+    loadTranslation(path, 0);
+  }
+
+  function previousUserQuestion(messageId) {
+    const messages = state.conversation && state.conversation.messages || [];
+    const index = messages.findIndex((message) => message.message_id === messageId);
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+      if (messages[cursor].role === 'user') return messages[cursor].content || '';
+    }
+    return '';
   }
 
   function scopeSummary(scope) {
@@ -408,18 +645,21 @@
       evidence = `<details class="v2-citations"><summary>查看证据标识</summary><div class="v2-citation"><small>${escapeHtml(message.evidence_ids.join('、'))}</small></div></details>`;
     }
     const meta = role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intent || '资料回答')}</span>${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${turn && turn.evidence_status ? `<span>证据：${escapeHtml(turn.evidence_status)}</span>` : ''}</div>` : '';
-    return `<div class="v2-message ${role}" data-message-id="${escapeHtml(message.message_id || '')}"><div class="v2-message-card">${escapeHtml(message.content || '')}${meta}${evidence}</div></div>`;
+    const content = role === 'assistant' ? safeMarkdown(message.content || '') : `<p>${escapeHtml(message.content || '')}</p>`;
+    const actions = role === 'assistant' ? `<div class="v2-message-actions"><button type="button" data-copy-message="${escapeHtml(message.message_id || '')}">复制</button><button type="button" data-regenerate-message="${escapeHtml(message.message_id || '')}">再次回答</button></div>` : '';
+    return `<div class="v2-message ${role}" data-message-id="${escapeHtml(message.message_id || '')}"><div class="v2-message-card"><div class="v2-message-content">${content}</div>${meta}${evidence}${actions}</div></div>`;
   }
 
   function renderConversation() {
     const session = state.conversation;
     $('conversationTitle').textContent = session ? (session.title || '资料问答') : '尚未开始会话';
     $('conversationScopeSummary').textContent = session ? scopeSummary(session.scope) : '请选择范围并新建会话';
+    updateContextChip(session && session.scope);
     const messages = session && Array.isArray(session.messages) ? session.messages : [];
     $('conversationMessages').innerHTML = messages.length ? messages.map(messageMarkup).join('') : emptyMarkup('从资料中提出第一个问题', '例如：这批资料主要讲了什么？哪些文件相互关联？');
     $('conversationQuestion').disabled = !session || state.conversationSending;
     $('conversationSendBtn').disabled = !session || state.conversationSending;
-    $('conversationComposerHint').textContent = session ? '回答将尽量引用可回查的原文证据' : '新建会话后即可提问';
+    $('conversationComposerHint').textContent = session ? '资料事实优先引用；分析判断会单独标明' : '新建会话后即可提问';
     renderConversationList();
     window.requestAnimationFrame(() => { $('conversationMessages').scrollTop = $('conversationMessages').scrollHeight; });
   }
@@ -508,9 +748,9 @@
     });
   }
 
-  async function sendQuestion() {
+  async function sendQuestion(questionOverride) {
     if (!state.conversation || state.conversationSending) return;
-    const question = ($('conversationQuestion').value || '').trim();
+    const question = String(questionOverride || $('conversationQuestion').value || '').trim();
     if (!question) { notify('请输入问题', true); return; }
     let turnScope;
     try { turnScope = conversationScope(); } catch (error) { notify(error.message, true); return; }
@@ -726,6 +966,9 @@
   function resetForScan(scanId) {
     state.scanId = scanId;
     state.overview = null;
+    state.researchBrief = null;
+    state.reportArtifact = null;
+    state.selectedScope = null;
     state.conversation = null;
     state.conversationList = [];
     state.turns.clear();
@@ -737,13 +980,16 @@
     state.watchers.clear();
     if ($('conversationScopeKind')) { $('conversationScopeKind').value = 'package'; renderScopeFields(); }
     const enabled = Boolean(scanId);
-    ['packageOverviewRefreshBtn', 'conversationNewBtn', 'translatePriorityBtn', 'translateBackfillBtn', 'translationOpenBtn'].forEach((id) => { if ($(id)) $(id).disabled = !enabled; });
+    ['packageOverviewRefreshBtn', 'packageOverviewAskAllBtn', 'conversationNewBtn', 'translatePriorityBtn', 'translateBackfillBtn', 'translationOpenBtn'].forEach((id) => { if ($(id)) $(id).disabled = !enabled; });
     renderTranslationSummary();
     renderConversation();
     renderConversationList();
     if (!enabled) {
       setOverviewState('导入数据包后生成内容概览。');
       $('packageOverviewMetrics').innerHTML = '';
+      if ($('packageOverviewSummary')) $('packageOverviewSummary').innerHTML = '';
+      if ($('packageOverviewTreemap')) $('packageOverviewTreemap').innerHTML = '';
+      renderSelectedScope();
     }
   }
 
@@ -775,8 +1021,14 @@
     renderScopeFields();
     resetForScan((window.localStorage.getItem(CURRENT_SCAN_KEY) || '').trim());
     $('packageOverviewRefreshBtn').addEventListener('click', () => loadOverview(true));
+    $('packageOverviewAskAllBtn').addEventListener('click', () => carryScopeToConversation({ kind: 'package', label: '整个数据包', source_paths: [] }));
+    $('packageOverviewAskBtn').addEventListener('click', () => carryScopeToConversation(state.selectedScope));
+    $('packageOverviewReportBtn').addEventListener('click', downloadReport);
     $('conversationScopeKind').addEventListener('change', () => { state.scopeConstraints = {}; renderScopeFields(); });
+    $('conversationScopeFields').addEventListener('input', () => updateContextChip());
     document.querySelector('[data-view="overview"]').addEventListener('click', (event) => {
+      const file = event.target.closest('[data-brief-file]');
+      if (file) { openBriefFile(file.dataset.briefFile); return; }
       const target = event.target.closest('[data-overview-scope-kind]');
       if (target) applyOverviewScope(target);
     });
@@ -801,6 +1053,18 @@
       if (state.conversation) $('conversationQuestion').focus();
     });
     $('conversationMessages').addEventListener('click', (event) => {
+      const copy = event.target.closest('[data-copy-message]');
+      if (copy) {
+        const message = (state.conversation && state.conversation.messages || []).find((item) => item.message_id === copy.dataset.copyMessage);
+        if (message && navigator.clipboard) navigator.clipboard.writeText(message.content || '').then(() => notify('回答已复制')).catch(() => notify('复制失败', true));
+        return;
+      }
+      const regenerate = event.target.closest('[data-regenerate-message]');
+      if (regenerate) {
+        const question = previousUserQuestion(regenerate.dataset.regenerateMessage);
+        if (question) sendQuestion(question);
+        return;
+      }
       const button = event.target.closest('[data-citation-translation]');
       if (!button) return;
       const path = button.dataset.citationTranslation;
