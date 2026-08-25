@@ -429,6 +429,7 @@ class OllamaTranslationProvider(TranslationProvider):
             "你是严谨的专业文档翻译引擎。将输入完整翻译成简体中文，保持事实、语气、段落和项目层级；"
             "不得总结、扩写、删减或解释。形如 __SJFX_KEEP_0001__ 和 __SJFX_TERM_0001__ 的保护标记"
             "必须原样、各保留一次，不能改写或移动到不对应的位置。输入中已有的中文保留自然表达。"
+            "只输出 {\"translation\":\"完整译文\"}，translation 必须是唯一的 JSON 顶层字段。"
         )
         user_prompt = json.dumps({
             "source_language": source_language,
@@ -465,7 +466,8 @@ class OllamaTranslationProvider(TranslationProvider):
         system_prompt = (
             "你是专业译文复核模型。对照原文修正候选简体中文译文中的遗漏、误译、未翻译内容和结构问题；"
             "不得总结、扩写或删减。所有 __SJFX_KEEP_0001__、__SJFX_TERM_0001__ 形式的保护标记必须原样各保留一次，"
-            "数字、日期、金额、术语、换行、制表符和表格竖线结构必须保持。只返回修正后的完整 translation。"
+            "数字、日期、金额、术语、换行、制表符和表格竖线结构必须保持。"
+            "只输出 {\"translation\":\"修正后的完整译文\"}，translation 必须是唯一的 JSON 顶层字段。"
         )
         user_prompt = json.dumps({
             "source_language": source_language,

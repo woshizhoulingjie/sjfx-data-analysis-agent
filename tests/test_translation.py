@@ -422,6 +422,7 @@ class TranslationCoreTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         system_prompt, user_prompt, kwargs = client.calls[0]
         self.assertIn("不得总结", system_prompt)
+        self.assertIn('{"translation":', system_prompt)
         self.assertIn("This is a report.", user_prompt)
         self.assertEqual(kwargs["required_fields"], ["translation"])
 
