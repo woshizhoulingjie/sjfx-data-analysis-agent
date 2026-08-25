@@ -293,6 +293,7 @@ def _candidate_spans(text, glossary):
         (r"https?://[^\s<>\]\[()]+", "url"),
         (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "email"),
         (r"\{\{[^{}\r\n]+\}\}|\$\{[^{}\r\n]+\}|%\([^)]+\)[#0 +\-]?[0-9.]*[a-zA-Z]|%[sdif]|\{[A-Za-z_][A-Za-z0-9_.-]*\}", "placeholder"),
+        (r"\b(?:\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[,.]?\s+\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4})\b", "date"),
         (r"\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?\b", "date"),
         (r"(?<![\w])(?:[$€£¥￥]\s?\d+(?:[,.]\d+)*|\d+(?:[,.]\d+)*\s?(?:USD|CNY|RMB|EUR|GBP|JPY|美元|人民币|元))(?![\w])", "amount"),
         (r"(?<![\w])[-+]?\d+(?:[,.]\d+)*(?:%|[A-Za-z]{1,5})?(?![\w])", "number"),

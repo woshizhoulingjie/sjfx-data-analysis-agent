@@ -426,6 +426,12 @@ class TranslationCoreTests(unittest.TestCase):
         self.assertIn("This is a report.", user_prompt)
         self.assertEqual(kwargs["required_fields"], ["translation"])
 
+    def test_written_english_date_is_preserved_as_one_token(self):
+        protected = protect_text("Approved on 25 August 2026 and August 26, 2026.")
+        self.assertEqual(list(protected.kinds.values()), ["date", "date"])
+        self.assertIn("25 August 2026", protected.replacements.values())
+        self.assertIn("August 26, 2026", protected.replacements.values())
+
 
 if __name__ == "__main__":
     unittest.main()
