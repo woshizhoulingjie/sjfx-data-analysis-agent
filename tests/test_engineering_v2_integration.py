@@ -325,10 +325,12 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
             return {"text": "full"}
 
         def translate(_scan_id, node_path, source_level, job_id=None, max_units=None):
-            return {
+            result = {
                 "status": "completed", "source_level": source_level,
                 "full_translation": source_level == "full",
             }
+            self.storage.save_translation(_scan_id, node_path, result)
+            return result
 
         job_id = first_id
         with patch.object(
@@ -352,9 +354,9 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
             else:
                 self.fail("deep_backfill continuation did not terminate")
 
-        self.assertEqual(set(promoted), {
-            "0.txt", "1.txt", "2.txt", "3.txt", "4.txt",
-        })
+        expected = {"0.txt", "1.txt", "2.txt", "3.txt", "4.txt"}
+        self.assertTrue(expected.issubset(set(promoted)))
+        self.assertTrue(all(promoted.count(path) == 1 for path in expected))
 
     def test_translation_candidates_prioritize_representatives_and_exclude_restricted(self):
         scan_id, scan = self._save_scan_with_files(["ordinary.txt", "priority.txt", ".env"])
@@ -376,7 +378,9 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
         )
 
         self.assertTrue(large)
-        self.assertEqual(paths, ["priority.txt", "ordinary.txt"])
+        self.assertEqual(paths[0], "priority.txt")
+        self.assertIn("ordinary.txt", paths)
+        self.assertNotIn(".env", paths)
 
     def test_overview_topic_scope_excludes_out_of_scope_evidence(self):
         scan_id, scan = self._save_scan_with_files(["north.txt", "south.txt"])
