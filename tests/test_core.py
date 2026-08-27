@@ -606,19 +606,22 @@ class CoreRegressionTests(unittest.TestCase):
             coverage = analysis["coverage"]
             self.assertTrue(analysis["policy"]["large_package"]["enabled"])
             self.assertEqual(coverage["inventory_files"], 4)
-            self.assertEqual(coverage["parsed_files"], 4)
-            self.assertEqual(coverage["pending_files"], 0)
-            self.assertFalse(any(node.get("node_type") == "pending_scope" for node in analysis["analysis_tree"]["children"]))
+            self.assertEqual(coverage["parsed_files"], 2)
+            self.assertEqual(coverage["pending_files"], 2)
+            self.assertTrue(any(
+                node.get("node_type") == "deep_pending_scope"
+                for node in analysis["analysis_tree"]["children"]
+            ))
             stored = storage.list_documents(scan_id)
-            self.assertEqual(len(stored), 4)
+            self.assertEqual(len(stored), 2)
             self.assertTrue(all(not item["payload"]["coverage"].get("overview_sampled") for item in stored))
 
-    def test_ten_gb_package_uses_bounded_batches_but_processes_every_file(self):
+    def test_ten_gb_package_limits_each_durable_job_to_one_deep_batch(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             for index in range(7):
                 (root / "doc{}.txt".format(index)).write_text(
-                    "远程证明通过硬件信任根验证运行环境状态。" * 1000,
+                    ("文件 {}：远程证明通过硬件信任根验证运行环境状态。".format(index)) * 1000,
                     encoding="utf-8",
                 )
             scan = scan_directory(root)
@@ -641,13 +644,15 @@ class CoreRegressionTests(unittest.TestCase):
                     UnifiedDocumentParser(max_chars=12000),
                     large_options={
                         "threshold_bytes": 1,
-                        "batch_files": 3,
+                        "batch_files": 30,
                         "overview_chars_per_file": 4000,
                     },
                 )
-            self.assertEqual(batch_sizes, [3, 3, 1])
+            self.assertEqual(batch_sizes, [7])
             self.assertEqual(analysis["coverage"]["parsed_files"], 7)
             self.assertEqual(analysis["coverage"]["pending_files"], 0)
+            self.assertLessEqual(analysis["workflow"]["processed_in_job"], 30)
+            self.assertEqual(analysis["workflow"]["remaining_priority_paths"], [])
             self.assertEqual(analysis["policy"]["large_package"]["inventory_bytes"], 10 * 1024 * 1024 * 1024)
             self.assertGreater(len(storage.get_document(scan_id, "doc0.txt")["text"]), 4000)
 
@@ -718,6 +723,43 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertNotIn("analysis_translation", stored)
             self.assertNotIn("translated_text", stored["evidence"][0])
 
+    def test_large_import_translation_is_scoped_to_current_deep_batch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for index in range(25):
+                (root / "foreign-{:02d}.txt".format(index)).write_text(
+                    "Foreign evidence document {} records a delivery decision. ".format(index) * 20,
+                    encoding="utf-8",
+                )
+            scan = scan_directory(root)
+            storage = Storage(root / "analysis.db")
+            scan_id = storage.save_scan(scan)
+            translated_batches = []
+
+            def translate_batch(**kwargs):
+                translated_batches.append(sorted(kwargs["documents"]))
+                return {
+                    "enabled": True, "eligible_files": len(kwargs["documents"]),
+                    "translated_files": len(kwargs["documents"]),
+                    "partial_files": 0, "failed_files": 0, "skipped_files": 0,
+                    "translated_characters": 0, "limitations": [],
+                }
+
+            analysis = analyze_package(
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=4000),
+                large_options={
+                    "threshold_bytes": 1, "initial_parse_files": 25,
+                    "batch_files": 20,
+                },
+                analysis_translation=translate_batch,
+            )
+            self.assertEqual(len(translated_batches), 1)
+            self.assertEqual(len(translated_batches[0]), 20)
+            self.assertEqual(
+                set(translated_batches[0]), set(analysis["workflow"]["processed_paths"])
+            )
+            self.assertEqual(len(analysis["workflow"]["remaining_priority_paths"]), 5)
+
     def test_large_package_scope_resume_reuses_checkpoint_and_extends_coverage(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -733,8 +775,8 @@ class CoreRegressionTests(unittest.TestCase):
                 scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000),
                 large_options=options, target_paths=["doc1.txt"],
             )
-            self.assertGreaterEqual(analysis["coverage"]["parsed_files"], 3)
-            self.assertLessEqual(analysis["coverage"]["pending_files"], 1)
+            self.assertGreaterEqual(analysis["coverage"]["parsed_files"], 2)
+            self.assertLessEqual(analysis["coverage"]["pending_files"], 2)
 
     def test_retry_success_removes_the_historical_failure_for_the_same_path(self):
         with tempfile.TemporaryDirectory() as folder:

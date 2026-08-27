@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#102d27">
   <title>SJFX · 数据分析工作台</title>
   <link rel="stylesheet" href="/static/style.css?v=20">
-  <link rel="stylesheet" href="/static/engineering-v2.css?v=2">
+    <link rel="stylesheet" href="/static/engineering-v2.css?v=4">
 </head>
 <body>
   <div class="app-shell">
@@ -71,14 +71,14 @@
         </section>
 
         <section class="app-view v2-chat-view" data-view="chat">
-          <div class="page-heading compact"><div><div class="eyebrow">ASK / THINK / VERIFY</div><h1>与资料对话</h1><p>自然交流、讨论分析思路，或让回答回到原始文件。资料事实优先引用，但聊天不被证据门槛锁住。</p></div><button class="primary" id="conversationNewBtn" disabled>＋ 新对话</button></div>
+          <div class="page-heading compact"><div><div class="eyebrow">PLAN / ANALYZE / VERIFY</div><h1>交互式数据包分析</h1><p>用自然语言下达研究指令，系统会规划步骤、检索资料、定向深析并核验结论。</p></div><button class="primary" id="conversationNewBtn" disabled>＋ 新分析会话</button></div>
           <div class="v2-chat-layout">
             <aside class="v2-chat-sidebar"><div class="v2-list-heading"><span>历史对话</span><button class="text-button" id="conversationListRefreshBtn">刷新</button></div><div id="conversationList" class="v2-session-list" aria-label="历史会话"></div></aside>
             <article class="v2-chat-main">
               <div class="v2-chat-header"><div><span class="section-kicker">LOCAL ASSISTANT</span><h2 id="conversationTitle">开始一个新对话</h2><small id="conversationScopeSummary">当前上下文：整个数据包</small></div><div id="conversationDeepeningState" class="v2-job-state" role="status" aria-live="polite"></div></div>
-              <div id="conversationMessages" class="v2-message-list" aria-live="polite"><div class="v2-empty"><strong>从资料中提出第一个问题</strong><span>例如：这批资料主要讲了什么？哪些文件相互关联？</span></div></div>
-              <div id="conversationSuggestions" class="v2-suggestions" aria-label="问题建议"><button type="button">概括这批资料</button><button type="button">有哪些值得研究的方向？</button><button type="button">帮我设计下一步分析思路</button></div>
-              <form id="conversationForm" class="v2-composer"><div class="v2-context-row"><span id="conversationContextChip" class="v2-context-chip">整个数据包</span><details class="v2-context-picker"><summary>更改范围</summary><div class="v2-context-popover"><label for="conversationScopeKind">范围类型</label><select id="conversationScopeKind"><option value="package">整个数据包</option><option value="topic">主题</option><option value="directory">目录</option><option value="entity">人物或机构</option><option value="time">时间范围</option><option value="file_type">文件类型</option><option value="files">指定文件</option></select><div id="conversationScopeFields"></div><label class="v2-check"><input id="conversationPersistScope" type="checkbox" checked><span>后续追问沿用</span></label></div></details></div><label class="sr-only" for="conversationQuestion">输入问题</label><textarea id="conversationQuestion" rows="3" maxlength="8000" placeholder="问资料内容，也可以讨论方法、思路或普通聊天" disabled></textarea><div><small id="conversationComposerHint">新建对话后即可开始</small><button class="primary" id="conversationSendBtn" type="submit" disabled>发送</button></div></form>
+              <div id="conversationMessages" class="v2-message-list" aria-live="polite"><div class="v2-empty"><strong>向当前数据包下达分析指令</strong><span>例如：比较各份合同的付款条款，找出对乙方不利的内容并按风险等级整理。</span></div></div>
+              <div id="conversationSuggestions" class="v2-suggestions" aria-label="分析建议"><button type="button">概括这批资料并列出关键证据</button><button type="button">找出资料中的矛盾、例外和风险</button><button type="button">建立主要人物、机构与事件的时间线</button></div>
+              <form id="conversationForm" class="v2-composer"><div class="v2-context-row"><span id="conversationContextChip" class="v2-context-chip">整个数据包</span><details class="v2-context-picker"><summary>更改范围</summary><div class="v2-context-popover"><label for="conversationScopeKind">范围类型</label><select id="conversationScopeKind"><option value="package">整个数据包</option><option value="topic">主题</option><option value="directory">目录</option><option value="entity">人物或机构</option><option value="time">时间范围</option><option value="file_type">文件类型</option><option value="files">指定文件</option></select><div id="conversationScopeFields"></div><label class="v2-check"><input id="conversationPersistScope" type="checkbox" checked><span>后续追问沿用</span></label></div></details></div><label class="sr-only" for="conversationQuestion">输入分析指令</label><textarea id="conversationQuestion" rows="3" maxlength="8000" placeholder="说明要分析什么、范围、判断标准和期望输出格式" disabled></textarea><div><small id="conversationComposerHint">新建分析会话后即可开始</small><button class="primary" id="conversationSendBtn" type="submit" disabled>开始分析</button></div></form>
             </article>
           </div>
         </section>
@@ -114,6 +114,6 @@
   <div id="toast" class="toast" aria-live="polite"></div>
   <script src="/static/product-shell.js?v=3"></script>
   <script src="/static/app.js?v=20"></script>
-  <script src="/static/engineering-v2.js?v=4"></script>
+    <script src="/static/engineering-v2.js?v=6"></script>
 </body>
 </html>

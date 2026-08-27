@@ -300,6 +300,43 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertIsInstance(payload["job_id"], str)
 
+    def test_async_conversation_turn_api_persists_and_can_cancel(self):
+        scan_id, _scan = self._save_scan_with_files(["contract.txt"])
+        owner = self.app_module.Config.OWNER_ID
+        session = self.app_module.conversation_engine.new_session(
+            scan_id, scope=self.app_module.ConversationScope("package"), title="合同分析"
+        )
+        self.storage.save_conversation(session.as_dict(), owner)
+        with self.app_module.app.test_request_context(
+            "/api/conversation/{}/turns".format(session.session_id),
+            method="POST",
+            json={
+                "scan_id": scan_id,
+                "question": "分析合同风险并列出证据",
+                "scope": {"kind": "package"},
+                "idempotency_key": "api-request-1",
+            },
+        ):
+            response, status = self.app_module.create_conversation_turn(session.session_id)
+        payload = response.get_json()
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["turn"]["status"], "queued")
+        self.assertEqual(len(payload["session"]["messages"]), 2)
+        turn_id = payload["turn"]["id"]
+
+        with self.app_module.app.test_request_context(
+            "/api/turns/{}".format(turn_id), method="GET"
+        ):
+            detail = self.app_module.get_conversation_turn(turn_id).get_json()
+        self.assertEqual(detail["turn"]["id"], turn_id)
+        self.assertEqual(detail["steps"], [])
+
+        with self.app_module.app.test_request_context(
+            "/api/turns/{}/cancel".format(turn_id), method="POST", json={}
+        ):
+            cancelled = self.app_module.cancel_conversation_turn(turn_id).get_json()
+        self.assertEqual(cancelled["turn"]["status"], "cancelled")
+
     def test_import_translation_is_bounded_prioritized_and_searchable(self):
         class _ImportTranslationService:
             def __init__(self):

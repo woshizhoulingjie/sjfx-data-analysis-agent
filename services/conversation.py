@@ -290,15 +290,16 @@ class ConversationSession:
             parts.append("较早对话摘要：{}".format(_clean_text(self.rolling_summary, policy.max_summary_chars)))
         recent = self.messages[-policy.max_recent_messages :]
         if recent:
-            rendered = []
+            rendered_reversed = []
             used = 0
-            for message in recent:
+            for message in reversed(recent):
                 label = "用户" if message.role == "user" else "助手"
                 line = "{}：{}".format(label, _clean_text(message.content, 900))
                 if used + len(line) > policy.max_recent_chars:
                     break
-                rendered.append(line)
+                rendered_reversed.append(line)
                 used += len(line)
+            rendered = list(reversed(rendered_reversed))
             if rendered:
                 parts.append("最近对话：\n" + "\n".join(rendered))
         return "\n".join(parts)
@@ -399,9 +400,28 @@ class IntentRouter:
     )
 
     def route(self, question: str, previous_intent: Optional[str] = None, is_follow_up: bool = False) -> IntentDecision:
-        text = _clean_text(question, 2000)
+        # The API accepts up to 8000 characters.  Keep the same bound here so
+        # intent detection cannot silently discard constraints from a long
+        # natural-language instruction.
+        text = _clean_text(question, 8000)
         if self.CASUAL_RE.search(text):
             return IntentDecision(name="casual", confidence=0.99, reason="普通交流或系统使用咨询")
+        matched_intents = [
+            name for name, pattern in (
+                ("translation", self.TRANSLATION_RE),
+                ("relationship", self.RELATION_RE),
+                ("structured", self.STRUCTURED_RE),
+                ("summary", self.SUMMARY_RE),
+                ("analysis", self.ANALYSIS_RE),
+            )
+            if pattern.search(text)
+        ]
+        if len(matched_intents) > 1:
+            return IntentDecision(
+                name="multi_task",
+                confidence=0.94,
+                reason="multiple intents: {}".format(",".join(matched_intents)),
+            )
         for name, pattern, reason in (
             ("translation", self.TRANSLATION_RE, "问题明确要求原文、中文翻译或双语对照"),
             ("relationship", self.RELATION_RE, "问题要求分析人物、机构、事件或文件之间的联系"),
@@ -435,7 +455,7 @@ class FollowUpResolver:
     )
 
     def resolve(self, question: str, session: ConversationSession) -> FollowUpResolution:
-        question = _clean_text(question, 4000)
+        question = _clean_text(question, 8000)
         if not question:
             raise ValueError("问题不能为空")
         previous = next((item for item in reversed(session.messages) if item.role == "user"), None)
@@ -762,8 +782,6 @@ def _sanitize_citation_labels(answer: str, citation_count: int) -> str:
         return match.group(0) if 1 <= number <= citation_count else ""
 
     answer = re.sub(r"\[(\d{1,4})\]", replace, str(answer or ""))
-    if citation_count and not re.search(r"\[(\d{1,4})\]", answer):
-        answer = answer.rstrip() + " [1]"
     return answer.strip()
 
 
@@ -830,6 +848,8 @@ class ConversationEngine:
         scope: Optional[ConversationScope] = None,
         coverage: Optional[Mapping[str, Any]] = None,
         persist_scope: bool = False,
+        retrieval_override: Optional[Mapping[str, Any]] = None,
+        analysis_plan: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not isinstance(session, ConversationSession):
             raise TypeError("session 必须是 ConversationSession")
@@ -846,14 +866,48 @@ class ConversationEngine:
             is_follow_up=resolution.is_follow_up,
         )
         context = session.context_text(self.context_policy)
+        if analysis_plan:
+            plan_context = {
+                "objective": analysis_plan.get("objective"),
+                "modes": list(analysis_plan.get("modes") or []),
+                "constraints": list(analysis_plan.get("constraints") or []),
+                "output": dict(analysis_plan.get("output") or {}),
+                "verification_feedback": dict(
+                    analysis_plan.get("verification_feedback") or {}
+                ),
+                "steps": [
+                    {"tool": item.get("tool"), "action": item.get("action")}
+                    for item in (analysis_plan.get("steps") or [])
+                ],
+            }
+            tool_context = str(analysis_plan.get("tool_context") or "")[:16000]
+            context = "{}\n受控分析计划：{}{}".format(
+                context,
+                json.dumps(plan_context, ensure_ascii=False),
+                "\n专业工具的确定性结果：{}".format(tool_context)
+                if tool_context
+                else "",
+            ).strip()
         rolling_summary_used = bool(session.rolling_summary)
 
         if decision.name == "casual":
             turn = self._answer_casual(session, resolution, decision, effective_scope, context)
         elif decision.name == "structured":
             turn = self._answer_structured(session, resolution, decision, effective_scope, context, coverage)
+        elif decision.name == "multi_task":
+            # Combination requests must use the same evidence/coverage path as
+            # single-purpose requests.  The previous implementation attempted
+            # to use ``citations`` and ``warnings`` before retrieval populated
+            # them, causing requests such as "翻译并总结" to fail at runtime.
+            turn = self._answer_from_retrieval(
+                session, resolution, decision, effective_scope, context, coverage,
+                retrieval_override=retrieval_override,
+            )
         else:
-            turn = self._answer_from_retrieval(session, resolution, decision, effective_scope, context, coverage)
+            turn = self._answer_from_retrieval(
+                session, resolution, decision, effective_scope, context, coverage,
+                retrieval_override=retrieval_override,
+            )
 
         user_message, assistant_message = session.append_exchange(
             question=resolution.original_question,
@@ -1004,8 +1058,13 @@ class ConversationEngine:
         scope: ConversationScope,
         context: str,
         coverage_override: Optional[Mapping[str, Any]],
+        retrieval_override: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        retrieval = self._retrieve(session, resolution.resolved_query, scope, decision.name)
+        retrieval = (
+            dict(retrieval_override)
+            if isinstance(retrieval_override, Mapping)
+            else self._retrieve(session, resolution.resolved_query, scope, decision.name)
+        )
         citations = _normalise_citations(
             self._retrieval_items(retrieval),
             limit=self.context_policy.max_prompt_evidence,
@@ -1047,8 +1106,12 @@ class ConversationEngine:
                 warnings=warnings,
             )
 
-        if decision.name == "translation":
-            answer, translation_warnings = self._translation_answer(
+        translation_requested = decision.name == "translation" or (
+            decision.name == "multi_task"
+            and bool(self.intent_router.TRANSLATION_RE.search(resolution.original_question))
+        )
+        if translation_requested:
+            translation_answer, translation_warnings = self._translation_answer(
                 resolution.original_question, citations
             )
             warnings.extend(translation_warnings)
@@ -1064,11 +1127,29 @@ class ConversationEngine:
                     promotion=promotion,
                     warnings=warnings,
                 )
+            if decision.name == "multi_task":
+                answer, model_warnings = self._grounded_answer(
+                    decision.name, resolution.resolved_query, context, citations
+                )
+                warnings.extend(model_warnings)
+            else:
+                answer = translation_answer
         else:
             answer, model_warnings = self._grounded_answer(
                 decision.name, resolution.resolved_query, context, citations
             )
             warnings.extend(model_warnings)
+
+        if decision.name == "multi_task" and translation_requested:
+            translated_blocks = [
+                "[{}] {}".format(item["citation_index"], item["translated_text"])
+                for item in citations[: self.max_translation_citations]
+                if item.get("translated_text")
+            ]
+            if translated_blocks and answer:
+                answer = "翻译内容:\n{}\n\n总结:\n{}".format(
+                    "\n".join(translated_blocks), answer
+                )
 
         status = "partial" if promotion else "answered"
         evidence_status = "partial" if promotion else "supported"

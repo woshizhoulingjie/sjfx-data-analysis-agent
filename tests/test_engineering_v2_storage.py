@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -8,6 +9,147 @@ from services.translation import document_translation_fingerprint
 
 
 class EngineeringV2StorageTests(unittest.TestCase):
+    def test_large_preview_uses_compressed_sidecar(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(
+                Path(folder) / "state.db",
+                sidecar_dir=Path(folder) / "sidecars",
+            )
+            preview = {
+                "schema_version": "file-preview/1.3", "path": "large.txt",
+                "status": "previewed", "size": 100000, "modified_at_ns": 1,
+                "preview_text": "compressible preview " * 5000,
+                "preview_windows": [], "language": {"code": "en"},
+                "coverage": {"preview_only": True, "parse_complete": False},
+            }
+            storage.save_file_preview("scan", "large.txt", preview)
+            with storage._connect() as conn:
+                stored = conn.execute(
+                    "SELECT payload FROM file_previews WHERE scan_id='scan' AND node_path='large.txt'"
+                ).fetchone()["payload"]
+            self.assertIn("__preview_sidecar__", stored)
+            self.assertLess(len(stored), 1000)
+            self.assertEqual(
+                storage.get_file_preview("scan", "large.txt")["preview_text"],
+                preview["preview_text"],
+            )
+
+    def test_file_failure_state_tracks_retry_policy_and_attempt_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "state.db")
+            for _attempt in range(2):
+                storage.set_file_state(
+                    "scan", "busy.pdf", "fingerprint", "failed",
+                    error="parser timeout", error_class="transient_runtime",
+                    retryable=True, next_retry_at=time.time() + 30,
+                )
+            state = storage.get_file_state("scan", "busy.pdf")
+            self.assertEqual(state["attempt_count"], 2)
+            self.assertEqual(state["error_class"], "transient_runtime")
+            self.assertTrue(state["retryable"])
+            self.assertGreater(state["next_retry_at"], time.time())
+
+    def test_deferred_job_is_not_claimed_before_available_at(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "state.db")
+            job_id = storage.create_job(
+                "scan", task_type="analyze_package",
+                options={"workflow_source": "background_backfill"},
+                owner_id="owner",
+            )
+            claimed = storage.claim_next_job("worker-1")
+            self.assertEqual(claimed["id"], job_id)
+            self.assertTrue(storage.defer_running_job(job_id, "资源不足", delay_seconds=60))
+            deferred = storage.get_job(job_id)
+            self.assertGreater(deferred["available_at"], time.time())
+            self.assertIsNone(storage.claim_next_job("worker-2"))
+
+    def test_file_workflow_state_round_trip_paging_and_stage_update(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "state.db")
+            saved = storage.save_file_workflow_states("scan", [{
+                "path": "reports/a.pdf", "workflow_state": "priority_queued",
+                "selection_state": "priority", "score": 82.5,
+                "score_components": {"evidence_potential": 15.0},
+                "reasons": ["主题代表"], "safety_status": "checked",
+                "light_index_status": "ready", "language_code": "en",
+                "ocr_candidate": True, "promotion_allowed": True,
+            }, {
+                "path": "cache.tmp", "workflow_state": "excluded",
+                "selection_state": "excluded", "score": 2.0,
+                "reasons": ["cache_temporary_or_dependency_file"],
+                "safety_status": "checked", "light_index_status": "ready",
+                "promotion_allowed": False,
+            }])
+            self.assertEqual(saved, 2)
+            page = storage.list_file_workflow_states_page("scan", limit=1)
+            self.assertEqual(page["total"], 2)
+            self.assertEqual(page["items"][0]["node_path"], "reports/a.pdf")
+            self.assertEqual(page["next_offset"], 1)
+            self.assertTrue(page["items"][0]["ocr_candidate"])
+            self.assertEqual(
+                page["items"][0]["score_components"]["evidence_potential"], 15.0
+            )
+
+            self.assertTrue(storage.update_file_workflow_stage(
+                "scan", "reports/a.pdf", "evidence_ready",
+                parse_status="completed", evidence_status="ready",
+                priority_source="question_promotion",
+            ))
+            state = storage.get_file_workflow_state("scan", "reports/a.pdf")
+            self.assertEqual(state["workflow_state"], "evidence_ready")
+            self.assertEqual(state["parse_status"], "completed")
+            self.assertEqual(state["priority_source"], "question_promotion")
+            self.assertEqual(storage.file_workflow_counts("scan")["evidence_ready"], 1)
+
+    def test_analysis_job_priority_and_scope_dedup_follow_workflow_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "state.db")
+            sources = [
+                "question_promotion", "manual_selection", "initial_overview",
+                "background_backfill",
+            ]
+            jobs = {}
+            for source in sources:
+                job_id, created = storage.create_or_get_typed_job(
+                    "scan", "analyze_package",
+                    options={"workflow_source": source, "target_paths": [source + ".txt"]},
+                    owner_id="owner",
+                )
+                self.assertTrue(created)
+                jobs[source] = storage.get_job(job_id)
+            translation_id = storage.create_job(
+                "scan", task_type="translate_package", owner_id="owner",
+            )
+            priorities = [jobs[source]["priority"] for source in sources]
+            priorities.append(storage.get_job(translation_id)["priority"])
+            self.assertEqual(priorities, [130, 110, 85, 20, 10])
+
+            duplicate_id, created = storage.create_or_get_typed_job(
+                "scan", "analyze_package",
+                options={
+                    "workflow_source": "background_backfill",
+                    "target_paths": ["background_backfill.txt"],
+                    "scope_label": "后台覆盖扩展",
+                },
+                owner_id="owner",
+            )
+            self.assertFalse(created)
+            self.assertEqual(duplicate_id, jobs["background_backfill"]["id"])
+
+            promoted_id, created = storage.create_or_get_typed_job(
+                "scan", "analyze_package",
+                options={
+                    "workflow_source": "question_promotion",
+                    "conversation_session_id": "conversation-1",
+                    "target_paths": ["background_backfill.txt"],
+                },
+                owner_id="owner",
+            )
+            self.assertTrue(created)
+            self.assertNotEqual(promoted_id, duplicate_id)
+            self.assertEqual(storage.get_job(promoted_id)["priority"], 130)
+
     def test_large_translation_uses_sidecar_and_projection(self):
         with tempfile.TemporaryDirectory() as folder:
             storage = Storage(Path(folder) / "state.db", sidecar_threshold=32 * 1024)

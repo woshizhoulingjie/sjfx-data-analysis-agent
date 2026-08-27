@@ -17,8 +17,8 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
     def test_page_ids_remain_unique_and_v2_assets_are_local(self):
         ids = re.findall(r'\bid="([^"]+)"', self.html)
         self.assertEqual(len(ids), len(set(ids)), "HTML element ids must remain unique")
-        self.assertIn('/static/engineering-v2.css?v=2', self.html)
-        self.assertIn('/static/engineering-v2.js?v=4', self.html)
+        self.assertIn('/static/engineering-v2.css?v=4', self.html)
+        self.assertIn('/static/engineering-v2.js?v=6', self.html)
         self.assertNotRegex(self.script, r'https?://|\bcdn\b')
         self.assertNotRegex(self.style, r'@import|https?://')
 
@@ -78,12 +78,15 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
     def test_conversation_client_keeps_scope_follow_up_citation_and_promotion_contracts(self):
         self.assertIn("'/api/conversations'", self.script)
         self.assertIn('/api/conversation/${encodeURIComponent(sessionId)}?scan_id=', self.script)
-        self.assertIn('/messages', self.script)
+        self.assertIn('/turns', self.script)
         self.assertIn('persist_scope', self.script)
         self.assertIn('turn.citations', self.script)
         self.assertIn('citation.original_text', self.script)
         self.assertIn('citation.translated_text', self.script)
         self.assertIn('watchPromotion', self.script)
+        self.assertIn('watchAnalysisTurn', self.script)
+        self.assertIn('data-cancel-turn', self.script)
+        self.assertIn('data-retry-turn', self.script)
         self.assertIn('promotion_job_id', self.script)
         self.assertIn('系统已自动重新检索并续写回答', self.script)
         self.assertIn('conversationContextChip', self.script)
@@ -91,6 +94,16 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('escapeHtml(value)', self.script)
         self.assertIn('data-copy-message', self.script)
         self.assertIn('data-regenerate-message', self.script)
+        self.assertIn('analysisQualityMarkup', self.script)
+        self.assertIn('turn.quality_metrics', self.script)
+        for metric in (
+            '候选文件', '已检查', '分析批次', '查询覆盖率', '引用',
+            '结论支持率', '无证据结论', '反证', '矛盾', '未解析文件',
+        ):
+            self.assertIn(metric, self.script)
+        for stage in ('batching', 'tool_execution', 'repairing'):
+            self.assertIn(stage, self.script)
+        self.assertIn('.v2-quality', self.style)
         for kind in ('package', 'topic', 'directory', 'entity', 'time', 'file_type', 'files'):
             self.assertIn('<option value="{}">'.format(kind), self.html)
 

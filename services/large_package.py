@@ -47,8 +47,8 @@ def build_policy(scan, options=None):
     # Kept for backwards-compatible configuration display.  They are no longer
     # used as a hard cap in full large-package mode.
     initial_limit = max(1, int(options.get("initial_parse_files") or 700))
-    deepen_limit = max(1, int(options.get("deepen_batch_files") or 500))
-    batch_files = max(1, min(1000, int(options.get("batch_files") or 500)))
+    deepen_limit = max(20, min(50, int(options.get("deepen_batch_files") or 30)))
+    batch_files = max(20, min(50, int(options.get("batch_files") or 30)))
     overview_chars = max(1000, min(12000, int(options.get("overview_chars_per_file") or 4000)))
     overview_evidence = max(1, min(20, int(options.get("overview_evidence_per_file") or 6)))
     preview_bytes = max(4096, min(1024 * 1024, int(options.get("preview_bytes_per_file") or 96 * 1024)))
@@ -83,8 +83,57 @@ def build_policy(scan, options=None):
         "batch_completion": "continue_until_inventory_exhausted",
         "batch_work_kind": "bounded_preview_then_selected_deep_parse",
         "batch_checkpoint_scope": "per_file",
+        "deep_batch_contract": "one_durable_job_per_20_to_50_files",
         "pause_behavior": "安全停止后保留逐文件检查点；再次启动同一扫描可续跑",
         "deep_analysis_strategy": "全量有界轻量预览与内容地图；自动深析代表文件，用户问答命中后动态晋升准确解析",
+    }
+
+
+def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
+                          preview_bytes_per_file=96 * 1024,
+                          preview_total_bytes=8 * 1024 * 1024 * 1024,
+                          max_content_bytes=10 * 1024 * 1024 * 1024,
+                          temp_reserve_bytes=0):
+    """Estimate durable state and worst-case parser scratch before content I/O."""
+    file_count = max(0, int(scan.get("file_count") or 0))
+    inventory_bytes = max(0, int(scan.get("total_size") or 0))
+    preview_source_bytes = min(
+        max(0, int(preview_total_bytes)),
+        file_count * max(4096, int(preview_bytes_per_file)),
+    )
+    # Preview sidecars are gzip-compressed; evidence keeps three bounded text
+    # windows. The multiplier includes SQLite rows, FTS and WAL headroom.
+    preview_state = int(preview_source_bytes * 0.60)
+    inventory_state = file_count * 1200
+    evidence_state = file_count * 3 * 2200
+    base_state = preview_state + inventory_state + evidence_state
+    required_state = int(base_state * 1.35) + 512 * 1024 * 1024
+    required_temp = int(max_content_bytes) * 2 + int(temp_reserve_bytes)
+    state_free_bytes = max(0, int(state_free_bytes or 0))
+    temp_free_bytes = max(0, int(temp_free_bytes or 0))
+    blockers = []
+    if state_free_bytes < required_state:
+        blockers.append("state_disk_insufficient")
+    if temp_free_bytes < required_temp:
+        blockers.append("parse_scratch_insufficient")
+    return {
+        "schema_version": "package-resource-plan/1.0",
+        "ready": not blockers,
+        "blockers": blockers,
+        "inventory_files": file_count,
+        "source_bytes": inventory_bytes,
+        "mandatory_hash_read_bytes": inventory_bytes,
+        "preview_source_budget_bytes": preview_source_bytes,
+        "estimated_state_bytes": required_state,
+        "state_free_bytes": state_free_bytes,
+        "required_temp_bytes": required_temp,
+        "temp_free_bytes": temp_free_bytes,
+        "assumptions": {
+            "preview_gzip_ratio": 0.60,
+            "preview_windows_per_file": 3,
+            "state_safety_multiplier": 1.35,
+            "full_sha256_requires_one_complete_source_read": True,
+        },
     }
 
 
@@ -212,12 +261,21 @@ def inventory_by_path(scan):
     return output
 
 
-def build_coverage(scan, documents, failures=None, pending_paths=None, policy=None):
-    files = inventory_by_path(scan)
+def build_coverage(scan, documents, failures=None, pending_paths=None, policy=None,
+                   workflow_states=None, translation_states=None, inventory=None):
+    files = dict(inventory) if inventory is not None else inventory_by_path(scan)
     failures = failures or []
     failed_paths = {item.get("path") for item in failures if item.get("path")}
     pending_paths = set(pending_paths or [])
     parsed_paths = set(documents)
+    workflow_states = {
+        str(path): dict(value or {})
+        for path, value in (workflow_states or {}).items()
+    }
+    translation_states = {
+        str(path): dict(value or {})
+        for path, value in (translation_states or {}).items()
+    }
     inventory_errors = list(scan.get("errors") or [])
     inventory_error_count = int(scan.get("scan_error_count", len(inventory_errors)) or 0)
     inventory_truncated = bool(scan.get("truncated"))
@@ -244,7 +302,6 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         # Paths absent from all known processing states are pending too.
         pending |= selected - parsed - failed
         total_bytes = sum(int(files[path].get("size") or 0) for path in selected)
-        parsed_bytes = sum(int(files[path].get("size") or 0) for path in parsed)
         def parse_is_complete(path):
             coverage = documents.get(path, {}).get("coverage") or {}
             if coverage.get("deep_parse_complete"):
@@ -266,6 +323,10 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
 
         parse_complete_paths = {path for path in parsed if parse_is_complete(path)}
         semantic_complete_paths = {path for path in parsed if semantic_is_complete(path)}
+        content_pending_paths = selected - parse_complete_paths - failed
+        parsed_bytes = sum(
+            int(files[path].get("size") or 0) for path in parse_complete_paths
+        )
         complete_text = len(parse_complete_paths)
         sampled = sum(
             1 for path in parsed
@@ -278,7 +339,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         semantic_partial = len(parsed - semantic_complete_paths)
         deep_analyzed = len(semantic_complete_paths)
         inventory_complete = inventory_complete_globally
-        parse_complete = bool(selected) and not pending and not failed and parse_partial == 0
+        parse_complete = bool(selected) and not content_pending_paths and not failed
         semantic_complete = (
             inventory_complete and parse_complete and bool(selected)
             and semantic_partial == 0
@@ -317,14 +378,14 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
                     ignored_files, ignored_directories
                 )
             )
-        if (policy or {}).get("enabled") and pending:
+        if (policy or {}).get("enabled") and content_pending_paths:
             limitations.append("大数据包采用有限预览预算持续处理；仍有文件待进入后续轻量预览批次。")
         if sampled:
             limitations.append("{} 个文件当前为抽样/首轮概览，不能视为全文深度分析。".format(sampled))
         if parse_partial:
             limitations.append("{} 个已解析文件本身存在截断、快速模式或其他解析不完整。".format(parse_partial))
-        if pending:
-            limitations.append("{} 个文件尚未进入内容分析。".format(len(pending)))
+        if content_pending_paths:
+            limitations.append("{} 个文件尚未完成正文解析。".format(len(content_pending_paths)))
         if failed:
             limitations.append("{} 个文件解析失败，可通过失败文件重试继续处理。".format(len(failed)))
         if archive_skipped_members or archive_failed_members:
@@ -350,13 +411,14 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         parse_coverage = {
             "complete": parse_complete,
             "inventory_files": len(selected),
-            "parsed_files": len(parsed),
+            "parsed_files": len(parse_complete_paths),
+            "document_records": len(parsed),
             "complete_files": len(parse_complete_paths),
             "partial_files": parse_partial,
-            "pending_files": len(pending),
+            "pending_files": len(content_pending_paths),
             "failed_files": len(failed),
             "parsed_bytes": parsed_bytes,
-            "parsed_file_ratio": round(len(parsed) / float(len(selected) or 1), 6),
+            "parsed_file_ratio": round(len(parse_complete_paths) / float(len(selected) or 1), 6),
             "parsed_byte_ratio": round(parsed_bytes / float(total_bytes or 1), 6),
         }
         semantic_analysis_coverage = {
@@ -369,17 +431,125 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "projection_character_limit": (policy or {}).get("overview_chars_per_file"),
             "projection_evidence_limit": (policy or {}).get("overview_evidence_per_file"),
         }
-        content_parse_ratio = round(len(parsed) / float(len(selected) or 1), 6)
+        scoped_workflow = {path: workflow_states.get(path, {}) for path in selected}
+        safety_checked = sum(
+            1 for state in scoped_workflow.values()
+            if state.get("safety_status") in {"checked", "restricted", "rejected"}
+        )
+        if not workflow_states:
+            safety_checked = len(selected)
+        selection_count = sum(
+            1 for state in scoped_workflow.values()
+            if state.get("selection_state") in {
+                "priority", "deferred", "excluded", "pending_preview",
+            }
+        )
+        selection_counts = Counter(
+            str(state.get("selection_state") or "pending")
+            for state in scoped_workflow.values()
+        )
+        if not workflow_states:
+            selection_count = len(selected)
+            selection_counts = Counter({"priority": len(selected)})
+        excluded_paths = {
+            path for path, state in scoped_workflow.items()
+            if state.get("selection_state") == "excluded"
+        }
+        light_eligible = selected - excluded_paths
+        light_ready = {
+            path for path, state in scoped_workflow.items()
+            if state.get("light_index_status") == "ready"
+        }
+        if not workflow_states:
+            light_ready = set(parsed)
+            light_eligible = set(selected)
+        ocr_candidates = {
+            path for path, state in scoped_workflow.items()
+            if bool(state.get("ocr_candidate"))
+        }
+        ocr_completed = {
+            path for path in ocr_candidates
+            if path in semantic_complete_paths
+            and not bool((documents.get(path, {}).get("parser") or {}).get("ocr_failed"))
+        }
+        foreign_paths = {
+            path for path, state in scoped_workflow.items()
+            if str(state.get("language_code") or "unknown") not in {"zh", "unknown", "mixed"}
+            and path not in excluded_paths
+        }
+        translated_paths = {
+            path for path in foreign_paths
+            if str((translation_states.get(path) or {}).get("status") or "") == "completed"
+        }
+        translation_partial = {
+            path for path in foreign_paths
+            if str((translation_states.get(path) or {}).get("status") or "") in {"partial", "failed"}
+        }
+        evidence_eligible = set(semantic_complete_paths)
+        evidence_ready = {
+            path for path in evidence_eligible
+            if bool(documents.get(path, {}).get("evidence"))
+        }
+
+        def coverage_item(complete, eligible, completed, **extra):
+            eligible = int(eligible)
+            completed = int(completed)
+            return {
+                "complete": bool(complete),
+                "eligible_files": eligible,
+                "completed_files": completed,
+                "pending_files": max(0, eligible - completed),
+                "coverage_ratio": round(completed / float(eligible or 1), 6),
+                **extra,
+            }
+
+        safety_coverage = coverage_item(
+            inventory_complete and safety_checked == len(selected),
+            len(selected), safety_checked,
+            restricted_files=selection_counts.get("excluded", 0),
+        )
+        light_index_coverage = coverage_item(
+            bool(light_eligible) and light_eligible <= light_ready,
+            len(light_eligible), len(light_eligible & light_ready),
+            excluded_files=len(excluded_paths),
+            contract="bounded preview/search entry; never equivalent to full-text parsing",
+        )
+        selection_coverage = coverage_item(
+            bool(selected) and selection_count == len(selected),
+            len(selected), selection_count,
+            state_counts=dict(sorted(selection_counts.items())),
+        )
+        ocr_coverage = coverage_item(
+            not ocr_candidates or ocr_candidates <= ocr_completed,
+            len(ocr_candidates), len(ocr_completed),
+            applicability="PDF/image candidates; completion requires promoted deep parse",
+        )
+        translation_coverage = coverage_item(
+            not foreign_paths or foreign_paths <= translated_paths,
+            len(foreign_paths), len(translated_paths),
+            partial_or_failed_files=len(translation_partial),
+            original_preserved=True,
+        )
+        evidence_readiness_coverage = coverage_item(
+            not evidence_eligible or evidence_eligible <= evidence_ready,
+            len(evidence_eligible), len(evidence_ready),
+            contract="deep-parsed files with source-locatable evidence",
+        )
+        # Preview projections are searchable documents, not completed body
+        # parses. Public parse ratios must never treat a preview as full text.
+        content_parse_ratio = round(len(parse_complete_paths) / float(len(selected) or 1), 6)
         deep_analysis_ratio = round(len(semantic_complete_paths) / float(len(selected) or 1), 6)
-        batch_size = max(1, int((policy or {}).get("batch_files") or 500))
-        remaining_batches = int(math.ceil((len(pending) + len(failed)) / float(batch_size)))
+        batch_size = max(20, min(50, int((policy or {}).get("batch_files") or 30)))
+        remaining_batches = int(math.ceil(
+            (len(content_pending_paths) + len(failed)) / float(batch_size)
+        ))
         extension_inventory = Counter(
             str(files[path].get("extension") or Path(path).suffix.lower() or "[无扩展名]")
             for path in selected
         )
         extension_parsed = Counter(
             str(files[path].get("extension") or Path(path).suffix.lower() or "[无扩展名]")
-            for path in parsed
+            for path in parse_complete_paths
         )
         format_coverage = []
         for extension, count in sorted(extension_inventory.items(), key=lambda item: (-item[1], item[0])):
@@ -395,14 +565,15 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "status": status,
             "inventory_files": len(selected),
             "scanned_files": len(selected),
-            "parsed_files": len(parsed),
+            "parsed_files": len(parse_complete_paths),
+            "document_records": len(parsed),
             "sampled_files": sampled,
             "complete_text_files": complete_text,
             "sampled_overview_files": sampled,
             "deep_analyzed_files": max(0, deep_analyzed),
             "partial_text_files": parse_partial,
             "failed_files": len(failed),
-            "pending_files": len(pending),
+            "pending_files": len(content_pending_paths),
             "parsed_file_ratio": content_parse_ratio,
             "coverage_ratio": content_parse_ratio,
             "inventory_coverage_ratio": 1.0 if inventory_complete else None,
@@ -418,10 +589,33 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "inventory_coverage": inventory_coverage,
             "parse_coverage": parse_coverage,
             "semantic_analysis_coverage": semantic_analysis_coverage,
+            "safety_coverage": safety_coverage,
+            "light_index_coverage": light_index_coverage,
+            "ocr_coverage": ocr_coverage,
+            "selection_coverage": selection_coverage,
+            "translation_coverage": translation_coverage,
+            "evidence_readiness_coverage": evidence_readiness_coverage,
+            "pipeline_coverage": {
+                "inventory": inventory_coverage,
+                "safety": safety_coverage,
+                "light_index": light_index_coverage,
+                "content_parse": parse_coverage,
+                "ocr": ocr_coverage,
+                "selection": selection_coverage,
+                "deep_analysis": semantic_analysis_coverage,
+                "translation": translation_coverage,
+                "evidence_readiness": evidence_readiness_coverage,
+            },
             "coverage_contract": {
                 "inventory": "文件和目录清点覆盖；只有未截断、无扫描错误、无显式排除且未触及深度上限时才是100%。符号链接登记自身但不跟随目标。",
+                "safety": "路径、软链接、敏感文件和归档安全检查覆盖。",
+                "light_index": "有效文件建立有界预览与搜索入口，不表示全文解析。",
                 "content_parse": "成功生成统一解析结果的文件占清点文件比例，允许快速模式或截断结果。",
+                "ocr": "只统计需要 OCR 候选的 PDF/图片，未深析不记为完成。",
+                "selection": "每个文件必须有优先、暂缓、排除或待预览状态及原因。",
                 "deep_analysis": "完成全文语义分析且不是有界投影的文件占清点文件比例。",
+                "translation": "外文原文保留，译文以文件/段落级工作副本单独计数。",
+                "evidence_readiness": "深析文件已生成可回溯到原文位置的证据。",
             },
             "coverage_level": coverage_level,
             "coverage_level_label": {

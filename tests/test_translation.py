@@ -17,6 +17,8 @@ from services.translation import (
     glossary_fingerprint,
     protect_text,
     segment_text,
+    split_mixed_text,
+    split_table_text,
     translation_memory_key,
     validate_translation,
 )
@@ -136,11 +138,24 @@ class TranslationCoreTests(unittest.TestCase):
         self.assertTrue(detect_language("This is the report and the result of the study.") ["needs_translation"])
         self.assertEqual(detect_language("これは日本語の文書です。") ["language"], "ja")
         self.assertEqual(detect_language("Это русский документ.") ["language"], "ru")
-        self.assertEqual(detect_language("यह एक हिंदी दस्तावेज़ है।") ["language"], "other")
+        self.assertEqual(detect_language("यह एक हिंदी दस्तावेज़ है।") ["language"], "hi")
         self.assertTrue(detect_language("นี่คือเอกสารภาษาไทย") ["needs_translation"])
         mixed = detect_language("中文说明后附 an English section with enough foreign words for review.")
         self.assertEqual(mixed["language"], "mixed")
         self.assertTrue(mixed["needs_translation"])
+
+    def test_mixed_script_split_preserves_offsets_and_content(self):
+        text = "中文说明后附 Arabic نص"
+        pieces = split_mixed_text(text)
+        self.assertEqual("".join(item["text"] for item in pieces), text)
+        self.assertEqual(pieces[0]["start"], 0)
+        self.assertEqual(pieces[-1]["end"], len(text))
+
+    def test_table_split_preserves_layout_separators(self):
+        text = "Name\tArabic\nالعنوان\tالقيمة"
+        pieces = split_table_text(text)
+        self.assertEqual("".join(item["text"] for item in pieces), text)
+        self.assertIn("\t", "".join(item["text"] for item in pieces))
 
     def test_segmentation_is_bounded_and_lossless(self):
         text = ("First sentence. " * 25) + "\n\n" + ("第二段内容。" * 30)

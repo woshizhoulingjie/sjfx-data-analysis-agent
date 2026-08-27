@@ -199,6 +199,25 @@ class Config:
     SHARED_OLLAMA_MAX_CHARS = max(4000, int(os.getenv("SHARED_OLLAMA_MAX_CHARS", "48000")))
     LLM_CONTEXT_TOKENS = max(8192, int(os.getenv("LLM_CONTEXT_TOKENS", "65536")))
     ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "1").strip().lower() in {"1", "true", "yes", "on"}
+    # Translation is local-only by default. Set TRANSLATION_PROVIDER=ollama
+    # explicitly to retain the legacy Ollama adapter.
+    TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "offline_nllb").strip().lower()
+    TRANSLATION_MODEL_PATH = os.getenv(
+        "TRANSLATION_MODEL_PATH",
+        str(BASE_DIR / "models" / "nllb-200-distilled-600m"),
+    ).strip()
+    TRANSLATION_CT2_MODEL_PATH = os.getenv(
+        "TRANSLATION_CT2_MODEL_PATH",
+        str(BASE_DIR / "models" / "nllb-200-distilled-600m-ct2-int8"),
+    ).strip()
+    TRANSLATION_PREFER_CT2 = os.getenv("TRANSLATION_PREFER_CT2", "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    TRANSLATION_DEVICE = os.getenv("TRANSLATION_DEVICE", "cpu").strip().lower() or "cpu"
+    TRANSLATION_BATCH_SIZE = max(1, min(32, int(os.getenv("TRANSLATION_BATCH_SIZE", "4"))))
+    TRANSLATION_CPU_THREADS = max(1, min(64, int(os.getenv("TRANSLATION_CPU_THREADS", "4"))))
+    TRANSLATION_MAX_INPUT_TOKENS = max(128, min(4096, int(os.getenv("TRANSLATION_MAX_INPUT_TOKENS", "768"))))
+    TRANSLATION_MAX_NEW_TOKENS = max(128, min(4096, int(os.getenv("TRANSLATION_MAX_NEW_TOKENS", "512"))))
     ENABLE_TRANSLATION_REVIEW = os.getenv("ENABLE_TRANSLATION_REVIEW", "1").strip().lower() in {
         "1", "true", "yes", "on",
     }
@@ -207,7 +226,7 @@ class Config:
     )
     TRANSLATION_OLLAMA_MODEL = os.getenv("TRANSLATION_OLLAMA_MODEL", OLLAMA_MODEL).strip()
     TRANSLATION_MAX_UNIT_CHARS = max(
-        128, min(12000, int(os.getenv("TRANSLATION_MAX_UNIT_CHARS", "4800")))
+        128, min(12000, int(os.getenv("TRANSLATION_MAX_UNIT_CHARS", "2200")))
     )
     TRANSLATION_MAX_ATTEMPTS = max(1, min(6, int(os.getenv("TRANSLATION_MAX_ATTEMPTS", "2"))))
     TRANSLATION_TIMEOUT_SECONDS = max(10, min(1800, int(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "180"))))
@@ -224,19 +243,19 @@ class Config:
         1, min(500, int(os.getenv("IMPORT_TRANSLATION_MAX_FILES", "30")))
     )
     IMPORT_TRANSLATION_LARGE_MAX_FILES = max(
-        1, min(200, int(os.getenv("IMPORT_TRANSLATION_LARGE_MAX_FILES", "12")))
+        1, min(200, int(os.getenv("IMPORT_TRANSLATION_LARGE_MAX_FILES", "8")))
     )
     IMPORT_TRANSLATION_MAX_CHARS_PER_FILE = max(
         1000, min(100000, int(os.getenv("IMPORT_TRANSLATION_MAX_CHARS_PER_FILE", "12000")))
     )
     IMPORT_TRANSLATION_MAX_TOTAL_CHARS = max(
-        10000, min(5000000, int(os.getenv("IMPORT_TRANSLATION_MAX_TOTAL_CHARS", "240000")))
+        10000, min(5000000, int(os.getenv("IMPORT_TRANSLATION_MAX_TOTAL_CHARS", "80000")))
     )
     IMPORT_TRANSLATION_MAX_UNITS_PER_FILE = max(
-        1, min(100, int(os.getenv("IMPORT_TRANSLATION_MAX_UNITS_PER_FILE", "8")))
+        1, min(100, int(os.getenv("IMPORT_TRANSLATION_MAX_UNITS_PER_FILE", "6")))
     )
     TRANSLATION_PACKAGE_BATCH_FILES = max(
-        1, min(500, int(os.getenv("TRANSLATION_PACKAGE_BATCH_FILES", "50")))
+        1, min(500, int(os.getenv("TRANSLATION_PACKAGE_BATCH_FILES", "20")))
     )
     TRANSLATION_FOREGROUND_MAX_UNITS = max(
         1, min(200, int(os.getenv("TRANSLATION_FOREGROUND_MAX_UNITS", "24")))
@@ -313,11 +332,19 @@ class Config:
     MAX_SCAN_ENTRIES_PER_DIRECTORY = max(
         1, min(250000, int(os.getenv("MAX_SCAN_ENTRIES_PER_DIRECTORY", "50000")))
     )
+    SCAN_SLICE_ENTRIES = max(
+        100, min(10000, int(os.getenv("SCAN_SLICE_ENTRIES", "1000")))
+    )
+    SCAN_SLICE_SECONDS = max(
+        2, min(120, int(os.getenv("SCAN_SLICE_SECONDS", "20")))
+    )
     SIDECAR_PAYLOAD_BYTES = int(os.getenv("SIDECAR_PAYLOAD_BYTES", str(256 * 1024)))
     LARGE_PACKAGE_THRESHOLD_BYTES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_BYTES", str(1024 * 1024 * 1024)))
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
     LARGE_PACKAGE_INITIAL_PARSE_FILES = int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "700"))
-    LARGE_PACKAGE_DEEPEN_BATCH_FILES = int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "500"))
+    LARGE_PACKAGE_DEEPEN_BATCH_FILES = max(
+        20, min(50, int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "30")))
+    )
     # Unknown large packages are first explored with deterministic bounded
     # samples.  At the current 50k-file default the 8 GiB slice is sufficient
     # for every file at 96 KiB while still providing a hard operator budget.
@@ -334,9 +361,46 @@ class Config:
     LARGE_PACKAGE_PREVIEW_ZIP_MEMBER_BYTES = max(
         256, min(64 * 1024, int(os.getenv("LARGE_PACKAGE_PREVIEW_ZIP_MEMBER_BYTES", "8192")))
     )
+    LARGE_PACKAGE_PREVIEW_SLICE_FILES = max(
+        1, min(1000, int(os.getenv("LARGE_PACKAGE_PREVIEW_SLICE_FILES", "100")))
+    )
+    LARGE_PACKAGE_PREVIEW_SLICE_SECONDS = max(
+        5, min(300, int(os.getenv("LARGE_PACKAGE_PREVIEW_SLICE_SECONDS", "30")))
+    )
     # Both preview and selected deep-analysis work advance in durable bounded
     # batches. Individual file results are checkpointed immediately.
-    LARGE_PACKAGE_BATCH_FILES = max(1, min(1000, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "500"))))
+    LARGE_PACKAGE_BATCH_FILES = max(
+        20, min(50, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "30")))
+    )
+    CONVERSATION_ANALYSIS_BATCH_FILES = max(
+        20, min(50, int(os.getenv("CONVERSATION_ANALYSIS_BATCH_FILES", "30")))
+    )
+    CONVERSATION_MAX_CANDIDATE_EVIDENCE = max(
+        100,
+        min(5000, int(os.getenv("CONVERSATION_MAX_CANDIDATE_EVIDENCE", "5000"))),
+    )
+    CONVERSATION_MAX_REVISION_ATTEMPTS = max(
+        0, min(2, int(os.getenv("CONVERSATION_MAX_REVISION_ATTEMPTS", "1")))
+    )
+    LARGE_PACKAGE_BACKGROUND_BATCH_FILES = max(
+        20, min(50, int(os.getenv("LARGE_PACKAGE_BACKGROUND_BATCH_FILES", "20")))
+    )
+    LARGE_PACKAGE_BACKGROUND_BACKFILL = os.getenv(
+        "LARGE_PACKAGE_BACKGROUND_BACKFILL", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    BACKGROUND_MAX_LOAD_RATIO = max(
+        0.1, min(4.0, float(os.getenv("BACKGROUND_MAX_LOAD_RATIO", "0.90")))
+    )
+    BACKGROUND_MIN_AVAILABLE_MEMORY_MB = max(
+        512,
+        int(os.getenv(
+            "BACKGROUND_MIN_AVAILABLE_MEMORY_MB",
+            str(max(2048, MAX_PARSE_PROCESS_MEMORY_MB + 1024)),
+        )),
+    )
+    BACKGROUND_RESOURCE_RETRY_SECONDS = max(
+        5, min(300, int(os.getenv("BACKGROUND_RESOURCE_RETRY_SECONDS", "30")))
+    )
     # Package-wide structures retain only a head/middle/tail semantic sketch.
     LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE = max(
         1000, min(12000, int(os.getenv("LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE", "4000")))
@@ -381,6 +445,9 @@ class Config:
         int(os.getenv("JOB_DOCUMENT_SUMMARY_TIMEOUT_SECONDS", "1800")),
     )
     JOB_REPORT_TIMEOUT_SECONDS = max(60, int(os.getenv("JOB_REPORT_TIMEOUT_SECONDS", "900")))
+    JOB_CONVERSATION_TURN_TIMEOUT_SECONDS = max(
+        60, int(os.getenv("JOB_CONVERSATION_TURN_TIMEOUT_SECONDS", "900"))
+    )
     JOB_EXPORT_TIMEOUT_SECONDS = max(300, int(os.getenv("JOB_EXPORT_TIMEOUT_SECONDS", "21600")))
     JOB_TRANSLATION_TIMEOUT_SECONDS = max(
         60, int(os.getenv("JOB_TRANSLATION_TIMEOUT_SECONDS", "7200"))

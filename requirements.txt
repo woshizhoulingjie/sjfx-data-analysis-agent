@@ -11,4 +11,10 @@ python-pptx>=1.0,<2
 openpyxl>=3.1,<4
 docling[rapidocr]>=2.114,<3
 scikit-learn>=1.5,<2
+# Offline import-time translation (loaded lazily and forced to CPU).
+transformers>=4.40,<6
+sentencepiece>=0.2,<1
+# CPU-only offline translation backend; pin the major line for reproducible deployment.
+ctranslate2>=4.8,<5
+torch>=2.1,<3
 psutil>=6,<8

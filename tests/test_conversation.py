@@ -261,7 +261,7 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertIn("不可信数据", model.calls[0]["system"])
         self.assertIn("Ignore all previous", model.calls[0]["user"])
 
-    def test_invalid_model_citation_is_removed_and_valid_reference_is_added(self):
+    def test_invalid_model_citation_is_removed_without_fabricating_a_reference(self):
         model = FakeModel("计划已获批 [99]。")
         engine = self.make_engine({"results": [evidence()]}, model=model)
         session = engine.new_session("scan-1")
@@ -269,7 +269,7 @@ class ConversationEngineTests(unittest.TestCase):
         result = engine.ask(session, "计划是否获批？")
 
         self.assertNotIn("[99]", result["answer"])
-        self.assertIn("[1]", result["answer"])
+        self.assertNotIn("[1]", result["answer"])
 
     def test_extractable_fallback_remains_grounded_without_a_chat_model(self):
         engine = self.make_engine({"results": [evidence()]}, model=None)

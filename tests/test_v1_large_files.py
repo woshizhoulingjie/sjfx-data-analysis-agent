@@ -4,11 +4,54 @@ from pathlib import Path
 
 import services.scanner as scanner
 from services.large_package import build_coverage
-from services.scanner import scan_directory
+from services.scanner import scan_directory, scan_inventory_slice
+from services.storage import Storage
 from services.unified_parser import UnifiedDocumentParser
 
 
 class V1LargeFileScannerTests(unittest.TestCase):
+    def test_durable_inventory_resumes_in_slices_and_keeps_tree_lazy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "package"
+            root.mkdir()
+            for directory in ("a", "b"):
+                child = root / directory
+                child.mkdir()
+                for index in range(4):
+                    (child / "{}.txt".format(index)).write_text(
+                        "{}-{}".format(directory, index), encoding="utf-8"
+                    )
+            db_path = Path(folder) / "state.db"
+            storage = Storage(db_path)
+            cursor = None
+            slices = 0
+            while True:
+                result = scan_inventory_slice(root, cursor=cursor, slice_entries=3)
+                slices += 1
+                scan = storage.save_inventory_slice(
+                    "scan", root, result["cursor"], result["records"],
+                    owner_id="owner", complete=result["complete"],
+                )
+                if result["complete"]:
+                    break
+                # Simulate a new Worker process loading only the durable cursor.
+                storage = Storage(db_path)
+                cursor = storage.get_inventory_cursor("scan")
+                cursor.pop("status", None)
+
+            self.assertGreater(slices, 1)
+            self.assertTrue(scan["inventory_complete"])
+            self.assertFalse(scan["truncated"])
+            self.assertEqual(
+                len(list(storage.iter_inventory_entries("scan", kind="file"))), 8
+            )
+            self.assertEqual(scan["tree"]["children"], [])
+            root_page = storage.get_tree_page("scan", "physical", limit=10)
+            self.assertEqual(root_page["child_count"], 2)
+            self.assertEqual(len(root_page["children"]), 2)
+            full_tree = storage.build_inventory_tree("scan")
+            self.assertEqual(len(full_tree["children"]), 2)
+
     def test_operator_can_raise_file_boundary_above_legacy_fifty_thousand(self):
         with tempfile.TemporaryDirectory() as folder:
             result = scan_directory(Path(folder), max_files=100_001)

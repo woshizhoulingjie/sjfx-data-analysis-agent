@@ -98,6 +98,12 @@ def evidence_corpus(documents, scope="."):
                 "block_index": item.get("block_index"),
                 "char_start": item.get("char_start"),
                 "char_end": item.get("char_end"),
+                "preview_only": bool(item.get("preview_only")),
+                "preview_window": item.get("preview_window"),
+                "preview_window_char_start": item.get("preview_window_char_start"),
+                "preview_window_char_end": item.get("preview_window_char_end"),
+                "source_byte_start": item.get("source_byte_start"),
+                "source_byte_end": item.get("source_byte_end"),
                 "parser_version": item.get("parser_version"),
                 "evidence_quality": quality,
             })

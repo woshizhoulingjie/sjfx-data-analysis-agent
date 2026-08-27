@@ -35,6 +35,10 @@ _KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
 _HANGUL_RE = re.compile(r"[\uac00-\ud7af]")
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 _ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
+_THAI_RE = re.compile(r"[\u0e00-\u0e7f]")
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097f]")
+_HEBREW_RE = re.compile(r"[\u0590-\u05ff]")
+_GREEK_RE = re.compile(r"[\u0370-\u03ff]")
 _LATIN_RE = re.compile(r"[A-Za-z\u00c0-\u024f]")
 _WORD_RE = re.compile(r"[A-Za-z\u00c0-\u024f]+", re.UNICODE)
 _TOKEN_RE = re.compile(r"__SJFX_(?:TERM|KEEP)_\d{4}__")
@@ -43,6 +47,8 @@ _LANGUAGE_NAMES = {
     "zh": "中文", "en": "英语", "fr": "法语", "de": "德语",
     "es": "西班牙语", "it": "意大利语", "pt": "葡萄牙语",
     "ru": "俄语", "ja": "日语", "ko": "韩语", "ar": "阿拉伯语",
+    "nl": "荷兰语", "tr": "土耳其语", "pl": "波兰语",
+    "th": "泰语", "hi": "印地语", "he": "希伯来语", "el": "希腊语",
     "other": "其他外语", "mixed": "混合语言", "und": "未确定语言",
 }
 
@@ -53,6 +59,9 @@ _LATIN_STOPWORDS = {
     "es": {"el", "la", "los", "las", "de", "y", "es", "para", "en", "una", "un", "que"},
     "it": {"il", "lo", "la", "gli", "le", "di", "e", "è", "per", "in", "una", "che"},
     "pt": {"o", "a", "os", "as", "de", "e", "é", "para", "em", "uma", "um", "que"},
+    "nl": {"de", "het", "een", "en", "van", "is", "voor", "met", "dat", "in"},
+    "tr": {"ve", "bir", "bu", "için", "ile", "olan", "de", "da", "olarak"},
+    "pl": {"i", "w", "z", "na", "jest", "dla", "nie", "to", "że", "oraz"},
 }
 
 _KNOWN_ACRONYMS = {
@@ -101,7 +110,9 @@ def _other_alpha_count(value):
     known = (
         len(_HAN_RE.findall(text)) + len(_KANA_RE.findall(text))
         + len(_HANGUL_RE.findall(text)) + len(_CYRILLIC_RE.findall(text))
-        + len(_ARABIC_RE.findall(text)) + len(_LATIN_RE.findall(text))
+        + len(_ARABIC_RE.findall(text)) + len(_THAI_RE.findall(text))
+        + len(_DEVANAGARI_RE.findall(text)) + len(_HEBREW_RE.findall(text))
+        + len(_GREEK_RE.findall(text)) + len(_LATIN_RE.findall(text))
     )
     return max(0, sum(1 for char in text if char.isalpha()) - known)
 
@@ -150,6 +161,10 @@ def detect_language(text):
         "hangul": len(_HANGUL_RE.findall(value)),
         "cyrillic": len(_CYRILLIC_RE.findall(value)),
         "arabic": len(_ARABIC_RE.findall(value)),
+        "thai": len(_THAI_RE.findall(value)),
+        "devanagari": len(_DEVANAGARI_RE.findall(value)),
+        "hebrew": len(_HEBREW_RE.findall(value)),
+        "greek": len(_GREEK_RE.findall(value)),
         "latin": len(_LATIN_RE.findall(value)),
         "other": _other_alpha_count(value),
     }
@@ -175,6 +190,18 @@ def detect_language(text):
     elif counts["arabic"] == max(counts.values()) and counts["arabic"]:
         language = "ar"
         confidence = min(0.99, 0.75 + counts["arabic"] / float(letters) * 0.24)
+    elif counts["thai"] == max(counts.values()) and counts["thai"]:
+        language = "th"
+        confidence = min(0.99, 0.75 + counts["thai"] / float(letters) * 0.24)
+    elif counts["devanagari"] == max(counts.values()) and counts["devanagari"]:
+        language = "hi"
+        confidence = min(0.99, 0.75 + counts["devanagari"] / float(letters) * 0.24)
+    elif counts["hebrew"] == max(counts.values()) and counts["hebrew"]:
+        language = "he"
+        confidence = min(0.99, 0.75 + counts["hebrew"] / float(letters) * 0.24)
+    elif counts["greek"] == max(counts.values()) and counts["greek"]:
+        language = "el"
+        confidence = min(0.99, 0.75 + counts["greek"] / float(letters) * 0.24)
     elif counts["han"]:
         foreign_letters = letters - counts["han"]
         foreign_ratio = foreign_letters / float(letters)
@@ -250,6 +277,71 @@ def segment_text(text, max_chars=2400):
             cursor = end
         piece_start = piece_end
     return segments
+
+
+def _script_class(char):
+    """Return a routable script family for mixed-language splitting."""
+    if _HAN_RE.match(char):
+        return "han"
+    if _KANA_RE.match(char):
+        return "ja"
+    if _HANGUL_RE.match(char):
+        return "ko"
+    if _CYRILLIC_RE.match(char):
+        return "ru"
+    if _ARABIC_RE.match(char):
+        return "ar"
+    if _THAI_RE.match(char):
+        return "th"
+    if _DEVANAGARI_RE.match(char):
+        return "hi"
+    if _HEBREW_RE.match(char):
+        return "he"
+    if _GREEK_RE.match(char):
+        return "el"
+    if _LATIN_RE.match(char):
+        return "latin"
+    return None
+
+
+def split_mixed_text(text):
+    """Split a mixed-script unit while retaining exact source offsets."""
+    value = str(text or "")
+    if not value:
+        return []
+    pieces = []
+    start = 0
+    active = None
+    for index, char in enumerate(value):
+        script = _script_class(char)
+        if script is None:
+            continue
+        if active is None:
+            active = script
+            continue
+        if script == active:
+            continue
+        # Keep separators with the preceding run; this makes concatenation
+        # byte-for-byte stable and lets the service restore whitespace.
+        end = index
+        if end > start:
+            pieces.append({"start": start, "end": end, "text": value[start:end]})
+        start = index
+        active = script
+    if start < len(value):
+        pieces.append({"start": start, "end": len(value), "text": value[start:]})
+    return pieces or [{"start": 0, "end": len(value), "text": value}]
+
+
+def split_table_text(text):
+    """Split table cells from layout separators while preserving offsets."""
+    value = str(text or "")
+    if not value:
+        return []
+    pieces = []
+    for match in re.finditer(r"[^\t|\r\n]+|[\t|\r\n]+", value):
+        pieces.append({"start": match.start(), "end": match.end(), "text": match.group(0)})
+    return pieces
 
 
 @dataclass
@@ -770,11 +862,6 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
     for kind, value in (("title", title), ("body", body)):
         paragraph_index = 0
         for item in segment_text(value, max_chars=max_unit_chars):
-            detection = detect_language(item["text"])
-            memory_key = translation_memory_key(
-                item["text"], detection["language"], glossary=glossary,
-                target_language=target_language, contract_version=contract_version,
-            )
             if kind == "title":
                 block_kind = "title"
                 section = title or None
@@ -787,19 +874,35 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                     None,
                 )
                 unit_paragraph_index = paragraph_index
-            units.append({
-                "unit_id": _unit_id(kind, item["start"], item["end"], item["text"]),
-                "kind": kind, "start": item["start"], "end": item["end"],
-                "block_kind": block_kind, "section": section,
-                "paragraph_index": unit_paragraph_index,
-                "source_text": item["text"], "source_language": detection["language"],
-                "language_confidence": detection["confidence"],
-                "translation_required": detection["needs_translation"],
-                "memory_key": memory_key, "status": "pending" if detection["needs_translation"] else "not_required",
-                "target_text": None if detection["needs_translation"] else item["text"],
-                "attempts": 0, "model": None, "usage": {}, "qa": None,
-                "error": None, "retryable": True,
-            })
+            base_detection = detect_language(item["text"])
+            if block_kind == "table":
+                pieces = split_table_text(item["text"])
+            elif base_detection["language"] == "mixed":
+                pieces = split_mixed_text(item["text"])
+            else:
+                pieces = [{"start": 0, "end": len(item["text"]), "text": item["text"]}]
+            for piece in pieces:
+                piece_start = int(item["start"]) + int(piece["start"])
+                piece_end = int(item["start"]) + int(piece["end"])
+                piece_text = piece["text"]
+                detection = detect_language(piece_text)
+                memory_key = translation_memory_key(
+                    piece_text, detection["language"], glossary=glossary,
+                    target_language=target_language, contract_version=contract_version,
+                )
+                units.append({
+                    "unit_id": _unit_id(kind, piece_start, piece_end, piece_text),
+                    "kind": kind, "start": piece_start, "end": piece_end,
+                    "block_kind": block_kind, "section": section,
+                    "paragraph_index": unit_paragraph_index,
+                    "source_text": piece_text, "source_language": detection["language"],
+                    "language_confidence": detection["confidence"],
+                    "translation_required": detection["needs_translation"],
+                    "memory_key": memory_key, "status": "pending" if detection["needs_translation"] else "not_required",
+                    "target_text": None if detection["needs_translation"] else piece_text,
+                    "attempts": 0, "model": None, "usage": {}, "qa": None,
+                    "error": None, "retryable": True,
+                })
     return units
 
 
@@ -1019,7 +1122,7 @@ class TranslationService:
         })
         return True
 
-    def _translate_unit(self, unit, glossary):
+    def _translate_unit(self, unit, glossary, initial_response=None):
         source_text = unit["source_text"]
         leading_match = re.match(r"^\s*", source_text)
         trailing_match = re.search(r"\s*$", source_text)
@@ -1062,10 +1165,14 @@ class TranslationService:
         for _run_attempt in range(self.policy.max_attempts):
             unit["attempts"] = int(unit.get("attempts") or 0) + 1
             try:
-                response = _normalise_provider_response(self.provider.translate(
-                    protected.text, unit["source_language"], TARGET_LANGUAGE,
-                    glossary=glossary, timeout=self.policy.timeout_seconds, retries=0,
-                ))
+                if initial_response is not None:
+                    response = _normalise_provider_response(initial_response)
+                    initial_response = None
+                else:
+                    response = _normalise_provider_response(self.provider.translate(
+                        protected.text, unit["source_language"], TARGET_LANGUAGE,
+                        glossary=glossary, timeout=self.policy.timeout_seconds, retries=0,
+                    ))
                 try:
                     restored_core, qa = validate_response(response)
                 except TranslationQualityError as primary_error:
@@ -1147,7 +1254,10 @@ class TranslationService:
             target_language=TARGET_LANGUAGE,
             contract_version=self.policy.contract_version,
         )
-        if self.policy.coalesce_paragraphs:
+        if (
+            self.policy.coalesce_paragraphs
+            and getattr(self.provider, "preserves_line_breaks", True)
+        ):
             units = _coalesce_fast_paragraph_units(
                 units, self.policy.max_unit_chars, glossary,
                 self.policy.contract_version,
@@ -1191,7 +1301,10 @@ class TranslationService:
             checkpoint_callback(self._result(document, units, glossary, cancelled=False))
             last_checkpoint_at = time.monotonic()
 
-        for unit in units:
+        index = 0
+        while index < len(units):
+            unit = units[index]
+            index += 1
             if unit["status"] != "pending":
                 continue
             if cancel_check is not None and cancel_check():
@@ -1199,9 +1312,54 @@ class TranslationService:
                 break
             if budget is not None and invoked >= budget:
                 break
-            invoked += 1
-            succeeded = self._translate_unit(unit, glossary)
-            units_since_checkpoint += 1
+            batch_units = [unit]
+            batch_size = int(getattr(self.provider, "batch_size", 1) or 1)
+            if hasattr(self.provider, "translate_batch") and batch_size > 1:
+                while len(batch_units) < batch_size and index < len(units):
+                    candidate = units[index]
+                    if (
+                        candidate.get("status") == "pending"
+                        and candidate.get("source_language") == unit.get("source_language")
+                        and (budget is None or invoked + len(batch_units) < budget)
+                    ):
+                        batch_units.append(candidate)
+                        index += 1
+                    else:
+                        break
+            responses = None
+            if len(batch_units) > 1:
+                protected_texts = []
+                for batch_unit in batch_units:
+                    source_text = str(batch_unit.get("source_text") or "")
+                    leading_match = re.match(r"^\s*", source_text)
+                    trailing_match = re.search(r"\s*$", source_text)
+                    leading = leading_match.group(0) if leading_match else ""
+                    trailing = trailing_match.group(0) if trailing_match else ""
+                    core_end = len(source_text) - len(trailing) if trailing else len(source_text)
+                    core = source_text[len(leading):core_end]
+                    protected_texts.append(protect_text(core, glossary=glossary).text)
+                try:
+                    responses = self.provider.translate_batch(
+                        protected_texts, unit["source_language"], TARGET_LANGUAGE,
+                        glossary=glossary, timeout=self.policy.timeout_seconds, retries=0,
+                    )
+                    if len(responses) != len(batch_units):
+                        raise TranslationProviderError(
+                            "批量翻译返回数量不匹配", retryable=True, code="batch_response_mismatch"
+                        )
+                except Exception:
+                    responses = None
+            stop_after_batch = False
+            for offset, batch_unit in enumerate(batch_units):
+                invoked += 1
+                succeeded = self._translate_unit(
+                    batch_unit, glossary,
+                    initial_response=(responses[offset] if responses is not None else None),
+                )
+                units_since_checkpoint += 1
+                if not succeeded and (fail_fast or not batch_unit.get("retryable", True)):
+                    stop_after_batch = True
+                    break
             if (
                 checkpoint_callback is not None
                 and intermediate_checkpoints < checkpoint_cap
@@ -1217,7 +1375,7 @@ class TranslationService:
                     intermediate_checkpoints += 1
                     units_since_checkpoint = 0
                     last_checkpoint_at = now
-            if not succeeded and (fail_fast or not unit.get("retryable", True)):
+            if stop_after_batch:
                 break
 
         result = self._result(document, units, glossary, cancelled=cancelled)

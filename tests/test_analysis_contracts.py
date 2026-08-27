@@ -6,7 +6,10 @@ from unittest.mock import patch
 
 from services.evidence import compact_evidence, evidence_quality, verify_claim_evidence
 from services.folder_analysis import _normalize_question_answer_evidence
-from services.large_package import build_coverage, build_policy, file_fingerprint, representative_paths
+from services.large_package import (
+    build_coverage, build_policy, file_fingerprint, package_resource_plan,
+    representative_paths,
+)
 from services.package_analysis import _build_structured_overview
 from services.storage import Storage
 from services.reporting import _direction_candidates
@@ -35,12 +38,64 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertEqual(result["inventory_files"], 0)
         self.assertEqual(result["parsed_files"], 0)
 
-    def test_large_package_default_is_500_file_batches_until_exhausted(self):
+    def test_resource_plan_blocks_before_content_io_when_disks_are_too_small(self):
+        plan = package_resource_plan(
+            {"file_count": 50000, "total_size": 100 * 1024 ** 3},
+            state_free_bytes=1024 ** 3,
+            temp_free_bytes=5 * 1024 ** 3,
+            max_content_bytes=10 * 1024 ** 3,
+            temp_reserve_bytes=1024 ** 3,
+        )
+        self.assertFalse(plan["ready"])
+        self.assertIn("state_disk_insufficient", plan["blockers"])
+        self.assertIn("parse_scratch_insufficient", plan["blockers"])
+        self.assertEqual(plan["mandatory_hash_read_bytes"], 100 * 1024 ** 3)
+
+    def test_large_package_default_is_30_file_deep_batches_until_exhausted(self):
         policy = build_policy({"file_count": 3000, "total_size": 1})
         self.assertTrue(policy["enabled"])
-        self.assertEqual(policy["batch_files"], 500)
+        self.assertEqual(policy["batch_files"], 30)
+        self.assertGreaterEqual(policy["batch_files"], 20)
+        self.assertLessEqual(policy["batch_files"], 50)
         self.assertEqual(policy["batch_completion"], "continue_until_inventory_exhausted")
         self.assertEqual(policy["batch_checkpoint_scope"], "per_file")
+        self.assertEqual(policy["deep_batch_contract"], "one_durable_job_per_20_to_50_files")
+
+    def test_pipeline_coverage_keeps_all_nine_stages_separate(self):
+        workflow = {
+            "a.txt": {
+                "safety_status": "checked", "light_index_status": "ready",
+                "selection_state": "priority", "language_code": "zh",
+                "ocr_candidate": False,
+            },
+            "b.txt": {
+                "safety_status": "checked", "light_index_status": "ready",
+                "selection_state": "deferred", "language_code": "en",
+                "ocr_candidate": False,
+            },
+        }
+        documents = {
+            "a.txt": {
+                "text": "原文", "evidence": [{"evidence_id": "E1", "text": "原文"}],
+                "coverage": {"deep_parse_complete": True},
+            },
+            "b.txt": {"text": "preview", "coverage": {"preview_only": True}},
+        }
+        _for_paths, coverage = build_coverage(
+            self.scan, documents, policy={"mode": "large_package", "enabled": True},
+            workflow_states=workflow,
+            translation_states={"b.txt": {"status": "partial"}},
+        )
+        self.assertEqual(set(coverage["pipeline_coverage"]), {
+            "inventory", "safety", "light_index", "content_parse", "ocr",
+            "selection", "deep_analysis", "translation", "evidence_readiness",
+        })
+        self.assertTrue(coverage["light_index_coverage"]["complete"])
+        self.assertEqual(coverage["content_parse_ratio"], 0.5)
+        self.assertEqual(coverage["parsed_files"], 1)
+        self.assertEqual(coverage["document_records"], 2)
+        self.assertFalse(coverage["semantic_analysis_coverage"]["complete"])
+        self.assertFalse(coverage["translation_coverage"]["complete"])
 
     def test_question_contract_rejects_navigation_evidence(self):
         title = {"evidence_id": "E-title", "label": "title", "text": "开源软件的特点"}

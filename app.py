@@ -5,6 +5,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -28,7 +29,7 @@ from services.package_analysis import (
     analyze_package, checkpoint_fingerprint, refresh_package_coverage, _parse_with_limits,
     _restore_source_provenance, _secure_source_snapshot,
 )
-from services.large_package import inventory_by_path
+from services.large_package import inventory_by_path, package_resource_plan
 from services.reporting import (
     build_local_report,
     build_report_analysis_prompt,
@@ -36,12 +37,16 @@ from services.reporting import (
     merge_model_report,
 )
 from services.retrieval import evidence_corpus, retrieve_evidence
-from services.scanner import IGNORED_DIRS, IGNORED_FILES, human_size, resolve_under, scan_directory
+from services.scanner import (
+    IGNORED_DIRS, IGNORED_FILES, human_size, resolve_under, scan_directory,
+    scan_inventory_slice,
+)
 from services.storage import Storage
 from services.tree_editor import filter_tree
 from services.structured_qa import answer_question
 from services.unified_parser import UnifiedDocumentParser
 from services.agent_runtime import PydanticAgentRuntime
+from services.offline_translation import OfflineNLLBProvider
 from services.translation import (
     OllamaTranslationProvider,
     StorageTranslationMemory,
@@ -59,6 +64,7 @@ from services.conversation import (
     ConversationScope,
     ConversationSession,
 )
+from services.turn_runtime import AnalysisTurnRuntime
 from services.package_overview import build_package_overview_from_storage
 from services.package_exploration import preview_as_document
 
@@ -138,17 +144,42 @@ llm_transport = OllamaClient(
 ACTIVE_LLM_BACKEND = "ollama"
 llm_generation_enabled = Config.ENABLE_SHARED_OLLAMA
 llm = PydanticAgentRuntime(llm_transport)
-translation_transport = OllamaClient(
-    base_url=Config.TRANSLATION_OLLAMA_BASE_URL,
-    model=Config.TRANSLATION_OLLAMA_MODEL,
-    timeout=Config.TRANSLATION_TIMEOUT_SECONDS,
-    max_concurrency=1,
-)
-translation_provider = (
-    OllamaTranslationProvider(translation_transport)
-    if Config.ENABLE_TRANSLATION
-    else UnavailableTranslationProvider("翻译功能已由部署配置关闭")
-)
+translation_transport = None
+if Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "offline_nllb":
+    translation_model_path = Config.TRANSLATION_MODEL_PATH
+    try:
+        import ctranslate2  # Optional: the main environment may not have CT2 yet.
+        ct2_available = True
+    except Exception:
+        ct2_available = False
+    if (
+        getattr(Config, "TRANSLATION_PREFER_CT2", True)
+        and ct2_available
+        and os.path.isfile(os.path.join(Config.TRANSLATION_CT2_MODEL_PATH, "model.bin"))
+    ):
+        translation_model_path = Config.TRANSLATION_CT2_MODEL_PATH
+    translation_provider = OfflineNLLBProvider(
+        model_path=translation_model_path,
+        device=Config.TRANSLATION_DEVICE,
+        batch_size=Config.TRANSLATION_BATCH_SIZE,
+        cpu_threads=Config.TRANSLATION_CPU_THREADS,
+        max_input_tokens=Config.TRANSLATION_MAX_INPUT_TOKENS,
+        max_new_tokens=Config.TRANSLATION_MAX_NEW_TOKENS,
+    )
+elif Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "ollama":
+    translation_transport = OllamaClient(
+        base_url=Config.TRANSLATION_OLLAMA_BASE_URL,
+        model=Config.TRANSLATION_OLLAMA_MODEL,
+        timeout=Config.TRANSLATION_TIMEOUT_SECONDS,
+        max_concurrency=1,
+    )
+    translation_provider = OllamaTranslationProvider(translation_transport)
+elif Config.ENABLE_TRANSLATION:
+    translation_provider = UnavailableTranslationProvider(
+        "未知翻译提供者：{}".format(Config.TRANSLATION_PROVIDER)
+    )
+else:
+    translation_provider = UnavailableTranslationProvider("翻译功能已由部署配置关闭")
 translation_service = TranslationService(
     provider=translation_provider,
     memory=StorageTranslationMemory(storage),
@@ -161,7 +192,11 @@ translation_service = TranslationService(
     ),
     reviewer=(
         OllamaTranslationProvider(llm_transport)
-        if Config.ENABLE_TRANSLATION_REVIEW and llm_generation_enabled
+        if (
+            Config.TRANSLATION_PROVIDER == "ollama"
+            and Config.ENABLE_TRANSLATION_REVIEW
+            and llm_generation_enabled
+        )
         else None
     ),
 )
@@ -287,6 +322,7 @@ def require_scan(scan_id):
     scan = storage.get_scan(scan_id, owner_id=_request_owner_id())
     if not scan:
         raise ValueError("扫描任务不存在、已失效或不属于当前访问用户")
+    scan.setdefault("_scan_id", str(scan_id))
     return scan
 def _walk_analysis_nodes(node):
     """遍历分析树中的所有节点。"""
@@ -321,6 +357,11 @@ def _physical_scope_member_paths(scan, node_path):
     """Resolve one physical file/folder selection to safe relative file paths."""
     node_path = node_path or "."
     resolve_under(scan["root"], node_path)
+    if scan.get("inventory_mode") == "durable_paged_v1":
+        scan_id = scan.get("_scan_id") or scan.get("scan_id")
+        if not storage.get_inventory_entry(scan_id, node_path):
+            raise ValueError("选中的物理目录不存在")
+        return storage.inventory_paths_under(scan_id, node_path)
     found = None
     stack = [scan.get("tree") or {}]
     while stack:
@@ -340,6 +381,16 @@ def _physical_scope_member_paths(scan, node_path):
         else:
             stack.extend(reversed(node.get("children") or []))
     return sorted(set(paths))
+
+
+def _inventory_by_path(scan_result):
+    if scan_result.get("inventory_mode") == "durable_paged_v1":
+        scan_id = scan_result.get("_scan_id") or scan_result.get("scan_id")
+        return {
+            item["path"]: item["payload"]
+            for item in storage.iter_inventory_entries(scan_id, kind="file")
+        }
+    return inventory_by_path(scan_result)
 
 
 def _package_documents(scan_id, canonical_only=False):
@@ -828,6 +879,9 @@ def _documents_context(scan_id, node_path, scan_result, max_files=30, max_chars=
 
 
 def _physical_inventory_node(scan_result, node_path):
+    if scan_result.get("inventory_mode") == "durable_paged_v1":
+        scan_id = scan_result.get("_scan_id") or scan_result.get("scan_id")
+        return storage.get_inventory_entry(scan_id, node_path or ".")
     stack = [scan_result.get("tree") or {}]
     while stack:
         node = stack.pop()
@@ -985,6 +1039,8 @@ def _package_large_options():
         "preview_zip_member_bytes": Config.LARGE_PACKAGE_PREVIEW_ZIP_MEMBER_BYTES,
         "overview_chars_per_file": Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE,
         "overview_evidence_per_file": Config.LARGE_PACKAGE_OVERVIEW_EVIDENCE_PER_FILE,
+        "background_batch_files": Config.LARGE_PACKAGE_BACKGROUND_BATCH_FILES,
+        "background_backfill": Config.LARGE_PACKAGE_BACKGROUND_BACKFILL,
     }
 
 
@@ -992,6 +1048,7 @@ def _publish_analysis_progress(scan_id, scan_result, percent, message, stage="an
     """Publish a small, honest overview while the final analysis is running."""
     counts = storage.file_state_counts(scan_id)
     metrics = storage.file_state_metrics(scan_id)
+    workflow_counts = storage.file_workflow_counts(scan_id)
     inventory_files = max(0, int(scan_result.get("file_count") or 0))
     parsed_files = int(counts.get("completed") or 0) + int(counts.get("overview") or 0)
     failed_files = int(counts.get("failed") or 0)
@@ -1050,6 +1107,34 @@ def _publish_analysis_progress(scan_id, scan_result, percent, message, stage="an
             "pending_files": pending_files,
             "deep_analyzed_files": 0,
             "deep_analysis_finalized": False,
+            "pipeline_coverage": {
+                "inventory": {
+                    "complete": inventory_complete,
+                    "completed_files": inventory_files,
+                    "eligible_files": inventory_files,
+                },
+                "safety": {
+                    "completed_files": workflow_counts["safety_checked"],
+                    "eligible_files": inventory_files,
+                },
+                "light_index": {
+                    "completed_files": workflow_counts["light_ready"],
+                    "eligible_files": inventory_files,
+                },
+                "selection": {
+                    "completed_files": workflow_counts["total"],
+                    "eligible_files": inventory_files,
+                    "state_counts": workflow_counts["selection_states"],
+                },
+                "content_parse": {
+                    "completed_files": workflow_counts["parse_completed"],
+                    "eligible_files": inventory_files,
+                },
+                "evidence_readiness": {
+                    "completed_files": workflow_counts["evidence_ready"],
+                    "eligible_files": workflow_counts["parse_completed"],
+                },
+            },
             "complete_analysis": False,
             "limitations": limitations,
         },
@@ -1180,7 +1265,7 @@ def _run_claimed_export_job(job):
         node_id="combined-{}".format(scan_id),
         selection_metadata=context["selection_metadata"],
         selected_evidence_ids=context["selected_evidence_ids"],
-        inventory_metadata=inventory_by_path(scan_result),
+        inventory_metadata=_inventory_by_path(scan_result),
         file_states=state_by_path,
         progress_callback=export_progress,
         cancel_check=export_cancel_check,
@@ -1279,35 +1364,93 @@ def _run_claimed_analysis_job(job):
         target_paths=options.get("target_paths"),
         cancel_check=lambda: storage.is_job_cancel_requested(job_id),
         parse_mode_override=options.get("parse_mode"),
+        workflow_source=options.get("workflow_source"),
         analysis_translation=(
             lambda **kwargs: _prepare_import_translations(
                 scan_id, job_id=job_id, **kwargs
             )
         ) if Config.ENABLE_TRANSLATION and Config.ENABLE_IMPORT_TRANSLATION else None,
+        yield_check=lambda: storage.has_queued_job_above_priority(
+            int(job.get("priority") or 80)
+        ),
+        aggregation_depth=int(options.get("continuation_depth") or 0),
+        aggregation_interval=3,
     )
+    if analysis.get("_slice_incomplete"):
+        return {
+            "_requeue_slice": True,
+            "_requeue_message": "轻量预览与哈希检查点已保存，等待下一轮继续。",
+            "scan_id": scan_id,
+        }
     _ensure_job_active(job_id)
-    conversation_continuation = _continue_conversation_after_promotion(
-        job, analysis, scan_result,
-    )
-    storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
-    overview = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id)
+    workflow = analysis.get("workflow") or {}
+    continuation_job_id = None
+    remaining_priority_paths = list(workflow.get("remaining_priority_paths") or [])
+    if remaining_priority_paths:
+        next_options = dict(options)
+        next_options.update({
+            "target_paths": remaining_priority_paths,
+            "workflow_source": options.get("workflow_source") or "initial_overview",
+            "scope_label": options.get("scope_label") or "首版概览优先文件",
+            "continuation_depth": int(options.get("continuation_depth") or 0) + 1,
+        })
+        continuation_job_id = storage.create_job(
+            scan_id, options=next_options, task_type="analyze_package",
+            owner_id=job.get("owner_id") or "legacy",
+        )
+    background_job_id = None
+    if not continuation_job_id and workflow.get("background_batch_paths"):
+        background_options = {
+            "target_paths": list(workflow.get("background_batch_paths") or []),
+            "workflow_source": "background_backfill",
+            "scope_label": "后台覆盖扩展",
+            "parse_mode": "accurate",
+        }
+        background_job_id, _background_created = storage.create_or_get_typed_job(
+            scan_id,
+            options=background_options,
+            task_type="analyze_package",
+            owner_id=job.get("owner_id") or "legacy",
+        )
+    conversation_continuation = None
+    analysis_turn_continuation = None
+    if not continuation_job_id:
+        if options.get("conversation_turn_id"):
+            analysis_turn_continuation = _resume_conversation_turn_after_promotion(job)
+        else:
+            conversation_continuation = _continue_conversation_after_promotion(
+                job, analysis, scan_result,
+            )
+    overview = None
+    report_source = str(options.get("workflow_source") or "initial_overview")
+    # A continuation has already persisted its analysis/checkpoints. Generating
+    # a model-backed Word report for every 20-50 file slice makes one logical
+    # overview needlessly expensive and delays question-triggered promotion.
+    # Publish the report after the priority chain, while background/question
+    # slices remain visible through progressive analysis and coverage APIs.
+    if not continuation_job_id and report_source not in {
+        "background_backfill", "question_promotion",
+    }:
+        storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
+        overview = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id)
     _ensure_job_active(job_id)
     translation_job_ids = []
-    if Config.ENABLE_TRANSLATION:
-        for target_path in options.get("target_paths") or []:
-            translation_job_id, _translation_created = storage.create_or_get_typed_job(
-                scan_id, "translate_document",
-                options={"path": str(target_path), "require_full": True},
-                owner_id=job.get("owner_id") or "legacy",
-            )
-            translation_job_ids.append(translation_job_id)
-        if Config.AUTO_TRANSLATE_PACKAGES and not options.get("target_paths"):
-            translation_job_id, _translation_created = storage.create_or_get_typed_job(
-                scan_id, "translate_package",
-                options={"phase": "preview_and_priority", "cursor": 0},
-                owner_id=job.get("owner_id") or "legacy",
-            )
-            translation_job_ids.append(translation_job_id)
+    # Selected foreign documents already receive a durable working translation
+    # inside their deep-analysis batch. Only optional package-wide backfill is
+    # queued here; do not schedule every processed file a second time.
+    if (
+        Config.ENABLE_TRANSLATION and Config.AUTO_TRANSLATE_PACKAGES
+        and not options.get("target_paths")
+    ):
+        translation_job_id, _translation_created = storage.create_or_get_typed_job(
+            scan_id, "translate_package",
+            options={
+                "phase": "preview_and_priority", "cursor": 0,
+                "workflow_source": "translation_backfill",
+            },
+            owner_id=job.get("owner_id") or "legacy",
+        )
+        translation_job_ids.append(translation_job_id)
     return {
         "scan_id": scan_id,
         "analysis": analysis.get("statistics", {}),
@@ -1316,6 +1459,9 @@ def _run_claimed_analysis_job(job):
         "translation_job_id": translation_job_ids[0] if translation_job_ids else None,
         "translation_job_ids": translation_job_ids,
         "conversation_continuation": conversation_continuation,
+        "analysis_turn_continuation": analysis_turn_continuation,
+        "continuation_job_id": continuation_job_id,
+        "background_job_id": background_job_id,
     }
 
 
@@ -1453,16 +1599,31 @@ def _apply_import_translation_overlay(document, state, source_char_limit=None):
     return True
 
 
+def _translation_detection_sample(text, limit=24000):
+    """Sample head, middle and tail so foreign appendices are not skipped."""
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    window = max(2000, limit // 3)
+    middle = len(value) // 2
+    return value[:window] + "\n" + value[middle - window // 2:middle + window // 2] + "\n" + value[-window:]
+
+
 def _prepare_import_translations(scan_id, job_id, documents, policy, priority_paths,
                                  progress, cancel_check):
     """Translate a bounded foreign working set before semantic analysis."""
     large = bool((policy or {}).get("enabled"))
+    # Import translation is deliberately bounded independently from the large
+    # package parse batch. Full coverage continues in the background queue.
     file_limit = (
-        Config.IMPORT_TRANSLATION_LARGE_MAX_FILES
-        if large else Config.IMPORT_TRANSLATION_MAX_FILES
+        max(1, int(Config.IMPORT_TRANSLATION_LARGE_MAX_FILES))
+        if large else max(1, int(Config.IMPORT_TRANSLATION_MAX_FILES))
     )
     per_file_limit = Config.IMPORT_TRANSLATION_MAX_CHARS_PER_FILE
-    total_limit = Config.IMPORT_TRANSLATION_MAX_TOTAL_CHARS
+    total_limit = max(
+        Config.IMPORT_TRANSLATION_MAX_TOTAL_CHARS,
+        file_limit * per_file_limit if large else 0,
+    )
     priority_paths = set(priority_paths or [])
     candidates = []
     restricted = 0
@@ -1473,7 +1634,7 @@ def _prepare_import_translations(scan_id, job_id, documents, policy, priority_pa
             continue
         text = str(document.get("text") or "")
         title = str((document.get("structure") or {}).get("title") or source.get("name") or "")
-        detection = detect_language(title + "\n" + text[:20000])
+        detection = detect_language(title + "\n" + _translation_detection_sample(text))
         if not detection.get("needs_translation") or not text.strip():
             continue
         candidates.append((path not in priority_paths, path, document, detection))
@@ -1482,6 +1643,7 @@ def _prepare_import_translations(scan_id, job_id, documents, policy, priority_pa
     result_summary = {
         "enabled": True,
         "mode": "fast_pre_analysis",
+        "scope": "current_deep_batch" if large else "current_analysis_scope",
         "target_language": "zh-CN",
         "eligible_files": len(candidates),
         "translated_files": 0,
@@ -1634,7 +1796,7 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
 
 
 def _promote_for_translation(scan_id, scan_result, node_path, job_id):
-    inventory = inventory_by_path(scan_result)
+    inventory = _inventory_by_path(scan_result)
     file_node = inventory.get(node_path)
     if not file_node:
         raise ValueError("文件不在当前数据包清单中：{}".format(node_path))
@@ -1780,14 +1942,13 @@ def _run_claimed_scan_and_analyze_job(job):
     # A supervised 24-hour slice may end after inventory was committed.  On
     # the next slice, continue from file checkpoints instead of rescanning a
     # potentially slow NAS tree.
-    existing_scan = storage.get_scan(job_id, owner_id=options.get("owner_id") or job.get("owner_id"))
-    if existing_scan:
-        return _run_claimed_analysis_job({
-            "id": job_id, "scan_id": job_id, "options": {},
-            "owner_id": options.get("owner_id") or job.get("owner_id"),
-            "progress": job.get("progress") or 15,
-            "_progress_start": 15, "_progress_end": 95,
-        })
+    existing_scan = storage.get_scan(
+        job_id, owner_id=options.get("owner_id") or job.get("owner_id")
+    )
+    if existing_scan and existing_scan.get("inventory_complete"):
+        scan_result = existing_scan
+    else:
+        scan_result = None
 
     def scan_progress(file_count, directory_count=0, current_path=""):
         _ensure_job_active(job_id)
@@ -1804,18 +1965,56 @@ def _run_claimed_scan_and_analyze_job(job):
         current_stage="目录扫描", current_file=root_path,
     )
     resolved_root = _resolve_allowed_scan_root(root_path)
-    scan_result = scan_directory(
-        resolved_root, options.get("max_files", Config.MAX_SCAN_FILES),
-        max_depth=options.get("max_depth", Config.MAX_SCAN_DEPTH),
-        max_directories=Config.MAX_SCAN_DIRECTORIES,
-        max_nodes=Config.MAX_SCAN_NODES,
-        max_entries_per_directory=Config.MAX_SCAN_ENTRIES_PER_DIRECTORY,
-        activity_callback=scan_progress,
-        cancel_check=lambda: _ensure_job_active(job_id),
+    if scan_result is None:
+        saved_cursor = storage.get_inventory_cursor(job_id)
+        if saved_cursor:
+            saved_cursor.pop("status", None)
+        scan_slice = scan_inventory_slice(
+            resolved_root, cursor=saved_cursor,
+            slice_entries=Config.SCAN_SLICE_ENTRIES,
+            slice_seconds=Config.SCAN_SLICE_SECONDS,
+            max_depth=options.get("max_depth", Config.MAX_SCAN_DEPTH),
+            max_directories=Config.MAX_SCAN_DIRECTORIES,
+            max_nodes=Config.MAX_SCAN_NODES,
+            activity_callback=scan_progress,
+            cancel_check=lambda: _ensure_job_active(job_id),
+            yield_check=lambda: storage.has_queued_job_above_priority(
+                int(job.get("priority") or 100)
+            ),
+        )
+        scan_result = storage.save_inventory_slice(
+            job_id, resolved_root, scan_slice["cursor"], scan_slice["records"],
+            owner_id=options.get("owner_id") or job.get("owner_id") or "legacy",
+            parse_mode=options.get("parse_mode"), complete=scan_slice["complete"],
+        )
+        if not scan_slice["complete"]:
+            return {
+                "_requeue_slice": True,
+                "_requeue_message": "目录清单检查点已保存，等待下一轮续扫。",
+                "scan_id": job_id,
+                "inventory_files": int(scan_slice["cursor"].get("file_count") or 0),
+            }
+
+    resource_plan = package_resource_plan(
+        scan_result,
+        state_free_bytes=shutil.disk_usage(str(Path(Config.DB_PATH).parent)).free,
+        temp_free_bytes=shutil.disk_usage(str(Config.PARSE_TEMP_DIR)).free,
+        preview_bytes_per_file=Config.LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE,
+        preview_total_bytes=Config.LARGE_PACKAGE_PREVIEW_TOTAL_BYTES,
+        max_content_bytes=Config.MAX_CONTENT_BYTES,
+        temp_reserve_bytes=Config.PARSE_TEMP_DISK_RESERVE_BYTES,
     )
-    scan_result["parse_mode"] = "accurate" if options.get("parse_mode") == "accurate" else "fast"
-    scan_result["scan_id"] = job_id
-    storage.save_scan(scan_result, scan_id=job_id, owner_id=options.get("owner_id") or "legacy")
+    scan_result["resource_plan"] = resource_plan
+    storage.update_scan(job_id, scan_result)
+    if not resource_plan["ready"]:
+        return {
+            "_defer_slice": True,
+            "_defer_seconds": 300,
+            "_defer_message": "资源预检未通过：{}；释放空间后自动继续。".format(
+                "、".join(resource_plan["blockers"])
+            ),
+            "scan_id": job_id,
+        }
     try:
         _publish_analysis_progress(
             job_id, scan_result, 15,
@@ -1928,6 +2127,8 @@ def status():
                 "initial_parse_files": Config.LARGE_PACKAGE_INITIAL_PARSE_FILES,
                 "deepen_batch_files": Config.LARGE_PACKAGE_DEEPEN_BATCH_FILES,
                 "batch_files": Config.LARGE_PACKAGE_BATCH_FILES,
+                "background_batch_files": Config.LARGE_PACKAGE_BACKGROUND_BATCH_FILES,
+                "background_backfill": Config.LARGE_PACKAGE_BACKGROUND_BACKFILL,
                 "full_inventory_processing": False,
                 "full_inventory_preview": True,
                 "preview_bytes_per_file": Config.LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE,
@@ -1937,6 +2138,10 @@ def status():
             "translation": {
                 "enabled": Config.ENABLE_TRANSLATION,
                 "provider": translation_provider.provider_id,
+                "configured_provider": Config.TRANSLATION_PROVIDER,
+                "device": getattr(translation_provider, "device", "cpu") if Config.TRANSLATION_PROVIDER == "offline_nllb" else "local",
+                "batch_size": Config.TRANSLATION_BATCH_SIZE if Config.TRANSLATION_PROVIDER == "offline_nllb" else 1,
+                "cpu_threads": Config.TRANSLATION_CPU_THREADS if Config.TRANSLATION_PROVIDER == "offline_nllb" else None,
                 "max_unit_chars": Config.TRANSLATION_MAX_UNIT_CHARS,
                 "mode": "quality" if Config.TRANSLATION_REVIEW_COMPLEX_UNITS else "fast",
                 "paragraph_batching": Config.TRANSLATION_COALESCE_PARAGRAPHS,
@@ -2045,10 +2250,43 @@ def get_scan(scan_id):
                 "response_mode": "bounded",
             })
         scan_result = require_scan(scan_id)
+        if full_requested and scan_result.get("inventory_mode") == "durable_paged_v1":
+            scan_result["tree"] = storage.build_inventory_tree(scan_id) or scan_result.get("tree")
         scan_result["scan_id"] = scan_id
         return jsonify({"ok": True, "scan": scan_result, "summaries": storage.list_summaries(scan_id), "analysis": storage.get_analysis(scan_id)})
     except ValueError as exc:
         return api_error(str(exc), 404)
+
+
+@app.route("/api/file-workflow/<scan_id>")
+def get_file_workflow(scan_id):
+    """Return auditable per-file gate and state-machine records."""
+    try:
+        scan_result = require_scan(scan_id)
+        node_path = str(request.args.get("path") or "").strip()
+        if node_path:
+            if not _physical_inventory_node(scan_result, node_path):
+                raise ValueError("文件不在当前数据包清单中")
+            workflow = storage.get_file_workflow_state(scan_id, node_path)
+            return jsonify({
+                "ok": True,
+                "item": workflow,
+                "analysis_state": storage.get_file_state(scan_id, node_path),
+                "translation": storage.get_translation(scan_id, node_path, hydrate=False),
+            })
+        offset = max(0, int(request.args.get("offset", 0) or 0))
+        limit = max(1, min(500, int(request.args.get("limit", 100) or 100)))
+        selection_state = str(request.args.get("selection_state") or "").strip() or None
+        if selection_state and selection_state not in {
+            "priority", "deferred", "excluded", "pending_preview",
+        }:
+            raise ValueError("未知筛选状态")
+        page = storage.list_file_workflow_states_page(
+            scan_id, offset=offset, limit=limit, selection_state=selection_state,
+        )
+        return jsonify({"ok": True, **page})
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
 
 
 @app.route("/api/tree/<scan_id>")
@@ -2302,7 +2540,13 @@ def get_document(scan_id):
 
 
 class _ConversationTranslationAdapter:
+    def __init__(self):
+        self._cache = {}
+
     def translate(self, text, source_language=None, target_language="zh-CN", context=None):
+        key = (str(source_language or ""), str(target_language or "zh-CN"), str(text or ""))
+        if key in self._cache:
+            return self._cache[key]
         document = {
             "source": {"path": "conversation-evidence"},
             "structure": {"title": ""},
@@ -2312,7 +2556,12 @@ class _ConversationTranslationAdapter:
         if state.get("status") not in {"completed", "not_required"}:
             message = (state.get("errors") or [{}])[0].get("message") or "证据翻译失败"
             raise ValueError(message)
-        return state.get("translated_text")
+        translated = state.get("translated_text")
+        if translated:
+            if len(self._cache) >= 256:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = translated
+        return translated
 
 
 def _conversation_retrieve(retrieval_request):
@@ -2346,29 +2595,39 @@ def _conversation_retrieve(retrieval_request):
     result = retrieve_evidence(
         {}, query, top_k=retrieval_request.top_k, indexed_chunks=indexed,
     )
-    states = {}
-    source_set = set()
+    candidate_paths = []
+    for item in indexed:
+        evidence_path = str(item.get("source_path") or "")
+        physical_path = str(
+            item.get("archive_source_path") or evidence_path.split("::", 1)[0]
+        )
+        if physical_path and physical_path not in candidate_paths:
+            candidate_paths.append(physical_path)
+    states = storage.get_file_states(retrieval_request.scan_id, candidate_paths)
     for item in result.get("results") or []:
         evidence_path = str(item.get("source_path") or "")
         physical_path = str(
             item.get("archive_source_path") or evidence_path.split("::", 1)[0]
         )
         if physical_path:
-            source_set.add(physical_path)
-            state = storage.get_file_state(retrieval_request.scan_id, physical_path) or {}
-            states[physical_path] = state.get("status")
+            state = states.get(physical_path) or {}
             preview = storage.get_file_preview(retrieval_request.scan_id, physical_path) or {}
             item["source_language"] = (preview.get("language") or {}).get("code")
             item["analysis_level"] = "deep" if state.get("status") == "completed" else "preview"
-    deferred = sorted(path for path in source_set if states.get(path) != "completed")
-    deep_hits = len(source_set) - len(deferred)
+    deferred = [
+        path for path in candidate_paths
+        if (states.get(path) or {}).get("status") != "completed"
+    ]
+    deep_candidates = len(candidate_paths) - len(deferred)
     analysis = storage.get_analysis(retrieval_request.scan_id) or {}
     package_coverage = analysis.get("coverage") or {}
     result["coverage"] = {
         "total_files": package_coverage.get("inventory_files"),
         "searchable_files": package_coverage.get("parsed_files"),
         "deep_analyzed_files": package_coverage.get("deep_analyzed_files"),
-        "query_coverage": round(deep_hits / float(len(source_set) or 1), 6),
+        "candidate_files": len(candidate_paths),
+        "deep_candidate_files": deep_candidates,
+        "query_coverage": round(deep_candidates / float(len(candidate_paths) or 1), 6),
         "deferred_candidates": deferred[:24],
     }
     result["needs_promotion"] = bool(deferred)
@@ -2397,6 +2656,71 @@ conversation_engine = ConversationEngine(
     structured_qa=CallableStructuredQA(_conversation_structured),
     translator=_ConversationTranslationAdapter() if Config.ENABLE_TRANSLATION else None,
 )
+def _run_claimed_conversation_turn_job(job):
+    """Execute one durable analysis turn without holding a Web request open."""
+    options = dict(job.get("options") or {})
+    turn_id = str(options.get("turn_id") or "")
+    turn = storage.get_conversation_turn(turn_id, owner_id=job.get("owner_id"))
+    if not turn:
+        raise ValueError("交互式分析轮次不存在或不属于当前用户")
+    if turn.get("status") == "completed":
+        return {
+            "turn_id": turn_id,
+            "status": "already_completed",
+            "verification_status": (turn.get("verification") or {}).get("status"),
+        }
+    if turn.get("status") == "cancelled":
+        raise JobCancelled("本轮分析已经取消")
+    _ensure_job_active(job["id"])
+    stored = storage.get_conversation(
+        turn["session_id"], turn["owner_id"], scan_id=turn["scan_id"]
+    )
+    if not stored:
+        raise ValueError("交互式分析会话不存在")
+    # The durable user message and assistant placeholder already belong to this
+    # turn. Excluding them prevents the engine from treating the same question
+    # as a follow-up and prevents automatic continuation from duplicating it.
+    stored = dict(stored)
+    stored["messages"] = [
+        message for message in stored.get("messages") or []
+        if str((message.get("metadata") or {}).get("turn_id") or "") != turn_id
+    ]
+    session = ConversationSession.from_dict(stored)
+    scope = ConversationScope.from_dict(turn.get("scope") or session.scope.as_dict())
+    scan_result = require_scan(turn["scan_id"])
+    turn["job_id"] = job["id"]
+    storage.update_conversation_turn(turn_id, job_id=job["id"])
+    result = AnalysisTurnRuntime(
+        storage,
+        conversation_engine,
+        batch_size=Config.CONVERSATION_ANALYSIS_BATCH_FILES,
+        max_candidate_evidence=Config.CONVERSATION_MAX_CANDIDATE_EVIDENCE,
+        max_revision_attempts=Config.CONVERSATION_MAX_REVISION_ATTEMPTS,
+        cancel_check=lambda: _ensure_job_active(job["id"]),
+    ).execute(
+        turn, session, scope, inventory_paths=list(_inventory_by_path(scan_result)),
+    )
+    _ensure_job_active(job["id"])
+    return result
+
+
+def _resume_conversation_turn_after_promotion(job):
+    options = dict(job.get("options") or {})
+    turn_id = str(options.get("conversation_turn_id") or "")
+    if not turn_id:
+        return None
+    turn = storage.get_conversation_turn(turn_id, owner_id=job.get("owner_id"))
+    if not turn:
+        return {"status": "turn_missing", "turn_id": turn_id}
+    queued_job_id = storage.replace_conversation_turn_job(
+        turn_id, job.get("owner_id") or "legacy",
+        message="补充深析完成，继续执行原分析任务",
+    )
+    return {
+        "status": "resumed" if queued_job_id else "not_resumed",
+        "turn_id": turn_id,
+        "job_id": queued_job_id,
+    }
 
 
 def _continue_conversation_after_promotion(job, analysis, scan_result):
@@ -2436,7 +2760,7 @@ def _continue_conversation_after_promotion(job, analysis, scan_result):
     depth = max(0, int(options.get("conversation_continuation_depth") or 0))
     promotion = turn.get("promotion_request") or {}
     if promotion.get("required") and depth < 3:
-        inventory_paths = set(inventory_by_path(scan_result))
+        inventory_paths = set(_inventory_by_path(scan_result))
         current_targets = set(str(path) for path in options.get("target_paths") or [])
         requested = [
             path for path in promotion.get("candidate_paths") or []
@@ -2449,6 +2773,7 @@ def _continue_conversation_after_promotion(job, analysis, scan_result):
                 job.get("scan_id"), "analyze_package",
                 options={
                     "target_paths": requested,
+                    "workflow_source": "question_promotion",
                     "scope_label": "问答补充深析：{}".format(question[:120]),
                     "parse_mode": "accurate",
                     "conversation_session_id": session_id,
@@ -2475,7 +2800,7 @@ def _continue_conversation_after_promotion(job, analysis, scan_result):
 def _scope_paths_from_storage(scan_id, scan_result, kind, value, constraints):
     """Resolve a logical overview selection to every matching physical file."""
     constraints = dict(constraints or {})
-    inventory = inventory_by_path(scan_result)
+    inventory = _inventory_by_path(scan_result)
     records = {path: dict(node or {}) for path, node in inventory.items()}
     for item in storage.iter_file_previews(scan_id):
         path = str(item.get("path") or "")
@@ -2655,74 +2980,134 @@ def get_conversation(session_id):
         )
         if not payload:
             return api_error("会话不存在", 404)
-        return jsonify({"ok": True, "session": payload})
+        owner_id = _request_owner_id() or "legacy"
+        return jsonify({
+            "ok": True,
+            "session": payload,
+            "turns": storage.list_conversation_turns(session_id, owner_id),
+            "research_memory": storage.get_conversation_research_memory(session_id),
+        })
     except ValueError as exc:
         return api_error(str(exc), 404)
 
 
-@app.route("/api/conversation/<session_id>/messages", methods=["POST"])
-def conversation_message(session_id):
+@app.route("/api/conversation/<session_id>/turns", methods=["POST"])
+def create_conversation_turn(session_id):
     payload = request.get_json(silent=True) or {}
+    owner_id = _request_owner_id() or "legacy"
     try:
         scan_id = str(payload.get("scan_id") or "")
         scan_result = require_scan(scan_id)
-        stored = storage.get_conversation(
-            session_id, _request_owner_id() or "legacy", scan_id=scan_id,
-        )
+        stored = storage.get_conversation(session_id, owner_id, scan_id=scan_id)
         if not stored:
             return api_error("会话不存在", 404)
         question = str(payload.get("question") or "").strip()
         if not question or len(question) > 8000:
             raise ValueError("问题不能为空且不能超过 8000 字符")
-        session = ConversationSession.from_dict(stored)
-        turn_scope = None
-        if payload.get("scope") is not None:
-            turn_scope = _resolved_conversation_scope(scan_id, scan_result, payload.get("scope") or {})
-        analysis = storage.get_analysis(scan_id) or {}
-        turn = conversation_engine.ask(
-            session,
-            question,
-            scope=turn_scope,
-            coverage=analysis.get("coverage") or {},
+        scope_payload = payload.get("scope")
+        if scope_payload is None:
+            scope = ConversationScope.from_dict(stored.get("scope") or {})
+        else:
+            scope = _resolved_conversation_scope(scan_id, scan_result, scope_payload or {})
+        turn, created = storage.create_conversation_turn(
+            session_id, scan_id, owner_id, question, scope.as_dict(),
             persist_scope=bool(payload.get("persist_scope")),
+            idempotency_key=payload.get("idempotency_key"),
         )
-        # The continuation Worker must see the triggering exchange before a
-        # promotion job can become claimable. Saving again after enqueueing can
-        # overwrite a fast continuation with this older in-memory snapshot.
-        storage.save_conversation(session.as_dict(), _request_owner_id() or "legacy")
-        promotion = turn.get("promotion_request") or {}
-        promotion_job_id = None
-        if promotion.get("required"):
-            inventory_paths = set(inventory_by_path(scan_result))
-            requested = [
-                path for path in promotion.get("candidate_paths") or []
-                if path in inventory_paths
-            ][: max(1, int(promotion.get("desired_file_count") or 12))]
-            if requested:
-                promotion_job_id, _promotion_created = storage.create_or_get_typed_job(
-                    scan_id, "analyze_package",
-                    options={
-                        "target_paths": requested,
-                        "scope_label": "问答补充深析：{}".format(question[:120]),
-                        "parse_mode": "accurate",
-                        "conversation_session_id": session_id,
-                        "conversation_question": question,
-                        "conversation_scope": (turn_scope or session.scope).as_dict(),
-                        "conversation_trigger_message_id": turn.get("message_id"),
-                        "conversation_continuation_depth": 0,
-                    },
-                    owner_id=_request_owner_id() or "legacy",
-                )
-                turn["promotion_job_id"] = promotion_job_id
-                turn["status"] = "promotion_queued"
+        session_payload = storage.get_conversation(session_id, owner_id, scan_id=scan_id)
         return jsonify({
             "ok": True,
             "turn": turn,
-            "session": session.as_dict(),
-            "promotion_job_id": promotion_job_id,
-        })
+            "session": session_payload,
+            "job_id": turn.get("job_id"),
+            "created": created,
+        }), 202 if created else 200
     except ValueError as exc:
         return api_error(str(exc), 400)
+
+
+@app.route("/api/turns/<turn_id>")
+def get_conversation_turn(turn_id):
+    owner_id = _request_owner_id() or "legacy"
+    turn = storage.get_conversation_turn(turn_id, owner_id=owner_id)
+    if not turn:
+        return api_error("分析轮次不存在", 404)
+    session = storage.get_conversation(
+        turn["session_id"], owner_id, scan_id=turn["scan_id"]
+    )
+    return jsonify({
+        "ok": True,
+        "turn": turn,
+        "steps": storage.list_conversation_turn_steps(turn_id),
+        "session": session,
+    })
+
+
+@app.route("/api/turns/<turn_id>/events")
+def get_conversation_turn_events(turn_id):
+    try:
+        after = max(0, int(request.args.get("after", 0) or 0))
+    except (TypeError, ValueError):
+        after = 0
+    events = storage.get_conversation_turn_events(
+        turn_id, _request_owner_id() or "legacy", after=after,
+    )
+    if events is None:
+        return api_error("分析轮次不存在", 404)
+    return jsonify({
+        "ok": True,
+        "items": events,
+        "next_after": events[-1]["event_id"] if events else after,
+    })
+
+
+@app.route("/api/turns/<turn_id>/cancel", methods=["POST"])
+def cancel_conversation_turn(turn_id):
+    owner_id = _request_owner_id() or "legacy"
+    turn = storage.get_conversation_turn(turn_id, owner_id=owner_id)
+    if not turn:
+        return api_error("分析轮次不存在", 404)
+    if turn.get("status") in {"completed", "failed", "cancelled"}:
+        return jsonify({"ok": True, "turn": turn})
+    for job_id in (turn.get("job_id"), turn.get("promotion_job_id")):
+        if job_id:
+            storage.cancel_job(job_id)
+    turn = storage.update_conversation_turn(
+        turn_id, status="cancelled", stage="cancelled", progress=100,
+        message="用户已取消本轮分析", event_type="cancelled",
+    )
+    storage.set_conversation_turn_message(
+        turn_id, "本轮分析已取消。", "cancelled", "cancelled", 100
+    )
+    return jsonify({"ok": True, "turn": turn})
+
+
+@app.route("/api/turns/<turn_id>/retry", methods=["POST"])
+def retry_conversation_turn(turn_id):
+    owner_id = _request_owner_id() or "legacy"
+    turn = storage.get_conversation_turn(turn_id, owner_id=owner_id)
+    if not turn:
+        return api_error("分析轮次不存在", 404)
+    if turn.get("status") not in {"failed", "cancelled"}:
+        return api_error("只有失败或已取消的分析可以重试", 409)
+    job_id = storage.replace_conversation_turn_job(
+        turn_id, owner_id, message="用户已重新提交本轮分析", force=True,
+    )
+    if not job_id:
+        return api_error("无法重新提交本轮分析", 409)
+    return jsonify({
+        "ok": True,
+        "turn": storage.get_conversation_turn(turn_id, owner_id=owner_id),
+        "job_id": job_id,
+    }), 202
+
+
+@app.route("/api/conversation/<session_id>/messages", methods=["POST"])
+def conversation_message(session_id):
+    # Backwards-compatible alias.  Older clients used /messages, but the
+    # durable /turns endpoint is the single source of truth for idempotency,
+    # Worker execution, cancellation, retries and promotion continuation.
+    return create_conversation_turn(session_id)
 
 
 @app.route("/api/translations/<scan_id>")
@@ -2753,7 +3138,7 @@ def document_translation(scan_id):
             payload = request.get_json(silent=True) or {}
             node_path = str(payload.get("path") or "")
             resolve_under(scan_result["root"], node_path)
-            if node_path not in inventory_by_path(scan_result):
+            if not _physical_inventory_node(scan_result, node_path):
                 raise ValueError("文件不在当前数据包中")
             job_id, _created = storage.create_or_get_typed_job(
                 scan_id, "translate_document",
@@ -3201,7 +3586,10 @@ def retry_failed(scan_id):
         target_paths = sorted(failed_paths & set(requested)) if isinstance(requested, list) else sorted(failed_paths)
         if not target_paths:
             return jsonify({"ok": True, "accepted": False, "message": "当前没有可重试的失败文件", "failed_files": 0})
-        options = {"target_paths": target_paths, "scope_label": "失败文件重试", "retry_failed": True}
+        options = {
+            "target_paths": target_paths, "scope_label": "失败文件重试",
+            "retry_failed": True, "workflow_source": "manual_selection",
+        }
         job_id, created = storage.create_or_get_typed_job(scan_id, "analyze_package", options=options, owner_id=_request_owner_id() or "legacy")
         return jsonify({"ok": True, "accepted": True, "job_id": job_id, "reused_active_job": not created, "retry_files": len(target_paths), "status_url": "/api/jobs/{}".format(job_id)}), 202
     except ValueError as exc:
@@ -3230,6 +3618,7 @@ def analyze_scope():
             "target_paths": member_paths,
             "scope_label": label,
             "parse_mode": "accurate" if payload.get("parse_mode") != "fast" else "fast",
+            "workflow_source": "manual_selection",
         })
         return jsonify({
             "ok": True, "job_id": job_id, "reused_active_job": not created,
@@ -3396,7 +3785,7 @@ def summarize():
                 or document_coverage.get("limited_by_fast_mode")
                 or document_coverage.get("overview_sampled")
             )
-            source_node = inventory_by_path(scan_result).get(node_path)
+            source_node = _inventory_by_path(scan_result).get(node_path)
             if not source_node:
                 raise ValueError("文件不在本次安全清点范围内")
             if needs_deep_parse or not unified_document:

@@ -794,3 +794,79 @@ python -m unittest discover -s tests -v
 - 系统聚焦资料理解和分析交接，不替代最终报告责任人对事实、版权、保密和引用的审查。
 
 仓库地址：[woshizhoulingjie/sjfx-data-analysis-agent](https://github.com/woshizhoulingjie/sjfx-data-analysis-agent)
+
+## 14. 交互式对话与离线翻译
+
+当前交互式对话采用“意图识别 → 有界检索 → 证据回答 → 引用校验”流程。用户可直接输入自然语言指令，例如：
+
+```text
+帮我找出数据包中关于供应链风险的文件，并总结主要问题
+翻译并总结这份阿拉伯语报告
+比较两份报告在时间和责任方面的差异
+重新说明上一轮提到的风险
+```
+
+### 对话执行架构
+
+```text
+用户指令
+    ↓
+IntentRouter / AnalysisPlanner
+    ↓
+当前范围和多轮上下文解析
+    ↓
+EvidenceRetriever（BM25/FTS + 证据质量筛选）
+    ↓
+原文证据 + 已有中文工作译本
+    ↓
+本地 Ollama 回答模型 / 结构化确定性计算
+    ↓
+ClaimVerifier 校验、引用和覆盖率
+```
+
+对于“翻译并总结”等组合指令，系统会使用统一的 `multi_task` 流程，不会丢失检索证据或只执行其中一个任务。短追问会继承上一轮的意图和主题范围，长指令最多支持 8000 字符。
+
+### 任务与性能边界
+
+- 普通事实问答、翻译和简单总结走有界检索快速路径，不会对整个数据包建立批量中间结果。
+- 结构化统计、跨文件比较、时间线、关系、风险和矛盾分析才会启动深度批处理。
+- 每轮使用持久化 Worker 执行，支持进度、取消、重试、补充深析和重启恢复。
+- `/api/conversation/<session_id>/turns` 是标准接口；旧的 `/messages` 路由仅作兼容别名，不再绕过 Worker。
+- 前端为一次逻辑发送保留同一个 `idempotency_key`，网络重试不会重复创建对话轮次。
+
+### 离线翻译
+
+外文文档在导入后生成中文工作译本，原文始终作为最终证据：
+
+```text
+解析/OCR
+  ↓
+语言检测与安全切分
+  ↓
+NLLB-200 distilled 600M（CTranslate2 INT8）
+  ↓
+译文质量检查
+  ↓
+SQLite document_translations + 原文/译文 sidecar
+  ↓
+中文工作译本供对话和大模型分析使用
+```
+
+默认配置为 `offline_nllb:600m:ct2-int8` + CPU，批量大小为 4，CPU 线程为 4，不占用共享 GPU。大数据包导入期只翻译有界工作集，全文补齐由后台任务执行。翻译失败会保留原文并标记真实状态，不会伪造完成。
+
+### 安全运行原则
+
+- Web 和 Worker 分别在 `sjfx-web.service` 与 `sjfx-worker.service` 中运行，默认只允许一个 Worker。
+- 文档解析、OCR、翻译均限制为 CPU，共享 Ollama embedding 默认关闭。
+- 数据库、译文 sidecar、模型和用户输出均不提交到 GitHub；只提交源代码、测试和部署说明。
+
+### 对话模块验收
+
+```bash
+PYTHONPATH=. CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=4 \
+  .venv/bin/python -m pytest -q \
+  tests/test_conversation.py tests/test_analysis_turns.py \
+  tests/test_engineering_v2_storage.py tests/test_engineering_v2_frontend.py
+```
+
+建议额外验证阿拉伯语、泰语、印地语、中阿混合文、长指令、结构化统计、网络重试和 Worker 重启恢复。

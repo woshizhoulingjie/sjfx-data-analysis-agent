@@ -29,6 +29,7 @@
     scanId: '', overview: null, researchBrief: null, reportArtifact: null,
     selectedScope: null, overviewLoading: false,
     conversation: null, conversationList: [], turns: new Map(), conversationSending: false,
+    conversationPending: null,
     translationItems: [], translationCounts: {}, translationPath: '', translationView: 'translated',
     translationOffset: 0, translationPage: null, translationLoading: false,
     watchers: new Map(), scopeConstraints: {}
@@ -641,6 +642,67 @@
     return `<div class="v2-citation"><strong>${escapeHtml(citation.citation_label || '')} ${escapeHtml(citation.source_path || '未知来源')}</strong><small>${escapeHtml(location)} · ${escapeHtml(citation.evidence_role || '直接证据')}</small>${translated}${original}<button type="button" class="text-button" data-citation-translation="${escapeHtml(citation.source_path || '')}">在翻译页打开</button></div>`;
   }
 
+  function analysisTurnStatusLabel(status) {
+    return {
+      queued: '等待分析', running: '正在分析', waiting_for_deep_analysis: '正在补充深析',
+      pending: '等待执行', completed: '分析完成', failed: '分析失败', cancelled: '已取消',
+      skipped: '已跳过'
+    }[status] || status || '等待分析';
+  }
+
+  function analysisTurnStageLabel(stage) {
+    return {
+      queued: '等待执行', understanding: '理解指令', planning: '制定计划',
+      retrieving: '检索资料', batching: '分批归并', tool_execution: '专业工具分析',
+      waiting_for_deep_analysis: '补充深析', executing: '执行分析',
+      verifying: '核验结论', repairing: '补检索并修正', completed: '分析完成',
+      failed: '分析失败', cancelled: '已取消'
+    }[stage] || stage || '等待执行';
+  }
+
+  function analysisQualityMarkup(turn) {
+    const metrics = turn && turn.quality_metrics;
+    if (!metrics || typeof metrics !== 'object') return '';
+    const ratio = metrics.claim_support_ratio == null ? null : numeric(metrics.claim_support_ratio);
+    const coverage = metrics.query_coverage == null ? null : numeric(metrics.query_coverage);
+    const values = [
+      ['候选文件', integer(metrics.candidate_files)],
+      ['已检查', integer(metrics.inspected_files)],
+      ['分析批次', integer(metrics.batch_count)],
+      ['引用', integer(metrics.citation_count)],
+      ['结论支持率', ratio == null ? '待核验' : `${Math.round(ratio * 100)}%`],
+      ['无证据结论', integer(metrics.unsupported_claim_count)],
+      ['反证', integer(metrics.counter_evidence_count)],
+      ['矛盾', integer(metrics.contradiction_count)],
+      ['未解析文件', integer(metrics.unparsed_files)]
+    ];
+    if (coverage != null) values.splice(4, 0, ['查询覆盖率', `${Math.round(coverage * 100)}%`]);
+    const status = { verified: '核验通过', partial: '部分通过', insufficient_evidence: '证据不足', not_required: '无需核验' }[metrics.verification_status] || metrics.verification_status || '待核验';
+    return `<section class="v2-quality" aria-label="分析质量"><header><strong>分析质量</strong><span>${escapeHtml(status)}</span></header><div>${values.map(([label, value]) => `<dl><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></dl>`).join('')}</div></section>`;
+  }
+
+  function registerAnalysisTurn(turn, steps) {
+    if (!turn || !turn.assistant_message_id) return;
+    const result = turn.result && typeof turn.result === 'object' ? turn.result : {};
+    state.turns.set(turn.assistant_message_id, {
+      ...result,
+      turn_id: turn.id,
+      status: turn.status,
+      stage: turn.stage,
+      progress: numeric(turn.progress),
+      error: turn.error,
+      job_id: turn.job_id,
+      promotion_job_id: turn.promotion_job_id,
+      plan: turn.plan,
+      verification: turn.verification,
+      steps: steps || turn.steps || []
+    });
+  }
+
+  function registerAnalysisTurns(turns) {
+    (turns || []).forEach((turn) => registerAnalysisTurn(turn, turn.steps));
+  }
+
   function messageMarkup(message) {
     const role = message.role === 'user' ? 'user' : 'assistant';
     const turn = state.turns.get(message.message_id);
@@ -653,8 +715,13 @@
     }
     const meta = role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intent || '资料回答')}</span>${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${turn && turn.evidence_status ? `<span>证据：${escapeHtml(turn.evidence_status)}</span>` : ''}</div>` : '';
     const content = role === 'assistant' ? safeMarkdown(message.content || '') : `<p>${escapeHtml(message.content || '')}</p>`;
-    const actions = role === 'assistant' ? `<div class="v2-message-actions"><button type="button" data-copy-message="${escapeHtml(message.message_id || '')}">复制</button><button type="button" data-regenerate-message="${escapeHtml(message.message_id || '')}">再次回答</button></div>` : '';
-    return `<div class="v2-message ${role}" data-message-id="${escapeHtml(message.message_id || '')}"><div class="v2-message-card"><div class="v2-message-content">${content}</div>${meta}${evidence}${actions}</div></div>`;
+    const running = turn && ['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status);
+    const retryable = turn && ['failed', 'cancelled'].includes(turn.status);
+    const progress = running ? `<div class="v2-turn-progress" role="status"><div><span>${escapeHtml(analysisTurnStageLabel(turn.stage))}</span><b>${Math.round(numeric(turn.progress))}%</b></div><progress max="100" value="${Math.round(numeric(turn.progress))}"></progress></div>` : '';
+    const quality = role === 'assistant' && turn ? analysisQualityMarkup(turn) : '';
+    const steps = turn && Array.isArray(turn.steps) && turn.steps.length ? `<details class="v2-analysis-steps"><summary>查看分析步骤</summary>${turn.steps.map((step) => `<div class="v2-analysis-step ${escapeHtml(step.status || 'pending')}"><span>${escapeHtml(step.action || step.tool || '')}</span><b>${escapeHtml(analysisTurnStatusLabel(step.status))}</b></div>`).join('')}</details>` : '';
+    const actions = role === 'assistant' ? `<div class="v2-message-actions"><button type="button" data-copy-message="${escapeHtml(message.message_id || '')}">复制</button>${running ? `<button type="button" data-cancel-turn="${escapeHtml(turn.turn_id || '')}">停止分析</button>` : ''}${retryable ? `<button type="button" data-retry-turn="${escapeHtml(turn.turn_id || '')}">重新分析</button>` : `<button type="button" data-regenerate-message="${escapeHtml(message.message_id || '')}">再次回答</button>`}</div>` : '';
+    return `<div class="v2-message ${role}" data-message-id="${escapeHtml(message.message_id || '')}"><div class="v2-message-card"><div class="v2-message-content">${content}</div>${progress}${meta}${quality}${steps}${evidence}${actions}</div></div>`;
   }
 
   function renderConversation() {
@@ -697,7 +764,9 @@
       const response = await api(`/api/conversation/${encodeURIComponent(sessionId)}?scan_id=${encodeURIComponent(state.scanId)}`);
       state.conversation = response.session;
       state.turns.clear();
+      registerAnalysisTurns(response.turns || []);
       renderConversation();
+      (response.turns || []).filter((turn) => ['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status)).forEach((turn) => watchAnalysisTurn(turn.id));
     } catch (error) { notify(error.message || '无法打开会话', true); }
   }
 
@@ -755,6 +824,68 @@
     });
   }
 
+  function watchAnalysisTurn(turnId) {
+    if (!turnId) return;
+    const key = `analysis-turn-${turnId}`;
+    const token = `${Date.now()}-${Math.random()}`;
+    state.watchers.set(key, token);
+    const host = $('conversationDeepeningState');
+    (async () => {
+      for (let attempt = 0; attempt < 1800 && state.watchers.get(key) === token; attempt += 1) {
+        try {
+          const response = await api(`/api/turns/${encodeURIComponent(turnId)}`);
+          const turn = response.turn || {};
+          if (response.session) state.conversation = response.session;
+          registerAnalysisTurn(turn, response.steps || []);
+          const progress = Math.round(numeric(turn.progress));
+          if (['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status)) {
+            host.className = 'v2-job-state is-running';
+            host.textContent = `${analysisTurnStageLabel(turn.stage)} · ${progress}%`;
+          } else if (turn.status === 'completed') {
+            host.className = 'v2-job-state is-complete';
+            host.textContent = '分析完成，结论与引用已保存。';
+          } else {
+            host.className = 'v2-job-state is-error';
+            host.textContent = `${analysisTurnStatusLabel(turn.status)}${turn.error ? `：${turn.error}` : ''}`;
+          }
+          renderConversation();
+          if (['completed', 'failed', 'cancelled'].includes(turn.status)) {
+            state.watchers.delete(key);
+            await loadConversationList();
+            return;
+          }
+        } catch (error) {
+          host.className = 'v2-job-state is-error';
+          host.textContent = `分析状态暂时无法读取：${error.message}`;
+        }
+        await wait(2000);
+      }
+    })();
+  }
+
+  async function cancelAnalysisTurn(turnId) {
+    if (!turnId) return;
+    try {
+      const response = await api(`/api/turns/${encodeURIComponent(turnId)}/cancel`, {
+        method: 'POST', body: '{}'
+      });
+      registerAnalysisTurn(response.turn, []);
+      if (state.conversation) await openConversation(state.conversation.session_id);
+    } catch (error) { notify(error.message || '停止分析失败', true); }
+  }
+
+  async function retryAnalysisTurn(turnId) {
+    if (!turnId) return;
+    try {
+      const response = await api(`/api/turns/${encodeURIComponent(turnId)}/retry`, {
+        method: 'POST', body: '{}'
+      });
+      registerAnalysisTurn(response.turn, []);
+      if (state.conversation) await openConversation(state.conversation.session_id);
+      watchAnalysisTurn(turnId);
+    } catch (error) { notify(error.message || '重新分析失败', true); }
+  }
+
   async function sendQuestion(questionOverride) {
     if (!state.conversation || state.conversationSending) return;
     const question = String(questionOverride || $('conversationQuestion').value || '').trim();
@@ -762,32 +893,43 @@
     let turnScope;
     try { turnScope = conversationScope(); } catch (error) { notify(error.message, true); return; }
     state.conversationSending = true;
+    // Keep one idempotency key for this logical send operation.  A transient
+    // network failure can therefore be retried without creating a duplicate
+    // conversation turn on the server.
+    const pending = state.conversationPending;
+    const idempotencyKey = pending && pending.question === question
+      ? pending.key
+      : `${state.conversation.session_id}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    state.conversationPending = { key: idempotencyKey, question };
     $('conversationQuestion').value = '';
     const optimistic = { message_id: `pending-${Date.now()}`, role: 'user', content: question };
     state.conversation.messages = (state.conversation.messages || []).concat([optimistic]);
     renderConversation();
     $('conversationComposerHint').textContent = '正在检索证据并组织回答…';
     try {
-      const response = await api(`/api/conversation/${encodeURIComponent(state.conversation.session_id)}/messages`, {
+      const response = await api(`/api/conversation/${encodeURIComponent(state.conversation.session_id)}/turns`, {
         method: 'POST', body: JSON.stringify({
           scan_id: state.scanId, question, scope: turnScope,
-          persist_scope: $('conversationPersistScope').checked
+          persist_scope: $('conversationPersistScope').checked,
+          idempotency_key: idempotencyKey
         })
       });
       state.conversation = response.session;
-      if (response.turn && response.turn.message_id) state.turns.set(response.turn.message_id, response.turn);
+      state.conversationPending = null;
+      registerAnalysisTurn(response.turn, []);
       renderConversation();
       await loadConversationList();
-      if (response.promotion_job_id || response.turn && response.turn.promotion_job_id) {
-        watchPromotion(response.promotion_job_id || response.turn.promotion_job_id);
-      } else {
-        $('conversationDeepeningState').textContent = '';
-        $('conversationDeepeningState').className = 'v2-job-state';
-      }
+      $('conversationDeepeningState').className = 'v2-job-state is-running';
+      $('conversationDeepeningState').textContent = '分析任务已进入队列';
+      if (response.turn && response.turn.id) watchAnalysisTurn(response.turn.id);
     } catch (error) {
       state.conversation.messages = state.conversation.messages.filter((message) => message.message_id !== optimistic.message_id);
       renderConversation();
       $('conversationQuestion').value = question;
+      // Keep the key for transport/server errors so the next submit reuses it;
+      // malformed/unauthorized requests are explicit failures and can start a
+      // fresh operation.
+      if (error && error.status >= 400 && error.status < 500) state.conversationPending = null;
       notify(error.message || '发送失败', true);
     } finally {
       state.conversationSending = false;
@@ -979,6 +1121,7 @@
     state.reportArtifact = null;
     state.selectedScope = null;
     state.conversation = null;
+    state.conversationPending = null;
     state.conversationList = [];
     state.turns.clear();
     state.translationItems = [];
@@ -1068,6 +1211,10 @@
         if (message && navigator.clipboard) navigator.clipboard.writeText(message.content || '').then(() => notify('回答已复制')).catch(() => notify('复制失败', true));
         return;
       }
+      const cancelTurn = event.target.closest('[data-cancel-turn]');
+      if (cancelTurn) { cancelAnalysisTurn(cancelTurn.dataset.cancelTurn); return; }
+      const retryTurn = event.target.closest('[data-retry-turn]');
+      if (retryTurn) { retryAnalysisTurn(retryTurn.dataset.retryTurn); return; }
       const regenerate = event.target.closest('[data-regenerate-message]');
       if (regenerate) {
         const question = previousUserQuestion(regenerate.dataset.regenerateMessage);

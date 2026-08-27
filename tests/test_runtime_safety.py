@@ -135,6 +135,31 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertIn("/F", command)
         self.assertFalse(process.is_alive())
 
+    def test_background_backfill_pauses_under_resource_pressure_only(self):
+        import worker
+
+        background = {
+            "task_type": "analyze_package", "priority": 20,
+            "options": {"workflow_source": "background_backfill"},
+        }
+        foreground = {
+            "task_type": "analyze_package", "priority": 130,
+            "options": {"workflow_source": "question_promotion"},
+        }
+        ample_disk = type("Disk", (), {"free": 10 ** 15})()
+        meminfo = "MemTotal:       65536000 kB\nMemAvailable:  1024 kB\n"
+        with patch.object(
+            worker.storage, "has_queued_job_above_priority", return_value=False
+        ), patch("worker.shutil.disk_usage", return_value=ample_disk), patch.object(
+            worker.os, "getloadavg", return_value=(0.0, 0.0, 0.0), create=True
+        ), patch("builtins.open", unittest.mock.mock_open(read_data=meminfo)):
+            ready, reasons = worker._background_resource_state(background)
+            foreground_ready, foreground_reasons = worker._background_resource_state(foreground)
+        self.assertFalse(ready)
+        self.assertIn("系统可用内存不足", reasons)
+        self.assertTrue(foreground_ready)
+        self.assertEqual(foreground_reasons, [])
+
 
 if __name__ == "__main__":
     unittest.main()

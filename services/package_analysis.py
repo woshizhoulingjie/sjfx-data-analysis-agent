@@ -38,6 +38,7 @@ from services.retrieval import build_retrieval_manifest, evidence_corpus, retrie
 from services.package_exploration import (
     CONTENT_MAP_SCHEMA,
     PREVIEW_SCHEMA,
+    PreviewSliceYield,
     PreviewBudget,
     build_content_map,
     preview_as_document,
@@ -108,6 +109,31 @@ def _temp_disk_worker_limit(requested_workers):
         return 1
 
 
+def _parse_failure_policy(exc, prior_attempts=0):
+    message = str(exc or "").casefold()
+    permanent_terms = (
+        "encrypted", "加密", "password", "密码", "unsupported", "不支持",
+        "sensitive", "受限", "path traversal", "路径穿越",
+    )
+    transient_terms = (
+        "timeout", "超时", "tempor", "busy", "connection", "连接",
+        "resource", "资源", "memory", "内存", "disk", "磁盘", "正在复制",
+        "发生变化", "worker", "服务不可用",
+    )
+    if any(term in message for term in permanent_terms):
+        return {"error_class": "permanent_input", "retryable": False, "next_retry_at": None}
+    retryable = isinstance(exc, (OSError, TimeoutError)) or any(
+        term in message for term in transient_terms
+    )
+    attempts = max(0, int(prior_attempts or 0)) + 1
+    delay = min(3600, 30 * (2 ** min(7, attempts - 1)))
+    return {
+        "error_class": "transient_runtime" if retryable else "parse_rejected",
+        "retryable": retryable,
+        "next_retry_at": time.time() + delay if retryable and attempts < 6 else None,
+    }
+
+
 def _canonical_projection(documents, exact_groups):
     """Return one analysis document per byte-identical source.
 
@@ -147,6 +173,29 @@ def _canonical_projection(documents, exact_groups):
     return canonical_documents, canonical_by_path, {
         path: sorted(values) for path, values in aliases_by_canonical.items()
     }
+
+
+def _large_exact_groups(content_map, documents):
+    """Project exact preview SHA groups into the normal dedup contract."""
+    groups = []
+    for item in (content_map or {}).get("duplicates") or []:
+        if item.get("kind") != "exact_sha256":
+            continue
+        members = sorted(path for path in item.get("paths") or [] if path in documents)
+        if len(members) < 2:
+            continue
+        canonical = str(item.get("canonical_path") or members[0])
+        if canonical not in documents:
+            canonical = members[0]
+        groups.append({
+            "group_id": "DUP-LARGE-{:04d}".format(len(groups) + 1),
+            "sha256": item.get("sha256"),
+            "canonical": canonical,
+            "members": members,
+            "derived_from": {path: canonical for path in members if path != canonical},
+            "duplicate_count": len(members) - 1,
+        })
+    return groups
 
 
 def _build_value_judgment(scan, documents, analysis_stats, coverage, exact_groups,
@@ -3706,7 +3755,7 @@ def _preview_matches_inventory(preview, file_node):
 
 
 def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=None,
-                           progress=None, cancel_check=None):
+                           progress=None, cancel_check=None, yield_check=None):
     """Persist one bounded preview per inventory entry and build a content map."""
     progress = progress or (lambda percent, message: None)
     deep_paths = set(deep_paths or [])
@@ -3739,17 +3788,43 @@ def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=Non
     previewed = 0
     total = max(1, len(files))
     batch_size = max(1, min(500, int(policy.get("batch_files") or 200)))
+    slice_files = max(1, int(getattr(Config, "LARGE_PACKAGE_PREVIEW_SLICE_FILES", 100)))
+    slice_seconds = max(5, int(getattr(Config, "LARGE_PACKAGE_PREVIEW_SLICE_SECONDS", 30)))
+    slice_started = time.monotonic()
+    start_index = max(0, int(((previous_map or {}).get("run") or {}).get("next_index") or 0))
 
     def flush():
         nonlocal pending_previews, pending_documents, pending_states
         storage.save_exploration_batch(
-            scan_id, pending_previews, pending_documents, pending_states,
+            scan_id, pending_previews, [], pending_states,
+            evidence_by_path=[
+                (path, evidence_corpus({path: document}))
+                for path, document in pending_documents
+            ],
+            remove_document_paths=[path for path, _document in pending_documents],
         )
         pending_previews = []
         pending_documents = []
         pending_states = []
 
-    for index, file_node in enumerate(files, 1):
+    def save_slice_checkpoint(next_index, reason):
+        checkpoint = {
+            "schema_version": CONTENT_MAP_SCHEMA,
+            "status": "previewing",
+            "representative_paths": [],
+            "run": {
+                "next_index": int(next_index),
+                "new_previews": previewed,
+                "reused_previews": reused,
+                "budget_consumed_bytes": budget.consumed_bytes,
+                "slice_incomplete": True,
+                "yield_reason": reason,
+            },
+        }
+        storage.save_content_map(scan_id, checkpoint)
+        return checkpoint
+
+    for index, file_node in enumerate(files[start_index:], start_index + 1):
         if cancel_check is not None and cancel_check():
             flush()
             raise ParseIsolationCancelled("任务已取消，已保存完成的轻量预览检查点")
@@ -3761,13 +3836,18 @@ def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=Non
         if _preview_matches_inventory(prior, file_node):
             reused += 1
         else:
-            preview = preview_file(
-                scan.get("root"), file_node,
-                per_file_bytes=policy.get("preview_bytes_per_file"),
-                budget=budget,
-                zip_member_limit=policy.get("preview_zip_members"),
-                zip_member_bytes=policy.get("preview_zip_member_bytes"),
-            )
+            try:
+                preview = preview_file(
+                    scan.get("root"), file_node,
+                    per_file_bytes=policy.get("preview_bytes_per_file"),
+                    budget=budget,
+                    zip_member_limit=policy.get("preview_zip_members"),
+                    zip_member_bytes=policy.get("preview_zip_member_bytes"),
+                    cancel_check=cancel_check, yield_check=yield_check,
+                )
+            except PreviewSliceYield:
+                flush()
+                return save_slice_checkpoint(index - 1, "higher_priority_job")
             pending_previews.append((path, preview))
             existing[path] = preview
             previewed += 1
@@ -3801,12 +3881,33 @@ def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=Non
                 2 + int(18 * index / total),
                 "全量有界轻量预览：{}/{}（复用 {}）".format(index, len(files), reused),
             )
+        if (
+            previewed >= slice_files
+            or time.monotonic() - slice_started >= slice_seconds
+            or (yield_check is not None and yield_check())
+        ) and index < len(files):
+            flush()
+            return save_slice_checkpoint(index, "slice_budget")
     flush()
     progress(20, "轻量预览完成，正在发现主题、重复候选与文件关系")
     content_map = build_content_map(
         (item["payload"] for item in storage.iter_file_previews(scan_id)),
         representative_limit=policy.get("initial_parse_files"),
     )
+    selection_decisions = content_map.pop("selection_decisions", [])
+    storage.save_file_workflow_states(scan_id, selection_decisions)
+    # Preview every valid file first, then remove exact aliases from the
+    # content-weighted retrieval index. Their physical paths and workflow rows
+    # remain fully auditable and point to the canonical source.
+    for duplicate in content_map.get("duplicates") or []:
+        if duplicate.get("kind") != "exact_sha256":
+            continue
+        canonical = duplicate.get("canonical_path")
+        for alias in duplicate.get("paths") or []:
+            if alias != canonical:
+                storage.replace_document_evidence_index(
+                    scan_id, alias, [], preserve_translations=True
+                )
     content_map["policy"] = {
         "preview_bytes_per_file": policy.get("preview_bytes_per_file"),
         "preview_total_bytes": policy.get("preview_total_bytes"),
@@ -3825,14 +3926,25 @@ def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=Non
 
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
                     large_options=None, target_paths=None, cancel_check=None, parse_mode_override=None,
-                    analysis_translation=None):
+                    analysis_translation=None, workflow_source=None, yield_check=None,
+                    aggregation_depth=0, aggregation_interval=3):
     progress = progress or (lambda percent, message: None)
-    files = list(_walk_files(scan["tree"]))
+    durable_inventory = list(storage.iter_inventory_entries(scan_id, kind="file"))
+    files = (
+        [item["payload"] for item in durable_inventory]
+        if durable_inventory else list(_walk_files(scan["tree"]))
+    )
     parse_mode = "fast" if scan.get("parse_mode") == "fast" else "accurate"
     policy = build_policy(scan, large_options)
-    inventory = inventory_by_path(scan)
+    inventory = (
+        {item["path"]: item["payload"] for item in durable_inventory}
+        if durable_inventory else inventory_by_path(scan)
+    )
     all_paths = set(inventory)
     target_paths = set(target_paths or []) & all_paths
+    workflow_source = str(workflow_source or (
+        "manual_selection" if target_paths else "initial_overview"
+    ))
     prior_states = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
     content_map = storage.get_content_map(scan_id) if policy.get("enabled") else None
     if policy.get("enabled") and not target_paths:
@@ -3845,7 +3957,15 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             deep_paths=deep_paths,
             progress=progress,
             cancel_check=cancel_check,
+            yield_check=yield_check,
         )
+        if ((content_map or {}).get("run") or {}).get("slice_incomplete"):
+            return {
+                "scan_id": scan_id,
+                "_slice_incomplete": True,
+                "content_map": content_map,
+                "workflow": {"source": workflow_source, "processed_paths": []},
+            }
         prior_states = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
     documents = {}
     for item in storage.iter_documents(scan_id, hydrate=not policy.get("enabled")):
@@ -3875,8 +3995,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         candidates = [node for node in files if node.get("path") in target_paths]
         phase_label = "补充分析"
     elif policy.get("enabled"):
-        representative_set = set((content_map or {}).get("representative_paths") or [])
-        candidates = [node for node in files if node.get("path") in representative_set]
+        representative_order = list((content_map or {}).get("representative_paths") or [])
+        by_path = {node.get("path"): node for node in files}
+        candidates = [by_path[path] for path in representative_order if path in by_path]
         phase_label = "代表文件准确深析"
     else:
         candidates = files
@@ -3937,7 +4058,19 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
         parse_candidates.append((file_node, None))
 
-    total_candidates = max(1, len(candidates))
+    remaining_batch_paths = []
+    if policy.get("enabled"):
+        batch_limit = max(20, min(50, int(policy.get("batch_files") or 30)))
+        if len(parse_candidates) > batch_limit:
+            remaining_batch_paths = [
+                item[0].get("path") for item in parse_candidates[batch_limit:]
+                if item[0].get("path")
+            ]
+            parse_candidates = parse_candidates[:batch_limit]
+    batch_translation_paths = {
+        item[0].get("path") for item in parse_candidates if item[0].get("path")
+    }
+    total_candidates = max(1, reusable_count + len(parse_candidates))
     completed_candidates = reusable_count
 
     def commit_parse_result(_index, file_node, document, error):
@@ -3982,6 +4115,12 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 scan_id, node_path, fingerprint,
                 "completed", document=document,
             )
+            storage.update_file_workflow_stage(
+                scan_id, node_path, "evidence_ready",
+                parse_status="completed",
+                evidence_status="ready" if document.get("evidence") else "no_evidence",
+                priority_source=workflow_source,
+            )
             failures = [item for item in failures if item.get("path") != node_path]
         except Exception as exc:
             fingerprint = file_fingerprint(
@@ -4008,13 +4147,28 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             else:
                 documents.pop(node_path, None)
                 storage.delete_document(scan_id, node_path)
-            storage.set_file_state(scan_id, node_path, fingerprint, "failed", error=str(exc))
+            prior_attempts = int((prior_states.get(node_path) or {}).get("attempt_count") or 0)
+            failure_policy = _parse_failure_policy(exc, prior_attempts=prior_attempts)
+            storage.set_file_state(
+                scan_id, node_path, fingerprint, "failed", error=str(exc),
+                **failure_policy
+            )
+            storage.update_file_workflow_stage(
+                scan_id, node_path, "deep_parse_failed",
+                parse_status="failed", evidence_status="failed",
+                priority_source=workflow_source,
+            )
         progress(
             parse_progress(completed_candidates, total_candidates),
             "{}：{}/{} {}".format(phase_label, completed_candidates, len(candidates), node_path),
         )
 
     if parse_candidates:
+        for file_node, _unused in parse_candidates:
+            storage.update_file_workflow_stage(
+                scan_id, file_node.get("path"), "deep_parse_queued",
+                parse_status="queued", priority_source=workflow_source,
+            )
         # A separate CPU parser pool is safe because every pool thread owns a
         # process-isolated Docling/OCR runner.  Ollama/model generation is not
         # called here and remains bounded by its own single-request semaphore.
@@ -4028,7 +4182,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
         batch_size = len(parse_candidates)
         if policy.get("enabled"):
-            batch_size = max(1, int(policy.get("batch_files") or 200))
+            batch_size = max(20, min(50, int(policy.get("batch_files") or 30)))
         parse_pulse = {"at": 0.0}
         for batch_start in range(0, len(parse_candidates), batch_size):
             current_batch = parse_candidates[batch_start:batch_start + batch_size]
@@ -4079,12 +4233,19 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "partial_files": 0, "failed_files": 0, "skipped_files": 0,
         "translated_characters": 0, "limitations": [],
     }
-    if callable(analysis_translation) and documents:
+    translation_documents = (
+        {
+            path: documents[path] for path in sorted(batch_translation_paths)
+            if path in documents
+        }
+        if policy.get("enabled") else documents
+    )
+    if callable(analysis_translation) and translation_documents:
         try:
             import_translation = analysis_translation(
-                documents=documents,
+                documents=translation_documents,
                 policy=policy,
-                priority_paths=set((content_map or {}).get("representative_paths") or []),
+                priority_paths=batch_translation_paths,
                 progress=progress,
                 cancel_check=cancel_check,
             ) or import_translation
@@ -4098,6 +4259,39 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 "failed_files": 1,
                 "limitations": ["导入期工作译本阶段异常，已回退原文分析：{}".format(str(exc)[:300])],
             })
+
+    aggregation_interval = max(1, int(aggregation_interval or 3))
+    aggregation_depth = max(0, int(aggregation_depth or 0))
+    previous_analysis = storage.get_analysis(scan_id) if policy.get("enabled") else None
+    if (
+        previous_analysis
+        and remaining_batch_paths
+        and aggregation_depth > 0
+        and aggregation_depth % aggregation_interval != 0
+    ):
+        # Per-file documents, evidence and translations are already durable.
+        # Intermediate initial-overview slices update coverage only; global
+        # clusters/tree/report are rebuilt at milestones and on the final slice.
+        analysis = refresh_package_coverage(scan_id, scan, storage) or previous_analysis
+        analysis["import_translation"] = import_translation
+        analysis["workflow"] = {
+            "schema_version": "large-package-workflow/1.0",
+            "source": workflow_source,
+            "batch_size": max(20, min(50, int(policy.get("batch_files") or 30))),
+            "processed_in_job": len(parse_candidates),
+            "processed_paths": sorted(batch_translation_paths),
+            "remaining_priority_paths": remaining_batch_paths,
+            "background_batch_paths": [],
+            "selection_gate": (content_map or {}).get("selection_gate") or {},
+            "global_aggregation": "deferred_to_milestone",
+            "next_aggregation_depth": (
+                (aggregation_depth // aggregation_interval) + 1
+            ) * aggregation_interval,
+        }
+        analysis.setdefault("policy", {})["import_translation"] = import_translation
+        storage.save_analysis(scan_id, analysis)
+        progress(95, "当前批次已增量入库；全局主题将在里程碑批次刷新")
+        return analysis
 
     classified_batch = []
     classified_total = max(1, len(documents))
@@ -4129,13 +4323,10 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     progress(72, "执行精确去重与高相似文档聚类")
     if policy.get("enabled"):
-        # Large-package mode prioritizes full content coverage.  Do not spend
-        # the package budget on pairwise similarity or canonical projection;
-        # every parsed file remains available to the content topic tree.
-        exact_groups = []
-        canonical_documents = documents
-        canonical_by_path = {path: path for path in documents}
-        aliases_by_canonical = {}
+        exact_groups = _large_exact_groups(content_map, documents)
+        canonical_documents, canonical_by_path, aliases_by_canonical = _canonical_projection(
+            documents, exact_groups
+        )
     else:
         exact_groups = _group_exact(documents)
         canonical_documents, canonical_by_path, aliases_by_canonical = _canonical_projection(
@@ -4151,15 +4342,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     similar_groups = [] if policy.get("enabled") else _group_similar(documents, exact_groups)
     topic_clusters = _topic_clusters(canonical_documents)
     if policy.get("enabled"):
-        # Rebuild the durable catalog one document at a time: one complete
-        # evidence scan, no 300k-object corpus allocation and no repeated BM25.
-        storage.clear_evidence_index(scan_id, preserve_translations=True)
-        evidence_index_count = 0
-        for indexed_path, indexed_document in canonical_documents.items():
-            evidence_index_count += storage.replace_document_evidence_index(
-                scan_id, indexed_path, evidence_corpus({indexed_path: indexed_document}),
-                preserve_translations=True,
-            )
+        # Preview checkpoints and deep parses update this catalog per source.
+        # Never clear and rebuild the whole package for a 20-50 file slice.
+        evidence_index_count = storage.count_evidence_index(scan_id)
         manifest_queries = [
             {"query": str(item.get("topic") or ""), "results": [], "deferred": True}
             for item in topic_clusters[:5] if str(item.get("topic") or "").strip()
@@ -4279,7 +4464,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     progress(82, "生成所有文件夹的本地摘要与证据链")
     node_summaries = {}
-    directories = list(_walk_directories(scan["tree"]))
+    durable_directories = list(storage.iter_inventory_entries(scan_id, kind="directory"))
+    directories = (
+        [item["payload"] for item in durable_directories]
+        if durable_directories else list(_walk_directories(scan["tree"]))
+    )
     unparsed_paths = sorted(all_paths - set(documents))
     summary_total = max(1, len(directories) + len(documents) + len(unparsed_paths))
     summary_done = 0
@@ -4409,9 +4598,10 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 (path, _document_without_analysis_overlay(document))
                 for path, document in classification_batch
             ])
-    scan["tree"] = _annotate_physical_tree_deduplication(
-        scan["tree"], canonical_by_path, documents, node_summaries
-    )
+    if scan.get("inventory_mode") != "durable_paged_v1":
+        scan["tree"] = _annotate_physical_tree_deduplication(
+            scan["tree"], canonical_by_path, documents, node_summaries
+        )
     if policy.get("enabled"):
         waiting = pending_group(deep_pending_paths, inventory, policy)
         if waiting:
@@ -4440,8 +4630,20 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "evidence_chain": [], "conclusion_evidence": [], "coverage": {"status": "失败", "inventory_files": len(failed_paths), "parsed_files": 0, "failed_files": len(failed_paths)},
         }
         adaptive_tree.setdefault("children", []).append(failed_group)
+    workflow_states = {
+        item.get("node_path"): item
+        for item in storage.iter_file_workflow_states(scan_id)
+        if item.get("node_path") in all_paths
+    }
+    translation_states = {
+        item.get("path"): item.get("payload") or {}
+        for item in storage.iter_translations(scan_id, hydrate=False)
+        if item.get("path") in all_paths
+    }
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
+        workflow_states=workflow_states, translation_states=translation_states,
+        inventory=inventory,
     )
     if import_translation.get("limitations"):
         package_coverage["limitations"] = list(dict.fromkeys(
@@ -4460,6 +4662,43 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         }
         package_coverage["deep_analysis_pending_files"] = len(deep_pending_paths)
         package_coverage["deep_analysis_strategy"] = "representative_then_query_promotion"
+    background_batch_paths = []
+    if (
+        policy.get("enabled")
+        and not remaining_batch_paths
+        and bool(getattr(Config, "LARGE_PACKAGE_BACKGROUND_BACKFILL", True))
+    ):
+        background_limit = max(20, min(50, int(
+            getattr(Config, "LARGE_PACKAGE_BACKGROUND_BATCH_FILES", 20)
+        )))
+        for path, state in sorted(
+            workflow_states.items(),
+            key=lambda item: (-float(item[1].get("selection_score") or 0), item[0]),
+        ):
+            if (
+                state.get("selection_state") == "deferred"
+                and state.get("light_index_status") == "ready"
+                and state.get("promotion_allowed")
+                and state.get("parse_status") not in {"completed", "failed"}
+                and path not in target_paths
+            ):
+                background_batch_paths.append(path)
+                if len(background_batch_paths) >= background_limit:
+                    break
+        if len(background_batch_paths) < background_limit:
+            now = time.time()
+            for path, state in sorted(prior_states.items()):
+                if (
+                    state.get("status") == "failed"
+                    and bool(state.get("retryable"))
+                    and int(state.get("attempt_count") or 0) < 6
+                    and float(state.get("next_retry_at") or 0) <= now
+                    and path not in target_paths
+                    and path not in background_batch_paths
+                ):
+                    background_batch_paths.append(path)
+                    if len(background_batch_paths) >= background_limit:
+                        break
     adaptive_tree = attach_tree_coverage(adaptive_tree, coverage_for_paths, all_paths)
     tree_version_rows = []
     tree_stack = [adaptive_tree]
@@ -4646,6 +4885,23 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "document_index": [compact_document(document) for document in documents.values()],
         "canonical_document_index": [compact_document(document) for document in canonical_documents.values()],
         "failures": failures,
+        "workflow": {
+            "schema_version": "large-package-workflow/1.0",
+            "source": workflow_source,
+            "batch_size": max(20, min(50, int(policy.get("batch_files") or 30)))
+            if policy.get("enabled") else len(candidates),
+            "processed_in_job": len(parse_candidates),
+            "processed_paths": [
+                item[0].get("path") for item in parse_candidates if item[0].get("path")
+            ],
+            "remaining_priority_paths": remaining_batch_paths,
+            "background_batch_paths": background_batch_paths,
+            "selection_gate": (content_map or {}).get("selection_gate") or {},
+            "priority_contract": [
+                "question_promotion", "manual_selection", "initial_overview",
+                "background_backfill", "translation_backfill",
+            ],
+        },
         "policy": {
             "requested_parse_mode": parse_mode,
             "parse_mode": actual_parse_mode,
@@ -4695,7 +4951,12 @@ def refresh_package_coverage(scan_id, scan, storage):
         {"path": item.get("node_path"), "error": item.get("error")}
         for item in states if item.get("status") == "failed"
     ]
-    all_paths = set(inventory_by_path(scan))
+    durable_inventory = list(storage.iter_inventory_entries(scan_id, kind="file"))
+    inventory = (
+        {item["path"]: item["payload"] for item in durable_inventory}
+        if durable_inventory else inventory_by_path(scan)
+    )
+    all_paths = set(inventory)
     pending_paths = all_paths - set(documents) - {item["path"] for item in failures}
     deep_paths = {
         path for path, document in documents.items()
@@ -4707,8 +4968,20 @@ def refresh_package_coverage(scan_id, scan, storage):
         )
     }
     deep_pending_paths = all_paths - deep_paths
+    workflow_states = {
+        item.get("node_path"): item
+        for item in storage.iter_file_workflow_states(scan_id)
+        if item.get("node_path") in all_paths
+    }
+    translation_states = {
+        item.get("path"): item.get("payload") or {}
+        for item in storage.iter_translations(scan_id, hydrate=False)
+        if item.get("path") in all_paths
+    }
     coverage_for_paths, package_coverage = build_coverage(
         scan, documents, failures=failures, pending_paths=pending_paths, policy=policy,
+        workflow_states=workflow_states, translation_states=translation_states,
+        inventory=inventory,
     )
     if policy.get("enabled"):
         preview_counts = storage.file_preview_counts(scan_id)
@@ -4722,20 +4995,17 @@ def refresh_package_coverage(scan_id, scan, storage):
         }
         package_coverage["deep_analysis_pending_files"] = len(deep_pending_paths)
     if policy.get("enabled"):
-        exact_groups = []
-        canonical_documents = documents
+        exact_groups = _large_exact_groups(
+            storage.get_content_map(scan_id), documents
+        )
+        canonical_documents, _canonical_by_path, _aliases = _canonical_projection(
+            documents, exact_groups
+        )
     else:
         exact_groups = _group_exact(documents)
         canonical_documents, _canonical_by_path, _aliases = _canonical_projection(documents, exact_groups)
     analysis["exact_duplicate_groups"] = exact_groups
-    if policy.get("enabled"):
-        storage.clear_evidence_index(scan_id, preserve_translations=True)
-        for document_path, document in canonical_documents.items():
-            storage.replace_document_evidence_index(
-                scan_id, document_path, evidence_corpus({document_path: document}),
-                preserve_translations=True,
-            )
-    else:
+    if not policy.get("enabled"):
         storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))
     tree = attach_tree_coverage(analysis.get("analysis_tree") or {}, coverage_for_paths, all_paths)
     analysis["analysis_tree"] = tree

@@ -418,6 +418,171 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
     }
 
 
+def scan_inventory_slice(root, cursor=None, slice_entries=1000, slice_seconds=20,
+                         max_depth=32, max_directories=1_000_000,
+                         max_nodes=2_000_000, cancel_check=None,
+                         yield_check=None, activity_callback=None):
+    """Enumerate one durable, lexically ordered inventory slice.
+
+    The cursor stores only the active directory stack and the last processed
+    name in each directory. Callers persist returned records and the cursor in
+    one transaction. Reopening a directory on resume is intentional: source
+    directory handles must never be kept across Worker processes.
+    """
+    root = Path(root).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError("目录不存在或不是文件夹")
+    max_depth = max(1, min(256, int(max_depth or 32)))
+    max_directories = max(1, min(1_000_000, int(max_directories or 1_000_000)))
+    max_nodes = max(2, min(2_000_000, int(max_nodes or 2_000_000)))
+    slice_entries = max(1, min(10000, int(slice_entries or 1000)))
+    slice_seconds = max(1.0, min(300.0, float(slice_seconds or 20)))
+    started = time.monotonic()
+
+    state = dict(cursor or {})
+    if state and state.get("version") != 1:
+        raise ValueError("扫描游标版本不兼容")
+    if state and str(state.get("root") or "") != str(root):
+        raise ValueError("扫描游标与当前目录不匹配")
+    records = []
+    if not state:
+        root_stat = root.stat()
+        root_node = {
+            "id": path_id(root), "name": root.name or str(root), "path": ".",
+            "kind": "directory", "scan_depth": 0,
+            "device": int(root_stat.st_dev), "inode": int(root_stat.st_ino),
+        }
+        records.append({"path": ".", "parent_path": None, "position": 0, "payload": root_node})
+        state = {
+            "version": 1, "root": str(root),
+            "stack": [{"path": ".", "depth": 0, "after_key": None}],
+            "file_count": 0, "directory_count": 1, "node_count": 1,
+            "symlink_count": 0, "ignored_file_count": 0,
+            "ignored_directory_count": 0, "depth_limited_directory_count": 0,
+            "total_size": 0, "type_counts": {}, "errors": [],
+        }
+
+    def relative_path(parent_path, name):
+        return name if parent_path == "." else parent_path.rstrip("/") + "/" + name
+
+    def should_yield():
+        return (
+            len(records) >= slice_entries
+            or time.monotonic() - started >= slice_seconds
+            or (yield_check is not None and bool(yield_check()))
+        )
+
+    while state["stack"]:
+        if cancel_check is not None:
+            cancel_check()
+        frame = state["stack"][-1]
+        directory_path = root if frame["path"] == "." else root / frame["path"]
+        try:
+            with os.scandir(str(directory_path)) as iterator:
+                names = [entry.name for entry in iterator]
+        except (OSError, PermissionError) as exc:
+            state["errors"].append({"path": frame["path"], "error": str(exc)[:1000]})
+            state["stack"].pop()
+            continue
+        names.sort(key=lambda value: (value.casefold(), value))
+        after = tuple(frame.get("after_key") or ())
+        next_item = None
+        for position, name in enumerate(names):
+            key = (name.casefold(), name)
+            if not after or key > after:
+                next_item = (position, name, key)
+                break
+        if next_item is None:
+            state["stack"].pop()
+            continue
+
+        position, name, key = next_item
+        frame["after_key"] = list(key)
+        child_path = relative_path(frame["path"], name)
+        item_path = directory_path / name
+        try:
+            item_stat = item_path.lstat()
+            mode = item_stat.st_mode
+            if stat_module.S_ISLNK(mode):
+                payload = {
+                    "id": path_id(item_path), "name": name, "path": child_path,
+                    "kind": "symlink", "extension": item_path.suffix.lower(),
+                    "size": 0, "link_metadata_size": int(item_stat.st_size),
+                    "size_human": human_size(0),
+                    "modified_at": datetime.fromtimestamp(
+                        item_stat.st_mtime, timezone.utc
+                    ).replace(microsecond=0).isoformat(),
+                    "modified_at_ns": int(item_stat.st_mtime_ns),
+                    "content_analysis_allowed": False,
+                    "content_policy": "inventory_only_symlink_target_not_followed",
+                }
+                records.append({
+                    "path": child_path, "parent_path": frame["path"],
+                    "position": position, "payload": payload,
+                })
+                state["symlink_count"] += 1
+                state["node_count"] += 1
+            elif stat_module.S_ISDIR(mode):
+                if name.casefold() in IGNORED_DIRS:
+                    state["ignored_directory_count"] += 1
+                    continue
+                if state["directory_count"] >= max_directories or state["node_count"] >= max_nodes:
+                    raise ValueError("目录清单超过已配置的安全上限，扫描未完成")
+                depth = int(frame["depth"]) + 1
+                payload = {
+                    "id": path_id(item_path), "name": name, "path": child_path,
+                    "kind": "directory", "scan_depth": depth,
+                    "device": int(item_stat.st_dev), "inode": int(item_stat.st_ino),
+                }
+                if depth >= max_depth:
+                    payload["depth_limited"] = True
+                    payload["simple_summary"] = "目录层级超过安全上限，未继续向下扫描。"
+                    state["depth_limited_directory_count"] += 1
+                records.append({
+                    "path": child_path, "parent_path": frame["path"],
+                    "position": position, "payload": payload,
+                })
+                state["directory_count"] += 1
+                state["node_count"] += 1
+                if depth < max_depth:
+                    state["stack"].append({
+                        "path": child_path, "depth": depth, "after_key": None,
+                    })
+            elif stat_module.S_ISREG(mode):
+                if should_ignore_file(name):
+                    state["ignored_file_count"] += 1
+                    continue
+                if state["node_count"] >= max_nodes:
+                    raise ValueError("文件清单超过已配置的安全上限，扫描未完成")
+                payload = _file_metadata(item_path, root, item_stat)
+                records.append({
+                    "path": child_path, "parent_path": frame["path"],
+                    "position": position, "payload": payload,
+                })
+                state["file_count"] += 1
+                state["node_count"] += 1
+                state["total_size"] += int(payload.get("size") or 0)
+                extension = payload.get("extension") or "[无扩展名]"
+                state["type_counts"][extension] = state["type_counts"].get(extension, 0) + 1
+        except ValueError:
+            raise
+        except (OSError, PermissionError) as exc:
+            state["errors"].append({"path": child_path, "error": str(exc)[:1000]})
+
+        if activity_callback is not None:
+            activity_callback(
+                state["file_count"], state["directory_count"], child_path
+            )
+        if should_yield():
+            break
+
+    complete = not state["stack"]
+    state["type_counts"] = dict(sorted(
+        state["type_counts"].items(), key=lambda item: (-item[1], item[0])
+    ))
+    return {"records": records, "cursor": state, "complete": complete}
+
+
 def _decode_bytes(data):
     for encoding in ("utf-8-sig", "utf-8", "gb18030", "utf-16"):
         try:

@@ -13,6 +13,7 @@ import multiprocessing
 import os
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import time
@@ -74,6 +75,65 @@ class RemoteJobError(RuntimeError):
         self.remote_traceback = remote_traceback
 
 
+def _finish_conversation_turn_after_worker_failure(job, status, error=None):
+    if job.get("task_type") != "conversation_turn":
+        return
+    turn_id = str((job.get("options") or {}).get("turn_id") or "")
+    if not turn_id:
+        return
+    message = "本轮分析已取消。" if status == "cancelled" else "交互式分析任务异常终止。"
+    storage.update_conversation_turn(
+        turn_id, status=status, stage=status, progress=100,
+        error=str(error)[:2000] if error else None,
+        message=message, event_type=status,
+    )
+    storage.set_conversation_turn_message(
+        turn_id, message, status, status, 100,
+        error=str(error)[:500] if error else None,
+    )
+
+
+def _background_resource_state(job):
+    """Gate only optional coverage expansion; foreground work always proceeds."""
+    options = job.get("options") or {}
+    if not (
+        job.get("task_type") == "analyze_package"
+        and options.get("workflow_source") == "background_backfill"
+    ):
+        return True, []
+    reasons = []
+    if storage.has_queued_job_above_priority(job.get("priority") or 20):
+        reasons.append("已有更高优先级任务")
+    try:
+        free_bytes = int(shutil.disk_usage(str(Config.PARSE_TEMP_DIR)).free)
+        required_bytes = int(Config.PARSE_TEMP_DISK_RESERVE_BYTES) + int(Config.MAX_CONTENT_BYTES)
+        if free_bytes < required_bytes:
+            reasons.append("解析临时磁盘空间不足")
+    except OSError:
+        reasons.append("无法确认解析临时磁盘空间")
+    try:
+        load_ratio = float(os.getloadavg()[0]) / float(max(1, os.cpu_count() or 1))
+        if load_ratio >= float(Config.BACKGROUND_MAX_LOAD_RATIO):
+            reasons.append("系统CPU负载较高")
+    except (AttributeError, OSError):
+        pass
+    try:
+        available_kib = None
+        with open("/proc/meminfo", "r", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    available_kib = int(line.split()[1])
+                    break
+        if (
+            available_kib is not None
+            and available_kib < int(Config.BACKGROUND_MIN_AVAILABLE_MEMORY_MB) * 1024
+        ):
+            reasons.append("系统可用内存不足")
+    except (OSError, ValueError, IndexError):
+        pass
+    return not reasons, reasons
+
+
 class _HeldWorkerLock:
     """File-backed inter-process lock with an explicit release operation."""
 
@@ -115,6 +175,7 @@ def execute(job):
     # from starting or recovering its SQLite queue.
     from app import (
         _run_claimed_analysis_job,
+        _run_claimed_conversation_turn_job,
         _run_claimed_export_job,
         _run_claimed_report_job,
         _run_claimed_scan_and_analyze_job,
@@ -126,6 +187,8 @@ def execute(job):
         return _run_claimed_scan_and_analyze_job(job)
     if task_type == "analyze_package":
         return _run_claimed_analysis_job(job)
+    if task_type == "conversation_turn":
+        return _run_claimed_conversation_turn_job(job)
     if task_type == "generate_report":
         return _run_claimed_report_job(job)
     if task_type == "generate_summary":
@@ -185,6 +248,7 @@ def _task_runtime_limit(job):
     limits = {
         "scan_and_analyze": Config.JOB_SCAN_TIMEOUT_SECONDS,
         "analyze_package": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
+        "conversation_turn": Config.JOB_CONVERSATION_TURN_TIMEOUT_SECONDS,
         "generate_summary": Config.JOB_SUMMARY_TIMEOUT_SECONDS,
         "generate_report": Config.JOB_REPORT_TIMEOUT_SECONDS,
         "export_package": Config.JOB_EXPORT_TIMEOUT_SECONDS,
@@ -420,8 +484,11 @@ def _acquire_worker_lock():
 def run_forever():
     lock_handle = _acquire_worker_lock()
     recovered = storage.recover_orphaned_jobs_after_lock()
+    reconciled_turns = storage.reconcile_conversation_turn_jobs()
     if recovered:
         logger.warning("Worker startup recovered %s orphaned task(s)", recovered)
+    if reconciled_turns:
+        logger.warning("Worker startup reconciled %s conversation turn(s)", reconciled_turns)
     try:
         storage.checkpoint_wal(force=True)
     except Exception:
@@ -443,8 +510,13 @@ def run_forever():
             if now - last_recovery >= recovery_interval:
                 try:
                     recovered = storage.recover_stale_jobs(Config.WORKER_STALE_SECONDS)
+                    reconciled_turns = storage.reconcile_conversation_turn_jobs()
                     if recovered:
                         logger.warning("Worker recovered %s stale task(s)", recovered)
+                    if reconciled_turns:
+                        logger.warning(
+                            "Worker reconciled %s conversation turn(s)", reconciled_turns
+                        )
                 except Exception:
                     logger.warning("周期性失联任务恢复失败，将继续运行", exc_info=True)
                 last_recovery = time.monotonic()
@@ -455,10 +527,35 @@ def run_forever():
             job_id = job["id"]
             try:
                 logger.info("Worker claimed task id=%s type=%s scan_id=%s", job_id, job.get("task_type"), job.get("scan_id"))
+                resources_ready, resource_reasons = _background_resource_state(job)
+                if not resources_ready:
+                    message = "后台补析已暂停：{}；资源恢复后自动重试。".format(
+                        "、".join(resource_reasons)
+                    )
+                    if storage.defer_running_job(
+                        job_id, message,
+                        delay_seconds=Config.BACKGROUND_RESOURCE_RETRY_SECONDS,
+                    ):
+                        logger.info("Deferred background task id=%s reasons=%s", job_id, resource_reasons)
+                        continue
                 result = execute_supervised(job)
+                if isinstance(result, dict) and result.pop("_defer_slice", False):
+                    message = result.pop("_defer_message", "资源不足，任务已延迟。")
+                    delay = int(result.pop("_defer_seconds", 60) or 60)
+                    if storage.defer_running_job(job_id, message, delay_seconds=delay):
+                        logger.info("Worker deferred checkpointed task id=%s delay=%s", job_id, delay)
+                        continue
+                if isinstance(result, dict) and result.pop("_requeue_slice", False):
+                    message = result.pop(
+                        "_requeue_message", "本轮检查点已保存，等待下一轮继续。"
+                    )
+                    if storage.requeue_job_slice(job_id, message):
+                        logger.info("Worker yielded checkpointed slice id=%s", job_id)
+                        continue
                 storage.finalize_job(job_id, result=result)
             except Exception as exc:
                 if isinstance(exc, JobCancelled) or exc.__class__.__name__ == "ParseIsolationCancelled":
+                    _finish_conversation_turn_after_worker_failure(job, "cancelled", exc)
                     if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
                         storage.update_analysis_progress_status(
                             job.get("scan_id"), "cancelled", "分析已取消；已完成的文件检查点仍保留。", "cancelled"
@@ -501,6 +598,7 @@ def run_forever():
                     )
                 else:
                     logger.exception("Worker task failed id=%s type=%s", job_id, job.get("task_type"))
+                _finish_conversation_turn_after_worker_failure(job, "failed", exc)
                 if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
                     storage.update_analysis_progress_status(
                         job.get("scan_id"), "failed",

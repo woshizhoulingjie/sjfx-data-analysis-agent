@@ -17,6 +17,7 @@ from services.package_exploration import (
 from services.scanner import scan_directory
 from services.storage import Storage
 from services.package_analysis import analyze_package
+from services.retrieval import evidence_corpus
 
 
 def _files(scan):
@@ -31,6 +32,57 @@ def _files(scan):
 
 
 class PackageExplorationTests(unittest.TestCase):
+    def test_large_preview_phase_resumes_across_bounded_worker_slices(self):
+        class Parser:
+            docling_device = "cpu"
+
+            def status(self):
+                return {"available": True}
+
+            def parse(self, path, relative_path=None, mode="accurate"):
+                source = Path(path)
+                text = source.read_text(encoding="utf-8")
+                return {
+                    "source": {
+                        "path": str(relative_path), "name": source.name,
+                        "extension": ".txt", "size": source.stat().st_size,
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    },
+                    "parser": {"name": "test", "mode": mode},
+                    "structure": {"title": source.stem, "headings": []},
+                    "text": text,
+                    "coverage": {"complete": True, "parse_complete": True},
+                    "evidence": [],
+                }
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for index in range(5):
+                (root / "{}.txt".format(index)).write_text(
+                    "bounded preview {} ".format(index) * 100, encoding="utf-8"
+                )
+            scan = scan_directory(root)
+            storage = Storage(root / "state.db")
+            scan_id = storage.save_scan(scan)
+            calls = 0
+            with patch(
+                "services.package_analysis.Config.LARGE_PACKAGE_PREVIEW_SLICE_FILES", 2
+            ), patch(
+                "services.package_analysis.Config.LARGE_PACKAGE_PREVIEW_SLICE_SECONDS", 300
+            ):
+                while True:
+                    calls += 1
+                    analysis = analyze_package(
+                        scan_id, scan, storage, Parser(),
+                        large_options={"threshold_bytes": 1, "initial_parse_files": 1},
+                    )
+                    if not analysis.get("_slice_incomplete"):
+                        break
+                    self.assertLess(calls, 10)
+            self.assertEqual(calls, 3)
+            self.assertEqual(sum(storage.file_preview_counts(scan_id).values()), 5)
+            self.assertFalse((analysis.get("content_map", {}).get("run") or {}).get("slice_incomplete"))
+
     def test_windowed_preview_reads_head_middle_and_tail(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -42,7 +94,40 @@ class PackageExplorationTests(unittest.TestCase):
             self.assertLessEqual(preview["sampled_bytes"], 1200)
             self.assertIn("HEAD", preview["preview_text"])
             self.assertIn("TAIL", preview["preview_text"])
+            self.assertEqual(
+                [item["label"] for item in preview["preview_windows"]],
+                ["head", "middle", "tail"],
+            )
+            projected = preview_as_document(preview)
+            self.assertEqual(len(projected["evidence"]), 3)
+            self.assertIn("TAIL", projected["evidence"][-1]["text"])
+            self.assertGreater(projected["evidence"][-1]["source_byte_start"], 0)
             self.assertTrue(preview["coverage"]["preview_only"])
+
+    def test_windowed_preview_indexes_the_entire_middle_and_tail_windows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            payload = b"HEAD " + b"A" * (2 * 1024 * 1024) + b" MIDDLE-NEEDLE "
+            payload += b"B" * (2 * 1024 * 1024) + b" TAIL-NEEDLE"
+            (root / "large.txt").write_bytes(payload)
+            preview = preview_file(
+                root, _files(scan_directory(root))[0], per_file_bytes=96 * 1024
+            )
+
+            document = preview_as_document(preview)
+            self.assertTrue(all(len(item["text"]) <= 1800 for item in document["evidence"]))
+            chunks = evidence_corpus({"large.txt": document})
+            self.assertTrue(any("MIDDLE-NEEDLE" in item["text"] for item in chunks))
+            self.assertTrue(any("TAIL-NEEDLE" in item["text"] for item in chunks))
+            tail = next(item for item in chunks if "TAIL-NEEDLE" in item["text"])
+            self.assertEqual(tail["preview_window"], "tail")
+            self.assertGreater(tail["source_byte_start"], 0)
+            self.assertGreater(tail["source_byte_end"], tail["source_byte_start"])
+
+            storage = Storage(root / "state.db")
+            storage.replace_document_evidence_index("scan", "large.txt", chunks)
+            self.assertTrue(storage.search_evidence_index("scan", "MIDDLE-NEEDLE"))
+            self.assertTrue(storage.search_evidence_index("scan", "TAIL-NEEDLE"))
 
     def test_preview_extracts_bounded_people_organizations_and_dates(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -59,7 +144,7 @@ class PackageExplorationTests(unittest.TestCase):
             self.assertTrue(preview["entities"]["organizations"])
             self.assertEqual(preview["dates"], ["2024-03-12"])
 
-    def test_global_budget_defers_remaining_files_without_reading_them(self):
+    def test_global_preview_budget_defers_content_but_still_stream_hashes_file(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "a.txt").write_text("A" * 5000, encoding="utf-8")
@@ -72,6 +157,9 @@ class PackageExplorationTests(unittest.TestCase):
             self.assertEqual(first["sampled_bytes"], 1000)
             self.assertEqual(second["status"], "deferred")
             self.assertEqual(second["sampled_bytes"], 0)
+            self.assertEqual(
+                second["source_sha256"], hashlib.sha256(b"B" * 5000).hexdigest()
+            )
 
     def test_small_file_is_not_duplicated_by_overlapping_sample_windows(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -105,9 +193,20 @@ class PackageExplorationTests(unittest.TestCase):
             scan = scan_directory(root)
             previews = [preview_file(root, node, per_file_bytes=1200) for node in _files(scan)]
             self.assertEqual(previews[0]["content_sample_sha256"], previews[1]["content_sample_sha256"])
+            self.assertEqual(previews[0]["source_sha256"], previews[1]["source_sha256"])
             self.assertNotEqual(previews[0]["preview_fingerprint"], previews[1]["preview_fingerprint"])
             content_map = build_content_map(previews, representative_limit=1)
             self.assertEqual(content_map["duplicates"][0]["file_count"], 2)
+            self.assertEqual(content_map["duplicates"][0]["kind"], "exact_sha256")
+            decisions = {
+                item["path"]: item for item in content_map["selection_decisions"]
+            }
+            duplicate_path = content_map["duplicates"][0]["paths"][1]
+            self.assertEqual(decisions[duplicate_path]["selection_state"], "excluded")
+            self.assertEqual(
+                decisions[duplicate_path]["reasons"], ["exact_duplicate_non_primary"]
+            )
+            self.assertNotIn(duplicate_path, content_map["representative_paths"])
 
     def test_content_map_is_diverse_bounded_and_promotable(self):
         previews = []
@@ -271,7 +370,7 @@ class PackageExplorationTests(unittest.TestCase):
             )
 
             refreshed = storage.get_file_preview(scan_id, "a.txt")
-            self.assertEqual(refreshed["schema_version"], "file-preview/1.1")
+            self.assertEqual(refreshed["schema_version"], "file-preview/1.3")
             self.assertIn("Alice Johnson", analysis["content_map"]["entities"]["people"][0]["name"])
 
     def test_large_package_only_deep_parses_selected_representatives(self):
