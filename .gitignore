@@ -5,6 +5,7 @@
 
 # Python runtime and caches
 .venv/
+.venv-*/
 venv/
 env/
 __pycache__/
@@ -43,6 +44,7 @@ work/
 .codex-backups/
 wx/
 *.bak*
+*.pre_*
 *_old.txt
 .gitignore.save
 .gitignore.save.*
