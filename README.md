@@ -141,6 +141,106 @@ sudo apt-get install -y qpdf
 
 ## 5. 5 分钟启动
 
+## 5.0 两台 RTX 3090 的标准部署与迁移流程
+
+本节是“旧 3090 服务器迁移到新 3090 服务器”的完整执行顺序。两台机器都执行同一套步骤；只有在两台机器都完成基线后，才进行性能比较。
+
+### A. 旧服务器冻结基线
+
+1. 记录代码提交号：`git rev-parse HEAD`。
+2. 记录 Python、NVIDIA 驱动、CUDA、Ollama/推理服务和模型 digest：
+
+```bash
+git rev-parse HEAD > results/source-commit.txt
+python --version > results/python-version.txt
+nvidia-smi -q > results/nvidia-before.txt
+ollama --version > results/ollama-version.txt 2>&1 || true
+ollama show "$OLLAMA_MODEL" --modelfile > results/model-modelfile.txt 2>&1 || true
+sha256sum requirements.lock.txt > results/requirements.sha256
+```
+
+3. 从 GitHub 拉取当前代码，执行 `pytest tests`，保存测试输出。
+4. 使用 Benchmark 包执行三轮 `core-llm`、`interactive`、`embedding`，并保存整个 `results/3090-old/` 目录。
+5. 备份生产状态库前先停止 Web 和 Worker；不要把 `.env`、Token、SQLite 生产库或原始业务资料提交到 GitHub。
+
+### B. 新服务器部署
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3 python3-venv python3-dev build-essential libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+git clone https://github.com/woshizhoulingjie/sjfx-data-analysis-agent.git
+cd sjfx-data-analysis-agent
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.lock.txt
+python -m pip check
+```
+
+确认新服务器的 `nvidia-smi`、Ollama 和模型版本与旧服务器一致。模型名称相同不等于模型相同，必须核对 digest 或模型文件 SHA-256。
+
+### C. 配置与启动
+
+```bash
+cp .env.example .env
+chmod 600 .env
+nano .env
+mkdir -p /var/lib/sjfx-data-analysis-agent /var/tmp/sjfx-data-analysis-agent-parse logs
+```
+
+至少填写 `OLLAMA_BASE_URL`、`OLLAMA_MODEL`、`OLLAMA_EMBED_MODEL`、`SJFX_API_ACCESS_TOKEN`、`SJFX_OWNER_ID`、`SCAN_ALLOWED_ROOTS` 和 `SJFX_STATE_DIR`。新旧服务器的 `SJFX_OWNER_ID` 应保持一致；访问 Token 可以不同。
+
+启动顺序必须是 Worker 后 Web，便于 Web 启动后立即有任务消费者：
+
+```bash
+source .venv/bin/activate
+nohup .venv/bin/python -u worker.py > logs/worker.log 2>&1 & echo $! > logs/worker.pid
+nohup .venv/bin/python -u app.py > logs/app.log 2>&1 & echo $! > logs/app.pid
+sleep 3
+curl -fsS -H "X-SJFX-Token: $SJFX_API_ACCESS_TOKEN" http://127.0.0.1:18000/api/status
+```
+
+看到 `ok=true`、`runtime_supported=true` 和 `model_generation_enabled=true` 才算启动完成；同时检查 `logs/worker.log` 已出现 Worker ready/started 信息。生产环境建议将这两个进程改为 systemd 服务，并配置 `Restart=on-failure`、专用用户、日志轮转和开机自启。
+
+### D. 迁移已有数据（可选）
+
+若只验证新服务器，不需要复制旧服务器 SQLite，直接导入测试数据即可。若需要迁移历史扫描：
+
+1. 停止旧服务器 Web/Worker，备份 `SJFX_STATE_DIR` 下的 SQLite、WAL 和 SHM 文件。
+2. 将状态库和原始资料通过受控内网复制到新服务器，保持路径位于新服务器 `SCAN_ALLOWED_ROOTS`。
+3. 新服务器先启动 Worker，执行历史扫描的“重建对话证据索引”任务。
+4. 在索引状态变为 `ready` 且 `expected_documents == processed_documents` 前，不要在该扫描上开启对话。
+5. 抽查历史文档、引用、覆盖率和导出结果，再切换用户流量。
+
+SQLite 复制不能替代原始文件迁移；如果原始路径不存在，历史扫描只能使用已保存的统一文档重建索引，无法重新解析缺失源文件。
+
+### E. 新旧 3090 对比验收
+
+在两台机器分别解压 `sjfx-benchmark-2.0.0.zip`，编辑 `benchmark.env`：
+
+```env
+BENCHMARK_BASE_URL=http://127.0.0.1:11434
+BENCHMARK_MODEL=<与旧服务器完全相同的模型>
+BENCHMARK_EMBEDDING_MODEL=<与旧服务器完全相同的Embedding模型>
+SJFX_BASE_URL=http://127.0.0.1:18000
+SJFX_API_TOKEN=<当前服务器Token>
+SJFX_DATA_ROOT=<位于SCAN_ALLOWED_ROOTS内的可写目录>
+BENCHMARK_OFFICIAL_RUNS=3
+```
+
+然后按相同顺序执行：
+
+```bash
+./validate_package.sh
+./run_3090.sh
+```
+
+比较 `results/3090-old/` 和 `results/3090-new/` 时，只比较相同 Benchmark 版本、数据集 SHA-256、模型 digest、量化、Tokenizer、上下文、温度、并发和输出上限的结果。功能门禁 S01-S07 必须全部通过；质量下降不超过 3 个百分点；延迟、吞吐、显存和功耗分别报告。任一参数不同，只能标为“方案对比”。
+
+### F. 回滚
+
+新服务器出现异常时，停止新服务器 Web/Worker，恢复旧服务器的服务和流量。不要直接覆盖生产 SQLite；保留新服务器的 `logs/`、任务 JSON 和 Benchmark 结果，供定位索引、解析、模型或资源问题。
+
 ### 第一步：下载项目
 
 使用 HTTPS：
