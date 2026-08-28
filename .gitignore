@@ -1,0 +1,61 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python runtime and caches
+.venv/
+.venv-*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local dependency copies
+vendor_packages/
+
+# Runtime data, databases, and parsed-document cache
+data/*
+!data/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+document_payloads/
+
+# Local AI/OCR/document models
+models/
+
+# Local sample or user data
+demo_data/
+
+# Generated reports, ZIP archives, logs, and temporary files
+outputs/*
+!outputs/.gitkeep
+logs/
+.logs/
+.cache/
+.tmp/
+.temp/
+
+# Local backups and working files
+work/
+.codex-backups/
+wx/
+*.bak*
+*.pre_*
+*_old.txt
+.gitignore.save
+.gitignore.save.*
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Server-side emergency backups
+backups/

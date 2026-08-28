@@ -1,0 +1,20 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.12,<3
+httpx>=0.27,<1
+# The runtime adapter uses PydanticAI for typed contracts only; model traffic is
+# handled by the local Ollama transport.  Do not install a cloud-provider extra.
+pydantic-ai-slim>=1.0,<2
+pypdf>=5,<7
+python-docx>=1.1,<2
+python-pptx>=1.0,<2
+openpyxl>=3.1,<4
+docling[rapidocr]>=2.114,<3
+scikit-learn>=1.5,<2
+# Offline import-time translation (loaded lazily and forced to CPU).
+transformers>=4.40,<6
+sentencepiece>=0.2,<1
+# CPU-only offline translation backend; pin the major line for reproducible deployment.
+ctranslate2>=4.8,<5
+torch>=2.1,<3
+psutil>=6,<8
