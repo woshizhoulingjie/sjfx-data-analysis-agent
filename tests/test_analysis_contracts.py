@@ -54,6 +54,7 @@ class AnalysisContractTests(unittest.TestCase):
     def test_large_package_default_is_30_file_deep_batches_until_exhausted(self):
         policy = build_policy({"file_count": 3000, "total_size": 1})
         self.assertTrue(policy["enabled"])
+        self.assertFalse(policy["full_inventory_processing"])
         self.assertEqual(policy["batch_files"], 30)
         self.assertGreaterEqual(policy["batch_files"], 20)
         self.assertLessEqual(policy["batch_files"], 50)

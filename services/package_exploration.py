@@ -102,9 +102,11 @@ def _utc_now():
 class PreviewBudget:
     """Thread-safe byte budget shared by one exploration slice."""
 
-    def __init__(self, total_bytes):
+    def __init__(self, total_bytes, consumed_bytes=0):
         self.total_bytes = max(0, int(total_bytes or 0))
-        self.consumed_bytes = 0
+        self.consumed_bytes = max(
+            0, min(self.total_bytes, int(consumed_bytes or 0))
+        ) if self.total_bytes else max(0, int(consumed_bytes or 0))
         self._lock = threading.Lock()
 
     def claim(self, requested):

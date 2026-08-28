@@ -3,7 +3,11 @@ import unittest
 from pathlib import Path
 
 from services.analysis_planner import AnalysisPlanner
-from services.analysis_tools import execute_analysis_toolbox, reduce_evidence_batches
+from services.analysis_tools import (
+    execute_analysis_toolbox,
+    merge_retrieval_results,
+    reduce_evidence_batches,
+)
 from services.claim_verifier import ClaimVerifier
 from services.conversation import ConversationScope, ConversationSession
 from services.research_memory import update_research_memory
@@ -28,8 +32,10 @@ class FakeEngine:
     def __init__(self, promotion=False):
         self.retriever = FakeRetriever()
         self.promotion = promotion
+        self.last_scope = None
 
     def ask(self, _session, question, **_kwargs):
+        self.last_scope = _kwargs.get("scope")
         promotion = None
         if self.promotion:
             promotion = {
@@ -94,6 +100,43 @@ class AnalysisTurnTests(unittest.TestCase):
         self.assertIn("cross_file_compare", tools)
         self.assertIn("timeline_builder", tools)
 
+    def test_planner_does_not_treat_short_independent_question_as_follow_up(self):
+        plan = AnalysisPlanner().plan(
+            "预算多少？",
+            {"kind": "package"},
+            {"current_objective": "上一轮分析项目风险"},
+        )
+        self.assertFalse(plan["follow_up"])
+        self.assertEqual(plan["objective"], "预算多少？")
+        self.assertEqual(plan["modes"], ["retrieval"])
+
+    def test_planner_only_uses_structured_mode_for_aggregation(self):
+        planner = AnalysisPlanner()
+        lookup = planner.plan(
+            "episodeSteps 和 runTimeout 分别是多少？", {"kind": "package"}
+        )
+        aggregate = planner.plan("共有多少条记录？", {"kind": "package"})
+        self.assertEqual(lookup["modes"], ["retrieval"])
+        self.assertIn("structured", aggregate["modes"])
+
+    def test_empty_repair_query_does_not_zero_successful_query_coverage(self):
+        merged = merge_retrieval_results([
+            {
+                "results": [{
+                    "evidence_id": "EV-1", "source_path": "a.json",
+                    "text": '"episodeSteps": 500', "retrieval_score": 1.0,
+                }],
+                "coverage": {"query_coverage": 1.0, "candidate_files": 1},
+            },
+            {
+                "results": [],
+                "coverage": {"query_coverage": 0.0},
+                "warnings": ["当前范围没有可检索正文证据。"],
+            },
+        ])
+        self.assertEqual(merged["coverage"]["query_coverage"], 1.0)
+        self.assertEqual(merged["warnings"], [])
+
     def test_verifier_never_treats_an_unreferenced_claim_as_supported(self):
         verification = ClaimVerifier().verify({
             "answer": "合同对乙方非常不利。",
@@ -102,6 +145,53 @@ class AnalysisTurnTests(unittest.TestCase):
         }, {"modes": ["risk"]})
         self.assertEqual(verification["status"], "partial")
         self.assertEqual(verification["ledger"]["unsupported_claim_count"], 1)
+
+    def test_verifier_accepts_exact_field_value_and_ignores_provenance_note(self):
+        verification = ClaimVerifier().verify({
+            "answer": (
+                "本次分析基于文件 a.json 的直接检索 [1]。\n"
+                "episodeSteps 为 500 [1]。"
+            ),
+            "citations": [{
+                "citation_index": 1,
+                "evidence_id": "EV-1",
+                "source_path": "a.json",
+                "original_text": '{"episodeSteps": 500, "runTimeout": 1200}',
+            }],
+            "coverage": {"query_coverage": 1.0},
+        }, {"modes": ["retrieval"], "scope": {"kind": "package"}, "steps": []})
+        self.assertEqual(verification["status"], "verified")
+        self.assertEqual(verification["quality_metrics"]["factual_claim_count"], 1)
+        self.assertEqual(verification["ledger"]["supported_claim_count"], 1)
+
+    def test_verifier_rejects_full_scope_claim_when_only_three_of_twenty_two_checked(self):
+        verification = ClaimVerifier().verify({
+            "answer": "资料显示该计划已经获批 [1]。",
+            "citations": [{
+                "citation_index": 1,
+                "evidence_id": "EV-1",
+                "source_path": "contracts/a.txt",
+                "original_text": "资料显示该计划已经获批。",
+            }],
+            "coverage": {
+                "query_coverage": 3 / 22,
+                "coverage_basis": "scope_inspection",
+                "scope_files": 22,
+                "inspected_files": 3,
+                "scope_inspection_coverage": 3 / 22,
+            },
+        }, {
+            "modes": ["comparison", "timeline"],
+            "scope": {"kind": "package"},
+            "steps": [],
+        }, batch_summary={"inventory_files": 22, "inspected_files": 3})
+
+        self.assertEqual(verification["status"], "partial")
+        self.assertTrue(verification["quality_metrics"]["scope_incomplete"])
+        self.assertAlmostEqual(
+            verification["quality_metrics"]["scope_inspection_coverage"], 3 / 22
+        )
+        self.assertTrue(any("3/22" in item for item in verification["warnings"]))
 
     def test_turn_creation_is_idempotent_and_messages_are_authoritative(self):
         storage = self.make_storage()
@@ -144,6 +234,82 @@ class AnalysisTurnTests(unittest.TestCase):
         self.assertEqual(
             storage.get_conversation_research_memory("session-1")["payload"]["last_turn_id"],
             turn["id"],
+        )
+
+    def test_runtime_narrows_an_explicit_filename_to_one_file(self):
+        storage = self.make_storage()
+        session = self.seed_session(storage)
+        turn, _created = storage.create_conversation_turn(
+            "session-1", "scan-1", "owner-1",
+            "contracts/a.txt 中的违约责任是什么？",
+            {"kind": "package"}, idempotency_key="explicit-file-1",
+        )
+        job = storage.claim_next_job("worker-1")
+        turn["job_id"] = job["id"]
+        engine = FakeEngine()
+        result = AnalysisTurnRuntime(storage, engine).execute(
+            turn, session, ConversationScope("package"),
+            ["contracts/a.txt", "contracts/b.txt"],
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(engine.last_scope.kind, "files")
+        self.assertEqual(engine.last_scope.source_paths, ("contracts/a.txt",))
+
+    def test_conversation_summary_and_audit_history_survive_reload_and_page(self):
+        storage = self.make_storage()
+        messages = []
+        for index in range(10):
+            messages.append({
+                "message_id": "history-{}".format(index + 1),
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": "历史消息 {}".format(index + 1),
+            })
+        storage.save_conversation({
+            "session_id": "session-page",
+            "scan_id": "scan-1",
+            "title": "长会话",
+            "scope": {"kind": "package"},
+            "messages": messages,
+        }, "owner-1")
+        turn, _created = storage.create_conversation_turn(
+            "session-page", "scan-1", "owner-1", "继续分析",
+            {"kind": "package"}, idempotency_key="page-1",
+        )
+        storage.complete_conversation_turn(
+            turn["id"],
+            {"answer": "阶段回答", "citations": [], "intent": {"name": "analysis"}},
+            {"status": "insufficient_evidence"},
+            [],
+            session_state={
+                "scope": {"kind": "package"},
+                "rolling_summary": "前四轮的持久化摘要",
+                "summarized_message_count": 8,
+            },
+        )
+
+        context = storage.get_conversation(
+            "session-page", "owner-1", scan_id="scan-1",
+            message_limit=100, context_only=True,
+        )
+        self.assertEqual(context["rolling_summary"], "前四轮的持久化摘要")
+        self.assertEqual(context["summarized_message_count"], 8)
+        self.assertEqual(context["message_page"]["total"], 12)
+        self.assertEqual(len(context["messages"]), 4)
+
+        latest = storage.get_conversation(
+            "session-page", "owner-1", scan_id="scan-1", message_limit=4,
+        )
+        self.assertEqual(len(latest["messages"]), 4)
+        self.assertTrue(latest["message_page"]["has_more"])
+        older = storage.get_conversation(
+            "session-page", "owner-1", scan_id="scan-1", message_limit=4,
+            before_sequence=latest["message_page"]["before_sequence"],
+        )
+        self.assertEqual(len(older["messages"]), 4)
+        self.assertLess(
+            int(older["message_page"]["before_sequence"] or 1_000_000),
+            latest["message_page"]["before_sequence"],
         )
 
     def test_promotion_waits_without_duplicating_the_user_message(self):

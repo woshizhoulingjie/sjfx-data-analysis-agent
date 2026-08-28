@@ -5,8 +5,10 @@ from services.conversation import (
     CallableStructuredQA,
     ContextWindowPolicy,
     ConversationEngine,
+    ConversationMessage,
     ConversationScope,
     ConversationSession,
+    FollowUpResolver,
     IntentRouter,
 )
 
@@ -103,6 +105,10 @@ class IntentRoutingTests(unittest.TestCase):
         self.assertEqual(router.route("把这封信翻译成中文").name, "translation")
         self.assertEqual(router.route("Alice 和 Bob 有什么关系？").name, "relationship")
         self.assertEqual(router.route("销售额合计是多少？").name, "structured")
+        self.assertEqual(
+            router.route("archive/79968841.json 中 episodeSteps 是多少？").name,
+            "retrieval",
+        )
         self.assertEqual(router.route("概括这个目录主要讲了什么").name, "summary")
         self.assertEqual(router.route("Alice 在什么时候批准计划？").name, "retrieval")
         self.assertEqual(router.route("你好").name, "casual")
@@ -113,6 +119,19 @@ class IntentRoutingTests(unittest.TestCase):
 
         self.assertEqual(decision.name, "relationship")
         self.assertLess(decision.confidence, 0.9)
+
+    def test_short_independent_questions_do_not_inherit_previous_question(self):
+        session = ConversationSession(
+            scan_id="scan-1",
+            messages=[ConversationMessage(role="user", content="上一轮讨论交付时间")],
+        )
+        resolver = FollowUpResolver()
+
+        for question in ("预算多少？", "风险有哪些？", "你会什么？"):
+            with self.subTest(question=question):
+                resolution = resolver.resolve(question, session)
+                self.assertFalse(resolution.is_follow_up)
+                self.assertEqual(resolution.resolved_query, question)
 
 
 class ConversationEngineTests(unittest.TestCase):

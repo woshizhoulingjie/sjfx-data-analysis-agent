@@ -103,11 +103,20 @@ def merge_retrieval_results(
     seen = set()
     deferred: List[str] = []
     coverage_values: List[float] = []
+    evidence_coverage_values: List[float] = []
     warnings: List[str] = []
     reported_candidate_files = 0
+    total_files = 0
+    scope_files = 0
+    searchable_files = 0
+    deep_analyzed_files = 0
+    deep_candidate_files = 0
+    candidate_depth_values: List[float] = []
+    coverage_bases = set()
     for result in results or []:
         result = dict(result or {})
-        for item in result.get("results") or result.get("evidence") or []:
+        result_items = list(result.get("results") or result.get("evidence") or [])
+        for item in result_items:
             key = (
                 str(item.get("evidence_id") or ""),
                 str(item.get("source_path") or ""),
@@ -121,10 +130,33 @@ def merge_retrieval_results(
         reported_candidate_files = max(
             reported_candidate_files, int(coverage.get("candidate_files") or 0)
         )
+        total_files = max(total_files, int(coverage.get("total_files") or 0))
+        scope_files = max(scope_files, int(coverage.get("scope_files") or 0))
+        searchable_files = max(
+            searchable_files, int(coverage.get("searchable_files") or 0)
+        )
+        deep_analyzed_files = max(
+            deep_analyzed_files, int(coverage.get("deep_analyzed_files") or 0)
+        )
+        deep_candidate_files = max(
+            deep_candidate_files, int(coverage.get("deep_candidate_files") or 0)
+        )
+        if coverage.get("coverage_basis"):
+            coverage_bases.add(str(coverage.get("coverage_basis")))
+        if coverage.get("candidate_deep_coverage") is not None:
+            try:
+                candidate_depth_values.append(
+                    float(coverage.get("candidate_deep_coverage"))
+                )
+            except (TypeError, ValueError):
+                pass
         value = coverage.get("query_coverage")
         if value is not None:
             try:
-                coverage_values.append(float(value))
+                numeric_coverage = float(value)
+                coverage_values.append(numeric_coverage)
+                if result_items:
+                    evidence_coverage_values.append(numeric_coverage)
             except (TypeError, ValueError):
                 pass
         for path in coverage.get("deferred_candidates") or coverage.get("promotion_candidates") or []:
@@ -138,12 +170,45 @@ def merge_retrieval_results(
     )
     merged = merged[: max(1, min(100, int(limit or 24)))]
     visible_candidate_files = len({_source(item) for item in merged if _source(item)})
+    scope_inspection_coverage = (
+        round(visible_candidate_files / float(scope_files), 6)
+        if scope_files else None
+    )
+    candidate_deep_coverage = (
+        min(candidate_depth_values) if candidate_depth_values else None
+    )
+    scope_based = "scope_inspection" in coverage_bases
+    # Repair/counter queries are deliberately broader than the user's primary
+    # query and may legitimately return no rows.  Such an empty auxiliary query
+    # must not reduce a successful exact lookup to zero coverage.
+    effective_query_coverage = (
+        max(evidence_coverage_values)
+        if evidence_coverage_values
+        else (max(coverage_values) if coverage_values else candidate_deep_coverage)
+    )
+    if merged:
+        stale_no_evidence = re.compile(
+            r"没有可检索正文证据|未找到可检索(?:正文)?证据|没有找到正文证据|^no match$",
+            re.I,
+        )
+        warnings = [item for item in warnings if not stale_no_evidence.search(item)]
     return {
         "results": merged,
         "coverage": {
-            "query_coverage": min(coverage_values) if coverage_values else None,
+            "total_files": total_files or None,
+            "scope_files": scope_files or None,
+            "searchable_files": searchable_files or None,
+            "deep_analyzed_files": deep_analyzed_files or None,
+            "deep_candidate_files": deep_candidate_files,
+            "candidate_deep_coverage": candidate_deep_coverage,
+            "scope_inspection_coverage": scope_inspection_coverage,
+            "coverage_basis": "scope_inspection" if scope_based else "candidate_depth",
+            "query_coverage": (
+                scope_inspection_coverage if scope_based else effective_query_coverage
+            ),
             "deferred_candidates": deferred[:100],
             "candidate_files": max(reported_candidate_files, visible_candidate_files),
+            "inspected_files": visible_candidate_files,
             "retrieved_files": visible_candidate_files,
         },
         "needs_promotion": bool(deferred),
@@ -311,6 +376,10 @@ def reduce_evidence_batches(
         "inspected_files": len(profiles),
         "inventory_files": len(inventory_paths or []),
         "unparsed_files": unparsed,
+        "scope_complete": len(profiles) == len(inventory_paths or []),
+        "scope_limitation": None if len(profiles) == len(inventory_paths or []) else (
+            "结果仅基于检索候选文件，不代表全部范围文件。"
+        ),
         "evidence_records": len(evidence or []),
         "batches": batches,
         "file_profiles": profiles,
@@ -583,7 +652,15 @@ def execute_analysis_toolbox(
         if name not in tools:
             continue
         _cancel(cancel_check)
-        output[name] = handler()
+        result = handler()
+        result["analysis_scope"] = {
+            "scope_files": int(batch_summary.get("inventory_files") or 0),
+            "candidate_files": int(batch_summary.get("candidate_files") or 0),
+            "inspected_files": int(batch_summary.get("inspected_files") or 0),
+            "scope_complete": bool(batch_summary.get("scope_complete")),
+            "limitation": batch_summary.get("scope_limitation"),
+        }
+        output[name] = result
     return output
 
 
@@ -601,6 +678,8 @@ def compact_tool_context(
                 "inspected_files",
                 "inventory_files",
                 "unparsed_files",
+                "scope_complete",
+                "scope_limitation",
                 "evidence_records",
             )
         },

@@ -36,14 +36,10 @@ from services.large_package import (
 )
 from services.retrieval import build_retrieval_manifest, evidence_corpus, retrieve_evidence
 from services.package_exploration import (
-    CONTENT_MAP_SCHEMA,
-    PREVIEW_SCHEMA,
-    PreviewSliceYield,
-    PreviewBudget,
-    build_content_map,
     preview_as_document,
     preview_file,
 )
+from services.large_package_runtime import explore_large_package
 from services.unified_parser import compact_document
 from services.unified_parser import UnifiedDocumentParser
 from services.parse_isolation import (
@@ -3744,184 +3740,13 @@ def _build_structured_overview(documents):
 
 
 
-def _preview_matches_inventory(preview, file_node):
-    if not preview or preview.get("status") not in {"previewed", "restricted"}:
-        return False
-    return (
-        int(preview.get("size") or -1) == int(file_node.get("size") or 0)
-        and int(preview.get("modified_at_ns") or -1)
-        == int(file_node.get("modified_at_ns") or 0)
-    )
-
-
 def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=None,
                            progress=None, cancel_check=None, yield_check=None):
-    """Persist one bounded preview per inventory entry and build a content map."""
-    progress = progress or (lambda percent, message: None)
-    deep_paths = set(deep_paths or [])
-    # Resume validation needs only size/mtime/checkpoint columns.  Loading the
-    # full preview JSON here would retain up to 96 KiB of text per inventory
-    # entry (several GiB for a normal 50k-file package).
-    existing = {
-        item["path"]: item for item in storage.iter_file_preview_states(scan_id)
-    }
-    previous_map = storage.get_content_map(scan_id)
-    previous_map_stale = bool(
-        previous_map and previous_map.get("schema_version") != CONTENT_MAP_SCHEMA
+    return explore_large_package(
+        scan_id, scan, files, storage, policy, deep_paths=deep_paths,
+        progress=progress, cancel_check=cancel_check, yield_check=yield_check,
+        preview_file_func=preview_file,
     )
-    if not previous_map_stale and existing:
-        first_path = min(existing)
-        first_preview = storage.get_file_preview(scan_id, first_path) or {}
-        previous_map_stale = bool(
-            first_preview and first_preview.get("schema_version") != PREVIEW_SCHEMA
-        )
-    if previous_map_stale:
-        # A preview contract upgrade changes the fields used by the content
-        # map. Re-read source windows instead of silently publishing an old
-        # map with missing analytical dimensions.
-        existing = {}
-    budget = PreviewBudget(policy.get("preview_total_bytes"))
-    pending_previews = []
-    pending_documents = []
-    pending_states = []
-    reused = 0
-    previewed = 0
-    total = max(1, len(files))
-    batch_size = max(1, min(500, int(policy.get("batch_files") or 200)))
-    slice_files = max(1, int(getattr(Config, "LARGE_PACKAGE_PREVIEW_SLICE_FILES", 100)))
-    slice_seconds = max(5, int(getattr(Config, "LARGE_PACKAGE_PREVIEW_SLICE_SECONDS", 30)))
-    slice_started = time.monotonic()
-    start_index = max(0, int(((previous_map or {}).get("run") or {}).get("next_index") or 0))
-
-    def flush():
-        nonlocal pending_previews, pending_documents, pending_states
-        storage.save_exploration_batch(
-            scan_id, pending_previews, [], pending_states,
-            evidence_by_path=[
-                (path, evidence_corpus({path: document}))
-                for path, document in pending_documents
-            ],
-            remove_document_paths=[path for path, _document in pending_documents],
-        )
-        pending_previews = []
-        pending_documents = []
-        pending_states = []
-
-    def save_slice_checkpoint(next_index, reason):
-        checkpoint = {
-            "schema_version": CONTENT_MAP_SCHEMA,
-            "status": "previewing",
-            "representative_paths": [],
-            "run": {
-                "next_index": int(next_index),
-                "new_previews": previewed,
-                "reused_previews": reused,
-                "budget_consumed_bytes": budget.consumed_bytes,
-                "slice_incomplete": True,
-                "yield_reason": reason,
-            },
-        }
-        storage.save_content_map(scan_id, checkpoint)
-        return checkpoint
-
-    for index, file_node in enumerate(files[start_index:], start_index + 1):
-        if cancel_check is not None and cancel_check():
-            flush()
-            raise ParseIsolationCancelled("任务已取消，已保存完成的轻量预览检查点")
-        path = file_node.get("path")
-        prior = existing.get(path)
-        # A pre-v2 completed document without a preview checkpoint cannot be
-        # proven fresh.  Do not preserve it merely because metadata is absent.
-        preserve_deep = path in deep_paths and _preview_matches_inventory(prior, file_node)
-        if _preview_matches_inventory(prior, file_node):
-            reused += 1
-        else:
-            try:
-                preview = preview_file(
-                    scan.get("root"), file_node,
-                    per_file_bytes=policy.get("preview_bytes_per_file"),
-                    budget=budget,
-                    zip_member_limit=policy.get("preview_zip_members"),
-                    zip_member_bytes=policy.get("preview_zip_member_bytes"),
-                    cancel_check=cancel_check, yield_check=yield_check,
-                )
-            except PreviewSliceYield:
-                flush()
-                return save_slice_checkpoint(index - 1, "higher_priority_job")
-            pending_previews.append((path, preview))
-            existing[path] = preview
-            previewed += 1
-            # A previous accurate parse is an upgrade and must never be
-            # overwritten by a lightweight projection.
-            if not preserve_deep and preview.get("status") in {"previewed", "restricted"}:
-                document = preview_as_document(preview)
-                pending_documents.append((path, document))
-                pending_states.append((
-                    path,
-                    "preview:{}".format(
-                        preview.get("preview_fingerprint") or preview.get("sample_sha256") or ""
-                    ),
-                    "previewed",
-                    document,
-                    None,
-                ))
-            elif preview.get("status") in {"failed", "deferred"} and not preserve_deep:
-                pending_states.append((
-                    path,
-                    "preview:{}".format(
-                        preview.get("preview_fingerprint") or preview.get("sample_sha256") or ""
-                    ),
-                    "preview_{}".format(preview.get("status")),
-                    None,
-                    "; ".join(preview.get("warnings") or []) or None,
-                ))
-        if index % batch_size == 0:
-            flush()
-            progress(
-                2 + int(18 * index / total),
-                "全量有界轻量预览：{}/{}（复用 {}）".format(index, len(files), reused),
-            )
-        if (
-            previewed >= slice_files
-            or time.monotonic() - slice_started >= slice_seconds
-            or (yield_check is not None and yield_check())
-        ) and index < len(files):
-            flush()
-            return save_slice_checkpoint(index, "slice_budget")
-    flush()
-    progress(20, "轻量预览完成，正在发现主题、重复候选与文件关系")
-    content_map = build_content_map(
-        (item["payload"] for item in storage.iter_file_previews(scan_id)),
-        representative_limit=policy.get("initial_parse_files"),
-    )
-    selection_decisions = content_map.pop("selection_decisions", [])
-    storage.save_file_workflow_states(scan_id, selection_decisions)
-    # Preview every valid file first, then remove exact aliases from the
-    # content-weighted retrieval index. Their physical paths and workflow rows
-    # remain fully auditable and point to the canonical source.
-    for duplicate in content_map.get("duplicates") or []:
-        if duplicate.get("kind") != "exact_sha256":
-            continue
-        canonical = duplicate.get("canonical_path")
-        for alias in duplicate.get("paths") or []:
-            if alias != canonical:
-                storage.replace_document_evidence_index(
-                    scan_id, alias, [], preserve_translations=True
-                )
-    content_map["policy"] = {
-        "preview_bytes_per_file": policy.get("preview_bytes_per_file"),
-        "preview_total_bytes": policy.get("preview_total_bytes"),
-        "representative_limit": policy.get("initial_parse_files"),
-        "selection_basis": "主题覆盖、格式/目录/语言覆盖、信息量、独特性与关系价值",
-    }
-    content_map["run"] = {
-        "new_previews": previewed,
-        "reused_previews": reused,
-        "budget_consumed_bytes": budget.consumed_bytes,
-        "budget_exhausted": budget.exhausted,
-    }
-    storage.save_content_map(scan_id, content_map)
-    return content_map
 
 
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
@@ -4123,6 +3948,46 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             )
             failures = [item for item in failures if item.get("path") != node_path]
         except Exception as exc:
+            preserved_document = storage.get_document(scan_id, node_path)
+            if workflow_source == "question_promotion" and preserved_document:
+                # Historical imports may outlive their original source root.
+                # A failed upgrade must not destroy the only durable copy.
+                documents[node_path] = (
+                    storage.project_document(
+                        preserved_document,
+                        text_limit=policy["overview_chars_per_file"],
+                        evidence_limit=policy["overview_evidence_per_file"],
+                    )
+                    if policy.get("enabled") else preserved_document
+                )
+                storage.replace_document_evidence_index(
+                    scan_id, node_path,
+                    evidence_corpus({node_path: preserved_document}),
+                )
+                fingerprint = str(
+                    (prior_states.get(node_path) or {}).get("fingerprint") or
+                    file_fingerprint(
+                        file_node, parse_mode=actual_parse_mode,
+                        parser_contract=parser_contract,
+                    )
+                )
+                storage.set_file_state(
+                    scan_id, node_path, fingerprint, "overview",
+                    document=preserved_document,
+                    error="原始源文件不可用，已保留数据库历史文档：{}".format(str(exc)[:300]),
+                    error_class="source_unavailable", retryable=False,
+                    next_retry_at=None,
+                )
+                storage.update_file_workflow_stage(
+                    scan_id, node_path, "evidence_ready",
+                    parse_status="source_unavailable", evidence_status="ready",
+                    priority_source=workflow_source,
+                )
+                progress(
+                    parse_progress(completed_candidates, total_candidates),
+                    "保留历史文档证据：{}".format(node_path),
+                )
+                return
             fingerprint = file_fingerprint(
                 file_node, parse_mode=actual_parse_mode, parser_contract=parser_contract,
             )
@@ -4263,6 +4128,32 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     aggregation_interval = max(1, int(aggregation_interval or 3))
     aggregation_depth = max(0, int(aggregation_depth or 0))
     previous_analysis = storage.get_analysis(scan_id) if policy.get("enabled") else None
+    if (
+        previous_analysis
+        and target_paths
+        and workflow_source == "question_promotion"
+    ):
+        # An interactive promotion only needs the newly parsed document and
+        # evidence index to become durable before the waiting turn resumes.
+        # Rebuilding summaries, clusters and LLM-generated topic names for the
+        # whole package made a one-file question pay the cost of 4,000+ files.
+        analysis = refresh_package_coverage(scan_id, scan, storage) or previous_analysis
+        analysis["import_translation"] = import_translation
+        analysis["workflow"] = {
+            "schema_version": "large-package-workflow/1.0",
+            "source": workflow_source,
+            "batch_size": max(1, len(parse_candidates)),
+            "processed_in_job": len(parse_candidates),
+            "processed_paths": sorted(batch_translation_paths),
+            "remaining_priority_paths": remaining_batch_paths,
+            "background_batch_paths": [],
+            "selection_gate": (content_map or {}).get("selection_gate") or {},
+            "global_aggregation": "skipped_for_interactive_promotion",
+        }
+        analysis.setdefault("policy", {})["import_translation"] = import_translation
+        storage.save_analysis(scan_id, analysis)
+        progress(95, "定向深析证据已入库，跳过整包主题重算")
+        return analysis
     if (
         previous_analysis
         and remaining_batch_paths
@@ -4666,7 +4557,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     if (
         policy.get("enabled")
         and not remaining_batch_paths
-        and bool(getattr(Config, "LARGE_PACKAGE_BACKGROUND_BACKFILL", True))
+        and bool(policy.get("background_backfill"))
     ):
         background_limit = max(20, min(50, int(
             getattr(Config, "LARGE_PACKAGE_BACKGROUND_BATCH_FILES", 20)

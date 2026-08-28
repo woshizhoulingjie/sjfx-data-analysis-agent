@@ -1,6 +1,7 @@
 import json
 import hashlib
 import hmac
+import importlib.util
 import logging
 import logging.handlers
 import os
@@ -10,6 +11,7 @@ import sys
 import time
 import uuid
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -19,7 +21,7 @@ from web_compat import (
     render_template, request, send_from_directory,
 )
 
-from config import Config
+from config import Config, ensure_runtime_directories
 from services.ollama import LocalModelError, OllamaClient, OllamaEmbeddingClient
 from services.document_analysis import analyze_document
 from services.evidence import embedding_mode, select_evidence, set_embedding_provider, verify_claim_evidence
@@ -41,7 +43,7 @@ from services.scanner import (
     IGNORED_DIRS, IGNORED_FILES, human_size, resolve_under, scan_directory,
     scan_inventory_slice,
 )
-from services.storage import Storage
+from services.storage import LazyStorage, Storage
 from services.tree_editor import filter_tree
 from services.structured_qa import answer_question
 from services.unified_parser import UnifiedDocumentParser
@@ -85,11 +87,21 @@ def _python_runtime_status(version_info=None):
     }
 
 
+@asynccontextmanager
+async def _app_lifespan(_application):
+    _initialize_runtime_state()
+    yield
+
+
 app = SJFXFastAPI(
     title="SJFX Data Analysis Agent",
     version="2.1",
     max_content_length=4 * 1024 * 1024,
     security_headers=True,
+    docs_url="/docs" if Config.ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if Config.ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if Config.ENABLE_API_DOCS else None,
+    lifespan=_app_lifespan,
 )
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("sjfx")
@@ -120,7 +132,13 @@ for _handler in logging.getLogger().handlers:
 logging.getLogger("docling").setLevel(logging.WARNING)
 logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 app.config["JSON_AS_ASCII"] = False
-storage = Storage(Config.DB_PATH, Config.DOCUMENT_CACHE_DIR, Config.SIDECAR_PAYLOAD_BYTES)
+storage = LazyStorage(
+    lambda: Storage(
+        Config.DB_PATH,
+        Config.DOCUMENT_CACHE_DIR,
+        Config.SIDECAR_PAYLOAD_BYTES,
+    )
+)
 # Bind historical pre-authentication records to the configured token before
 # serving requests.  This closes the legacy "first caller claims the record"
 # loophole while keeping existing demo links usable for the project owner.
@@ -129,11 +147,6 @@ _token_owner_alias = (
     hashlib.sha256(Config.API_ACCESS_TOKEN.encode("utf-8")).hexdigest()[:24]
     if Config.API_ACCESS_TOKEN else None
 )
-storage.migrate_legacy_ownership(
-    _configured_owner_id,
-    aliases=["legacy", "default", _token_owner_alias],
-)
-storage.register_existing_outputs(Config.OUTPUT_DIR, _configured_owner_id)
 # The deployment is intentionally local-only: all generation uses Ollama on this host.
 llm_transport = OllamaClient(
     base_url=Config.OLLAMA_BASE_URL,
@@ -147,11 +160,9 @@ llm = PydanticAgentRuntime(llm_transport)
 translation_transport = None
 if Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "offline_nllb":
     translation_model_path = Config.TRANSLATION_MODEL_PATH
-    try:
-        import ctranslate2  # Optional: the main environment may not have CT2 yet.
-        ct2_available = True
-    except Exception:
-        ct2_available = False
+    # Checking availability must not import CT2's native runtime in the Web
+    # process.  The provider imports it lazily only when translation executes.
+    ct2_available = importlib.util.find_spec("ctranslate2") is not None
     if (
         getattr(Config, "TRANSLATION_PREFER_CT2", True)
         and ct2_available
@@ -232,7 +243,9 @@ _summary_worker_execution = InternalExecutionCapability("sjfx_summary_worker_exe
 _summary_worker_execution_context = _summary_worker_execution.activate
 
 
-if not logger.handlers:
+def _configure_file_logging():
+    if logger.handlers:
+        return
     _file_handler = logging.handlers.RotatingFileHandler(
         str(Config.LOG_DIR / "app.log"), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
     )
@@ -240,6 +253,20 @@ if not logger.handlers:
     _file_handler.addFilter(_log_filter)
     logger.addHandler(_file_handler)
     logger.propagate = False
+
+
+def _initialize_runtime_state():
+    """Perform filesystem and database mutations only for a real Web startup."""
+    ensure_runtime_directories()
+    runtime_storage = storage.initialize()
+    runtime_storage.migrate_legacy_ownership(
+        _configured_owner_id,
+        aliases=["legacy", "default", _token_owner_alias],
+    )
+    runtime_storage.register_existing_outputs(
+        Config.OUTPUT_DIR, _configured_owner_id
+    )
+    _configure_file_logging()
 
 
 def _api_token_expired():
@@ -2003,6 +2030,7 @@ def _run_claimed_scan_and_analyze_job(job):
         preview_total_bytes=Config.LARGE_PACKAGE_PREVIEW_TOTAL_BYTES,
         max_content_bytes=Config.MAX_CONTENT_BYTES,
         temp_reserve_bytes=Config.PARSE_TEMP_DISK_RESERVE_BYTES,
+        full_deep_backfill=Config.LARGE_PACKAGE_BACKGROUND_BACKFILL,
     )
     scan_result["resource_plan"] = resource_plan
     storage.update_scan(job_id, scan_result)
@@ -2254,6 +2282,25 @@ def get_scan(scan_id):
             scan_result["tree"] = storage.build_inventory_tree(scan_id) or scan_result.get("tree")
         scan_result["scan_id"] = scan_id
         return jsonify({"ok": True, "scan": scan_result, "summaries": storage.list_summaries(scan_id), "analysis": storage.get_analysis(scan_id)})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/scan/<scan_id>", methods=["DELETE"])
+def delete_scan(scan_id):
+    """Delete one owned, inactive scan and all of its durable artifacts."""
+    try:
+        require_scan(scan_id)
+        result = storage.delete_scan(
+            scan_id,
+            owner_id=_request_owner_id(),
+            output_dir=Config.OUTPUT_DIR,
+        )
+        if not result.get("deleted"):
+            return api_error("扫描不存在或已被清理", 404)
+        return jsonify({"ok": True, "cleanup": result})
+    except RuntimeError as exc:
+        return api_error(str(exc), 409)
     except ValueError as exc:
         return api_error(str(exc), 404)
 
@@ -2614,21 +2661,82 @@ def _conversation_retrieve(retrieval_request):
             preview = storage.get_file_preview(retrieval_request.scan_id, physical_path) or {}
             item["source_language"] = (preview.get("language") or {}).get("code")
             item["analysis_level"] = "deep" if state.get("status") == "completed" else "preview"
+    deep_candidates = sum(
+        1 for path in candidate_paths
+        if (states.get(path) or {}).get("status") == "completed"
+    )
+    indexed_only_candidates = sum(
+        1 for path in candidate_paths
+        if (
+            (states.get(path) or {}).get("status") != "completed"
+            and (states.get(path) or {}).get("retryable") is not None
+            and not bool((states.get(path) or {}).get("retryable"))
+        )
+    )
     deferred = [
         path for path in candidate_paths
-        if (states.get(path) or {}).get("status") != "completed"
+        if (
+            (states.get(path) or {}).get("status") != "completed"
+            and not (
+                (states.get(path) or {}).get("retryable") is not None
+                and not bool((states.get(path) or {}).get("retryable"))
+            )
+        )
     ]
-    deep_candidates = len(candidate_paths) - len(deferred)
-    analysis = storage.get_analysis(retrieval_request.scan_id) or {}
+    analysis = storage.get_analysis_overview(retrieval_request.scan_id) or {}
     package_coverage = analysis.get("coverage") or {}
+    total_files = int(package_coverage.get("inventory_files") or 0)
+    scope_extension = scope.value if scope.kind == "file_type" else None
+    scope_files = storage.count_inventory_files(
+        retrieval_request.scan_id,
+        scope=scope.retrieval_path,
+        source_paths=list(scope.source_paths) or None,
+        extension=scope_extension,
+    )
+    if not scope_files and scope.kind in {"package", "topic", "entity", "time"}:
+        scope_files = total_files
+    inspected_paths = {
+        str(item.get("archive_source_path") or str(
+            item.get("source_path") or ""
+        ).split("::", 1)[0])
+        for item in result.get("results") or []
+    }
+    inspected_paths.discard("")
+    inspected_files = len(inspected_paths)
+    candidate_deep_coverage = round(
+        deep_candidates / float(len(candidate_paths) or 1), 6
+    )
+    candidate_evidence_coverage = round(
+        (deep_candidates + indexed_only_candidates)
+        / float(len(candidate_paths) or 1), 6
+    )
+    scope_inspection_coverage = round(
+        inspected_files / float(scope_files or 1), 6
+    )
+    broad_modes = {
+        "summary", "comparison", "timeline", "relationship", "contradiction",
+        "risk", "multi_task",
+    }
+    broad_scope = retrieval_request.intent in broad_modes
+    query_coverage = (
+        scope_inspection_coverage if broad_scope else candidate_evidence_coverage
+    )
     result["coverage"] = {
-        "total_files": package_coverage.get("inventory_files"),
+        "total_files": total_files or None,
+        "scope_files": scope_files or None,
         "searchable_files": package_coverage.get("parsed_files"),
         "deep_analyzed_files": package_coverage.get("deep_analyzed_files"),
         "candidate_files": len(candidate_paths),
+        "inspected_files": inspected_files,
+        "retrieved_files": inspected_files,
         "deep_candidate_files": deep_candidates,
-        "query_coverage": round(deep_candidates / float(len(candidate_paths) or 1), 6),
-        "deferred_candidates": deferred[:24],
+        "indexed_only_candidate_files": indexed_only_candidates,
+        "candidate_deep_coverage": candidate_deep_coverage,
+        "candidate_evidence_coverage": candidate_evidence_coverage,
+        "scope_inspection_coverage": scope_inspection_coverage,
+        "coverage_basis": "scope_inspection" if broad_scope else "candidate_depth",
+        "query_coverage": query_coverage,
+        "deferred_candidates": deferred[:100],
     }
     result["needs_promotion"] = bool(deferred)
     return result
@@ -2637,7 +2745,12 @@ def _conversation_retrieve(retrieval_request):
 def _conversation_structured(request_data):
     scope = request_data.scope
     documents = []
-    for item in storage.iter_documents(request_data.scan_id, hydrate=False, batch_size=200):
+    for item in storage.iter_structured_documents(
+        request_data.scan_id,
+        hydrate=False,
+        batch_size=100,
+        source_paths=list(scope.source_paths) or None,
+    ):
         path = item.get("path")
         if not scope.contains_source(path):
             continue
@@ -2645,7 +2758,18 @@ def _conversation_structured(request_data):
         if document.get("data_profile") or document.get("data_profiles"):
             documents.append({"path": path, "payload": document})
     result = answer_question(request_data.question, documents)
-    analysis = storage.get_analysis(request_data.scan_id) or {}
+    result_coverage = result.get("coverage") or {}
+    if result_coverage.get("complete") is False:
+        source_paths = list(result.get("source_paths") or [])
+        states = storage.get_file_states(request_data.scan_id, source_paths)
+        promotion_candidates = [
+            path for path in source_paths
+            if (states.get(path) or {}).get("status") != "completed"
+        ]
+        if promotion_candidates:
+            result["promotion_candidates"] = promotion_candidates[:24]
+            result["needs_promotion"] = True
+    analysis = storage.get_analysis_overview(request_data.scan_id) or {}
     result.setdefault("coverage", (analysis.get("coverage") or {}).get("semantic_analysis_coverage") or {})
     return result
 
@@ -2656,6 +2780,126 @@ conversation_engine = ConversationEngine(
     structured_qa=CallableStructuredQA(_conversation_structured),
     translator=_ConversationTranslationAdapter() if Config.ENABLE_TRANSLATION else None,
 )
+
+
+def _conversation_index_status(scan_id):
+    documents = storage.count_documents(scan_id)
+    evidence = storage.count_evidence_index(scan_id)
+    preview_counts = storage.file_preview_counts(scan_id)
+    previews = sum(int(value or 0) for value in preview_counts.values())
+    durable = storage.get_search_index_state(scan_id)
+    if durable:
+        expected = int(durable.get("expected_documents") or 0)
+        processed = int(durable.get("processed_documents") or 0)
+        failed = int(durable.get("failed_documents") or 0)
+        ready = bool(
+            durable.get("status") == "ready"
+            and expected == documents
+            and processed == expected
+            and not failed
+        )
+        state = "ready" if ready else str(durable.get("status") or "rebuild_required")
+    else:
+        # Existing releases had no generation ledger.  Preserve access to a
+        # populated legacy index, while every future rebuild uses the strict
+        # state machine below.
+        ready = not bool(documents and not evidence)
+        state = "legacy_ready" if ready and evidence else (
+            "ready" if ready else "rebuild_required"
+        )
+        expected = documents
+        processed = documents if ready else 0
+        failed = 0
+    return {
+        "ready": ready,
+        "state": state,
+        "documents": documents,
+        "evidence_records": evidence,
+        "previews": previews,
+        "preview_status_counts": preview_counts,
+        "generation": (durable or {}).get("generation") if durable else "legacy",
+        "expected_documents": expected,
+        "processed_documents": processed,
+        "failed_documents": failed,
+        "empty_documents": int((durable or {}).get("empty_documents") or 0),
+        "started_at": (durable or {}).get("started_at"),
+        "updated_at": (durable or {}).get("updated_at"),
+        "completed_at": (durable or {}).get("completed_at"),
+        "error": (durable or {}).get("error"),
+    }
+
+
+def _run_claimed_search_index_rebuild_job(job):
+    """Rebuild conversational evidence from durable documents only.
+
+    Historical scans may outlive their source directory.  Re-indexing their
+    stored unified documents keeps migration independent of source-file I/O.
+    """
+    scan_id = str(job.get("scan_id") or "")
+    require_scan(scan_id)
+    total = storage.count_documents(scan_id)
+    state = storage.get_search_index_state(scan_id)
+    if not state or state.get("status") not in {"rebuilding", "interrupted"}:
+        state = storage.begin_search_index_rebuild(scan_id, total)
+    elif state.get("status") == "interrupted":
+        state = storage.begin_search_index_rebuild(scan_id, total)
+    processed = int(state.get("processed_documents") or 0)
+    resume_after = str(state.get("last_node_path") or "") or None
+    indexed = 0
+    empty_documents = int(state.get("empty_documents") or 0)
+    last_path = resume_after
+    try:
+        for item in storage.iter_documents(
+            scan_id, hydrate=True, batch_size=20, start_after=resume_after
+        ):
+            _ensure_job_active(job["id"])
+            path = str(item.get("path") or "")
+            document = dict(item.get("payload") or {})
+            chunks = evidence_corpus({path: document})
+            indexed += storage.replace_document_evidence_index(
+                scan_id, path, chunks, preserve_translations=True
+            )
+            processed += 1
+            last_path = path
+            if not chunks:
+                empty_documents += 1
+            if processed % 20 == 0 or processed == total:
+                storage.checkpoint_search_index_rebuild(
+                    scan_id, processed, empty_documents, last_path
+                )
+                progress = 100 if not total else min(
+                    99, max(1, int(processed * 100 / total))
+                )
+                storage.update_job(
+                    job["id"],
+                    progress=progress,
+                    stage="rebuilding_search_index",
+                    message="正在从历史文档重建证据索引：{}/{}".format(
+                        processed, total
+                    ),
+                    current_stage="历史文档证据索引重建",
+                    current_file=path,
+                    heartbeat=True,
+                )
+        storage.checkpoint_search_index_rebuild(
+            scan_id, processed, empty_documents, last_path
+        )
+        storage.complete_search_index_rebuild(
+            scan_id, processed, empty_documents, last_path
+        )
+    except Exception as exc:
+        storage.interrupt_search_index_rebuild(scan_id, exc)
+        raise
+    status = _conversation_index_status(scan_id)
+    return {
+        "scan_id": scan_id,
+        "processed_documents": processed,
+        "indexed_evidence_records": indexed,
+        "empty_documents": empty_documents,
+        "search_index": status,
+    }
+
+
 def _run_claimed_conversation_turn_job(job):
     """Execute one durable analysis turn without holding a Web request open."""
     options = dict(job.get("options") or {})
@@ -2673,7 +2917,9 @@ def _run_claimed_conversation_turn_job(job):
         raise JobCancelled("本轮分析已经取消")
     _ensure_job_active(job["id"])
     stored = storage.get_conversation(
-        turn["session_id"], turn["owner_id"], scan_id=turn["scan_id"]
+        turn["session_id"], turn["owner_id"], scan_id=turn["scan_id"],
+        message_limit=500,
+        context_only=True,
     )
     if not stored:
         raise ValueError("交互式分析会话不存在")
@@ -2953,7 +3199,11 @@ def create_conversation():
             scan_id, scope=scope, title=str(payload.get("title") or "资料问答")[:200]
         )
         storage.save_conversation(session.as_dict(), _request_owner_id() or "legacy")
-        return jsonify({"ok": True, "session": session.as_dict()}), 201
+        return jsonify({
+            "ok": True,
+            "session": session.as_dict(),
+            "search_index": _conversation_index_status(scan_id),
+        }), 201
     except ValueError as exc:
         return api_error(str(exc), 400)
 
@@ -2975,8 +3225,16 @@ def get_conversation(session_id):
     scan_id = str(request.args.get("scan_id", "") or "")
     try:
         require_scan(scan_id)
+        message_limit = max(
+            20, min(200, int(request.args.get("message_limit", 100) or 100))
+        )
+        before_sequence = request.args.get("before_sequence")
+        if before_sequence is not None:
+            before_sequence = max(1, int(before_sequence))
         payload = storage.get_conversation(
             session_id, _request_owner_id() or "legacy", scan_id=scan_id,
+            message_limit=message_limit,
+            before_sequence=before_sequence,
         )
         if not payload:
             return api_error("会话不存在", 404)
@@ -2986,6 +3244,7 @@ def get_conversation(session_id):
             "session": payload,
             "turns": storage.list_conversation_turns(session_id, owner_id),
             "research_memory": storage.get_conversation_research_memory(session_id),
+            "search_index": _conversation_index_status(scan_id),
         })
     except ValueError as exc:
         return api_error(str(exc), 404)
@@ -3004,6 +3263,15 @@ def create_conversation_turn(session_id):
         question = str(payload.get("question") or "").strip()
         if not question or len(question) > 8000:
             raise ValueError("问题不能为空且不能超过 8000 字符")
+        search_index = _conversation_index_status(scan_id)
+        if not search_index["ready"]:
+            return jsonify({
+                "ok": False,
+                "error": "对话证据索引尚未完整就绪，请先完成或恢复索引重建。",
+                "code": "search_index_rebuild_required",
+                "search_index": search_index,
+                "rebuild_url": "/api/scans/{}/rebuild-search-index".format(scan_id),
+            }), 409
         scope_payload = payload.get("scope")
         if scope_payload is None:
             scope = ConversationScope.from_dict(stored.get("scope") or {})
@@ -3024,6 +3292,37 @@ def create_conversation_turn(session_id):
         }), 202 if created else 200
     except ValueError as exc:
         return api_error(str(exc), 400)
+
+
+@app.route("/api/scans/<scan_id>/rebuild-search-index", methods=["POST"])
+def rebuild_search_index(scan_id):
+    try:
+        require_scan(scan_id)
+        options = {
+            "workflow_source": "index_rebuild",
+            "scope_label": "重建轻量预览与对话证据索引",
+            "parse_mode": "accurate",
+        }
+        job_id, created = storage.create_or_get_typed_job(
+            scan_id,
+            "rebuild_search_index",
+            options=options,
+            owner_id=_request_owner_id() or "legacy",
+        )
+        if created:
+            storage.begin_search_index_rebuild(
+                scan_id, storage.count_documents(scan_id)
+            )
+        return jsonify({
+            "ok": True,
+            "accepted": True,
+            "job_id": job_id,
+            "created": created,
+            "search_index": _conversation_index_status(scan_id),
+            "status_url": "/api/jobs/{}".format(job_id),
+        }), 202 if created else 200
+    except ValueError as exc:
+        return api_error(str(exc), 404)
 
 
 @app.route("/api/turns/<turn_id>")
@@ -3099,6 +3398,87 @@ def retry_conversation_turn(turn_id):
         "ok": True,
         "turn": storage.get_conversation_turn(turn_id, owner_id=owner_id),
         "job_id": job_id,
+    }), 202
+
+
+@app.route("/api/turns/<turn_id>/continue-deep-analysis", methods=["POST"])
+def continue_conversation_turn_deep_analysis(turn_id):
+    owner_id = _request_owner_id() or "legacy"
+    turn = storage.get_conversation_turn(turn_id, owner_id=owner_id)
+    if not turn:
+        return api_error("分析轮次不存在", 404)
+    if turn.get("status") != "completed":
+        return api_error("只有已完成的阶段性分析可以继续深析", 409)
+    result = dict(turn.get("result") or {})
+    if not result.get("promotion_limit_reached"):
+        return api_error("本轮没有待继续的深析候选文件", 409)
+    promotion = dict(result.get("promotion_request") or {})
+    payload = request.get_json(silent=True) or {}
+    raw_candidate_paths = payload.get("candidate_paths") or []
+    if not isinstance(raw_candidate_paths, list):
+        return api_error("candidate_paths 必须是文件路径数组", 400)
+    requested_filter = {
+        str(path) for path in raw_candidate_paths if path
+    }
+    try:
+        desired = max(1, min(24, int(payload.get("desired_file_count") or 12)))
+    except (TypeError, ValueError):
+        return api_error("desired_file_count 必须是 1 到 24 的整数", 400)
+    inventory = set(storage.inventory_paths_under(turn["scan_id"], "."))
+    candidates = []
+    for path in promotion.get("candidate_paths") or []:
+        path = str(path)
+        if (
+            path not in inventory
+            or (requested_filter and path not in requested_filter)
+            or path in candidates
+            or (storage.get_file_state(turn["scan_id"], path) or {}).get("status")
+            == "completed"
+        ):
+            continue
+        candidates.append(path)
+        if len(candidates) >= desired:
+            break
+    if not candidates:
+        return api_error("候选文件已经完成深析或不再属于当前数据包", 409)
+    job_id, _created = storage.create_or_get_typed_job(
+        turn["scan_id"],
+        "analyze_package",
+        options={
+            "target_paths": candidates,
+            "workflow_source": "question_promotion",
+            "scope_label": "用户继续交互式深析：{}".format(turn["question"][:120]),
+            "parse_mode": "accurate",
+            "conversation_turn_id": turn_id,
+            "conversation_scope": turn.get("scope") or {},
+            "conversation_continuation_depth": 1,
+        },
+        owner_id=owner_id,
+    )
+    storage.update_conversation_turn(
+        turn_id,
+        status="waiting_for_deep_analysis",
+        stage="waiting_for_deep_analysis",
+        progress=65,
+        promotion_job_id=job_id,
+        continuation_depth=0,
+        message="已按用户要求继续深析 {} 份候选文件".format(len(candidates)),
+        event_type="promotion_continued",
+    )
+    storage.set_conversation_turn_message(
+        turn_id,
+        "正在继续深析 {} 份候选文件；完成后会重新核验本轮回答。".format(
+            len(candidates)
+        ),
+        "waiting_for_deep_analysis",
+        "waiting_for_deep_analysis",
+        65,
+    )
+    return jsonify({
+        "ok": True,
+        "turn": storage.get_conversation_turn(turn_id, owner_id=owner_id),
+        "job_id": job_id,
+        "candidate_paths": candidates,
     }), 202
 
 

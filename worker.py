@@ -20,12 +20,18 @@ import time
 import traceback
 from pathlib import Path
 
-from config import Config
-from services.storage import Storage
+from config import Config, ensure_runtime_directories
+from services.storage import LazyStorage, Storage
 
 
 logger = logging.getLogger("sjfx.worker")
-storage = Storage(Config.DB_PATH, Config.DOCUMENT_CACHE_DIR, Config.SIDECAR_PAYLOAD_BYTES)
+storage = LazyStorage(
+    lambda: Storage(
+        Config.DB_PATH,
+        Config.DOCUMENT_CACHE_DIR,
+        Config.SIDECAR_PAYLOAD_BYTES,
+    )
+)
 
 
 class _WorkerSensitiveFilter(logging.Filter):
@@ -42,7 +48,9 @@ class _WorkerSensitiveFilter(logging.Filter):
         return True
 
 
-if not logger.handlers:
+def _configure_worker_logging():
+    if logger.handlers:
+        return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     for _root_handler in logging.getLogger().handlers:
         _root_handler.addFilter(_WorkerSensitiveFilter())
@@ -178,6 +186,7 @@ def execute(job):
         _run_claimed_conversation_turn_job,
         _run_claimed_export_job,
         _run_claimed_report_job,
+        _run_claimed_search_index_rebuild_job,
         _run_claimed_scan_and_analyze_job,
         _run_claimed_summary_job,
         _run_claimed_translation_job,
@@ -189,6 +198,8 @@ def execute(job):
         return _run_claimed_analysis_job(job)
     if task_type == "conversation_turn":
         return _run_claimed_conversation_turn_job(job)
+    if task_type == "rebuild_search_index":
+        return _run_claimed_search_index_rebuild_job(job)
     if task_type == "generate_report":
         return _run_claimed_report_job(job)
     if task_type == "generate_summary":
@@ -249,6 +260,7 @@ def _task_runtime_limit(job):
         "scan_and_analyze": Config.JOB_SCAN_TIMEOUT_SECONDS,
         "analyze_package": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
         "conversation_turn": Config.JOB_CONVERSATION_TURN_TIMEOUT_SECONDS,
+        "rebuild_search_index": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
         "generate_summary": Config.JOB_SUMMARY_TIMEOUT_SECONDS,
         "generate_report": Config.JOB_REPORT_TIMEOUT_SECONDS,
         "export_package": Config.JOB_EXPORT_TIMEOUT_SECONDS,
@@ -482,6 +494,9 @@ def _acquire_worker_lock():
 
 
 def run_forever():
+    ensure_runtime_directories()
+    _configure_worker_logging()
+    storage.initialize()
     lock_handle = _acquire_worker_lock()
     recovered = storage.recover_orphaned_jobs_after_lock()
     reconciled_turns = storage.reconcile_conversation_turn_jobs()
@@ -498,9 +513,34 @@ def run_forever():
     checkpoint_interval = getattr(storage, "sqlite_checkpoint_interval", 60)
     last_recovery = time.monotonic()
     recovery_interval = max(30.0, min(300.0, Config.WORKER_STALE_SECONDS / 3.0))
+    last_history_cleanup = 0.0
     try:
         while True:
             now = time.monotonic()
+            retention_enabled = bool(
+                Config.HISTORY_RETENTION_DAYS or Config.HISTORY_MAX_SCANS
+            )
+            if retention_enabled and (
+                now - last_history_cleanup
+                >= Config.HISTORY_CLEANUP_INTERVAL_SECONDS
+            ):
+                try:
+                    cleanup = storage.cleanup_history(
+                        owner_id=Config.OWNER_ID,
+                        retention_days=Config.HISTORY_RETENTION_DAYS,
+                        max_scans=Config.HISTORY_MAX_SCANS,
+                        output_dir=Config.OUTPUT_DIR,
+                        dry_run=False,
+                        limit=25,
+                    )
+                    if cleanup.get("deleted"):
+                        logger.info(
+                            "History retention removed %s inactive scan(s)",
+                            len(cleanup["deleted"]),
+                        )
+                except Exception:
+                    logger.warning("历史保留策略执行失败，将稍后重试", exc_info=True)
+                last_history_cleanup = time.monotonic()
             if now - last_checkpoint >= checkpoint_interval:
                 try:
                     storage.checkpoint_wal()

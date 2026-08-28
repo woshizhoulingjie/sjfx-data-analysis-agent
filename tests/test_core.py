@@ -774,9 +774,55 @@ class CoreRegressionTests(unittest.TestCase):
             analysis = analyze_package(
                 scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000),
                 large_options=options, target_paths=["doc1.txt"],
+                workflow_source="question_promotion",
             )
             self.assertGreaterEqual(analysis["coverage"]["parsed_files"], 2)
             self.assertLessEqual(analysis["coverage"]["pending_files"], 2)
+            self.assertEqual(
+                analysis["workflow"]["global_aggregation"],
+                "skipped_for_interactive_promotion",
+            )
+
+    def test_question_promotion_preserves_historical_document_when_source_is_gone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for index in range(3):
+                (root / "doc{}.txt".format(index)).write_text(
+                    "历史数据库证据 {}".format(index) * 120, encoding="utf-8"
+                )
+            scan = scan_directory(root)
+            storage = Storage(root / "analysis.db")
+            scan_id = storage.save_scan(scan)
+            options = {
+                "threshold_bytes": 1, "initial_parse_files": 3,
+                "overview_chars_per_file": 500,
+            }
+            analyze_package(
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000),
+                large_options=options,
+            )
+            target = next(
+                item["node_path"] for item in storage.iter_file_states(scan_id)
+                if item.get("status") == "completed"
+            )
+            original = storage.get_document(scan_id, target)
+            (root / target).unlink()
+
+            analysis = analyze_package(
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000),
+                large_options=options, target_paths=[target],
+                workflow_source="question_promotion",
+            )
+
+            self.assertEqual(storage.get_document(scan_id, target), original)
+            self.assertGreater(storage.count_evidence_index(scan_id), 0)
+            state = storage.get_file_state(scan_id, target)
+            self.assertEqual(state["status"], "overview")
+            self.assertFalse(state["retryable"])
+            self.assertEqual(
+                analysis["workflow"]["global_aggregation"],
+                "skipped_for_interactive_promotion",
+            )
 
     def test_retry_success_removes_the_historical_failure_for_the_same_path(self):
         with tempfile.TemporaryDirectory() as folder:

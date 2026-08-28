@@ -20,6 +20,11 @@ SECTION_LABEL_RE = re.compile(
 VERIFICATION_NOTE_RE = re.compile(
     r"(?:条陈述因证据不足|未作为确定结论输出|未找到直接原文支持|避免伪造事实)"
 )
+PROVENANCE_NOTE_RE = re.compile(
+    r"^(?:(?:本次|当前|以上)?(?:分析|回答|结论|核验)(?:是)?(?:基于|依据|引用自)|"
+    r"(?:证据|引用)(?:来自|来源于)|本次(?:检查|检索)(?:了|范围为))",
+    re.I,
+)
 NEGATION_RE = re.compile(r"(?:未|无|没有|不能|无法|不可|并非|不再|尚未)")
 
 
@@ -54,6 +59,15 @@ def _claim_body(value: Any) -> str:
     text = re.sub(r"\[\d+\]", "", str(value or ""))
     text = re.sub(r"^(?:部分证据支持|分析判断)[:：]\s*", "", text)
     return text.strip(" -*#\t")
+
+
+def _identifiers(value: Any) -> set:
+    """Return field-like tokens useful for exact key/value verification."""
+    return {
+        item.lower()
+        for item in re.findall(r"[A-Za-z_][A-Za-z0-9_.-]{2,}", str(value or ""))
+        if item.lower() not in {"the", "and", "from", "file", "value", "json"}
+    }
 
 
 def _scope_contains(scope: ConversationScope, citation: Mapping[str, Any]) -> bool:
@@ -97,7 +111,9 @@ class ClaimVerifier:
                 claim.update({"status": "section_label", "evidence_ids": []})
                 verified_claims.append(claim)
                 continue
-            if VERIFICATION_NOTE_RE.search(text):
+            if VERIFICATION_NOTE_RE.search(text) or PROVENANCE_NOTE_RE.search(
+                _claim_body(text)
+            ):
                 claim.update({"status": "analysis_or_advice", "evidence_ids": []})
                 verified_claims.append(claim)
                 continue
@@ -160,6 +176,32 @@ class ClaimVerifier:
             for item in named:
                 citation_numbers.update(_numbers(_citation_item(item).get("text")))
             numeric_supported = not claim_numbers or claim_numbers.issubset(citation_numbers)
+            claim_identifiers = _identifiers(check_text)
+            if claim_numbers and numeric_supported and claim_identifiers:
+                for evaluation, item in zip(evaluations, named):
+                    evidence_identifiers = _identifiers(
+                        _citation_item(item).get("text")
+                    )
+                    if claim_identifiers.intersection(evidence_identifiers):
+                        evaluation.update({
+                            "support_status": "supported",
+                            "support_score": max(
+                                0.92, float(evaluation.get("support_score") or 0)
+                            ),
+                            "support_reason": "字段名和精确数值均可在对应原文中直接核对。",
+                            "support_relation": "exact_field_value",
+                            "matched_identifiers": sorted(
+                                claim_identifiers.intersection(evidence_identifiers)
+                            )[:8],
+                        })
+                supported = [
+                    item for item in evaluations
+                    if item.get("support_status") == "supported"
+                ]
+                partial = [
+                    item for item in evaluations
+                    if item.get("support_status") == "partially_supported"
+                ]
             if not numeric_supported:
                 numeric_failures += 1
 
@@ -170,6 +212,23 @@ class ClaimVerifier:
                 status = "partially_supported"
             else:
                 status = "unsupported"
+            if missing:
+                failure_reason = "引用标号不存在：{}".format(
+                    "、".join(str(item) for item in missing)
+                )
+            elif not named:
+                failure_reason = "陈述没有关联正文引用"
+            elif not numeric_supported:
+                missing_numbers = sorted(claim_numbers - citation_numbers)
+                failure_reason = "引用中缺少数值：{}".format(
+                    "、".join(missing_numbers)
+                )
+            elif status == "unsupported":
+                failure_reason = "引用正文与陈述的核心含义不匹配"
+            elif status == "partially_supported":
+                failure_reason = "引用只支持陈述的一部分"
+            else:
+                failure_reason = None
             claim.update(
                 {
                     "status": status,
@@ -185,6 +244,7 @@ class ClaimVerifier:
                         "missing_citation_indexes": missing,
                         "numeric_values": sorted(claim_numbers),
                         "numeric_supported": numeric_supported,
+                        "failure_reason": failure_reason,
                         "evidence_checks": evaluations,
                     },
                 }
@@ -213,6 +273,27 @@ class ClaimVerifier:
 
         coverage = dict(turn_result.get("coverage") or {})
         query_coverage = coverage.get("query_coverage")
+        broad_scope_modes = {
+            "summary", "comparison", "timeline", "relationship",
+            "contradiction", "risk", "multi_task",
+        }
+        scope_files = int(
+            batch_summary.get("inventory_files")
+            or coverage.get("scope_files")
+            or coverage.get("total_files")
+            or 0
+        )
+        inspected_scope_files = int(
+            batch_summary.get("inspected_files")
+            or coverage.get("inspected_files")
+            or coverage.get("retrieved_files")
+            or 0
+        )
+        scope_incomplete = bool(
+            broad_scope_modes.intersection(plan.get("modes") or [])
+            and scope_files
+            and inspected_scope_files < scope_files
+        )
         if not casual and not citations:
             warnings.append("当前回答没有可持久化的正文引用。")
         if unsupported_count:
@@ -221,6 +302,18 @@ class ClaimVerifier:
                     unsupported_count
                 )
             )
+            for item in verified_claims:
+                if item.get("status") != "unsupported":
+                    continue
+                reason = (item.get("verification") or {}).get("failure_reason")
+                warnings.append(
+                    "未通过核验：{}（{}）。".format(
+                        _claim_body(item.get("text"))[:100],
+                        reason or "缺少直接原文支持",
+                    )
+                )
+                if sum(value.startswith("未通过核验：") for value in warnings) >= 5:
+                    break
         if partial_count:
             warnings.append("有 {} 条陈述只得到部分支持。".format(partial_count))
         if numeric_failures:
@@ -233,6 +326,13 @@ class ClaimVerifier:
             warnings.append("反向证据检索未完成。")
         if query_coverage is not None and float(query_coverage) < 0.45:
             warnings.append("当前问题的候选证据覆盖率较低。")
+        if scope_incomplete:
+            warnings.append(
+                "当前结论仅基于候选文件：实际检查 {}/{} 个范围文件，"
+                "不能视为全范围完整结论。".format(
+                    inspected_scope_files, scope_files
+                )
+            )
         if contradictions:
             warnings.append("检出 {} 组需要保留的矛盾或不一致证据。".format(len(contradictions)))
 
@@ -246,6 +346,7 @@ class ClaimVerifier:
             and not invalid_labels
             and not out_of_scope
             and not numeric_failures
+            and not scope_incomplete
         ):
             status = "verified"
         elif citations and factual_count:
@@ -285,6 +386,18 @@ class ClaimVerifier:
             "unsupported_claim_count": unsupported_count,
             "claim_support_ratio": support_ratio,
             "query_coverage": query_coverage,
+            "coverage_basis": coverage.get("coverage_basis"),
+            "scope_files": scope_files or None,
+            "scope_inspection_coverage": coverage.get(
+                "scope_inspection_coverage"
+            ) if coverage.get("scope_inspection_coverage") is not None else (
+                round(inspected_scope_files / float(scope_files), 6)
+                if scope_files else None
+            ),
+            "candidate_deep_coverage": coverage.get("candidate_deep_coverage"),
+            "deep_candidate_files": int(coverage.get("deep_candidate_files") or 0),
+            "deep_analyzed_files": coverage.get("deep_analyzed_files"),
+            "scope_incomplete": scope_incomplete,
             "counter_evidence_count": len(counter_items),
             "contradiction_count": len(contradictions),
             "unparsed_files": int(unparsed_files or 0),
@@ -310,6 +423,17 @@ class ClaimVerifier:
             "numeric_values_checked": True,
             "counter_evidence_checked": counter_search_performed,
             "warnings": warnings,
+            "failed_claims": [
+                {
+                    "claim_id": item.get("claim_id"),
+                    "text": item.get("text"),
+                    "reason": (item.get("verification") or {}).get(
+                        "failure_reason"
+                    ),
+                }
+                for item in verified_claims
+                if item.get("status") in {"unsupported", "partially_supported"}
+            ],
             "counter_evidence": counter_items[:20],
             "contradictions": contradictions[:20],
             "quality_metrics": quality_metrics,
@@ -350,10 +474,29 @@ class ClaimVerifier:
         result["answer"] = answer
         result["evidence_status"] = "supported" if kept and not omitted else "partial"
         result["status"] = "answered" if kept else "insufficient_evidence"
+        stale_verification_warning = re.compile(
+            r"(?:事实性陈述没有通过|陈述只得到部分支持|数字结论无法|"
+            r"引用标号无对应证据|候选证据覆盖率较低|当前回答没有可持久化的正文引用|"
+            r"^未通过核验：)"
+        )
+        prior_warnings = [
+            item for item in (result.get("warnings") or [])
+            if not stale_verification_warning.search(str(item))
+        ]
+        if result.get("citations"):
+            prior_warnings = [
+                item for item in prior_warnings
+                if "没有可检索正文证据" not in str(item)
+            ]
         result["warnings"] = list(
             dict.fromkeys(
-                list(result.get("warnings") or [])
-                + list(verification.get("warnings") or [])
+                prior_warnings + list(verification.get("warnings") or [])
             )
+        )
+        result["citation_verification_status"] = verification.get("status")
+        result["scope_completeness"] = (
+            "candidate_only"
+            if (verification.get("quality_metrics") or {}).get("scope_incomplete")
+            else "checked_scope"
         )
         return result

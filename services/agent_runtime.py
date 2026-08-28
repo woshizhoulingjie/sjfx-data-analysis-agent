@@ -12,8 +12,6 @@ import json
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
-from pydantic_ai import Agent
-
 from services.ollama import LocalModelError
 from services.model_output import extract_json_value, validate_json_object
 
@@ -35,11 +33,13 @@ class StructuredAgentResult(BaseModel):
 
 
 class PydanticAgentRuntime:
-    """Typed, local-first adapter around the configured model transport.
+    """Dependency-light typed adapter around the local Ollama transport.
 
-    PydanticAI is deliberately an orchestration boundary here, rather than a
-    second parallel client.  The existing transport is retained for native
-    Ollama ``think:false`` and the single shared-GPU semaphore.
+    The previous implementation instantiated ``pydantic_ai.Agent`` but never
+    executed it: every request already travelled through the audited local
+    transport below.  Removing that unused object avoids importing provider,
+    MCP and orchestration stacks in every Web/Worker process while preserving
+    the same Pydantic output contract.
     """
 
     def __init__(self, transport):
@@ -49,14 +49,6 @@ class PydanticAgentRuntime:
         self.configured = transport.configured
         self.requires_confirmation = transport.requires_confirmation
         self.privacy_label = transport.privacy_label
-        # PydanticAI owns the typed agent contract. Native execution remains in
-        # the established transport so synchronous local Ollama retains
-        # ``think:false`` and the shared-GPU semaphore without event-loop risks.
-        self.agent = Agent(
-            "test",
-            output_type=StructuredAgentResult,
-            system_prompt="SJFX structured analysis agent",
-        )
 
     def health_check(self, *args, **kwargs):
         return self.transport.health_check(*args, **kwargs)
@@ -70,9 +62,8 @@ class PydanticAgentRuntime:
 
     def chat_json(self, system_prompt, user_prompt, *, required_fields=None,
                   output_context="模型结构化输出", **kwargs):
-        # PydanticAI is installed as the explicit agent runtime dependency.
-        # Native transport remains the execution backend because Ollama's
-        # local API needs ``think:false`` and bounded serial execution.
+        # Native transport remains the execution backend because Ollama's local
+        # API needs ``think:false`` and bounded serial execution.
         result = self.transport.chat(
             UNTRUSTED_DOCUMENT_POLICY + "\n" + str(system_prompt or "")
             + "\n只返回一个合法 JSON 对象，不要 Markdown 代码围栏。",

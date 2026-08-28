@@ -4,7 +4,18 @@ SJFX 用来处理“一批拿回来但还不知道里面有什么”的本地资
 
 本手册面向第一次接触项目的使用者。按照“5 分钟启动”配置后，即可在浏览器完成导入、分析、深挖、检索和导出。
 
-当前版本已经完成四项核心加固：大资料包按 **500 个文件一批持续处理并断点续跑**；中文主题目录采用稳定节点身份和主归属校验；证据链升级为逐结论核验；推荐研究方向改为基于正式分析树和可回查证据的十维评分。模型只负责受控的命名、摘要和语言增强，不替代本地解析、建树、检索与证据校验。
+当前版本已经完成四项核心加固：大资料包按 **20–50 个文件一批持续处理并断点续跑**；中文主题目录采用稳定节点身份和主归属校验；证据链升级为逐结论核验；推荐研究方向改为基于正式分析树和可回查证据的十维评分。模型只负责受控的命名、摘要和语言增强，不替代本地解析、建树、检索与证据校验。
+
+### 本轮交互式对话与大数据包改修
+
+- 对话质量不再用单一百分比混淆不同范围，接口和页面分别显示范围文件、候选文件、实际检查、深析完成和未检查数量；候选集结论会明确标注，不能冒充全包结论。
+- 独立短问题不会因为字数少而继承上一轮；只有“上述、那这个、继续”等明确指代或延续信号才按追问处理。
+- “字段值是多少”走定向证据检索；只有求和、统计、分组和跨文件计算才进入结构化聚合，避免简单问答扫描整个数据包。
+- 多路检索按最终有效证据合并覆盖率，空的辅助查询不会把成功主查询降为 0；重新核验后会清理已经失效的“没有证据”或“数字无法核对”警告。
+- 对话审计历史完整保留并分页加载，模型上下文只使用滚动摘要和最近轮次；回答、消息和摘要在同一事务中提交。
+- 历史文档可通过后台任务直接重建对话证据索引，不依赖已经删除的原始目录。重建状态保存版本、预期/已处理/失败文档数、断点和完成时间；重建期间禁止对话读取半成品索引。
+- 大包轻量预览预算在 Worker 切片之间累计，任务让出或重启后从持久化游标继续；默认关闭无条件全文后台补齐，采用“代表文件 + 用户问题/选择触发深析”。
+- 自动深析达到本轮上限时会显示剩余候选数，用户可以继续深析、接受阶段性结果或缩小范围。
 
 ## 1. 你能用它完成什么
 
@@ -23,7 +34,7 @@ SJFX 用来处理“一批拿回来但还不知道里面有什么”的本地资
 - 勾选多个主题、目录、文档或证据组合导出；相同源文件自动去重。
 - 生成概览 Word 和包含原始资料、分析成果、覆盖率及交接说明的 ZIP 包。
 - 小于 500 份规范文档使用自适应平均链接聚类；更大规模自动切换 MiniBatchKMeans，并按内容哈希持久化复用本地 Embedding 和规范证据索引。
-- 大资料包默认以 500 个文件为一个持久化处理批次，自动进入下一批直至全部完成、部分完成或明确失败；每个文件完成后立即保存检查点。
+- 大资料包的轻量预览按有界 Worker 切片遍历清点范围，深析默认以 30 个文件为一个持久化批次（允许 20–50）；每个完成文件立即保存检查点，后续按代表性、用户问题或人工选择继续晋升。
 
 ## 2. 使用前先理解三个概念
 
@@ -154,7 +165,7 @@ Linux：
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
 ```
 
 Windows PowerShell（仅建议用于开发验证）：
@@ -288,7 +299,7 @@ http://服务器IP:18000
 
 目录盘点结束后，原始目录会优先显示；解析、去重、主题分析和概览报告继续在后台运行。不要因为原始目录已经出现就重复点击“导入并分析”。
 
-大资料包不会只处理首批文件。系统默认每批领取 500 个文件，当前批次完成后自动继续下一批，直到清点范围内的文件全部进入完成、部分完成或失败等明确终态。停止或重启 Worker 后，已经完成的单文件检查点会被复用。
+大资料包不会只清点首批文件。系统会按有界切片为清点范围建立轻量预览、文件状态和可检索证据；深度解析默认先处理代表文件，并按用户问题、人工选择或“继续深析”请求分批晋升。停止或重启 Worker 后，预览字节预算、游标和已经完成的单文件检查点都会被复用。只有明确设置 `LARGE_PACKAGE_BACKGROUND_BACKFILL=1` 时，系统才会在后台继续尝试全量深析。
 
 ### 6.2 选择解析模式
 
@@ -431,21 +442,21 @@ Docling/OCR 留给用户选中的主题、目录或文件范围。对于扫描�
 
 - 扫描器先在配置的文件、目录、节点、单目录条目和深度安全边界内完成清点；任何边界命中
   都会设置 `truncated` 或相应计数，本次清点不得宣称 100%；
-- 已清点文件进入快速解析队列，默认每批 500 个，当前批完成后自动继续，直到所有文件完成、部分完成或明确失败；
+- 已清点文件按有界切片建立轻量预览和可检索状态；代表文件、问题命中文件和人工选择文件进入深析队列，默认每批 30 个；
 - 完整解析结果逐文件写入 sidecar，包级内存只保留有限内容画像；
 - 大包默认跳过高相似度和 embedding 语义聚类，但仍根据全部已解析文件的正文头、中、尾和章节生成内容主题树；
-- 可通过 `LARGE_PACKAGE_BATCH_FILES` 调整批量大小，默认 500，允许范围为 1-1000；共享服务器上应优先保持单模型并发和较低 CPU 解析并发，而不是盲目放大批量或并发。
+- 可通过 `LARGE_PACKAGE_BATCH_FILES` 调整批量大小，默认 30，代码强制范围为 20–50；共享服务器上应优先保持单模型并发和较低 CPU 解析并发，而不是盲目放大批量或并发。
 
 ```text
 安全边界内的完整盘点
   ↓
-500 文件一批持续快速解析
+有界切片完成全量轻量预览
   ↓
-逐文件保存检查点和内容画像
+代表文件按 20–50 个一批深析并逐文件保存检查点
   ↓
 分页展示物理树 + 有限投影生成主题树
   ↓
-按需高精度深挖 + 不超过 10 GiB 的组合导出
+问题/人工选择触发高精度深挖 + 不超过 10 GiB 的组合导出
 ```
 
 它的目标是让数十或数百 GiB 总资料包也能用稳定内存完成清点、渐进概览和断点续跑，
@@ -505,10 +516,15 @@ SJFX_SQLITE_CHECKPOINT_INTERVAL=60
 LARGE_PACKAGE_THRESHOLD_BYTES=1073741824
 LARGE_PACKAGE_THRESHOLD_FILES=3000
 LARGE_PACKAGE_INITIAL_PARSE_FILES=700
-LARGE_PACKAGE_DEEPEN_BATCH_FILES=500
-LARGE_PACKAGE_BATCH_FILES=500
+LARGE_PACKAGE_DEEPEN_BATCH_FILES=30
+LARGE_PACKAGE_BATCH_FILES=30
+LARGE_PACKAGE_BACKGROUND_BACKFILL=0
 LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE=4000
 LARGE_PACKAGE_OVERVIEW_EVIDENCE_PER_FILE=6
+LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE=98304
+LARGE_PACKAGE_PREVIEW_TOTAL_BYTES=8589934592
+LARGE_PACKAGE_PREVIEW_SLICE_FILES=100
+LARGE_PACKAGE_PREVIEW_SLICE_SECONDS=30
 ```
 
 修改这些数值前先用真实样本压测。扫描安全边界可以根据机器和资料规模提高，但命中任何边界
@@ -655,20 +671,44 @@ cd /path/to/sjfx-data-analysis-agent
 git status
 git pull --ff-only origin main
 source .venv/bin/activate
-pip install -r requirements.txt
-python -m unittest discover -s tests -v
+pip install -r requirements.lock.txt
+python -m pytest
 ```
 
 测试通过后，再按第 5 节重新启动 Web 和 Worker。
 
+`requirements.lock.txt` 是在受控 Linux/Python 环境中从项目直接依赖闭包生成的精确版本清单；
+开发机或不同平台可先使用 `requirements.txt`。升级依赖并完成全量测试后，使用
+`python scripts/generate_requirements_lock.py` 重新生成锁文件，不要直接提交整个虚拟环境的
+`pip freeze` 输出。
+
 ### 查看日志
 
 ```bash
-tail -f logs/app.log
-tail -f logs/worker.log
+tail -f "${SJFX_STATE_DIR:-$HOME/.local/state/sjfx-data-analysis-agent}/logs/app.log"
+tail -f "${SJFX_STATE_DIR:-$HOME/.local/state/sjfx-data-analysis-agent}/logs/worker.log"
 ```
 
 Web 日志主要看启动、接口和端口；Worker 日志主要看扫描、解析、模型、报告和导出任务。
+
+### 清理历史数据
+
+历史清理默认关闭。先执行只读预览，再明确应用：
+
+```bash
+python scripts/cleanup_history.py --retention-days 30 --max-scans 100
+python scripts/cleanup_history.py --retention-days 30 --max-scans 100 --apply
+```
+
+清理一个扫描会在同一数据库事务中删除它的任务、文档、主题、对话、证据和制品登记，随后
+安全删除对应 sidecar 与输出文件；运行中任务不会被删除。也可以调用已鉴权的
+`DELETE /api/scan/<scan_id>`。设置 `HISTORY_RETENTION_DAYS` 或 `HISTORY_MAX_SCANS` 后，Worker
+会按 `HISTORY_CLEANUP_INTERVAL_SECONDS` 分批执行相同清理。迁移服务器状态目录时，应在确认
+新目录完整可用后再人工处理旧的 `/var/tmp` 副本，程序不会猜测并删除未知目录。
+
+生产部署不提供 `/docs`、`/redoc` 和 `/openapi.json`。仅在 `HOST=127.0.0.1`、
+`AUTH_REQUIRED=0` 且 `ENABLE_API_DOCS=1` 的本机开发环境中开放交互式 API 文档；非回环监听
+关闭鉴权会直接导致配置校验失败。
 
 ## 10. 常见问题排查
 
@@ -759,7 +799,7 @@ ss -ltnp | grep 18000
 
 ```bash
 source .venv/bin/activate
-python -m unittest discover -s tests -v
+python -m pytest
 ```
 
 一次最小验收应确认：
@@ -785,7 +825,7 @@ python -m unittest discover -s tests -v
 19. 推荐研究方向来自正式分析树，显示十维得分、证据数和独立来源数；无证据或未分类主题不会进入正式推荐；
 20. 超过单块预算的长文档执行完整分块分析与汇总，软分块阈值不会导致静默丢弃中间正文。
 
-截至 2026-08-24，当前主线已通过 199 项全量自动回归测试；目录树、证据链和推荐研究方向的最近改修另有专项回归验证。真实服务器上线前仍应按本节和性能验收文档对目标机器、模型和资料类型重新验收。
+回归数量以 `python -m pytest` 的当次输出为准；CI 使用相同的测试入口，并先执行 Ruff 正确性检查。真实服务器上线前仍应按本节和性能验收文档对目标机器、模型和资料类型重新验收。
 
 完整容量验收命令、阈值和 JSON 字段见
 [真实 1 / 5 / 10 GiB 性能与恢复验收](docs/PERFORMANCE_ACCEPTANCE.md)。测试脚本会独立复算
@@ -813,11 +853,13 @@ python -m unittest discover -s tests -v
 ├── static/ 与 templates/          # 浏览器界面
 ├── tests/                         # 自动回归测试
 ├── scripts/benchmark_package.py   # 真实 1/5/10 GiB 性能与恢复验收
+├── scripts/cleanup_history.py     # 历史扫描、sidecar 与输出清理（默认预览）
 ├── deploy/                        # systemd 示例
-├── data/agent.db                  # 本地任务与结果数据库（不提交）
-├── data/document_payloads/        # 大正文压缩侧存（不提交）
-├── outputs/                       # 生成成果（不提交）
-└── logs/                          # 运行日志（不提交）
+└── ${SJFX_STATE_DIR}/             # 生产运行状态（默认 ~/.local/state/...）
+    ├── agent.db                   # 本地任务与结果数据库
+    ├── document_payloads/         # 大正文压缩侧存
+    ├── outputs/                   # 生成成果
+    └── logs/                      # Web 与 Worker 日志
 ```
 
 ## 13. 当前边界
@@ -864,15 +906,19 @@ EvidenceRetriever（BM25/FTS + 证据质量筛选）
 ClaimVerifier 校验、引用和覆盖率
 ```
 
-对于“翻译并总结”等组合指令，系统会使用统一的 `multi_task` 流程，不会丢失检索证据或只执行其中一个任务。短追问会继承上一轮的意图和主题范围，长指令最多支持 8000 字符。
+对于“翻译并总结”等组合指令，系统会使用统一的 `multi_task` 流程，不会丢失检索证据或只执行其中一个任务。只有包含明确指代或延续信号的追问才继承上一轮意图和主题范围；“预算多少？”“风险有哪些？”等独立短问题会重新规划。长指令最多支持 8000 字符。
 
 ### 任务与性能边界
 
 - 普通事实问答、翻译和简单总结走有界检索快速路径，不会对整个数据包建立批量中间结果。
+- 单文件字段值和精确数字查询同样走定向检索；“多少”本身不是启动全包结构化分析的条件。
 - 结构化统计、跨文件比较、时间线、关系、风险和矛盾分析才会启动深度批处理。
 - 每轮使用持久化 Worker 执行，支持进度、取消、重试、补充深析和重启恢复。
 - `/api/conversation/<session_id>/turns` 是标准接口；旧的 `/messages` 路由仅作兼容别名，不再绕过 Worker。
 - 前端为一次逻辑发送保留同一个 `idempotency_key`，网络重试不会重复创建对话轮次。
+- `conversation_messages` 保存完整审计历史，页面按页向上加载；模型只读取滚动摘要和最近完整轮次，长对话上下文保持有界。
+- 页面分别展示范围、候选、实际检查、深析完成和未检查文件数；“引用核验通过”与“全范围分析完成”是两个不同状态。
+- 索引状态为 `rebuilding` 或 `interrupted` 时，对话接口返回 409，并提示通过 `POST /api/scans/<scan_id>/rebuild-search-index` 完成或恢复重建。
 
 ### 离线翻译
 

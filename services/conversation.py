@@ -385,7 +385,10 @@ class IntentRouter:
     TRANSLATION_RE = re.compile(r"翻译|译成|中文(?:版|翻译)?|中英对照|双语|原文|translate|translation", re.I)
     RELATION_RE = re.compile(r"关系|联系|关联|往来|互动|通信|谁.{0,8}谁|relationship|correspondence", re.I)
     STRUCTURED_RE = re.compile(
-        r"合计|总和|总计|总额|累计|平均|均值|最大|最高|最小|最低|多少(?:条|行|个)?|数量|条数|行数|记录数|sum|total|average|avg|max|min|count|how many",
+        r"合计|总和|总计|总额|累计|平均|均值|最大值|最高值|最小值|最低值|"
+        r"多少(?:条|行|个|份|人|项|种|次)|(?:记录|文件|合同|人员|项目)(?:数量|数目)|"
+        r"条数|行数|记录数|统计|占比|分组|汇总|sum|total|average|avg|count|"
+        r"group\s+by|how many",
         re.I,
     )
     SUMMARY_RE = re.compile(r"总结|概括|概览|综述|梳理|主要(?:讲|内容|发现)|重点是什么|摘要|overview|summari[sz]e", re.I)
@@ -450,7 +453,8 @@ class FollowUpResolution:
 
 class FollowUpResolver:
     FOLLOW_UP_RE = re.compile(
-        r"^(?:那|那么|它|他|她|他们|这些|这个|该|其中|后来|然后|为什么|怎么|还有|继续|再|呢|又|对此|上述)",
+        r"^(?:那|那么|它|他|她|他们|这些|这个|该|其中|后来|然后|还有|继续|"
+        r"接着|再说|又|对此|上述|前述|关于这个|这个呢|其(?:中|他|余))",
         re.I,
     )
 
@@ -461,7 +465,7 @@ class FollowUpResolver:
         previous = next((item for item in reversed(session.messages) if item.role == "user"), None)
         if previous is None:
             return FollowUpResolution(question, question, False, None)
-        is_follow_up = bool(self.FOLLOW_UP_RE.search(question) or len(question.rstrip("？?。.!")) <= 8)
+        is_follow_up = bool(self.FOLLOW_UP_RE.search(question))
         if not is_follow_up:
             return FollowUpResolution(question, question, False, None)
         antecedent = _clean_text(previous.resolved_query or previous.content, 1200)
@@ -584,8 +588,15 @@ class ChatTranslationProvider:
 class CoverageSnapshot:
     known: bool = False
     total_files: Optional[int] = None
+    scope_files: Optional[int] = None
     searchable_files: Optional[int] = None
     deep_analyzed_files: Optional[int] = None
+    candidate_files: Optional[int] = None
+    inspected_files: Optional[int] = None
+    deep_candidate_files: Optional[int] = None
+    candidate_deep_coverage: Optional[float] = None
+    scope_inspection_coverage: Optional[float] = None
+    coverage_basis: Optional[str] = None
     query_coverage: Optional[float] = None
     deferred_candidates: Tuple[str, ...] = field(default_factory=tuple)
 
@@ -610,8 +621,26 @@ class CoverageSnapshot:
             return None
 
         total = integer("total_files", "inventory_files", "file_count")
+        scope_files = integer("scope_files", "range_files")
         searchable = integer("searchable_files", "indexed_files", "available_files")
         deep = integer("deep_analyzed_files", "deep_parsed_files", "analysed_files")
+        candidate_files = integer("candidate_files")
+        inspected_files = integer("inspected_files", "retrieved_files")
+        deep_candidate_files = integer("deep_candidate_files")
+
+        def ratio_value(*keys: str) -> Optional[float]:
+            for key in keys:
+                value = merged.get(key)
+                if value is None:
+                    continue
+                try:
+                    return min(1.0, max(0.0, float(value)))
+                except (TypeError, ValueError, OverflowError):
+                    return None
+            return None
+
+        candidate_deep_coverage = ratio_value("candidate_deep_coverage")
+        scope_inspection_coverage = ratio_value("scope_inspection_coverage")
         ratio = merged.get("query_coverage", merged.get("coverage_ratio"))
         try:
             ratio = min(1.0, max(0.0, float(ratio))) if ratio is not None else None
@@ -629,12 +658,22 @@ class CoverageSnapshot:
             ratio = 0.0
         elif ratio is None and merged.get("complete") is True:
             ratio = 1.0
-        known = any(value is not None for value in (total, searchable, deep, ratio)) or "complete" in merged
+        known = any(value is not None for value in (
+            total, scope_files, searchable, deep, candidate_files,
+            inspected_files, deep_candidate_files, ratio,
+        )) or "complete" in merged
         return cls(
             known=known,
             total_files=total,
+            scope_files=scope_files,
             searchable_files=searchable,
             deep_analyzed_files=deep,
+            candidate_files=candidate_files,
+            inspected_files=inspected_files,
+            deep_candidate_files=deep_candidate_files,
+            candidate_deep_coverage=candidate_deep_coverage,
+            scope_inspection_coverage=scope_inspection_coverage,
+            coverage_basis=str(merged.get("coverage_basis") or "") or None,
             query_coverage=ratio,
             deferred_candidates=_unique_strings(candidates, limit=100),
         )
@@ -643,8 +682,15 @@ class CoverageSnapshot:
         return {
             "known": self.known,
             "total_files": self.total_files,
+            "scope_files": self.scope_files,
             "searchable_files": self.searchable_files,
             "deep_analyzed_files": self.deep_analyzed_files,
+            "candidate_files": self.candidate_files,
+            "inspected_files": self.inspected_files,
+            "deep_candidate_files": self.deep_candidate_files,
+            "candidate_deep_coverage": self.candidate_deep_coverage,
+            "scope_inspection_coverage": self.scope_inspection_coverage,
+            "coverage_basis": self.coverage_basis,
             "query_coverage": self.query_coverage,
             "deferred_candidates": list(self.deferred_candidates),
         }

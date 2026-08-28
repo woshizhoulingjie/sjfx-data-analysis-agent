@@ -43,8 +43,19 @@ class AnalysisPlanner:
         re.I,
     )
     TRANSLATION_RE = re.compile(r"翻译|译成|双语|中英对照|translate|translation", re.I)
+    # Structured execution is reserved for aggregation across records/files.
+    # A bare value lookup such as ``预算多少`` or ``episodeSteps 是多少`` is a
+    # bounded retrieval question and must not materialise every structured
+    # document in the package.
     STRUCTURED_RE = re.compile(
-        r"合计|总额|总和|平均|最大|最小|多少(?:条|行|个)?|数量|统计|占比|sum|total|average|count",
+        r"合计|总额|总和|累计|平均|均值|最大值|最小值|"
+        r"多少(?:条|行|个|份|人|项|种|次)|(?:记录|文件|合同|人员|项目)(?:数量|数目)|"
+        r"统计|占比|分组|汇总|sum|total|average|avg|count|group\s+by|how many",
+        re.I,
+    )
+    FOLLOW_UP_RE = re.compile(
+        r"^(?:那|那么|它|他|她|他们|这些|这个|该|其中|后来|然后|还有|继续|"
+        r"接着|再说|又|对此|上述|前述|关于这个|这个呢|其(?:中|他|余))",
         re.I,
     )
     COMPARE_RE = re.compile(r"比较|对比|差异|相同|不同|各(?:份|个)|compare|difference", re.I)
@@ -66,10 +77,7 @@ class AnalysisPlanner:
             raise ValueError("问题不能为空")
         scope = dict(scope or {"kind": "package"})
         memory = dict(memory or {})
-        follow_up = bool(
-            len(question.rstrip("？?。.!")) <= 12
-            or re.match(r"^(?:那|那么|它|他|她|这些|这个|其中|为什么|怎么|还有|继续|再|呢)", question)
-        )
+        follow_up = bool(self.FOLLOW_UP_RE.search(question))
         previous_objective = _text(memory.get("current_objective"), 1600)
         objective = question
         if follow_up and previous_objective and previous_objective != question:

@@ -18,7 +18,7 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         ids = re.findall(r'\bid="([^"]+)"', self.html)
         self.assertEqual(len(ids), len(set(ids)), "HTML element ids must remain unique")
         self.assertIn('/static/engineering-v2.css?v=4', self.html)
-        self.assertIn('/static/engineering-v2.js?v=6', self.html)
+        self.assertIn('/static/engineering-v2.js?v=7', self.html)
         self.assertNotRegex(self.script, r'https?://|\bcdn\b')
         self.assertNotRegex(self.style, r'@import|https?://')
 
@@ -87,6 +87,11 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('watchAnalysisTurn', self.script)
         self.assertIn('data-cancel-turn', self.script)
         self.assertIn('data-retry-turn', self.script)
+        self.assertIn('data-continue-deep-turn', self.script)
+        self.assertIn('/continue-deep-analysis', self.script)
+        self.assertIn('data-rebuild-search-index', self.script)
+        self.assertIn('/rebuild-search-index', self.script)
+        self.assertIn("error.code = payload.code", self.script)
         self.assertIn('promotion_job_id', self.script)
         self.assertIn('系统已自动重新检索并续写回答', self.script)
         self.assertIn('conversationContextChip', self.script)
@@ -97,7 +102,8 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('analysisQualityMarkup', self.script)
         self.assertIn('turn.quality_metrics', self.script)
         for metric in (
-            '候选文件', '已检查', '分析批次', '查询覆盖率', '引用',
+            '范围文件', '候选文件', '实际检查', '未检查', '深析完成',
+            '分析批次', '范围检查率', '候选深析率', '覆盖率', '引用',
             '结论支持率', '无证据结论', '反证', '矛盾', '未解析文件',
         ):
             self.assertIn(metric, self.script)

@@ -201,6 +201,12 @@ class _SecurityHeadersMiddleware:
                     "X-Frame-Options": "DENY",
                     "Referrer-Policy": "no-referrer",
                     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+                    "Content-Security-Policy": (
+                        "default-src 'self'; base-uri 'self'; object-src 'none'; "
+                        "frame-ancestors 'none'; form-action 'self'; "
+                        "script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                        "img-src 'self' data:; connect-src 'self'"
+                    ),
                 }
                 for name, value in defaults.items():
                     if name not in headers:

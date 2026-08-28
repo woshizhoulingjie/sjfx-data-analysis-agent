@@ -273,7 +273,27 @@ class Config:
     DOWNLOAD_TICKET_TTL_SECONDS = max(
         30, min(600, int(os.getenv("DOWNLOAD_TICKET_TTL_SECONDS", "120")))
     )
-    AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "0" if HOST in {"127.0.0.1", "localhost", "::1"} else "1").strip().lower() in {"1", "true", "yes"}
+    _LOOPBACK_HOST = HOST in {"127.0.0.1", "localhost", "::1"}
+    AUTH_REQUIRED = os.getenv(
+        "AUTH_REQUIRED", "0" if _LOOPBACK_HOST else "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not _LOOPBACK_HOST and not AUTH_REQUIRED:
+        raise RuntimeError(
+            "非回环地址部署必须启用 AUTH_REQUIRED，拒绝启动未鉴权服务"
+        )
+    if AUTH_REQUIRED and not API_ACCESS_TOKEN:
+        raise RuntimeError(
+            "AUTH_REQUIRED=1 时必须配置 SJFX_API_ACCESS_TOKEN"
+        )
+    # Interactive API documentation is a development-only surface.  It is
+    # disabled whenever authentication is enabled or the server is reachable
+    # beyond loopback, so route metadata cannot bypass the access guard.
+    ENABLE_API_DOCS = (
+        os.getenv("ENABLE_API_DOCS", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+        and _LOOPBACK_HOST
+        and not AUTH_REQUIRED
+    )
     _allowed_roots_raw = os.getenv("SCAN_ALLOWED_ROOTS", "").strip()
     if not _allowed_roots_raw and HOST not in {"127.0.0.1", "localhost", "::1"}:
         raise RuntimeError("非回环地址部署必须显式设置 SCAN_ALLOWED_ROOTS，拒绝使用宽泛默认扫描范围")
@@ -382,11 +402,14 @@ class Config:
     CONVERSATION_MAX_REVISION_ATTEMPTS = max(
         0, min(2, int(os.getenv("CONVERSATION_MAX_REVISION_ATTEMPTS", "1")))
     )
+    CONVERSATION_MAX_PROMOTION_DEPTH = max(
+        1, min(12, int(os.getenv("CONVERSATION_MAX_PROMOTION_DEPTH", "3")))
+    )
     LARGE_PACKAGE_BACKGROUND_BATCH_FILES = max(
         20, min(50, int(os.getenv("LARGE_PACKAGE_BACKGROUND_BATCH_FILES", "20")))
     )
     LARGE_PACKAGE_BACKGROUND_BACKFILL = os.getenv(
-        "LARGE_PACKAGE_BACKGROUND_BACKFILL", "1"
+        "LARGE_PACKAGE_BACKGROUND_BACKFILL", "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
     BACKGROUND_MAX_LOAD_RATIO = max(
         0.1, min(4.0, float(os.getenv("BACKGROUND_MAX_LOAD_RATIO", "0.90")))
@@ -456,24 +479,47 @@ class Config:
         300, int(os.getenv("JOB_TRANSLATION_PACKAGE_TIMEOUT_SECONDS", "86400"))
     )
     MAX_JOB_RESUME_ATTEMPTS = max(1, min(256, int(os.getenv("MAX_JOB_RESUME_ATTEMPTS", "64"))))
+    HISTORY_RETENTION_DAYS = max(
+        0, min(3650, int(os.getenv("HISTORY_RETENTION_DAYS", "0")))
+    )
+    HISTORY_MAX_SCANS = max(
+        0, min(100000, int(os.getenv("HISTORY_MAX_SCANS", "0")))
+    )
+    HISTORY_CLEANUP_INTERVAL_SECONDS = max(
+        300,
+        min(86400, int(os.getenv("HISTORY_CLEANUP_INTERVAL_SECONDS", "3600"))),
+    )
 
 
-if os.name != "nt":
-    os.umask(0o077)
-Config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-Config.DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-Config.PARSE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-Config.OUTPUT_DIR.mkdir(exist_ok=True)
-Config.LOG_DIR.mkdir(exist_ok=True)
-Config.MODELS_DIR.mkdir(exist_ok=True)
-Config.DOCLING_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-Config.RAPIDOCR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-if os.name != "nt":
-    for _private_dir in (
-        Config.DATA_DIR, Config.DOCUMENT_CACHE_DIR, Config.PARSE_TEMP_DIR,
-        Config.LOG_DIR, Config.OUTPUT_DIR,
+def ensure_runtime_directories():
+    """Create private runtime directories during an explicit process startup.
+
+    Importing :mod:`config` is intentionally read-only.  This keeps test
+    discovery, static analysis and management commands from touching the live
+    database/state volume merely because they imported application modules.
+    """
+    if os.name != "nt":
+        os.umask(0o077)
+    for directory in (
+        Config.DATA_DIR,
+        Config.DOCUMENT_CACHE_DIR,
+        Config.PARSE_TEMP_DIR,
+        Config.OUTPUT_DIR,
+        Config.LOG_DIR,
+        Config.MODELS_DIR,
+        Config.DOCLING_ARTIFACTS_DIR,
+        Config.RAPIDOCR_MODEL_DIR,
     ):
-        try:
-            _private_dir.chmod(0o700)
-        except OSError:
-            pass
+        directory.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        for private_dir in (
+            Config.DATA_DIR,
+            Config.DOCUMENT_CACHE_DIR,
+            Config.PARSE_TEMP_DIR,
+            Config.LOG_DIR,
+            Config.OUTPUT_DIR,
+        ):
+            try:
+                private_dir.chmod(0o700)
+            except OSError:
+                pass
