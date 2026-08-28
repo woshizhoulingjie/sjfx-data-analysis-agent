@@ -161,6 +161,13 @@ class PackageExplorationTests(unittest.TestCase):
                 second["source_sha256"], hashlib.sha256(b"B" * 5000).hexdigest()
             )
 
+    def test_preview_budget_resume_keeps_prior_consumption(self):
+        budget = PreviewBudget(1000, consumed_bytes=750)
+
+        self.assertEqual(budget.claim(400), 250)
+        self.assertEqual(budget.consumed_bytes, 1000)
+        self.assertTrue(budget.exhausted)
+
     def test_small_file_is_not_duplicated_by_overlapping_sample_windows(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

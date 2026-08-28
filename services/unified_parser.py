@@ -567,10 +567,6 @@ class UnifiedDocumentParser:
         self._ocr_engine = None
         self._lock = threading.Lock()
         self.parse_temp_root = _configured_parse_temp_root()
-        # A SIGKILL/timeout cannot run a child's finally block. Reaping dead
-        # PID-owned objects on each parser construction gives the parent and
-        # the next worker a deterministic recovery path.
-        cleanup_stale_parse_temp_dirs(self.parse_temp_root)
         # These flags also cover direct use outside app.py/config.py.
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -1014,6 +1010,9 @@ class UnifiedDocumentParser:
             base["warnings"].append("压缩包嵌套层级达到安全上限，未继续展开。")
             return
 
+        # Construction is import-safe; create and maintain scratch space only
+        # when an archive is actually parsed.
+        self.parse_temp_root.mkdir(parents=True, exist_ok=True)
         cleanup_stale_parse_temp_dirs(self.parse_temp_root)
         temp_root = Path(tempfile.mkdtemp(
             prefix="sjfx-archive-p{}-".format(os.getpid()),

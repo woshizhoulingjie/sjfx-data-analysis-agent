@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
+from config import Config
 from services.analysis_planner import AnalysisPlanner
 from services.analysis_tools import (
     TOOL_LABELS,
@@ -105,6 +107,38 @@ class AnalysisTurnRuntime:
         return ConversationSession.from_dict(session.as_dict())
 
     @staticmethod
+    def _explicit_question_paths(
+        question: str, inventory_paths: Sequence[str], limit: int = 24
+    ) -> Sequence[str]:
+        """Resolve file names explicitly written in a question.
+
+        Exact file references are stronger than broad lexical retrieval.  The
+        result stays bounded; an ambiguous name matching too many files falls
+        back to the caller's existing scope instead of silently truncating.
+        """
+        text = str(question or "").replace("\\", "/").casefold()
+        if not text:
+            return []
+        matches = []
+        for raw_path in inventory_paths or []:
+            path = str(raw_path or "").replace("\\", "/").strip()
+            if not path:
+                continue
+            lowered = path.casefold()
+            logical_name = PurePosixPath(lowered.replace("::", "/")).name
+            physical_name = PurePosixPath(lowered.split("::", 1)[0]).name
+            names = {
+                value for value in (logical_name, physical_name)
+                if len(value) >= 4
+            }
+            if lowered not in text and not any(name in text for name in names):
+                continue
+            matches.append(path)
+            if len(matches) > limit:
+                return []
+        return list(dict.fromkeys(matches))
+
+    @staticmethod
     def _batch_metrics(batch_summary: Mapping[str, Any]) -> Dict[str, Any]:
         return {
             key: batch_summary.get(key)
@@ -116,6 +150,8 @@ class AnalysisTurnRuntime:
                 "inspected_files",
                 "inventory_files",
                 "unparsed_files",
+                "scope_complete",
+                "scope_limitation",
                 "evidence_records",
             )
         }
@@ -257,7 +293,34 @@ class AnalysisTurnRuntime:
                 event_type="plan",
             )
 
-            modes = set(plan.get("modes") or [])
+            ordered_modes = list(plan.get("modes") or [])
+            modes = set(ordered_modes)
+            primary_mode = ordered_modes[0] if ordered_modes else "analysis"
+            scoped_inventory_paths = [
+                str(path) for path in inventory_paths or []
+                if scope.contains_source(path)
+            ]
+            if scope.kind == "file_type":
+                expected_extension = str(scope.value or "").lower().strip()
+                if expected_extension and not expected_extension.startswith("."):
+                    expected_extension = "." + expected_extension
+                scoped_inventory_paths = [
+                    path for path in scoped_inventory_paths
+                    if PurePosixPath(path.split("::", 1)[0]).suffix.lower()
+                    == expected_extension
+                ]
+            execution_scope = scope
+            explicit_paths = self._explicit_question_paths(
+                turn["question"], scoped_inventory_paths
+            )
+            if explicit_paths:
+                execution_scope = ConversationScope(
+                    kind="files",
+                    source_paths=tuple(explicit_paths),
+                    label="问题中明确指定的文件",
+                )
+                scoped_inventory_paths = list(explicit_paths)
+                plan["resolved_file_mentions"] = list(explicit_paths)
             retrieval_override = None
             batch_summary: Dict[str, Any] = {}
             tool_results: Dict[str, Any] = {}
@@ -274,9 +337,9 @@ class AnalysisTurnRuntime:
                     retrieval_override = execute_bounded_searches(
                         self.engine,
                         turn["scan_id"],
-                        scope,
+                        execution_scope,
                         plan.get("query_variants") or [turn["question"]],
-                        intent=next(iter(modes), "analysis"),
+                        intent=primary_mode,
                         top_k=12,
                     )
                     candidate_files = int(
@@ -328,9 +391,9 @@ class AnalysisTurnRuntime:
                     batch_summary = build_batch_analysis(
                         self.storage,
                         turn["scan_id"],
-                        scope,
+                        execution_scope,
                         plan,
-                        inventory_paths,
+                        scoped_inventory_paths,
                         batch_size=self.batch_size,
                         max_evidence=self.max_candidate_evidence,
                         cancel_check=self.cancel_check,
@@ -361,17 +424,39 @@ class AnalysisTurnRuntime:
                 plan=durable_plan,
             )
             self._checkpoint()
+            working_session = self._fresh_session(session)
             turn_result = self.engine.ask(
-                self._fresh_session(session),
+                working_session,
                 turn["question"],
-                scope=scope,
+                scope=execution_scope,
                 persist_scope=False,
                 retrieval_override=retrieval_override,
                 analysis_plan=plan,
             )
 
+            def apply_scope_guard(result: Dict[str, Any]) -> Dict[str, Any]:
+                if not batch_summary or batch_summary.get("scope_complete"):
+                    return result
+                inspected = int(batch_summary.get("inspected_files") or 0)
+                scope_total = int(batch_summary.get("inventory_files") or 0)
+                limitation = (
+                    "本轮仅检查检索命中的 {}/{} 个范围文件；以下内容是候选集结论，"
+                    "不是全范围完整结论。".format(inspected, scope_total)
+                )
+                result["warnings"] = list(dict.fromkeys(
+                    list(result.get("warnings") or []) + [limitation]
+                ))
+                answer = str(result.get("answer") or "")
+                if limitation not in answer:
+                    result["answer"] = "范围说明\n- {}\n\n{}".format(
+                        limitation, answer
+                    )
+                return result
+
+            turn_result = apply_scope_guard(turn_result)
+
             promotion = dict(turn_result.get("promotion_request") or {})
-            inventory = set(str(path) for path in inventory_paths or [])
+            inventory = set(scoped_inventory_paths)
             requested = []
             for path in promotion.get("candidate_paths") or []:
                 path = str(path)
@@ -387,7 +472,11 @@ class AnalysisTurnRuntime:
                 ):
                     break
             depth = max(0, int(turn.get("continuation_depth") or 0))
-            if promotion.get("required") and requested and depth < 3:
+            max_promotion_depth = int(
+                getattr(self.engine, "max_promotion_depth", 0)
+                or getattr(Config, "CONVERSATION_MAX_PROMOTION_DEPTH", 3)
+            )
+            if promotion.get("required") and requested and depth < max_promotion_depth:
                 self._checkpoint()
                 promotion_job_id, _created = self.storage.create_or_get_typed_job(
                     turn["scan_id"],
@@ -400,7 +489,7 @@ class AnalysisTurnRuntime:
                         ),
                         "parse_mode": "accurate",
                         "conversation_turn_id": turn_id,
-                        "conversation_scope": scope.as_dict(),
+                        "conversation_scope": execution_scope.as_dict(),
                         "conversation_continuation_depth": depth + 1,
                     },
                     owner_id=turn["owner_id"],
@@ -434,6 +523,17 @@ class AnalysisTurnRuntime:
                     "promotion_job_id": promotion_job_id,
                     "candidate_paths": requested,
                 }
+            if promotion.get("required") and requested:
+                remaining = len(promotion.get("candidate_paths") or [])
+                warning = (
+                    "自动深析已达到单轮上限；仍有 {} 个候选文件可继续深析。"
+                    "当前回答保持阶段性结论。".format(remaining)
+                )
+                turn_result["promotion_limit_reached"] = True
+                turn_result["remaining_deferred_candidates"] = remaining
+                turn_result["warnings"] = list(dict.fromkeys(
+                    list(turn_result.get("warnings") or []) + [warning]
+                ))
 
             self._publish(
                 turn, "running", "verifying", 80, "正在逐条核验结论、数字、引用和反证"
@@ -461,9 +561,9 @@ class AnalysisTurnRuntime:
                 repair_retrieval = execute_bounded_searches(
                     self.engine,
                     turn["scan_id"],
-                    scope,
+                    execution_scope,
                     self._repair_queries(plan, verification),
-                    intent=next(iter(modes), "analysis"),
+                    intent=primary_mode,
                     top_k=20,
                 )
                 retrieval_override = merge_retrieval_results(
@@ -491,14 +591,16 @@ class AnalysisTurnRuntime:
                     ][:12],
                 }
                 self._checkpoint()
+                working_session = self._fresh_session(session)
                 turn_result = self.engine.ask(
-                    self._fresh_session(session),
+                    working_session,
                     turn["question"],
-                    scope=scope,
+                    scope=execution_scope,
                     persist_scope=False,
                     retrieval_override=retrieval_override,
                     analysis_plan=repair_plan,
                 )
+                turn_result = apply_scope_guard(turn_result)
                 verification = self._verify(
                     turn_id, repair_plan, turn_result, tool_results, batch_summary
                 )
@@ -512,21 +614,38 @@ class AnalysisTurnRuntime:
                     tool_results=tool_results,
                     batch_summary=batch_summary,
                 )
+                turn_result = apply_scope_guard(turn_result)
 
             verification["revision_attempts"] = revision_attempts
             quality_metrics = dict(verification.get("quality_metrics") or {})
             quality_metrics["revision_attempts"] = revision_attempts
             quality_metrics["professional_tool_count"] = len(tool_results)
             turn_result["quality_metrics"] = quality_metrics
+            turn_result["citation_verification_status"] = verification.get("status")
+            turn_result["scope_completeness"] = (
+                "candidate_only"
+                if quality_metrics.get("scope_incomplete")
+                else "checked_scope"
+            )
             turn_result["analysis_tools"] = self._tool_summaries(tool_results)
             verification_warnings = list(verification.get("warnings") or [])
-            if verification_warnings:
-                turn_result["warnings"] = list(
-                    dict.fromkeys(
-                        list(turn_result.get("warnings") or [])
-                        + verification_warnings
-                    )
-                )
+            stale_fragments = (
+                "事实性陈述没有通过", "陈述只得到部分支持", "数字结论无法",
+                "引用标号无对应证据", "候选证据覆盖率较低",
+                "当前回答没有可持久化的正文引用", "未通过核验：",
+            )
+            prior_warnings = [
+                item for item in (turn_result.get("warnings") or [])
+                if not any(fragment in str(item) for fragment in stale_fragments)
+            ]
+            if turn_result.get("citations"):
+                prior_warnings = [
+                    item for item in prior_warnings
+                    if "没有可检索正文证据" not in str(item)
+                ]
+            turn_result["warnings"] = list(
+                dict.fromkeys(prior_warnings + verification_warnings)
+            )
             self._step(
                 turn_id,
                 plan,
@@ -541,6 +660,7 @@ class AnalysisTurnRuntime:
                 turn_result,
                 verification,
                 (verification.get("ledger") or {}).get("claims") or [],
+                session_state=working_session.as_dict(),
             )
             memory = update_research_memory(
                 memory_record.get("payload") or {},

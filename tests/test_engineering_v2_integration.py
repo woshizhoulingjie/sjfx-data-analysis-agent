@@ -337,6 +337,102 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
             cancelled = self.app_module.cancel_conversation_turn(turn_id).get_json()
         self.assertEqual(cancelled["turn"]["status"], "cancelled")
 
+    def test_old_scan_rebuilds_search_index_without_original_source_file(self):
+        scan_id, scan = self._save_scan_with_files(["legacy.txt"])
+        owner = self.app_module.Config.OWNER_ID
+        self.storage.save_document(scan_id, "legacy.txt", {
+            "source": {"path": "legacy.txt", "name": "legacy.txt"},
+            "text": "The historical record confirms that the project received final approval in August 2026 after legal, finance, and delivery reviews were completed.",
+            "evidence": [{
+                "evidence_id": "legacy-evidence-1",
+                "source_path": "legacy.txt",
+                "label": "paragraph",
+                "text": "The historical record confirms that the project received final approval in August 2026 after legal, finance, and delivery reviews were completed.",
+            }],
+        })
+        self.storage.clear_evidence_index(scan_id)
+        (Path(scan["root"]) / "legacy.txt").unlink()
+        session = self.app_module.conversation_engine.new_session(
+            scan_id, scope=self.app_module.ConversationScope("package")
+        )
+        self.storage.save_conversation(session.as_dict(), owner)
+
+        with self.app_module.app.test_request_context(
+            "/api/conversation/{}/turns".format(session.session_id),
+            method="POST",
+            json={"scan_id": scan_id, "question": "这份资料讲了什么？"},
+        ):
+            response, status = self.app_module.create_conversation_turn(
+                session.session_id
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(
+            response.get_json()["code"], "search_index_rebuild_required"
+        )
+
+        with self.app_module.app.test_request_context(
+            "/api/scans/{}/rebuild-search-index".format(scan_id),
+            method="POST", json={},
+        ):
+            response, status = self.app_module.rebuild_search_index(scan_id)
+        self.assertIn(status, {200, 202})
+        job_id = response.get_json()["job_id"]
+        self.assertTrue(job_id)
+        rebuilding = response.get_json()["search_index"]
+        self.assertEqual(rebuilding["state"], "rebuilding")
+        self.assertFalse(rebuilding["ready"])
+        self.assertEqual(rebuilding["expected_documents"], 1)
+        job = self.storage.claim_next_job("index-test-worker")
+        self.assertEqual(job["id"], job_id)
+        self.assertEqual(job["task_type"], "rebuild_search_index")
+
+        result = self.app_module._run_claimed_search_index_rebuild_job(job)
+
+        self.assertEqual(result["processed_documents"], 1)
+        self.assertGreater(result["indexed_evidence_records"], 0)
+        self.assertTrue(result["search_index"]["ready"])
+        self.assertEqual(result["search_index"]["state"], "ready")
+        self.assertEqual(result["search_index"]["processed_documents"], 1)
+        self.assertTrue(result["search_index"]["generation"])
+
+    def test_user_can_continue_deep_analysis_after_automatic_limit(self):
+        scan_id, _scan = self._save_scan_with_files(
+            ["contracts/a.txt", "contracts/b.txt"]
+        )
+        owner = self.app_module.Config.OWNER_ID
+        session = self.app_module.conversation_engine.new_session(
+            scan_id, scope=self.app_module.ConversationScope("package")
+        )
+        self.storage.save_conversation(session.as_dict(), owner)
+        turn, _created = self.storage.create_conversation_turn(
+            session.session_id, scan_id, owner, "继续检查其余合同",
+            {"kind": "package"}, idempotency_key="continue-api-1",
+        )
+        self.storage.update_conversation_turn(
+            turn["id"], status="completed", stage="completed", progress=100,
+            result={
+                "answer": "当前为阶段性结果。",
+                "promotion_limit_reached": True,
+                "promotion_request": {
+                    "required": True,
+                    "candidate_paths": ["contracts/a.txt", "contracts/b.txt"],
+                },
+            },
+        )
+
+        with self.app_module.app.test_request_context(
+            "/api/turns/{}/continue-deep-analysis".format(turn["id"]),
+            method="POST", json={"desired_file_count": 1},
+        ):
+            response, status = (
+                self.app_module.continue_conversation_turn_deep_analysis(turn["id"])
+            )
+        payload = response.get_json()
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(len(payload["candidate_paths"]), 1)
+        self.assertEqual(payload["turn"]["status"], "waiting_for_deep_analysis")
+        self.assertTrue(payload["turn"]["promotion_job_id"])
+
     def test_import_translation_is_bounded_prioritized_and_searchable(self):
         class _ImportTranslationService:
             def __init__(self):

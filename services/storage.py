@@ -1,10 +1,12 @@
 import json
+import calendar
 import gzip
 import hashlib
 import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -19,6 +21,34 @@ from services.translation import document_translation_fingerprint
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class LazyStorage:
+    """Thread-safe proxy that opens SQLite only on explicit first use.
+
+    Web and Worker modules are imported by test discovery and by spawned
+    processes.  Keeping construction lazy prevents those imports from running
+    schema migrations or ownership updates against the configured live state.
+    """
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._instance = None
+        self._instance_lock = threading.Lock()
+
+    def initialize(self):
+        if self._instance is None:
+            with self._instance_lock:
+                if self._instance is None:
+                    self._instance = self._factory()
+        return self._instance
+
+    @property
+    def initialized(self):
+        return self._instance is not None
+
+    def __getattr__(self, name):
+        return getattr(self.initialize(), name)
 
 
 class Storage:
@@ -249,6 +279,21 @@ class Storage:
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (scan_id, index_key)
                 );
+                CREATE TABLE IF NOT EXISTS search_index_states (
+                    scan_id TEXT PRIMARY KEY,
+                    generation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    expected_documents INTEGER NOT NULL DEFAULT 0,
+                    processed_documents INTEGER NOT NULL DEFAULT 0,
+                    failed_documents INTEGER NOT NULL DEFAULT 0,
+                    empty_documents INTEGER NOT NULL DEFAULT 0,
+                    evidence_records INTEGER NOT NULL DEFAULT 0,
+                    last_node_path TEXT,
+                    error TEXT,
+                    started_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL
+                );
                 CREATE TABLE IF NOT EXISTS tree_edits (
                     scan_id TEXT NOT NULL,
                     edit_id TEXT NOT NULL,
@@ -443,6 +488,8 @@ class Storage:
                     ON inventory_entries(scan_id, kind, node_path);
                 CREATE INDEX IF NOT EXISTS idx_embedding_cache_updated ON embedding_cache(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_evidence_index_scan_source ON evidence_index(scan_id, source_path);
+                CREATE INDEX IF NOT EXISTS idx_search_index_states_status
+                    ON search_index_states(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_tree_nodes_parent
                     ON tree_nodes(scan_id, tree_kind, parent_key, position, node_key);
                 CREATE INDEX IF NOT EXISTS idx_download_tickets_expiry
@@ -468,6 +515,54 @@ class Storage:
                     ON conversation_turn_events(turn_id, event_id);
                 CREATE INDEX IF NOT EXISTS idx_conversation_step_status
                     ON conversation_analysis_steps(turn_id, position, status);
+                CREATE TRIGGER IF NOT EXISTS trg_scans_delete_search_index_state
+                AFTER DELETE ON scans
+                BEGIN
+                    DELETE FROM search_index_states WHERE scan_id=OLD.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_scans_delete_cascade
+                BEFORE DELETE ON scans
+                BEGIN
+                    DELETE FROM conversation_analysis_steps
+                        WHERE turn_id IN (SELECT id FROM conversation_turns WHERE scan_id=OLD.id);
+                    DELETE FROM conversation_turn_events
+                        WHERE turn_id IN (SELECT id FROM conversation_turns WHERE scan_id=OLD.id);
+                    DELETE FROM conversation_turn_evidence
+                        WHERE turn_id IN (SELECT id FROM conversation_turns WHERE scan_id=OLD.id);
+                    DELETE FROM conversation_claims
+                        WHERE turn_id IN (SELECT id FROM conversation_turns WHERE scan_id=OLD.id);
+                    DELETE FROM conversation_messages
+                        WHERE session_id IN (SELECT id FROM conversations WHERE scan_id=OLD.id);
+                    DELETE FROM conversation_research_memory
+                        WHERE session_id IN (SELECT id FROM conversations WHERE scan_id=OLD.id);
+                    DELETE FROM conversation_turns WHERE scan_id=OLD.id;
+                    DELETE FROM conversations WHERE scan_id=OLD.id;
+                    DELETE FROM download_tickets
+                        WHERE filename IN (
+                            SELECT filename FROM output_artifacts WHERE scan_id=OLD.id
+                        );
+                    DELETE FROM output_artifacts WHERE scan_id=OLD.id;
+                    DELETE FROM summaries WHERE scan_id=OLD.id;
+                    DELETE FROM unified_documents WHERE scan_id=OLD.id;
+                    DELETE FROM package_analyses WHERE scan_id=OLD.id;
+                    DELETE FROM analysis_jobs WHERE scan_id=OLD.id;
+                    DELETE FROM file_analysis_states WHERE scan_id=OLD.id;
+                    DELETE FROM file_workflow_states WHERE scan_id=OLD.id;
+                    DELETE FROM inventory_entries WHERE scan_id=OLD.id;
+                    DELETE FROM inventory_scan_states WHERE scan_id=OLD.id;
+                    DELETE FROM retrieval_sessions WHERE scan_id=OLD.id;
+                    DELETE FROM evidence_index WHERE scan_id=OLD.id;
+                    DELETE FROM search_index_states WHERE scan_id=OLD.id;
+                    DELETE FROM tree_edits WHERE scan_id=OLD.id;
+                    DELETE FROM scan_overviews WHERE scan_id=OLD.id;
+                    DELETE FROM analysis_overviews WHERE scan_id=OLD.id;
+                    DELETE FROM analysis_progress WHERE scan_id=OLD.id;
+                    DELETE FROM tree_nodes WHERE scan_id=OLD.id;
+                    DELETE FROM file_previews WHERE scan_id=OLD.id;
+                    DELETE FROM package_content_maps WHERE scan_id=OLD.id;
+                    DELETE FROM package_overviews WHERE scan_id=OLD.id;
+                    DELETE FROM document_translations WHERE scan_id=OLD.id;
+                END;
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_jobs)").fetchall()}
             migrations = {
@@ -569,6 +664,11 @@ class Storage:
                     "archive_source_path UNINDEXED,section,text,tokenize='unicode61')"
                 )
                 self.evidence_fts_available = True
+                conn.execute(
+                    "CREATE TRIGGER IF NOT EXISTS trg_scans_delete_evidence_fts "
+                    "AFTER DELETE ON scans BEGIN "
+                    "DELETE FROM evidence_fts WHERE scan_id=OLD.id; END"
+                )
             except sqlite3.DatabaseError as exc:
                 # Some minimal Python/SQLite builds omit FTS5.  Retrieval then
                 # uses a bounded LIKE candidate query, never an all-row load.
@@ -1289,6 +1389,110 @@ class Storage:
             ).fetchone()
         return int(row["value"] if row else 0)
 
+    def get_search_index_state(self, scan_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM search_index_states WHERE scan_id=?",
+                (str(scan_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def begin_search_index_rebuild(self, scan_id, expected_documents):
+        """Start a rebuild generation or resume its last durable checkpoint."""
+        scan_id = str(scan_id)
+        expected_documents = max(0, int(expected_documents or 0))
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM search_index_states WHERE scan_id=?", (scan_id,)
+            ).fetchone()
+            if (
+                row
+                and row["status"] in {"rebuilding", "interrupted"}
+                and int(row["expected_documents"] or 0) == expected_documents
+            ):
+                conn.execute(
+                    "UPDATE search_index_states SET status='rebuilding',error=NULL,updated_at=? "
+                    "WHERE scan_id=?",
+                    (now, scan_id),
+                )
+            else:
+                generation = uuid.uuid4().hex
+                conn.execute(
+                    "INSERT OR REPLACE INTO search_index_states("
+                    "scan_id,generation,status,expected_documents,processed_documents,"
+                    "failed_documents,empty_documents,evidence_records,last_node_path,error,"
+                    "started_at,updated_at,completed_at) VALUES (?,?, 'rebuilding', ?,0,0,0,0,NULL,NULL,?,?,NULL)",
+                    (scan_id, generation, expected_documents, now, now),
+                )
+        return self.get_search_index_state(scan_id)
+
+    def checkpoint_search_index_rebuild(
+        self, scan_id, processed_documents, empty_documents, last_node_path
+    ):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE search_index_states SET status='rebuilding',processed_documents=?,"
+                "empty_documents=?,last_node_path=?,error=NULL,updated_at=? WHERE scan_id=?",
+                (
+                    max(0, int(processed_documents or 0)),
+                    max(0, int(empty_documents or 0)),
+                    str(last_node_path or "") or None,
+                    time.time(),
+                    str(scan_id),
+                ),
+            )
+
+    def interrupt_search_index_rebuild(self, scan_id, error):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE search_index_states SET status='interrupted',error=?,updated_at=? "
+                "WHERE scan_id=? AND status='rebuilding'",
+                (str(error or "")[:1000], time.time(), str(scan_id)),
+            )
+
+    def complete_search_index_rebuild(
+        self, scan_id, processed_documents, empty_documents, last_node_path
+    ):
+        """Atomically publish a generation only after every document committed."""
+        scan_id = str(scan_id)
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            state = conn.execute(
+                "SELECT * FROM search_index_states WHERE scan_id=?", (scan_id,)
+            ).fetchone()
+            if not state or state["status"] != "rebuilding":
+                raise RuntimeError("证据索引重建状态不存在或已失效")
+            actual_documents = int(conn.execute(
+                "SELECT COUNT(*) FROM unified_documents WHERE scan_id=?", (scan_id,)
+            ).fetchone()[0])
+            expected_documents = int(state["expected_documents"] or 0)
+            processed_documents = max(0, int(processed_documents or 0))
+            if actual_documents != expected_documents or processed_documents != expected_documents:
+                raise RuntimeError(
+                    "重建期间文档集合发生变化或处理未完成：预期 {}，当前 {}，已处理 {}".format(
+                        expected_documents, actual_documents, processed_documents
+                    )
+                )
+            evidence_records = int(conn.execute(
+                "SELECT COUNT(*) FROM evidence_index WHERE scan_id=?", (scan_id,)
+            ).fetchone()[0])
+            conn.execute(
+                "UPDATE search_index_states SET status='ready',processed_documents=?,"
+                "failed_documents=0,empty_documents=?,evidence_records=?,last_node_path=?,"
+                "error=NULL,updated_at=?,completed_at=? WHERE scan_id=?",
+                (
+                    processed_documents,
+                    max(0, int(empty_documents or 0)),
+                    evidence_records,
+                    str(last_node_path or "") or None,
+                    now,
+                    now,
+                    scan_id,
+                ),
+            )
+        return self.get_search_index_state(scan_id)
+
     def clear_evidence_index(self, scan_id, preserve_translations=False):
         with self.lock, self._connect() as conn:
             suffix = " AND index_key NOT LIKE 'translation:%'" if preserve_translations else ""
@@ -1917,6 +2121,93 @@ class Storage:
                         "payload": json.loads(row["payload"]),
                     }
 
+    def count_inventory_files(self, scan_id, scope=".", source_paths=None,
+                              extension=None):
+        """Count the physical files in a conversation scope without loading JSON."""
+        scan_id = str(scan_id)
+        scope = str(scope or ".").replace("\\", "/")
+        source_paths = sorted(set(
+            str(item).replace("\\", "/")
+            for item in (source_paths or []) if item
+        ))
+        clauses = ["scan_id=?", "kind='file'"]
+        values = [scan_id]
+        with self._connect() as conn:
+            durable_inventory_exists = bool(conn.execute(
+                "SELECT 1 FROM inventory_entries WHERE scan_id=? AND kind='file' LIMIT 1",
+                (scan_id,),
+            ).fetchone())
+            if source_paths:
+                conn.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS inventory_allowed_sources("
+                    "path TEXT PRIMARY KEY)"
+                )
+                conn.execute("DELETE FROM inventory_allowed_sources")
+                conn.executemany(
+                    "INSERT OR IGNORE INTO inventory_allowed_sources(path) VALUES (?)",
+                    [(path,) for path in source_paths],
+                )
+                clauses.append(
+                    "EXISTS (SELECT 1 FROM inventory_allowed_sources a "
+                    "WHERE inventory_entries.node_path=a.path "
+                    "OR inventory_entries.node_path LIKE a.path || '/%')"
+                )
+            elif scope != ".":
+                clauses.append("(node_path=? OR node_path LIKE ?)")
+                values.extend((scope, scope.rstrip("/") + "/%"))
+            if extension:
+                suffix = str(extension).lower().strip()
+                if suffix and not suffix.startswith("."):
+                    suffix = "." + suffix
+                clauses.append("LOWER(node_path) LIKE ?")
+                values.append("%" + suffix)
+            row = conn.execute(
+                "SELECT COUNT(*) AS value FROM inventory_entries WHERE {}".format(
+                    " AND ".join(clauses)
+                ),
+                values,
+            ).fetchone()
+            if durable_inventory_exists:
+                return int(row["value"] or 0)
+
+            # Standard-size scans predate the paged inventory table and keep
+            # the same physical paths in the lightweight tree index.
+            tree_clauses = [
+                "scan_id=?", "tree_kind='physical'",
+                "json_extract(payload,'$.kind')='file'",
+            ]
+            tree_values = [scan_id]
+            if source_paths:
+                tree_clauses.append(
+                    "EXISTS (SELECT 1 FROM inventory_allowed_sources a "
+                    "WHERE tree_nodes.node_key=a.path "
+                    "OR tree_nodes.node_key LIKE a.path || '/%')"
+                )
+            elif scope != ".":
+                tree_clauses.append("(node_key=? OR node_key LIKE ?)")
+                tree_values.extend((scope, scope.rstrip("/") + "/%"))
+            if extension:
+                suffix = str(extension).lower().strip()
+                if suffix and not suffix.startswith("."):
+                    suffix = "." + suffix
+                tree_clauses.append("LOWER(node_key) LIKE ?")
+                tree_values.append("%" + suffix)
+            row = conn.execute(
+                "SELECT COUNT(*) AS value FROM tree_nodes WHERE {}".format(
+                    " AND ".join(tree_clauses)
+                ),
+                tree_values,
+            ).fetchone()
+        return int(row["value"] or 0)
+
+    def count_documents(self, scan_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS value FROM unified_documents WHERE scan_id=?",
+                (str(scan_id),),
+            ).fetchone()
+        return int(row["value"] or 0)
+
     def get_inventory_entry(self, scan_id, node_path):
         with self._connect() as conn:
             row = conn.execute(
@@ -1938,6 +2229,23 @@ class Storage:
                     "SELECT node_path FROM inventory_entries WHERE scan_id=? AND kind='file' "
                     "AND (node_path=? OR node_path LIKE ?) ORDER BY node_path",
                     (str(scan_id), node_path, node_path.rstrip("/") + "/%"),
+                ).fetchall()
+            if not rows and not conn.execute(
+                "SELECT 1 FROM inventory_entries WHERE scan_id=? AND kind='file' LIMIT 1",
+                (str(scan_id),),
+            ).fetchone():
+                clauses = [
+                    "scan_id=?", "tree_kind='physical'",
+                    "json_extract(payload,'$.kind')='file'",
+                ]
+                values = [str(scan_id)]
+                if node_path != ".":
+                    clauses.append("(node_key=? OR node_key LIKE ?)")
+                    values.extend((node_path, node_path.rstrip("/") + "/%"))
+                rows = conn.execute(
+                    "SELECT node_key AS node_path FROM tree_nodes WHERE {} "
+                    "ORDER BY node_key".format(" AND ".join(clauses)),
+                    values,
                 ).fetchall()
         return [row["node_path"] for row in rows]
 
@@ -1976,6 +2284,144 @@ class Storage:
                 self._replace_tree_index(conn, scan_id, "physical", payload.get("tree") or {})
             conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
         return scan_id
+
+    def delete_scan(self, scan_id, owner_id=None, output_dir=None):
+        """Atomically delete one inactive scan and all database descendants.
+
+        SQLite triggers provide the database-level cascade for both this method
+        and maintenance tools.  Filesystem sidecars and registered artifacts
+        are removed afterwards with strict root checks; failures are reported
+        without ever deleting a path outside application-owned directories.
+        """
+        scan_id = str(scan_id or "").strip()
+        if not scan_id:
+            raise ValueError("扫描标识不能为空")
+        with self.lock, self._connect() as conn:
+            clauses = ["id=?"]
+            values = [scan_id]
+            if owner_id is not None:
+                clauses.append("owner_id=?")
+                values.append(str(owner_id))
+            row = conn.execute(
+                "SELECT id FROM scans WHERE {}".format(" AND ".join(clauses)),
+                values,
+            ).fetchone()
+            if not row:
+                return {"deleted": False, "scan_id": scan_id}
+            active = conn.execute(
+                "SELECT COUNT(*) FROM analysis_jobs WHERE scan_id=? "
+                "AND status IN ('queued','running','cancelling')",
+                (scan_id,),
+            ).fetchone()[0]
+            if active:
+                raise RuntimeError("扫描仍有排队或运行中任务，请先取消并等待任务结束")
+            artifacts = [
+                item["filename"]
+                for item in conn.execute(
+                    "SELECT filename FROM output_artifacts WHERE scan_id=?",
+                    (scan_id,),
+                ).fetchall()
+            ]
+            deleted = conn.execute(
+                "DELETE FROM scans WHERE id=?", (scan_id,)
+            ).rowcount == 1
+
+        removed_sidecars = False
+        sidecar_root = self.sidecar_dir.resolve()
+        sidecar_target = (sidecar_root / scan_id).resolve()
+        try:
+            sidecar_target.relative_to(sidecar_root)
+            if sidecar_target != sidecar_root and sidecar_target.is_dir():
+                shutil.rmtree(str(sidecar_target))
+                removed_sidecars = True
+        except (OSError, RuntimeError, ValueError) as exc:
+            LOGGER.warning("无法清理扫描 sidecar：scan_id=%s error=%s", scan_id, exc)
+
+        removed_artifacts = 0
+        if output_dir:
+            output_root = Path(output_dir).resolve()
+            for filename in artifacts:
+                if Path(str(filename)).name != str(filename):
+                    continue
+                candidate = (output_root / str(filename)).resolve()
+                try:
+                    candidate.relative_to(output_root)
+                    if candidate.is_file() or candidate.is_symlink():
+                        candidate.unlink()
+                        removed_artifacts += 1
+                except (OSError, RuntimeError, ValueError) as exc:
+                    LOGGER.warning(
+                        "无法清理扫描产物：scan_id=%s file=%s error=%s",
+                        scan_id, filename, exc,
+                    )
+        return {
+            "deleted": deleted,
+            "scan_id": scan_id,
+            "sidecars_removed": removed_sidecars,
+            "artifacts_registered": len(artifacts),
+            "artifacts_removed": removed_artifacts,
+        }
+
+    def cleanup_history(
+        self,
+        *,
+        owner_id=None,
+        retention_days=0,
+        max_scans=0,
+        output_dir=None,
+        dry_run=True,
+        limit=100,
+    ):
+        """Plan or apply bounded retention cleanup for inactive scans."""
+        retention_days = max(0, int(retention_days or 0))
+        max_scans = max(0, int(max_scans or 0))
+        limit = max(1, min(1000, int(limit or 100)))
+        if not retention_days and not max_scans:
+            return {"dry_run": bool(dry_run), "candidate_scan_ids": [], "deleted": []}
+        clauses = [
+            "NOT EXISTS (SELECT 1 FROM analysis_jobs j WHERE j.scan_id=scans.id "
+            "AND j.status IN ('queued','running','cancelling'))"
+        ]
+        values = []
+        if owner_id is not None:
+            clauses.append("owner_id=?")
+            values.append(str(owner_id))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,created_at FROM scans WHERE {} "
+                "ORDER BY created_at DESC,id DESC".format(" AND ".join(clauses)),
+                values,
+            ).fetchall()
+        cutoff = time.time() - retention_days * 86400 if retention_days else None
+        candidates = []
+        for position, row in enumerate(rows):
+            expired = False
+            if cutoff is not None:
+                try:
+                    expired = calendar.timegm(
+                        time.strptime(str(row["created_at"])[:19], "%Y-%m-%d %H:%M:%S")
+                    ) < cutoff
+                except (TypeError, ValueError, OverflowError):
+                    expired = False
+            overflow = bool(max_scans and position >= max_scans)
+            if expired or overflow:
+                candidates.append(str(row["id"]))
+            if len(candidates) >= limit:
+                break
+        result = {
+            "dry_run": bool(dry_run),
+            "candidate_scan_ids": candidates,
+            "deleted": [],
+        }
+        if dry_run:
+            return result
+        for candidate in candidates:
+            deleted = self.delete_scan(
+                candidate, owner_id=owner_id, output_dir=output_dir
+            )
+            if deleted.get("deleted"):
+                result["deleted"].append(deleted)
+        return result
 
     def migrate_legacy_ownership(self, owner_id, aliases=None):
         """Bind legacy/token-derived owner aliases to one stable owner id."""
@@ -2341,7 +2787,7 @@ class Storage:
         self._unlink_translation_sidecar(translation_sidecar)
         return deleted
 
-    def iter_documents(self, scan_id, hydrate=True, batch_size=100):
+    def iter_documents(self, scan_id, hydrate=True, batch_size=100, start_after=None):
         """Yield documents from bounded SQLite batches.
 
         This avoids retaining both every serialized JSON row and every decoded
@@ -2350,10 +2796,17 @@ class Storage:
         """
         batch_size = max(1, min(1000, int(batch_size or 100)))
         with self._connect() as conn:
-            cursor = conn.execute(
-                "SELECT node_path,payload FROM unified_documents WHERE scan_id=? ORDER BY node_path",
-                (str(scan_id),),
-            )
+            if start_after:
+                cursor = conn.execute(
+                    "SELECT node_path,payload FROM unified_documents "
+                    "WHERE scan_id=? AND node_path>? ORDER BY node_path",
+                    (str(scan_id), str(start_after)),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT node_path,payload FROM unified_documents WHERE scan_id=? ORDER BY node_path",
+                    (str(scan_id),),
+                )
             try:
                 while True:
                     rows = cursor.fetchmany(batch_size)
@@ -2366,6 +2819,52 @@ class Storage:
                                 row["payload"], hydrate=hydrate
                             ),
                         }
+            finally:
+                cursor.close()
+
+    def iter_structured_documents(
+        self, scan_id, hydrate=False, batch_size=100, source_paths=None
+    ):
+        """Yield only documents with structured profiles using SQLite JSON filters."""
+        batch_size = max(1, min(500, int(batch_size or 100)))
+        source_paths = sorted(set(
+            str(item) for item in (source_paths or []) if item
+        ))
+        with self._connect() as conn:
+            source_filter = ""
+            if source_paths:
+                conn.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS structured_allowed_sources("
+                    "path TEXT PRIMARY KEY)"
+                )
+                conn.execute("DELETE FROM structured_allowed_sources")
+                conn.executemany(
+                    "INSERT OR IGNORE INTO structured_allowed_sources(path) VALUES (?)",
+                    [(path,) for path in source_paths],
+                )
+                source_filter = (
+                    "AND EXISTS (SELECT 1 FROM structured_allowed_sources a "
+                    "WHERE d.node_path=a.path OR d.node_path LIKE a.path || '/%' "
+                    "OR d.node_path LIKE a.path || '::%') "
+                )
+            cursor = conn.execute(
+                "SELECT d.node_path,d.payload FROM unified_documents d WHERE d.scan_id=? "
+                "AND (json_type(payload,'$.data_profile') IS NOT NULL "
+                "OR json_array_length(COALESCE(json_extract(payload,'$.data_profiles'),'[]'))>0) "
+                + source_filter + "ORDER BY d.node_path",
+                (str(scan_id),),
+            )
+            try:
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        payload = (
+                            self._load_document_payload(row["payload"])
+                            if hydrate else json.loads(row["payload"])
+                        )
+                        yield {"path": row["node_path"], "payload": payload}
             finally:
                 cursor.close()
 
@@ -2853,7 +3352,9 @@ class Storage:
                 )
         return session_id
 
-    def get_conversation(self, session_id, owner_id, scan_id=None):
+    def get_conversation(self, session_id, owner_id, scan_id=None,
+                         message_limit=100, before_sequence=None,
+                         context_only=False):
         clauses = ["id=?", "owner_id=?"]
         values = [str(session_id), str(owner_id)]
         if scan_id is not None:
@@ -2865,14 +3366,45 @@ class Storage:
             ).fetchone()
             if not row:
                 return None
-            message_rows = conn.execute(
-                "SELECT payload FROM conversation_messages WHERE session_id=? "
-                "ORDER BY CASE WHEN sequence IS NULL THEN 1 ELSE 0 END,sequence,created_at,message_id",
+            payload = json.loads(row["payload"])
+            total_messages = int(conn.execute(
+                "SELECT COUNT(*) AS value FROM conversation_messages WHERE session_id=?",
                 (str(session_id),),
+            ).fetchone()["value"])
+            limit = max(2, min(500, int(message_limit or 100)))
+            message_values = [str(session_id)]
+            message_where = "session_id=?"
+            if context_only:
+                summarized = max(0, int(payload.get("summarized_message_count") or 0))
+                if summarized:
+                    message_where += " AND sequence>?"
+                    message_values.append(summarized)
+            if before_sequence is not None:
+                message_where += " AND sequence<?"
+                message_values.append(max(1, int(before_sequence)))
+            message_values.append(limit)
+            message_rows = conn.execute(
+                "SELECT sequence,payload FROM conversation_messages WHERE {} "
+                "ORDER BY CASE WHEN sequence IS NULL THEN 1 ELSE 0 END DESC,"
+                "sequence DESC,created_at DESC,message_id DESC LIMIT ?".format(
+                    message_where
+                ),
+                message_values,
             ).fetchall()
-        payload = json.loads(row["payload"])
         if message_rows:
-            payload["messages"] = [json.loads(item["payload"]) for item in message_rows]
+            ordered_rows = list(reversed(message_rows))
+            payload["messages"] = [json.loads(item["payload"]) for item in ordered_rows]
+            first_sequence = ordered_rows[0]["sequence"]
+        else:
+            payload["messages"] = []
+            first_sequence = None
+        payload["message_page"] = {
+            "limit": limit,
+            "total": total_messages,
+            "returned": len(message_rows),
+            "before_sequence": first_sequence if first_sequence and first_sequence > 1 else None,
+            "has_more": bool(first_sequence and first_sequence > 1),
+        }
         return payload
 
     def list_conversations(self, scan_id, owner_id, limit=50):
@@ -3167,7 +3699,8 @@ class Storage:
             output.append(item)
         return output
 
-    def complete_conversation_turn(self, turn_id, turn_result, verification, claims):
+    def complete_conversation_turn(self, turn_id, turn_result, verification, claims,
+                                   session_state=None):
         turn_result = dict(turn_result or {})
         citations = list(turn_result.get("citations") or [])
         claims = list(claims or [])
@@ -3242,10 +3775,34 @@ class Storage:
                     row["session_id"], row["assistant_message_id"],
                 ),
             )
-            conn.execute(
-                "UPDATE conversations SET revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (row["session_id"],),
-            )
+            if session_state:
+                conversation_row = conn.execute(
+                    "SELECT payload FROM conversations WHERE id=?",
+                    (row["session_id"],),
+                ).fetchone()
+                conversation_payload = json.loads(conversation_row["payload"])
+                for key in (
+                    "scope", "rolling_summary", "summarized_message_count",
+                    "updated_at", "title", "status",
+                ):
+                    if key in session_state:
+                        conversation_payload[key] = session_state[key]
+                # Full messages remain in conversation_messages as the audit log.
+                conversation_payload["messages"] = []
+                conn.execute(
+                    "UPDATE conversations SET payload=?,revision=revision+1,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (
+                        json.dumps(conversation_payload, ensure_ascii=False),
+                        row["session_id"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    "UPDATE conversations SET revision=revision+1,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (row["session_id"],),
+                )
             conn.execute(
                 "INSERT INTO conversation_turn_events("
                 "turn_id,event_type,stage,progress,message,payload"
@@ -3841,6 +4398,8 @@ class Storage:
                 return 130
             if source == "manual_selection":
                 return 110
+            if source == "index_rebuild":
+                return 110
             if source == "initial_overview":
                 return 85
             if source == "background_backfill":
@@ -3848,6 +4407,7 @@ class Storage:
         return {
             "scan_and_analyze": 100,
             "conversation_turn": 125,
+            "rebuild_search_index": 110,
             # Explicit single-document translation is a manual action. Bulk
             # package translation remains the lowest-priority backfill.
             "translate_document": 110,

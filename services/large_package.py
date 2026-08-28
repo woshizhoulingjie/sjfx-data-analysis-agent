@@ -49,6 +49,7 @@ def build_policy(scan, options=None):
     initial_limit = max(1, int(options.get("initial_parse_files") or 700))
     deepen_limit = max(20, min(50, int(options.get("deepen_batch_files") or 30)))
     batch_files = max(20, min(50, int(options.get("batch_files") or 30)))
+    background_backfill = bool(options.get("background_backfill", False))
     overview_chars = max(1000, min(12000, int(options.get("overview_chars_per_file") or 4000)))
     overview_evidence = max(1, min(20, int(options.get("overview_evidence_per_file") or 6)))
     preview_bytes = max(4096, min(1024 * 1024, int(options.get("preview_bytes_per_file") or 96 * 1024)))
@@ -67,7 +68,7 @@ def build_policy(scan, options=None):
         "initial_parse_files": initial_limit,
         "deepen_batch_files": deepen_limit,
         "batch_files": batch_files,
-        "full_inventory_processing": False,
+        "full_inventory_processing": background_backfill,
         "full_inventory_preview": True,
         "classification_scope": "all_bounded_previews",
         "preview_bytes_per_file": preview_bytes,
@@ -84,6 +85,7 @@ def build_policy(scan, options=None):
         "batch_work_kind": "bounded_preview_then_selected_deep_parse",
         "batch_checkpoint_scope": "per_file",
         "deep_batch_contract": "one_durable_job_per_20_to_50_files",
+        "background_backfill": background_backfill,
         "pause_behavior": "安全停止后保留逐文件检查点；再次启动同一扫描可续跑",
         "deep_analysis_strategy": "全量有界轻量预览与内容地图；自动深析代表文件，用户问答命中后动态晋升准确解析",
     }
@@ -93,7 +95,7 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
                           preview_bytes_per_file=96 * 1024,
                           preview_total_bytes=8 * 1024 * 1024 * 1024,
                           max_content_bytes=10 * 1024 * 1024 * 1024,
-                          temp_reserve_bytes=0):
+                          temp_reserve_bytes=0, full_deep_backfill=False):
     """Estimate durable state and worst-case parser scratch before content I/O."""
     file_count = max(0, int(scan.get("file_count") or 0))
     inventory_bytes = max(0, int(scan.get("total_size") or 0))
@@ -107,7 +109,8 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
     inventory_state = file_count * 1200
     evidence_state = file_count * 3 * 2200
     base_state = preview_state + inventory_state + evidence_state
-    required_state = int(base_state * 1.35) + 512 * 1024 * 1024
+    deep_state = int(inventory_bytes * 1.5) if full_deep_backfill else 0
+    required_state = int(base_state * 1.35) + deep_state + 512 * 1024 * 1024
     required_temp = int(max_content_bytes) * 2 + int(temp_reserve_bytes)
     state_free_bytes = max(0, int(state_free_bytes or 0))
     temp_free_bytes = max(0, int(temp_free_bytes or 0))
@@ -123,6 +126,8 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
         "inventory_files": file_count,
         "source_bytes": inventory_bytes,
         "mandatory_hash_read_bytes": inventory_bytes,
+        "full_deep_backfill": bool(full_deep_backfill),
+        "estimated_deep_state_bytes": deep_state,
         "preview_source_budget_bytes": preview_source_bytes,
         "estimated_state_bytes": required_state,
         "state_free_bytes": state_free_bytes,

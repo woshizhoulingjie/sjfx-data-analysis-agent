@@ -2,9 +2,6 @@ fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
 pydantic>=2.12,<3
 httpx>=0.27,<1
-# The runtime adapter uses PydanticAI for typed contracts only; model traffic is
-# handled by the local Ollama transport.  Do not install a cloud-provider extra.
-pydantic-ai-slim>=1.0,<2
 pypdf>=5,<7
 python-docx>=1.1,<2
 python-pptx>=1.0,<2

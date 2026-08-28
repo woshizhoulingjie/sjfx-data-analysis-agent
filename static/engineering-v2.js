@@ -29,7 +29,7 @@
     scanId: '', overview: null, researchBrief: null, reportArtifact: null,
     selectedScope: null, overviewLoading: false,
     conversation: null, conversationList: [], turns: new Map(), conversationSending: false,
-    conversationPending: null,
+    conversationPending: null, searchIndex: null,
     translationItems: [], translationCounts: {}, translationPath: '', translationView: 'translated',
     translationOffset: 0, translationPage: null, translationLoading: false,
     watchers: new Map(), scopeConstraints: {}
@@ -71,6 +71,8 @@
     if (!response.ok || !payload.ok) {
       const error = new Error(payload.error || `请求失败（HTTP ${response.status}）`);
       error.status = response.status;
+      error.code = payload.code;
+      error.payload = payload;
       throw error;
     }
     return payload;
@@ -665,9 +667,17 @@
     if (!metrics || typeof metrics !== 'object') return '';
     const ratio = metrics.claim_support_ratio == null ? null : numeric(metrics.claim_support_ratio);
     const coverage = metrics.query_coverage == null ? null : numeric(metrics.query_coverage);
+    const scopeFiles = numeric(metrics.scope_files == null ? metrics.inventory_files : metrics.scope_files);
+    const inspectedFiles = numeric(metrics.inspected_files);
+    const uncheckedFiles = Math.max(0, scopeFiles - inspectedFiles);
+    const candidateDepth = metrics.candidate_deep_coverage == null ? null : numeric(metrics.candidate_deep_coverage);
+    const scopeCoverage = metrics.scope_inspection_coverage == null ? null : numeric(metrics.scope_inspection_coverage);
     const values = [
+      ['范围文件', integer(scopeFiles)],
       ['候选文件', integer(metrics.candidate_files)],
-      ['已检查', integer(metrics.inspected_files)],
+      ['实际检查', integer(inspectedFiles)],
+      ['未检查', integer(uncheckedFiles)],
+      ['深析完成', integer(metrics.deep_candidate_files == null ? metrics.deep_analyzed_files : metrics.deep_candidate_files)],
       ['分析批次', integer(metrics.batch_count)],
       ['引用', integer(metrics.citation_count)],
       ['结论支持率', ratio == null ? '待核验' : `${Math.round(ratio * 100)}%`],
@@ -676,8 +686,10 @@
       ['矛盾', integer(metrics.contradiction_count)],
       ['未解析文件', integer(metrics.unparsed_files)]
     ];
-    if (coverage != null) values.splice(4, 0, ['查询覆盖率', `${Math.round(coverage * 100)}%`]);
-    const status = { verified: '核验通过', partial: '部分通过', insufficient_evidence: '证据不足', not_required: '无需核验' }[metrics.verification_status] || metrics.verification_status || '待核验';
+    if (scopeCoverage != null) values.splice(5, 0, ['范围检查率', `${Math.round(scopeCoverage * 100)}%`]);
+    if (candidateDepth != null) values.splice(6, 0, ['候选深析率', `${Math.round(candidateDepth * 100)}%`]);
+    if (coverage != null && scopeCoverage == null && candidateDepth == null) values.splice(5, 0, ['覆盖率', `${Math.round(coverage * 100)}%`]);
+    const status = { verified: '引用核验通过', partial: '引用部分通过', insufficient_evidence: '证据不足', not_required: '无需引用核验' }[metrics.verification_status] || metrics.verification_status || '待核验';
     return `<section class="v2-quality" aria-label="分析质量"><header><strong>分析质量</strong><span>${escapeHtml(status)}</span></header><div>${values.map(([label, value]) => `<dl><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></dl>`).join('')}</div></section>`;
   }
 
@@ -719,23 +731,54 @@
     const retryable = turn && ['failed', 'cancelled'].includes(turn.status);
     const progress = running ? `<div class="v2-turn-progress" role="status"><div><span>${escapeHtml(analysisTurnStageLabel(turn.stage))}</span><b>${Math.round(numeric(turn.progress))}%</b></div><progress max="100" value="${Math.round(numeric(turn.progress))}"></progress></div>` : '';
     const quality = role === 'assistant' && turn ? analysisQualityMarkup(turn) : '';
+    const warnings = role === 'assistant' && turn && Array.isArray(turn.warnings) && turn.warnings.length
+      ? `<section class="v2-turn-warnings"><strong>范围与核验限制</strong><ul>${turn.warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></section>`
+      : '';
     const steps = turn && Array.isArray(turn.steps) && turn.steps.length ? `<details class="v2-analysis-steps"><summary>查看分析步骤</summary>${turn.steps.map((step) => `<div class="v2-analysis-step ${escapeHtml(step.status || 'pending')}"><span>${escapeHtml(step.action || step.tool || '')}</span><b>${escapeHtml(analysisTurnStatusLabel(step.status))}</b></div>`).join('')}</details>` : '';
-    const actions = role === 'assistant' ? `<div class="v2-message-actions"><button type="button" data-copy-message="${escapeHtml(message.message_id || '')}">复制</button>${running ? `<button type="button" data-cancel-turn="${escapeHtml(turn.turn_id || '')}">停止分析</button>` : ''}${retryable ? `<button type="button" data-retry-turn="${escapeHtml(turn.turn_id || '')}">重新分析</button>` : `<button type="button" data-regenerate-message="${escapeHtml(message.message_id || '')}">再次回答</button>`}</div>` : '';
-    return `<div class="v2-message ${role}" data-message-id="${escapeHtml(message.message_id || '')}"><div class="v2-message-card"><div class="v2-message-content">${content}</div>${progress}${meta}${quality}${steps}${evidence}${actions}</div></div>`;
+    const continueDeep = turn && turn.status === 'completed' && turn.promotion_limit_reached
+      ? `<button type="button" data-continue-deep-turn="${escapeHtml(turn.turn_id || '')}">继续深析</button>`
+      : '';
+    const actions = role === 'assistant' ? `<div class="v2-message-actions"><button type="button" data-copy-message="${escapeHtml(message.message_id || '')}">复制</button>${running ? `<button type="button" data-cancel-turn="${escapeHtml(turn.turn_id || '')}">停止分析</button>` : ''}${continueDeep}${retryable ? `<button type="button" data-retry-turn="${escapeHtml(turn.turn_id || '')}">重新分析</button>` : `<button type="button" data-regenerate-message="${escapeHtml(message.message_id || '')}">再次回答</button>`}</div>` : '';
+    return `<div class="v2-message ${role}" data-message-id="${escapeHtml(message.message_id || '')}"><div class="v2-message-card"><div class="v2-message-content">${content}</div>${progress}${meta}${quality}${warnings}${steps}${evidence}${actions}</div></div>`;
   }
 
   function renderConversation() {
     const session = state.conversation;
+    const indexBlocked = Boolean(session && state.searchIndex && !state.searchIndex.ready);
     $('conversationTitle').textContent = session ? (session.title || '资料问答') : '尚未开始会话';
     $('conversationScopeSummary').textContent = session ? scopeSummary(session.scope) : '请选择范围并新建会话';
     updateContextChip(session && session.scope);
     const messages = session && Array.isArray(session.messages) ? session.messages : [];
-    $('conversationMessages').innerHTML = messages.length ? messages.map(messageMarkup).join('') : emptyMarkup('从资料中提出第一个问题', '例如：这批资料主要讲了什么？哪些文件相互关联？');
-    $('conversationQuestion').disabled = !session || state.conversationSending;
-    $('conversationSendBtn').disabled = !session || state.conversationSending;
-    $('conversationComposerHint').textContent = session ? '资料事实优先引用；分析判断会单独标明' : '新建会话后即可提问';
+    const older = session && session.message_page && session.message_page.has_more
+      ? '<button type="button" class="text-button v2-load-older" data-load-older-messages>加载更早消息</button>'
+      : '';
+    $('conversationMessages').innerHTML = messages.length ? older + messages.map(messageMarkup).join('') : emptyMarkup('从资料中提出第一个问题', '例如：这批资料主要讲了什么？哪些文件相互关联？');
+    $('conversationQuestion').disabled = !session || state.conversationSending || indexBlocked;
+    $('conversationSendBtn').disabled = !session || state.conversationSending || indexBlocked;
+    $('conversationComposerHint').textContent = indexBlocked
+      ? '该历史数据包需要先重建轻量预览与证据索引'
+      : (session ? '资料事实优先引用；分析判断会单独标明' : '新建会话后即可提问');
+    if (indexBlocked) {
+      const host = $('conversationDeepeningState');
+      host.className = 'v2-job-state is-error';
+      host.innerHTML = `对话索引尚未就绪 · ${integer(state.searchIndex.documents)} 份文档 <button type="button" data-rebuild-search-index>重建索引</button>`;
+    }
     renderConversationList();
     window.requestAnimationFrame(() => { $('conversationMessages').scrollTop = $('conversationMessages').scrollHeight; });
+  }
+
+  async function loadOlderConversationMessages() {
+    const session = state.conversation;
+    const page = session && session.message_page;
+    if (!session || !page || !page.before_sequence) return;
+    try {
+      const response = await api(`/api/conversation/${encodeURIComponent(session.session_id)}?scan_id=${encodeURIComponent(state.scanId)}&message_limit=100&before_sequence=${encodeURIComponent(page.before_sequence)}`);
+      const older = response.session || {};
+      const currentMessages = Array.isArray(session.messages) ? session.messages : [];
+      const olderMessages = Array.isArray(older.messages) ? older.messages : [];
+      state.conversation = { ...session, ...older, messages: olderMessages.concat(currentMessages) };
+      renderConversation();
+    } catch (error) { notify(error.message || '加载历史消息失败', true); }
   }
 
   async function createConversation() {
@@ -749,6 +792,7 @@
         method: 'POST', body: JSON.stringify({ scan_id: state.scanId, scope, title: `资料问答 · ${new Date().toLocaleString('zh-CN', { hour12: false })}` })
       });
       state.conversation = response.session;
+      state.searchIndex = response.search_index || null;
       state.turns.clear();
       renderConversation();
       await loadConversationList();
@@ -763,6 +807,7 @@
     try {
       const response = await api(`/api/conversation/${encodeURIComponent(sessionId)}?scan_id=${encodeURIComponent(state.scanId)}`);
       state.conversation = response.session;
+      state.searchIndex = response.search_index || null;
       state.turns.clear();
       registerAnalysisTurns(response.turns || []);
       renderConversation();
@@ -886,6 +931,46 @@
     } catch (error) { notify(error.message || '重新分析失败', true); }
   }
 
+  async function continueDeepAnalysis(turnId) {
+    if (!turnId) return;
+    try {
+      const response = await api(`/api/turns/${encodeURIComponent(turnId)}/continue-deep-analysis`, {
+        method: 'POST', body: JSON.stringify({ desired_file_count: 12 })
+      });
+      registerAnalysisTurn(response.turn, []);
+      renderConversation();
+      $('conversationDeepeningState').className = 'v2-job-state is-running';
+      $('conversationDeepeningState').textContent = `已继续深析 ${integer((response.candidate_paths || []).length)} 份候选文件`;
+      watchAnalysisTurn(turnId);
+    } catch (error) { notify(error.message || '继续深析失败', true); }
+  }
+
+  async function rebuildConversationSearchIndex() {
+    if (!state.scanId) return;
+    try {
+      const response = await api(`/api/scans/${encodeURIComponent(state.scanId)}/rebuild-search-index`, {
+        method: 'POST', body: '{}'
+      });
+      const host = $('conversationDeepeningState');
+      host.className = 'v2-job-state is-running';
+      host.textContent = response.created ? '索引重建任务已进入队列' : '索引重建任务正在运行';
+      watchJob(response.job_id, `search-index-${state.scanId}`, (job) => {
+        const progress = job.progress == null ? '' : ` · ${Math.round(numeric(job.progress))}%`;
+        if (job.status === 'completed') {
+          host.className = 'v2-job-state is-complete';
+          host.textContent = '对话索引重建完成。';
+          if (state.conversation) openConversation(state.conversation.session_id);
+        } else if (['failed', 'cancelled'].includes(job.status)) {
+          host.className = 'v2-job-state is-error';
+          host.textContent = `索引重建${jobStatusLabel(job)}${job.error ? `：${job.error}` : ''}`;
+        } else {
+          host.className = 'v2-job-state is-running';
+          host.textContent = `索引重建${jobStatusLabel(job)}${progress}`;
+        }
+      });
+    } catch (error) { notify(error.message || '提交索引重建失败', true); }
+  }
+
   async function sendQuestion(questionOverride) {
     if (!state.conversation || state.conversationSending) return;
     const question = String(questionOverride || $('conversationQuestion').value || '').trim();
@@ -924,6 +1009,9 @@
       if (response.turn && response.turn.id) watchAnalysisTurn(response.turn.id);
     } catch (error) {
       state.conversation.messages = state.conversation.messages.filter((message) => message.message_id !== optimistic.message_id);
+      if (error.code === 'search_index_rebuild_required' && error.payload) {
+        state.searchIndex = error.payload.search_index || state.searchIndex;
+      }
       renderConversation();
       $('conversationQuestion').value = question;
       // Keep the key for transport/server errors so the next submit reuses it;
@@ -1122,6 +1210,7 @@
     state.selectedScope = null;
     state.conversation = null;
     state.conversationPending = null;
+    state.searchIndex = null;
     state.conversationList = [];
     state.turns.clear();
     state.translationItems = [];
@@ -1205,6 +1294,10 @@
       if (state.conversation) $('conversationQuestion').focus();
     });
     $('conversationMessages').addEventListener('click', (event) => {
+      if (event.target.closest('[data-load-older-messages]')) {
+        loadOlderConversationMessages();
+        return;
+      }
       const copy = event.target.closest('[data-copy-message]');
       if (copy) {
         const message = (state.conversation && state.conversation.messages || []).find((item) => item.message_id === copy.dataset.copyMessage);
@@ -1215,6 +1308,8 @@
       if (cancelTurn) { cancelAnalysisTurn(cancelTurn.dataset.cancelTurn); return; }
       const retryTurn = event.target.closest('[data-retry-turn]');
       if (retryTurn) { retryAnalysisTurn(retryTurn.dataset.retryTurn); return; }
+      const continueTurn = event.target.closest('[data-continue-deep-turn]');
+      if (continueTurn) { continueDeepAnalysis(continueTurn.dataset.continueDeepTurn); return; }
       const regenerate = event.target.closest('[data-regenerate-message]');
       if (regenerate) {
         const question = previousUserQuestion(regenerate.dataset.regenerateMessage);
@@ -1229,6 +1324,9 @@
       window.sessionStorage.setItem(LAST_DOCUMENT_KEY, path);
       window.SJFXShell && window.SJFXShell.activate('translation');
       loadTranslation(path, 0);
+    });
+    $('conversationDeepeningState').addEventListener('click', (event) => {
+      if (event.target.closest('[data-rebuild-search-index]')) rebuildConversationSearchIndex();
     });
     $('translationListRefreshBtn').addEventListener('click', loadTranslationList);
     $('translationFilter').addEventListener('change', renderTranslationList);
