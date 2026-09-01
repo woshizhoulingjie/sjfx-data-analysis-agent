@@ -1,16 +1,20 @@
 import json
+import copy
 import hashlib
 import hmac
 import importlib.util
+import itertools
 import logging
 import logging.handlers
 import os
 import re
 import shutil
 import sys
+import threading
 import time
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -29,9 +33,14 @@ from services.exporter import create_report_docx, export_node, safe_name
 from services.folder_analysis import analyze_folder
 from services.package_analysis import (
     analyze_package, checkpoint_fingerprint, refresh_package_coverage, _parse_with_limits,
-    _restore_source_provenance, _secure_source_snapshot,
+    _restore_source_provenance, _logical_source_snapshot, _secure_source_snapshot,
 )
 from services.large_package import inventory_by_path, package_resource_plan
+from services.processing_queue import (
+    deep_processing_eligible,
+    ranked_pending_paths,
+    relationship_recall_paths,
+)
 from services.reporting import (
     build_local_report,
     build_report_analysis_prompt,
@@ -69,9 +78,15 @@ from services.conversation import (
 from services.turn_runtime import AnalysisTurnRuntime
 from services.package_overview import build_package_overview_from_storage
 from services.package_exploration import preview_as_document
+from services.homogeneous_documents import analyze_homogeneous_documents
+from services.logical_units import iter_logical_units
 
 
 MINIMUM_PYTHON_VERSION = (3, 10)
+
+
+class _HomogeneousYield(RuntimeError):
+    """The single Worker yielded a long homogeneous pass to foreground work."""
 
 
 def _python_runtime_status(version_info=None):
@@ -105,6 +120,15 @@ app = SJFXFastAPI(
 )
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("sjfx")
+
+# Short-lived per-process cache for repeated conversational questions.  It is
+# intentionally tiny and TTL-bound: it reduces duplicate retrieval while an
+# operator is polling a turn, but never replaces the durable evidence index or
+# leaks data between scan IDs/scopes.
+_CONVERSATION_RETRIEVAL_CACHE = {}
+_CONVERSATION_RETRIEVAL_CACHE_LOCK = threading.Lock()
+_CONVERSATION_RETRIEVAL_CACHE_MAX = 128
+_CONVERSATION_RETRIEVAL_CACHE_TTL = 30.0
 
 
 class _SensitiveLogFilter(logging.Filter):
@@ -211,6 +235,18 @@ translation_service = TranslationService(
         else None
     ),
 )
+
+# NLLB owns a large native model and its tokenizer/decoder state.  A single
+# shared execution gate makes every caller (document view, package backfill,
+# conversation evidence and import pipeline) use that model predictably.  It
+# prevents competing generation calls from multiplying CPU threads or causing
+# native-backend contention on a shared server.
+_translation_execution_lock = threading.RLock()
+
+
+def _translate_document_serialized(document, **kwargs):
+    with _translation_execution_lock:
+        return translation_service.translate_document(document, **kwargs)
 # 完整分析专用的文档级 embedding。
 # 只用于 analyze_package 中的一文档一向量语义聚类，
 # 不受 evidence embedding 开关影响。
@@ -415,9 +451,20 @@ def _inventory_by_path(scan_result):
         scan_id = scan_result.get("_scan_id") or scan_result.get("scan_id")
         return {
             item["path"]: item["payload"]
-            for item in storage.iter_inventory_entries(scan_id, kind="file")
+            for item in storage.iter_inventory_entries(scan_id)
+            if item.get("kind") in {"file", "logical_file"}
         }
     return inventory_by_path(scan_result)
+
+
+def _requested_member_paths(scan_result, node_path):
+    """Resolve a UI file/folder selection, including virtual logical files."""
+    node_path = str(node_path or ".")
+    logical_node = _inventory_by_path(scan_result).get(node_path)
+    if logical_node and logical_node.get("logical_unit"):
+        resolve_under(scan_result["root"], logical_node.get("container_path") or "")
+        return [node_path]
+    return _physical_scope_member_paths(scan_result, node_path)
 
 
 def _package_documents(scan_id, canonical_only=False):
@@ -800,7 +847,7 @@ def _combined_export_context(scan_id, scan_result, analysis, payload):
             if evidence_id:
                 explicit_evidence_ids.append(evidence_id)
         else:
-            paths = _physical_scope_member_paths(scan_result, raw.get("path", "."))
+            paths = _requested_member_paths(scan_result, raw.get("path", "."))
             summary_type = "folder" if kind == "directory" else "file"
             summary = storage.get_summary(scan_id, raw.get("path", "."), summary_type) or {}
         member_paths.update(paths)
@@ -983,6 +1030,9 @@ def _local_document_fallback(document, node_path, reason):
         "conclusions": [],
         "uncertainties": [],
         "warnings": ["共享模型未生成最终内容，已返回本地统一解析摘要：{}".format(reason)],
+        "generated_by": "local-fallback",
+        "analysis_depth": "fallback",
+        "deep_analysis": False,
         "evidence_chain": select_evidence(
             document.get("evidence", []),
             topics=structure.get("headings", [])[:8] + [structure.get("title"), source.get("name")],
@@ -1032,7 +1082,16 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
 
 def _write_local_overview(scan_id, owner_id=None, job_id=None):
     scan_result = require_scan(scan_id)
-    analysis = storage.get_analysis(scan_id) or {}
+    analysis = dict(storage.get_analysis(scan_id) or {})
+    # Reports consume the same edge contract exposed to graph/search/dialogue
+    # clients.  Feature-index rows remain recall signals and are not promoted
+    # into report conclusions as file relationships.
+    relationship_catalog = storage.get_relationship_catalog(scan_id)
+    analysis["relationships"] = relationship_catalog.get("items") or []
+    analysis["relationship_catalog"] = {
+        key: relationship_catalog.get(key)
+        for key in ("schema_version", "relationship_count", "truncated", "contract")
+    }
     summaries = storage.list_summaries(scan_id)
     report_data = build_local_report(scan_result, summaries, analysis)
     report_data, model_name, model_usage, warning = _analyze_report_with_model(
@@ -1069,6 +1128,88 @@ def _package_large_options():
         "background_batch_files": Config.LARGE_PACKAGE_BACKGROUND_BATCH_FILES,
         "background_backfill": Config.LARGE_PACKAGE_BACKGROUND_BACKFILL,
     }
+
+
+def _package_processing_status(scan_id, scan_result=None):
+    """Return an honest logical-queue snapshot for progress and controls."""
+    scan_result = scan_result or require_scan(scan_id)
+    inventory_files = max(0, int(scan_result.get("file_count") or 0))
+    # The presentation projection is the single authority for user-visible
+    # states.  The legacy queue aggregate is retained only for operational
+    # scheduler details; it cannot distinguish partial/failed/processing and
+    # counted archive containers after their members had become logical work.
+    state_counts = storage.file_status_counts(scan_id, include_container_only=False)
+    queue_counts = storage.package_processing_counts(scan_id)
+    foundation_total = int(state_counts.get("total") or 0)
+    completed_files = int(state_counts.get("completed") or 0)
+    pending_files = int(state_counts.get("pending") or 0)
+    processing_files = int(state_counts.get("processing") or 0)
+    partial_files = int(state_counts.get("partial") or 0)
+    failed_files = int(state_counts.get("failed") or 0)
+    excluded_files = int(state_counts.get("out_of_scope") or 0)
+    retry_waiting_files = int(state_counts.get("retry_waiting") or 0)
+    incomplete_files = int(state_counts.get("incomplete") or 0)
+    if not foundation_total and inventory_files:
+        pending_files = inventory_files
+    logical_total = max(0, foundation_total - excluded_files)
+    active_job = storage.get_active_package_job(scan_id)
+    control = storage.get_package_processing_control(scan_id)
+    return {
+        **control,
+        "inventory_files": inventory_files,
+        "inventory_complete": bool(scan_result.get("inventory_complete", not scan_result.get("truncated"))),
+        "foundation_total_files": foundation_total,
+        "foundation_searchable_files": int(state_counts.get("light_ready") or 0),
+        "foundation_searchable_ratio": round(
+            int(state_counts.get("light_ready") or 0)
+            / float(foundation_total or 1), 6
+        ),
+        "logical_total_files": logical_total,
+        "container_only_files": int(state_counts.get("container_only") or 0),
+        "deep_completed_files": completed_files,
+        "deep_pending_files": pending_files,
+        "deep_processing_files": processing_files,
+        "deep_partial_files": partial_files,
+        "deep_failed_files": failed_files,
+        "terminal_excluded_files": excluded_files,
+        "retry_waiting_files": retry_waiting_files,
+        # Kept for old clients; non-retryable/attention failures are now
+        # represented truthfully by deep_failed_files.
+        "needs_attention_files": int(queue_counts.get("needs_attention") or 0),
+        "incomplete_files": incomplete_files,
+        "status_counts": state_counts,
+        "deep_completion_ratio": round(
+            completed_files / float(logical_total or 1), 6
+        ),
+        "batch_file_limit": max(1, min(500, int(Config.LARGE_PACKAGE_BATCH_FILES))),
+        "active_job_id": active_job.get("id") if active_job else None,
+        "active_job_status": active_job.get("status") if active_job else None,
+        "all_eligible_complete": bool(
+            (foundation_total == 0 and bool(scan_result.get("inventory_complete")))
+            or (
+                foundation_total > 0
+                and not incomplete_files
+                and not retry_waiting_files
+            )
+        ),
+    }
+
+
+def _next_package_batch(scan_id, scan_result, preferred_paths=None):
+    inventory = _inventory_by_path(scan_result)
+    workflow_by_path = {
+        item.get("node_path"): item for item in storage.iter_file_workflow_states(scan_id)
+    }
+    analysis_by_path = {
+        item.get("node_path"): item for item in storage.iter_file_states(scan_id)
+    }
+    return ranked_pending_paths(
+        inventory,
+        workflow_by_path,
+        analysis_by_path,
+        preferred_paths=preferred_paths,
+        limit=Config.LARGE_PACKAGE_BATCH_FILES,
+    )
 
 
 def _publish_analysis_progress(scan_id, scan_result, percent, message, stage="analyzing"):
@@ -1335,6 +1476,11 @@ def _run_claimed_analysis_job(job):
     scan_id = job["scan_id"]
     options = job.get("options") or {}
     scan_result = require_scan(scan_id)
+    storage.ensure_package_processing_control(scan_id)
+    pause_exempt = str(options.get("workflow_source") or "") == "question_promotion"
+    if storage.package_processing_paused(scan_id) and not pause_exempt:
+        storage.cancel_job(job_id)
+        raise JobCancelled()
     scope_label = options.get("scope_label")
     progress_start = job.get("_progress_start")
     progress_end = job.get("_progress_end", 95)
@@ -1383,6 +1529,18 @@ def _run_claimed_analysis_job(job):
             except Exception:
                 logger.warning("刷新渐进分析概览失败 scan_id=%s", scan_id, exc_info=True)
 
+    translation_pipeline = (
+        _ImportTranslationPipeline(
+            scan_id, job_id, progress=progress,
+            cancel_check=lambda: storage.is_job_cancel_requested(job_id),
+        )
+        if (
+            Config.ENABLE_TRANSLATION
+            and Config.ENABLE_IMPORT_TRANSLATION
+            and Config.TRANSLATION_PIPELINE_ENABLED
+        )
+        else None
+    )
     analysis = analyze_package(
         scan_id, scan_result, storage, parser, progress,
         embedding_client=_package_embedding_client,
@@ -1396,7 +1554,12 @@ def _run_claimed_analysis_job(job):
             lambda **kwargs: _prepare_import_translations(
                 scan_id, job_id=job_id, **kwargs
             )
-        ) if Config.ENABLE_TRANSLATION and Config.ENABLE_IMPORT_TRANSLATION else None,
+        ) if (
+            Config.ENABLE_TRANSLATION
+            and Config.ENABLE_IMPORT_TRANSLATION
+            and translation_pipeline is None
+        ) else None,
+        translation_pipeline=translation_pipeline,
         yield_check=lambda: storage.has_queued_job_above_priority(
             int(job.get("priority") or 80)
         ),
@@ -1411,9 +1574,11 @@ def _run_claimed_analysis_job(job):
         }
     _ensure_job_active(job_id)
     workflow = analysis.get("workflow") or {}
+    large_enabled = bool(((analysis.get("policy") or {}).get("large_package") or {}).get("enabled"))
+    continue_full = bool(options.get("continue_full", True))
     continuation_job_id = None
     remaining_priority_paths = list(workflow.get("remaining_priority_paths") or [])
-    if remaining_priority_paths:
+    if remaining_priority_paths and not storage.package_processing_paused(scan_id):
         next_options = dict(options)
         next_options.update({
             "target_paths": remaining_priority_paths,
@@ -1426,12 +1591,19 @@ def _run_claimed_analysis_job(job):
             owner_id=job.get("owner_id") or "legacy",
         )
     background_job_id = None
-    if not continuation_job_id and workflow.get("background_batch_paths"):
+    if (
+        not continuation_job_id
+        and continue_full
+        and not storage.package_processing_paused(scan_id)
+        and workflow.get("background_batch_paths")
+    ):
         background_options = {
             "target_paths": list(workflow.get("background_batch_paths") or []),
             "workflow_source": "background_backfill",
-            "scope_label": "后台覆盖扩展",
+            "scope_label": "全量队列下一批（最多500个逻辑文件）",
             "parse_mode": "accurate",
+            "continue_full": True,
+            "continuation_depth": int(options.get("continuation_depth") or 0) + 1,
         }
         background_job_id, _background_created = storage.create_or_get_typed_job(
             scan_id,
@@ -1460,6 +1632,32 @@ def _run_claimed_analysis_job(job):
     }:
         storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
         overview = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id)
+    processing = _package_processing_status(scan_id, scan_result) if large_enabled else None
+    all_eligible_complete = bool(processing and processing.get("all_eligible_complete"))
+    if large_enabled and not continuation_job_id and not background_job_id:
+        if all_eligible_complete:
+            if overview is None and report_source == "background_backfill":
+                storage.update_job(
+                    job_id, progress=96, stage="final_calibration",
+                    message="全库关系校准完成，正在生成最终概览 Word", heartbeat=True,
+                )
+                overview = _write_local_overview(
+                    scan_id, owner_id=job.get("owner_id"), job_id=job_id
+                )
+            storage.set_package_processing_state(
+                scan_id, "completed", "全部有效逻辑文件已完成并完成全局校准。"
+            )
+        elif not continue_full:
+            storage.set_package_processing_state(
+                scan_id, "paused", "本次优先范围已完成；普通待处理文件仍保留在全量队列。"
+            )
+        elif report_source in {
+            "initial_overview", "background_backfill", "user_query",
+            "user_intent", "relationship_recall", "manual_queue",
+        }:
+            storage.set_package_processing_state(
+                scan_id, "paused", "当前没有可立即领取的文件；失败或受限文件已单独保留。"
+            )
     _ensure_job_active(job_id)
     translation_job_ids = []
     # Selected foreign documents already receive a durable working translation
@@ -1489,6 +1687,7 @@ def _run_claimed_analysis_job(job):
         "analysis_turn_continuation": analysis_turn_continuation,
         "continuation_job_id": continuation_job_id,
         "background_job_id": background_job_id,
+        "processing": _package_processing_status(scan_id, scan_result) if large_enabled else None,
     }
 
 
@@ -1511,14 +1710,42 @@ def _translation_candidate_paths(scan_id, phase):
                 if translation.get("full_translation"):
                     continue
                 if translation.get("source_level") == "full" and translation.get("status") == "failed":
-                    # Do not create an infinite background retry loop while a
-                    # model is unavailable. An explicit document/package retry
-                    # will make a fresh attempt after the operator fixes it.
-                    continue
+                    # Older builds treated harmless prose line-wrap changes as
+                    # hard failures. Retry those stale records once under the
+                    # relaxed contract, while keeping unavailable models and
+                    # real table/token failures out of an infinite loop.
+                    error_codes = {
+                        str(error.get("code") or error)
+                        if isinstance(error, dict) else str(error)
+                        for error in (translation.get("errors") or [])
+                    }
+                    if error_codes != {"line_structure_changed"}:
+                        continue
             candidates.append(path)
         representatives = set((storage.get_content_map(scan_id) or {}).get("representative_paths") or [])
         return sorted(set(candidates), key=lambda path: (path not in representatives, path)), large
     return sorted(item.get("path") for item in storage.iter_documents(scan_id, hydrate=False)), large
+
+
+def _translation_inventory_node(scan_result, node_path):
+    """Validate a translation target against the immutable logical inventory.
+
+    Archive members and structured-file partitions use virtual paths such as
+    ``archive.zip::letters/a.txt``.  They are individually inventoried but do
+    not exist as filesystem paths, so physical-tree lookup is insufficient.
+    The enclosing container is still resolved under the scan root before any
+    bytes are read.
+    """
+    node_path = str(node_path or "").strip()
+    file_node = _inventory_by_path(scan_result).get(node_path)
+    if not file_node:
+        raise ValueError("文件不在当前数据包清单中")
+    source_path = (
+        file_node.get("container_path")
+        if file_node.get("logical_unit") else node_path
+    )
+    resolve_under(scan_result["root"], source_path)
+    return file_node
 
 
 def _translation_document(scan_id, node_path, source_level):
@@ -1636,6 +1863,220 @@ def _translation_detection_sample(text, limit=24000):
     return value[:window] + "\n" + value[middle - window // 2:middle + window // 2] + "\n" + value[-window:]
 
 
+class _ImportTranslationPipeline:
+    """One bounded NLLB consumer that overlaps durable parse and translation.
+
+    Parsing remains the source of truth: a parsed document is saved first, then
+    the pipeline creates an independent, transient Chinese working view for
+    analysis.  This means a translation failure or a Worker restart can never
+    overwrite the original document, and the persisted per-unit checkpoints
+    allow the next run to continue instead of retranslating completed units.
+    """
+
+    parse_max_concurrency = Config.TRANSLATION_PIPELINE_PARSE_MAX_CONCURRENCY
+
+    def __init__(self, scan_id, job_id, progress=None, cancel_check=None):
+        self.scan_id = scan_id
+        self.job_id = job_id
+        self.progress = progress or (lambda _percent, _message: None)
+        self.cancel_check = cancel_check
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sjfx-import-translation"
+        )
+        self._lock = threading.Lock()
+        self._futures = []
+        self._started = False
+        self._closed = False
+        self._aborted = False
+        self._file_limit = 0
+        self._per_file_limit = 0
+        self._total_limit = 0
+        self._reserved_characters = 0
+        self._reserved_files = 0
+        self._summary = {
+            "enabled": True,
+            "mode": "fast_parse_translation_pipeline",
+            "scope": "current_analysis_scope",
+            "target_language": "zh-CN",
+            "eligible_files": 0,
+            "translated_files": 0,
+            "partial_files": 0,
+            "failed_files": 0,
+            "skipped_files": 0,
+            "restricted_files": 0,
+            "reused_files": 0,
+            "translated_characters": 0,
+            "source_characters": 0,
+            "provider_attempts": 0,
+            "limitations": [],
+            "original_evidence_preserved": True,
+        }
+
+    def start(self, policy, priority_paths=None):
+        """Set one immutable budget before parser completions are submitted."""
+        del priority_paths  # The parse queue is already priority ordered.
+        if self._started:
+            return
+        large = bool((policy or {}).get("enabled"))
+        self._file_limit = (
+            max(1, int(Config.IMPORT_TRANSLATION_LARGE_MAX_FILES))
+            if large else max(1, int(Config.IMPORT_TRANSLATION_MAX_FILES))
+        )
+        self._per_file_limit = int(Config.IMPORT_TRANSLATION_MAX_CHARS_PER_FILE)
+        self._total_limit = max(
+            int(Config.IMPORT_TRANSLATION_MAX_TOTAL_CHARS),
+            self._file_limit * self._per_file_limit if large else 0,
+        )
+        self._summary.update({
+            "scope": "current_deep_batch" if large else "current_analysis_scope",
+            "file_limit": self._file_limit,
+            "per_file_character_limit": self._per_file_limit,
+            "total_character_limit": self._total_limit,
+        })
+        self._started = True
+
+    def submit(self, path, source_document, analysis_document):
+        """Queue one completed parse without blocking the next parse request."""
+        if not self._started or self._closed or self._aborted:
+            return False
+        source = source_document.get("source") or {}
+        if source.get("sensitive") or source.get("content_policy") == "restricted":
+            with self._lock:
+                self._summary["restricted_files"] += 1
+            return False
+        source_text = str(source_document.get("text") or "")
+        title = str((source_document.get("structure") or {}).get("title") or source.get("name") or "")
+        detection = detect_language(title + "\n" + _translation_detection_sample(source_text))
+        if not detection.get("needs_translation") or not source_text.strip():
+            return False
+        with self._lock:
+            self._summary["eligible_files"] += 1
+            available = min(self._per_file_limit, self._total_limit - self._reserved_characters)
+            if self._reserved_files >= self._file_limit or available < 1000:
+                self._summary["skipped_files"] += 1
+                return False
+            source_chars = min(len(source_text), available)
+            self._reserved_files += 1
+            self._reserved_characters += source_chars
+            self._summary["source_characters"] += source_chars
+            future = self._executor.submit(
+                self._translate_one, str(path), source_document, analysis_document,
+                source_chars,
+            )
+            self._futures.append(future)
+        return True
+
+    def _translate_one(self, path, source_document, analysis_document, source_chars):
+        if self._aborted or (self.cancel_check is not None and self.cancel_check()):
+            return
+        projection = storage.project_document(
+            source_document, text_limit=source_chars,
+            evidence_limit=Config.LARGE_PACKAGE_OVERVIEW_EVIDENCE_PER_FILE,
+        )
+        previous = storage.get_translation(self.scan_id, path, hydrate=True)
+        if previous and previous.get("full_translation") and previous.get("status") == "completed":
+            state = previous
+            reused = True
+        else:
+            reused = False
+            source_level = (
+                "analysis" if len(str(source_document.get("text") or "")) > source_chars
+                else "full"
+            )
+
+            def checkpoint(state):
+                state["source_level"] = source_level
+                state["analysis_working_translation"] = True
+                state["source_fingerprint"] = document_translation_fingerprint(source_document)
+                state["full_translation"] = bool(
+                    source_level == "full"
+                    and state.get("status") in {"completed", "not_required"}
+                )
+                storage.save_translation(self.scan_id, path, state)
+
+            state = _translate_document_serialized(
+                projection,
+                resume_state=previous,
+                max_units=Config.IMPORT_TRANSLATION_MAX_UNITS_PER_FILE,
+                checkpoint_callback=checkpoint,
+                cancel_check=self.cancel_check,
+            )
+            checkpoint(state)
+        translated = _apply_import_translation_overlay(
+            analysis_document, state, source_char_limit=source_chars,
+        )
+        with self._lock:
+            if reused:
+                self._summary["reused_files"] += 1
+            self._summary["provider_attempts"] += int(
+                (state.get("performance") or {}).get("provider_attempts") or 0
+            )
+            if translated:
+                self._summary["translated_characters"] += sum(
+                    len(str(unit.get("target_text") or ""))
+                    for unit in state.get("units") or []
+                    if isinstance(unit, dict)
+                    and unit.get("kind") == "body"
+                    and unit.get("status") in {"completed", "not_required"}
+                    and int(unit.get("start") or 0) < source_chars
+                )
+                if state.get("status") in {"completed", "not_required"}:
+                    self._summary["translated_files"] += 1
+                else:
+                    self._summary["partial_files"] += 1
+            else:
+                self._summary["failed_files"] += 1
+
+    def finish(self):
+        """Wait for the small tail of queued work and return an honest summary."""
+        if self._closed:
+            with self._lock:
+                return copy.deepcopy(self._summary)
+        try:
+            for future in list(self._futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    logger.warning("导入期翻译任务失败 scan_id=%s", self.scan_id, exc_info=True)
+                    with self._lock:
+                        self._summary["failed_files"] += 1
+                        self._summary["limitations"].append(
+                            "一个外语文件未能生成可用工作译本：{}".format(str(exc)[:200])
+                        )
+        finally:
+            self._executor.shutdown(wait=True)
+            self._closed = True
+        with self._lock:
+            if self._summary["skipped_files"]:
+                self._summary["limitations"].append(
+                    "外语文件超过导入期预算，{} 个文件将在后台或点名分析时继续全文翻译。".format(
+                        self._summary["skipped_files"]
+                    )
+                )
+            if self._summary["partial_files"]:
+                self._summary["limitations"].append(
+                    "{} 个文件已生成中文工作译本；完整译文将由后台续跑。".format(
+                        self._summary["partial_files"]
+                    )
+                )
+            if self._summary["failed_files"]:
+                self._summary["limitations"].append(
+                    "{} 个外语文件未能生成可用工作译本，已安全回退原文分析。".format(
+                        self._summary["failed_files"]
+                    )
+                )
+            return copy.deepcopy(self._summary)
+
+    def abort(self):
+        """Stop accepting work and wait for the current checkpoint to finish."""
+        self._aborted = True
+        for future in list(self._futures):
+            future.cancel()
+        if not self._closed:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._closed = True
+
+
 def _prepare_import_translations(scan_id, job_id, documents, policy, priority_paths,
                                  progress, cancel_check):
     """Translate a bounded foreign working set before semantic analysis."""
@@ -1724,7 +2165,7 @@ def _prepare_import_translations(scan_id, job_id, documents, policy, priority_pa
                 )
                 storage.save_translation(scan_id, path, state)
 
-            state = translation_service.translate_document(
+            state = _translate_document_serialized(
                 projection,
                 resume_state=previous,
                 max_units=Config.IMPORT_TRANSLATION_MAX_UNITS_PER_FILE,
@@ -1807,7 +2248,7 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
                 current_stage="文档翻译", current_file=node_path, heartbeat=True,
             )
 
-    result = translation_service.translate_document(
+    result = _translate_document_serialized(
         document,
         resume_state=previous,
         max_units=max_units,
@@ -1823,12 +2264,9 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
 
 
 def _promote_for_translation(scan_id, scan_result, node_path, job_id):
-    inventory = _inventory_by_path(scan_result)
-    file_node = inventory.get(node_path)
-    if not file_node:
-        raise ValueError("文件不在当前数据包清单中：{}".format(node_path))
+    file_node = _translation_inventory_node(scan_result, node_path)
     _ensure_job_active(job_id)
-    with _secure_source_snapshot(
+    with _logical_source_snapshot(
         scan_result["root"], file_node,
         cancel_check=lambda: storage.is_job_cancel_requested(job_id),
     ) as snapshot:
@@ -1849,6 +2287,131 @@ def _promote_for_translation(scan_id, scan_result, node_path, job_id):
     return document
 
 
+def _run_claimed_homogeneous_analysis_job(job):
+    """Build the auditable ledger and bounded relationship graph for one scan."""
+    job_id = job["id"]
+    scan_id = job["scan_id"]
+    require_scan(scan_id)
+    storage.update_job(
+        job_id, progress=8, stage="detecting_schema",
+        message="正在识别公共字段和同构结构",
+        current_stage="同构结构检测", heartbeat=True,
+    )
+    _ensure_job_active(job_id)
+    total_documents = max(1, int(storage.count_documents(scan_id) or 0))
+    checkpoint_dir = Path(Config.DATA_DIR) / "homogeneous_checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / (str(scan_id) + ".jsonl")
+    resumed_records = []
+    if checkpoint_path.exists():
+        try:
+            with checkpoint_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if isinstance(record, dict) and record.get("path"):
+                        resumed_records.append(record)
+        except OSError:
+            resumed_records = []
+    resumed_paths = {str(item.get("path")) for item in resumed_records}
+    resume_after = max(resumed_paths) if resumed_paths else None
+    checkpoint_handle = checkpoint_path.open("a", encoding="utf-8")
+    scanned_offset = len(resumed_records)
+
+    def homogeneous_progress(scanned, usable):
+        # Publish a heartbeat while the deterministic relationship pass is
+        # still running.  Without this, a large package looked frozen even
+        # though the worker was actively parsing and indexing records.
+        _ensure_job_active(job_id)
+        overall_scanned = scanned_offset + scanned
+        progress = min(78, 8 + int(overall_scanned * 68 / total_documents))
+        storage.update_job(
+            job_id,
+            progress=progress,
+            stage="extracting_structured_records",
+            message="正在提取同构字段：已检查 {} 份，可用 {} 份".format(overall_scanned, scanned_offset + usable),
+            current_stage="同构字段提取",
+            current_file="",
+            heartbeat=True,
+        )
+
+    def save_record(record):
+        if str(record.get("path") or "") in resumed_paths:
+            return
+        checkpoint_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        checkpoint_handle.flush()
+
+    def maybe_yield():
+        _ensure_job_active(job_id)
+        if storage.has_queued_job_above_priority(int(job.get("priority") or 90)):
+            raise _HomogeneousYield()
+
+    def on_homogeneous_progress(scanned, usable):
+        homogeneous_progress(scanned, usable)
+        # Resumed records are already checkpointed and must not cause an
+        # endless yield loop while the same foreground task remains queued.
+        if scanned > len(resumed_records):
+            maybe_yield()
+
+    try:
+        result = analyze_homogeneous_documents(
+            itertools.chain(
+                ({"record": item} for item in resumed_records),
+                storage.iter_documents(
+                scan_id, hydrate=True, batch_size=100, start_after=resume_after
+                ),
+            ),
+            cancel_check=lambda: _ensure_job_active(job_id),
+            progress_callback=on_homogeneous_progress,
+            record_callback=save_record,
+        )
+    except _HomogeneousYield:
+        checkpoint_handle.close()
+        storage.update_job(
+            job_id,
+            progress=min(78, 8 + int((scanned_offset / total_documents) * 68)),
+            stage="checkpointed",
+            message="检测到交互式任务，已保存同构字段检查点并让出处理资源",
+            current_stage="同构分析检查点",
+            heartbeat=True,
+        )
+        return {
+            "_requeue_slice": True,
+            "_requeue_message": "同构分析已保存 {} 份记录，优先处理交互式任务后自动继续。".format(
+                scanned_offset
+            ),
+            "scan_id": scan_id,
+            "record_count": scanned_offset,
+        }
+    finally:
+        if not checkpoint_handle.closed:
+            checkpoint_handle.close()
+    storage.update_job(
+        job_id, progress=82, stage="building_relationships",
+        message="正在保存文件台账、关系和事项时间线",
+        current_stage="关系与事项构建", heartbeat=True,
+    )
+    _ensure_job_active(job_id)
+    counts = storage.save_homogeneous_analysis(scan_id, result)
+    try:
+        checkpoint_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("无法清理同构分析检查点 scan_id=%s", scan_id, exc_info=True)
+    return {
+        "scan_id": scan_id,
+        "eligible": bool(result.get("eligible")),
+        "structural_score": result.get("structural_score"),
+        "record_count": counts["records"],
+        "relationship_count": counts["relations"],
+        "case_count": counts["cases"],
+        "anomaly_count": counts["anomalies"],
+    }
+
+
 def _run_claimed_translation_job(job):
     """Run interactive or package-wide local translation with durable slices."""
     job_id = job["id"]
@@ -1857,7 +2420,7 @@ def _run_claimed_translation_job(job):
     scan_result = require_scan(scan_id)
     if job.get("task_type") == "translate_document":
         node_path = str(options.get("path") or "")
-        resolve_under(scan_result["root"], node_path)
+        _translation_inventory_node(scan_result, node_path)
         state = (storage.get_file_state(scan_id, node_path) or {}).get("status")
         if options.get("require_full", True) and state != "completed":
             _promote_for_translation(scan_id, scan_result, node_path, job_id)
@@ -2001,6 +2564,7 @@ def _run_claimed_scan_and_analyze_job(job):
             slice_entries=Config.SCAN_SLICE_ENTRIES,
             slice_seconds=Config.SCAN_SLICE_SECONDS,
             max_depth=options.get("max_depth", Config.MAX_SCAN_DEPTH),
+            max_files=options.get("max_files", Config.MAX_SCAN_FILES),
             max_directories=Config.MAX_SCAN_DIRECTORIES,
             max_nodes=Config.MAX_SCAN_NODES,
             activity_callback=scan_progress,
@@ -2008,6 +2572,7 @@ def _run_claimed_scan_and_analyze_job(job):
             yield_check=lambda: storage.has_queued_job_above_priority(
                 int(job.get("priority") or 100)
             ),
+            manifest_dir=Config.DATA_DIR / "inventory_manifests" / str(job_id),
         )
         scan_result = storage.save_inventory_slice(
             job_id, resolved_root, scan_slice["cursor"], scan_slice["records"],
@@ -2021,6 +2586,40 @@ def _run_claimed_scan_and_analyze_job(job):
                 "scan_id": job_id,
                 "inventory_files": int(scan_slice["cursor"].get("file_count") or 0),
             }
+
+    # Older scans predate derived logical units. Rebuild them lazily before
+    # analysis whenever eligible containers are present, even if their payload
+    # was previously marked complete.
+    logical_migration_needed = not bool(scan_result.get("logical_inventory_complete"))
+    if not logical_migration_needed:
+        logical_migration_needed = storage.count_logical_inventory_entries(job_id) == 0 and any(
+            str(item.get("payload", {}).get("extension") or "").lower() in {
+                ".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".bz2", ".rar", ".7z",
+                ".csv", ".tsv", ".jsonl", ".xlsx", ".xlsm",
+            }
+            for item in storage.iter_inventory_entries(job_id, kind="file")
+        )
+    if logical_migration_needed:
+        storage.update_job(
+            job_id, progress=12, stage="logical_inventory",
+            message="正在登记压缩包成员和大型结构化文件分片", heartbeat=True,
+        )
+        physical_files = (
+            item["payload"]
+            for item in storage.iter_inventory_entries(job_id, kind="file")
+        )
+        logical_counts = storage.replace_logical_inventory_entries(
+            job_id,
+            iter_logical_units(
+                resolved_root, physical_files,
+                partition_bytes=Config.LOGICAL_PARTITION_BYTES,
+                rows_per_partition=Config.LOGICAL_PARTITION_ROWS,
+                max_units_per_container=Config.MAX_LOGICAL_UNITS_PER_CONTAINER,
+            ),
+        )
+        scan_result.update(logical_counts)
+        scan_result["logical_inventory_complete"] = True
+        storage.update_scan(job_id, scan_result)
 
     resource_plan = package_resource_plan(
         scan_result,
@@ -2075,6 +2674,7 @@ def _run_claimed_scan_and_analyze_job(job):
 
 def _start_analysis_job(scan_id, options=None):
     """Persist work for the independent Worker; the API process never runs it."""
+    storage.set_package_processing_state(scan_id, "running", "分析任务已提交")
     return storage.create_or_get_job(scan_id, options=options, owner_id=_request_owner_id() or "legacy")
 
 
@@ -2157,7 +2757,7 @@ def status():
                 "batch_files": Config.LARGE_PACKAGE_BATCH_FILES,
                 "background_batch_files": Config.LARGE_PACKAGE_BACKGROUND_BATCH_FILES,
                 "background_backfill": Config.LARGE_PACKAGE_BACKGROUND_BACKFILL,
-                "full_inventory_processing": False,
+                "full_inventory_processing": bool(Config.LARGE_PACKAGE_BACKGROUND_BACKFILL),
                 "full_inventory_preview": True,
                 "preview_bytes_per_file": Config.LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE,
                 "preview_total_bytes": Config.LARGE_PACKAGE_PREVIEW_TOTAL_BYTES,
@@ -2212,11 +2812,64 @@ def test_model():
         return api_error(str(exc), 400)
 
 
+@app.route("/api/general-chat", methods=["POST"])
+def general_chat():
+    """Answer a lightweight chat turn without requiring an imported data package."""
+    payload = request.get_json(silent=True) or {}
+    question = str(payload.get("question") or "").strip()
+    if not question or len(question) > 8000:
+        return api_error("\\u95ee\\u9898\\u4e0d\\u80fd\\u4e3a\\u7a7a\\u4e14\\u4e0d\\u80fd\\u8d85\\u8fc7 8000 \\u5b57\\u7b26", 400)
+    try:
+        require_local_model_enabled()
+        history = payload.get("messages") or []
+        if not isinstance(history, list):
+            history = []
+        transcript = []
+        for item in history[-12:]:
+            if not isinstance(item, dict):
+                continue
+            role = "\\u7528\\u6237" if item.get("role") == "user" else "\\u52a9\\u624b"
+            content = str(item.get("content") or "").strip()
+            if content:
+                transcript.append("{}\\uff1a{}".format(role, content[:4000]))
+        system = (
+            "你是 SJFX \\u4e2d\\u7684\\u901a\\u7528\\u4e2d\\u6587\\u804a\\u5929\\u52a9\\u624b\\u3002"
+            "\\u50cf\\u6210\\u719f\\u7684\\u5927\\u6a21\\u578b\\u4ea7\\u54c1\\u4e00\\u6837\\u81ea\\u7136\\u3001\\u76f4\\u63a5\\u5730\\u56de\\u7b54\\u7528\\u6237\\u3002"
+            "\\u5148\\u7406\\u89e3\\u7528\\u6237\\u771f\\u6b63\\u60f3\\u5b8c\\u6210\\u7684\\u4e8b\\uff0c\\u518d\\u7ed9\\u51fa\\u6709\\u5e2e\\u52a9\\u7684\\u5185\\u5bb9\\u3002"
+            "\\u53ef\\u4ee5\\u95f2\\u804a\\u3001\\u89e3\\u91ca\\u6982\\u5ff5\\u3001\\u5199\\u4f5c\\u3001\\u6539\\u5199\\u3001\\u7ffb\\u8bd1\\u548c\\u63d0\\u4f9b\\u601d\\u8def\\u3002"
+            "\\u5f53\\u524d\\u6ca1\\u6709\\u52a0\\u8f7d\\u8d44\\u6599\\u5305\\uff0c\\u4e0d\\u8981\\u58f0\\u79f0\\u4f60\\u770b\\u8fc7\\u4efb\\u4f55\\u7528\\u6237\\u6587\\u4ef6\\u6216\\u5f15\\u7528\\u4e0d\\u5b58\\u5728\\u7684\\u8bc1\\u636e\\u3002"
+            "\\u5982\\u679c\\u7528\\u6237\\u7684\\u95ee\\u9898\\u660e\\u663e\\u9700\\u8981\\u5f53\\u524d\\u8d44\\u6599\\uff0c\\u8bf7\\u5766\\u8bda\\u8bf4\\u660e\\u5bfc\\u5165\\u8d44\\u6599\\u5305\\u540e\\u53ef\\u4ee5\\u7ee7\\u7eed\\uff0c\\u5e76\\u7ed9\\u51fa\\u901a\\u7528\\u56de\\u7b54\\u6216\\u4e0b\\u4e00\\u6b65\\u3002"
+        )
+        prompt = "\\u5bf9\\u8bdd\\u5386\\u53f2\\uff1a{}\\n\\n\\u7528\\u6237\\u6700\\u65b0\\u95ee\\u9898\\uff1a{}".format(
+            "\\n".join(transcript) if transcript else "\\u65e0",
+            question,
+        )
+        result = llm_transport.chat(
+            system,
+            prompt,
+            temperature=0.35,
+            max_tokens=1400,
+            timeout=min(45, int(getattr(Config, "CONVERSATION_MODEL_TIMEOUT_SECONDS", 45))),
+        )
+        answer = str((result or {}).get("content") or "").strip()
+        if not answer:
+            raise LocalModelError("\\u672c\\u5730\\u6a21\\u578b\\u8fd4\\u56de\\u4e3a\\u7a7a")
+        return jsonify({
+            "ok": True,
+            "answer": answer,
+            "model": (result or {}).get("model") or Config.OLLAMA_MODEL,
+            "evidence_status": "not_required",
+            "task_status": "fulfilled",
+        })
+    except (ValueError, LocalModelError) as exc:
+        return api_error(str(exc), 503)
+
 @app.route("/api/scan", methods=["POST"])
 def scan():
     payload = request.get_json(silent=True) or {}
     path = payload.get("path", "").strip()
-    parse_mode = "accurate" if payload.get("parse_mode") == "accurate" else "fast"
+    requested_parse_mode = str(payload.get("parse_mode") or "auto").strip().lower()
+    parse_mode = requested_parse_mode if requested_parse_mode in {"auto", "fast", "accurate"} else "auto"
     if not path:
         return api_error("请输入要扫描的本地目录")
     try:
@@ -2273,6 +2926,7 @@ def get_scan(scan_id):
                 },
                 "analysis": analysis,
                 "progressive_analysis": storage.get_analysis_progress(scan_id),
+                "processing": _package_processing_status(scan_id, scan_result),
                 "tree_edits": storage.list_tree_edits(scan_id, _request_owner_id(), limit=500),
                 "tree_edits_total": storage.tree_edit_count(scan_id, _request_owner_id()),
                 "response_mode": "bounded",
@@ -2281,9 +2935,219 @@ def get_scan(scan_id):
         if full_requested and scan_result.get("inventory_mode") == "durable_paged_v1":
             scan_result["tree"] = storage.build_inventory_tree(scan_id) or scan_result.get("tree")
         scan_result["scan_id"] = scan_id
-        return jsonify({"ok": True, "scan": scan_result, "summaries": storage.list_summaries(scan_id), "analysis": storage.get_analysis(scan_id)})
+        return jsonify({
+            "ok": True,
+            "scan": scan_result,
+            "summaries": storage.list_summaries(scan_id),
+            "analysis": storage.get_analysis(scan_id),
+            "processing": _package_processing_status(scan_id, scan_result),
+        })
     except ValueError as exc:
         return api_error(str(exc), 404)
+
+
+@app.route("/api/package-processing/<scan_id>")
+def get_package_processing(scan_id):
+    try:
+        scan_result = require_scan(scan_id)
+        return jsonify({
+            "ok": True,
+            "processing": _package_processing_status(scan_id, scan_result),
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/package-processing/<scan_id>/pause", methods=["POST"])
+def pause_package_processing(scan_id):
+    try:
+        require_scan(scan_id)
+        payload = request.get_json(silent=True) or {}
+        reason = str(payload.get("reason") or "用户结束本次运行；已完成检查点保留。")
+        result = storage.pause_package_analysis_jobs(scan_id, reason=reason)
+        storage.update_analysis_progress_status(
+            scan_id, "paused",
+            "已安全暂停；已完成结果永久保留，未完成文件仍在待处理队列。",
+            "paused",
+        )
+        return jsonify({
+            "ok": True,
+            **result,
+            "processing": _package_processing_status(scan_id),
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/package-processing/<scan_id>/resume", methods=["POST"])
+def resume_package_processing(scan_id):
+    """Resume or reprioritize the durable queue without dropping ordinary work."""
+    try:
+        scan_result = require_scan(scan_id)
+        payload = request.get_json(silent=True) or {}
+        mode = str(payload.get("mode") or "continue").strip().lower()
+        if mode not in {"continue", "recall", "query", "selection"}:
+            raise ValueError("未知续跑方式")
+        continue_full = bool(payload.get("continue_full", True))
+        inventory_paths = set(_inventory_by_path(scan_result))
+        preferred_paths = []
+        recall_items = []
+        priority_source = {
+            "continue": "background_backfill",
+            "recall": "relationship_recall",
+            "query": "user_query",
+            "selection": "manual_selection",
+        }[mode]
+        reason = {
+            "continue": "按原全量队列直接续跑",
+            "recall": "按已处理文件的实体、编号、主题和引用关系召回",
+            "query": "按用户关键词或自然语言研究要求优先",
+            "selection": "用户手动指定优先文件",
+        }[mode]
+
+        if mode == "query":
+            query = str(payload.get("query") or "").strip()
+            if not query:
+                raise ValueError("请输入关键词或自然语言研究要求")
+            hits = storage.search_evidence_index(scan_id, query, limit=5000)
+            for hit in hits:
+                for key in ("source_path", "archive_source_path"):
+                    candidate = str(hit.get(key) or "")
+                    if candidate in inventory_paths:
+                        preferred_paths.append(candidate)
+                    elif "::" in candidate and candidate.split("::", 1)[0] in inventory_paths:
+                        preferred_paths.append(candidate.split("::", 1)[0])
+            preferred_paths = list(dict.fromkeys(preferred_paths))
+        elif mode == "selection":
+            requested = payload.get("target_paths") or []
+            if not isinstance(requested, list):
+                raise ValueError("target_paths 必须是文件路径数组")
+            preferred_paths = [
+                str(path) for path in requested if str(path) in inventory_paths
+            ]
+            preferred_paths = list(dict.fromkeys(preferred_paths))
+            if not preferred_paths:
+                raise ValueError("没有选中当前数据包中的有效文件")
+        elif mode == "recall":
+            workflow_by_path = {
+                item.get("node_path"): item
+                for item in storage.iter_file_workflow_states(scan_id)
+            }
+            analysis_by_path = {
+                item.get("node_path"): item for item in storage.iter_file_states(scan_id)
+            }
+            completed_paths = {
+                path for path, state in analysis_by_path.items()
+                if str(state.get("status") or "") == "completed"
+            }
+            eligible_paths = {
+                path for path in inventory_paths
+                if deep_processing_eligible(
+                    workflow_by_path.get(path), analysis_by_path.get(path)
+                )
+            }
+            recall_items = storage.recall_file_relation_features(
+                scan_id, completed_paths, eligible_paths, limit=5000,
+            )
+            if not recall_items:
+                # Compatibility fallback for scans created before the complete
+                # feature index migration.
+                recall_items = relationship_recall_paths(
+                    storage.get_content_map(scan_id) or {},
+                    completed_paths,
+                    eligible_paths,
+                    limit=5000,
+                )
+            preferred_paths = [item["path"] for item in recall_items]
+
+        if preferred_paths:
+            workflow_for_priority = {
+                item.get("node_path"): item
+                for item in storage.iter_file_workflow_states(scan_id)
+            }
+            states_for_priority = {
+                item.get("node_path"): item for item in storage.iter_file_states(scan_id)
+            }
+            preferred_paths = [
+                path for path in preferred_paths
+                if deep_processing_eligible(
+                    workflow_for_priority.get(path), states_for_priority.get(path)
+                )
+            ]
+
+        if mode in {"query", "recall", "selection"} and not preferred_paths:
+            return jsonify({
+                "ok": True,
+                "accepted": False,
+                "message": (
+                    "全库基础索引中没有找到匹配的未处理文件"
+                    if mode == "query" else (
+                        "当前没有可召回的关联未处理文件"
+                        if mode == "recall" else "所选文件均已处理或不属于可处理队列"
+                    )
+                ),
+                "processing": _package_processing_status(scan_id, scan_result),
+                "recall": [],
+            })
+
+        if preferred_paths:
+            storage.prioritize_file_workflow_states(
+                scan_id, preferred_paths, priority_source, reason,
+                score_boost=2000.0 if mode == "selection" else 1500.0,
+            )
+        storage.set_package_processing_state(scan_id, "running", reason)
+        batch_paths = _next_package_batch(
+            scan_id, scan_result, preferred_paths=preferred_paths
+        )
+        if not batch_paths:
+            processing = _package_processing_status(scan_id, scan_result)
+            if processing.get("all_eligible_complete"):
+                storage.set_package_processing_state(
+                    scan_id, "completed", "全部有效逻辑文件已经完成。"
+                )
+            else:
+                storage.set_package_processing_state(
+                    scan_id, "paused", "没有可立即领取的文件；请检查失败或受限队列。"
+                )
+            return jsonify({
+                "ok": True,
+                "accepted": False,
+                "message": "当前没有待处理的有效逻辑文件",
+                "processing": _package_processing_status(scan_id, scan_result),
+                "recall": recall_items[:100],
+            })
+        options = {
+            "target_paths": batch_paths,
+            "workflow_source": priority_source if mode != "continue" else "background_backfill",
+            "scope_label": reason,
+            "parse_mode": "accurate",
+            "continue_full": continue_full,
+            "continuation_depth": 0,
+        }
+        job_id, created = storage.create_or_get_typed_job(
+            scan_id, "analyze_package", options=options,
+            owner_id=_request_owner_id() or "legacy",
+        )
+        storage.update_analysis_progress_status(
+            scan_id, "queued",
+            "已按新的优先级生成下一批；普通待处理文件仍保留。",
+            "queued",
+        )
+        return jsonify({
+            "ok": True,
+            "accepted": True,
+            "job_id": job_id,
+            "reused_active_job": not created,
+            "mode": mode,
+            "batch_files": len(batch_paths),
+            "preferred_matches": len(preferred_paths),
+            "continue_full": continue_full,
+            "recall": recall_items[:100],
+            "processing": _package_processing_status(scan_id, scan_result),
+            "status_url": "/api/jobs/{}".format(job_id),
+        }), 202 if created else 200
+    except ValueError as exc:
+        return api_error(str(exc), 400)
 
 
 @app.route("/api/scan/<scan_id>", methods=["DELETE"])
@@ -2307,31 +3171,98 @@ def delete_scan(scan_id):
 
 @app.route("/api/file-workflow/<scan_id>")
 def get_file_workflow(scan_id):
-    """Return auditable per-file gate and state-machine records."""
+    """Return the single user-facing state contract for every logical file.
+
+    The legacy endpoint exposed scheduling rows only.  That made previewed,
+    failed, and archive-member files indistinguishable from completed work.
+    ``Storage.list_file_status_page`` joins the immutable inventory with all
+    durable processing stages and returns the canonical seven-state projection.
+    """
     try:
-        scan_result = require_scan(scan_id)
+        require_scan(scan_id)
         node_path = str(request.args.get("path") or "").strip()
         if node_path:
-            if not _physical_inventory_node(scan_result, node_path):
+            item = storage.get_file_status(scan_id, node_path)
+            if not item:
                 raise ValueError("文件不在当前数据包清单中")
-            workflow = storage.get_file_workflow_state(scan_id, node_path)
             return jsonify({
                 "ok": True,
-                "item": workflow,
+                "item": item,
+                "workflow": storage.get_file_workflow_state(scan_id, node_path),
                 "analysis_state": storage.get_file_state(scan_id, node_path),
                 "translation": storage.get_translation(scan_id, node_path, hydrate=False),
             })
         offset = max(0, int(request.args.get("offset", 0) or 0))
         limit = max(1, min(500, int(request.args.get("limit", 100) or 100)))
-        selection_state = str(request.args.get("selection_state") or "").strip() or None
-        if selection_state and selection_state not in {
-            "priority", "deferred", "excluded", "pending_preview",
-        }:
-            raise ValueError("未知筛选状态")
-        page = storage.list_file_workflow_states_page(
-            scan_id, offset=offset, limit=limit, selection_state=selection_state,
+        status = str(request.args.get("status") or "all").strip().lower()
+        # Keep old clients functional while giving the new UI a truthful
+        # status filter. ``deferred`` historically meant not yet selected,
+        # not retry-waiting, so it maps to the pending presentation state.
+        if status == "all" and request.args.get("selection_state"):
+            status = {
+                "priority": "pending", "deferred": "pending",
+                "pending_preview": "pending", "excluded": "out_of_scope",
+            }.get(str(request.args.get("selection_state")).strip(), "all")
+        page = storage.list_file_status_page(
+            scan_id, offset=offset, limit=limit, status=status,
         )
+        page["status_counts"] = storage.file_status_counts(scan_id)
         return jsonify({"ok": True, **page})
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/file-workflow/<scan_id>/retry", methods=["POST"])
+def retry_file_workflow(scan_id):
+    """Queue selected failed/partial files for an explicit operator retry."""
+    try:
+        scan_result = require_scan(scan_id)
+        payload = request.get_json(silent=True) or {}
+        requested = payload.get("paths")
+        if requested is None and payload.get("path"):
+            requested = [payload.get("path")]
+        if not isinstance(requested, list):
+            raise ValueError("paths 必须是文件路径数组")
+        if len(requested) > 500:
+            raise ValueError("单次最多重试500个逻辑文件")
+        inventory = _inventory_by_path(scan_result)
+        paths = list(dict.fromkeys(
+            str(path) for path in requested
+            if str(path) in inventory
+        ))
+        if not paths:
+            raise ValueError("没有选中当前数据包中的有效文件")
+        changed = storage.request_file_reanalysis(
+            scan_id, paths, reason=str(payload.get("reason") or "用户手动重试文件")
+        )
+        # Files without a previous analysis row are still valid manual
+        # priorities; failed/partial rows receive the reset retry budget above.
+        storage.prioritize_file_workflow_states(
+            scan_id, paths, "manual_retry", "用户手动重试文件", score_boost=2500.0
+        )
+        batch_paths = _next_package_batch(scan_id, scan_result, preferred_paths=paths)
+        if not batch_paths:
+            return jsonify({
+                "ok": True, "accepted": False, "retry_files": changed,
+                "message": "所选文件当前没有可立即加入队列的项目",
+                "processing": _package_processing_status(scan_id, scan_result),
+            })
+        storage.set_package_processing_state(scan_id, "running", "用户手动重试文件")
+        job_id, created = storage.create_or_get_typed_job(
+            scan_id, "analyze_package", options={
+                "target_paths": batch_paths,
+                "workflow_source": "manual_retry",
+                "parse_mode": "accurate",
+                "retry_failed": True,
+            }, owner_id=_request_owner_id() or "legacy",
+        )
+        return jsonify({
+            "ok": True, "accepted": True, "job_id": job_id,
+            "reused_active_job": not created, "retry_files": changed,
+            "batch_files": len(batch_paths),
+            "status_url": "/api/jobs/{}".format(job_id),
+            "processing": _package_processing_status(scan_id, scan_result),
+        }), 202 if created else 200
     except (TypeError, ValueError) as exc:
         return api_error(str(exc), 400)
 
@@ -2557,15 +3488,194 @@ def tree_edits(scan_id):
 
 @app.route("/api/document/<scan_id>")
 def get_document(scan_id):
+    def document_error(message, status):
+        # Flask accepts ``(response, status)`` from a route, but callers of
+        # this document endpoint also use it as a focused source resolver.
+        # Return a concrete Response so both paths expose the same status.
+        response, response_status = api_error(message, status)
+        response.status_code = response_status
+        return response
+
     try:
-        require_scan(scan_id)
-        node_path = request.args.get("path", "")
-        document = storage.get_document(scan_id, node_path)
+        scan = require_scan(scan_id)
+        node_path = str(request.args.get("path", "") or "").strip()
+        if not node_path:
+            raise ValueError("缺少文件路径")
+        logical_source = storage.get_inventory_entry(scan_id, node_path) or {}
+        stored_document = storage.get_document(scan_id, node_path)
+        preview = storage.get_file_preview(scan_id, node_path)
+        coverage = (stored_document or {}).get("coverage") or {}
+        parser_name = str(((stored_document or {}).get("parser") or {}).get("name") or "")
+        is_deep_document = bool(stored_document) and (
+            bool(coverage.get("semantic_complete") or coverage.get("deep_parse_complete"))
+            or (
+                bool(coverage.get("complete"))
+                and not bool(coverage.get("preview_only") or coverage.get("semantic_projection"))
+                and parser_name != "bounded-package-preview"
+            )
+        )
+        # A saved exploration projection is searchable, but it is not an
+        # authoritative full document. Prefer the original persisted preview
+        # so callers can show its sampling boundaries honestly.
+        if is_deep_document:
+            document = stored_document
+            analysis_level = "deep"
+        elif preview:
+            document = preview_as_document(preview)
+            analysis_level = "preview"
+        elif stored_document:
+            document = stored_document
+            analysis_level = "preview"
+        else:
+            document = None
+            analysis_level = "metadata"
+        member_evidence = None
+        # A logical unit is stored under its stable ``container::member`` path.
+        # Older scans may only have the parsed container document, so project
+        # the matching member evidence without pretending the container text is
+        # the member's own full text.
+        if "::" in node_path:
+            container_path, member_name = node_path.split("::", 1)
+            is_known_logical = bool(
+                logical_source.get("logical_unit")
+                and str(logical_source.get("container_path") or "") == container_path
+                # Archive members record ``member_name`` while JSONL and
+                # worksheet partitions use their virtual path as identity.
+                # Requiring a missing member_name to equal the suffix made a
+                # known structured partition look like a forged path.
+                and (
+                    not str(logical_source.get("member_name") or "")
+                    or str(logical_source.get("member_name") or "") == member_name
+                )
+            )
+            if not document:
+                container_document = storage.get_document(scan_id, container_path)
+                candidates = [
+                    dict(item) for item in (container_document or {}).get("evidence") or []
+                    if isinstance(item, dict)
+                    and (
+                        str(item.get("source_path") or "") == node_path
+                        or (
+                            str(item.get("archive_source_path") or "") == container_path
+                            and str(item.get("archive_member") or "") == member_name
+                        )
+                    )
+                ]
+                if not is_known_logical and not candidates:
+                    return document_error("逻辑文件不在当前数据包清单中", 404)
+                if container_document and candidates:
+                    document = dict(container_document)
+                    document["text"] = "\n".join(
+                        str(item.get("text") or "") for item in candidates
+                    )
+                    document["evidence"] = candidates
+                    document.setdefault("coverage", {})["complete"] = False
+                    document.setdefault("warnings", []).append(
+                        "此为压缩包成员的兼容投影，仅包含已建立索引的成员证据。"
+                    )
+                    member_evidence = candidates
+                    analysis_level = "preview"
+        if not document and logical_source:
+            # A known logical unit can be opened before its preview/deep pass
+            # completes. Return its exact container and partition coordinates
+            # rather than incorrectly claiming it does not exist.
+            document = {
+                "schema_version": "unified-document/1.0",
+                "source": {"path": node_path, "name": logical_source.get("name")},
+                "parser": {"name": "inventory-metadata", "mode": "metadata"},
+                "structure": {"title": logical_source.get("name") or Path(node_path).name, "headings": []},
+                "coverage": {"complete": False, "parse_complete": False, "semantic_complete": False},
+                "warnings": ["该逻辑文件已进入清单，正文预览或深度解析尚未完成。"],
+                "text": "", "evidence": [],
+            }
         if not document:
-            return api_error("该文件尚无统一解析结果", 404)
+            return document_error("文件不在当前数据包清单中且没有可回查结果", 404)
+        source = dict(document.get("source") or {})
+        if "::" in node_path:
+            container_path, member_name = node_path.split("::", 1)
+            source.update({
+                "path": node_path,
+                "logical_path": node_path,
+                "physical_path": container_path,
+                "container_path": container_path,
+                "logical_member": member_name,
+                "archive_member": member_name,
+                "logical_unit": True,
+            })
+        else:
+            source.setdefault("physical_path", source.get("path") or node_path)
+
+        location = {
+            key: logical_source.get(key)
+            for key in (
+                "logical_kind", "member_name", "byte_start", "byte_end",
+                "record_boundary", "sheet_name", "row_start", "row_end",
+                "partition_index", "actual_row_count",
+            )
+            if logical_source.get(key) is not None
+        }
+
+        def focus_value(name):
+            value = request.args.get(name)
+            if value in {None, ""}:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                raise ValueError("定位参数 {} 必须为整数".format(name))
+
+        focus = {
+            "page": focus_value("page"),
+            "paragraph_index": focus_value("paragraph_index"),
+            "block_index": focus_value("block_index"),
+            "char_start": focus_value("char_start"),
+            "char_end": focus_value("char_end"),
+            "section": str(request.args.get("section") or "").strip() or None,
+        }
+        evidence_items = member_evidence if member_evidence is not None else list(document.get("evidence") or [])
+        if any(value is not None for value in focus.values()):
+            def focus_rank(item):
+                matches = sum(
+                    1 for key, value in focus.items()
+                    if value is not None and str(item.get(key) or "") == str(value)
+                )
+                return -matches
+            evidence_items.sort(key=focus_rank)
+        selected_evidence = select_evidence(
+            evidence_items,
+            topics=document.get("structure", {}).get("headings", [])[:8] + [document.get("structure", {}).get("title")],
+            max_items=12,
+            per_source=12,
+            max_chars=520,
+        )
+        # A document view is an evidence browser, not a claim answer.  Strict
+        # topic ranking may legitimately reject a short member/partition
+        # excerpt whose text does not repeat the file title.  In that case the
+        # exact stored evidence must remain visible and clearly be marked as a
+        # direct, unranked source excerpt instead of presenting an empty card.
+        if not selected_evidence and evidence_items:
+            selected_evidence = []
+            for item in evidence_items:
+                if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+                    continue
+                compact = dict(item)
+                compact["text"] = str(compact.get("text") or "")[:520]
+                compact["selection_fallback"] = "direct_source_excerpt"
+                selected_evidence.append(compact)
+                if len(selected_evidence) >= 12:
+                    break
         return jsonify({"ok": True, "document": {
             "schema_version": document.get("schema_version"),
-            "source": document.get("source"),
+            "source": source,
+            "source_reference": {
+                "logical_path": source.get("logical_path") or source.get("path"),
+                "physical_path": source.get("physical_path") or source.get("path"),
+                "container_path": source.get("container_path"),
+                "logical_member": source.get("logical_member") or source.get("archive_member"),
+                "location": location,
+            },
+            "analysis_level": analysis_level,
+            "focus": focus,
             "parser": document.get("parser"),
             "structure": document.get("structure"),
             "coverage": document.get("coverage", {}),
@@ -2573,17 +3683,12 @@ def get_document(scan_id):
             "data_profiles": document.get("data_profiles", []),
             "warnings": document.get("warnings", []),
             "text_preview": document.get("text", "")[:5000],
-            "evidence": select_evidence(
-                document.get("evidence", []),
-                topics=document.get("structure", {}).get("headings", [])[:8] + [document.get("structure", {}).get("title")],
-                max_items=12,
-                per_source=12,
-                max_chars=520,
-            ),
-            "evidence_count": len(document.get("evidence", [])),
+            "evidence": selected_evidence,
+            "evidence_count": len(evidence_items),
         }})
     except ValueError as exc:
-        return api_error(str(exc), 404)
+        message = str(exc)
+        return document_error(message, 404 if "扫描任务不存在" in message else 400)
 
 
 class _ConversationTranslationAdapter:
@@ -2599,7 +3704,7 @@ class _ConversationTranslationAdapter:
             "structure": {"title": ""},
             "text": str(text or ""),
         }
-        state = translation_service.translate_document(document)
+        state = _translate_document_serialized(document)
         if state.get("status") not in {"completed", "not_required"}:
             message = (state.get("errors") or [{}])[0].get("message") or "证据翻译失败"
             raise ValueError(message)
@@ -2611,7 +3716,96 @@ class _ConversationTranslationAdapter:
         return translated
 
 
+def _conversation_projection_fallback(retrieval_request):
+    """Build a bounded temporary corpus when a historical index is absent.
+
+    A missing or rebuilding durable index must not turn already-persisted
+    documents into an apparent "no result".  This fallback deliberately uses
+    Storage's bounded document projection, never a document sidecar's full
+    body, and advertises its reduced coverage to the conversation runtime.
+    """
+    chunk_limit = max(
+        100, min(5000, int(Config.CONVERSATION_MAX_CANDIDATE_EVIDENCE))
+    )
+    # A projection normally contributes several evidence chunks.  Keeping a
+    # separate document ceiling guarantees one request cannot hydrate an
+    # unbounded historical package just because its search index was deleted.
+    document_limit = max(
+        50,
+        min(
+            int(getattr(Config, "CONVERSATION_RETRIEVAL_DOCUMENT_LIMIT", 500)),
+            chunk_limit // 2,
+        ),
+    )
+    deadline = time.monotonic() + float(
+        getattr(Config, "CONVERSATION_RETRIEVAL_TIMEOUT_SECONDS", 8.0)
+    )
+    scope = retrieval_request.scope
+    chunks = []
+    paths = []
+    scanned_documents = 0
+    exhausted = False
+    for item in storage.iter_documents(
+        retrieval_request.scan_id, hydrate=False, batch_size=50
+    ):
+        if time.monotonic() >= deadline:
+            exhausted = True
+            break
+        path = str(item.get("path") or "")
+        if not path or not scope.contains_source(path):
+            continue
+        if scanned_documents >= document_limit:
+            exhausted = True
+            break
+        scanned_documents += 1
+        document = dict(item.get("payload") or {})
+        source = dict(document.get("source") or {})
+        source.setdefault("path", path)
+        document["source"] = source
+        for evidence in evidence_corpus({path: document}, scope="."):
+            projection = dict(evidence)
+            # The source is a bounded semantic projection rather than a full
+            # reparse.  The normal result renderer and verifier will preserve
+            # that distinction instead of overstating the evidence quality.
+            projection["preview_only"] = True
+            projection["index_kind"] = "projection_fallback"
+            projection["projection_fallback"] = True
+            chunks.append(projection)
+            if len(chunks) >= chunk_limit:
+                exhausted = True
+                break
+        if path not in paths:
+            paths.append(path)
+        if exhausted:
+            break
+    return chunks, {
+        "used": bool(chunks),
+        "documents_considered": scanned_documents,
+        "document_limit": document_limit,
+        "evidence_limit": chunk_limit,
+        "truncated": exhausted,
+        "paths": paths,
+    }
+
+
 def _conversation_retrieve(retrieval_request):
+    started_at = time.monotonic()
+    cache_key = (
+        str(retrieval_request.scan_id),
+        str(retrieval_request.query or "").strip().casefold(),
+        json.dumps(
+            retrieval_request.scope.as_dict(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        tuple(sorted(retrieval_request.scope.source_paths or ())),
+        str(retrieval_request.intent or ""),
+    )
+    with _CONVERSATION_RETRIEVAL_CACHE_LOCK:
+        cached = _CONVERSATION_RETRIEVAL_CACHE.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < _CONVERSATION_RETRIEVAL_CACHE_TTL:
+            return copy.deepcopy(cached[1])
     query = retrieval_request.query
     scope = retrieval_request.scope
     if scope.kind in {"topic", "entity", "file_type"}:
@@ -2621,13 +3815,25 @@ def _conversation_retrieve(retrieval_request):
             (scope.value or {}).get("start", ""), (scope.value or {}).get("end", ""), query
         )
     source_paths = list(scope.source_paths) or None
+    candidate_limit = int(
+        getattr(Config, "CONVERSATION_RETRIEVAL_CANDIDATE_LIMIT", 600)
+    )
     indexed = storage.search_evidence_index(
         retrieval_request.scan_id,
         query,
         scope=scope.retrieval_path,
         source_paths=source_paths,
-        limit=2000,
+        limit=candidate_limit,
     )
+    projection_fallback = None
+    # Historical scans can retain durable documents after their original
+    # directory disappears.  If their old evidence index is absent, search
+    # the bounded persisted projections rather than rejecting the question or
+    # falsely reporting that the package has no relevant material.
+    if not indexed and not storage.count_evidence_index(retrieval_request.scan_id):
+        indexed, projection_fallback = _conversation_projection_fallback(
+            retrieval_request
+        )
     if scope.kind == "file_type" and (scope.constraints or {}).get("dimension") == "format":
         expected = str(scope.value or "").lower().strip()
         if expected and not expected.startswith(".") and expected != "[无扩展名]":
@@ -2642,50 +3848,98 @@ def _conversation_retrieve(retrieval_request):
     result = retrieve_evidence(
         {}, query, top_k=retrieval_request.top_k, indexed_chunks=indexed,
     )
+    # Evidence from archive members and structured-file partitions is stored
+    # under the logical source path (for example
+    # ``bundle.zip::letters/a.txt``).  Do not collapse that back to its
+    # physical container here: the member has its own parse state, coverage
+    # and retry lifecycle.  Keeping both identities lets citations point to
+    # the real source while still exposing the outer file as provenance.
     candidate_paths = []
+    physical_candidate_paths = []
+    physical_by_evidence_path = {}
     for item in indexed:
         evidence_path = str(item.get("source_path") or "")
         physical_path = str(
             item.get("archive_source_path") or evidence_path.split("::", 1)[0]
         )
-        if physical_path and physical_path not in candidate_paths:
-            candidate_paths.append(physical_path)
-    states = storage.get_file_states(retrieval_request.scan_id, candidate_paths)
+        if evidence_path and evidence_path not in candidate_paths:
+            candidate_paths.append(evidence_path)
+        if evidence_path:
+            physical_by_evidence_path.setdefault(evidence_path, physical_path)
+        if physical_path and physical_path not in physical_candidate_paths:
+            physical_candidate_paths.append(physical_path)
+    states = storage.get_file_states(
+        retrieval_request.scan_id,
+        candidate_paths + physical_candidate_paths,
+    )
+
+    def state_for_evidence_path(evidence_path):
+        """Prefer a logical member state, then preserve legacy container state.
+
+        New imports always have a logical-unit row, but historical archive
+        analyses stored only the physical container.  The fallback keeps those
+        durable results usable without claiming that a missing member record is
+        an unprocessed file.
+        """
+        evidence_path = str(evidence_path or "")
+        physical_path = physical_by_evidence_path.get(
+            evidence_path, evidence_path.split("::", 1)[0]
+        )
+        return states.get(evidence_path) or states.get(physical_path) or {}
+
+    fallback_paths = set((projection_fallback or {}).get("paths") or [])
     for item in result.get("results") or []:
         evidence_path = str(item.get("source_path") or "")
         physical_path = str(
             item.get("archive_source_path") or evidence_path.split("::", 1)[0]
         )
-        if physical_path:
-            state = states.get(physical_path) or {}
-            preview = storage.get_file_preview(retrieval_request.scan_id, physical_path) or {}
-            item["source_language"] = (preview.get("language") or {}).get("code")
-            item["analysis_level"] = "deep" if state.get("status") == "completed" else "preview"
+        state = state_for_evidence_path(evidence_path)
+        preview = (
+            storage.get_file_preview(retrieval_request.scan_id, evidence_path)
+            or storage.get_file_preview(retrieval_request.scan_id, physical_path)
+            or {}
+        )
+        item["source_language"] = (preview.get("language") or {}).get("code")
+        item["analysis_level"] = (
+            "deep" if state.get("status") == "completed" else
+            "projection" if item.get("projection_fallback") else "preview"
+        )
+        item["logical_source_path"] = evidence_path if "::" in evidence_path else None
+        item["physical_source_path"] = physical_path or evidence_path
     deep_candidates = sum(
         1 for path in candidate_paths
-        if (states.get(path) or {}).get("status") == "completed"
+        if state_for_evidence_path(path).get("status") == "completed"
     )
     indexed_only_candidates = sum(
         1 for path in candidate_paths
         if (
-            (states.get(path) or {}).get("status") != "completed"
-            and (states.get(path) or {}).get("retryable") is not None
-            and not bool((states.get(path) or {}).get("retryable"))
+            path in fallback_paths
+            or (
+                state_for_evidence_path(path).get("status") != "completed"
+                and state_for_evidence_path(path).get("retryable") is not None
+                and not bool(state_for_evidence_path(path).get("retryable"))
+            )
         )
     )
     deferred = [
         path for path in candidate_paths
         if (
-            (states.get(path) or {}).get("status") != "completed"
+            state_for_evidence_path(path).get("status") != "completed"
+            and path not in fallback_paths
             and not (
-                (states.get(path) or {}).get("retryable") is not None
-                and not bool((states.get(path) or {}).get("retryable"))
+                state_for_evidence_path(path).get("retryable") is not None
+                and not bool(state_for_evidence_path(path).get("retryable"))
             )
         )
     ]
     analysis = storage.get_analysis_overview(retrieval_request.scan_id) or {}
     package_coverage = analysis.get("coverage") or {}
-    total_files = int(package_coverage.get("inventory_files") or 0)
+    physical_inventory_files = int(package_coverage.get("inventory_files") or 0)
+    status_counts = storage.file_status_counts(retrieval_request.scan_id)
+    # The state projection excludes archive containers that were replaced by
+    # independently schedulable members.  This is the denominator a user
+    # needs when judging whether an answer covered a large package.
+    total_files = int(status_counts.get("total") or physical_inventory_files)
     scope_extension = scope.value if scope.kind == "file_type" else None
     scope_files = storage.count_inventory_files(
         retrieval_request.scan_id,
@@ -2693,12 +3947,12 @@ def _conversation_retrieve(retrieval_request):
         source_paths=list(scope.source_paths) or None,
         extension=scope_extension,
     )
-    if not scope_files and scope.kind in {"package", "topic", "entity", "time"}:
+    if scope.kind == "package":
+        scope_files = total_files
+    elif not scope_files and scope.kind in {"topic", "entity", "time"}:
         scope_files = total_files
     inspected_paths = {
-        str(item.get("archive_source_path") or str(
-            item.get("source_path") or ""
-        ).split("::", 1)[0])
+        str(item.get("source_path") or item.get("archive_source_path") or "")
         for item in result.get("results") or []
     }
     inspected_paths.discard("")
@@ -2721,12 +3975,23 @@ def _conversation_retrieve(retrieval_request):
     query_coverage = (
         scope_inspection_coverage if broad_scope else candidate_evidence_coverage
     )
+    if projection_fallback and projection_fallback.get("used"):
+        # Projected historical text is useful enough for a cautious answer,
+        # but it is not equivalent to a complete durable evidence index.
+        query_coverage = min(query_coverage, 0.35)
+        result["warnings"] = list(dict.fromkeys(
+            list(result.get("warnings") or []) + [
+                "当前回答使用已保存文档的有界语义投影；完整证据索引仍在缺失或重建中，结论只能作为阶段性结果。"
+            ]
+        ))
     result["coverage"] = {
         "total_files": total_files or None,
+        "physical_inventory_files": physical_inventory_files or None,
         "scope_files": scope_files or None,
         "searchable_files": package_coverage.get("parsed_files"),
         "deep_analyzed_files": package_coverage.get("deep_analyzed_files"),
         "candidate_files": len(candidate_paths),
+        "candidate_physical_files": len(physical_candidate_paths),
         "inspected_files": inspected_files,
         "retrieved_files": inspected_files,
         "deep_candidate_files": deep_candidates,
@@ -2737,8 +4002,21 @@ def _conversation_retrieve(retrieval_request):
         "coverage_basis": "scope_inspection" if broad_scope else "candidate_depth",
         "query_coverage": query_coverage,
         "deferred_candidates": deferred[:100],
+        "projection_fallback": projection_fallback,
     }
     result["needs_promotion"] = bool(deferred)
+    if time.monotonic() - started_at >= float(
+        getattr(Config, "CONVERSATION_RETRIEVAL_TIMEOUT_SECONDS", 8.0)
+    ):
+        result["warnings"] = list(dict.fromkeys(
+            list(result.get("warnings") or [])
+            + ["检索达到交互式时间预算，已返回当前最高相关证据；可继续追问以扩大范围。"]
+        ))
+        result["coverage"]["retrieval_time_budget_exceeded"] = True
+    with _CONVERSATION_RETRIEVAL_CACHE_LOCK:
+        _CONVERSATION_RETRIEVAL_CACHE[cache_key] = (time.monotonic(), copy.deepcopy(result))
+        while len(_CONVERSATION_RETRIEVAL_CACHE) > _CONVERSATION_RETRIEVAL_CACHE_MAX:
+            _CONVERSATION_RETRIEVAL_CACHE.pop(next(iter(_CONVERSATION_RETRIEVAL_CACHE)))
     return result
 
 
@@ -2810,8 +4088,15 @@ def _conversation_index_status(scan_id):
         expected = documents
         processed = documents if ready else 0
         failed = 0
+    # ``ready`` intentionally remains strict: it means the durable index has
+    # fully caught up.  ``usable`` is a different user-facing guarantee: a
+    # partial index or persisted document projections can still support a
+    # cautious, coverage-labelled answer while a rebuild continues.
+    usable = bool(evidence or documents or previews)
     return {
         "ready": ready,
+        "usable": usable,
+        "partial": bool(usable and not ready),
         "state": state,
         "documents": documents,
         "evidence_records": evidence,
@@ -3188,6 +4473,74 @@ def package_overview(scan_id):
         return api_error(str(exc), 400)
 
 
+@app.route("/api/homogeneous-analysis/<scan_id>", methods=["GET", "POST"])
+def homogeneous_analysis(scan_id):
+    """Start or read the independent homogeneous-document analysis module."""
+    try:
+        require_scan(scan_id)
+        if request.method == "POST":
+            job_id, created = storage.create_or_get_typed_job(
+                scan_id, "homogeneous_analysis",
+                options={"workflow_source": "homogeneous_module"},
+                owner_id=_request_owner_id() or "legacy",
+            )
+            return jsonify({
+                "ok": True, "accepted": True, "job_id": job_id,
+                "reused_active_job": not created,
+                "status_url": "/api/jobs/{}".format(job_id),
+            }), 202
+        try:
+            offset = int(request.args.get("offset", 0))
+            limit = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            raise ValueError("分页参数必须是整数")
+        result = storage.get_homogeneous_analysis(
+            scan_id, offset=offset, limit=limit,
+            query=request.args.get("query", ""),
+            relation_type=request.args.get("relation_type", ""),
+        )
+        return jsonify({"ok": True, "available": bool(result), "analysis": result})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/homogeneous-record/<scan_id>")
+def homogeneous_record(scan_id):
+    try:
+        require_scan(scan_id)
+        node_path = str(request.args.get("path") or "").strip()
+        if not node_path:
+            raise ValueError("缺少文件路径")
+        result = storage.get_homogeneous_record(scan_id, node_path)
+        if not result:
+            return api_error("同构分析台账中不存在该文件", 404)
+        return jsonify({"ok": True, **result})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/relationships/<scan_id>")
+def relationship_catalog(scan_id):
+    """Read the shared, evidence-carrying file relationship contract."""
+    try:
+        require_scan(scan_id)
+        try:
+            limit = int(request.args.get("limit", 500))
+        except (TypeError, ValueError):
+            raise ValueError("limit 必须是整数")
+        source_path = str(request.args.get("path") or "").strip()
+        if source_path:
+            resolve_under(require_scan(scan_id)["root"], source_path.split("::", 1)[0])
+        return jsonify({
+            "ok": True,
+            "relationships": storage.get_relationship_catalog(
+                scan_id, source_path=source_path or None, limit=limit,
+            ),
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
 @app.route("/api/conversations", methods=["POST"])
 def create_conversation():
     payload = request.get_json(silent=True) or {}
@@ -3264,11 +4617,11 @@ def create_conversation_turn(session_id):
         if not question or len(question) > 8000:
             raise ValueError("问题不能为空且不能超过 8000 字符")
         search_index = _conversation_index_status(scan_id)
-        if not search_index["ready"]:
+        if not search_index["usable"]:
             return jsonify({
                 "ok": False,
-                "error": "对话证据索引尚未完整就绪，请先完成或恢复索引重建。",
-                "code": "search_index_rebuild_required",
+                "error": "当前数据包尚无可检索文本；请先等待基础解析或恢复索引重建。",
+                "code": "search_index_unavailable",
                 "search_index": search_index,
                 "rebuild_url": "/api/scans/{}/rebuild-search-index".format(scan_id),
             }), 409
@@ -3289,6 +4642,8 @@ def create_conversation_turn(session_id):
             "session": session_payload,
             "job_id": turn.get("job_id"),
             "created": created,
+            "search_index": search_index,
+            "coverage_mode": "complete" if search_index["ready"] else "partial",
         }), 202 if created else 200
     except ValueError as exc:
         return api_error(str(exc), 400)
@@ -3492,19 +4847,56 @@ def conversation_message(session_id):
 
 @app.route("/api/translations/<scan_id>")
 def list_translations(scan_id):
+    """List one bounded, searchable page of translation work.
+
+    In addition to persisted translation states, the page includes
+    language-classified files that have not begun translation.  That makes a
+    large package's pending work visible instead of presenting only the first
+    translated subset.
+    """
     try:
         require_scan(scan_id)
         limit = max(1, min(500, int(request.args.get("limit", 100) or 100)))
-        items = []
-        for item in storage.iter_translations(scan_id, hydrate=False, batch_size=limit):
-            items.append({"path": item["path"], **(item.get("payload") or {})})
-            if len(items) >= limit:
-                break
+        offset = max(0, min(10_000_000, int(request.args.get("offset", 0) or 0)))
+        query = str(
+            request.args.get("query", request.args.get("q", "")) or ""
+        ).strip()
+        if len(query) > 500:
+            raise ValueError("query 不能超过 500 个字符")
+
+        # Support both the documented comma-separated form and repeated
+        # ``status`` query parameters when the underlying request adapter has
+        # a MultiDict-compatible ``getlist`` method.
+        status_values = []
+        getlist = getattr(request.args, "getlist", None)
+        for key in ("status", "statuses"):
+            values = getlist(key) if callable(getlist) else [request.args.get(key, "")]
+            for raw in values or []:
+                for value in str(raw or "").split(","):
+                    value = value.strip()
+                    if not value or value.casefold() == "all":
+                        continue
+                    if len(value) > 64:
+                        raise ValueError("status 不能超过 64 个字符")
+                    status_values.append(value)
+        statuses = list(dict.fromkeys(status_values))
+        language = str(request.args.get("language", "all") or "all").strip().lower()
+        page = storage.list_translation_page(
+            scan_id,
+            offset=offset,
+            limit=limit,
+            statuses=statuses or None,
+            language=language,
+            query=query,
+        )
+        counts = storage.translation_counts(scan_id)
         return jsonify({
             "ok": True,
-            "counts": storage.translation_counts(scan_id),
-            "items": items,
-            "limit": limit,
+            # Preserve the established meaning for existing clients: these
+            # are counts of durable translation records, not all candidates.
+            "counts": counts,
+            **page,
+            "previous_offset": max(0, offset - limit) if offset else None,
         })
     except (TypeError, ValueError) as exc:
         return api_error(str(exc), 400)
@@ -3517,9 +4909,7 @@ def document_translation(scan_id):
         if request.method == "POST":
             payload = request.get_json(silent=True) or {}
             node_path = str(payload.get("path") or "")
-            resolve_under(scan_result["root"], node_path)
-            if not _physical_inventory_node(scan_result, node_path):
-                raise ValueError("文件不在当前数据包中")
+            _translation_inventory_node(scan_result, node_path)
             job_id, _created = storage.create_or_get_typed_job(
                 scan_id, "translate_document",
                 options={
@@ -3531,17 +4921,27 @@ def document_translation(scan_id):
             return jsonify({"ok": True, "job_id": job_id, "path": node_path}), 202
 
         node_path = str(request.args.get("path", "") or "")
-        resolve_under(scan_result["root"], node_path)
-        document = storage.get_document(scan_id, node_path)
-        if not document:
-            return api_error("该文件尚无可翻译内容", 404)
+        _translation_inventory_node(scan_result, node_path)
+        stored_document = storage.get_document(scan_id, node_path)
+        document = stored_document
+        preview = storage.get_file_preview(scan_id, node_path)
+        workflow = storage.get_file_workflow_state(scan_id, node_path) or {}
+        # Translation work items can be known from the all-file preview pass
+        # before a deep document exists.  Returning their bounded preview (or
+        # an honest metadata state) keeps a paged list actionable instead of
+        # turning every unstarted row into a 404.
+        if not document and preview:
+            document = preview_as_document(preview)
         state = storage.get_translation(scan_id, node_path, hydrate=True)
         view = str(request.args.get("view", "translated") or "translated").lower()
         if view not in {"original", "translated", "bilingual"}:
             raise ValueError("view 仅支持 original、translated、bilingual")
         offset = max(0, int(request.args.get("offset", 0) or 0))
         limit = max(200, min(20000, int(request.args.get("limit", 8000) or 8000)))
-        original = str((state or {}).get("original_text") if state else document.get("text") or "")
+        original_value = (
+            (state or {}).get("original_text") if state else (document or {}).get("text")
+        )
+        original = str(original_value or "")
         translated = (state or {}).get("translated_text")
         translated = str(translated) if translated is not None else None
 
@@ -3562,25 +4962,32 @@ def document_translation(scan_id):
             "view": view,
             "status": (state or {}).get("status") or "not_started",
             "source_level": (state or {}).get("source_level"),
+            "source_availability": "document" if stored_document else (
+                "preview" if preview else "metadata"
+            ),
+            "content_available": bool(document),
             "full_translation": bool((state or {}).get("full_translation")),
-            "source_language": (state or {}).get("source_language"),
+            "source_language": (state or {}).get("source_language") or (
+                (preview.get("language") or {}).get("code") if preview else None
+            ) or workflow.get("language_code") or "unknown",
             "target_language": (state or {}).get("target_language") or "zh-CN",
             "translation_mode": (state or {}).get("translation_mode") or (
                 "quality" if Config.TRANSLATION_REVIEW_COMPLEX_UNITS else "fast"
             ),
             "performance": (state or {}).get("performance") or {},
             "titles": {
-                "original": (state or {}).get("original_title") or (document.get("structure") or {}).get("title"),
+                "original": (state or {}).get("original_title") or ((document or {}).get("structure") or {}).get("title"),
                 "translated": (state or {}).get("translated_title"),
             },
             "progress": (state or {}).get("progress"),
             "errors": (state or {}).get("errors") or [],
+            "warnings": (state or {}).get("warnings") or [],
         }
         if view in {"original", "bilingual"}:
             response["original"] = page(original)
         if view in {"translated", "bilingual"}:
             response["translated"] = page(translated)
-        if not state:
+        if not state and document:
             response["plan"] = build_translation_plan(
                 storage.project_document(
                     document, text_limit=Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE
@@ -3608,6 +5015,60 @@ def translate_package(scan_id):
         return jsonify({"ok": True, "job_id": job_id, "phase": phase}), 202
     except ValueError as exc:
         return api_error(str(exc), 400)
+
+
+def _retrieval_search_status(scan_id, scan_result, result, evidence_index_count):
+    """Explain an empty search without turning unindexed data into a miss."""
+    processing = storage.package_processing_counts(scan_id)
+    preview_counts = storage.file_preview_counts(scan_id)
+    workflow_total = int(processing.get("workflow_total") or 0)
+    indexed_files = int(processing.get("light_ready") or 0)
+    document_count = storage.count_documents(scan_id)
+    previewed_files = int(preview_counts.get("previewed") or 0)
+    inventory_total = max(0, int(scan_result.get("file_count") or 0))
+    searchable_files = max(indexed_files, document_count, previewed_files)
+    expected_files = workflow_total or inventory_total
+    unindexed_files = max(0, expected_files - searchable_files)
+    incomplete_files = int(processing.get("incomplete") or 0)
+    retry_waiting = int(processing.get("retry_waiting") or 0)
+    needs_attention = int(processing.get("needs_attention") or 0)
+    durable = storage.get_search_index_state(scan_id) or {}
+    durable_state = str(durable.get("status") or "legacy")
+    result_count = int(result.get("result_count") or len(result.get("results") or []))
+    if result_count:
+        code = "matched"
+        message = "已在当前可检索范围内找到匹配证据。"
+    elif not evidence_index_count and not document_count:
+        code = "index_unavailable"
+        message = "当前范围尚无可检索正文证据；请等待基础解析或搜索索引完成。"
+    elif (
+        unindexed_files
+        or incomplete_files
+        or durable_state in {"rebuilding", "interrupted", "rebuild_required"}
+    ):
+        code = "partial_index"
+        message = (
+            "当前已索引内容没有匹配；仍有 {} 个文件尚未完成基础索引或深度处理，"
+            "不能据此判断全库没有相关内容。"
+        ).format(max(unindexed_files, incomplete_files))
+    else:
+        code = "no_match"
+        message = "当前已完成索引的范围内没有匹配内容。"
+    return {
+        "code": code,
+        "message": message,
+        "coverage": {
+            "inventory_files": inventory_total,
+            "workflow_files": workflow_total,
+            "foundation_searchable_files": searchable_files,
+            "unindexed_files": unindexed_files,
+            "deep_incomplete_files": incomplete_files,
+            "retry_waiting_files": retry_waiting,
+            "needs_attention_files": needs_attention,
+            "evidence_records": int(evidence_index_count or 0),
+            "index_state": durable_state,
+        },
+    }
 
 
 @app.route("/api/retrieve", methods=["POST"])
@@ -3641,12 +5102,6 @@ def retrieve():
         # document remains only a compatibility fallback for pre-index data.
         documents = [] if evidence_index_count else _package_documents(scan_id, canonical_only=True)
         indexed_chunks = None
-
-        if not documents and not evidence_index_count:
-            return api_error(
-                "完整解析尚未完成，暂时没有可检索证据。",
-                409
-            )
 
         # =====================================================
         # 情况1：用户选中的是“主题节点”
@@ -3760,8 +5215,54 @@ def retrieve():
             indexed_chunks=indexed_chunks if evidence_index_count else None,
         )
 
+        # Search may be driven by text evidence, metadata, or a relation.  A
+        # selected result therefore carries catalog edges touching its source
+        # files, using exactly the contract consumed by reports and graphs.
+        result_paths = {
+            str(item.get("archive_source_path") or item.get("source_path") or "")
+            for item in (result.get("results") or [])
+        }
+        relation_items = []
+        for path in sorted(path for path in result_paths if path)[:50]:
+            catalog = storage.get_relationship_catalog(scan_id, source_path=path, limit=100)
+            relation_items.extend(catalog.get("items") or [])
+        relation_items = list({item.get("relation_key"): item for item in relation_items}.values())
+        result["relationship_catalog"] = {
+            "schema_version": "relationship-catalog/1.0",
+            "items": relation_items[:500],
+            "relationship_count": len(relation_items),
+            "matched_source_count": len(result_paths),
+            "feature_index_is_recall_only": True,
+        }
+        for relation in result["relationship_catalog"]["items"]:
+            relation["match_type"] = "relation"
+
         # 返回前端真正的逻辑范围
         result["scope"] = scope_key
+        result["search_status"] = _retrieval_search_status(
+            scan_id, scan_result, result, evidence_index_count
+        )
+
+        index_job_id = None
+        if result["search_status"].get("code") == "index_unavailable":
+            # A rebuild of durable deep documents alone cannot help a newly
+            # scanned package with no document rows yet.  Submit the normal
+            # resumable package pipeline so it creates the all-file preview
+            # index first; repeated requests safely reuse the same active job.
+            index_job_id, _created = storage.create_or_get_typed_job(
+                scan_id,
+                "analyze_package",
+                options={
+                    "workflow_source": "index_rebuild",
+                    "scope_label": "检索请求触发基础索引",
+                    "parse_mode": "accurate",
+                },
+                owner_id=_request_owner_id() or "legacy",
+            )
+            storage.set_package_processing_state(
+                scan_id, "running", "检索请求已提交基础索引任务"
+            )
+            result["search_status"]["index_job_id"] = index_job_id
 
         if node_id:
             result["node_id"] = node_id
@@ -3789,10 +5290,14 @@ def retrieve():
             ],
         )
 
-        return jsonify({
+        response = {
             "ok": True,
-            "retrieval": result
-        })
+            "retrieval": result,
+        }
+        if index_job_id:
+            response["job_id"] = index_job_id
+            response["status_url"] = "/api/jobs/{}".format(index_job_id)
+        return jsonify(response)
 
     except ValueError as exc:
         return api_error(
@@ -3820,7 +5325,7 @@ def ask_numeric():
             member_paths = set(node.get("member_paths") or [])
             documents = [item for item in documents if item.get("path") in member_paths]
         elif payload.get("path"):
-            member_paths = set(_physical_scope_member_paths(scan_result, payload.get("path") or "."))
+            member_paths = set(_requested_member_paths(scan_result, payload.get("path") or "."))
             documents = [item for item in documents if item.get("path") in member_paths]
         result = answer_question(payload.get("question", ""), documents)
         result["scope"] = "node:{}".format(node_id) if node_id else (payload.get("path") or ".")
@@ -3930,12 +5435,21 @@ def cancel_job(job_id):
         return api_error("分析任务不存在", 404)
     if job.get("status") in {"completed", "failed", "cancelled"}:
         return jsonify({"ok": True, "job": job, "cancelled": job.get("status") == "cancelled"})
-    job = storage.cancel_job(job_id)
+    package_pause = None
+    if job.get("task_type") in {"scan_and_analyze", "analyze_package"}:
+        package_pause = storage.pause_package_analysis_jobs(
+            job.get("scan_id"),
+            reason="用户结束本次运行；已完成检查点保留。",
+        )
+        job = storage.get_job(job_id, owner_id=_request_owner_id())
+    else:
+        job = storage.cancel_job(job_id)
     return jsonify({
         "ok": True,
         "job": _job_api_view(job),
         "cancel_requested": True,
         "cancelled": bool(job and job.get("status") == "cancelled"),
+        "package_pause": package_pause,
     })
 
 
@@ -3945,9 +5459,10 @@ def rerun_package_analysis():
     try:
         scan_id = payload.get("scan_id", "")
         scan_result = require_scan(scan_id)
-        if payload.get("parse_mode") in {"fast", "accurate"}:
+        if payload.get("parse_mode") in {"auto", "fast", "accurate"}:
             scan_result["parse_mode"] = payload["parse_mode"]
             storage.update_scan(scan_id, scan_result)
+        storage.set_package_processing_state(scan_id, "running", "用户重新执行完整分析")
         job_id, created = _start_analysis_job(scan_id)
         return jsonify({"ok": True, "job_id": job_id, "reused_active_job": not created})
     except ValueError as exc:
@@ -3970,6 +5485,7 @@ def retry_failed(scan_id):
             "target_paths": target_paths, "scope_label": "失败文件重试",
             "retry_failed": True, "workflow_source": "manual_selection",
         }
+        storage.set_package_processing_state(scan_id, "running", "用户重试失败文件")
         job_id, created = storage.create_or_get_typed_job(scan_id, "analyze_package", options=options, owner_id=_request_owner_id() or "legacy")
         return jsonify({"ok": True, "accepted": True, "job_id": job_id, "reused_active_job": not created, "retry_files": len(target_paths), "status_url": "/api/jobs/{}".format(job_id)}), 202
     except ValueError as exc:
@@ -3990,7 +5506,7 @@ def analyze_scope():
             label = node.get("name") or "主题节点"
         else:
             node_path = payload.get("path", ".")
-            member_paths = _physical_scope_member_paths(scan_result, node_path)
+            member_paths = _requested_member_paths(scan_result, node_path)
             label = node_path
         if not member_paths:
             raise ValueError("当前节点没有可补充分析的文件")
@@ -4009,15 +5525,43 @@ def analyze_scope():
         return api_error(str(exc), 400)
 
 
-def _summary_cache_valid(summary, summary_type, require_healthy=False):
-    """Reject stale folder evidence contracts while preserving file caches."""
+def _summary_cache_valid(summary, summary_type, require_healthy=False, require_model=False):
+    """Validate a summary for the requested depth and evidence contract.
+
+    A local parser preview is useful for browsing, but it is not a substitute
+    for the explicit "model deep summary" action.  ``require_model`` keeps
+    those two products separate and also invalidates summaries written by old
+    releases that did not record their provenance.
+    """
     if not summary or summary.get("schema_version") not in {3, 4}:
         return False
     if require_healthy and bool((summary.get("parser_info") or {}).get("degraded")):
         return False
+    if require_model:
+        generated_by = str(summary.get("generated_by") or "").strip().lower()
+        analysis_depth = str(summary.get("analysis_depth") or "").strip().lower()
+        if generated_by not in {"model-deep-analysis", "model"}:
+            return False
+        expected_depth = "deep_folder" if summary_type == "folder" else "deep_document"
+        if analysis_depth not in {expected_depth, "deep"}:
+            return False
+        if not str(summary.get("core_summary") or summary.get("summary") or "").strip():
+            return False
     if summary_type == "folder":
         return summary.get("evidence_contract") == "question-answer-evidence/3.0"
     return True
+
+
+def _summary_target_node(scan_result, node_path):
+    """Find a summary target in either the physical or logical inventory."""
+    node = _physical_inventory_node(scan_result, node_path)
+    if node:
+        return node
+    node = _inventory_by_path(scan_result).get(str(node_path or ""))
+    if node and node.get("logical_unit"):
+        resolve_under(scan_result["root"], node.get("container_path") or "")
+        return node
+    return None
 
 
 @app.route("/api/summary", methods=["POST"])
@@ -4039,7 +5583,9 @@ def summarize():
                 if node.get("kind") != "group":
                     raise ValueError("只有主题或子方向节点可以生成节点摘要")
                 cached = storage.get_summary(scan_id, "node:{}".format(node_id), "folder")
-                if force or not _summary_cache_valid(cached, "folder"):
+                if force or not _summary_cache_valid(
+                    cached, "folder", require_model=llm_generation_enabled
+                ):
                     require_local_model_enabled()
                     job_id, created = storage.create_or_get_typed_job(
                         scan_id, "generate_summary", options=payload, owner_id=_request_owner_id() or "legacy"
@@ -4050,12 +5596,17 @@ def summarize():
                         "status_url": "/api/jobs/{}".format(job_id),
                     }), 202
             else:
-                physical_node = _physical_inventory_node(scan_result, node_path)
+                physical_node = _summary_target_node(scan_result, node_path)
                 if not physical_node:
                     raise ValueError("节点不在本次安全清点范围内")
                 summary_type = "folder" if physical_node.get("kind") == "directory" or kind == "directory" else "file"
                 cached = storage.get_summary(scan_id, node_path, summary_type)
-                if force or not _summary_cache_valid(cached, summary_type, require_healthy=True):
+                if force or not _summary_cache_valid(
+                    cached,
+                    summary_type,
+                    require_healthy=True,
+                    require_model=llm_generation_enabled,
+                ):
                     require_local_model_enabled()
                     job_id, created = storage.create_or_get_typed_job(
                         scan_id, "generate_summary", options=payload, owner_id=_request_owner_id() or "legacy"
@@ -4072,7 +5623,12 @@ def summarize():
                 raise ValueError("只有主题或子方向节点可以生成节点摘要")
             cache_path = "node:{}".format(node_id)
             cached = storage.get_summary(scan_id, cache_path, "folder")
-            if _summary_cache_valid(cached, "folder") and not force:
+            if _summary_cache_valid(
+                cached,
+                "folder",
+                require_healthy=True,
+                require_model=llm_generation_enabled,
+            ) and not force:
                 return jsonify({"ok": True, "summary": cached, "cached": True, "degraded": bool(cached.get("parser_info", {}).get("degraded"))})
 
             context = _virtual_node_context(scan_id, node)
@@ -4095,28 +5651,45 @@ def summarize():
                     "batch_errors": batch_errors,
                     "degraded": bool(batch_errors or not result.get("model")),
                 }
+                generated["generated_by"] = (
+                    "model-deep-analysis" if result.get("model") else "local-fallback"
+                )
+                generated["analysis_depth"] = "deep_folder"
+                generated["deep_analysis"] = bool(result.get("model"))
                 summary = generated
             else:
                 summary = local_summary
                 summary["warnings"] = ["模型深度摘要未启用，已返回主题的本地结论—证据链。"]
+                summary["generated_by"] = "local-fallback"
+                summary["analysis_depth"] = "fallback"
+                summary["deep_analysis"] = False
 
             summary["node_path"] = cache_path
             summary["summary_type"] = "folder"
             summary["schema_version"] = 4
+            summary["summary"] = summary.get("summary") or summary.get("core_summary")
             summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
             storage.save_summary(scan_id, cache_path, "folder", summary)
             return jsonify({"ok": True, "summary": summary, "cached": False, "degraded": bool(summary.get("parser_info", {}).get("degraded"))})
 
-        physical_node = _physical_inventory_node(scan_result, node_path)
+        physical_node = _summary_target_node(scan_result, node_path)
         if not physical_node:
             raise ValueError("节点不在本次安全清点范围内")
-        selected = Path(scan_result["root"]) / node_path
+        selected = Path(scan_result["root"]) / str(
+            physical_node.get("container_path")
+            if physical_node.get("logical_unit") else node_path
+        )
         summary_type = "folder" if physical_node.get("kind") == "directory" or kind == "directory" else "file"
         local_only = not llm_generation_enabled
         if not local_only:
             require_local_model_enabled()
         cached = storage.get_summary(scan_id, node_path, summary_type)
-        if _summary_cache_valid(cached, summary_type, require_healthy=True) and not force:
+        if _summary_cache_valid(
+            cached,
+            summary_type,
+            require_healthy=True,
+            require_model=llm_generation_enabled,
+        ) and not force:
             degraded = bool(cached.get("parser_info", {}).get("degraded"))
             return jsonify({"ok": True, "summary": cached, "cached": True, "degraded": degraded})
         if summary_type == "folder" and local_only:
@@ -4132,6 +5705,9 @@ def summarize():
                 "coverage": context.get("coverage", {}), "local_model": None, "usage": {},
                 "batch_errors": batch_errors, "degraded": True,
             }
+            summary["generated_by"] = "local-fallback"
+            summary["analysis_depth"] = "fallback"
+            summary["deep_analysis"] = False
         elif summary_type == "folder":
             context = _folder_summary_context(scan_id, node_path, scan_result)
             summary, result, batch_errors = analyze_folder(llm, context, node_path)
@@ -4148,6 +5724,11 @@ def summarize():
                 "batch_errors": batch_errors,
                 "degraded": bool(batch_errors or not result.get("model")),
             }
+            summary["generated_by"] = (
+                "model-deep-analysis" if result.get("model") else "local-fallback"
+            )
+            summary["analysis_depth"] = "deep_folder"
+            summary["deep_analysis"] = bool(result.get("model"))
         else:
             unified_document = storage.get_document(scan_id, node_path)
             # In large-package mode the first pass stores a bounded projection.
@@ -4170,7 +5751,7 @@ def summarize():
                 raise ValueError("文件不在本次安全清点范围内")
             if needs_deep_parse or not unified_document:
                 deep_mode = "accurate"
-                with _secure_source_snapshot(scan_result["root"], source_node) as snapshot:
+                with _logical_source_snapshot(scan_result["root"], source_node) as snapshot:
                     unified_document = _parse_with_limits(parser, snapshot, node_path, mode=deep_mode)
                 _restore_source_provenance(unified_document, scan_result["root"], source_node)
                 storage.save_document(scan_id, node_path, unified_document)
@@ -4227,12 +5808,20 @@ def summarize():
                 "degraded": bool(
                     coverage.get("failed_chunks")
                     or any(item.get("output_truncated") for item in coverage.get("model_calls", []))
+                    or coverage.get("local_limit_truncated")
+                    or not (coverage.get("metadata", {}).get("coverage", {}).get("complete", True))
                     or not result.get("model")
                 ),
             }
+            summary["generated_by"] = (
+                "model-deep-analysis" if result.get("model") else "local-fallback"
+            )
+            summary["analysis_depth"] = "deep_document"
+            summary["deep_analysis"] = bool(result.get("model"))
         summary["node_path"] = node_path
         summary["summary_type"] = summary_type
         summary["schema_version"] = 4
+        summary["summary"] = summary.get("summary") or summary.get("core_summary")
         summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
         storage.save_summary(scan_id, node_path, summary_type, summary)
         degraded = bool(summary.get("parser_info", {}).get("degraded"))

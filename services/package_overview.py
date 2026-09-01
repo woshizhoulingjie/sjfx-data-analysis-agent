@@ -1073,6 +1073,20 @@ def build_package_overview_from_storage(storage, scan_id, *, limits=None, batch_
                 }
                 for item in content_map.get("topics") or []
             ]
+    # All consumers share the same normalized relationship contract.  The
+    # catalog keeps preview hints distinguishable from validated edges and
+    # deduplicates edges emitted by multiple analysis pipelines.
+    if hasattr(storage, "get_relationship_catalog"):
+        catalog = storage.get_relationship_catalog(scan_id)
+        if catalog.get("items"):
+            analysis = dict(analysis or {})
+            analysis["relationships"] = catalog["items"]
+            analysis["relationship_catalog"] = {
+                "schema_version": catalog.get("schema_version"),
+                "relationship_count": catalog.get("relationship_count"),
+                "truncated": catalog.get("truncated", False),
+                "contract": catalog.get("contract") or {},
+            }
     overview = build_package_overview(
         scan=scan, documents=documents, analysis=analysis, limits=limits,
     )

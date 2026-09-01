@@ -1,0 +1,90 @@
+.package-processing-panel {
+  margin-top: 16px;
+  padding: 18px;
+  border: 1px solid #cfe2d6;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #f4faf6 0%, #fffaf0 100%);
+}
+
+.package-processing-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.package-processing-heading h3 { margin-top: 5px; }
+
+.package-processing-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.package-processing-metrics > div {
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid #dbe8df;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .82);
+}
+
+.package-processing-metrics b,
+.package-processing-metrics span { display: block; }
+.package-processing-metrics b { color: var(--green-dark); font-size: 16px; }
+.package-processing-metrics span { margin-top: 4px; color: var(--muted); font-size: 10px; }
+.package-processing-panel p { margin: 12px 0 4px; color: var(--muted); }
+.package-processing-reason { display: block; color: var(--muted); }
+
+.package-processing-actions,
+.package-priority-query {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.package-priority-query input { min-width: 260px; flex: 1; }
+.package-continue-option { display: flex; align-items: center; gap: 8px; margin: 13px 0 7px; }
+.package-continue-option input { width: auto; }
+.package-processing-note { display: block; color: var(--muted); line-height: 1.6; }
+
+.file-workflow-surface { display: none; margin-top: 16px; }
+.app-view[data-view="packages"] > .file-workflow-surface { display: block; }
+.file-workflow-heading, .file-workflow-tools, .file-workflow-pagination {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.file-workflow-heading h3 { margin: 4px 0 0; font-size: 16px; }
+.file-workflow-total, .file-workflow-pagination, .file-workflow-row small { color: var(--muted); font-size: 11px; }
+.file-workflow-tools { justify-content: flex-start; margin: 13px 0 9px; }
+.file-workflow-tools select { width: min(210px, 100%); padding: 8px 10px; }
+.file-workflow-list { max-height: 355px; overflow: auto; border-top: 1px solid var(--line); }
+.file-workflow-row { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 5px 10px; align-items: center; padding: 9px 2px; border-bottom: 1px solid #edf0ed; }
+.file-workflow-row small { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-workflow-path { min-width: 0; overflow: hidden; padding: 0; border: 0; background: transparent; color: var(--green-dark); text-align: left; text-overflow: ellipsis; white-space: nowrap; box-shadow: none; }
+.file-workflow-path:hover:not(:disabled) { transform: none; box-shadow: none; text-decoration: underline; }
+.file-workflow-status { padding: 3px 6px; border-radius: 4px; background: #eef3ef; color: #375244; font-size: 10px; white-space: nowrap; }
+.file-workflow-status.status-failed { background: #fff0ee; color: #9b382c; }
+.file-workflow-status.status-retry_waiting, .file-workflow-status.status-partial { background: #fff6e7; color: #8a5d14; }
+.file-workflow-status.status-out_of_scope { background: #eef1f3; color: #5b6570; }
+.file-workflow-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.file-workflow-retry { padding: 3px 6px; border-radius: 4px; font-size: 10px; }
+.file-workflow-pagination { justify-content: flex-end; margin-top: 10px; }
+.file-workflow-pagination button { padding: 6px 9px; font-size: 11px; }
+.file-workflow-empty { padding: 18px 2px; color: var(--muted); font-size: 12px; }
+.evidence-card-actions { float: right; display: inline-flex; gap: 5px; margin: 0 0 6px 10px; }
+.evidence-source-link, .evidence-prioritize-link { padding: 4px 7px; border-radius: 5px; color: var(--green-dark); font-size: 10px; }
+.evidence-prioritize-link { border-color: #c9ddcf; background: #f1faf4; }
+
+@media (max-width: 760px) {
+  .package-processing-metrics { grid-template-columns: 1fr 1fr; }
+  .package-processing-actions button { width: 100%; }
+  .package-priority-query { flex-direction: column; }
+  .package-priority-query input { min-width: 0; }
+  .file-workflow-heading { align-items: flex-start; }
+  .file-workflow-tools { align-items: stretch; flex-direction: column; }
+  .file-workflow-tools select { width: 100%; }
+  .file-workflow-row { grid-template-columns: minmax(0, 1fr); }
+  .file-workflow-status { width: max-content; }
+}

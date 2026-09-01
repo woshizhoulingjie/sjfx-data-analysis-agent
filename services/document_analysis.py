@@ -2,11 +2,88 @@ import json
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 
 from services.ollama import LocalModelError
 from services.evidence import select_evidence
 from services.scanner import extract_text
 
+
+TOPIC_STOPWORDS = {
+    "the", "and", "for", "with", "from", "this", "that", "are", "was", "were",
+    "have", "has", "into", "using", "paper", "article", "document", "study",
+    "通过", "以及", "其中", "相关", "内容", "文件", "本文", "研究", "分析",
+}
+COMMON_TOPIC_WORDS = {
+    "shadow", "shadows", "cipher", "spaces", "exploiting", "tweak", "repetition",
+    "hardware", "memory", "encryption", "attack", "attacks", "security", "paper",
+    "privacy", "cryptography", "method", "methods", "experiment", "results", "system",
+    "data", "analysis", "network", "language", "model", "research", "evaluation",
+}
+
+
+def _topic_candidates(text):
+    values = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}", str(text or ""))
+    counter = Counter(value.casefold() for value in values if value.casefold() not in TOPIC_STOPWORDS)
+    return [value for value, _count in counter.most_common(80)]
+
+
+def _split_concatenated_topic(value, candidates):
+    """Recover boundaries in a model topic such as ``memoryencryption``."""
+    value = str(value or "").strip()
+    if not value or re.search(r"\s|[,，、;；/|]", value) or len(value) < 18:
+        return [value] if value else []
+    source = value.casefold()
+    vocabulary = sorted(
+        {item.casefold() for item in (list(candidates or []) + list(COMMON_TOPIC_WORDS)) if len(item) >= 3},
+        key=lambda item: (-len(item), item),
+    )
+    parts = []
+    index = 0
+    while index < len(source):
+        match = next((word for word in vocabulary if source.startswith(word, index)), None)
+        if not match:
+            end = index + 1
+            while end < len(source) and not any(source.startswith(word, end) for word in vocabulary):
+                end += 1
+            parts.append(source[index:end])
+            index = end
+        else:
+            parts.append(match)
+            index += len(match)
+    if len(parts) <= 1 or sum(len(item) for item in parts) < len(source) * 0.8:
+        return [value]
+    return parts
+
+
+def _normalise_topics(values, text, title="", limit=12):
+    candidates = _topic_candidates("{} {}".format(title, text))
+    output = []
+    for raw in values or []:
+        nested = raw if isinstance(raw, (list, tuple, set)) else re.split(r"[,，、;；/|\n]+", str(raw or ""))
+        for value in nested:
+            value = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n-—")
+            if not value:
+                continue
+            for piece in _split_concatenated_topic(value, candidates):
+                piece = piece.strip()
+                if piece and piece.casefold() not in TOPIC_STOPWORDS and piece not in output:
+                    output.append(piece)
+                if len(output) >= limit:
+                    return output
+    if len(output) < 2:
+        for candidate in candidates:
+            if candidate not in output:
+                output.append(candidate)
+            if len(output) >= limit:
+                break
+    return output[:limit]
+
+
+def _normalise_summary_topics(summary, text, title=""):
+    summary = dict(summary or {})
+    summary["topics"] = _normalise_topics(summary.get("topics") or [], text, title)
+    return summary
 
 def _estimated_tokens(text):
     """Conservative tokenizer-free estimate used only for prompt budgeting."""
@@ -201,7 +278,7 @@ def _local_merge(node_path, chunks, chunk_results, warnings):
         "basis": "基于已解析正文块的事实、章节和结论字段；未引入领域关键词或外部事实。",
         "questions": ["核心结论分别由哪些正文块和原文证据支持？", "不同正文块之间是否存在定义、口径或结论差异？", "失败块是否包含会改变整体判断的关键信息？"],
     }
-    return {
+    return _normalise_summary_topics({
         "title": node_path,
         "structure_overview": {"sections": _dedupe(sections), "document_type": "长文档"},
         "core_summary": "\n".join(value for value in summaries if value)[:12000],
@@ -212,7 +289,7 @@ def _local_merge(node_path, chunks, chunk_results, warnings):
         "uncertainties": [],
         "warnings": _dedupe(list(warnings) + limitations + errors),
         "recommended_research_direction": research,
-    }
+    }, "\n".join(summaries + facts + conclusions), node_path)
 
 
 def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
@@ -282,7 +359,9 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             required_fields=("core_summary",),
             output_context="全文文档分析",
         )
-        summary = result["json"]
+        summary = _normalise_summary_topics(
+            result["json"], text, extracted.get("metadata", {}).get("title") or node_path
+        )
         coverage["model_calls"] = [_model_call_profile(
             "full_document_analysis", result, 3200, context_window_tokens, 1,
         )]
@@ -366,7 +445,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             required_fields=("core_summary",),
             output_context="全文分块汇总",
         )
-        summary = final_result["json"]
+        summary = _normalise_summary_topics(final_result["json"], text, node_path)
     except LocalModelError as exc:
         summary = _local_merge(node_path, chunks, ordered, extracted["warnings"] + ["最终本地模型汇总失败：{}".format(exc)])
         final_result = {"model": None, "usage": {}, "content": ""}

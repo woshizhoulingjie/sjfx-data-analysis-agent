@@ -600,7 +600,7 @@ class CoreRegressionTests(unittest.TestCase):
             storage = Storage(root / "analysis.db")
             scan_id = storage.save_scan(scan)
             analysis = analyze_package(
-                scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000),
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=10000),
                 large_options={"threshold_bytes": 1, "initial_parse_files": 2, "deepen_batch_files": 2, "overview_chars_per_file": 500},
             )
             coverage = analysis["coverage"]
@@ -641,7 +641,7 @@ class CoreRegressionTests(unittest.TestCase):
                     scan_id,
                     scan,
                     storage,
-                    UnifiedDocumentParser(max_chars=12000),
+                    UnifiedDocumentParser(max_chars=100000),
                     large_options={
                         "threshold_bytes": 1,
                         "batch_files": 30,
@@ -708,7 +708,7 @@ class CoreRegressionTests(unittest.TestCase):
                 }
 
             analysis = analyze_package(
-                scan_id, scan, storage, UnifiedDocumentParser(max_chars=10000),
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000),
                 analysis_translation=add_working_translation,
             )
 
@@ -770,9 +770,9 @@ class CoreRegressionTests(unittest.TestCase):
             storage = Storage(root / "analysis.db")
             scan_id = storage.save_scan(scan)
             options = {"threshold_bytes": 1, "initial_parse_files": 2, "deepen_batch_files": 2, "overview_chars_per_file": 500}
-            analyze_package(scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000), large_options=options)
+            analyze_package(scan_id, scan, storage, UnifiedDocumentParser(max_chars=10000), large_options=options)
             analysis = analyze_package(
-                scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000),
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=10000),
                 large_options=options, target_paths=["doc1.txt"],
                 workflow_source="question_promotion",
             )
@@ -798,7 +798,7 @@ class CoreRegressionTests(unittest.TestCase):
                 "overview_chars_per_file": 500,
             }
             analyze_package(
-                scan_id, scan, storage, UnifiedDocumentParser(max_chars=1000),
+                scan_id, scan, storage, UnifiedDocumentParser(max_chars=10000),
                 large_options=options,
             )
             target = next(

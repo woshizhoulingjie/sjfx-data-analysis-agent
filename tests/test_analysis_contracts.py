@@ -51,18 +51,19 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertIn("parse_scratch_insufficient", plan["blockers"])
         self.assertEqual(plan["mandatory_hash_read_bytes"], 100 * 1024 ** 3)
 
-    def test_large_package_default_is_30_file_deep_batches_until_exhausted(self):
+    def test_large_package_default_is_resumable_500_file_full_queue(self):
         policy = build_policy({"file_count": 3000, "total_size": 1})
         self.assertTrue(policy["enabled"])
-        self.assertFalse(policy["full_inventory_processing"])
-        self.assertEqual(policy["batch_files"], 30)
-        self.assertGreaterEqual(policy["batch_files"], 20)
-        self.assertLessEqual(policy["batch_files"], 50)
+        self.assertTrue(policy["full_inventory_processing"])
+        self.assertEqual(policy["batch_files"], 500)
         self.assertEqual(policy["batch_completion"], "continue_until_inventory_exhausted")
         self.assertEqual(policy["batch_checkpoint_scope"], "per_file")
-        self.assertEqual(policy["deep_batch_contract"], "one_durable_job_per_20_to_50_files")
+        self.assertEqual(
+            policy["deep_batch_contract"],
+            "one_logical_batch_up_to_500_files_with_bounded_subtasks",
+        )
 
-    def test_pipeline_coverage_keeps_all_nine_stages_separate(self):
+    def test_pipeline_coverage_keeps_all_stages_separate(self):
         workflow = {
             "a.txt": {
                 "safety_status": "checked", "light_index_status": "ready",
@@ -90,6 +91,7 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertEqual(set(coverage["pipeline_coverage"]), {
             "inventory", "safety", "light_index", "content_parse", "ocr",
             "selection", "deep_analysis", "translation", "evidence_readiness",
+            "logical_queue",
         })
         self.assertTrue(coverage["light_index_coverage"]["complete"])
         self.assertEqual(coverage["content_parse_ratio"], 0.5)

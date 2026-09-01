@@ -151,6 +151,32 @@ def _tfidf_scores(texts, query):
         return [0.0] * len(texts), False
 
 
+def _match_type(item):
+    """Classify the persisted evidence channel used for a hit.
+
+    The evidence index is shared by original text, bounded previews and
+    translation units.  Keeping the classification beside retrieval means
+    every caller gets the same truthful label instead of inferring it from a
+    display string.
+    """
+    item = item or {}
+    index_kind = str(item.get("index_kind") or "").strip().casefold()
+    label = str(item.get("label") or "").strip().casefold()
+    if item.get("relation_hit") or index_kind in {"relation", "relationship"}:
+        return "relation"
+    if index_kind in {"metadata", "file_metadata", "catalog_metadata"}:
+        return "metadata"
+    if index_kind in {"summary", "document_summary", "folder_summary"} or label in {
+        "summary", "document_summary", "folder_summary",
+    }:
+        return "summary"
+    if index_kind == "translation" or label == "translation_unit":
+        return "translation"
+    if bool(item.get("preview_only")):
+        return "preview_text"
+    return "full_text"
+
+
 def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
                       candidate_evidence_ids=None, indexed_chunks=None):
     query = re.sub(r"\s+", " ", str(query or "")).strip()
@@ -175,6 +201,7 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
             "method": "BM25 + 本地 TF-IDF 字符向量",
             "corpus_chunks": 0,
             "results": [],
+            "match_type_counts": {},
             "warnings": ["当前范围没有可检索正文证据。"],
             "index_mode": index_mode,
         }
@@ -211,9 +238,11 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
         payload["retrieval_score"] = round(float(combined), 6)
         payload["bm25_score"] = round(float(lexical), 6)
         payload["vector_score"] = round(float(vector), 6)
+        payload["match_type"] = _match_type(payload)
         results.append(payload)
         if len(results) >= max(1, min(int(top_k), 50)):
             break
+    match_type_counts = Counter(item.get("match_type") or "full_text" for item in results)
     return {
         "query": query,
         "scope": scope,
@@ -221,6 +250,7 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
         "corpus_chunks": len(chunks),
         "result_count": len(results),
         "results": results,
+        "match_type_counts": dict(match_type_counts),
         "warnings": [] if results else ["未找到与问题有明显相关性的证据。"],
         "index_mode": index_mode,
     }

@@ -195,6 +195,13 @@ class Storage:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS package_processing_controls (
+                    scan_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL DEFAULT 'running',
+                    pause_requested INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS file_analysis_states (
                     scan_id TEXT NOT NULL,
                     node_path TEXT NOT NULL,
@@ -350,16 +357,91 @@ class Storage:
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (scan_id, node_path)
                 );
+                CREATE TABLE IF NOT EXISTS file_relation_features (
+                    scan_id TEXT NOT NULL,
+                    node_path TEXT NOT NULL,
+                    feature_kind TEXT NOT NULL,
+                    feature_value TEXT NOT NULL,
+                    weight REAL NOT NULL DEFAULT 1,
+                    PRIMARY KEY (scan_id, node_path, feature_kind, feature_value)
+                );
                 CREATE TABLE IF NOT EXISTS package_content_maps (
                     scan_id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS relationship_catalog (
+                    scan_id TEXT NOT NULL,
+                    relation_key TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    target_path TEXT NOT NULL,
+                    relation_type TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, relation_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_relationship_catalog_source
+                    ON relationship_catalog(scan_id, source_path);
+                CREATE INDEX IF NOT EXISTS idx_relationship_catalog_target
+                    ON relationship_catalog(scan_id, target_path);
                 CREATE TABLE IF NOT EXISTS package_overviews (
                     scan_id TEXT PRIMARY KEY,
                     schema_version TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS homogeneous_analyses (
+                    scan_id TEXT PRIMARY KEY,
+                    schema_version TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS homogeneous_records (
+                    scan_id TEXT NOT NULL,
+                    node_path TEXT NOT NULL,
+                    document_date TEXT,
+                    document_number TEXT,
+                    sender TEXT,
+                    recipient TEXT,
+                    subject TEXT,
+                    matter_id TEXT,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, node_path)
+                );
+                CREATE TABLE IF NOT EXISTS homogeneous_relations (
+                    scan_id TEXT NOT NULL,
+                    relation_id TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    target_path TEXT NOT NULL,
+                    relation_type TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, relation_id)
+                );
+                CREATE TABLE IF NOT EXISTS homogeneous_cases (
+                    scan_id TEXT NOT NULL,
+                    case_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    document_count INTEGER NOT NULL DEFAULT 0,
+                    start_date TEXT,
+                    end_date TEXT,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, case_id)
+                );
+                CREATE TABLE IF NOT EXISTS homogeneous_anomalies (
+                    scan_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    anomaly_type TEXT NOT NULL,
+                    node_path TEXT,
+                    severity TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (scan_id, position)
                 );
                 CREATE TABLE IF NOT EXISTS document_translations (
                     scan_id TEXT NOT NULL,
@@ -478,6 +560,8 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_summaries_scan_path ON summaries(scan_id, node_path);
                 CREATE INDEX IF NOT EXISTS idx_retrieval_sessions_scan_created ON retrieval_sessions(scan_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_file_analysis_states_scan_status ON file_analysis_states(scan_id, status);
+                CREATE INDEX IF NOT EXISTS idx_package_processing_controls_state
+                    ON package_processing_controls(state, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_file_workflow_states_scan_selection
                     ON file_workflow_states(scan_id, selection_state, node_path);
                 CREATE INDEX IF NOT EXISTS idx_file_workflow_states_scan_workflow
@@ -498,8 +582,24 @@ class Storage:
                     ON file_previews(scan_id, status, node_path);
                 CREATE INDEX IF NOT EXISTS idx_file_previews_scan_language
                     ON file_previews(scan_id, language_code, node_path);
+                CREATE INDEX IF NOT EXISTS idx_file_relation_features_lookup
+                    ON file_relation_features(scan_id, feature_kind, feature_value, node_path);
                 CREATE INDEX IF NOT EXISTS idx_document_translations_scan_status
                     ON document_translations(scan_id, status, node_path);
+                CREATE INDEX IF NOT EXISTS idx_homogeneous_records_date
+                    ON homogeneous_records(scan_id, document_date, node_path);
+                CREATE INDEX IF NOT EXISTS idx_homogeneous_records_number
+                    ON homogeneous_records(scan_id, document_number);
+                CREATE INDEX IF NOT EXISTS idx_homogeneous_records_matter
+                    ON homogeneous_records(scan_id, matter_id, document_date);
+                CREATE INDEX IF NOT EXISTS idx_homogeneous_relations_source
+                    ON homogeneous_relations(scan_id, source_path, relation_type);
+                CREATE INDEX IF NOT EXISTS idx_homogeneous_relations_target
+                    ON homogeneous_relations(scan_id, target_path, relation_type);
+                CREATE INDEX IF NOT EXISTS idx_homogeneous_cases_size
+                    ON homogeneous_cases(scan_id, document_count DESC, title);
+                CREATE INDEX IF NOT EXISTS idx_homogeneous_anomalies_type
+                    ON homogeneous_anomalies(scan_id, anomaly_type, severity);
                 CREATE INDEX IF NOT EXISTS idx_conversations_scan_owner
                     ON conversations(scan_id, owner_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_conversation_messages_session
@@ -559,8 +659,15 @@ class Storage:
                     DELETE FROM analysis_progress WHERE scan_id=OLD.id;
                     DELETE FROM tree_nodes WHERE scan_id=OLD.id;
                     DELETE FROM file_previews WHERE scan_id=OLD.id;
+                    DELETE FROM file_relation_features WHERE scan_id=OLD.id;
                     DELETE FROM package_content_maps WHERE scan_id=OLD.id;
+                    DELETE FROM relationship_catalog WHERE scan_id=OLD.id;
                     DELETE FROM package_overviews WHERE scan_id=OLD.id;
+                    DELETE FROM homogeneous_analyses WHERE scan_id=OLD.id;
+                    DELETE FROM homogeneous_records WHERE scan_id=OLD.id;
+                    DELETE FROM homogeneous_relations WHERE scan_id=OLD.id;
+                    DELETE FROM homogeneous_cases WHERE scan_id=OLD.id;
+                    DELETE FROM homogeneous_anomalies WHERE scan_id=OLD.id;
                     DELETE FROM document_translations WHERE scan_id=OLD.id;
                 END;
             """)
@@ -995,7 +1102,8 @@ class Storage:
                 "source_path", "source_language", "language_detection",
                 "target_language", "provider_id", "glossary_fingerprint",
                 "status", "translation_required", "cancelled", "progress",
-                "errors", "updated_at", "translated_title", "source_level",
+                "errors", "updated_at", "original_title", "working_title",
+                "translated_title", "source_level",
                 "full_translation",
             )
             if key in payload
@@ -1552,7 +1660,26 @@ class Storage:
                     terms.extend((value[:3], value[:4]))
             else:
                 terms.append(value)
-        return list(dict.fromkeys(item for item in terms if item))[:16]
+        # Deterministic concept expansion keeps natural-language recall useful
+        # even when the optional embedding service is unavailable. These are
+        # retrieval candidates only; final answers still require source
+        # evidence and therefore cannot be manufactured by the expansion.
+        concept_groups = (
+            ("逾期", "未支付", "拖欠", "欠款", "没有按时付款", "付款延迟", "支付延迟"),
+            ("解除合同", "终止合同", "合同终止", "解约", "撤销合同"),
+            ("欺诈", "诈骗", "虚假陈述", "伪造", "造假"),
+            ("违约", "违反约定", "未履行", "不履行", "履约失败"),
+            ("赔偿", "损害赔偿", "补偿", "损失承担", "赔付"),
+            ("发票", "票据", "账单", "付款凭证", "收据"),
+        )
+        compact_query = re.sub(r"\s+", "", text)
+        for group in concept_groups:
+            if any(re.sub(r"\s+", "", item) in compact_query for item in group):
+                for item in group:
+                    terms.append(item)
+                    if re.fullmatch(r"[\u4e00-\u9fff]+", item):
+                        terms.extend(item[index:index + 2] for index in range(len(item) - 1))
+        return list(dict.fromkeys(item for item in terms if item))[:64]
 
     def search_evidence_index(self, scan_id, query, scope=".", source_paths=None,
                               candidate_evidence_ids=None, limit=2500):
@@ -2120,6 +2247,60 @@ class Storage:
                         "position": int(row["position"]), "kind": row["kind"],
                         "payload": json.loads(row["payload"]),
                     }
+
+    def replace_logical_inventory_entries(self, scan_id, units, batch_size=5000):
+        """Replace derived logical children without changing physical totals."""
+        scan_id = str(scan_id)
+        batch_size = max(100, min(20000, int(batch_size or 5000)))
+        inserted = 0
+        containers = set()
+        with self.lock, self._connect() as conn:
+            conn.execute("DELETE FROM inventory_entries WHERE scan_id=? AND kind='logical_file'", (scan_id,))
+            batch = []
+            for position, unit in enumerate(units or []):
+                unit = dict(unit or {})
+                node_path = str(unit.get("path") or "")
+                container = str(unit.get("container_path") or "")
+                if not node_path or not container:
+                    continue
+                containers.add(container)
+                batch.append((
+                    scan_id, node_path, container, position, "logical_file",
+                    json.dumps(unit, ensure_ascii=False, separators=(",", ":")),
+                ))
+                if len(batch) >= batch_size:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO inventory_entries("
+                        "scan_id,node_path,parent_path,position,kind,payload,updated_at) "
+                        "VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)", batch,
+                    )
+                    inserted += len(batch)
+                    batch = []
+            if batch:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO inventory_entries("
+                    "scan_id,node_path,parent_path,position,kind,payload,updated_at) "
+                    "VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)", batch,
+                )
+                inserted += len(batch)
+            row = conn.execute("SELECT payload FROM scans WHERE id=?", (scan_id,)).fetchone()
+            if row:
+                payload = json.loads(row["payload"])
+                payload["logical_file_count"] = inserted
+                payload["logical_container_count"] = len(containers)
+                conn.execute(
+                    "UPDATE scans SET payload=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), scan_id),
+                )
+        return {"logical_file_count": inserted, "logical_container_count": len(containers)}
+
+    def count_logical_inventory_entries(self, scan_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS value FROM inventory_entries WHERE scan_id=? AND kind='logical_file'",
+                (str(scan_id),),
+            ).fetchone()
+        return int(row["value"] or 0) if row else 0
 
     def count_inventory_files(self, scan_id, scope=".", source_paths=None,
                               extension=None):
@@ -2825,7 +3006,12 @@ class Storage:
     def iter_structured_documents(
         self, scan_id, hydrate=False, batch_size=100, source_paths=None
     ):
-        """Yield only documents with structured profiles using SQLite JSON filters."""
+        """Yield only documents with structured profiles.
+
+        SQLite JSON1 is preferred for the large-package path.  Some supported
+        Python/SQLite builds omit that extension, so retain a streaming
+        payload filter rather than failing every structured-data query.
+        """
         batch_size = max(1, min(500, int(batch_size or 100)))
         source_paths = sorted(set(
             str(item) for item in (source_paths or []) if item
@@ -2847,13 +3033,26 @@ class Storage:
                     "WHERE d.node_path=a.path OR d.node_path LIKE a.path || '/%' "
                     "OR d.node_path LIKE a.path || '::%') "
                 )
-            cursor = conn.execute(
-                "SELECT d.node_path,d.payload FROM unified_documents d WHERE d.scan_id=? "
-                "AND (json_type(payload,'$.data_profile') IS NOT NULL "
-                "OR json_array_length(COALESCE(json_extract(payload,'$.data_profiles'),'[]'))>0) "
-                + source_filter + "ORDER BY d.node_path",
-                (str(scan_id),),
-            )
+            fallback_payload_filter = False
+            try:
+                cursor = conn.execute(
+                    "SELECT d.node_path,d.payload FROM unified_documents d WHERE d.scan_id=? "
+                    "AND (json_type(payload,'$.data_profile') IS NOT NULL "
+                    "OR json_array_length(COALESCE(json_extract(payload,'$.data_profiles'),'[]'))>0) "
+                    + source_filter + "ORDER BY d.node_path",
+                    (str(scan_id),),
+                )
+            except sqlite3.OperationalError as exc:
+                if "json_" not in str(exc).lower() and "no such function: json" not in str(exc).lower():
+                    raise
+                # Preserve source-path filtering in SQL.  Only the structured
+                # profile predicate is evaluated per row below.
+                fallback_payload_filter = True
+                cursor = conn.execute(
+                    "SELECT d.node_path,d.payload FROM unified_documents d WHERE d.scan_id=? "
+                    + source_filter + "ORDER BY d.node_path",
+                    (str(scan_id),),
+                )
             try:
                 while True:
                     rows = cursor.fetchmany(batch_size)
@@ -2864,6 +3063,10 @@ class Storage:
                             self._load_document_payload(row["payload"])
                             if hydrate else json.loads(row["payload"])
                         )
+                        if fallback_payload_filter and not (
+                            payload.get("data_profile") or payload.get("data_profiles")
+                        ):
+                            continue
                         yield {"path": row["node_path"], "payload": payload}
             finally:
                 cursor.close()
@@ -3117,6 +3320,263 @@ class Storage:
             ).fetchall()
         return {row["status"]: int(row["value"]) for row in rows}
 
+    def rebuild_file_relation_features(self, scan_id, rows, batch_size=5000):
+        """Replace the scalable all-file relation feature index.
+
+        The user-facing content map remains intentionally small. This table is
+        the complete recall substrate and is queried in SQLite, so relation
+        recall is not limited by the graph preview's 1,200-edge display cap.
+        """
+        scan_id = str(scan_id)
+        batch_size = max(100, min(20000, int(batch_size or 5000)))
+        inserted = 0
+        with self.lock, self._connect() as conn:
+            conn.execute("DELETE FROM file_relation_features WHERE scan_id=?", (scan_id,))
+            batch = []
+            for node_path, kind, value, weight in rows or []:
+                node_path = str(node_path or "")
+                kind = str(kind or "")[:40]
+                value = re.sub(r"\s+", " ", str(value or "")).strip().casefold()[:240]
+                if not node_path or not kind or not value:
+                    continue
+                batch.append((scan_id, node_path, kind, value, float(weight or 1.0)))
+                if len(batch) >= batch_size:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO file_relation_features("
+                        "scan_id,node_path,feature_kind,feature_value,weight) VALUES (?,?,?,?,?)",
+                        batch,
+                    )
+                    inserted += len(batch)
+                    batch = []
+            if batch:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO file_relation_features("
+                    "scan_id,node_path,feature_kind,feature_value,weight) VALUES (?,?,?,?,?)",
+                    batch,
+                )
+                inserted += len(batch)
+        return inserted
+
+    def clear_file_relation_features(self, scan_id):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM file_relation_features WHERE scan_id=?", (str(scan_id),)
+            )
+
+    def append_file_relation_features(self, scan_id, rows):
+        prepared = []
+        for node_path, kind, value, weight in rows or []:
+            node_path = str(node_path or "")
+            kind = str(kind or "")[:40]
+            value = re.sub(r"\s+", " ", str(value or "")).strip().casefold()[:240]
+            if node_path and kind and value:
+                prepared.append((str(scan_id), node_path, kind, value, float(weight or 1.0)))
+        if not prepared:
+            return 0
+        with self.lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO file_relation_features("
+                "scan_id,node_path,feature_kind,feature_value,weight) VALUES (?,?,?,?,?)",
+                prepared,
+            )
+        return len(prepared)
+
+    def recall_file_relation_features(self, scan_id, completed_paths,
+                                      eligible_paths, limit=5000):
+        """Recall all-file neighbours with inverse-frequency feature scoring."""
+        completed = sorted({str(path) for path in completed_paths or [] if path})
+        eligible = sorted({str(path) for path in eligible_paths or [] if path})
+        if not completed or not eligible:
+            return []
+        limit = max(1, min(5000, int(limit or 5000)))
+        with self._connect() as conn:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS relation_completed(path TEXT PRIMARY KEY)")
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS relation_eligible(path TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM relation_completed")
+            conn.execute("DELETE FROM relation_eligible")
+            conn.executemany("INSERT OR IGNORE INTO relation_completed(path) VALUES (?)", [(p,) for p in completed])
+            conn.executemany("INSERT OR IGNORE INTO relation_eligible(path) VALUES (?)", [(p,) for p in eligible])
+            rows = conn.execute(
+                "WITH frequencies AS ("
+                " SELECT feature_kind,feature_value,COUNT(*) AS n"
+                " FROM file_relation_features WHERE scan_id=?"
+                " GROUP BY feature_kind,feature_value HAVING n BETWEEN 2 AND 10000"
+                "), source_features AS ("
+                " SELECT DISTINCT f.feature_kind,f.feature_value"
+                " FROM file_relation_features f JOIN relation_completed c ON c.path=f.node_path"
+                " WHERE f.scan_id=?"
+                ")"
+                " SELECT target.node_path,"
+                " SUM((target.weight*1.0)/frequencies.n) AS score,"
+                " GROUP_CONCAT(target.feature_kind || ':' || target.feature_value, ' | ') AS reasons"
+                " FROM source_features source"
+                " JOIN frequencies ON frequencies.feature_kind=source.feature_kind"
+                "  AND frequencies.feature_value=source.feature_value"
+                " JOIN file_relation_features target ON target.scan_id=?"
+                "  AND target.feature_kind=source.feature_kind"
+                "  AND target.feature_value=source.feature_value"
+                " JOIN relation_eligible e ON e.path=target.node_path"
+                " GROUP BY target.node_path ORDER BY score DESC,target.node_path LIMIT ?",
+                (str(scan_id), str(scan_id), str(scan_id), limit),
+            ).fetchall()
+        output = []
+        for row in rows:
+            reasons = list(dict.fromkeys(
+                item.strip() for item in str(row["reasons"] or "").split(" | ") if item.strip()
+            ))[:8]
+            output.append({
+                "path": row["node_path"],
+                "score": round(float(row["score"] or 0.0), 6),
+                "reasons": reasons,
+            })
+        return output
+
+    def count_file_relation_features(self, scan_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS value FROM file_relation_features WHERE scan_id=?",
+                (str(scan_id),),
+            ).fetchone()
+        return int(row["value"] or 0) if row else 0
+
+    @staticmethod
+    def _normalize_relationship(item, source_kind):
+        """Convert all relationship producers to one auditable edge contract.
+
+        Feature-index rows deliberately do not enter here: they are retrieval
+        hints, not asserted edges between two files.  Keeping that distinction
+        prevents a shared keyword from being rendered as a confirmed relation.
+        """
+        item = dict(item or {})
+        source = str(item.get("source_path") or item.get("source") or "").strip()
+        target = str(item.get("target_path") or item.get("target") or "").strip()
+        if not source or not target or source == target:
+            return None
+        relation_type = str(item.get("relation_type") or item.get("type") or "related").strip()[:80]
+        try:
+            confidence = float(item.get("confidence", item.get("weight", 0)) or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        # Preview weights are counts rather than calibrated probabilities.
+        if source_kind == "preview_content_map":
+            confidence = min(0.69, 0.30 + 0.08 * max(0.0, confidence))
+        confidence = max(0.0, min(1.0, confidence))
+        reasons = item.get("reasons") or item.get("reason") or []
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        evidence = item.get("evidence") or item.get("evidence_ids") or []
+        if isinstance(evidence, dict):
+            evidence = [evidence]
+        elif isinstance(evidence, str):
+            evidence = [evidence]
+        key = hashlib.sha256(
+            "\\0".join((source, target, relation_type)).encode("utf-8", errors="replace")
+        ).hexdigest()
+        return {
+            "relation_id": str(item.get("relation_id") or key[:20]),
+            "relation_key": key,
+            "source_path": source,
+            "target_path": target,
+            "relation_type": relation_type or "related",
+            "confidence": round(confidence, 4),
+            "status": str(item.get("status") or "derived"),
+            "calibration": "validated" if source_kind == "homogeneous_analysis" else "derived",
+            "source_kinds": [source_kind],
+            "reasons": list(reasons)[:20],
+            "evidence": list(evidence)[:30],
+        }
+
+    def rebuild_relationship_catalog(self, scan_id):
+        """Merge edge-producing analyses into the shared relationship contract.
+
+        The operation is intentionally idempotent and bounded by persisted
+        analysis output.  Consumers use this catalog rather than silently
+        mixing validated edges with preview hints on their own.
+        """
+        scan_id = str(scan_id)
+        with self.lock, self._connect() as conn:
+            homogeneous = conn.execute(
+                "SELECT payload FROM homogeneous_relations WHERE scan_id=?", (scan_id,)
+            ).fetchall()
+            package_row = conn.execute(
+                "SELECT payload FROM package_analyses WHERE scan_id=?", (scan_id,)
+            ).fetchone()
+            map_row = conn.execute(
+                "SELECT payload FROM package_content_maps WHERE scan_id=?", (scan_id,)
+            ).fetchone()
+            candidates = []
+            for row in homogeneous:
+                candidates.append((json.loads(row["payload"]), "homogeneous_analysis"))
+            if package_row:
+                package = json.loads(package_row["payload"])
+                for key in ("file_relationships", "relationships"):
+                    value = package.get(key) or []
+                    if isinstance(value, dict):
+                        value = value.get("items") or value.get("relationships") or []
+                    candidates.extend((item, "package_analysis") for item in value if isinstance(item, dict))
+                graph = package.get("relationship_graph") or {}
+                candidates.extend((item, "package_analysis") for item in (graph.get("edges") or []) if isinstance(item, dict))
+            if map_row:
+                content_map = json.loads(map_row["payload"])
+                candidates.extend((item, "preview_content_map") for item in (content_map.get("relationships") or []) if isinstance(item, dict))
+
+            merged = {}
+            for item, source_kind in candidates:
+                relation = self._normalize_relationship(item, source_kind)
+                if not relation:
+                    continue
+                current = merged.get(relation["relation_key"])
+                if current is None:
+                    merged[relation["relation_key"]] = relation
+                    continue
+                current["confidence"] = max(current["confidence"], relation["confidence"])
+                current["source_kinds"] = sorted(set(current["source_kinds"] + relation["source_kinds"]))
+                current["reasons"] = (current["reasons"] + [x for x in relation["reasons"] if x not in current["reasons"]])[:20]
+                current["evidence"] = (current["evidence"] + [x for x in relation["evidence"] if x not in current["evidence"]])[:30]
+                if "validated" in (current["calibration"], relation["calibration"]):
+                    current["calibration"] = "validated"
+            conn.execute("DELETE FROM relationship_catalog WHERE scan_id=?", (scan_id,))
+            conn.executemany(
+                "INSERT INTO relationship_catalog(scan_id,relation_key,source_path,target_path,relation_type,confidence,payload,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                [(scan_id, item["relation_key"], item["source_path"], item["target_path"],
+                  item["relation_type"], item["confidence"], json.dumps(item, ensure_ascii=False))
+                 for item in merged.values()],
+            )
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (scan_id,))
+        return len(merged)
+
+    def get_relationship_catalog(self, scan_id, source_path=None, limit=2000, refresh=False):
+        scan_id = str(scan_id)
+        limit = max(1, min(10000, int(limit or 2000)))
+        if refresh:
+            self.rebuild_relationship_catalog(scan_id)
+        with self._connect() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS value FROM relationship_catalog WHERE scan_id=?", (scan_id,)
+            ).fetchone()
+        if not int(count["value"] or 0):
+            self.rebuild_relationship_catalog(scan_id)
+        clauses, values = ["scan_id=?"], [scan_id]
+        if source_path:
+            clauses.append("(source_path=? OR target_path=?)")
+            values.extend((str(source_path), str(source_path)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM relationship_catalog WHERE {} ORDER BY confidence DESC,relation_key LIMIT ?".format(" AND ".join(clauses)),
+                values + [limit],
+            ).fetchall()
+            total = conn.execute(
+                "SELECT COUNT(*) AS value FROM relationship_catalog WHERE {}".format(" AND ".join(clauses)), values,
+            ).fetchone()
+        return {
+            "schema_version": "relationship-catalog/1.0",
+            "items": [json.loads(row["payload"]) for row in rows],
+            "relationship_count": int(total["value"] or 0),
+            "truncated": int(total["value"] or 0) > len(rows),
+            "contract": {"feature_index_is_recall_only": True, "sources": ["homogeneous_analysis", "package_analysis", "preview_content_map"]},
+        }
+
     def save_content_map(self, scan_id, payload):
         with self.lock, self._connect() as conn:
             conn.execute(
@@ -3125,6 +3585,7 @@ class Storage:
                 (str(scan_id), json.dumps(payload or {}, ensure_ascii=False)),
             )
             conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
+            conn.execute("DELETE FROM relationship_catalog WHERE scan_id=?", (str(scan_id),))
 
     def get_content_map(self, scan_id):
         with self._connect() as conn:
@@ -3290,6 +3751,213 @@ class Storage:
             finally:
                 cursor.close()
 
+    @staticmethod
+    def _translation_list_query():
+        """Return the compact, durable source for the translation workbench.
+
+        Translation rows alone are not a complete work list: a large package
+        can contain many language-classified files which have not been
+        translated yet.  The union intentionally contains only persisted
+        metadata keys, never document or preview bodies, so filtering and
+        paging remain bounded even when the package has large sidecars.
+        """
+        return """
+            WITH candidate_paths AS (
+                SELECT node_path FROM document_translations WHERE scan_id=?
+                UNION SELECT node_path FROM file_workflow_states WHERE scan_id=?
+                UNION SELECT node_path FROM file_previews WHERE scan_id=?
+                UNION SELECT node_path FROM unified_documents WHERE scan_id=?
+            ), joined AS (
+                SELECT
+                    paths.node_path,
+                    translation.status AS translation_status,
+                    translation.source_language AS translation_language,
+                    translation.payload AS translation_payload,
+                    translation.updated_at AS translation_updated_at,
+                    workflow.language_code AS workflow_language,
+                    workflow.updated_at AS workflow_updated_at,
+                    preview.language_code AS preview_language,
+                    preview.status AS preview_status,
+                    preview.updated_at AS preview_updated_at,
+                    document.created_at AS document_created_at,
+                    CASE
+                        WHEN document.node_path IS NOT NULL THEN 'document'
+                        WHEN preview.node_path IS NOT NULL THEN 'preview'
+                        ELSE 'metadata'
+                    END AS source_availability
+                FROM candidate_paths paths
+                LEFT JOIN document_translations translation
+                    ON translation.scan_id=? AND translation.node_path=paths.node_path
+                LEFT JOIN file_workflow_states workflow
+                    ON workflow.scan_id=? AND workflow.node_path=paths.node_path
+                LEFT JOIN file_previews preview
+                    ON preview.scan_id=? AND preview.node_path=paths.node_path
+                LEFT JOIN unified_documents document
+                    ON document.scan_id=? AND document.node_path=paths.node_path
+            ), projected AS (
+                SELECT
+                    node_path,
+                    COALESCE(NULLIF(LOWER(translation_status), ''), 'not_started') AS status,
+                    CASE
+                        WHEN LOWER(COALESCE(translation_language, '')) LIKE 'zh%' THEN 'zh'
+                        WHEN LOWER(COALESCE(translation_language, '')) NOT IN ('', 'unknown')
+                            THEN LOWER(translation_language)
+                        WHEN LOWER(COALESCE(workflow_language, '')) LIKE 'zh%' THEN 'zh'
+                        WHEN LOWER(COALESCE(workflow_language, '')) NOT IN ('', 'unknown')
+                            THEN LOWER(workflow_language)
+                        WHEN LOWER(COALESCE(preview_language, '')) LIKE 'zh%' THEN 'zh'
+                        WHEN LOWER(COALESCE(preview_language, '')) NOT IN ('', 'unknown')
+                            THEN LOWER(preview_language)
+                        ELSE 'unknown'
+                    END AS source_language,
+                    translation_payload,
+                    preview_status,
+                    source_availability,
+                    COALESCE(
+                        translation_updated_at, workflow_updated_at,
+                        preview_updated_at, document_created_at
+                    ) AS updated_at
+                FROM joined
+            )
+        """
+
+    @staticmethod
+    def _translation_list_filter(status=None, statuses=None, language=None, query=None):
+        """Build a validated SQL predicate for the translation work list."""
+        valid_statuses = {
+            'all', 'completed', 'partial', 'failed', 'not_required',
+            'not_started', 'pending', 'running', 'cancelled',
+            'cache_unavailable',
+        }
+        raw_statuses = statuses if statuses is not None else [status]
+        if isinstance(raw_statuses, str):
+            raw_statuses = [raw_statuses]
+        normalized_statuses = []
+        for value in raw_statuses or []:
+            value = str(value or '').strip().lower()
+            if not value or value == 'all':
+                continue
+            if value not in valid_statuses:
+                raise ValueError('未知翻译状态筛选条件')
+            if value not in normalized_statuses:
+                normalized_statuses.append(value)
+
+        language = str(language or 'all').strip().lower()
+        if language != 'all' and language != 'foreign' and not re.match(
+            r'^[a-z0-9][a-z0-9_-]{0,31}$', language
+        ):
+            raise ValueError('未知源语言筛选条件')
+
+        query = str(query or '').strip()
+        if len(query) > 500:
+            raise ValueError('文件搜索条件不能超过 500 个字符')
+
+        clauses = []
+        values = []
+        if normalized_statuses:
+            clauses.append('status IN ({})'.format(','.join('?' for _ in normalized_statuses)))
+            values.extend(normalized_statuses)
+        if language == 'foreign':
+            clauses.append("source_language NOT IN ('zh', 'unknown')")
+        elif language != 'all':
+            clauses.append('source_language=?')
+            values.append(language)
+        if query:
+            # Treat `%`, `_` and `\\` as literal user input.  A file-name
+            # search must never turn into an unexpectedly broad SQL pattern.
+            # Translation payloads are kept as compact projections for large
+            # sidecars, so this also preserves the established ability to
+            # find a translated title without hydrating document-sized text.
+            escaped = query.casefold().replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+            pattern = '%{}%'.format(escaped)
+            clauses.append("(LOWER(node_path) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(translation_payload, '')) LIKE ? ESCAPE '\\')")
+            values.extend((pattern, pattern))
+        return (
+            (' WHERE ' + ' AND '.join(clauses)) if clauses else '',
+            values, normalized_statuses, language, query,
+        )
+
+    def list_translation_page(self, scan_id, offset=0, limit=100,
+                              status=None, statuses=None, language=None, query=None):
+        """Page the complete translation work list without hydrating bodies.
+
+        The returned total refers to the active filters.  ``status_counts``
+        and ``language_counts`` describe the complete list, so the client can
+        show honest filter choices without loading every item into the browser.
+        """
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(500, int(limit or 100)))
+        where, filter_values, statuses, language, query = self._translation_list_filter(
+            status=status, statuses=statuses, language=language, query=query,
+        )
+        sql = self._translation_list_query()
+        source_values = [str(scan_id)] * 8
+        with self._connect() as conn:
+            count_rows = conn.execute(
+                sql + " SELECT status,source_language,COUNT(*) AS value FROM projected "
+                "GROUP BY status,source_language",
+                source_values,
+            ).fetchall()
+            total = int(conn.execute(
+                sql + ' SELECT COUNT(*) AS value FROM projected' + where,
+                source_values + filter_values,
+            ).fetchone()['value'] or 0)
+            rows = conn.execute(
+                sql + ' SELECT * FROM projected' + where +
+                ' ORDER BY node_path LIMIT ? OFFSET ?',
+                source_values + filter_values + [limit, offset],
+            ).fetchall()
+
+        status_counts = {}
+        language_counts = {}
+        for row in count_rows:
+            item_status = str(row['status'] or 'not_started')
+            item_language = str(row['source_language'] or 'unknown')
+            value = int(row['value'] or 0)
+            status_counts[item_status] = status_counts.get(item_status, 0) + value
+            language_counts[item_language] = language_counts.get(item_language, 0) + value
+
+        items = []
+        for row in rows:
+            payload = self._load_translation_payload(
+                row['translation_payload'], hydrate=False,
+            ) if row['translation_payload'] else {}
+            payload = dict(payload or {})
+            original_title = str(
+                payload.get('original_title') or payload.get('working_title') or ''
+            ).strip()
+            translated_title = str(payload.get('translated_title') or '').strip()
+            path = str(row['node_path'])
+            payload.update({
+                'path': path,
+                'status': str(row['status'] or 'not_started'),
+                'source_language': str(row['source_language'] or 'unknown'),
+                'source_availability': str(row['source_availability'] or 'metadata'),
+                'preview_status': row['preview_status'],
+                'titles': {
+                    'original': original_title or Path(path).name or path,
+                    'translated': translated_title or None,
+                },
+            })
+            items.append(payload)
+
+        next_offset = offset + len(items)
+        return {
+            'items': items,
+            'offset': offset,
+            'limit': limit,
+            'total': total,
+            'next_offset': next_offset if next_offset < total else None,
+            'has_more': next_offset < total,
+            'status': statuses[0] if len(statuses) == 1 else None,
+            'statuses': statuses,
+            'language': language,
+            'query': query,
+            'unfiltered_total': sum(status_counts.values()),
+            'status_counts': status_counts,
+            'language_counts': language_counts,
+        }
+
     def translation_counts(self, scan_id):
         with self._connect() as conn:
             rows = conn.execute(
@@ -3406,6 +4074,182 @@ class Storage:
             "has_more": bool(first_sequence and first_sequence > 1),
         }
         return payload
+
+    def save_homogeneous_analysis(self, scan_id, payload):
+        """Atomically replace the derived ledger, relationship graph and cases."""
+        payload = dict(payload or {})
+        records = list(payload.pop("records", []) or [])
+        relations = list(payload.pop("relations", []) or [])
+        cases = list(payload.pop("cases", []) or [])
+        anomalies = list(payload.pop("anomalies", []) or [])
+        scan_id = str(scan_id)
+        with self.lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM homogeneous_records WHERE scan_id=?", (scan_id,))
+            conn.execute("DELETE FROM homogeneous_relations WHERE scan_id=?", (scan_id,))
+            conn.execute("DELETE FROM homogeneous_cases WHERE scan_id=?", (scan_id,))
+            conn.execute("DELETE FROM homogeneous_anomalies WHERE scan_id=?", (scan_id,))
+            conn.execute(
+                "INSERT OR REPLACE INTO homogeneous_analyses("
+                "scan_id,schema_version,status,payload,updated_at) "
+                "VALUES (?,?,?,?,CURRENT_TIMESTAMP)",
+                (
+                    scan_id,
+                    str(payload.get("schema_version") or "homogeneous-documents/1.0"),
+                    str(payload.get("status") or "completed"),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            record_rows = []
+            for record in records:
+                fields = record.get("fields") or {}
+                record_rows.append((
+                    scan_id, str(record.get("path") or ""),
+                    str(fields.get("date") or ""),
+                    str(fields.get("document_number") or ""),
+                    str(fields.get("sender") or ""),
+                    str(fields.get("recipient") or ""),
+                    str(fields.get("subject") or ""),
+                    str(fields.get("matter_id") or ""),
+                    json.dumps(record, ensure_ascii=False),
+                ))
+            conn.executemany(
+                "INSERT INTO homogeneous_records("
+                "scan_id,node_path,document_date,document_number,sender,recipient,"
+                "subject,matter_id,payload,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                record_rows,
+            )
+            conn.executemany(
+                "INSERT INTO homogeneous_relations("
+                "scan_id,relation_id,source_path,target_path,relation_type,confidence,"
+                "payload,updated_at) VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                [(
+                    scan_id, str(item.get("relation_id") or ""),
+                    str(item.get("source_path") or ""),
+                    str(item.get("target_path") or ""),
+                    str(item.get("relation_type") or "related"),
+                    float(item.get("confidence") or 0),
+                    json.dumps(item, ensure_ascii=False),
+                ) for item in relations],
+            )
+            conn.executemany(
+                "INSERT INTO homogeneous_cases("
+                "scan_id,case_id,title,document_count,start_date,end_date,payload,"
+                "updated_at) VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                [(
+                    scan_id, str(item.get("case_id") or ""),
+                    str(item.get("title") or "未命名事项"),
+                    int(item.get("document_count") or 0),
+                    str(item.get("start_date") or ""), str(item.get("end_date") or ""),
+                    json.dumps(item, ensure_ascii=False),
+                ) for item in cases],
+            )
+            conn.executemany(
+                "INSERT INTO homogeneous_anomalies("
+                "scan_id,position,anomaly_type,node_path,severity,payload,updated_at) "
+                "VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                [(
+                    scan_id, position, str(item.get("type") or "unknown"),
+                    str(item.get("path") or ""), str(item.get("severity") or "low"),
+                    json.dumps(item, ensure_ascii=False),
+                ) for position, item in enumerate(anomalies)],
+            )
+            conn.execute("DELETE FROM relationship_catalog WHERE scan_id=?", (scan_id,))
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (scan_id,))
+        return {
+            "records": len(records), "relations": len(relations),
+            "cases": len(cases), "anomalies": len(anomalies),
+        }
+
+    def get_homogeneous_analysis(
+        self, scan_id, offset=0, limit=100, query="", relation_type="",
+        relation_limit=500, case_limit=100, anomaly_limit=200,
+    ):
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(500, int(limit or 100)))
+        relation_limit = max(1, min(2000, int(relation_limit or 500)))
+        case_limit = max(1, min(500, int(case_limit or 100)))
+        anomaly_limit = max(1, min(1000, int(anomaly_limit or 200)))
+        query = str(query or "").strip()[:200]
+        relation_type = str(relation_type or "").strip()[:40]
+        scan_id = str(scan_id)
+        with self._connect() as conn:
+            analysis_row = conn.execute(
+                "SELECT payload,updated_at FROM homogeneous_analyses WHERE scan_id=?",
+                (scan_id,),
+            ).fetchone()
+            if not analysis_row:
+                return None
+            summary = json.loads(analysis_row["payload"])
+            summary["updated_at"] = analysis_row["updated_at"]
+            clauses, values = ["scan_id=?"], [scan_id]
+            if query:
+                clauses.append(
+                    "(node_path LIKE ? OR document_number LIKE ? OR sender LIKE ? "
+                    "OR recipient LIKE ? OR subject LIKE ? OR matter_id LIKE ?)"
+                )
+                values.extend(["%{}%".format(query)] * 6)
+            where = " AND ".join(clauses)
+            total = int(conn.execute(
+                "SELECT COUNT(*) AS value FROM homogeneous_records WHERE {}".format(where),
+                values,
+            ).fetchone()["value"])
+            record_rows = conn.execute(
+                "SELECT payload FROM homogeneous_records WHERE {} "
+                "ORDER BY CASE WHEN document_date='' THEN 1 ELSE 0 END,"
+                "document_date,node_path LIMIT ? OFFSET ?".format(where),
+                values + [limit, offset],
+            ).fetchall()
+            relation_clauses, relation_values = ["scan_id=?"], [scan_id]
+            if relation_type:
+                relation_clauses.append("relation_type=?")
+                relation_values.append(relation_type)
+            relation_rows = conn.execute(
+                "SELECT payload FROM homogeneous_relations WHERE {} "
+                "ORDER BY confidence DESC,relation_id LIMIT ?".format(
+                    " AND ".join(relation_clauses)
+                ), relation_values + [relation_limit],
+            ).fetchall()
+            case_rows = conn.execute(
+                "SELECT payload FROM homogeneous_cases WHERE scan_id=? "
+                "ORDER BY document_count DESC,title LIMIT ?",
+                (scan_id, case_limit),
+            ).fetchall()
+            anomaly_rows = conn.execute(
+                "SELECT payload FROM homogeneous_anomalies WHERE scan_id=? "
+                "ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,"
+                "position LIMIT ?", (scan_id, anomaly_limit),
+            ).fetchall()
+        records = [json.loads(row["payload"]) for row in record_rows]
+        return {
+            "summary": summary,
+            "records": {
+                "items": records, "offset": offset, "limit": limit, "total": total,
+                "next_offset": offset + len(records) if offset + len(records) < total else None,
+            },
+            "relations": [json.loads(row["payload"]) for row in relation_rows],
+            "cases": [json.loads(row["payload"]) for row in case_rows],
+            "anomalies": [json.loads(row["payload"]) for row in anomaly_rows],
+        }
+
+    def get_homogeneous_record(self, scan_id, node_path):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM homogeneous_records WHERE scan_id=? AND node_path=?",
+                (str(scan_id), str(node_path)),
+            ).fetchone()
+            if not row:
+                return None
+            relations = conn.execute(
+                "SELECT payload FROM homogeneous_relations WHERE scan_id=? "
+                "AND (source_path=? OR target_path=?) ORDER BY confidence DESC LIMIT 500",
+                (str(scan_id), str(node_path), str(node_path)),
+            ).fetchall()
+        return {
+            "record": json.loads(row["payload"]),
+            "relations": [json.loads(item["payload"]) for item in relations],
+        }
 
     def list_conversations(self, scan_id, owner_id, limit=50):
         limit = max(1, min(200, int(limit or 50)))
@@ -3994,6 +4838,53 @@ class Storage:
                     output[item["node_path"]] = item
         return output
 
+    def request_file_reanalysis(self, scan_id, node_paths, reason=None):
+        """Explicitly re-open retryable work without silently losing history.
+
+        Automatic retries retain the original attempt budget. A user asking to
+        retry a known file is a new operator decision, so it receives a fresh
+        bounded retry budget and is returned to the durable queue. Completed
+        files are intentionally excluded here; a separate reanalysis action
+        should be used when the user wants to invalidate a healthy result.
+        """
+        paths = list(dict.fromkeys(
+            str(path) for path in (node_paths or []) if str(path).strip()
+        ))
+        if not paths:
+            return 0
+        note = str(reason or "用户请求重新分析").strip()[:1800]
+        updated = 0
+        with self.lock, self._connect() as conn:
+            for start in range(0, len(paths), 500):
+                batch = paths[start:start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                eligible = conn.execute(
+                    "SELECT node_path FROM file_analysis_states WHERE scan_id=? "
+                    "AND node_path IN ({}) AND status IN "
+                    "('failed','needs_attention','overview','preview_failed','preview_deferred')".format(
+                        placeholders
+                    ),
+                    [str(scan_id)] + batch,
+                ).fetchall()
+                retry_paths = [str(row["node_path"]) for row in eligible]
+                if not retry_paths:
+                    continue
+                conn.executemany(
+                    "UPDATE file_analysis_states SET status='failed',retryable=1,"
+                    "attempt_count=0,next_retry_at=0,error=?,error_class='manual_retry',"
+                    "updated_at=CURRENT_TIMESTAMP WHERE scan_id=? AND node_path=?",
+                    [(note, str(scan_id), path) for path in retry_paths],
+                )
+                conn.executemany(
+                    "UPDATE file_workflow_states SET workflow_state='manual_retry_queued',"
+                    "selection_state='priority',parse_status='queued',evidence_status='pending',"
+                    "priority_source='manual_retry',updated_at=CURRENT_TIMESTAMP "
+                    "WHERE scan_id=? AND node_path=?",
+                    [(str(scan_id), path) for path in retry_paths],
+                )
+                updated += len(retry_paths)
+        return updated
+
     def iter_file_states(self, scan_id, batch_size=500):
         batch_size = max(1, min(5000, int(batch_size or 500)))
         with self._connect() as conn:
@@ -4124,6 +5015,361 @@ class Storage:
             "next_offset": offset + len(rows) if offset + len(rows) < total else None,
         }
 
+    @staticmethod
+    def _json_object(value):
+        """Decode a persisted object without allowing one bad legacy row to
+        make the operational status screen unavailable.
+
+        The status projection intentionally reads only compact metadata
+        columns.  It must remain usable for multi-gigabyte sidecar documents
+        and for scans created by older releases.
+        """
+        if isinstance(value, dict):
+            return dict(value)
+        try:
+            decoded = json.loads(value or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+    @classmethod
+    def _file_status_item(cls, row, now=None):
+        """Project independent persistence records into one user-facing state.
+
+        ``file_workflow_states`` describes scheduling, ``file_analysis_states``
+        describes deep parsing, previews make the full inventory searchable,
+        and translations have their own durable lifecycle.  Rendering any one
+        of those in isolation previously made a file look complete when it was
+        only previewed, waiting for retry, or deliberately outside scope.
+        """
+        raw = dict(row)
+        now = time.time() if now is None else float(now)
+        inventory = cls._json_object(raw.pop("inventory_payload", None))
+        reasons = cls._json_object(raw.pop("workflow_reasons", None))
+        # ``reasons`` is stored as an array rather than object.  Keep the
+        # tolerant decoder above for old rows, then decode the normal shape.
+        try:
+            reason_values = json.loads(raw.get("workflow_reasons_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            reason_values = []
+        if not isinstance(reason_values, list):
+            reason_values = []
+        # A malformed historical array can be represented by the fallback
+        # object, but never let it leak implementation details to the UI.
+        if not reason_values and isinstance(reasons.get("items"), list):
+            reason_values = reasons["items"]
+        reason_values = [str(value) for value in reason_values if str(value).strip()][:20]
+
+        analysis_status = str(raw.get("analysis_status") or "").strip().lower()
+        workflow_state = str(raw.get("workflow_state") or "").strip().lower()
+        parse_status = str(raw.get("parse_status") or "").strip().lower()
+        selection_state = str(raw.get("selection_state") or "").strip().lower()
+        preview_status = str(raw.get("preview_status") or "").strip().lower()
+        retryable = bool(raw.get("retryable"))
+        attempts = max(0, int(raw.get("attempt_count") or 0))
+        next_retry_at = raw.get("next_retry_at")
+        try:
+            next_retry_at = float(next_retry_at) if next_retry_at is not None else None
+        except (TypeError, ValueError):
+            next_retry_at = None
+        retry_waiting = bool(
+            analysis_status == "failed" and retryable and attempts < 6
+            and next_retry_at is not None and next_retry_at > now
+        )
+        logical_container = workflow_state == "logical_container" or (
+            "logical_container_replaced_by_children" in reason_values
+        )
+        policy_excluded = bool(
+            raw.get("promotion_allowed") == 0
+            or str(raw.get("safety_status") or "").lower() in {"restricted", "rejected"}
+            or analysis_status == "out_of_scope"
+        )
+
+        if analysis_status == "completed" or (
+            not analysis_status and parse_status == "completed"
+        ):
+            display_status = "completed"
+            coverage_ratio = 1.0
+            coverage_known = True
+        elif retry_waiting:
+            display_status = "retry_waiting"
+            coverage_ratio = None
+            coverage_known = False
+        elif analysis_status == "failed":
+            display_status = "failed"
+            coverage_ratio = None
+            coverage_known = False
+        elif logical_container:
+            # The physical container is retained for auditability, while its
+            # independently schedulable members carry the real deep-analysis
+            # coverage.  It must not be presented as a terminal exclusion.
+            display_status = "partial"
+            coverage_ratio = None
+            coverage_known = False
+        elif policy_excluded:
+            display_status = "out_of_scope"
+            coverage_ratio = 0.0
+            coverage_known = True
+        elif analysis_status in {
+            "needs_attention", "overview", "previewed", "preview_failed",
+            "preview_deferred",
+        } or parse_status in {"partial", "source_unavailable"} or preview_status in {
+            "previewed", "restricted", "deferred", "failed",
+        }:
+            display_status = "partial"
+            coverage_ratio = None
+            coverage_known = False
+        elif parse_status in {"processing", "parsing", "running"} or workflow_state in {
+            "deep_parsing", "deep_parse_running", "processing",
+        }:
+            display_status = "processing"
+            coverage_ratio = 0.0
+            coverage_known = True
+        else:
+            display_status = "pending"
+            coverage_ratio = 0.0
+            coverage_known = True
+
+        node_path = str(raw.get("node_path") or "")
+        container_path = str(
+            inventory.get("container_path") or raw.get("container_path") or ""
+        )
+        original_path = container_path or node_path.split("::", 1)[0]
+        message = str(raw.get("analysis_error") or "").strip()
+        if not message:
+            if display_status == "completed":
+                message = "已完成深度解析并建立可回查证据"
+            elif display_status == "retry_waiting":
+                message = "解析失败后等待自动重试"
+            elif display_status == "failed":
+                message = "解析失败，需要人工重试或检查文件"
+            elif display_status == "out_of_scope":
+                message = "当前处理范围外或受安全策略限制"
+            elif logical_container:
+                message = "容器已拆分为独立逻辑文件；请查看其成员状态"
+            elif reason_values:
+                message = reason_values[0]
+            elif display_status == "partial":
+                message = "已有基础内容或部分结果，尚未完成完整深析"
+            elif display_status == "processing":
+                message = "正在执行深度解析"
+            else:
+                message = "等待进入深度处理队列"
+
+        return {
+            "node_path": node_path,
+            "path": node_path,
+            "name": str(inventory.get("name") or Path(node_path).name or node_path),
+            "extension": str(inventory.get("extension") or Path(original_path).suffix).lower(),
+            "size": int(inventory.get("size") or raw.get("source_size") or 0),
+            "inventory_kind": raw.get("inventory_kind") or "file",
+            "logical": bool(raw.get("inventory_kind") == "logical_file" or inventory.get("logical_unit")),
+            "logical_kind": inventory.get("logical_kind"),
+            "container_path": container_path or None,
+            "original_path": original_path,
+            "display_status": display_status,
+            "status": display_status,
+            "reason": message[:2000],
+            "workflow_state": raw.get("workflow_state") or "discovered",
+            "selection_state": raw.get("selection_state") or "pending",
+            "selection_score": float(raw.get("selection_score") or 0.0),
+            "priority_source": raw.get("priority_source"),
+            "workflow_reasons": reason_values,
+            "safety_status": raw.get("safety_status") or "unknown",
+            "promotion_allowed": bool(raw.get("promotion_allowed", 1)),
+            "light_index_status": raw.get("light_index_status") or "pending",
+            "preview_status": raw.get("preview_status") or None,
+            "analysis_status": raw.get("analysis_status") or None,
+            "parse_status": raw.get("parse_status") or "pending",
+            "evidence_status": raw.get("evidence_status") or "pending",
+            "parser": raw.get("parser") or None,
+            "attempt_count": attempts,
+            "retryable": retryable,
+            "next_retry_at": next_retry_at,
+            "error_class": raw.get("error_class") or None,
+            "analysis_level": (
+                "deep" if display_status == "completed" else
+                "preview" if preview_status in {"previewed", "restricted"} or analysis_status in {"overview", "previewed"}
+                else "metadata"
+            ),
+            "coverage_ratio": coverage_ratio,
+            "coverage_known": coverage_known,
+            "translation_status": raw.get("translation_status") or "not_started",
+            "translation_source_language": raw.get("translation_source_language") or None,
+            "updated_at": raw.get("updated_at") or raw.get("analysis_updated_at") or raw.get("preview_updated_at"),
+            "accounting_role": "container_only" if logical_container else "logical_file",
+        }
+
+    @staticmethod
+    def _file_status_projection_query(status=None):
+        """Return the bounded SQL projection shared by status-page and count APIs."""
+        status = str(status or "all").strip().lower()
+        valid_statuses = {
+            "all", "pending", "processing", "completed", "partial", "failed",
+            "retry_waiting", "out_of_scope",
+        }
+        if status not in valid_statuses:
+            raise ValueError("未知文件状态筛选条件")
+        # A union of compact keys means old scans, in-progress imports, and
+        # logical children all participate even before every workflow record
+        # exists. No document/preview sidecar body is selected here.
+        source = """
+            WITH all_paths AS (
+                SELECT node_path FROM file_workflow_states WHERE scan_id=?
+                UNION SELECT node_path FROM file_analysis_states WHERE scan_id=?
+                UNION SELECT node_path FROM file_previews WHERE scan_id=?
+                UNION SELECT node_path FROM document_translations WHERE scan_id=?
+                UNION SELECT node_path FROM unified_documents WHERE scan_id=?
+                UNION SELECT node_path FROM inventory_entries
+                    WHERE scan_id=? AND kind IN ('file','logical_file')
+            ), projected AS (
+                SELECT paths.node_path,
+                    inventory.kind AS inventory_kind, inventory.payload AS inventory_payload,
+                    workflow.workflow_state, workflow.selection_state, workflow.selection_score,
+                    workflow.reasons AS workflow_reasons_json, workflow.safety_status,
+                    workflow.light_index_status, workflow.parse_status, workflow.evidence_status,
+                    workflow.promotion_allowed, workflow.priority_source,
+                    analysis.status AS analysis_status, analysis.parser, analysis.error AS analysis_error,
+                    analysis.error_class, analysis.retryable, analysis.attempt_count,
+                    analysis.next_retry_at, analysis.updated_at AS analysis_updated_at,
+                    preview.status AS preview_status, preview.source_size,
+                    preview.updated_at AS preview_updated_at,
+                    translation.status AS translation_status,
+                    translation.source_language AS translation_source_language,
+                    workflow.updated_at AS updated_at,
+                    CASE
+                        WHEN analysis.status='completed' OR
+                            (analysis.status IS NULL AND workflow.parse_status='completed') THEN 'completed'
+                        WHEN analysis.status='failed' AND analysis.retryable=1
+                            AND analysis.attempt_count<6
+                            AND COALESCE(analysis.next_retry_at,0)>? THEN 'retry_waiting'
+                        WHEN analysis.status='failed' THEN 'failed'
+                        WHEN workflow.workflow_state='logical_container'
+                            OR workflow.reasons LIKE '%logical_container_replaced_by_children%' THEN 'partial'
+                        WHEN analysis.status='out_of_scope' OR workflow.promotion_allowed=0
+                            OR workflow.safety_status IN ('restricted','rejected') THEN 'out_of_scope'
+                        WHEN analysis.status IN ('needs_attention','overview','previewed','preview_failed','preview_deferred')
+                            OR workflow.parse_status IN ('partial','source_unavailable')
+                            OR preview.status IN ('previewed','restricted','deferred','failed') THEN 'partial'
+                        WHEN workflow.parse_status IN ('processing','parsing','running')
+                            OR workflow.workflow_state IN ('deep_parsing','deep_parse_running','processing') THEN 'processing'
+                        ELSE 'pending'
+                    END AS status_key
+                FROM all_paths paths
+                LEFT JOIN inventory_entries inventory
+                    ON inventory.scan_id=? AND inventory.node_path=paths.node_path
+                LEFT JOIN file_workflow_states workflow
+                    ON workflow.scan_id=? AND workflow.node_path=paths.node_path
+                LEFT JOIN file_analysis_states analysis
+                    ON analysis.scan_id=? AND analysis.node_path=paths.node_path
+                LEFT JOIN file_previews preview
+                    ON preview.scan_id=? AND preview.node_path=paths.node_path
+                LEFT JOIN document_translations translation
+                    ON translation.scan_id=? AND translation.node_path=paths.node_path
+            )
+        """
+        # Every scan-id placeholder is explicit, making the query safe even
+        # when SQL statement caching is disabled by a deployment.
+        return source, status
+
+    def list_file_status_page(self, scan_id, offset=0, limit=100, status=None):
+        """Return a paged, user-facing projection of every logical file.
+
+        This is deliberately a database page, not a Python list of the whole
+        package. It therefore remains bounded for hundreds of thousands of
+        files while still including legacy physical inventory rows.
+        """
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(500, int(limit or 100)))
+        query, status = self._file_status_projection_query(status)
+        # Six CTE scans, then five joins, plus the current timestamp used to
+        # distinguish a delayed automatic retry from an immediately queueable
+        # retry.  Keep the values adjacent to the SQL for auditability.
+        base_values = [str(scan_id)] * 6 + [time.time()] + [str(scan_id)] * 5
+        where = "" if status == "all" else " WHERE status_key=?"
+        values = list(base_values)
+        if status != "all":
+            values.append(status)
+        with self._connect() as conn:
+            total = int(conn.execute(
+                query + " SELECT COUNT(*) AS value FROM projected" + where,
+                values,
+            ).fetchone()["value"] or 0)
+            rows = conn.execute(
+                query + " SELECT * FROM projected" + where +
+                " ORDER BY CASE status_key WHEN 'failed' THEN 0 WHEN 'retry_waiting' THEN 1 "
+                "WHEN 'processing' THEN 2 WHEN 'pending' THEN 3 WHEN 'partial' THEN 4 "
+                "WHEN 'completed' THEN 5 ELSE 6 END, COALESCE(updated_at,analysis_updated_at,preview_updated_at) DESC,node_path "
+                "LIMIT ? OFFSET ?",
+                values + [limit, offset],
+            ).fetchall()
+        items = [self._file_status_item(row) for row in rows]
+        return {
+            "items": items,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "next_offset": offset + len(items) if offset + len(items) < total else None,
+            "status": status,
+        }
+
+    def get_file_status(self, scan_id, node_path):
+        """Look up one projected logical or physical file without path tricks."""
+        # Use the same projection with a path predicate; never hydrate or page
+        # through a whole package merely to open one evidence source.
+        query, _status = self._file_status_projection_query("all")
+        values = [str(scan_id)] * 6 + [time.time()] + [str(scan_id)] * 5
+        with self._connect() as conn:
+            row = conn.execute(
+                query + " SELECT * FROM projected WHERE node_path=? LIMIT 1",
+                values + [str(node_path)],
+            ).fetchone()
+        return self._file_status_item(row) if row else None
+
+    def file_status_counts(self, scan_id, include_container_only=True):
+        """Count canonical file states without making archive containers work.
+
+        Archive containers remain visible in the paged status inventory, but
+        once they have been replaced by independently schedulable members they
+        must not become an extra incomplete item in the logical-file coverage
+        denominator.  ``include_container_only`` is retained for diagnostic
+        callers that explicitly want the physical container count.
+        """
+        query, _status = self._file_status_projection_query("all")
+        values = [str(scan_id)] * 6 + [time.time()] + [str(scan_id)] * 5
+        container_condition = (
+            "(workflow_state='logical_container' OR "
+            "COALESCE(workflow_reasons_json,'') LIKE '%logical_container_replaced_by_children%')"
+        )
+        where = "" if include_container_only else " WHERE NOT " + container_condition
+        with self._connect() as conn:
+            rows = conn.execute(
+                query + " SELECT status_key,COUNT(*) AS value,"
+                "SUM(CASE WHEN light_index_status='ready' THEN 1 ELSE 0 END) AS light_ready "
+                "FROM projected" + where + " GROUP BY status_key",
+                values,
+            ).fetchall()
+            container_row = conn.execute(
+                query + " SELECT COUNT(*) AS value FROM projected WHERE " + container_condition,
+                values,
+            ).fetchone()
+        result = {
+            "pending": 0, "processing": 0, "completed": 0, "partial": 0,
+            "failed": 0, "retry_waiting": 0, "out_of_scope": 0,
+        }
+        light_ready = 0
+        for row in rows:
+            result[str(row["status_key"])] = int(row["value"] or 0)
+            light_ready += int(row["light_ready"] or 0)
+        result["total"] = sum(result.values())
+        result["light_ready"] = light_ready
+        result["container_only"] = int(container_row["value"] or 0)
+        result["incomplete"] = (
+            result["pending"] + result["processing"] + result["partial"]
+            + result["failed"] + result["retry_waiting"]
+        )
+        return result
+
     def file_workflow_counts(self, scan_id):
         with self._connect() as conn:
             rows = conn.execute(
@@ -4147,9 +5393,75 @@ class Storage:
             )},
         }
 
+    def package_processing_counts(self, scan_id):
+        """Aggregate queue states without treating delayed/failed work as done.
+
+        ``pending`` means work that may be leased immediately. ``retry_waiting``
+        remains incomplete but is deliberately hidden from the ready queue until
+        its backoff expires. ``needs_attention`` is also incomplete and requires
+        an operator/capability change. Only policy exclusions are terminal.
+        """
+        now = time.time()
+        # Early releases persisted duplicate/cache exclusions with
+        # ``promotion_allowed=1``.  The scheduler has always excluded their
+        # reason codes, so counts must apply the same rule until a legacy scan
+        # is rebuilt.  Otherwise such files can leave a package permanently
+        # stuck at "incomplete" even though no worker will ever claim them.
+        terminal_exclusion = (
+            "w.promotion_allowed=0 OR w.safety_status IN ('restricted','rejected') "
+            "OR w.reasons LIKE '%\"exact_duplicate_non_primary\"%' "
+            "OR w.reasons LIKE '%\"cache_temporary_or_dependency_file\"%'"
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS workflow_total,"
+                "COALESCE(SUM(CASE WHEN w.light_index_status='ready' THEN 1 ELSE 0 END),0) AS light_ready,"
+                "COALESCE(SUM(CASE WHEN f.status='completed' OR w.parse_status='completed' THEN 1 ELSE 0 END),0) AS completed,"
+                "COALESCE(SUM(CASE WHEN f.status='failed' AND f.retryable=1 "
+                "AND f.attempt_count<6 AND COALESCE(f.next_retry_at,0)>? THEN 1 ELSE 0 END),0) AS retry_waiting,"
+                "COALESCE(SUM(CASE WHEN f.status='needs_attention' OR "
+                "(f.status='failed' AND (f.retryable=0 OR f.attempt_count>=6)) "
+                "THEN 1 ELSE 0 END),0) AS needs_attention,"
+                "COALESCE(SUM(CASE WHEN ({terminal_exclusion}) THEN 1 ELSE 0 END),0) AS policy_excluded,"
+                "COALESCE(SUM(CASE WHEN NOT (COALESCE(f.status,'')='completed' OR w.parse_status='completed') "
+                "AND NOT ({terminal_exclusion}) "
+                "AND COALESCE(f.status,'')!='needs_attention' "
+                "AND (f.status IS NULL OR f.status!='failed' OR "
+                "(f.retryable=1 AND f.attempt_count<6 AND COALESCE(f.next_retry_at,0)<=?)) "
+                "THEN 1 ELSE 0 END),0) AS pending "
+                "FROM file_workflow_states w LEFT JOIN file_analysis_states f "
+                "ON f.scan_id=w.scan_id AND f.node_path=w.node_path WHERE w.scan_id=?".format(
+                    terminal_exclusion=terminal_exclusion
+                ),
+                (now, now, str(scan_id)),
+            ).fetchone()
+        result = {key: int(row[key] or 0) for key in (
+            "workflow_total", "light_ready", "completed", "pending",
+            "retry_waiting", "needs_attention", "policy_excluded",
+        )}
+        # Backwards-compatible field used by existing UI. It now means only a
+        # deliberate terminal policy exclusion, never a delayed retry/failure.
+        result["excluded"] = result["policy_excluded"]
+        result["incomplete"] = max(
+            0, result["workflow_total"] - result["completed"] - result["policy_excluded"]
+        )
+        return result
+
+    def get_active_package_job(self, scan_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM analysis_jobs WHERE scan_id=? "
+                "AND task_type IN ('scan_and_analyze','analyze_package') "
+                "AND status IN ('running','cancelling','queued') "
+                "ORDER BY CASE WHEN status IN ('running','cancelling') THEN 0 ELSE 1 END,"
+                "priority DESC,rowid LIMIT 1",
+                (str(scan_id),),
+            ).fetchone()
+        return self._decode_job(dict(row)) if row else None
+
     def update_file_workflow_stage(self, scan_id, node_path, workflow_state,
                                    parse_status=None, evidence_status=None,
-                                   priority_source=None):
+                                   priority_source=None, light_index_status=None):
         assignments = ["workflow_state=?", "updated_at=CURRENT_TIMESTAMP"]
         values = [str(workflow_state)]
         if parse_status is not None:
@@ -4161,6 +5473,9 @@ class Storage:
         if priority_source is not None:
             assignments.append("priority_source=?")
             values.append(str(priority_source))
+        if light_index_status is not None:
+            assignments.append("light_index_status=?")
+            values.append(str(light_index_status))
         values.extend([str(scan_id), str(node_path)])
         with self.lock, self._connect() as conn:
             result = conn.execute(
@@ -4169,6 +5484,126 @@ class Storage:
                 ), values,
             )
         return bool(result.rowcount)
+
+    def prioritize_file_workflow_states(self, scan_id, paths, priority_source,
+                                        reason, score_boost=1000.0):
+        """Move user/recall-selected files ahead without removing other work."""
+        paths = list(dict.fromkeys(str(path) for path in (paths or []) if path))
+        if not paths:
+            return 0
+        source = str(priority_source or "manual_selection")
+        reason = str(reason or source)[:500]
+        updated = 0
+        with self.lock, self._connect() as conn:
+            for start in range(0, len(paths), 500):
+                batch = paths[start:start + 500]
+                rows = conn.execute(
+                    "SELECT node_path,reasons FROM file_workflow_states "
+                    "WHERE scan_id=? AND node_path IN ({})".format(
+                        ",".join("?" for _ in batch)
+                    ),
+                    [str(scan_id)] + batch,
+                ).fetchall()
+                for row in rows:
+                    try:
+                        reasons = json.loads(row["reasons"] or "[]")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        reasons = []
+                    reasons = [reason] + [item for item in reasons if item != reason]
+                    result = conn.execute(
+                        "UPDATE file_workflow_states SET selection_state='priority',"
+                        "workflow_state='priority_queued',selection_score=MAX(selection_score,?),"
+                        "reasons=?,priority_source=?,updated_at=CURRENT_TIMESTAMP "
+                        "WHERE scan_id=? AND node_path=? AND promotion_allowed=1 "
+                        "AND safety_status NOT IN ('restricted','rejected')",
+                        (
+                            float(score_boost),
+                            json.dumps(reasons[:12], ensure_ascii=False),
+                            source, str(scan_id), row["node_path"],
+                        ),
+                    )
+                    updated += int(result.rowcount or 0)
+        return updated
+
+    def ensure_package_processing_control(self, scan_id, state="running"):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO package_processing_controls("
+                "scan_id,state,pause_requested,reason) VALUES (?,?,0,NULL)",
+                (str(scan_id), str(state or "running")),
+            )
+        return self.get_package_processing_control(scan_id)
+
+    def get_package_processing_control(self, scan_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM package_processing_controls WHERE scan_id=?",
+                (str(scan_id),),
+            ).fetchone()
+        if not row:
+            return {
+                "scan_id": str(scan_id), "state": "running",
+                "pause_requested": False, "reason": None,
+            }
+        item = dict(row)
+        item["pause_requested"] = bool(item.get("pause_requested"))
+        return item
+
+    def set_package_processing_state(self, scan_id, state, reason=None):
+        state = str(state or "running")
+        if state not in {"running", "paused", "completed"}:
+            raise ValueError("未知数据包处理状态")
+        pause_requested = 1 if state == "paused" else 0
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO package_processing_controls("
+                "scan_id,state,pause_requested,reason,updated_at) "
+                "VALUES (?,?,?,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(scan_id) DO UPDATE SET state=excluded.state,"
+                "pause_requested=excluded.pause_requested,reason=excluded.reason,"
+                "updated_at=CURRENT_TIMESTAMP",
+                (str(scan_id), state, pause_requested, str(reason)[:1000] if reason else None),
+            )
+        return self.get_package_processing_control(scan_id)
+
+    def package_processing_paused(self, scan_id):
+        control = self.get_package_processing_control(scan_id)
+        return bool(control.get("pause_requested") or control.get("state") == "paused")
+
+    def pause_package_analysis_jobs(self, scan_id, reason=None):
+        """Pause the full-package chain while preserving per-file checkpoints."""
+        message = str(reason or "用户结束本次运行；已完成检查点保留。")
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO package_processing_controls("
+                "scan_id,state,pause_requested,reason,updated_at) "
+                "VALUES (?,'paused',1,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(scan_id) DO UPDATE SET state='paused',pause_requested=1,"
+                "reason=excluded.reason,updated_at=CURRENT_TIMESTAMP",
+                (str(scan_id), message[:1000]),
+            )
+            queued = conn.execute(
+                "UPDATE analysis_jobs SET status='cancelled',stage='cancelled',"
+                "cancel_requested=1,message=?,current_stage='已暂停',current_file='',"
+                "worker_id=NULL,heartbeat_at=NULL,finished_at=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE scan_id=? AND task_type IN ('scan_and_analyze','analyze_package') "
+                "AND status='queued'",
+                (message, now, str(scan_id)),
+            ).rowcount
+            running = conn.execute(
+                "UPDATE analysis_jobs SET status='cancelling',stage='cancelling',"
+                "cancel_requested=1,message=?,current_stage='正在安全暂停',"
+                "updated_at=CURRENT_TIMESTAMP "
+                "WHERE scan_id=? AND task_type IN ('scan_and_analyze','analyze_package') "
+                "AND status IN ('running','cancelling')",
+                (message, str(scan_id)),
+            ).rowcount
+        return {
+            "control": self.get_package_processing_control(scan_id),
+            "queued_cancelled": int(queued or 0),
+            "running_stopping": int(running or 0),
+        }
 
     def save_analysis(self, scan_id, payload):
         with self.lock, self._connect() as conn:
@@ -4187,6 +5622,8 @@ class Storage:
             )
             self._replace_tree_index(conn, scan_id, "analysis", payload.get("analysis_tree") or {})
             conn.execute("DELETE FROM analysis_progress WHERE scan_id=?", (str(scan_id),))
+            conn.execute("DELETE FROM relationship_catalog WHERE scan_id=?", (str(scan_id),))
+            conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
 
     def get_analysis(self, scan_id):
         with self._connect() as conn:
@@ -4411,6 +5848,7 @@ class Storage:
             # Explicit single-document translation is a manual action. Bulk
             # package translation remains the lowest-priority backfill.
             "translate_document": 110,
+            "homogeneous_analysis": 90,
             "analyze_package": 80,
             "export_package": 60,
             "translate_package": 10,
@@ -4513,6 +5951,11 @@ class Storage:
                 "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
                 (job_id, job_id, "scan_and_analyze", "queued", "queued", 0, "等待扫描目录", json.dumps(options, ensure_ascii=False), owner_id or "legacy", priority),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO package_processing_controls("
+                "scan_id,state,pause_requested,reason) VALUES (?,'running',0,NULL)",
+                (job_id,),
             )
         return job_id
 
@@ -4732,6 +6175,58 @@ class Storage:
                 return None
             claimed = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (row["id"],)).fetchone()
         return self._decode_job(dict(claimed)) if claimed else None
+
+    def wake_due_file_retries(self, limit=200):
+        """Turn due retryable file failures into queued package jobs.
+
+        The operation is idempotent: a scan with an active analysis job is not
+        re-enqueued, and due timestamps are cleared in the same transaction.
+        """
+        now = time.time()
+        limit = max(1, min(2000, int(limit or 200)))
+        created = 0
+        with self.lock, self._connect() as conn:
+            scans = conn.execute(
+                "SELECT DISTINCT f.scan_id,s.owner_id FROM file_analysis_states f "
+                "JOIN scans s ON s.id=f.scan_id "
+                "WHERE f.status='failed' AND f.retryable=1 AND f.attempt_count<6 "
+                "AND COALESCE(f.next_retry_at,0)<=? LIMIT ?", (now, limit),
+            ).fetchall()
+            for scan in scans:
+                scan_id = str(scan["scan_id"])
+                active = conn.execute(
+                    "SELECT 1 FROM analysis_jobs WHERE scan_id=? "
+                    "AND task_type='analyze_package' AND status IN ('queued','running','cancelling') "
+                    "AND cancel_requested=0 LIMIT 1", (scan_id,)
+                ).fetchone()
+                if active:
+                    continue
+                rows = conn.execute(
+                    "SELECT node_path FROM file_analysis_states WHERE scan_id=? "
+                    "AND status='failed' AND retryable=1 AND attempt_count<6 "
+                    "AND COALESCE(next_retry_at,0)<=? ORDER BY node_path LIMIT ?",
+                    (scan_id, limit),
+                ).fetchall()
+                paths = [str(row["node_path"]) for row in rows]
+                if not paths:
+                    continue
+                options = {"workflow_source": "retry_scheduler", "target_paths": paths}
+                job_id = uuid.uuid4().hex[:12]
+                options_json = json.dumps(options, ensure_ascii=False)
+                owner_id = str(scan["owner_id"] or "legacy")
+                conn.execute(
+                    "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                    (job_id, scan_id, "analyze_package", "queued", "queued", 1,
+                     "检测到到期失败文件，已自动安排重试", options_json, owner_id, 105),
+                )
+                conn.executemany(
+                    "UPDATE file_analysis_states SET next_retry_at=NULL,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE scan_id=? AND node_path=? AND status='failed'",
+                    [(scan_id, path) for path in paths],
+                )
+                created += 1
+        return created
 
     def list_jobs(self, owner_id=None, statuses=None, limit=50):
         """Return an owner-scoped task history for the product task center."""

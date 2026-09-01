@@ -113,6 +113,9 @@ class IntentRoutingTests(unittest.TestCase):
         self.assertEqual(router.route("Alice 在什么时候批准计划？").name, "retrieval")
         self.assertEqual(router.route("你好").name, "casual")
         self.assertEqual(router.route("有哪些值得研究的方向？").name, "analysis")
+        self.assertEqual(router.route("给我写篇小说").name, "creative")
+        self.assertEqual(router.route("什么是量子力学？").name, "general_qa")
+        self.assertEqual(router.route("这份合同的日期是什么？").name, "retrieval")
 
     def test_short_follow_up_inherits_previous_intent(self):
         decision = IntentRouter().route("后来呢？", previous_intent="relationship", is_follow_up=True)
@@ -213,6 +216,24 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(retrieval_calls, [])
         self.assertEqual(len(model.calls), 1)
         self.assertIn("不得声称数据包", model.calls[0]["system"])
+
+    def test_general_question_uses_model_without_retrieval_or_citations(self):
+        retrieval_calls = []
+        model = FakeModel("量子力学研究微观尺度下物质和能量的规律。")
+        engine = self.make_engine(
+            lambda request: retrieval_calls.append(request) or {"results": [evidence()]},
+            model=model,
+        )
+        session = engine.new_session("scan-1")
+
+        result = engine.ask(session, "什么是量子力学？")
+
+        self.assertEqual(result["intent"]["name"], "general_qa")
+        self.assertEqual(result["evidence_status"], "not_required")
+        self.assertEqual(result["task_status"], "fulfilled")
+        self.assertEqual(result["citations"], [])
+        self.assertEqual(retrieval_calls, [])
+        self.assertEqual(len(model.calls), 1)
 
     def test_analysis_without_evidence_returns_labelled_advice(self):
         model = FakeModel(

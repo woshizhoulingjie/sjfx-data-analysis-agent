@@ -15,10 +15,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from services.conversation import RetrievalRequest
+from services.logical_units import iter_logical_units
 from services.package_exploration import build_content_map, preview_file
 from services.package_analysis import _explore_large_package
 from services.package_overview import build_package_overview_from_storage
-from services.scanner import scan_directory
+from services.scanner import scan_directory, scan_inventory_slice
 from services.storage import Storage
 from services.translation import ProviderResponse, TranslationProvider, TranslationService
 
@@ -288,6 +289,64 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(status, 202)
         self.assertIsInstance(payload["job_id"], str)
+
+    def test_logical_archive_member_is_a_valid_translation_target(self):
+        """An archive member must not be rejected as a missing physical path."""
+        import zipfile
+
+        archive_path = self.root / "mail.zip"
+        with zipfile.ZipFile(str(archive_path), "w") as archive:
+            archive.writestr("letters/one.txt", "The invoice remains unpaid.")
+        scan_slice = scan_inventory_slice(self.root, slice_entries=100)
+        scan_id = "logical-translation"
+        scan = self.storage.save_inventory_slice(
+            scan_id, str(self.root), scan_slice["cursor"], scan_slice["records"],
+            owner_id=self.app_module.Config.OWNER_ID, complete=True,
+        )
+        physical = [
+            item["payload"]
+            for item in self.storage.iter_inventory_entries(scan_id, kind="file")
+        ]
+        units = list(iter_logical_units(self.root, physical))
+        self.assertEqual(len(units), 1)
+        self.storage.replace_logical_inventory_entries(scan_id, units)
+        scan = self.storage.get_scan(scan_id)
+        logical_path = units[0]["path"]
+
+        with self.app_module.app.test_request_context(
+            "/api/translation/{}".format(scan_id), method="POST",
+            json={"path": logical_path, "require_full": True},
+        ):
+            response, status = self.app_module.document_translation(scan_id)
+        self.assertEqual(status, 202)
+        self.assertEqual(response.get_json()["path"], logical_path)
+
+        job_id = response.get_json()["job_id"]
+
+        def parse_snapshot(_parser, snapshot, _node_path, _mode, **_kwargs):
+            return {"source": {}, "text": Path(snapshot).read_text(encoding="utf-8"), "evidence": []}
+
+        with patch.object(self.app_module, "_parse_with_limits", side_effect=parse_snapshot):
+            document = self.app_module._promote_for_translation(
+                scan_id, scan, logical_path, job_id
+            )
+        self.assertIn("invoice remains unpaid", document["text"])
+        self.assertEqual(
+            self.storage.get_file_state(scan_id, logical_path)["status"], "completed"
+        )
+
+    def test_retrieve_explains_when_the_index_is_not_available(self):
+        scan_id, _scan = self._save_scan_with_files(["pending.txt"])
+        with self.app_module.app.test_request_context(
+            "/api/retrieve", method="POST",
+            json={"scan_id": scan_id, "query": "付款", "path": "."},
+        ):
+            response = self.app_module.retrieve()
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(
+            payload["retrieval"]["search_status"]["code"], "index_unavailable"
+        )
         self.assertTrue(payload["job_id"])
 
         with self.app_module.app.test_request_context(
@@ -299,6 +358,137 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(status, 202)
         self.assertIsInstance(payload["job_id"], str)
+
+    def test_document_api_opens_archive_member_with_container_and_focus(self):
+        """A member path resolves when an older scan only stored its container."""
+        import zipfile
+
+        archive_path = self.root / "bundle.zip"
+        member_path = "letters/a.txt"
+        with zipfile.ZipFile(str(archive_path), "w") as archive:
+            archive.writestr(member_path, "The invoice is overdue and remains unpaid.")
+        inventory = scan_inventory_slice(self.root, slice_entries=100)
+        scan_id = "logical-document"
+        self.storage.save_inventory_slice(
+            scan_id, str(self.root), inventory["cursor"], inventory["records"],
+            owner_id=self.app_module.Config.OWNER_ID, complete=True,
+        )
+        physical = [
+            item["payload"]
+            for item in self.storage.iter_inventory_entries(scan_id, kind="file")
+        ]
+        units = list(iter_logical_units(self.root, physical))
+        self.assertEqual(len(units), 1)
+        self.storage.replace_logical_inventory_entries(scan_id, units)
+        logical_path = units[0]["path"]
+        self.storage.save_document(scan_id, "bundle.zip", {
+            "schema_version": "unified-document/1.0",
+            "source": {"path": "bundle.zip", "name": "bundle.zip"},
+            "parser": {"name": "archive"},
+            "structure": {"title": "bundle.zip"},
+            "text": "container preview",
+            "evidence": [{
+                "evidence_id": "EV-member", "source_path": logical_path,
+                "archive_source_path": "bundle.zip", "archive_member": member_path,
+                "page": 2, "paragraph_index": 4, "char_start": 32, "char_end": 65,
+                "section": "催款函", "text": "The invoice is overdue and remains unpaid.",
+            }],
+        })
+
+        with self.app_module.app.test_request_context(
+            "/api/document/{}?path={}&page=2&paragraph_index=4&char_start=32&char_end=65".format(
+                scan_id, self.app_module.quote(logical_path)
+            )
+        ):
+            response = self.app_module.get_document(scan_id)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        document = payload["document"]
+        self.assertEqual(document["source_reference"]["physical_path"], "bundle.zip")
+        self.assertEqual(document["source_reference"]["logical_member"], member_path)
+        self.assertEqual(document["source"]["logical_path"], logical_path)
+        self.assertEqual(document["focus"]["paragraph_index"], 4)
+        self.assertEqual(document["focus"]["char_end"], 65)
+        self.assertEqual(document["evidence"][0]["source_path"], logical_path)
+        self.assertEqual(document["analysis_level"], "preview")
+
+        # A subsequently completed member must replace the compatibility
+        # projection rather than continuing to show its container excerpt.
+        self.storage.save_document(scan_id, logical_path, {
+            "schema_version": "unified-document/1.0",
+            "source": {"path": logical_path, "name": "a.txt"},
+            "parser": {"name": "text"},
+            "text": "完整深析正文。",
+            "evidence": [],
+            "coverage": {"complete": True, "semantic_complete": True},
+        })
+        with self.app_module.app.test_request_context(
+            "/api/document/{}?path={}".format(scan_id, self.app_module.quote(logical_path))
+        ):
+            deep_response = self.app_module.get_document(scan_id)
+        deep_document = deep_response.get_json()["document"]
+        self.assertEqual(deep_document["analysis_level"], "deep")
+        self.assertEqual(deep_document["text_preview"], "完整深析正文。")
+
+    def test_document_api_projects_logical_partition_preview_with_location(self):
+        scan_id, _scan = self._save_scan_with_files(["records.jsonl"])
+        logical_path = "records.jsonl::partition/000001"
+        self.storage.replace_logical_inventory_entries(scan_id, [{
+            "path": logical_path, "name": "records-part-000001.jsonl",
+            "logical_unit": True, "logical_kind": "structured_text_partition",
+            "container_path": "records.jsonl", "extension": ".jsonl", "size": 120,
+            "byte_start": 100, "byte_end": 220, "partition_index": 1,
+            "record_boundary": "line",
+        }])
+        self.storage.save_file_preview(scan_id, logical_path, {
+            "path": logical_path, "name": "records-part-000001.jsonl",
+            "extension": ".jsonl", "size": 120, "status": "previewed",
+            "preview_text": '{"id": 2, "amount": 18}',
+            "preview_windows": [{
+                "label": "partition", "text": '{"id": 2, "amount": 18}',
+                "byte_start": 100, "byte_end": 220,
+            }],
+            "coverage": {"preview_only": True, "parse_complete": False},
+        })
+        with self.app_module.app.test_request_context(
+            "/api/document/{}?path={}".format(scan_id, self.app_module.quote(logical_path))
+        ):
+            response = self.app_module.get_document(scan_id)
+        document = response.get_json()["document"]
+        self.assertEqual(document["analysis_level"], "preview")
+        self.assertEqual(document["source_reference"]["physical_path"], "records.jsonl")
+        self.assertEqual(document["source_reference"]["location"]["byte_start"], 100)
+        self.assertEqual(document["source_reference"]["location"]["byte_end"], 220)
+        self.assertTrue(document["evidence"][0]["preview_only"])
+
+        pending_path = "records.jsonl::partition/000002"
+        self.storage.replace_logical_inventory_entries(scan_id, [{
+            "path": logical_path, "name": "records-part-000001.jsonl",
+            "logical_unit": True, "logical_kind": "structured_text_partition",
+            "container_path": "records.jsonl", "extension": ".jsonl", "size": 120,
+            "byte_start": 100, "byte_end": 220, "partition_index": 1,
+            "record_boundary": "line",
+        }, {
+            "path": pending_path, "name": "records-part-000002.jsonl",
+            "logical_unit": True, "logical_kind": "structured_text_partition",
+            "container_path": "records.jsonl", "extension": ".jsonl", "size": 80,
+            "byte_start": 220, "byte_end": 300, "partition_index": 2,
+            "record_boundary": "line",
+        }])
+        with self.app_module.app.test_request_context(
+            "/api/document/{}?path={}".format(scan_id, self.app_module.quote(pending_path))
+        ):
+            pending = self.app_module.get_document(scan_id)
+        pending_document = pending.get_json()["document"]
+        self.assertEqual(pending.status_code, 200)
+        self.assertEqual(pending_document["analysis_level"], "metadata")
+        self.assertEqual(pending_document["source_reference"]["location"]["byte_start"], 220)
+
+        with self.app_module.app.test_request_context(
+            "/api/document/{}?path=records.jsonl%3A%3Apartition%2F999999".format(scan_id)
+        ):
+            missing = self.app_module.get_document(scan_id)
+        self.assertEqual(missing.status_code, 404)
 
     def test_async_conversation_turn_api_persists_and_can_cancel(self):
         scan_id, _scan = self._save_scan_with_files(["contract.txt"])

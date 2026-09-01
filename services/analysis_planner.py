@@ -67,6 +67,10 @@ class AnalysisPlanner:
     RELATION_RE = re.compile(r"关系|关联|联系|往来|互动|网络|relationship|correspondence", re.I)
     CONTRADICTION_RE = re.compile(r"矛盾|冲突|不一致|相反|反证|例外|contradict|conflict", re.I)
     RISK_RE = re.compile(r"风险|不利|隐患|责任|漏洞|异常|risk|liabilit", re.I)
+    RESEARCH_RE = re.compile(r"研究|调研|研究报告|调查分析|research|investigat", re.I)
+    CREATIVE_RE = re.compile(r"\u5199(?:\u4e00?\u7bc7|\u4e00?\u4e2a)?(?:\u5c0f\u8bf4|\u6545\u4e8b|\u8bd7|\u8bd7\u6b4c)|\u521b\u4f5c|\u7f16(?:\u4e00\u4e2a|\u4e2a)?\u6545\u4e8b|\u751f\u6210(?:\u4e00\u7bc7|\u4e00\u4e2a)?(?:\u5c0f\u8bf4|\u6545\u4e8b|\u8bd7\u6b4c)|\u626e\u6f14|write\s+(?:a\s+)?(?:story|novel|poem)", re.I)
+    DOCUMENT_HINT_RE = re.compile(r"\u6570\u636e\u5305|\u8d44\u6599|\u6587\u6863|\u6587\u4ef6|\u539f\u6587|\u9644\u4ef6|\u672c\u9879\u76ee|\u8fd9\u4e2a\u9879\u76ee|\u8fd9\u4efd|\u4e0a\u8ff0|\u524d\u8ff0|\u5176\u4e2d|\u626b\u63cf|\u7d22\u5f15|\u5408\u540c|\u62a5\u544a|\u8bb0\u5f55|\u914d\u7f6e|\u4ee3\u7801", re.I)
+    GENERAL_QA_RE = re.compile(r"^(?:\u4ec0\u4e48\u662f|\u4ec0\u4e48\u53eb|\u4e3a\u4ec0\u4e48|\u600e\u4e48(?:\u6837|\u529e|\u505a)|\u5982\u4f55|\u80fd\u5426|\u662f\u5426|\u8bf7(?:\u89e3\u91ca|\u4ecb\u7ecd)|\u89e3\u91ca\u4e00\u4e0b|\u4ecb\u7ecd\u4e00\u4e0b|what is|why |how to|can you)", re.I)
     SUMMARY_RE = re.compile(r"总结|概括|综述|概览|主要内容|梳理|summary|overview", re.I)
     REPORT_RE = re.compile(r"报告|研究报告|完整分析|深入分析|综合分析|report", re.I)
 
@@ -83,6 +87,8 @@ class AnalysisPlanner:
         if follow_up and previous_objective and previous_objective != question:
             objective = "{}；当前追问：{}".format(previous_objective, question)
         casual = bool(self.CASUAL_RE.search(question))
+        creative = bool(self.CREATIVE_RE.search(question))
+        general_qa = bool(self.GENERAL_QA_RE.search(question)) and not bool(self.DOCUMENT_HINT_RE.search(question))
         modes: List[str] = []
         checks = (
             ("translation", self.TRANSLATION_RE),
@@ -92,10 +98,15 @@ class AnalysisPlanner:
             ("relationship", self.RELATION_RE),
             ("contradiction", self.CONTRADICTION_RE),
             ("risk", self.RISK_RE),
+            ("research", self.RESEARCH_RE),
             ("summary", self.SUMMARY_RE),
         )
         if casual:
             modes.append("casual")
+        elif creative:
+            modes.append("creative")
+        elif general_qa:
+            modes.append("general_qa")
         else:
             modes.extend(name for name, pattern in checks if pattern.search(question))
             if not modes:
@@ -126,6 +137,8 @@ class AnalysisPlanner:
 
         if casual:
             add("conversation_response", "结合研究记忆进行基础交流，不读取数据包事实")
+        elif creative:
+            add("conversation_response", "\u76f4\u63a5\u5b8c\u6210\u521b\u4f5c\u8bf7\u6c42\uff0c\u4e0d\u8bfb\u53d6\u8d44\u6599\u5305\u4e8b\u5b9e")
         else:
             add("document_discovery", "在当前范围的轻量索引中发现相关候选文件")
             add("evidence_search", "检索能够直接支持用户目标的正文证据")
@@ -170,16 +183,16 @@ class AnalysisPlanner:
             "scope": scope,
             "modes": modes,
             "tasks": [
-                *([] if casual else ["document_discovery", "evidence_search"]),
-                *[mode for mode in modes if mode not in {"casual", "retrieval"}],
-                *([] if casual else ["claim_verifier", "answer_composer"]),
+                *([] if casual or creative or general_qa else ["document_discovery", "evidence_search"]),
+                *[mode for mode in modes if mode not in {"casual", "creative", "general_qa", "retrieval"}],
+                *([] if casual or creative or general_qa else ["claim_verifier", "answer_composer"]),
             ],
             "query_variants": query_variants,
             "steps": steps,
             "constraints": constraints[:20],
             "output": {
                 "format": output_format,
-                "include_citations": not casual,
+                "include_citations": not (casual or creative or general_qa),
                 "include_counter_evidence": "counter_evidence_search" in {
                     item["tool"] for item in steps
                 },

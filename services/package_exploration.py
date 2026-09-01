@@ -38,6 +38,10 @@ TEXT_EXTENSIONS = {
 OFFICE_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".xlsm"}
 ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".rar", ".7z"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+OUT_OF_SCOPE_MEDIA_EXTENSIONS = {
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma",
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".wmv", ".m4v",
+}
 DEEP_PARSE_EXTENSIONS = (
     TEXT_EXTENSIONS | OFFICE_EXTENSIONS | ARCHIVE_EXTENSIONS | IMAGE_EXTENSIONS
     | {".pdf", ".doc", ".ppt", ".xls", ".eml", ".msg", ".mbox", ".pst"}
@@ -355,7 +359,10 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
     status = "previewed"
     source_sha256 = ""
 
-    if is_sensitive_file(path.name):
+    if extension in OUT_OF_SCOPE_MEDIA_EXTENSIONS:
+        status = "out_of_scope"
+        warning.append("音视频按当前项目范围仅登记文件清单，不读取、不解析、不进入深度处理队列。")
+    elif is_sensitive_file(path.name):
         status = "restricted"
         warning.append("敏感文件仅登记元数据，未读取正文。")
     elif budget is not None and budget.exhausted:
@@ -517,9 +524,9 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
         "sample_sha256": content_sample_sha256,
         "content_sample_sha256": content_sample_sha256,
         "source_sha256": source_sha256,
-        "hash_status": "completed" if source_sha256 else (
+        "hash_status": "out_of_scope" if status == "out_of_scope" else ("completed" if source_sha256 else (
             "restricted" if status == "restricted" else "failed"
-        ),
+        )),
         "preview_fingerprint": preview_fingerprint,
         "encoding": encoding,
         "language": language,
@@ -534,6 +541,7 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
             "preview_only": True,
             "parse_complete": False,
             "semantic_complete": False,
+            "out_of_scope": status == "out_of_scope",
             "sampled_bytes": sampled_bytes,
             "source_bytes": size,
         },
@@ -617,6 +625,30 @@ def preview_as_document(preview):
     }
 
 
+def preview_relation_features(preview):
+    """Yield bounded, auditable features for the complete relation index."""
+    preview = preview or {}
+    path = str(preview.get("path") or "")
+    if not path or preview.get("status") != "previewed":
+        return
+    values = []
+    values.extend(("topic", value, 1.0) for value in (preview.get("keywords") or [])[:8])
+    entities = preview.get("entities") or {}
+    values.extend(("person", value, 2.5) for value in entities.get("people") or [])
+    values.extend(("organization", value, 2.5) for value in entities.get("organizations") or [])
+    values.extend(("email", value, 4.0) for value in entities.get("email_addresses") or [])
+    values.extend(("date", value, 1.5) for value in (preview.get("dates") or [])[:20])
+    values.append(("document_type", preview.get("document_type"), 0.3))
+    seen = set()
+    for kind, value, weight in values:
+        normalized = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+        key = (kind, normalized)
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        yield path, kind, normalized, weight
+
+
 def _representative_score(preview, topic_frequency, type_frequency, language_frequency,
                           duplicate_frequency):
     keywords = list(preview.get("keywords") or [])
@@ -683,6 +715,8 @@ def _hard_selection_decision(preview, exact_duplicate_non_primary=False):
     name = PurePosixPath(path).name.casefold()
     extension = str(preview.get("extension") or "").casefold()
     status = str(preview.get("status") or "unknown")
+    if status == "out_of_scope":
+        return "excluded", "out_of_scope_media", False
     size = max(0, int(preview.get("size") or 0))
     if status == "restricted":
         return "excluded", "restricted_or_sensitive", False
@@ -693,9 +727,15 @@ def _hard_selection_decision(preview, exact_duplicate_non_primary=False):
     if size == 0:
         return "excluded", "empty_file", False
     if exact_duplicate_non_primary:
-        return "excluded", "exact_duplicate_non_primary", True
+        # A duplicate alias is deliberately represented in the inventory, but
+        # it is a terminal queue exclusion.  Marking it promotable leaves the
+        # scheduler and coverage counters disagreeing about whether work
+        # remains.  The canonical file carries the one independent result.
+        return "excluded", "exact_duplicate_non_primary", False
     if name in LOW_VALUE_NAMES or extension in LOW_VALUE_EXTENSIONS:
-        return "excluded", "cache_temporary_or_dependency_file", True
+        # Cache/dependency files remain visible for auditability, never enter
+        # deep processing, and must count as a terminal policy exclusion.
+        return "excluded", "cache_temporary_or_dependency_file", False
     if extension and extension not in DEEP_PARSE_EXTENSIONS:
         return "deferred", "unsupported_or_binary_metadata_only", True
     return None, None, True

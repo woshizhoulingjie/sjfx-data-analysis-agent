@@ -1,8 +1,8 @@
 """Policies and coverage contracts for genuinely large data packages.
 
-Every file is inventoried and receives a bounded preview.  Accurate parsing is
-reserved for diverse representatives and for files promoted by user queries;
-the two coverage levels are never reported as if they were equivalent.
+Every file is inventoried and receives a bounded searchable foundation before
+eligible logical files enter a resumable full deep-processing queue.  Priority
+changes ordering only; bounded previews are never reported as full parsing.
 """
 import hashlib
 import json
@@ -46,10 +46,10 @@ def build_policy(scan, options=None):
     threshold_files = int(options.get("threshold_files") or 3000)
     # Kept for backwards-compatible configuration display.  They are no longer
     # used as a hard cap in full large-package mode.
-    initial_limit = max(1, int(options.get("initial_parse_files") or 700))
-    deepen_limit = max(20, min(50, int(options.get("deepen_batch_files") or 30)))
-    batch_files = max(20, min(50, int(options.get("batch_files") or 30)))
-    background_backfill = bool(options.get("background_backfill", False))
+    initial_limit = max(1, min(500, int(options.get("initial_parse_files") or 500)))
+    deepen_limit = max(1, min(500, int(options.get("deepen_batch_files") or 500)))
+    batch_files = max(1, min(500, int(options.get("batch_files") or 500)))
+    background_backfill = bool(options.get("background_backfill", True))
     overview_chars = max(1000, min(12000, int(options.get("overview_chars_per_file") or 4000)))
     overview_evidence = max(1, min(20, int(options.get("overview_evidence_per_file") or 6)))
     preview_bytes = max(4096, min(1024 * 1024, int(options.get("preview_bytes_per_file") or 96 * 1024)))
@@ -84,10 +84,10 @@ def build_policy(scan, options=None):
         "batch_completion": "continue_until_inventory_exhausted",
         "batch_work_kind": "bounded_preview_then_selected_deep_parse",
         "batch_checkpoint_scope": "per_file",
-        "deep_batch_contract": "one_durable_job_per_20_to_50_files",
+        "deep_batch_contract": "one_logical_batch_up_to_500_files_with_bounded_subtasks",
         "background_backfill": background_backfill,
         "pause_behavior": "安全停止后保留逐文件检查点；再次启动同一扫描可续跑",
-        "deep_analysis_strategy": "全量有界轻量预览与内容地图；自动深析代表文件，用户问答命中后动态晋升准确解析",
+        "deep_analysis_strategy": "全量基础索引后每批最多500个逻辑文件连续深析；用户意图与关系召回只调整顺序，不删除剩余文件",
     }
 
 
@@ -99,7 +99,10 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
     """Estimate durable state and worst-case parser scratch before content I/O."""
     file_count = max(0, int(scan.get("file_count") or 0))
     inventory_bytes = max(0, int(scan.get("total_size") or 0))
-    preview_source_bytes = min(
+    # Capacity must cover one bounded foundation preview for every file.  The
+    # operator value is a reserve floor, not a reason to make tail files
+    # unsearchable after an arbitrary package-wide byte cap is reached.
+    preview_source_bytes = max(
         max(0, int(preview_total_bytes)),
         file_count * max(4096, int(preview_bytes_per_file)),
     )
@@ -138,6 +141,7 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
             "preview_windows_per_file": 3,
             "state_safety_multiplier": 1.35,
             "full_sha256_requires_one_complete_source_read": True,
+            "preview_total_is_capacity_floor": True,
         },
     }
 
@@ -459,6 +463,8 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
         excluded_paths = {
             path for path, state in scoped_workflow.items()
             if state.get("selection_state") == "excluded"
+            or not bool(state.get("promotion_allowed", True))
+            or state.get("safety_status") in {"restricted", "rejected"}
         }
         light_eligible = selected - excluded_paths
         light_ready = {
@@ -540,11 +546,20 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             len(evidence_eligible), len(evidence_ready),
             contract="deep-parsed files with source-locatable evidence",
         )
+        logical_eligible_paths = selected - excluded_paths
+        logical_completed_paths = logical_eligible_paths & semantic_complete_paths
+        logical_queue_coverage = coverage_item(
+            not logical_eligible_paths or logical_eligible_paths <= semantic_complete_paths,
+            len(logical_eligible_paths), len(logical_completed_paths),
+            terminal_excluded_files=len(excluded_paths),
+            failed_files=len(logical_eligible_paths & failed),
+            contract="terminal exclusions do not consume deep-processing slots; every other logical file remains queued",
+        )
         # Preview projections are searchable documents, not completed body
         # parses. Public parse ratios must never treat a preview as full text.
         content_parse_ratio = round(len(parse_complete_paths) / float(len(selected) or 1), 6)
         deep_analysis_ratio = round(len(semantic_complete_paths) / float(len(selected) or 1), 6)
-        batch_size = max(20, min(50, int((policy or {}).get("batch_files") or 30)))
+        batch_size = max(1, min(500, int((policy or {}).get("batch_files") or 500)))
         remaining_batches = int(math.ceil(
             (len(content_pending_paths) + len(failed)) / float(batch_size)
         ))
@@ -600,6 +615,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
             "selection_coverage": selection_coverage,
             "translation_coverage": translation_coverage,
             "evidence_readiness_coverage": evidence_readiness_coverage,
+            "logical_queue_coverage": logical_queue_coverage,
             "pipeline_coverage": {
                 "inventory": inventory_coverage,
                 "safety": safety_coverage,
@@ -610,6 +626,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
                 "deep_analysis": semantic_analysis_coverage,
                 "translation": translation_coverage,
                 "evidence_readiness": evidence_readiness_coverage,
+                "logical_queue": logical_queue_coverage,
             },
             "coverage_contract": {
                 "inventory": "文件和目录清点覆盖；只有未截断、无扫描错误、无显式排除且未触及深度上限时才是100%。符号链接登记自身但不跟随目标。",
@@ -621,6 +638,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
                 "deep_analysis": "完成全文语义分析且不是有界投影的文件占清点文件比例。",
                 "translation": "外文原文保留，译文以文件/段落级工作副本单独计数。",
                 "evidence_readiness": "深析文件已生成可回溯到原文位置的证据。",
+                "logical_queue": "完全重复副本及安全排除项不消耗深析名额，其余逻辑文件全部保留并最终处理。",
             },
             "coverage_level": coverage_level,
             "coverage_level_label": {
@@ -650,7 +668,7 @@ def build_coverage(scan, documents, failures=None, pending_paths=None, policy=No
                 "eta_note": "尚无稳定的同类文件吞吐基线，完成首个批次后再按格式估算 ETA。" if remaining_batches else "已无待处理批次。",
             },
             "large_package_notice": (
-                "大数据包按每批 {} 个文件完成有界轻量预览并建立内容地图；仅代表文件和用户命中文件进入准确深析。逐文件保存检查点，可安全停止并续跑。轻量预览不等同于全文深度分析。".format(batch_size)
+                "大数据包先完成全量基础索引，再按每批最多 {} 个逻辑文件连续深析直至全量完成；用户可安全暂停，召回与检索只调整剩余队列顺序。轻量索引不等同于全文深度分析。".format(batch_size)
                 if (policy or {}).get("enabled") else None
             ),
         }
@@ -681,8 +699,8 @@ def pending_group(paths, inventory, policy):
         "node_type": "deep_pending_scope",
         "node_id": "pending-{}".format(hashlib.sha256("|".join(paths).encode("utf-8")).hexdigest()[:16]),
         "dimension": "分析进度",
-        "name": "待按需深度分析",
-        "summary": "该分支包含 {} 个已纳入清点、但尚未进入准确深度分析的文件；用户问答命中后可自动晋升。".format(len(paths)),
+        "name": "全量深度处理待办",
+        "summary": "该分支包含 {} 个已完成盘点和基础索引、正在等待连续深度处理的文件；检索、召回和手动选择只会把相关文件提前，不会删除其他待办。".format(len(paths)),
         "member_paths": paths,
         "file_count": len(paths),
         "total_size": total_size,

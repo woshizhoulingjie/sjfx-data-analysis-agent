@@ -185,6 +185,7 @@ def execute(job):
         _run_claimed_analysis_job,
         _run_claimed_conversation_turn_job,
         _run_claimed_export_job,
+        _run_claimed_homogeneous_analysis_job,
         _run_claimed_report_job,
         _run_claimed_search_index_rebuild_job,
         _run_claimed_scan_and_analyze_job,
@@ -196,6 +197,8 @@ def execute(job):
         return _run_claimed_scan_and_analyze_job(job)
     if task_type == "analyze_package":
         return _run_claimed_analysis_job(job)
+    if task_type == "homogeneous_analysis":
+        return _run_claimed_homogeneous_analysis_job(job)
     if task_type == "conversation_turn":
         return _run_claimed_conversation_turn_job(job)
     if task_type == "rebuild_search_index":
@@ -259,6 +262,7 @@ def _task_runtime_limit(job):
     limits = {
         "scan_and_analyze": Config.JOB_SCAN_TIMEOUT_SECONDS,
         "analyze_package": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
+        "homogeneous_analysis": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
         "conversation_turn": Config.JOB_CONVERSATION_TURN_TIMEOUT_SECONDS,
         "rebuild_search_index": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
         "generate_summary": Config.JOB_SUMMARY_TIMEOUT_SECONDS,
@@ -560,6 +564,12 @@ def run_forever():
                 except Exception:
                     logger.warning("周期性失联任务恢复失败，将继续运行", exc_info=True)
                 last_recovery = time.monotonic()
+            try:
+                awakened = storage.wake_due_file_retries()
+                if awakened:
+                    logger.info("自动唤醒 %s 个到期文件重试任务", awakened)
+            except Exception:
+                logger.warning("到期文件重试唤醒失败，将在下一轮重试", exc_info=True)
             job = storage.claim_next_job(WORKER_ID)
             if not job:
                 time.sleep(Config.WORKER_POLL_SECONDS)

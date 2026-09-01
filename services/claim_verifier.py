@@ -404,6 +404,13 @@ class ClaimVerifier:
             "numeric_failure_count": numeric_failures,
             "out_of_scope_citation_count": len(out_of_scope),
         }
+        # Canonical names for new API/UI consumers; retain legacy fields above.
+        quality_metrics.update({
+            "retrieval_coverage": query_coverage,
+            "inspection_coverage": quality_metrics["scope_inspection_coverage"],
+            "deep_analysis_coverage": quality_metrics["candidate_deep_coverage"],
+            "evidence_support_ratio": support_ratio,
+        })
         ledger.update(
             {
                 "claims": verified_claims,
@@ -463,7 +470,12 @@ class ClaimVerifier:
             else:
                 omitted += 1
         if kept:
-            answer = "核验后的结论\n" + "\n".join("- " + item for item in kept)
+            # Rebuild the list after filtering so removed claims never leave
+            # broken numbering or orphaned sections in the final answer.
+            answer = "\n".join(
+                "{}. {}".format(index, item)
+                for index, item in enumerate(kept, 1)
+            )
         else:
             answer = "现有证据不足，暂时无法形成可核验的确定结论。"
         if omitted:

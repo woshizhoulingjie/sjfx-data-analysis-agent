@@ -786,7 +786,15 @@ class UnifiedDocumentParser:
         max_archive_file_bytes = content_byte_limit("MAX_ARCHIVE_FILE_BYTES")
         effective_file_limit = max_archive_file_bytes if is_archive else max_single_file_bytes
         relative_path = str(relative_path or path.name).replace("\\", "/")
-        mode = "fast" if str(mode).lower() == "fast" else "accurate"
+        requested_mode = str(mode or "accurate").strip().lower()
+        if requested_mode not in {"fast", "accurate", "auto"}:
+            requested_mode = "accurate"
+        # ``auto`` is the single user-facing mode.  It keeps cheap/native
+        # extraction on the fast path and reserves Docling for files whose
+        # content actually needs layout/OCR work.  Archives stay in auto mode
+        # so each member is routed independently instead of inheriting the
+        # container's cost profile.
+        mode = self._select_auto_mode(path, ext) if requested_mode == "auto" else requested_mode
         over_size_limit = file_size > effective_file_limit
         # Reject by inventory size before a 10+ GiB sequential read.  Accepted
         # inputs are hashed as part of the authoritative parse contract.
@@ -821,6 +829,7 @@ class UnifiedDocumentParser:
             "evidence": [],
             "warnings": [],
         }
+        base["parser"]["requested_mode"] = requested_mode
         if over_size_limit:
             base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
             base["coverage"].update({"complete": False, "coverage_ratio": 0.0, "limited_by_size": True})
@@ -839,6 +848,12 @@ class UnifiedDocumentParser:
             return base
         if ext not in SUPPORTED_EXTENSIONS:
             base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
+            base["coverage"].update({
+                "complete": False,
+                "coverage_ratio": 0.0,
+                "content_unsupported": True,
+                "restriction_reason": "unsupported_extension",
+            })
             base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
             return base
 
@@ -881,6 +896,8 @@ class UnifiedDocumentParser:
 
         if is_archive:
             self._parse_archive(path, base, mode=mode, archive_depth=_archive_depth)
+            base["parser"]["requested_mode"] = requested_mode
+            base["parser"]["mode"] = "auto" if requested_mode == "auto" else mode
             base["content_sha256"] = _digest_text(base["text"])
             base["coverage"]["stored_characters"] = len(base["text"])
             archive_manifest = base.get("archive_manifest") or {}
@@ -975,7 +992,46 @@ class UnifiedDocumentParser:
                     base["warnings"].append("数据画像：{}".format(judgment["reason"]))
         except Exception as exc:
             base["warnings"].append("结构化数据画像失败，正文解析仍可用：{}".format(exc))
+        # Preserve the operator-facing request even when a parser fallback
+        # replaces the parser metadata dictionary.  ``mode`` records the
+        # concrete route chosen by auto mode; ``requested_mode`` records why
+        # that route was selected and is used by the UI/audit trail.
+        base.setdefault("parser", {})["requested_mode"] = requested_mode
+        base["parser"]["mode"] = str(base["parser"].get("mode") or mode)
         return base
+
+    def _select_auto_mode(self, path, ext):
+        """Choose a bounded parser route without materialising the document.
+
+        Auto mode deliberately favours native/streaming readers for ordinary
+        text and Office files.  PDFs are sampled with the lightweight extractor
+        only to determine whether a text layer exists; image-only or otherwise
+        empty PDFs are sent to the accurate OCR/layout route.  This keeps the
+        public workflow simple while avoiding Docling for the majority of
+        machine-generated documents.
+        """
+        simple = {
+            ".txt", ".md", ".markdown", ".html", ".htm", ".csv", ".tsv",
+            ".json", ".jsonl", ".xml", ".docx", ".pptx", ".xlsx", ".xlsm",
+        }
+        if ext in simple:
+            return "fast"
+        if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
+            return "fast"
+        if ext == ".pdf":
+            try:
+                probe = extract_text(path, max_chars=12000)
+                text = str((probe or {}).get("text") or "").strip()
+                # A small text layer is often just a title on a scanned PDF;
+                # require a meaningful amount before choosing the fast route.
+                if len(text) >= 80:
+                    return "fast"
+            except Exception:
+                pass
+            return "accurate"
+        if ext in ARCHIVE_EXTENSIONS or path.name.lower().endswith((".tar.gz", ".tar.bz2")):
+            return "auto"
+        return "fast"
 
     def _parse_archive(self, path, base, mode="accurate", archive_depth=0):
         """Parse supported archive members inside a private, bounded scratch root."""

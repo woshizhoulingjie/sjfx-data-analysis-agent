@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - exercised only by legacy Python.
         pass
 
 from services.evidence import evidence_quality
+from config import Config
 
 
 SCHEMA_VERSION = "conversation-answer/1.0"
@@ -396,9 +397,28 @@ class IntentRouter:
         r"^(?:你好|您好|嗨|hi|hello|谢谢|感谢|辛苦了|再见|你是谁|你能做什么|怎么用|帮助)(?:[呀啊吗呢！!。.？?\s]*)$",
         re.I,
     )
+    CREATIVE_RE = re.compile(
+        r"\u5199(?:\u4e00?\u7bc7|\u4e00?\u4e2a)?(?:\u5c0f\u8bf4|\u6545\u4e8b|\u8bd7|\u8bd7\u6b4c)|"
+        r"\u521b\u4f5c|\u7f16(?:\u4e00\u4e2a|\u4e2a)?\u6545\u4e8b|"
+        r"\u751f\u6210(?:\u4e00\u7bc7|\u4e00\u4e2a)?(?:\u5c0f\u8bf4|\u6545\u4e8b|\u8bd7\u6b4c)|"
+        r"\u626e\u6f14|\u89d2\u8272\u626e\u6f14|\u5199\u4ee3\u7801\u793a\u4f8b|"
+        r"write\s+(?:a\s+)?(?:story|novel|poem)|creative writing",
+        re.I,
+    )
+    DOCUMENT_HINT_RE = re.compile(
+        r"\u6570\u636e\u5305|\u8d44\u6599|\u6587\u6863|\u6587\u4ef6|\u539f\u6587|\u9644\u4ef6|"
+        r"\u672c\u9879\u76ee|\u8fd9\u4e2a\u9879\u76ee|\u8fd9\u4efd|\u4e0a\u8ff0|\u524d\u8ff0|\u5176\u4e2d|"
+        r"\u626b\u63cf|\u7d22\u5f15|\u5408\u540c|\u62a5\u544a|\u8bb0\u5f55|\u914d\u7f6e|\u4ee3\u7801",
+        re.I,
+    )
+    GENERAL_QA_RE = re.compile(
+        r"^(?:\u4ec0\u4e48\u662f|\u4ec0\u4e48\u53eb|\u4e3a\u4ec0\u4e48|\u600e\u4e48(?:\u6837|\u529e|\u505a)|\u5982\u4f55|\u80fd\u5426|\u662f\u5426|"
+        r"\u8bf7(?:\u89e3\u91ca|\u4ecb\u7ecd)|\u89e3\u91ca\u4e00\u4e0b|\u4ecb\u7ecd\u4e00\u4e0b|what is|why |how to|can you)",
+        re.I,
+    )
     ANALYSIS_RE = re.compile(
         r"怎么看|如何理解|你认为|你觉得|可能意味着|说明什么|有什么启发|下一步|怎么研究|"
-        r"研究(?:的)?方向|分析思路|提出假设|给些建议|头脑风暴|brainstorm|suggest|recommend|hypothesi[sz]e",
+        r"研究报告|调研|调查分析|研究(?:的)?方向|分析思路|提出假设|给些建议|头脑风暴|brainstorm|suggest|recommend|hypothesi[sz]e|research|investigat",
         re.I,
     )
 
@@ -409,6 +429,10 @@ class IntentRouter:
         text = _clean_text(question, 8000)
         if self.CASUAL_RE.search(text):
             return IntentDecision(name="casual", confidence=0.99, reason="普通交流或系统使用咨询")
+        if self.CREATIVE_RE.search(text):
+            return IntentDecision(name="creative", confidence=0.99, reason="\u7528\u6237\u8bf7\u6c42\u521b\u4f5c\u6216\u751f\u6210\u5185\u5bb9")
+        if self.GENERAL_QA_RE.search(text) and not self.DOCUMENT_HINT_RE.search(text):
+            return IntentDecision(name="general_qa", confidence=0.96, reason="general question outside active document scope")
         matched_intents = [
             name for name, pattern in (
                 ("translation", self.TRANSLATION_RE),
@@ -434,7 +458,7 @@ class IntentRouter:
         ):
             if pattern.search(text):
                 return IntentDecision(name=name, confidence=0.98, reason=reason)
-        if is_follow_up and previous_intent in {"translation", "relationship", "structured", "summary", "retrieval", "analysis", "casual"}:
+        if is_follow_up and previous_intent in {"translation", "relationship", "structured", "summary", "retrieval", "analysis", "casual", "creative", "general_qa"}:
             return IntentDecision(
                 name=str(previous_intent),
                 confidence=0.78,
@@ -718,7 +742,13 @@ class PromotionRequest:
         }
 
 
-def _model_text(model: Any, system_prompt: str, user_prompt: str, max_tokens: int = 1800) -> str:
+def _model_text(
+    model: Any,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 1800,
+    timeout: Optional[int] = None,
+) -> str:
     if model is None:
         return ""
     if hasattr(model, "chat"):
@@ -728,6 +758,7 @@ def _model_text(model: Any, system_prompt: str, user_prompt: str, max_tokens: in
             temperature=0.1,
             max_tokens=max_tokens,
             retries=0,
+            timeout=timeout,
         )
     elif hasattr(model, "generate"):
         value = model.generate(system_prompt, user_prompt)
@@ -847,6 +878,7 @@ class ConversationEngine:
         "relationship": "说明实体/文件之间的关系、方向、时间与依据；证据只能证明共现时，不得声称因果。",
         "summary": "概括当前会话范围的主要内容，并明确这只是命中证据的概览。",
         "analysis": "先回答，再分开列出资料依据与进一步分析；推断必须明确标为分析判断。",
+        "creative": "\u5b8c\u6210\u7528\u6237\u8981\u6c42\u7684\u521b\u4f5c\uff0c\u8bed\u8a00\u81ea\u7136\uff0c\u4e0d\u8981\u628a\u8d44\u6599\u5305\u5185\u5bb9\u4f2a\u88c5\u6210\u521b\u4f5c\u4e8b\u5b9e\u3002",
     }
 
     def __init__(
@@ -938,6 +970,10 @@ class ConversationEngine:
 
         if decision.name == "casual":
             turn = self._answer_casual(session, resolution, decision, effective_scope, context)
+        elif decision.name == "creative":
+            turn = self._answer_creative(session, resolution, decision, effective_scope, context)
+        elif decision.name == "general_qa":
+            turn = self._answer_general_qa(session, resolution, decision, effective_scope, context)
         elif decision.name == "structured":
             turn = self._answer_structured(session, resolution, decision, effective_scope, context, coverage)
         elif decision.name == "multi_task":
@@ -996,7 +1032,10 @@ class ConversationEngine:
         prompt = "会话上下文：\n{}\n\n用户消息：{}".format(context or "无", resolution.original_question)
         warnings: List[str] = []
         try:
-            answer = _model_text(self.answer_model, system, prompt, max_tokens=900)
+            answer = _model_text(
+                self.answer_model, system, prompt, max_tokens=700,
+                timeout=min(20, int(getattr(Config, "CONVERSATION_MODEL_TIMEOUT_SECONDS", 45))),
+            )
         except Exception as exc:
             answer = "我可以继续帮你梳理数据包、讨论分析思路、翻译资料，或根据原文证据回答问题。"
             warnings.append("本地回答模型暂时不可用：{}".format(_clean_text(exc, 180)))
@@ -1006,6 +1045,71 @@ class ConversationEngine:
             session, resolution, decision, scope, answer, [], status="answered",
             evidence_status="not_required", coverage=CoverageSnapshot(), promotion=None,
             warnings=warnings,
+        )
+
+    def _answer_general_qa(
+        self,
+        session: ConversationSession,
+        resolution: FollowUpResolution,
+        decision: IntentDecision,
+        scope: ConversationScope,
+        context: str,
+    ) -> Dict[str, Any]:
+        system = (
+            "You are a natural, reliable assistant. Answer the user's general question "
+            "directly in the user's language. Do not use, cite, or invent active "
+            "document-package information. For real-time or unverifiable external facts, "
+            "state that boundary and offer a useful next step."
+        )
+        prompt = "Conversation context:\n{}\n\nUser question: {}".format(
+            context or "none", resolution.original_question
+        )
+        warnings: List[str] = []
+        try:
+            answer = _model_text(
+                self.answer_model, system, prompt, max_tokens=1000,
+                timeout=min(30, int(getattr(Config, "CONVERSATION_MODEL_TIMEOUT_SECONDS", 45))),
+            )
+        except Exception as exc:
+            answer = "The local answer model is temporarily unavailable. Please try again shortly."
+            warnings.append("local answer model unavailable: {}".format(_clean_text(exc, 180)))
+        return self._base_turn(
+            session, resolution, decision, scope,
+            answer or "Please make the question a little more specific and I will answer directly.",
+            [], status="answered", evidence_status="not_required",
+            coverage=CoverageSnapshot(), promotion=None, warnings=warnings,
+        )
+
+    def _answer_creative(
+        self,
+        session: ConversationSession,
+        resolution: FollowUpResolution,
+        decision: IntentDecision,
+        scope: ConversationScope,
+        context: str,
+    ) -> Dict[str, Any]:
+        system = (
+            "\u4f60\u662f\u6570\u636e\u5206\u6790\u5de5\u4f5c\u53f0\u4e2d\u7684\u901a\u7528\u4e2d\u6587\u52a9\u624b\u3002"
+            "\u7528\u6237\u672c\u8f6e\u662f\u521b\u4f5c\u8bf7\u6c42\uff0c\u8bf7\u50cf\u5927\u6a21\u578b\u804a\u5929\u4e00\u6837\u76f4\u63a5\u5b8c\u6210\uff0c\u8bed\u8a00\u81ea\u7136\uff0c"
+            "\u4e0d\u8981\u68c0\u7d22\u3001\u5f15\u7528\u6216\u89e3\u91ca\u8d44\u6599\u5305\u5185\u90e8\u6d41\u7a0b\u3002"
+        )
+        prompt = "\u4f1a\u8bdd\u4e0a\u4e0b\u6587\uff1a\\n{}\\n\\n\u7528\u6237\u521b\u4f5c\u8bf7\u6c42\uff1a{}".format(
+            context or "\u65e0", resolution.original_question
+        )
+        warnings: List[str] = []
+        try:
+            answer = _model_text(
+                self.answer_model, system, prompt, max_tokens=1800,
+                timeout=min(45, int(getattr(Config, "CONVERSATION_MODEL_TIMEOUT_SECONDS", 45))),
+            )
+        except Exception as exc:
+            answer = "\u672c\u5730\u56de\u7b54\u6a21\u578b\u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002"
+            warnings.append("\u672c\u5730\u56de\u7b54\u6a21\u578b\u6682\u65f6\u4e0d\u53ef\u7528\uff1a{}".format(_clean_text(exc, 180)))
+        return self._base_turn(
+            session, resolution, decision, scope,
+            answer or "\u8bf7\u544a\u8bc9\u6211\u4f60\u60f3\u521b\u4f5c\u7684\u4e3b\u9898\u3001\u98ce\u683c\u548c\u957f\u5ea6\u3002",
+            [], status="answered", evidence_status="not_required",
+            coverage=CoverageSnapshot(), promotion=None, warnings=warnings,
         )
 
     def _base_turn(
@@ -1038,6 +1142,11 @@ class ConversationEngine:
             "coverage": coverage.as_dict(),
             "promotion_request": promotion.as_dict() if promotion else None,
             "warnings": list(dict.fromkeys(str(item) for item in (warnings or []) if item)),
+            "task_status": (
+                "fulfilled" if status == "answered"
+                else "partially_fulfilled" if status == "partial"
+                else "not_fulfilled"
+            ),
         }
 
     def _promotion(
@@ -1217,7 +1326,10 @@ class ConversationEngine:
         prompt = "会话上下文：\n{}\n\n用户问题：{}".format(context or "无", question)
         warnings: List[str] = []
         try:
-            answer = _model_text(self.answer_model, system, prompt, max_tokens=1500)
+            answer = _model_text(
+                self.answer_model, system, prompt, max_tokens=1000,
+                timeout=min(30, int(getattr(Config, "CONVERSATION_MODEL_TIMEOUT_SECONDS", 45))),
+            )
         except Exception as exc:
             answer = (
                 "直接回答\n目前可以先把它作为待验证的分析假设。\n\n"
@@ -1324,7 +1436,14 @@ class ConversationEngine:
         )
         warnings: List[str] = []
         try:
-            answer = _model_text(self.answer_model, self.SYSTEM_PROMPT, user_prompt, max_tokens=1800)
+            model_timeout = int(getattr(Config, "CONVERSATION_MODEL_TIMEOUT_SECONDS", 45))
+            if intent in {"relationship", "structured", "timeline", "comparison", "contradiction", "risk"}:
+                model_timeout = min(model_timeout, 30)
+            answer = _model_text(
+                self.answer_model, self.SYSTEM_PROMPT, user_prompt,
+                max_tokens=1200 if intent in {"relationship", "structured", "timeline", "comparison", "contradiction", "risk"} else 1600,
+                timeout=model_timeout,
+            )
         except Exception as exc:  # Evidence remains usable during a local-model restart.
             answer = ""
             warnings.append("本地回答模型不可用，已返回有界证据摘录：{}".format(_clean_text(exc, 180)))

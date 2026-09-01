@@ -9,7 +9,9 @@
 
   const CURRENT_SCAN_KEY = 'sjfx_current_scan_id_v1';
   const LAST_DOCUMENT_KEY = 'sjfx_last_document_path_v2';
+  const LAST_DOCUMENT_SCAN_KEY = 'sjfx_last_document_scan_id_v1';
   const PAGE_SIZE = 6000;
+  const TRANSLATION_LIST_PAGE_SIZE = 100;
   const COLORS = ['#4169a1', '#d68a3a', '#508c78', '#a45f67', '#7667a8', '#b4a13d', '#5b7e94', '#8a7162'];
   const $ = (id) => document.getElementById(id);
   const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -27,13 +29,26 @@
 
   const state = {
     scanId: '', overview: null, researchBrief: null, reportArtifact: null,
-    selectedScope: null, overviewLoading: false,
-    conversation: null, conversationList: [], turns: new Map(), conversationSending: false,
+    selectedScope: null, overviewLoading: false, overviewRequestSeq: 0,
+    conversation: null, conversationList: [], turns: new Map(), conversationSending: false, conversationLoading: false,
+    generalChatMessages: [], generalChatSending: false,
     conversationPending: null, searchIndex: null,
     translationItems: [], translationCounts: {}, translationPath: '', translationView: 'translated',
     translationOffset: 0, translationPage: null, translationLoading: false,
+    translationListOffset: 0, translationListPage: null, translationListLoading: false,
+    translationRequestSeq: 0, translationListRequestSeq: 0, translationSearchTimer: 0,
+    conversationListRequestSeq: 0,
     watchers: new Map(), scopeConstraints: {}
   };
+
+  const OVERVIEW_MOUNT_IDS = [
+    'packageOverviewMetrics', 'packageOverviewSummary', 'packageOverviewTreemap',
+    'packageOverviewDirectories', 'packageOverviewFormats', 'packageOverviewTypes',
+    'packageOverviewLanguages', 'packageOverviewTimeline', 'packageOverviewTopics',
+    'packageOverviewEntities', 'packageOverviewRelationships', 'packageOverviewDuplicates',
+    'packageOverviewOutliers', 'packageOverviewBriefSummary', 'packageOverviewFindings',
+    'packageOverviewDirection', 'packageOverviewResearchDetails', 'packageOverviewScopeFiles'
+  ];
 
   function currentRoute() {
     return document.body.dataset.route || 'dashboard';
@@ -92,11 +107,30 @@
     return `${bytes >= 100 || unit === 0 ? bytes.toFixed(0) : bytes.toFixed(1)} ${units[unit]}`;
   }
 
+  function rememberTranslationPath(path) {
+    const value = String(path || '').trim();
+    if (!value) return;
+    window.sessionStorage.setItem(LAST_DOCUMENT_KEY, value);
+    if (state.scanId) window.sessionStorage.setItem(LAST_DOCUMENT_SCAN_KEY, state.scanId);
+  }
+
   function setOverviewState(message, type) {
     const host = $('packageOverviewState');
     if (!host) return;
     host.textContent = message;
     host.className = 'v2-inline-state' + (type ? ` is-${type}` : '');
+  }
+
+  function resetOverviewView(scanId) {
+    OVERVIEW_MOUNT_IDS.forEach((id) => { if ($(id)) $(id).innerHTML = ''; });
+    const reportButton = $('packageOverviewReportBtn');
+    if (reportButton) {
+      reportButton.disabled = true;
+      reportButton.dataset.filename = '';
+    }
+    if ($('packageOverviewAskAllBtn')) $('packageOverviewAskAllBtn').disabled = !scanId;
+    setOverviewState(scanId ? '正在切换到新的数据包，旧结果已清除…' : '导入数据包后生成内容概览。');
+    renderSelectedScope();
   }
 
   function disclosure(section, noun) {
@@ -298,12 +332,16 @@
       const a = positions[item.source_file], b = positions[item.target_file];
       return `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}"><title>${escapeHtml(item.relation || '关联')} · 权重 ${escapeHtml(item.weight == null ? '—' : item.weight)}</title></line>`;
     }).join('');
+    const fileScope = (path) => ({
+      kind: 'files', value: path, label: `关联文件 · ${basename(path)}`,
+      source_paths: [path], dimension: 'relationship_file'
+    });
     const nodeMarkup = nodes.map((path) => {
       const point = positions[path];
-      return `<g><circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="8"><title>${escapeHtml(path)}</title></circle><text x="${point.x.toFixed(1)}" y="${(point.y + (point.y < centreY ? -13 : 20)).toFixed(1)}" text-anchor="middle">${escapeHtml(truncate(basename(path), 18))}</text></g>`;
+      return `<g class="v2-relationship-node v2-overview-scope" role="button" tabindex="0" aria-label="查看 ${escapeHtml(path)} 的资料范围"${scopeAttributes(fileScope(path))}><circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="8"><title>${escapeHtml(path)}</title></circle><text x="${point.x.toFixed(1)}" y="${(point.y + (point.y < centreY ? -13 : 20)).toFixed(1)}" text-anchor="middle">${escapeHtml(truncate(basename(path), 18))}</text></g>`;
     }).join('');
-    const rows = relationships.slice(0, 10).map((item) => `<tr><td>${escapeHtml(item.source_file)}</td><td>${escapeHtml(item.relation || '关联')}</td><td>${escapeHtml(item.target_file)}</td><td>${escapeHtml(item.weight == null ? '—' : item.weight)}</td></tr>`).join('');
-    host.innerHTML = `<div class="v2-relationship-wrap"><svg class="v2-relationship-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="文件关系网络">${lines}${nodeMarkup}</svg></div><table class="v2-relationship-table"><thead><tr><th>来源文件</th><th>关系</th><th>目标文件</th><th>权重</th></tr></thead><tbody>${rows}</tbody></table>${disclosure(section, '关系')}`;
+    const rows = relationships.slice(0, 10).map((item) => `<tr><td><button type="button" class="v2-relationship-path" title="限定到 ${escapeHtml(item.source_file)}"${scopeAttributes(fileScope(item.source_file))}>${escapeHtml(item.source_file)}</button></td><td>${escapeHtml(item.relation || '关联')}</td><td><button type="button" class="v2-relationship-path" title="限定到 ${escapeHtml(item.target_file)}"${scopeAttributes(fileScope(item.target_file))}>${escapeHtml(item.target_file)}</button></td><td>${escapeHtml(item.weight == null ? '—' : item.weight)}</td></tr>`).join('');
+    host.innerHTML = `<div class="v2-relationship-hint">点击节点或文件路径，可将该文件带入范围、对话或文档查看。</div><div class="v2-relationship-wrap"><svg class="v2-relationship-svg" viewBox="0 0 ${width} ${height}" role="group" aria-label="文件关系网络；点击节点查看对应文件">${lines}${nodeMarkup}</svg></div><table class="v2-relationship-table"><thead><tr><th>来源文件</th><th>关系</th><th>目标文件</th><th>权重</th></tr></thead><tbody>${rows}</tbody></table>${disclosure(section, '关系')}`;
   }
 
   function duplicateGroup(group) {
@@ -458,20 +496,25 @@
 
   async function loadOverview(force) {
     if (!state.scanId || state.overviewLoading || (state.overview && !force)) return;
+    const requestedScanId = state.scanId;
+    const requestSeq = ++state.overviewRequestSeq;
     state.overviewLoading = true;
     $('packageOverviewRefreshBtn').disabled = true;
     setOverviewState('正在汇总数据包自身的内容构成…');
     try {
-      const response = await api(`/api/package-overview/${encodeURIComponent(state.scanId)}`);
+      const response = await api(`/api/package-overview/${encodeURIComponent(requestedScanId)}`);
+      if (state.scanId !== requestedScanId || state.overviewRequestSeq !== requestSeq) return;
       state.overview = response.overview || {};
       state.researchBrief = response.research_brief || {};
       state.reportArtifact = response.report_artifact || null;
       renderOverview(state.overview);
     } catch (error) {
-      setOverviewState(error.message || '无法加载数据包概览', 'error');
+      if (state.scanId === requestedScanId && state.overviewRequestSeq === requestSeq) setOverviewState(error.message || '无法加载数据包概览', 'error');
     } finally {
-      state.overviewLoading = false;
-      $('packageOverviewRefreshBtn').disabled = !state.scanId;
+      if (state.overviewRequestSeq === requestSeq) {
+        state.overviewLoading = false;
+        if (state.scanId === requestedScanId) $('packageOverviewRefreshBtn').disabled = !state.scanId;
+      }
     }
   }
 
@@ -593,7 +636,7 @@
   function openBriefFile(path) {
     if (!path) return;
     state.translationPath = path;
-    window.sessionStorage.setItem(LAST_DOCUMENT_KEY, path);
+    rememberTranslationPath(path);
     window.SJFXShell && window.SJFXShell.activate('translation');
     loadTranslation(path, 0);
   }
@@ -609,10 +652,22 @@
 
   function scopeSummary(scope) {
     scope = scope || { kind: 'package' };
+    if (scope.kind === 'general') return '通用聊天';
     if (scope.kind === 'package') return '范围：整个数据包';
     if (scope.kind === 'time') return `范围：${scope.value && scope.value.start || '不限'} 至 ${scope.value && scope.value.end || '不限'}`;
     if (scope.kind === 'files') return `范围：${(scope.source_paths || scope.value || []).length} 个指定文件`;
     return `范围：${scopeKindLabel(scope.kind)} · ${scope.label || scope.value || '—'}`;
+  }
+
+  function ensureGeneralSession() {
+    if (state.scanId || state.conversation) return;
+    state.conversation = {
+      session_id: `general-${Date.now()}`,
+      scan_id: '',
+      title: '通用聊天',
+      scope: { kind: 'general' },
+      messages: state.generalChatMessages.slice()
+    };
   }
 
   function renderConversationList() {
@@ -627,12 +682,15 @@
 
   async function loadConversationList() {
     if (!state.scanId) return;
+    const requestedScanId = state.scanId;
+    const requestSeq = ++state.conversationListRequestSeq;
     try {
-      const response = await api(`/api/conversations/${encodeURIComponent(state.scanId)}`);
+      const response = await api(`/api/conversations/${encodeURIComponent(requestedScanId)}`);
+      if (state.scanId !== requestedScanId || state.conversationListRequestSeq !== requestSeq) return;
       state.conversationList = response.items || [];
       renderConversationList();
     } catch (error) {
-      $('conversationList').innerHTML = `<span class="help-text">${escapeHtml(error.message)}</span>`;
+      if (state.scanId === requestedScanId && state.conversationListRequestSeq === requestSeq) $('conversationList').innerHTML = `<span class="help-text">${escapeHtml(error.message)}</span>`;
     }
   }
 
@@ -662,16 +720,38 @@
     }[stage] || stage || '等待执行';
   }
 
+  function taskStatusLabel(status) {
+    return {
+      fulfilled: '\u4efb\u52a1\u5df2\u5b8c\u6210',
+      partially_fulfilled: '\u4efb\u52a1\u90e8\u5206\u5b8c\u6210',
+      not_fulfilled: '\u4efb\u52a1\u672a\u5b8c\u6210'
+    }[status] || '';
+  }
+
+  function intentLabel(intent) {
+    return {
+      creative: '\u521b\u4f5c', general_qa: '\u901a\u7528\u95ee\u7b54',
+      casual: '\u5bf9\u8bdd', retrieval: '\u8d44\u6599\u95ee\u7b54',
+      summary: '\u8d44\u6599\u6458\u8981', analysis: '\u5206\u6790',
+      structured: '\u7ed3\u6784\u5316\u67e5\u8be2', translation: '\u7ffb\u8bd1',
+      relationship: '\u5173\u7cfb\u5206\u6790', multi_task: '\u7efc\u5408\u4efb\u52a1'
+    }[intent] || intent || '\u52a9\u624b\u56de\u7b54';
+  }
+
   function analysisQualityMarkup(turn) {
     const metrics = turn && turn.quality_metrics;
-    if (!metrics || typeof metrics !== 'object') return '';
-    const ratio = metrics.claim_support_ratio == null ? null : numeric(metrics.claim_support_ratio);
-    const coverage = metrics.query_coverage == null ? null : numeric(metrics.query_coverage);
+    if (!metrics || typeof metrics !== 'object' || metrics.verification_status === 'not_required') return '';
+    const ratioValue = metrics.evidence_support_ratio == null ? metrics.claim_support_ratio : metrics.evidence_support_ratio;
+    const ratio = ratioValue == null ? null : numeric(ratioValue);
+    const coverageValue = metrics.retrieval_coverage == null ? metrics.query_coverage : metrics.retrieval_coverage;
+    const coverage = coverageValue == null ? null : numeric(coverageValue);
     const scopeFiles = numeric(metrics.scope_files == null ? metrics.inventory_files : metrics.scope_files);
     const inspectedFiles = numeric(metrics.inspected_files);
     const uncheckedFiles = Math.max(0, scopeFiles - inspectedFiles);
-    const candidateDepth = metrics.candidate_deep_coverage == null ? null : numeric(metrics.candidate_deep_coverage);
-    const scopeCoverage = metrics.scope_inspection_coverage == null ? null : numeric(metrics.scope_inspection_coverage);
+    const candidateDepthValue = metrics.deep_analysis_coverage == null ? metrics.candidate_deep_coverage : metrics.deep_analysis_coverage;
+    const candidateDepth = candidateDepthValue == null ? null : numeric(candidateDepthValue);
+    const scopeCoverageValue = metrics.inspection_coverage == null ? metrics.scope_inspection_coverage : metrics.inspection_coverage;
+    const scopeCoverage = scopeCoverageValue == null ? null : numeric(scopeCoverageValue);
     const values = [
       ['范围文件', integer(scopeFiles)],
       ['候选文件', integer(metrics.candidate_files)],
@@ -690,7 +770,8 @@
     if (candidateDepth != null) values.splice(6, 0, ['候选深析率', `${Math.round(candidateDepth * 100)}%`]);
     if (coverage != null && scopeCoverage == null && candidateDepth == null) values.splice(5, 0, ['覆盖率', `${Math.round(coverage * 100)}%`]);
     const status = { verified: '引用核验通过', partial: '引用部分通过', insufficient_evidence: '证据不足', not_required: '无需引用核验' }[metrics.verification_status] || metrics.verification_status || '待核验';
-    return `<section class="v2-quality" aria-label="分析质量"><header><strong>分析质量</strong><span>${escapeHtml(status)}</span></header><div>${values.map(([label, value]) => `<dl><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></dl>`).join('')}</div></section>`;
+    const task = taskStatusLabel(turn && turn.task_status);
+    return `<section class="v2-quality" aria-label="分析质量"><header><strong>分析质量</strong><span>${escapeHtml(task ? `${task} · ${status}` : status)}</span></header><div>${values.map(([label, value]) => `<dl><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></dl>`).join('')}</div></section>`;
   }
 
   function registerAnalysisTurn(turn, steps) {
@@ -715,6 +796,15 @@
     (turns || []).forEach((turn) => registerAnalysisTurn(turn, turn.steps));
   }
 
+  function assistantDisplayText(value) {
+    let text = String(value || '');
+    text = text.split(/\n(?:\u8d44\u6599\u4f9d\u636e|\u6838\u9a8c\u8bf4\u660e)\s*\n/)[0];
+    text = text.replace(/\s*\[\d+\]/g, '');
+    text = text.replace(/^\s*(\u6838\u9a8c\u540e\u7684\u7ed3\u8bba|\u8d44\u6599\u4f9d\u636e|\u6838\u9a8c\u8bf4\u660e)\s*$/gm, '');
+    text = text.replace(/^\s*-\s*\d+\s*\u6761\u9648\u8ff0.*$/gm, '');
+    return text.trim();
+  }
+
   function messageMarkup(message) {
     const role = message.role === 'user' ? 'user' : 'assistant';
     const turn = state.turns.get(message.message_id);
@@ -725,8 +815,10 @@
     } else if (message.evidence_ids && message.evidence_ids.length) {
       evidence = `<details class="v2-citations"><summary>查看证据标识</summary><div class="v2-citation"><small>${escapeHtml(message.evidence_ids.join('、'))}</small></div></details>`;
     }
-    const meta = role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intent || '资料回答')}</span>${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${turn && turn.evidence_status ? `<span>证据：${escapeHtml(turn.evidence_status)}</span>` : ''}</div>` : '';
-    const content = role === 'assistant' ? safeMarkdown(message.content || '') : `<p>${escapeHtml(message.content || '')}</p>`;
+    const task = turn && taskStatusLabel(turn.task_status);
+    const evidenceStatus = turn && turn.evidence_status;
+    const meta = role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intentLabel(intent))}</span>${task ? `<span>${escapeHtml(task)}</span>` : ''}${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${evidenceStatus && evidenceStatus !== 'not_required' ? `<span>证据：${escapeHtml(evidenceStatus)}</span>` : ''}</div>` : '';
+    const content = role === 'assistant' ? safeMarkdown(assistantDisplayText(message.content)) : `<p>${escapeHtml(message.content || '')}</p>`;
     const running = turn && ['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status);
     const retryable = turn && ['failed', 'cancelled'].includes(turn.status);
     const progress = running ? `<div class="v2-turn-progress" role="status"><div><span>${escapeHtml(analysisTurnStageLabel(turn.stage))}</span><b>${Math.round(numeric(turn.progress))}%</b></div><progress max="100" value="${Math.round(numeric(turn.progress))}"></progress></div>` : '';
@@ -744,24 +836,66 @@
 
   function renderConversation() {
     const session = state.conversation;
-    const indexBlocked = Boolean(session && state.searchIndex && !state.searchIndex.ready);
-    $('conversationTitle').textContent = session ? (session.title || '资料问答') : '尚未开始会话';
-    $('conversationScopeSummary').textContent = session ? scopeSummary(session.scope) : '请选择范围并新建会话';
-    updateContextChip(session && session.scope);
+    const generalMode = Boolean(session && !state.scanId);
+    const indexBlocked = Boolean(
+      session && state.searchIndex && state.searchIndex.usable === false
+    );
+    const indexPartial = Boolean(
+      session && state.searchIndex && state.searchIndex.usable !== false
+      && !state.searchIndex.ready
+    );
+    const suggestions = $('conversationSuggestions');
+    if (suggestions) {
+      const hidden = !session;
+      const examples = generalMode
+        ? ['帮我把这段话写得更自然', '给我想几个可执行的方案', '解释一个我不熟悉的概念']
+        : ['概括这批资料并列出关键证据', '找出资料中的矛盾、例外和风险', '建立主要人物、机构与事件的时间线'];
+      const expected = examples.map(escapeHtml).join('|');
+      if (suggestions.dataset.examples !== expected) {
+        suggestions.innerHTML = examples.map((item) => `<button type="button">${escapeHtml(item)}</button>`).join('');
+        suggestions.dataset.examples = expected;
+      }
+      suggestions.hidden = hidden;
+      suggestions.setAttribute('aria-hidden', String(hidden));
+      suggestions.querySelectorAll('button').forEach((button) => { button.disabled = hidden || state.conversationSending || state.generalChatSending; });
+    }
+    $('conversationTitle').textContent = session ? (generalMode ? '通用聊天' : (session.title || '资料问答')) : '尚未开始对话';
+    $('conversationScopeSummary').textContent = session ? (generalMode ? '通用聊天 · 导入数据包后可切换资料证据模式' : scopeSummary(session.scope)) : '请选择范围并新建会话';
+    const contextPicker = document.querySelector('.v2-context-picker');
+    if (contextPicker) contextPicker.hidden = generalMode;
+    updateContextChip(generalMode ? { kind: 'general' } : (session && session.scope));
     const messages = session && Array.isArray(session.messages) ? session.messages : [];
     const older = session && session.message_page && session.message_page.has_more
       ? '<button type="button" class="text-button v2-load-older" data-load-older-messages>加载更早消息</button>'
       : '';
-    $('conversationMessages').innerHTML = messages.length ? older + messages.map(messageMarkup).join('') : emptyMarkup('从资料中提出第一个问题', '例如：这批资料主要讲了什么？哪些文件相互关联？');
-    $('conversationQuestion').disabled = !session || state.conversationSending || indexBlocked;
-    $('conversationSendBtn').disabled = !session || state.conversationSending || indexBlocked;
+    $('conversationMessages').setAttribute('aria-busy', String(state.conversationLoading));
+    $('conversationMessages').innerHTML = state.conversationLoading
+      ? emptyMarkup('正在打开会话', '正在读取历史消息、分析进度和可引用证据。')
+      : (messages.length ? older + messages.map(messageMarkup).join('') : emptyMarkup(
+        generalMode ? '问我任何问题' : '从资料中提出第一个问题',
+        generalMode ? '我会先理解你的目标，再给出自然回答；导入资料包后还能补充原文证据。' : '例如：这批资料主要讲了什么？哪些文件相互关联？'
+      ));
+    $('conversationQuestion').disabled = !session || state.conversationSending || state.generalChatSending || state.conversationLoading || (!generalMode && indexBlocked);
+    $('conversationSendBtn').disabled = !session || state.conversationSending || state.generalChatSending || state.conversationLoading || (!generalMode && indexBlocked);
+    $('conversationNewBtn').disabled = false;
     $('conversationComposerHint').textContent = indexBlocked
-      ? '该历史数据包需要先重建轻量预览与证据索引'
-      : (session ? '资料事实优先引用；分析判断会单独标明' : '新建会话后即可提问');
+      ? '当前没有可检索文本；请等待基础解析或重建索引'
+      : indexPartial
+        ? '当前可基于已索引资料作答；回答会标注覆盖范围，完整索引仍可继续重建'
+      : (generalMode ? '通用聊天模式 · 回答不引用当前资料；导入数据包后可在同一界面追溯证据'
+        : (session ? '资料事实优先引用；分析判断会单独标明' : '新建会话后即可提问'));
+    if (!session && $('conversationDeepeningState')) {
+      $('conversationDeepeningState').className = 'v2-job-state';
+      $('conversationDeepeningState').textContent = '';
+    }
     if (indexBlocked) {
       const host = $('conversationDeepeningState');
       host.className = 'v2-job-state is-error';
-      host.innerHTML = `对话索引尚未就绪 · ${integer(state.searchIndex.documents)} 份文档 <button type="button" data-rebuild-search-index>重建索引</button>`;
+      host.innerHTML = `当前没有可检索文本 · ${integer(state.searchIndex.documents)} 份已保存文档 <button type="button" data-rebuild-search-index>重建索引</button>`;
+    } else if (indexPartial) {
+      const host = $('conversationDeepeningState');
+      host.className = 'v2-job-state is-running';
+      host.innerHTML = `阶段性索引可用 · ${integer(state.searchIndex.evidence_records)} 条证据 · ${integer(state.searchIndex.processed_documents)}/${integer(state.searchIndex.expected_documents)} 份文档已入索引 <button type="button" data-rebuild-search-index>继续重建</button>`;
     }
     renderConversationList();
     window.requestAnimationFrame(() => { $('conversationMessages').scrollTop = $('conversationMessages').scrollHeight; });
@@ -782,14 +916,22 @@
   }
 
   async function createConversation() {
-    if (!state.scanId) return;
+    if (!state.scanId) {
+      state.generalChatMessages = [];
+      state.conversation = null;
+      ensureGeneralSession();
+      state.turns.clear();
+      renderConversation();
+      $('conversationQuestion').focus();
+      return;
+    }
     let scope;
     try { scope = conversationScope(); } catch (error) { notify(error.message, true); return; }
     const button = $('conversationNewBtn');
     button.disabled = true;
     try {
       const response = await api('/api/conversations', {
-        method: 'POST', body: JSON.stringify({ scan_id: state.scanId, scope, title: `资料问答 · ${new Date().toLocaleString('zh-CN', { hour12: false })}` })
+        method: 'POST', body: JSON.stringify({ scan_id: state.scanId, scope, title: `对话 · ${new Date().toLocaleString('zh-CN', { hour12: false })}` })
       });
       state.conversation = response.session;
       state.searchIndex = response.search_index || null;
@@ -804,6 +946,8 @@
 
   async function openConversation(sessionId) {
     if (!state.scanId || !sessionId) return;
+    state.conversationLoading = true;
+    renderConversation();
     try {
       const response = await api(`/api/conversation/${encodeURIComponent(sessionId)}?scan_id=${encodeURIComponent(state.scanId)}`);
       state.conversation = response.session;
@@ -813,6 +957,7 @@
       renderConversation();
       (response.turns || []).filter((turn) => ['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status)).forEach((turn) => watchAnalysisTurn(turn.id));
     } catch (error) { notify(error.message || '无法打开会话', true); }
+    finally { state.conversationLoading = false; renderConversation(); }
   }
 
   function jobStatusLabel(job) {
@@ -822,17 +967,20 @@
   async function watchJob(jobId, key, callback) {
     if (!jobId) return;
     const token = `${Date.now()}-${Math.random()}`;
+    const requestedScanId = state.scanId;
     state.watchers.set(key, token);
     for (let attempt = 0; attempt < 240 && state.watchers.get(key) === token; attempt += 1) {
       try {
         const response = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
         const job = response.job || response;
+        if (state.scanId !== requestedScanId || state.watchers.get(key) !== token) return null;
         callback(job, false);
         if (['completed', 'failed', 'cancelled'].includes(job.status)) {
           state.watchers.delete(key);
           return job;
         }
       } catch (error) {
+        if (state.scanId !== requestedScanId || state.watchers.get(key) !== token) return null;
         callback({ status: 'connection_error', error: error.message }, false);
       }
       await wait(3000);
@@ -873,37 +1021,59 @@
     if (!turnId) return;
     const key = `analysis-turn-${turnId}`;
     const token = `${Date.now()}-${Math.random()}`;
+    const requestedScanId = state.scanId;
+    let afterEventId = 0;
+    let needsSnapshot = true;
     state.watchers.set(key, token);
     const host = $('conversationDeepeningState');
     (async () => {
-      for (let attempt = 0; attempt < 1800 && state.watchers.get(key) === token; attempt += 1) {
+      for (let attempt = 0; attempt < 2400 && state.watchers.get(key) === token; attempt += 1) {
         try {
-          const response = await api(`/api/turns/${encodeURIComponent(turnId)}`);
-          const turn = response.turn || {};
-          if (response.session) state.conversation = response.session;
-          registerAnalysisTurn(turn, response.steps || []);
-          const progress = Math.round(numeric(turn.progress));
-          if (['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status)) {
+          // Events are the lightweight progress channel. The full turn/session
+          // snapshot is fetched only after a change so long analyses do not
+          // repeatedly transfer the same evidence and conversation payload.
+          const eventResponse = await api(`/api/turns/${encodeURIComponent(turnId)}/events?after=${afterEventId}`);
+          if (state.scanId !== requestedScanId || state.watchers.get(key) !== token) return;
+          const events = Array.isArray(eventResponse.items) ? eventResponse.items : [];
+          afterEventId = numeric(eventResponse.next_after == null ? afterEventId : eventResponse.next_after);
+          if (events.length) {
+            const latest = events[events.length - 1] || {};
+            const progress = latest.progress == null ? '' : ` · ${Math.round(numeric(latest.progress))}%`;
             host.className = 'v2-job-state is-running';
-            host.textContent = `${analysisTurnStageLabel(turn.stage)} · ${progress}%`;
-          } else if (turn.status === 'completed') {
-            host.className = 'v2-job-state is-complete';
-            host.textContent = '分析完成，结论与引用已保存。';
-          } else {
-            host.className = 'v2-job-state is-error';
-            host.textContent = `${analysisTurnStatusLabel(turn.status)}${turn.error ? `：${turn.error}` : ''}`;
+            host.textContent = `${analysisTurnStageLabel(latest.stage)}${progress}${latest.message ? ` · ${latest.message}` : ''}`;
           }
-          renderConversation();
-          if (['completed', 'failed', 'cancelled'].includes(turn.status)) {
-            state.watchers.delete(key);
-            await loadConversationList();
-            return;
+          if (needsSnapshot || events.length) {
+            const response = await api(`/api/turns/${encodeURIComponent(turnId)}`);
+            if (state.scanId !== requestedScanId || state.watchers.get(key) !== token) return;
+            const turn = response.turn || {};
+            if (response.session) state.conversation = response.session;
+            registerAnalysisTurn(turn, response.steps || []);
+            const progress = Math.round(numeric(turn.progress));
+            if (['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status)) {
+              host.className = 'v2-job-state is-running';
+              host.textContent = `${analysisTurnStageLabel(turn.stage)} · ${progress}%`;
+            } else if (turn.status === 'completed') {
+              host.className = 'v2-job-state is-complete';
+              host.textContent = '分析完成，结论与引用已保存。';
+            } else {
+              host.className = 'v2-job-state is-error';
+              host.textContent = `${analysisTurnStatusLabel(turn.status)}${turn.error ? `：${turn.error}` : ''}`;
+            }
+            renderConversation();
+            needsSnapshot = false;
+            if (['completed', 'failed', 'cancelled'].includes(turn.status)) {
+              state.watchers.delete(key);
+              await loadConversationList();
+              return;
+            }
           }
         } catch (error) {
+          if (state.scanId !== requestedScanId || state.watchers.get(key) !== token) return;
           host.className = 'v2-job-state is-error';
           host.textContent = `分析状态暂时无法读取：${error.message}`;
+          needsSnapshot = true;
         }
-        await wait(2000);
+        await wait(needsSnapshot ? 2000 : 1500);
       }
     })();
   }
@@ -975,8 +1145,41 @@
     if (!state.conversation || state.conversationSending) return;
     const question = String(questionOverride || $('conversationQuestion').value || '').trim();
     if (!question) { notify('请输入问题', true); return; }
+    const generalMode = !state.scanId;
     let turnScope;
-    try { turnScope = conversationScope(); } catch (error) { notify(error.message, true); return; }
+    if (!generalMode) {
+      try { turnScope = conversationScope(); } catch (error) { notify(error.message, true); return; }
+    }
+    if (generalMode) {
+      state.generalChatSending = true;
+      const history = (state.conversation.messages || []).filter((message) => message.role === 'user' || message.role === 'assistant').slice(-12);
+      const optimistic = { message_id: `pending-${Date.now()}`, role: 'user', content: question };
+      state.conversation.messages = (state.conversation.messages || []).concat([optimistic]);
+      state.generalChatMessages = state.conversation.messages.slice();
+      $('conversationQuestion').value = '';
+      renderConversation();
+      try {
+        const response = await api('/api/general-chat', { method: 'POST', body: JSON.stringify({ question, messages: history }) });
+        const stamp = Date.now();
+        state.conversation.messages = state.conversation.messages.filter((message) => message.message_id !== optimistic.message_id).concat([
+          { message_id: `general-${stamp}-user`, role: 'user', content: question },
+          { message_id: `general-${stamp}-assistant`, role: 'assistant', content: response.answer || '暂时无法回答。', intent: 'general_qa', evidence_status: 'not_required' }
+        ]);
+        state.generalChatMessages = state.conversation.messages.slice();
+        renderConversation();
+      } catch (error) {
+        state.conversation.messages = state.conversation.messages.filter((message) => message.message_id !== optimistic.message_id);
+        state.generalChatMessages = state.conversation.messages.slice();
+        renderConversation();
+        $('conversationQuestion').value = question;
+        notify(error.message || '发送失败', true);
+      } finally {
+        state.generalChatSending = false;
+        renderConversation();
+        $('conversationQuestion').focus();
+      }
+      return;
+    }
     state.conversationSending = true;
     // Keep one idempotency key for this logical send operation.  A transient
     // network failure can therefore be retried without creating a duplicate
@@ -1028,7 +1231,70 @@
 
   /* Translation */
   function translationStatusLabel(status) {
-    return { completed: '已完成', partial: '部分完成', failed: '失败', not_required: '无需翻译', not_started: '未开始', pending: '等待翻译', running: '翻译中' }[status] || status || '未开始';
+    return {
+      completed: '已完成', partial: '部分完成', failed: '失败',
+      not_required: '无需翻译', not_started: '未开始', pending: '等待翻译',
+      running: '翻译中', cancelled: '已取消', cache_unavailable: '缓存不可用'
+    }[status] || status || '未开始';
+  }
+
+  function translationLanguageLabel(language) {
+    return {
+      zh: '中文', en: '英语', ja: '日语', ko: '韩语', fr: '法语', de: '德语',
+      es: '西班牙语', ru: '俄语', ar: '阿拉伯语', pt: '葡萄牙语', it: '意大利语',
+      mixed: '混合语言', unknown: '待识别'
+    }[language] || String(language || 'unknown').toUpperCase();
+  }
+
+  function translationListControls() {
+    return {
+      status: ($('translationFilter') && $('translationFilter').value) || 'all',
+      language: ($('translationLanguageFilter') && $('translationLanguageFilter').value) || 'all',
+      query: ($('translationSearch') && $('translationSearch').value || '').trim()
+    };
+  }
+
+  function renderTranslationFilterControls() {
+    const page = state.translationListPage || {};
+    const statusCounts = page.status_counts || {};
+    const languageCounts = page.language_counts || {};
+    const statusSelect = $('translationFilter');
+    const languageSelect = $('translationLanguageFilter');
+    if (statusSelect) {
+      const selected = statusSelect.value || 'all';
+      const order = ['all', 'failed', 'partial', 'running', 'pending', 'not_started', 'completed', 'not_required', 'cancelled', 'cache_unavailable'];
+      const available = new Set(order);
+      Object.keys(statusCounts).forEach((value) => available.add(value));
+      const values = order.concat(Array.from(available).filter((value) => !order.includes(value)).sort());
+      statusSelect.innerHTML = values.map((value) => {
+        const label = value === 'all' ? '全部状态' : translationStatusLabel(value);
+        const count = value === 'all' ? numeric(page.unfiltered_total) : numeric(statusCounts[value]);
+        return `<option value="${escapeHtml(value)}">${escapeHtml(label)}${page.unfiltered_total != null ? `（${integer(count)}）` : ''}</option>`;
+      }).join('');
+      statusSelect.value = values.includes(selected) ? selected : 'all';
+    }
+    if (languageSelect) {
+      const selected = languageSelect.value || 'all';
+      const order = ['all', 'foreign', 'zh', 'unknown'];
+      const available = new Set(order);
+      Object.keys(languageCounts).forEach((value) => available.add(value));
+      const values = order.concat(Array.from(available).filter((value) => !order.includes(value)).sort());
+      languageSelect.innerHTML = values.map((value) => {
+        let label = '全部语言';
+        let count = numeric(page.unfiltered_total);
+        if (value === 'foreign') {
+          label = '全部外语';
+          count = Object.entries(languageCounts).reduce((total, item) => (
+            item[0] !== 'zh' && item[0] !== 'unknown' ? total + numeric(item[1]) : total
+          ), 0);
+        } else if (value !== 'all') {
+          label = translationLanguageLabel(value);
+          count = numeric(languageCounts[value]);
+        }
+        return `<option value="${escapeHtml(value)}">${escapeHtml(label)}${page.unfiltered_total != null ? `（${integer(count)}）` : ''}</option>`;
+      }).join('');
+      languageSelect.value = values.includes(selected) ? selected : 'all';
+    }
   }
 
   function renderTranslationSummary() {
@@ -1038,44 +1304,143 @@
       host.innerHTML = '<span class="help-text">导入数据包后可识别并翻译外文资料。</span>';
       return;
     }
-    const counts = state.translationCounts || {};
+    const page = state.translationListPage || {};
+    const counts = page.status_counts || state.translationCounts || {};
+    const total = page.unfiltered_total == null
+      ? Object.values(counts).reduce((sum, value) => sum + numeric(value), 0)
+      : numeric(page.unfiltered_total);
     const values = [
-      ['翻译记录', Object.values(counts).reduce((sum, value) => sum + numeric(value), 0)],
-      ['已完成', counts.completed || counts.not_required || 0],
-      ['部分完成', counts.partial || 0],
-      ['失败', counts.failed || 0]
+      ['资料清单', total],
+      ['已完成', numeric(counts.completed) + numeric(counts.not_required)],
+      ['待翻译', numeric(counts.not_started) + numeric(counts.pending) + numeric(counts.running)],
+      ['需处理', numeric(counts.partial) + numeric(counts.failed)]
     ];
     host.innerHTML = values.map(([label, value]) => `<div class="v2-translation-stat"><span>${escapeHtml(label)}</span><b>${integer(value)}</b></div>`).join('');
+  }
+
+  function resetTranslationView(scanId) {
+    state.translationOffset = 0;
+    state.translationPage = null;
+    state.translationLoading = false;
+    state.translationListOffset = 0;
+    state.translationListPage = null;
+    state.translationListLoading = false;
+    window.clearTimeout(state.translationSearchTimer);
+    state.translationPath = '';
+    if ($('translationPath')) $('translationPath').value = '';
+    if ($('translationFilter')) $('translationFilter').value = 'all';
+    if ($('translationLanguageFilter')) $('translationLanguageFilter').value = 'all';
+    if ($('translationSearch')) $('translationSearch').value = '';
+    if ($('translationDocumentTitle')) $('translationDocumentTitle').textContent = '选择文件查看原文与译文';
+    if ($('translationDocumentMeta')) $('translationDocumentMeta').textContent = '';
+    if ($('translationDocumentState')) {
+      $('translationDocumentState').textContent = scanId ? '正在读取新数据包的翻译记录…' : '从左侧选择文件，或输入文件相对路径。';
+      $('translationDocumentState').className = 'v2-inline-state';
+    }
+    if ($('translationDocumentContent')) {
+      $('translationDocumentContent').innerHTML = scanId
+        ? emptyMarkup('正在切换数据包', '旧文档结果已清除，新的翻译记录正在读取。') : '';
+    }
+    if ($('translationPageInfo')) $('translationPageInfo').textContent = '—';
+    ['translationPrevBtn', 'translationNextBtn', 'translateDocumentBtn'].forEach((id) => { if ($(id)) $(id).disabled = true; });
+    if ($('translationList')) {
+      $('translationList').innerHTML = scanId
+        ? '<span class="help-text">正在读取新数据包的翻译记录…</span>'
+        : '<span class="help-text">导入数据包后显示翻译记录。</span>';
+    }
+    if ($('translationListSummary')) $('translationListSummary').textContent = scanId ? '正在读取文件清单…' : '';
+    if ($('translationListPageInfo')) $('translationListPageInfo').textContent = '—';
+    ['translationListPrevBtn', 'translationListNextBtn'].forEach((id) => { if ($(id)) $(id).disabled = true; });
+    renderTranslationSummary();
+  }
+
+  function renderTranslationListPager() {
+    const page = state.translationListPage || {};
+    const total = numeric(page.total);
+    const offset = numeric(page.offset == null ? state.translationListOffset : page.offset);
+    const count = (state.translationItems || []).length;
+    if ($('translationListPageInfo')) {
+      $('translationListPageInfo').textContent = total
+        ? `${integer(offset + 1)}–${integer(Math.min(total, offset + count))} / ${integer(total)} 份`
+        : '0 份';
+    }
+    if ($('translationListPrevBtn')) $('translationListPrevBtn').disabled = state.translationListLoading || offset <= 0;
+    if ($('translationListNextBtn')) $('translationListNextBtn').disabled = state.translationListLoading || !page.has_more;
   }
 
   function renderTranslationList() {
     const host = $('translationList');
     if (!host) return;
-    const filter = $('translationFilter').value;
-    const filtered = state.translationItems.filter((item) => filter === 'all' || (item.status || 'not_started') === filter);
-    if (!filtered.length) {
-      host.innerHTML = '<span class="help-text">当前筛选条件下没有翻译记录。仍可在上方输入任意已解析文件路径。</span>';
+    const page = state.translationListPage || {};
+    const items = state.translationItems || [];
+    renderTranslationFilterControls();
+    renderTranslationListPager();
+    if ($('translationListSummary')) {
+      const controls = translationListControls();
+      const total = numeric(page.total);
+      const suffix = [
+        controls.status !== 'all' ? translationStatusLabel(controls.status) : '',
+        controls.language !== 'all' ? (controls.language === 'foreign' ? '外语' : translationLanguageLabel(controls.language)) : '',
+        controls.query ? `“${controls.query}”` : ''
+      ].filter(Boolean).join(' · ');
+      $('translationListSummary').textContent = page.unfiltered_total == null
+        ? (state.translationListLoading ? '正在读取文件清单…' : '')
+        : `匹配 ${integer(total)} 份${suffix ? ` · ${suffix}` : ''}`;
+    }
+    if (!items.length) {
+      host.innerHTML = state.translationListLoading
+        ? '<span class="help-text">正在读取翻译资料…</span>'
+        : '<span class="help-text">当前条件下没有匹配文件。可以调整状态、语言或文件名搜索。</span>';
       return;
     }
-    host.innerHTML = filtered.map((item) => {
+    host.innerHTML = items.map((item) => {
       const progress = item.progress || {};
       const total = numeric(progress.required_units || progress.total_units);
       const completed = numeric(progress.completed_units);
       const progressText = total ? ` · ${integer(completed)}/${integer(total)} 段` : '';
-      return `<button type="button" class="v2-translation-item${state.translationPath === item.path ? ' active' : ''}" data-translation-path="${escapeHtml(item.path)}"><strong>${escapeHtml(item.titles && (item.titles.translated || item.titles.original) || basename(item.path))}</strong><span>${escapeHtml(item.path)} · ${escapeHtml(translationStatusLabel(item.status))}${escapeHtml(progressText)}</span></button>`;
+      const availability = item.source_availability === 'metadata' ? ' · 待解析' : item.source_availability === 'preview' ? ' · 预览可读' : '';
+      return `<button type="button" class="v2-translation-item${state.translationPath === item.path ? ' active' : ''}" data-translation-path="${escapeHtml(item.path)}"><strong>${escapeHtml(item.titles && (item.titles.translated || item.titles.original) || basename(item.path))}</strong><span>${escapeHtml(item.path)} · ${escapeHtml(translationLanguageLabel(item.source_language))} · ${escapeHtml(translationStatusLabel(item.status))}${escapeHtml(progressText)}${escapeHtml(availability)}</span></button>`;
     }).join('');
   }
 
-  async function loadTranslationList() {
+  async function loadTranslationList(options) {
     if (!state.scanId) return;
+    options = options || {};
+    const requestedScanId = state.scanId;
+    const requestSeq = ++state.translationListRequestSeq;
+    state.translationListOffset = Math.max(0, numeric(options.offset == null ? state.translationListOffset : options.offset));
+    state.translationListLoading = true;
+    renderTranslationList();
     try {
-      const response = await api(`/api/translations/${encodeURIComponent(state.scanId)}?limit=500`);
+      const controls = translationListControls();
+      const query = new URLSearchParams({
+        offset: String(state.translationListOffset), limit: String(TRANSLATION_LIST_PAGE_SIZE),
+        status: controls.status, language: controls.language, q: controls.query
+      });
+      const response = await api(`/api/translations/${encodeURIComponent(requestedScanId)}?${query.toString()}`);
+      if (state.scanId !== requestedScanId || state.translationListRequestSeq !== requestSeq) return;
+      if (!response.items?.length && numeric(response.total) && numeric(response.offset) >= numeric(response.total)) {
+        const lastOffset = Math.floor((numeric(response.total) - 1) / TRANSLATION_LIST_PAGE_SIZE) * TRANSLATION_LIST_PAGE_SIZE;
+        if (lastOffset !== state.translationListOffset) return loadTranslationList({ offset: lastOffset });
+      }
       state.translationItems = response.items || [];
       state.translationCounts = response.counts || {};
+      state.translationListPage = response;
+      state.translationListOffset = numeric(response.offset);
       renderTranslationSummary();
       renderTranslationList();
+      if ($('translationOpenBtn')) $('translationOpenBtn').disabled = false;
     } catch (error) {
-      $('translationList').innerHTML = `<span class="help-text">${escapeHtml(error.message)}</span>`;
+      if (state.scanId === requestedScanId && state.translationListRequestSeq === requestSeq) {
+        $('translationList').innerHTML = `<span class="help-text">${escapeHtml(error.message)}</span>`;
+        if ($('translationListSummary')) $('translationListSummary').textContent = '无法读取翻译资料';
+        if ($('translationOpenBtn')) $('translationOpenBtn').disabled = false;
+      }
+    } finally {
+      if (state.translationListRequestSeq === requestSeq) {
+        state.translationListLoading = false;
+        renderTranslationListPager();
+      }
     }
   }
 
@@ -1096,6 +1461,8 @@
     const details = [];
     if (progress.required_units) details.push(`已完成 ${integer(progress.completed_units)}/${integer(progress.required_units)} 个翻译段`);
     if (page.source_level) details.push(page.source_level === 'full' ? '全文来源' : '轻量预览来源');
+    else if (page.source_availability === 'preview') details.push('当前为全库预览，翻译时会按需读取全文');
+    else if (page.content_available === false || page.source_availability === 'metadata') details.push('当前只有文件清单；翻译时会先按需解析');
     if (page.full_translation) details.push('全文译文已就绪');
     if (page.performance && page.performance.paragraph_batching) details.push('短段落已合并加速');
     $('translationDocumentState').textContent = details.join(' · ') || (page.plan && page.plan.translation_required ? `需要翻译，共 ${integer(page.plan.required_unit_count)} 个外文段` : '文档已打开');
@@ -1113,6 +1480,14 @@
     if (page.errors && page.errors.length) {
       content = `<div class="v2-document-errors">${page.errors.map((error) => escapeHtml(typeof error === 'string' ? error : error.message || error.code || JSON.stringify(error))).join('<br>')}</div>${content}`;
     }
+    if (page.warnings && page.warnings.length) {
+      const warningLabels = page.warnings.map((warning) => {
+        if (warning === 'line_structure_changed') return '正文换行已按语义标准化，未影响全文内容';
+        if (warning === 'reference_metadata_preserved') return '参考文献、链接与编号按原文保留，确保可回查';
+        return warning;
+      });
+      content = `<div class="v2-document-warnings">${warningLabels.map(escapeHtml).join('<br>')}</div>${content}`;
+    }
     $('translationDocumentContent').innerHTML = content;
     const bounds = translationPageBounds(page);
     $('translationPageInfo').textContent = bounds.total ? `${integer(bounds.offset + 1)}–${integer(bounds.end)} / ${integer(bounds.total)} 字符` : '暂无正文';
@@ -1125,26 +1500,32 @@
   async function loadTranslation(path, offset) {
     path = String(path || '').trim();
     if (!state.scanId || !path || state.translationLoading) return;
+    const requestedScanId = state.scanId;
+    const requestSeq = ++state.translationRequestSeq;
     state.translationLoading = true;
     state.translationPath = path;
     state.translationOffset = Math.max(0, numeric(offset));
     $('translationPath').value = path;
-    window.sessionStorage.setItem(LAST_DOCUMENT_KEY, path);
+    rememberTranslationPath(path);
     $('translationDocumentState').textContent = '正在读取文档页面…';
     $('translationDocumentState').className = 'v2-inline-state';
     $('translationOpenBtn').disabled = true;
     try {
       const query = new URLSearchParams({ path, view: state.translationView, offset: String(state.translationOffset), limit: String(PAGE_SIZE) });
-      const response = await api(`/api/translation/${encodeURIComponent(state.scanId)}?${query.toString()}`);
-      renderTranslationDocument(response);
+      const response = await api(`/api/translation/${encodeURIComponent(requestedScanId)}?${query.toString()}`);
+      if (state.scanId === requestedScanId && state.translationRequestSeq === requestSeq) renderTranslationDocument(response);
     } catch (error) {
-      $('translationDocumentState').textContent = error.message || '无法打开文档';
-      $('translationDocumentState').className = 'v2-inline-state is-error';
-      $('translationDocumentContent').innerHTML = emptyMarkup('文档未能打开', error.message || '请检查文件路径和解析状态。');
-      $('translateDocumentBtn').disabled = !state.scanId || !state.translationPath;
+      if (state.scanId === requestedScanId && state.translationRequestSeq === requestSeq) {
+        $('translationDocumentState').textContent = error.message || '无法打开文档';
+        $('translationDocumentState').className = 'v2-inline-state is-error';
+        $('translationDocumentContent').innerHTML = emptyMarkup('文档未能打开', error.message || '请检查文件路径和解析状态。');
+        $('translateDocumentBtn').disabled = !state.scanId || !state.translationPath;
+      }
     } finally {
-      state.translationLoading = false;
-      $('translationOpenBtn').disabled = !state.scanId;
+      if (state.translationRequestSeq === requestSeq) {
+        state.translationLoading = false;
+        $('translationOpenBtn').disabled = !state.scanId;
+      }
     }
   }
 
@@ -1177,8 +1558,8 @@
       const response = await api(`/api/translation/${encodeURIComponent(state.scanId)}`, {
         method: 'POST', body: JSON.stringify({ path, require_full: true })
       });
-      $('translationDocumentState').textContent = '当前文件已加入快速翻译队列。';
-      watchJob(response.job_id, 'translation-document', (job) => translationJobState(job, '当前文件快速翻译'));
+      $('translationDocumentState').textContent = '当前文件已加入全文翻译队列。';
+      watchJob(response.job_id, 'translation-document', (job) => translationJobState(job, '当前文件全文翻译'));
     } catch (error) {
       notify(error.message || '无法提交翻译', true);
       button.disabled = false;
@@ -1193,7 +1574,7 @@
       const response = await api(`/api/translate-package/${encodeURIComponent(state.scanId)}`, {
         method: 'POST', body: JSON.stringify({ phase })
       });
-      const label = phase === 'deep_backfill' ? '全部外文快速补齐' : '预览与重点文件快速翻译';
+      const label = phase === 'deep_backfill' ? '全部外文全文补齐' : '预览与重点文件翻译';
       $('translationDocumentState').textContent = `${label}已加入后台队列。`;
       watchJob(response.job_id, `translation-package-${phase}`, (job) => translationJobState(job, label));
       notify(`${label}已提交`);
@@ -1203,12 +1584,37 @@
   }
 
   function resetForScan(scanId) {
+    const previousScanId = state.scanId;
+    if (previousScanId && previousScanId !== scanId) {
+      // A remembered document belongs to the previous package and must never
+      // be opened against the newly selected scan.
+      window.sessionStorage.removeItem(LAST_DOCUMENT_KEY);
+      window.sessionStorage.removeItem(LAST_DOCUMENT_SCAN_KEY);
+    }
+    if (!scanId) {
+      window.sessionStorage.removeItem(LAST_DOCUMENT_KEY);
+      window.sessionStorage.removeItem(LAST_DOCUMENT_SCAN_KEY);
+    }
     state.scanId = scanId;
+    // Invalidate any in-flight package request before replacing the active
+    // workspace.  The response guards below then become a no-op for the old
+    // package instead of repainting the new view with stale data.
+    state.overviewLoading = false;
+    state.translationLoading = false;
+    state.translationListLoading = false;
+    state.overviewRequestSeq += 1;
+    state.translationRequestSeq += 1;
+    state.translationListRequestSeq += 1;
+    window.clearTimeout(state.translationSearchTimer);
+    state.translationSearchTimer = 0;
+    state.conversationListRequestSeq += 1;
     state.overview = null;
     state.researchBrief = null;
     state.reportArtifact = null;
     state.selectedScope = null;
     state.conversation = null;
+    state.conversationLoading = false;
+    if (!scanId) ensureGeneralSession();
     state.conversationPending = null;
     state.searchIndex = null;
     state.conversationList = [];
@@ -1221,17 +1627,13 @@
     state.watchers.clear();
     if ($('conversationScopeKind')) { $('conversationScopeKind').value = 'package'; renderScopeFields(); }
     const enabled = Boolean(scanId);
-    ['packageOverviewRefreshBtn', 'packageOverviewAskAllBtn', 'conversationNewBtn', 'translatePriorityBtn', 'translateBackfillBtn', 'translationOpenBtn'].forEach((id) => { if ($(id)) $(id).disabled = !enabled; });
+    ['packageOverviewRefreshBtn', 'packageOverviewAskAllBtn', 'translatePriorityBtn', 'translateBackfillBtn', 'translationOpenBtn'].forEach((id) => { if ($(id)) $(id).disabled = !enabled; });
+    if ($('conversationNewBtn')) $('conversationNewBtn').disabled = false;
+    resetOverviewView(scanId);
+    resetTranslationView(scanId);
     renderTranslationSummary();
     renderConversation();
     renderConversationList();
-    if (!enabled) {
-      setOverviewState('导入数据包后生成内容概览。');
-      $('packageOverviewMetrics').innerHTML = '';
-      if ($('packageOverviewSummary')) $('packageOverviewSummary').innerHTML = '';
-      if ($('packageOverviewTreemap')) $('packageOverviewTreemap').innerHTML = '';
-      renderSelectedScope();
-    }
   }
 
   function syncScan() {
@@ -1250,7 +1652,8 @@
     if (route === 'chat') loadConversationList();
     if (route === 'translation') {
       loadTranslationList();
-      const remembered = state.translationPath || window.sessionStorage.getItem(LAST_DOCUMENT_KEY) || '';
+      const rememberedScan = window.sessionStorage.getItem(LAST_DOCUMENT_SCAN_KEY) || '';
+      const remembered = state.translationPath || (rememberedScan === state.scanId ? window.sessionStorage.getItem(LAST_DOCUMENT_KEY) || '' : '');
       if (remembered) {
         $('translationPath').value = remembered;
         if (!state.translationPath) loadTranslation(remembered, 0);
@@ -1321,18 +1724,38 @@
       const path = button.dataset.citationTranslation;
       if (!path) return;
       state.translationPath = path;
-      window.sessionStorage.setItem(LAST_DOCUMENT_KEY, path);
+      rememberTranslationPath(path);
       window.SJFXShell && window.SJFXShell.activate('translation');
       loadTranslation(path, 0);
     });
     $('conversationDeepeningState').addEventListener('click', (event) => {
       if (event.target.closest('[data-rebuild-search-index]')) rebuildConversationSearchIndex();
     });
-    $('translationListRefreshBtn').addEventListener('click', loadTranslationList);
-    $('translationFilter').addEventListener('change', renderTranslationList);
+    $('translationListRefreshBtn').addEventListener('click', () => loadTranslationList());
+    $('translationFilter').addEventListener('change', () => loadTranslationList({ offset: 0 }));
+    $('translationLanguageFilter').addEventListener('change', () => loadTranslationList({ offset: 0 }));
+    $('translationSearch').addEventListener('input', (event) => {
+      if (event.isComposing) return;
+      window.clearTimeout(state.translationSearchTimer);
+      state.translationSearchTimer = window.setTimeout(() => loadTranslationList({ offset: 0 }), 260);
+    });
+    $('translationSearch').addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      window.clearTimeout(state.translationSearchTimer);
+      loadTranslationList({ offset: 0 });
+    });
     $('translationList').addEventListener('click', (event) => {
       const button = event.target.closest('[data-translation-path]');
       if (button) loadTranslation(button.dataset.translationPath, 0);
+    });
+    $('translationListPrevBtn').addEventListener('click', () => {
+      const pageOffset = numeric(state.translationListPage && state.translationListPage.offset);
+      loadTranslationList({ offset: Math.max(0, pageOffset - TRANSLATION_LIST_PAGE_SIZE) });
+    });
+    $('translationListNextBtn').addEventListener('click', () => {
+      const nextOffset = state.translationListPage && state.translationListPage.next_offset;
+      if (nextOffset != null) loadTranslationList({ offset: numeric(nextOffset) });
     });
     $('translationOpenBtn').addEventListener('click', () => loadTranslation($('translationPath').value, 0));
     $('translationPath').addEventListener('keydown', (event) => {
@@ -1351,7 +1774,7 @@
     document.addEventListener('click', (event) => {
       const row = event.target.closest('.tree-row[data-path]');
       if (row && row.dataset.path && row.dataset.path !== '.') {
-        window.sessionStorage.setItem(LAST_DOCUMENT_KEY, row.dataset.path);
+        rememberTranslationPath(row.dataset.path);
         if (!state.translationPath) $('translationPath').value = row.dataset.path;
       }
     }, true);

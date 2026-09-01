@@ -15,6 +15,7 @@ from services.package_exploration import (
     build_content_map,
     preview_as_document,
     preview_file,
+    preview_relation_features,
 )
 from services.parse_isolation import ParseIsolationCancelled
 from services.retrieval import evidence_corpus
@@ -62,11 +63,32 @@ def explore_large_package(
         existing = {}
         previous_map = None
     previous_run = (previous_map or {}).get("run") or {}
+    deferred_paths = {
+        path for path, item in existing.items()
+        if str(item.get("status") or "") == "deferred"
+    }
     previous_budget_consumed = max(
         0, int(previous_run.get("budget_consumed_bytes") or 0)
     )
+    # A previous release used the package budget as a hard cap. When resuming
+    # such a scan, reclaim that historical accounting and revisit the deferred
+    # tail; reused previews do not consume bytes again.
+    if deferred_paths:
+        previous_budget_consumed = 0
+    # The configured package budget is a capacity-planning floor, never a
+    # correctness cap. Every non-restricted inventory item must receive its
+    # own bounded preview, otherwise later files become invisible merely due
+    # to lexical order. The per-file bound keeps memory and state predictable.
+    per_file_preview_bytes = max(1, int(policy.get("preview_bytes_per_file") or 1))
+    required_preview_bytes = sum(
+        min(max(0, int(item.get("size") or 0)), per_file_preview_bytes)
+        for item in files
+    )
+    effective_preview_budget = max(
+        int(policy.get("preview_total_bytes") or 0), required_preview_bytes
+    )
     budget = PreviewBudget(
-        policy.get("preview_total_bytes"),
+        effective_preview_budget,
         consumed_bytes=previous_budget_consumed,
     )
     pending_previews = []
@@ -86,6 +108,13 @@ def explore_large_package(
     start_index = max(
         0, int(((previous_map or {}).get("run") or {}).get("next_index") or 0)
     )
+    if deferred_paths:
+        deferred_indices = [
+            index for index, item in enumerate(files)
+            if item.get("path") in deferred_paths
+        ]
+        if deferred_indices:
+            start_index = min(start_index, min(deferred_indices))
 
     def flush():
         nonlocal pending_previews, pending_documents, pending_states
@@ -189,6 +218,16 @@ def explore_large_package(
                         "; ".join(preview.get("warnings") or []) or None,
                     )
                 )
+            elif preview.get("status") == "out_of_scope" and not preserve_deep:
+                pending_states.append(
+                    (
+                        path,
+                        "preview:out_of_scope",
+                        "out_of_scope",
+                        None,
+                        "; ".join(preview.get("warnings") or []) or None,
+                    )
+                )
         if index % batch_size == 0:
             flush()
             progress(
@@ -206,9 +245,28 @@ def explore_large_package(
             return save_slice_checkpoint(index, "slice_budget")
     flush()
     progress(20, "轻量预览完成，正在发现主题、重复候选与文件关系")
+    storage.clear_file_relation_features(scan_id)
+    relation_feature_count = 0
+
+    def preview_stream():
+        nonlocal relation_feature_count
+        feature_batch = []
+        for item in storage.iter_file_previews(scan_id):
+            payload = item["payload"]
+            feature_batch.extend(preview_relation_features(payload))
+            if len(feature_batch) >= 5000:
+                relation_feature_count += storage.append_file_relation_features(
+                    scan_id, feature_batch
+                )
+                feature_batch = []
+            yield payload
+        if feature_batch:
+            relation_feature_count += storage.append_file_relation_features(
+                scan_id, feature_batch
+            )
+
     content_map = build_content_map(
-        (item["payload"] for item in storage.iter_file_previews(scan_id)),
-        representative_limit=policy.get("initial_parse_files"),
+        preview_stream(), representative_limit=policy.get("initial_parse_files"),
     )
     selection_decisions = content_map.pop("selection_decisions", [])
     storage.save_file_workflow_states(scan_id, selection_decisions)
@@ -224,6 +282,8 @@ def explore_large_package(
     content_map["policy"] = {
         "preview_bytes_per_file": policy.get("preview_bytes_per_file"),
         "preview_total_bytes": policy.get("preview_total_bytes"),
+        "effective_preview_total_bytes": effective_preview_budget,
+        "preview_total_is_capacity_floor": True,
         "representative_limit": policy.get("initial_parse_files"),
         "selection_basis": "主题覆盖、格式/目录/语言覆盖、信息量、独特性与关系价值",
     }
@@ -235,6 +295,8 @@ def explore_large_package(
             0, budget.consumed_bytes - previous_budget_consumed
         ),
         "budget_exhausted": budget.exhausted,
+        "effective_budget_bytes": effective_preview_budget,
+        "relation_feature_count": relation_feature_count,
     }
     preview_counts = storage.file_preview_counts(scan_id)
     content_map["run"]["preview_status_counts"] = preview_counts

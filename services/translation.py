@@ -27,8 +27,26 @@ from services.ollama import LocalModelError
 
 
 TRANSLATION_SCHEMA_VERSION = "document-translation/1.0"
-TRANSLATION_CONTRACT_VERSION = "zh-translation/1.1"
+# Bump this whenever a quality decision changes.  Translation-memory keys
+# include the contract version, so records rejected only by an older policy
+# cannot keep poisoning a resumed full-document translation.
+TRANSLATION_CONTRACT_VERSION = "zh-translation/1.3"
 TARGET_LANGUAGE = "zh-CN"
+
+# Stable terminology used by the local translation model when callers do not
+# provide a project-specific glossary. Keep source acronyms in every rendering
+# so evidence, code and cross-document search remain interoperable.
+DEFAULT_TECHNICAL_GLOSSARY = {
+    "TEE": "可信执行环境（TEE）",
+    "RTPM": "RTPM",
+    "COSE": "CBOR 对象签名与加密（COSE）",
+    "CBOR": "简明二进制对象表示法（CBOR）",
+    "MAC": "消息认证码（MAC）",
+    "EAT": "实体证明令牌（EAT）",
+    "TPM": "可信平台模块（TPM）",
+    "SEV-SNP": "SEV-SNP",
+    "RISC-V": "RISC-V",
+}
 
 _HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
@@ -120,7 +138,7 @@ def _other_alpha_count(value):
 def _normalise_glossary(glossary):
     """Return a deterministic source-to-Chinese glossary dictionary."""
     if glossary is None:
-        return {}
+        return dict(DEFAULT_TECHNICAL_GLOSSARY)
     if isinstance(glossary, dict):
         items = glossary.items()
     elif isinstance(glossary, (list, tuple)):
@@ -138,7 +156,9 @@ def _normalise_glossary(glossary):
         if not source or not target:
             raise ValueError("术语表的源词和目标词都不能为空")
         result[source] = target
-    return result
+    merged = dict(DEFAULT_TECHNICAL_GLOSSARY)
+    merged.update(result)
+    return merged
 
 
 def glossary_fingerprint(glossary):
@@ -559,7 +579,8 @@ class OllamaTranslationProvider(TranslationProvider):
         system_prompt = (
             "你是专业译文复核模型。对照原文修正候选简体中文译文中的遗漏、误译、未翻译内容和结构问题；"
             "不得总结、扩写或删减。所有 __SJFX_KEEP_0001__、__SJFX_TERM_0001__ 形式的保护标记必须原样各保留一次，"
-            "数字、日期、金额、术语、换行、制表符和表格竖线结构必须保持。"
+            "数字、日期、金额、术语、换行、制表符和表格竖线结构必须保持；术语表中的"
+            "目标译法必须逐字采用，代码、标识符、URL 和路径不得翻译。"
             "只输出 {\"translation\":\"修正后的完整译文\"}，translation 必须是唯一的 JSON 顶层字段。"
         )
         user_prompt = json.dumps({
@@ -694,7 +715,7 @@ def _normalise_provider_response(value):
 
 
 def validate_translation(source, protected, provider_output, restored,
-                         source_language, glossary=None):
+                         source_language, glossary=None, strict_layout=False):
     """Return a machine-readable QA decision for one translated unit."""
     errors = []
     warnings = []
@@ -754,9 +775,12 @@ def validate_translation(source, protected, provider_output, restored,
     if source_language == "mixed" and han_count:
         warnings.append("mixed_language_source")
 
-    # Layout-bearing separators are part of the document contract, not prose
-    # the model may rewrite. Exact line boundaries preserve paragraphs and
-    # footnotes; tabs/pipes preserve lightweight table structure.
+    # OCR and PDF text extraction frequently add visual line wraps that a
+    # translation engine correctly normalizes.  A changed line count is useful
+    # review information but never proves content loss, including in a table:
+    # actual tab and pipe counts below are the hard table-layout contract.
+    # ``strict_layout`` remains accepted for API compatibility with earlier
+    # callers, but must not turn a harmless wrap into a failed translation.
     structural_counts = {
         "line_breaks": str(source or "").count("\n"),
         "tabs": str(source or "").count("\t"),
@@ -768,7 +792,7 @@ def validate_translation(source, protected, provider_output, restored,
         "table_pipes": restored.count("|"),
     }
     if structural_counts["line_breaks"] != restored_counts["line_breaks"]:
-        errors.append("line_structure_changed")
+        warnings.append("line_structure_changed")
     if structural_counts["tabs"] and structural_counts["tabs"] != restored_counts["tabs"]:
         errors.append("table_structure_changed")
     if structural_counts["table_pipes"] >= 2 and structural_counts["table_pipes"] != restored_counts["table_pipes"]:
@@ -808,10 +832,43 @@ def _heading_texts(structure):
     return values
 
 
+def _is_reference_metadata(text):
+    """Recognise citation-heavy bibliographies that must retain source form.
+
+    References, identifiers, volume/page numbers and URLs are evidence metadata
+    rather than prose. Machine-translating them frequently damages traceability,
+    while forcing Chinese-only quality rules rejects legitimate preserved
+    citations. The test is deliberately strict so ordinary numbered prose is
+    still translated.
+    """
+    value = str(text or "")
+    lines = [line for line in value.splitlines() if line.strip()]
+    if len(lines) < 6:
+        return False
+    compact_length = max(1, len(re.sub(r"\s+", "", value)))
+    digits = len(re.findall(r"\d", value))
+    links = len(re.findall(r"(?:https?://|www\.|\bdoi\s*[:/])", value, re.I))
+    citation_lines = sum(
+        1 for line in lines
+        if re.search(
+            r"(?:\b(?:19|20)\d{2}\b|\b(?:vol\.?|no\.?|pp\.?|isbn|issn|doi)\b|"
+            r"^\s*(?:\[\d+\]|\d+[.)]))",
+            line, re.I,
+        )
+    )
+    return (
+        citation_lines >= 3
+        and digits / float(compact_length) >= 0.025
+        and (links >= 1 or citation_lines >= max(5, len(lines) // 5))
+    )
+
+
 def _block_kind(text, heading_values, evidence_markers):
     compact = re.sub(r"\s+", " ", str(text or "")).strip()
     if compact in heading_values:
         return "heading"
+    if _is_reference_metadata(text):
+        return "reference"
     evidence_labels = [
         label for label, marker in evidence_markers
         if marker and (marker[:160] in compact or compact[:160] in marker)
@@ -886,6 +943,10 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                 piece_end = int(item["start"]) + int(piece["end"])
                 piece_text = piece["text"]
                 detection = detect_language(piece_text)
+                reference_metadata = block_kind == "reference"
+                translation_required = bool(
+                    detection["needs_translation"] and not reference_metadata
+                )
                 memory_key = translation_memory_key(
                     piece_text, detection["language"], glossary=glossary,
                     target_language=target_language, contract_version=contract_version,
@@ -897,11 +958,16 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                     "paragraph_index": unit_paragraph_index,
                     "source_text": piece_text, "source_language": detection["language"],
                     "language_confidence": detection["confidence"],
-                    "translation_required": detection["needs_translation"],
-                    "memory_key": memory_key, "status": "pending" if detection["needs_translation"] else "not_required",
-                    "target_text": None if detection["needs_translation"] else piece_text,
-                    "attempts": 0, "model": None, "usage": {}, "qa": None,
+                    "translation_required": translation_required,
+                    "memory_key": memory_key, "status": "pending" if translation_required else "not_required",
+                    "target_text": None if translation_required else piece_text,
+                    "attempts": 0, "model": None, "usage": {},
+                    "qa": (
+                        {"passed": True, "warnings": ["reference_metadata_preserved"]}
+                        if reference_metadata else None
+                    ),
                     "error": None, "retryable": True,
+                    "preserved_reason": "reference_metadata" if reference_metadata else None,
                 })
     return units
 
@@ -1021,6 +1087,11 @@ class TranslationService:
         completed = [unit for unit in required if unit["status"] == "completed"]
         failed = [unit for unit in required if unit["status"] == "failed"]
         pending = [unit for unit in required if unit["status"] == "pending"]
+        warnings = sorted({
+            warning
+            for unit in units
+            for warning in ((unit.get("qa") or {}).get("warnings") or [])
+        })
         all_ready = not failed and not pending
         if not required:
             status = "not_required"
@@ -1082,6 +1153,7 @@ class TranslationService:
             },
             "units": copy.deepcopy(units),
             "errors": [copy.deepcopy(unit["error"]) for unit in failed if unit.get("error")],
+            "warnings": warnings,
             "updated_at": _utc_now(),
         }
 
@@ -1138,6 +1210,7 @@ class TranslationService:
             qa = validate_translation(
                 core, protected, response.text, restored_core,
                 unit["source_language"], glossary=glossary,
+                strict_layout=unit.get("block_kind") == "table",
             )
             if not qa["passed"]:
                 raise TranslationQualityError(
@@ -1162,6 +1235,157 @@ class TranslationService:
                 )
             return _normalise_provider_response(value)
 
+        def segmented_recovery():
+            """Retry an overlong prose unit as verified natural subsegments.
+
+            NLLB's token-window fallback is safe against truncation, but a
+            single dense paragraph can still produce a partly copied target.
+            Repeating that same request is deterministic and wastes CPU.  Only
+            after that specific quality failure, split at the existing
+            lossless sentence/paragraph boundaries and validate every result
+            independently.  The first recovery level uses one provider batch;
+            only an individual short piece that still fails is subdivided
+            further. Tables never enter this recovery path.
+            """
+            segment_limit = max(360, min(480, self.policy.max_unit_chars // 8))
+            pieces = segment_text(core, max_chars=segment_limit)
+            if len(pieces) < 2:
+                return None
+
+            def prepare_piece(piece_source):
+                leading_match = re.match(r"^\s*", piece_source)
+                trailing_match = re.search(r"\s*$", piece_source)
+                leading_piece = leading_match.group(0) if leading_match else ""
+                trailing_piece = trailing_match.group(0) if trailing_match else ""
+                core_end = len(piece_source) - len(trailing_piece) if trailing_piece else len(piece_source)
+                piece_core = piece_source[len(leading_piece):core_end]
+                return {
+                    "source": piece_source,
+                    "leading": leading_piece,
+                    "trailing": trailing_piece,
+                    "core": piece_core,
+                    "protected": protect_text(piece_core, glossary=glossary) if piece_core else None,
+                }
+
+            def validate_piece(item, response):
+                piece_core = item["core"]
+                if not piece_core:
+                    return item["source"], {"passed": True, "warnings": []}
+                protected_piece = item["protected"]
+                restored_piece_core = protected_piece.restore(response.text).strip()
+                piece_qa = validate_translation(
+                    piece_core, protected_piece, response.text, restored_piece_core,
+                    unit["source_language"], glossary=glossary, strict_layout=False,
+                )
+                if not piece_qa["passed"]:
+                    raise TranslationQualityError(
+                        "细分重试质量校验失败：{}".format(
+                            ", ".join(piece_qa["errors"])
+                        ),
+                        code=piece_qa["errors"][0] if piece_qa["errors"] else "quality_error",
+                    )
+                return item["leading"] + restored_piece_core + item["trailing"], piece_qa
+
+            def recover_piece(piece_source):
+                """Recursively retry only one short piece that still copied text."""
+                item = prepare_piece(piece_source)
+                if not item["core"]:
+                    return piece_source, {"passed": True, "warnings": []}, None, 1
+                response = _normalise_provider_response(self.provider.translate(
+                    item["protected"].text, unit["source_language"], TARGET_LANGUAGE,
+                    glossary=glossary, timeout=self.policy.timeout_seconds, retries=0,
+                ))
+                try:
+                    rendered, piece_qa = validate_piece(item, response)
+                    return rendered, piece_qa, response, 1
+                except TranslationQualityError as exc:
+                    if exc.code != "target_contains_untranslated_text" or len(item["core"]) <= 180:
+                        raise
+                    child_limit = max(180, min(360, len(item["core"]) // 2))
+                    children = segment_text(piece_source, max_chars=child_limit)
+                    if len(children) < 2:
+                        raise
+                    rendered_parts = []
+                    qa_parts = []
+                    last_response = response
+                    count = 0
+                    for child in children:
+                        rendered, child_qa, child_response, child_count = recover_piece(
+                            str(child.get("text") or "")
+                        )
+                        rendered_parts.append(rendered)
+                        qa_parts.append(child_qa)
+                        last_response = child_response or last_response
+                        count += child_count
+                    return "".join(rendered_parts), {
+                        "passed": True,
+                        "warnings": sorted({
+                            warning for result in qa_parts
+                            for warning in (result.get("warnings") or [])
+                        }),
+                    }, last_response, count
+
+            prepared = [prepare_piece(str(piece.get("text") or "")) for piece in pieces]
+            translatable = [item for item in prepared if item["core"]]
+            responses = []
+            if translatable and hasattr(self.provider, "translate_batch"):
+                try:
+                    responses = list(self.provider.translate_batch(
+                        [item["protected"].text for item in translatable],
+                        unit["source_language"], TARGET_LANGUAGE, glossary=glossary,
+                        timeout=self.policy.timeout_seconds, retries=0,
+                    ))
+                    if len(responses) != len(translatable):
+                        raise TranslationProviderError(
+                            "细分翻译返回数量不匹配", retryable=True,
+                            code="batch_response_mismatch",
+                        )
+                    responses = [_normalise_provider_response(value) for value in responses]
+                except Exception:
+                    responses = []
+            restored_pieces = []
+            qa_results = []
+            last_response = None
+            response_index = 0
+            actual_segment_count = 0
+            for item in prepared:
+                if not item["core"]:
+                    restored_pieces.append(item["source"])
+                    continue
+                response = responses[response_index] if responses else None
+                response_index += 1
+                if response is None:
+                    rendered, piece_qa, response, count = recover_piece(item["source"])
+                else:
+                    try:
+                        rendered, piece_qa = validate_piece(item, response)
+                        count = 1
+                    except TranslationQualityError as exc:
+                        if exc.code != "target_contains_untranslated_text":
+                            raise
+                        rendered, piece_qa, response, count = recover_piece(item["source"])
+                restored_pieces.append(rendered)
+                qa_results.append(piece_qa)
+                last_response = response or last_response
+                actual_segment_count += count
+            if not qa_results:
+                return None
+            warnings = sorted({
+                warning for result in qa_results for warning in (result.get("warnings") or [])
+            })
+            return (
+                "".join(restored_pieces),
+                {
+                    "passed": True,
+                    "score": min(float(result.get("score") or 0.0) for result in qa_results),
+                    "errors": [],
+                    "warnings": warnings,
+                    "fallback_segmented": True,
+                    "segment_count": actual_segment_count,
+                },
+                last_response,
+            )
+
         for _run_attempt in range(self.policy.max_attempts):
             unit["attempts"] = int(unit.get("attempts") or 0) + 1
             try:
@@ -1176,12 +1400,23 @@ class TranslationService:
                 try:
                     restored_core, qa = validate_response(response)
                 except TranslationQualityError as primary_error:
-                    reviewed = reviewed_response(response.text, [primary_error.code])
-                    if reviewed is None:
-                        raise
-                    response = reviewed
-                    restored_core, qa = validate_response(response)
-                    unit["reviewed_by"] = response.model or getattr(self.reviewer, "provider_id", "reviewer")
+                    recovered = None
+                    if (
+                        primary_error.code == "target_contains_untranslated_text"
+                        and unit.get("block_kind") != "table"
+                        and len(core) >= max(1200, int(self.policy.max_unit_chars * 0.45))
+                    ):
+                        recovered = segmented_recovery()
+                    if recovered is not None:
+                        restored_core, qa, response = recovered
+                        unit["recovered_by"] = "segmented_retry"
+                    else:
+                        reviewed = reviewed_response(response.text, [primary_error.code])
+                        if reviewed is None:
+                            raise
+                        response = reviewed
+                        restored_core, qa = validate_response(response)
+                        unit["reviewed_by"] = response.model or getattr(self.reviewer, "provider_id", "reviewer")
 
                 complex_unit = (
                     unit.get("block_kind") in {"table", "footnote"}
@@ -1387,7 +1622,7 @@ class TranslationService:
 
 
 __all__ = [
-    "TARGET_LANGUAGE", "TRANSLATION_SCHEMA_VERSION", "TranslationError",
+    "TARGET_LANGUAGE", "TRANSLATION_SCHEMA_VERSION", "DEFAULT_TECHNICAL_GLOSSARY", "TranslationError",
     "TranslationProviderError", "TranslationQualityError", "ProviderResponse",
     "TranslationProvider", "UnavailableTranslationProvider", "OllamaTranslationProvider",
     "TranslationMemory", "InMemoryTranslationMemory", "StorageTranslationMemory", "TranslationPolicy",

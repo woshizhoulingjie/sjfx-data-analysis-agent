@@ -1,4 +1,5 @@
 import copy
+import csv
 import hashlib
 import json
 import math
@@ -6,6 +7,9 @@ import os
 import shutil
 import stat as stat_module
 import tempfile
+import bz2
+import tarfile
+import zipfile
 from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 import re
@@ -40,8 +44,10 @@ from services.package_exploration import (
     preview_file,
 )
 from services.large_package_runtime import explore_large_package
+from services.processing_queue import estimated_work_units, ranked_pending_paths
 from services.unified_parser import compact_document
 from services.unified_parser import UnifiedDocumentParser
+from services.logical_units import container_node_for
 from services.parse_isolation import (
     ParseIsolationCancelled,
     ParseIsolationError,
@@ -600,6 +606,17 @@ def _restore_source_provenance(document, scan_root, file_node):
         "sensitive": bool(file_node.get("sensitive")),
         "content_policy": file_node.get("content_policy") or source.get("content_policy"),
     })
+    if file_node.get("logical_unit"):
+        source.update({
+            "absolute_path": "{}::{}".format(
+                Path(scan_root) / str(file_node.get("container_path") or ""),
+                file_node.get("member_name") or file_node.get("logical_kind") or "partition",
+            ),
+            "logical_unit": True,
+            "logical_kind": file_node.get("logical_kind"),
+            "container_path": file_node.get("container_path"),
+            "archive_member": file_node.get("member_name"),
+        })
     return document
 
 
@@ -701,6 +718,173 @@ def _secure_source_snapshot(scan_root, file_node, cancel_check=None):
             except (ImportError, OSError):
                 pass
             lease_handle.close()
+        shutil.rmtree(str(scratch), ignore_errors=True)
+
+
+@contextmanager
+def _logical_source_snapshot(scan_root, file_node, cancel_check=None):
+    """Materialise exactly one logical member/partition into private scratch."""
+    if not file_node.get("logical_unit"):
+        with _secure_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
+            yield snapshot
+        return
+    Config.PARSE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(
+        prefix="sjfx-logical-p{}-".format(os.getpid()), dir=str(Config.PARSE_TEMP_DIR)
+    ))
+    target = scratch / str(file_node.get("name") or "logical-unit.txt")
+    container_node = container_node_for(file_node)
+    kind = str(file_node.get("logical_kind") or "")
+    try:
+        if kind == "structured_text_partition":
+            source_fd, opened_before = _open_inventory_source(scan_root, container_node)
+            start = max(0, int(file_node.get("byte_start") or 0))
+            end = max(start, int(file_node.get("byte_end") or 0))
+            with os.fdopen(source_fd, "rb", closefd=True) as source, target.open("xb") as output:
+                include_header = bool(file_node.get("include_header"))
+                header = source.readline(1024 * 1024) if include_header else b""
+                if start > 0:
+                    if include_header:
+                        output.write(header)
+                    source.seek(start)
+                else:
+                    source.seek(start)
+                while source.tell() < end:
+                    if cancel_check is not None and cancel_check():
+                        raise ParseIsolationCancelled("任务已取消，停止生成结构化分片")
+                    line = source.readline(min(4 * 1024 * 1024, end - source.tell() + 1024 * 1024))
+                    if not line:
+                        break
+                    output.write(line)
+                output.flush()
+                os.fsync(output.fileno())
+                opened_after = os.fstat(source.fileno())
+            if (
+                int(opened_before.st_dev), int(opened_before.st_ino),
+                int(opened_before.st_size), int(opened_before.st_mtime_ns),
+            ) != (
+                int(opened_after.st_dev), int(opened_after.st_ino),
+                int(opened_after.st_size), int(opened_after.st_mtime_ns),
+            ):
+                raise SourceFileChangedError("结构化源文件在分片期间发生变化")
+        elif kind == "archive_member":
+            source_fd, opened_before = _open_inventory_source(scan_root, container_node)
+            with os.fdopen(source_fd, "rb", closefd=True) as container:
+                member = str(file_node.get("member_name") or "")
+                archive_name = str(container_node.get("path") or "").lower()
+                if archive_name.endswith(".zip"):
+                    archive = zipfile.ZipFile(container)
+                    info = archive.getinfo(member)
+                    encrypted = bool(info.flag_bits & 0x1)
+                    size = int(info.file_size or 0)
+                    source_stream = archive.open(info, "r")
+                elif archive_name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+                    archive = tarfile.open(fileobj=container, mode="r:*")
+                    info = archive.getmember(member)
+                    encrypted = False
+                    size = int(info.size or 0)
+                    source_stream = archive.extractfile(info)
+                elif archive_name.endswith(".bz2"):
+                    archive = None
+                    source_stream = bz2.BZ2File(container, mode="rb")
+                    info = None
+                    encrypted = False
+                    size = int(Config.MAX_CONTENT_BYTES)
+                elif archive_name.endswith(".rar"):
+                    try:
+                        import rarfile
+                    except ImportError as exc:
+                        raise ValueError("RAR逻辑成员需要安装 rarfile 依赖") from exc
+                    archive = rarfile.RarFile(container)
+                    info = archive.getinfo(member)
+                    encrypted = bool(getattr(info, "needs_password", lambda: False)())
+                    size = int(info.file_size or 0)
+                    source_stream = archive.open(info, "r")
+                else:
+                    try:
+                        import py7zr
+                    except ImportError as exc:
+                        raise ValueError("7z逻辑成员需要安装 py7zr 依赖") from exc
+                    # py7zr extracts into a private directory, preserving the
+                    # same bounded snapshot/cleanup contract as other archives.
+                    archive = py7zr.SevenZipFile(container, mode="r")
+                    archive.extract(path=str(scratch), targets=[member])
+                    extracted = scratch / member
+                    size = extracted.stat().st_size
+                    encrypted = False
+                    source_stream = extracted.open("rb")
+                try:
+                        if encrypted:
+                            raise ValueError("加密压缩包成员需要密码，不能读取")
+                        if size > int(Config.MAX_CONTENT_BYTES):
+                            raise ValueError("压缩包成员超过中央内容上限")
+                        with source_stream as source, target.open("xb") as output:
+                            copied = 0
+                            while True:
+                                if cancel_check is not None and cancel_check():
+                                    raise ParseIsolationCancelled("任务已取消，停止提取压缩包成员")
+                                chunk = source.read(4 * 1024 * 1024)
+                                if not chunk:
+                                    break
+                                copied += len(chunk)
+                                if copied > size:
+                                    raise ValueError("压缩包成员实际大小超过中央目录声明")
+                                output.write(chunk)
+                            output.flush()
+                            os.fsync(output.fileno())
+                finally:
+                    try:
+                        archive.close()
+                    except Exception:
+                        pass
+                opened_after = os.fstat(container.fileno())
+            if not archive_name.endswith(".bz2") and copied != size:
+                raise ValueError("压缩包成员提取长度与中央目录不一致")
+            if (
+                int(opened_before.st_dev), int(opened_before.st_ino),
+                int(opened_before.st_size), int(opened_before.st_mtime_ns),
+            ) != (
+                int(opened_after.st_dev), int(opened_after.st_ino),
+                int(opened_after.st_size), int(opened_after.st_mtime_ns),
+            ):
+                raise SourceFileChangedError("压缩包在成员提取期间发生变化")
+        elif kind == "workbook_rows":
+            try:
+                import openpyxl
+            except ImportError as exc:
+                raise ValueError("缺少 openpyxl，无法处理工作簿逻辑分片") from exc
+            source_fd, opened_before = _open_inventory_source(scan_root, container_node)
+            with os.fdopen(source_fd, "rb", closefd=True) as container:
+                workbook = openpyxl.load_workbook(container, read_only=True, data_only=True)
+                try:
+                    worksheet = workbook[str(file_node.get("sheet_name") or "")]
+                    with target.open("w", encoding="utf-8-sig", newline="") as output:
+                        writer = csv.writer(output)
+                        for row in worksheet.iter_rows(
+                            min_row=max(1, int(file_node.get("row_start") or 1)),
+                            max_row=max(1, int(file_node.get("row_end") or 1)),
+                            values_only=True,
+                        ):
+                            if cancel_check is not None and cancel_check():
+                                raise ParseIsolationCancelled("任务已取消，停止生成工作表分片")
+                            writer.writerow(["" if value is None else value for value in row])
+                        output.flush()
+                        os.fsync(output.fileno())
+                finally:
+                    workbook.close()
+                opened_after = os.fstat(container.fileno())
+            if (
+                int(opened_before.st_dev), int(opened_before.st_ino),
+                int(opened_before.st_size), int(opened_before.st_mtime_ns),
+            ) != (
+                int(opened_after.st_dev), int(opened_after.st_ino),
+                int(opened_after.st_size), int(opened_after.st_mtime_ns),
+            ):
+                raise SourceFileChangedError("工作簿在分片期间发生变化")
+        else:
+            raise ValueError("不支持的逻辑文件类型：{}".format(kind))
+        yield target
+    finally:
         shutil.rmtree(str(scratch), ignore_errors=True)
 
 
@@ -864,6 +1048,7 @@ def _parallel_parse_files(
     cancel_check=None,
     on_complete=None,
     on_tick=None,
+    on_start=None,
 ):
     """Parse independent files concurrently while preserving hard limits.
 
@@ -886,10 +1071,12 @@ def _parallel_parse_files(
         for index, file_node in enumerate(candidates):
             if cancel_check is not None and cancel_check():
                 raise ParseIsolationCancelled("任务已取消，停止提交新的解析文件")
+            if on_start is not None:
+                on_start(index, file_node)
             if on_tick is not None:
                 on_tick(index, len(candidates), [file_node.get("path") or ""])
             try:
-                with _secure_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
+                with _logical_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
                     document = _parse_with_timeout_fallback(
                         parser, snapshot, file_node["path"], mode, cancel_check=cancel_check
                     )
@@ -919,11 +1106,13 @@ def _parallel_parse_files(
 
     def submit_one(index):
         file_node = candidates[index]
+        if on_start is not None:
+            on_start(index, file_node)
 
         def parse_task():
             child_parser = getattr(_PARSE_THREAD_LOCAL, "parser", parser)
             try:
-                with _secure_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
+                with _logical_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
                     document = _parse_with_timeout_fallback(
                         child_parser,
                         snapshot,
@@ -1404,6 +1593,8 @@ def _node_summary(node, documents):
         "representative_documents": [doc.get("source", {}).get("path") for doc in representatives],
         "evidence_chain": [_first_evidence(doc) for doc in representatives],
         "generated_by": "local-unified-parser",
+        "analysis_depth": "preview",
+        "deep_analysis": False,
         "generated_at": _now(),
     }
 
@@ -1448,6 +1639,8 @@ def _file_summary(path, document):
         "representative_documents": [path],
         "evidence_chain": evidence,
         "generated_by": "local-unified-parser",
+        "analysis_depth": "preview",
+        "deep_analysis": False,
         "generated_at": _now(),
     }
 
@@ -1477,6 +1670,8 @@ def _inventory_file_summary(path, file_node, state="pending"):
         "evidence_chain": [],
         "deep_analysis_recommended": state != "failed",
         "generated_by": "local-inventory",
+        "analysis_depth": "inventory",
+        "deep_analysis": False,
         "generated_at": _now(),
     }
 
@@ -3584,6 +3779,18 @@ def checkpoint_fingerprint(node, parser, parse_mode, document):
 
 def _verified_source_sha256(root, file_node, cancel_check=None):
     """Hash the exact inventoried handle without reopening a mutable path."""
+    if file_node.get("logical_unit"):
+        digest = hashlib.sha256()
+        with _logical_source_snapshot(root, file_node, cancel_check) as snapshot:
+            with Path(snapshot).open("rb") as stream:
+                while True:
+                    if cancel_check is not None and cancel_check():
+                        raise ParseIsolationCancelled("任务已取消，停止检查逻辑文件缓存")
+                    block = stream.read(4 * 1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+        return digest.hexdigest()
     source_fd, before = _open_inventory_source(root, file_node)
     digest = hashlib.sha256()
     with os.fdopen(source_fd, "rb", closefd=True) as stream:
@@ -3740,31 +3947,74 @@ def _build_structured_overview(documents):
 
 
 
+def _preview_inventory_file(root, file_node, **kwargs):
+    if not file_node.get("logical_unit"):
+        return preview_file(root, file_node, **kwargs)
+    with _logical_source_snapshot(root, file_node, kwargs.get("cancel_check")) as snapshot:
+        stat = Path(snapshot).stat()
+        temporary_node = {
+            "path": Path(snapshot).name,
+            "name": Path(snapshot).name,
+            "extension": Path(snapshot).suffix.lower(),
+            "size": stat.st_size,
+            "modified_at_ns": stat.st_mtime_ns,
+            "modified_at": file_node.get("modified_at"),
+        }
+        preview = preview_file(Path(snapshot).parent, temporary_node, **kwargs)
+    preview.update({
+        "path": file_node["path"],
+        "name": file_node.get("name"),
+        "extension": file_node.get("extension"),
+        "size": int(file_node.get("size") or stat.st_size),
+        "modified_at_ns": int(file_node.get("modified_at_ns") or 0),
+        "logical_unit": True,
+        "logical_kind": file_node.get("logical_kind"),
+        "container_path": file_node.get("container_path"),
+        "archive_member": file_node.get("member_name"),
+    })
+    preview["preview_fingerprint"] = hashlib.sha256(json.dumps({
+        "path": preview["path"],
+        "size": preview["size"],
+        "modified_at_ns": preview["modified_at_ns"],
+        "content_sample_sha256": preview.get("content_sample_sha256") or preview.get("sample_sha256"),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return preview
+
+
 def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=None,
                            progress=None, cancel_check=None, yield_check=None):
     return explore_large_package(
         scan_id, scan, files, storage, policy, deep_paths=deep_paths,
         progress=progress, cancel_check=cancel_check, yield_check=yield_check,
-        preview_file_func=preview_file,
+        preview_file_func=_preview_inventory_file,
     )
 
 
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
                     large_options=None, target_paths=None, cancel_check=None, parse_mode_override=None,
                     analysis_translation=None, workflow_source=None, yield_check=None,
-                    aggregation_depth=0, aggregation_interval=3):
+                    aggregation_depth=0, aggregation_interval=3, translation_pipeline=None):
     progress = progress or (lambda percent, message: None)
     durable_inventory = list(storage.iter_inventory_entries(scan_id, kind="file"))
+    logical_inventory = list(storage.iter_inventory_entries(scan_id, kind="logical_file"))
     files = (
         [item["payload"] for item in durable_inventory]
         if durable_inventory else list(_walk_files(scan["tree"]))
     )
-    parse_mode = "fast" if scan.get("parse_mode") == "fast" else "accurate"
+    queue_files = files + [item["payload"] for item in logical_inventory]
+    logical_container_paths = {
+        str(item["payload"].get("container_path") or "")
+        for item in logical_inventory
+        if item["payload"].get("container_path")
+    }
+    requested_scan_mode = str(scan.get("parse_mode") or "auto").strip().lower()
+    parse_mode = requested_scan_mode if requested_scan_mode in {"fast", "accurate", "auto"} else "auto"
     policy = build_policy(scan, large_options)
     inventory = (
         {item["path"]: item["payload"] for item in durable_inventory}
         if durable_inventory else inventory_by_path(scan)
     )
+    inventory.update({item["path"]: item["payload"] for item in logical_inventory})
     all_paths = set(inventory)
     target_paths = set(target_paths or []) & all_paths
     workflow_source = str(workflow_source or (
@@ -3778,7 +4028,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             if path in all_paths and state.get("status") == "completed"
         }
         content_map = _explore_large_package(
-            scan_id, scan, files, storage, policy,
+            scan_id, scan, queue_files, storage, policy,
             deep_paths=deep_paths,
             progress=progress,
             cancel_check=cancel_check,
@@ -3792,6 +4042,41 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 "workflow": {"source": workflow_source, "processed_paths": []},
             }
         prior_states = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
+    if policy.get("enabled") and logical_inventory:
+        logical_states = []
+        logical_containers = set()
+        for item in logical_inventory:
+            unit = item["payload"]
+            logical_containers.add(str(unit.get("container_path") or ""))
+            promotable = bool(unit.get("promotion_allowed", True))
+            logical_states.append({
+                "path": unit["path"],
+                "workflow_state": "logical_unit_queued" if promotable else "excluded",
+                "selection_state": "deferred" if promotable else "excluded",
+                "score": 10.0,
+                "score_components": {"logical_partition": 1.0},
+                "reasons": [
+                    "logical_{}".format(unit.get("logical_kind") or "unit")
+                    if promotable else "encrypted_member"
+                ],
+                "promotion_allowed": promotable,
+                "safety_status": "checked" if promotable else "restricted",
+                "light_index_status": "pending" if promotable else "restricted",
+                "ocr_candidate": str(unit.get("extension") or "").lower() == ".pdf",
+            })
+        for container_path in sorted(path for path in logical_containers if path):
+            logical_states.append({
+                "path": container_path,
+                "workflow_state": "logical_container",
+                "selection_state": "excluded",
+                "score": 0.0,
+                "score_components": {"container_only": 1.0},
+                "reasons": ["logical_container_replaced_by_children"],
+                "promotion_allowed": False,
+                "safety_status": "checked",
+                "light_index_status": "ready",
+            })
+        storage.save_file_workflow_states(scan_id, logical_states)
     documents = {}
     for item in storage.iter_documents(scan_id, hydrate=not policy.get("enabled")):
         if item.get("path") not in all_paths:
@@ -3817,19 +4102,23 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     ]
 
     if target_paths:
-        candidates = [node for node in files if node.get("path") in target_paths]
+        candidates = [node for node in queue_files if node.get("path") in target_paths]
         phase_label = "补充分析"
     elif policy.get("enabled"):
         representative_order = list((content_map or {}).get("representative_paths") or [])
-        by_path = {node.get("path"): node for node in files}
-        candidates = [by_path[path] for path in representative_order if path in by_path]
+        by_path = {node.get("path"): node for node in queue_files}
+        candidates = [
+            by_path[path] for path in representative_order
+            if path in by_path and path not in logical_container_paths
+        ]
         phase_label = "代表文件准确深析"
     else:
         candidates = files
         phase_label = "完整分析"
 
     if parse_mode_override is not None:
-        actual_parse_mode = "fast" if str(parse_mode_override).lower() == "fast" else "accurate"
+        override_mode = str(parse_mode_override).strip().lower()
+        actual_parse_mode = override_mode if override_mode in {"fast", "accurate", "auto"} else "accurate"
     elif policy.get("enabled"):
         # The all-file pass is handled by the bounded explorer above.  Files in
         # this queue are representatives or user promotions and therefore get
@@ -3857,7 +4146,10 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             if stored_sha256:
                 try:
                     current_sha256 = _verified_source_sha256(scan["root"], file_node, cancel_check)
-                    acceptable_modes = [actual_parse_mode]
+                    acceptable_modes = (
+                        ["fast", "accurate"] if actual_parse_mode == "auto"
+                        else [actual_parse_mode]
+                    )
                     stored_mode = str((existing.get("parser") or {}).get("mode") or "").lower()
                     if actual_parse_mode == "fast" and stored_mode.startswith("accurate"):
                         # Accurate is a strict upgrade of the fast first pass;
@@ -3884,17 +4176,43 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         parse_candidates.append((file_node, None))
 
     remaining_batch_paths = []
+    used_work_units = len(parse_candidates)
     if policy.get("enabled"):
-        batch_limit = max(20, min(50, int(policy.get("batch_files") or 30)))
-        if len(parse_candidates) > batch_limit:
-            remaining_batch_paths = [
-                item[0].get("path") for item in parse_candidates[batch_limit:]
-                if item[0].get("path")
-            ]
-            parse_candidates = parse_candidates[:batch_limit]
+        batch_limit = max(1, min(500, int(policy.get("batch_files") or 500)))
+        workflow_for_batch = {
+            item.get("node_path"): item
+            for item in storage.iter_file_workflow_states(scan_id)
+        }
+        selected_candidates = []
+        deferred_candidates = []
+        used_work_units = 0
+        for item in parse_candidates:
+            file_node = item[0]
+            node_path = file_node.get("path")
+            units = estimated_work_units(
+                node_path, file_node, workflow_for_batch.get(node_path)
+            )
+            if (
+                len(selected_candidates) >= batch_limit
+                or (selected_candidates and used_work_units + units > 500)
+            ):
+                deferred_candidates.append(item)
+                continue
+            selected_candidates.append(item)
+            used_work_units += units
+        remaining_batch_paths = [
+            item[0].get("path") for item in deferred_candidates
+            if item[0].get("path")
+        ]
+        parse_candidates = selected_candidates
     batch_translation_paths = {
         item[0].get("path") for item in parse_candidates if item[0].get("path")
     }
+    if translation_pipeline is not None:
+        # The pipeline receives a source document only after its parse result is
+        # durable. It can therefore overlap one bounded CPU translation stream
+        # with the next parse without risking source/translation corruption.
+        translation_pipeline.start(policy, priority_paths=batch_translation_paths)
     total_candidates = max(1, reusable_count + len(parse_candidates))
     completed_candidates = reusable_count
 
@@ -3916,9 +4234,10 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     "若文件已完整，请检查是否损坏、加密或属于分卷压缩包。".format(details or "未发现可解析成员")
                 )
             storage.save_document(scan_id, node_path, document)
+            resolved_mode = str((document.get("parser") or {}).get("mode") or actual_parse_mode)
             fingerprint = file_fingerprint(
                 file_node,
-                parse_mode=actual_parse_mode,
+                parse_mode=resolved_mode,
                 parser_contract=parser_contract,
                 source_sha256=(document.get("source") or {}).get("sha256"),
             )
@@ -3936,6 +4255,33 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 storage.replace_document_evidence_index(
                     scan_id, node_path, evidence_corpus({node_path: document})
                 )
+            coverage = document.get("coverage") or {}
+            if not bool(coverage.get("complete", True)):
+                limitation = "; ".join(
+                    str(item) for item in document.get("warnings") or [] if item
+                ) or str(coverage.get("restriction_reason") or "coverage_incomplete")
+                storage.set_file_state(
+                    scan_id, node_path, fingerprint, "needs_attention",
+                    document=document,
+                    error="正文未完整覆盖：{}".format(limitation[:1200]),
+                    error_class="coverage_incomplete", retryable=False,
+                    next_retry_at=None,
+                )
+                storage.update_file_workflow_stage(
+                    scan_id, node_path, "needs_attention",
+                    parse_status="partial",
+                    evidence_status="ready" if document.get("evidence") else "no_evidence",
+                    priority_source=workflow_source,
+                    light_index_status="ready" if document.get("evidence") else "no_content",
+                )
+                documents[node_path].setdefault("coverage", {})["deep_parse_complete"] = False
+                failures = [item for item in failures if item.get("path") != node_path]
+                failures.append({
+                    "path": node_path,
+                    "error": "正文未完整覆盖：{}".format(limitation[:300]),
+                    "needs_attention": True,
+                })
+                return
             storage.set_file_state(
                 scan_id, node_path, fingerprint,
                 "completed", document=document,
@@ -3945,7 +4291,12 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 parse_status="completed",
                 evidence_status="ready" if document.get("evidence") else "no_evidence",
                 priority_source=workflow_source,
+                light_index_status="ready" if document.get("evidence") else "no_content",
             )
+            if translation_pipeline is not None:
+                translation_pipeline.submit(
+                    node_path, document, documents[node_path],
+                )
             failures = [item for item in failures if item.get("path") != node_path]
         except Exception as exc:
             preserved_document = storage.get_document(scan_id, node_path)
@@ -4043,12 +4394,28 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         # compete with the shared local Qwen model for the 3090 VRAM.
         if str(getattr(parser, "docling_device", "cpu")).lower() != "cpu":
             parse_workers = 1
+        if translation_pipeline is not None:
+            parse_workers = min(
+                parse_workers,
+                max(1, int(getattr(translation_pipeline, "parse_max_concurrency", 1))),
+            )
         parse_workers = _temp_disk_worker_limit(parse_workers)
 
         batch_size = len(parse_candidates)
         if policy.get("enabled"):
-            batch_size = max(20, min(50, int(policy.get("batch_files") or 30)))
+            batch_size = max(1, min(500, int(policy.get("batch_files") or 500)))
         parse_pulse = {"at": 0.0}
+
+        def mark_parse_started(_index, file_node):
+            # This transition is intentionally committed before handing the
+            # source to a parser worker.  The UI can then distinguish a file
+            # actively consuming parser resources from one merely queued for a
+            # future batch, and a worker restart safely returns it to retry.
+            storage.update_file_workflow_stage(
+                scan_id, file_node.get("path"), "deep_parsing",
+                parse_status="processing", priority_source=workflow_source,
+            )
+
         for batch_start in range(0, len(parse_candidates), batch_size):
             current_batch = parse_candidates[batch_start:batch_start + batch_size]
             batch_offset = batch_start
@@ -4069,19 +4436,36 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     ),
                 )
 
-            _parallel_parse_files(
-                parser,
-                [item[0] for item in current_batch],
-                scan["root"],
-                actual_parse_mode,
-                max_workers=parse_workers,
-                cancel_check=cancel_check,
-                on_complete=commit_parse_result,
-                on_tick=parse_tick,
-            )
+            try:
+                _parallel_parse_files(
+                    parser,
+                    [item[0] for item in current_batch],
+                    scan["root"],
+                    actual_parse_mode,
+                    max_workers=parse_workers,
+                    cancel_check=cancel_check,
+                    on_complete=commit_parse_result,
+                    on_tick=parse_tick,
+                    on_start=mark_parse_started,
+                )
+            except BaseException:
+                # A cancelled parse must not leave a translation thread running
+                # against a job that has already been returned to the queue.
+                translation_pipeline and translation_pipeline.abort()
+                raise
 
     failed_paths = {item.get("path") for item in failures}
-    pending_paths = all_paths - set(documents) - failed_paths
+    workflow_after_parse = {
+        item.get("node_path"): item
+        for item in storage.iter_file_workflow_states(scan_id)
+        if item.get("node_path") in all_paths
+    }
+    terminal_excluded_paths = {
+        path for path, state in workflow_after_parse.items()
+        if not bool(state.get("promotion_allowed", True))
+        or str(state.get("safety_status") or "") in {"restricted", "rejected"}
+    }
+    pending_paths = all_paths - set(documents) - failed_paths - terminal_excluded_paths
     deep_analyzed_paths = {
         path for path, document in documents.items()
         if (document.get("coverage") or {}).get("deep_parse_complete")
@@ -4091,7 +4475,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             and not (document.get("coverage") or {}).get("semantic_projection")
         )
     }
-    deep_pending_paths = all_paths - deep_analyzed_paths
+    deep_pending_paths = all_paths - deep_analyzed_paths - terminal_excluded_paths
 
     import_translation = {
         "enabled": False, "eligible_files": 0, "translated_files": 0,
@@ -4105,7 +4489,18 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         }
         if policy.get("enabled") else documents
     )
-    if callable(analysis_translation) and translation_documents:
+    if translation_pipeline is not None:
+        try:
+            import_translation = translation_pipeline.finish() or import_translation
+        except Exception as exc:
+            if cancel_check is not None and cancel_check():
+                raise ParseIsolationCancelled("任务已取消，停止导入期翻译") from exc
+            import_translation.update({
+                "enabled": True,
+                "failed_files": 1,
+                "limitations": ["导入期翻译流水线异常，已回退原文分析：{}".format(str(exc)[:300])],
+            })
+    elif callable(analysis_translation) and translation_documents:
         try:
             import_translation = analysis_translation(
                 documents=translation_documents,
@@ -4125,9 +4520,45 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 "limitations": ["导入期工作译本阶段异常，已回退原文分析：{}".format(str(exc)[:300])],
             })
 
-    aggregation_interval = max(1, int(aggregation_interval or 3))
+    configured_aggregation_interval = max(1, int(aggregation_interval or 3))
+    estimated_batches = int(math.ceil(
+        len(all_paths) / float(max(1, min(500, int(policy.get("batch_files") or 500))))
+    ))
+    # Rebuild global structures at roughly 5% milestones (and always at the
+    # final batch), instead of paying an O(all-files) cost after every 500-file
+    # slice. Small packages retain the historical three-batch cadence.
+    aggregation_interval = max(
+        configured_aggregation_interval,
+        int(math.ceil(estimated_batches / 20.0)),
+    )
     aggregation_depth = max(0, int(aggregation_depth or 0))
     previous_analysis = storage.get_analysis(scan_id) if policy.get("enabled") else None
+    next_background_paths = []
+    if (
+        previous_analysis
+        and workflow_source == "background_backfill"
+        and policy.get("enabled")
+    ):
+        # Background jobs arrive already bounded to <=500 files, therefore
+        # remaining_batch_paths is normally empty. Compute the following batch
+        # before deciding whether this job is an aggregation milestone; this
+        # lets ordinary batches persist documents/coverage without rebuilding
+        # whole-package clusters, while the final batch still calibrates all.
+        latest_workflow = {
+            item.get("node_path"): item
+            for item in storage.iter_file_workflow_states(scan_id)
+        }
+        latest_states_for_queue = {
+            item.get("node_path"): item for item in storage.iter_file_states(scan_id)
+            if item.get("node_path") in all_paths
+        }
+        next_background_paths = ranked_pending_paths(
+            inventory,
+            latest_workflow,
+            latest_states_for_queue,
+            exclude_paths=target_paths,
+            limit=max(1, min(500, int(policy.get("batch_files") or 500))),
+        )
     if (
         previous_analysis
         and target_paths
@@ -4137,13 +4568,15 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         # evidence index to become durable before the waiting turn resumes.
         # Rebuilding summaries, clusters and LLM-generated topic names for the
         # whole package made a one-file question pay the cost of 4,000+ files.
-        analysis = refresh_package_coverage(scan_id, scan, storage) or previous_analysis
+        analysis = refresh_package_progress_counts(scan_id, scan, storage) or previous_analysis
         analysis["import_translation"] = import_translation
         analysis["workflow"] = {
             "schema_version": "large-package-workflow/1.0",
             "source": workflow_source,
             "batch_size": max(1, len(parse_candidates)),
             "processed_in_job": len(parse_candidates),
+            "estimated_work_units": int(used_work_units),
+            "workload_limit": 500 if policy.get("enabled") else None,
             "processed_paths": sorted(batch_translation_paths),
             "remaining_priority_paths": remaining_batch_paths,
             "background_batch_paths": [],
@@ -4156,23 +4589,25 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         return analysis
     if (
         previous_analysis
-        and remaining_batch_paths
+        and (remaining_batch_paths or next_background_paths)
         and aggregation_depth > 0
         and aggregation_depth % aggregation_interval != 0
     ):
         # Per-file documents, evidence and translations are already durable.
         # Intermediate initial-overview slices update coverage only; global
         # clusters/tree/report are rebuilt at milestones and on the final slice.
-        analysis = refresh_package_coverage(scan_id, scan, storage) or previous_analysis
+        analysis = refresh_package_progress_counts(scan_id, scan, storage) or previous_analysis
         analysis["import_translation"] = import_translation
         analysis["workflow"] = {
             "schema_version": "large-package-workflow/1.0",
             "source": workflow_source,
-            "batch_size": max(20, min(50, int(policy.get("batch_files") or 30))),
+            "batch_size": max(1, min(500, int(policy.get("batch_files") or 500))),
             "processed_in_job": len(parse_candidates),
+            "estimated_work_units": int(used_work_units),
+            "workload_limit": 500 if policy.get("enabled") else None,
             "processed_paths": sorted(batch_translation_paths),
             "remaining_priority_paths": remaining_batch_paths,
-            "background_batch_paths": [],
+            "background_batch_paths": next_background_paths,
             "selection_gate": (content_map or {}).get("selection_gate") or {},
             "global_aggregation": "deferred_to_milestone",
             "next_aggregation_depth": (
@@ -4552,44 +4987,31 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "complete": not pending_paths,
         }
         package_coverage["deep_analysis_pending_files"] = len(deep_pending_paths)
-        package_coverage["deep_analysis_strategy"] = "representative_then_query_promotion"
+        package_coverage["deep_analysis_strategy"] = "full_queue_with_priority_reordering"
     background_batch_paths = []
     if (
         policy.get("enabled")
         and not remaining_batch_paths
         and bool(policy.get("background_backfill"))
     ):
-        background_limit = max(20, min(50, int(
-            getattr(Config, "LARGE_PACKAGE_BACKGROUND_BATCH_FILES", 20)
+        background_limit = max(1, min(500, int(
+            getattr(Config, "LARGE_PACKAGE_BACKGROUND_BATCH_FILES", 500)
         )))
-        for path, state in sorted(
-            workflow_states.items(),
-            key=lambda item: (-float(item[1].get("selection_score") or 0), item[0]),
-        ):
-            if (
-                state.get("selection_state") == "deferred"
-                and state.get("light_index_status") == "ready"
-                and state.get("promotion_allowed")
-                and state.get("parse_status") not in {"completed", "failed"}
-                and path not in target_paths
-            ):
-                background_batch_paths.append(path)
-                if len(background_batch_paths) >= background_limit:
-                    break
-        if len(background_batch_paths) < background_limit:
-            now = time.time()
-            for path, state in sorted(prior_states.items()):
-                if (
-                    state.get("status") == "failed"
-                    and bool(state.get("retryable"))
-                    and int(state.get("attempt_count") or 0) < 6
-                    and float(state.get("next_retry_at") or 0) <= now
-                    and path not in target_paths
-                    and path not in background_batch_paths
-                ):
-                    background_batch_paths.append(path)
-                    if len(background_batch_paths) >= background_limit:
-                        break
+        # Full-package mode never abandons an ordinary eligible file.  User
+        # intent, relation recall and representative scoring only alter this
+        # ordering; terminal safety exclusions and exact duplicate aliases do
+        # not consume a logical deep-analysis slot.
+        latest_states = {
+            item.get("node_path"): item for item in storage.iter_file_states(scan_id)
+            if item.get("node_path") in all_paths
+        }
+        background_batch_paths = ranked_pending_paths(
+            inventory,
+            workflow_states,
+            latest_states,
+            exclude_paths=target_paths,
+            limit=background_limit,
+        )
     adaptive_tree = attach_tree_coverage(adaptive_tree, coverage_for_paths, all_paths)
     tree_version_rows = []
     tree_stack = [adaptive_tree]
@@ -4693,6 +5115,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "complete_analysis": package_coverage.get("complete_analysis", False),
             "coverage_limitations": package_coverage.get("limitations", []),
             "large_package_mode": policy.get("enabled"),
+            "relation_feature_index_count": storage.count_file_relation_features(scan_id) if policy.get("enabled") else 0,
+            "relation_global_calibration": bool(not pending_paths and not failures),
+            "relation_contract": "全量特征索引用于召回；全量完成后统一执行实体消歧、关系去重与证据校准",
             "exact_duplicate_groups": len(exact_groups),
             "exact_duplicate_files": exact_duplicate_files,
             "canonical_documents": len(canonical_documents),
@@ -4779,9 +5204,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "workflow": {
             "schema_version": "large-package-workflow/1.0",
             "source": workflow_source,
-            "batch_size": max(20, min(50, int(policy.get("batch_files") or 30)))
+            "batch_size": max(1, min(500, int(policy.get("batch_files") or 500)))
             if policy.get("enabled") else len(candidates),
             "processed_in_job": len(parse_candidates),
+            "estimated_work_units": int(used_work_units),
+            "workload_limit": 500 if policy.get("enabled") else None,
             "processed_paths": [
                 item[0].get("path") for item in parse_candidates if item[0].get("path")
             ],
@@ -4789,9 +5216,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "background_batch_paths": background_batch_paths,
             "selection_gate": (content_map or {}).get("selection_gate") or {},
             "priority_contract": [
-                "question_promotion", "manual_selection", "initial_overview",
+                "manual_selection", "user_query", "user_intent",
+                "relationship_recall", "question_promotion", "initial_overview",
                 "background_backfill", "translation_backfill",
             ],
+            "completion_contract": "continue_until_all_eligible_logical_files_are_processed",
         },
         "policy": {
             "requested_parse_mode": parse_mode,
@@ -4811,6 +5240,57 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     storage.save_analysis(scan_id, analysis)
     storage.update_scan(scan_id, scan)
     progress(95, "本地分析流水线完成")
+    return analysis
+
+
+def refresh_package_progress_counts(scan_id, scan, storage):
+    """Publish O(1) batch progress without rebuilding whole-package objects."""
+    analysis = storage.get_analysis(scan_id) or {}
+    if not analysis:
+        return None
+    counts = storage.package_processing_counts(scan_id)
+    total = int(counts.get("workflow_total") or 0)
+    excluded = int(counts.get("policy_excluded") or counts.get("excluded") or 0)
+    logical_total = max(0, total - excluded)
+    completed = int(counts.get("completed") or 0)
+    incomplete = int(counts.get("incomplete") or max(0, logical_total - completed))
+    ratio = round(completed / float(logical_total or 1), 6)
+    previews = storage.file_preview_counts(scan_id)
+    coverage = analysis.setdefault("coverage", {})
+    coverage.update({
+        "inventory_files": int(scan.get("file_count") or 0),
+        "logical_files": logical_total,
+        "deep_analyzed_files": completed,
+        "deep_analysis_pending_files": incomplete,
+        "parsed_file_ratio": ratio,
+        "coverage_ratio": ratio,
+        "complete_analysis": bool(logical_total and not incomplete),
+        "retry_waiting_files": int(counts.get("retry_waiting") or 0),
+        "needs_attention_files": int(counts.get("needs_attention") or 0),
+        "preview_coverage": {
+            "previewed_files": int(previews.get("previewed") or 0),
+            "restricted_files": int(previews.get("restricted") or 0),
+            "deferred_files": int(previews.get("deferred") or 0),
+            "failed_files": int(previews.get("failed") or 0),
+            "inventory_files": total,
+            "complete": not int(previews.get("deferred") or 0),
+        },
+    })
+    statistics = analysis.setdefault("statistics", {})
+    statistics.update({
+        "deep_analyzed_files": completed,
+        "deep_analysis_pending_files": incomplete,
+        "parsed_file_ratio": ratio,
+        "coverage_ratio": ratio,
+        "complete_analysis": coverage["complete_analysis"],
+    })
+    analysis.setdefault("overview", {}).update({
+        "deep_analyzed_files": completed,
+        "deep_analysis_pending_files": incomplete,
+        "coverage_ratio": ratio,
+        "complete_analysis": coverage["complete_analysis"],
+    })
+    storage.save_analysis(scan_id, analysis)
     return analysis
 
 
@@ -4842,13 +5322,26 @@ def refresh_package_coverage(scan_id, scan, storage):
         {"path": item.get("node_path"), "error": item.get("error")}
         for item in states if item.get("status") == "failed"
     ]
-    durable_inventory = list(storage.iter_inventory_entries(scan_id, kind="file"))
+    durable_inventory = [
+        item for item in storage.iter_inventory_entries(scan_id)
+        if item.get("kind") in {"file", "logical_file"}
+    ]
     inventory = (
         {item["path"]: item["payload"] for item in durable_inventory}
         if durable_inventory else inventory_by_path(scan)
     )
     all_paths = set(inventory)
-    pending_paths = all_paths - set(documents) - {item["path"] for item in failures}
+    workflow_states = {
+        item.get("node_path"): item
+        for item in storage.iter_file_workflow_states(scan_id)
+        if item.get("node_path") in all_paths
+    }
+    terminal_excluded_paths = {
+        path for path, state in workflow_states.items()
+        if not bool(state.get("promotion_allowed", True))
+        or str(state.get("safety_status") or "") in {"restricted", "rejected"}
+    }
+    pending_paths = all_paths - set(documents) - {item["path"] for item in failures} - terminal_excluded_paths
     deep_paths = {
         path for path, document in documents.items()
         if (document.get("coverage") or {}).get("deep_parse_complete")
@@ -4858,12 +5351,7 @@ def refresh_package_coverage(scan_id, scan, storage):
             and not (document.get("coverage") or {}).get("semantic_projection")
         )
     }
-    deep_pending_paths = all_paths - deep_paths
-    workflow_states = {
-        item.get("node_path"): item
-        for item in storage.iter_file_workflow_states(scan_id)
-        if item.get("node_path") in all_paths
-    }
+    deep_pending_paths = all_paths - deep_paths - terminal_excluded_paths
     translation_states = {
         item.get("path"): item.get("payload") or {}
         for item in storage.iter_translations(scan_id, hydrate=False)

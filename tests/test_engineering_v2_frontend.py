@@ -17,14 +17,14 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
     def test_page_ids_remain_unique_and_v2_assets_are_local(self):
         ids = re.findall(r'\bid="([^"]+)"', self.html)
         self.assertEqual(len(ids), len(set(ids)), "HTML element ids must remain unique")
-        self.assertIn('/static/engineering-v2.css?v=4', self.html)
-        self.assertIn('/static/engineering-v2.js?v=7', self.html)
+        self.assertIn('/static/engineering-v2.css?v=6', self.html)
+        self.assertIn('/static/engineering-v2.js?v=10', self.html)
         self.assertNotRegex(self.script, r'https?://|\bcdn\b')
         self.assertNotRegex(self.style, r'@import|https?://')
 
     def test_api_token_is_normalized_before_becoming_a_request_header(self):
         app_script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn('/static/app.js?v=20', self.html)
+        self.assertIn('/static/app.js?v=23', self.html)
         for script in (app_script, self.script):
             self.assertIn('normalizeApiToken', script)
             self.assertIn("removeItem('sjfx_api_token')", script)
@@ -75,6 +75,18 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn("renderSelectedScope", self.script)
         self.assertIn("carryScopeToConversation", self.script)
 
+    def test_relationship_graph_and_table_paths_select_file_scope(self):
+        self.assertIn("function renderRelationships(overview)", self.script)
+        self.assertIn("kind: 'files'", self.script)
+        self.assertIn("v2-relationship-node v2-overview-scope", self.script)
+        self.assertIn("data-overview-scope-paths", self.script)
+        self.assertIn("v2-relationship-path", self.script)
+        self.assertIn("关联文件", self.script)
+        self.assertIn("packageOverviewScopeFiles", self.script)
+        self.assertIn("openBriefFile(path)", self.script)
+        self.assertIn(".v2-relationship-node", self.style)
+        self.assertIn(".v2-relationship-path", self.style)
+
     def test_conversation_client_keeps_scope_follow_up_citation_and_promotion_contracts(self):
         self.assertIn("'/api/conversations'", self.script)
         self.assertIn('/api/conversation/${encodeURIComponent(sessionId)}?scan_id=', self.script)
@@ -97,6 +109,8 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('conversationContextChip', self.script)
         self.assertIn('safeMarkdown', self.script)
         self.assertIn('escapeHtml(value)', self.script)
+        self.assertIn('state.searchIndex.usable === false', self.script)
+        self.assertIn('阶段性索引可用', self.script)
         self.assertIn('data-copy-message', self.script)
         self.assertIn('data-regenerate-message', self.script)
         self.assertIn('analysisQualityMarkup', self.script)
@@ -124,8 +138,33 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('PAGE_SIZE = 6000', self.script)
         self.assertIn('translationPrevBtn', self.script)
         self.assertIn('translationNextBtn', self.script)
+        self.assertIn('translationListPrevBtn', self.html)
+        self.assertIn('translationListNextBtn', self.html)
+        self.assertIn('translationSearch', self.html)
+        self.assertIn('translationLanguageFilter', self.html)
+        self.assertIn('TRANSLATION_LIST_PAGE_SIZE = 100', self.script)
+        self.assertIn('translationListOffset', self.script)
+        self.assertIn('translationListRequestSeq', self.script)
+        self.assertIn('language: controls.language', self.script)
         self.assertIn('escapeHtml(original)', self.script)
         self.assertIn('escapeHtml(translated)', self.script)
+
+    def test_translation_work_list_uses_bounded_server_paging_and_filters(self):
+        for element_id in (
+            'translationSearch', 'translationLanguageFilter',
+            'translationListPrevBtn', 'translationListNextBtn',
+            'translationListPageInfo',
+        ):
+            self.assertIn('id="{}"'.format(element_id), self.html)
+        for contract in (
+            'TRANSLATION_LIST_PAGE_SIZE = 100', 'translationListRequestSeq',
+            'translationListOffset', 'translationSearchTimer',
+            'translationLanguageLabel', 'translationListControls',
+            'translationListNextBtn', 'source_availability',
+        ):
+            self.assertIn(contract, self.script)
+        self.assertIn('.v2-translation-filters', self.style)
+        self.assertIn('.v2-list-pager', self.style)
 
     def test_visuals_are_native_responsive_and_accessible(self):
         self.assertIn('<svg class="v2-donut"', self.script)
@@ -137,6 +176,24 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn(':focus-visible', self.style)
         self.assertIn('aria-live="polite"', self.html)
         self.assertIn('role="img"', self.script)
+
+    def test_package_file_queue_and_evidence_traceback_are_frontend_contracts(self):
+        app_script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        processing_style = (PROJECT_ROOT / "static" / "large-package-processing.css").read_text(encoding="utf-8")
+        self.assertIn('id="fileWorkflowPanel"', self.html)
+        self.assertIn('/api/file-workflow/${encodeURIComponent(state.scan.scan_id)}', app_script)
+        self.assertIn('FILE_WORKFLOW_LABELS', app_script)
+        self.assertIn('normalizedFileStatus', app_script)
+        self.assertIn('data-file-workflow-page', app_script)
+        self.assertIn('data-file-open', app_script)
+        self.assertIn('data-evidence-source', app_script)
+        self.assertIn('openEvidenceSource', app_script)
+        self.assertIn('data-evidence-prioritize', app_script)
+        self.assertIn('prioritizeEvidenceSource', app_script)
+        self.assertIn('/api/package-processing/${encodeURIComponent(scanId)}/resume', app_script)
+        self.assertIn('.file-workflow-row', processing_style)
+        self.assertIn('.evidence-source-link', processing_style)
+        self.assertIn('.evidence-prioritize-link', processing_style)
 
 
 if __name__ == "__main__":

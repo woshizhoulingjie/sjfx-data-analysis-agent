@@ -73,7 +73,7 @@ class FrontendTaskContractTests(unittest.TestCase):
         self.assertIn("useProgressiveAnalysis", script)
         self.assertIn("data-job-open", script)
         self.assertIn("打开分析结果", script)
-        self.assertIn('/static/app.js?v=20', html)
+        self.assertIn('/static/app.js?v=23', html)
         self.assertIn("allowed_result_fields", app_source)
         self.assertIn("_job_api_view(job, compact=compact)", app_source)
 
@@ -88,6 +88,22 @@ class FrontendTaskContractTests(unittest.TestCase):
         self.assertNotIn('"python_compatible": True', app_source)
         self.assertNotIn("Python 3.7 baseline", package_source)
         self.assertIn("Python 3.10 或更高版本", readme)
+
+    def test_polished_shell_keeps_navigation_and_hidden_workflows_operable(self):
+        html = (PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        polish = (PROJECT_ROOT / "static" / "ui-polish.js").read_text(encoding="utf-8")
+        style = (PROJECT_ROOT / "static" / "ui-polish.css").read_text(encoding="utf-8")
+        self.assertIn('/static/ui-polish.css?v=6', html)
+        self.assertIn('/static/ui-polish.js?v=4', html)
+        for contract in (
+            'quickNavigatorBtn', 'quickNavigatorDialog', 'quickNavigatorInput',
+            'handleQuickNavigatorKeys', 'selectQuickRoute', 'syncNavigationDrawer',
+            "sidebar.scrollTop = 0",
+        ):
+            self.assertIn(contract, polish)
+        self.assertIn('.workspace-journey[hidden] { display:none; }', style)
+        self.assertIn('.quick-navigator-overlay', style)
+        self.assertIn('@media (min-width: 761px) and (max-height: 830px)', style)
 
 
 if __name__ == "__main__":

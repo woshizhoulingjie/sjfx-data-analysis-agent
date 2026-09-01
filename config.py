@@ -214,9 +214,15 @@ class Config:
         "1", "true", "yes", "on",
     }
     TRANSLATION_DEVICE = os.getenv("TRANSLATION_DEVICE", "cpu").strip().lower() or "cpu"
-    TRANSLATION_BATCH_SIZE = max(1, min(32, int(os.getenv("TRANSLATION_BATCH_SIZE", "4"))))
+    # Batch short units in one CPU model call for better throughput. Keep one
+    # translation worker and a bounded thread pool so this cannot compete with
+    # other users by spawning extra model processes.
+    TRANSLATION_BATCH_SIZE = max(1, min(32, int(os.getenv("TRANSLATION_BATCH_SIZE", "8"))))
     TRANSLATION_CPU_THREADS = max(1, min(64, int(os.getenv("TRANSLATION_CPU_THREADS", "4"))))
-    TRANSLATION_MAX_INPUT_TOKENS = max(128, min(4096, int(os.getenv("TRANSLATION_MAX_INPUT_TOKENS", "768"))))
+    # NLLB-200 accepts up to roughly 1k source tokens. Using the full safe
+    # window reduces needless CPU calls while the provider still performs
+    # token-aware splitting for anything larger.
+    TRANSLATION_MAX_INPUT_TOKENS = max(128, min(4096, int(os.getenv("TRANSLATION_MAX_INPUT_TOKENS", "1024"))))
     TRANSLATION_MAX_NEW_TOKENS = max(128, min(4096, int(os.getenv("TRANSLATION_MAX_NEW_TOKENS", "512"))))
     ENABLE_TRANSLATION_REVIEW = os.getenv("ENABLE_TRANSLATION_REVIEW", "1").strip().lower() in {
         "1", "true", "yes", "on",
@@ -226,7 +232,7 @@ class Config:
     )
     TRANSLATION_OLLAMA_MODEL = os.getenv("TRANSLATION_OLLAMA_MODEL", OLLAMA_MODEL).strip()
     TRANSLATION_MAX_UNIT_CHARS = max(
-        128, min(12000, int(os.getenv("TRANSLATION_MAX_UNIT_CHARS", "2200")))
+        128, min(12000, int(os.getenv("TRANSLATION_MAX_UNIT_CHARS", "4800")))
     )
     TRANSLATION_MAX_ATTEMPTS = max(1, min(6, int(os.getenv("TRANSLATION_MAX_ATTEMPTS", "2"))))
     TRANSLATION_TIMEOUT_SECONDS = max(10, min(1800, int(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "180"))))
@@ -236,6 +242,15 @@ class Config:
     TRANSLATION_REVIEW_COMPLEX_UNITS = os.getenv(
         "TRANSLATION_REVIEW_COMPLEX_UNITS", "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
+    # The import pipeline starts translation as soon as a parsed document is
+    # durable. It deliberately owns one local NLLB instance; parser parallelism
+    # is reduced while it is active so shared-host CPU use stays predictable.
+    TRANSLATION_PIPELINE_ENABLED = os.getenv(
+        "TRANSLATION_PIPELINE_ENABLED", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    TRANSLATION_PIPELINE_PARSE_MAX_CONCURRENCY = max(
+        1, min(8, int(os.getenv("TRANSLATION_PIPELINE_PARSE_MAX_CONCURRENCY", "1")))
+    )
     ENABLE_IMPORT_TRANSLATION = os.getenv(
         "ENABLE_IMPORT_TRANSLATION", "1"
     ).strip().lower() in {"1", "true", "yes", "on"}
@@ -337,11 +352,11 @@ class Config:
     EXPORT_DISK_RESERVE_BYTES = int(os.getenv("EXPORT_DISK_RESERVE_BYTES", str(1024 * 1024 * 1024)))
     # Default conservatively, but allow an operator to raise the inventory
     # boundary for very large evidence packages after sizing memory/disk.
-    MAX_SCAN_FILES = max(1, min(1_000_000, int(os.getenv("MAX_SCAN_FILES", "50000"))))
+    MAX_SCAN_FILES = max(1, min(1_000_000, int(os.getenv("MAX_SCAN_FILES", "500000"))))
     # Bound recursive inventory construction before Python stack or hostile media
     # can exhaust the local analysis box.  Symlinks are never followed.
     MAX_SCAN_DEPTH = max(1, min(256, int(os.getenv("MAX_SCAN_DEPTH", "32"))))
-    MAX_SCAN_DIRECTORIES = max(1, min(1_000_000, int(os.getenv("MAX_SCAN_DIRECTORIES", "50000"))))
+    MAX_SCAN_DIRECTORIES = max(1, min(1_000_000, int(os.getenv("MAX_SCAN_DIRECTORIES", "500000"))))
     MAX_SCAN_NODES = max(
         2,
         min(2_000_000, int(os.getenv("MAX_SCAN_NODES", str(MAX_SCAN_FILES + MAX_SCAN_DIRECTORIES + 1)))),
@@ -361,9 +376,11 @@ class Config:
     SIDECAR_PAYLOAD_BYTES = int(os.getenv("SIDECAR_PAYLOAD_BYTES", str(256 * 1024)))
     LARGE_PACKAGE_THRESHOLD_BYTES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_BYTES", str(1024 * 1024 * 1024)))
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
-    LARGE_PACKAGE_INITIAL_PARSE_FILES = int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "700"))
+    LARGE_PACKAGE_INITIAL_PARSE_FILES = max(
+        1, min(500, int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "500")))
+    )
     LARGE_PACKAGE_DEEPEN_BATCH_FILES = max(
-        20, min(50, int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "30")))
+        1, min(500, int(os.getenv("LARGE_PACKAGE_DEEPEN_BATCH_FILES", "500")))
     )
     # Unknown large packages are first explored with deterministic bounded
     # samples.  At the current 50k-file default the 8 GiB slice is sufficient
@@ -390,14 +407,29 @@ class Config:
     # Both preview and selected deep-analysis work advance in durable bounded
     # batches. Individual file results are checkpointed immediately.
     LARGE_PACKAGE_BATCH_FILES = max(
-        20, min(50, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "30")))
+        1, min(500, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "500")))
     )
     CONVERSATION_ANALYSIS_BATCH_FILES = max(
         20, min(50, int(os.getenv("CONVERSATION_ANALYSIS_BATCH_FILES", "30")))
     )
     CONVERSATION_MAX_CANDIDATE_EVIDENCE = max(
         100,
-        min(5000, int(os.getenv("CONVERSATION_MAX_CANDIDATE_EVIDENCE", "5000"))),
+        min(5000, int(os.getenv("CONVERSATION_MAX_CANDIDATE_EVIDENCE", "1600"))),
+    )
+    # Interactive turns must remain responsive while large background
+    # analyses continue.  These limits apply only to the conversational
+    # retrieval window; the durable evidence index itself remains complete.
+    CONVERSATION_RETRIEVAL_CANDIDATE_LIMIT = max(
+        100, min(2000, int(os.getenv("CONVERSATION_RETRIEVAL_CANDIDATE_LIMIT", "600")))
+    )
+    CONVERSATION_RETRIEVAL_DOCUMENT_LIMIT = max(
+        50, min(1000, int(os.getenv("CONVERSATION_RETRIEVAL_DOCUMENT_LIMIT", "500")))
+    )
+    CONVERSATION_RETRIEVAL_TIMEOUT_SECONDS = max(
+        2.0, min(30.0, float(os.getenv("CONVERSATION_RETRIEVAL_TIMEOUT_SECONDS", "8")))
+    )
+    CONVERSATION_MODEL_TIMEOUT_SECONDS = max(
+        10, min(180, int(os.getenv("CONVERSATION_MODEL_TIMEOUT_SECONDS", "45")))
     )
     CONVERSATION_MAX_REVISION_ATTEMPTS = max(
         0, min(2, int(os.getenv("CONVERSATION_MAX_REVISION_ATTEMPTS", "1")))
@@ -406,11 +438,21 @@ class Config:
         1, min(12, int(os.getenv("CONVERSATION_MAX_PROMOTION_DEPTH", "3")))
     )
     LARGE_PACKAGE_BACKGROUND_BATCH_FILES = max(
-        20, min(50, int(os.getenv("LARGE_PACKAGE_BACKGROUND_BATCH_FILES", "20")))
+        1, min(500, int(os.getenv("LARGE_PACKAGE_BACKGROUND_BATCH_FILES", "500")))
     )
     LARGE_PACKAGE_BACKGROUND_BACKFILL = os.getenv(
-        "LARGE_PACKAGE_BACKGROUND_BACKFILL", "0"
+        "LARGE_PACKAGE_BACKGROUND_BACKFILL", "1"
     ).strip().lower() in {"1", "true", "yes", "on"}
+    LOGICAL_PARTITION_BYTES = max(
+        256 * 1024,
+        min(64 * 1024 * 1024, int(os.getenv("LOGICAL_PARTITION_BYTES", str(1024 * 1024)))),
+    )
+    LOGICAL_PARTITION_ROWS = max(
+        500, min(100000, int(os.getenv("LOGICAL_PARTITION_ROWS", "10000")))
+    )
+    MAX_LOGICAL_UNITS_PER_CONTAINER = max(
+        1000, min(200000, int(os.getenv("MAX_LOGICAL_UNITS_PER_CONTAINER", "200000")))
+    )
     BACKGROUND_MAX_LOAD_RATIO = max(
         0.1, min(4.0, float(os.getenv("BACKGROUND_MAX_LOAD_RATIO", "0.90")))
     )
@@ -437,7 +479,7 @@ class Config:
     # before the standard library allocates an unbounded ZipInfo list.
     MAX_ZIP_CENTRAL_DIRECTORY_ENTRIES = max(
         MAX_ARCHIVE_ENTRIES,
-        min(200000, int(os.getenv("MAX_ZIP_CENTRAL_DIRECTORY_ENTRIES", "50000"))),
+        min(200000, int(os.getenv("MAX_ZIP_CENTRAL_DIRECTORY_ENTRIES", "200000"))),
     )
     MAX_ARCHIVE_FILE_BYTES = content_byte_limit("MAX_ARCHIVE_FILE_BYTES")
     MAX_ARCHIVE_MEMBER_BYTES = content_byte_limit("MAX_ARCHIVE_MEMBER_BYTES")

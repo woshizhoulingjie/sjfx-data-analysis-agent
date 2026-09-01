@@ -102,6 +102,86 @@ class EngineeringV2StorageTests(unittest.TestCase):
             self.assertEqual(state["priority_source"], "question_promotion")
             self.assertEqual(storage.file_workflow_counts("scan")["evidence_ready"], 1)
 
+    def test_file_status_projection_keeps_retry_and_logical_container_honest(self):
+        """The operational UI must not infer completion from one table alone."""
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "state.db")
+            storage.save_file_workflow_states("scan", [{
+                "path": "complete.txt", "promotion_allowed": True,
+                "safety_status": "checked", "parse_status": "completed",
+            }, {
+                "path": "waiting.txt", "promotion_allowed": True,
+                "safety_status": "checked",
+            }, {
+                "path": "outside.mp4", "promotion_allowed": False,
+                "safety_status": "checked", "reasons": ["out_of_scope_media"],
+            }, {
+                "path": "bundle.zip", "workflow_state": "logical_container",
+                "promotion_allowed": False,
+                "reasons": ["logical_container_replaced_by_children"],
+            }])
+            storage.set_file_state(
+                "scan", "complete.txt", "complete", "completed",
+                document={"text": "verified source"},
+            )
+            storage.set_file_state(
+                "scan", "waiting.txt", "waiting", "failed",
+                error="temporary parser timeout", retryable=True,
+                next_retry_at=time.time() + 60,
+            )
+
+            page = storage.list_file_status_page("scan", limit=20)
+            states = {item["path"]: item for item in page["items"]}
+            self.assertEqual(states["complete.txt"]["display_status"], "completed")
+            self.assertEqual(states["waiting.txt"]["display_status"], "retry_waiting")
+            self.assertEqual(states["outside.mp4"]["display_status"], "out_of_scope")
+            self.assertEqual(states["bundle.zip"]["display_status"], "partial")
+            self.assertEqual(states["bundle.zip"]["accounting_role"], "container_only")
+            self.assertEqual(
+                storage.list_file_status_page("scan", status="retry_waiting")["total"], 1
+            )
+            counts = storage.file_status_counts("scan", include_container_only=False)
+            self.assertEqual(counts["completed"], 1)
+            self.assertEqual(counts["retry_waiting"], 1)
+            self.assertEqual(counts["container_only"], 1)
+            # The ZIP physical container remains inspectable but must not be
+            # counted as a separate incomplete logical file beside its members.
+            self.assertEqual(counts["total"], 3)
+            all_rows = storage.file_status_counts("scan")
+            self.assertEqual(all_rows["total"], 4)
+            self.assertGreater(counts["incomplete"], 0)
+
+    def test_manual_file_reanalysis_resets_retry_budget_without_touching_completed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(Path(folder) / "state.db")
+            storage.save_file_workflow_states("scan", [{
+                "path": "failed.txt", "promotion_allowed": True,
+                "safety_status": "checked",
+            }, {
+                "path": "complete.txt", "promotion_allowed": True,
+                "safety_status": "checked",
+            }])
+            for _ in range(3):
+                storage.set_file_state(
+                    "scan", "failed.txt", "failed", "failed", error="timeout",
+                    retryable=False,
+                )
+            storage.set_file_state(
+                "scan", "complete.txt", "complete", "completed",
+                document={"text": "done"},
+            )
+            self.assertEqual(
+                storage.request_file_reanalysis("scan", ["failed.txt", "complete.txt"]), 1
+            )
+            failed = storage.get_file_state("scan", "failed.txt")
+            completed = storage.get_file_state("scan", "complete.txt")
+            self.assertEqual(failed["attempt_count"], 0)
+            self.assertTrue(failed["retryable"])
+            self.assertEqual(failed["next_retry_at"], 0)
+            self.assertEqual(completed["status"], "completed")
+            workflow = storage.get_file_workflow_state("scan", "failed.txt")
+            self.assertEqual(workflow["workflow_state"], "manual_retry_queued")
+
     def test_analysis_job_priority_and_scope_dedup_follow_workflow_contract(self):
         with tempfile.TemporaryDirectory() as folder:
             storage = Storage(Path(folder) / "state.db")

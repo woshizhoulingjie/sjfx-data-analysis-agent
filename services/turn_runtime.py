@@ -324,7 +324,7 @@ class AnalysisTurnRuntime:
             retrieval_override = None
             batch_summary: Dict[str, Any] = {}
             tool_results: Dict[str, Any] = {}
-            if "casual" not in modes:
+            if not modes.intersection({"casual", "creative", "general_qa"}):
                 if "structured" not in modes:
                     self._step(turn_id, plan, "document_discovery", "running", 20)
                     self._publish(
@@ -334,13 +334,16 @@ class AnalysisTurnRuntime:
                         24,
                         "正在整个指定范围内寻找相关文件",
                     )
+                    retrieval_top_k = 8 if primary_mode in {
+                        "relationship", "contradiction", "risk"
+                    } else 10
                     retrieval_override = execute_bounded_searches(
                         self.engine,
                         turn["scan_id"],
                         execution_scope,
                         plan.get("query_variants") or [turn["question"]],
                         intent=primary_mode,
-                        top_k=12,
+                        top_k=retrieval_top_k,
                     )
                     candidate_files = int(
                         (retrieval_override.get("coverage") or {}).get("candidate_files")
@@ -388,6 +391,14 @@ class AnalysisTurnRuntime:
                         "正在按每批 {} 份文件建立结构化中间结果".format(self.batch_size),
                         event_type="batching",
                     )
+                    # Relationship/timeline tools do not need thousands of
+                    # duplicate evidence chunks.  A bounded candidate budget
+                    # keeps one interactive turn responsive while preserving
+                    # the full durable index for later recall/promotion.
+                    mode_budget = (
+                        900 if primary_mode in {"relationship", "timeline", "contradiction"}
+                        else 1400
+                    )
                     batch_summary = build_batch_analysis(
                         self.storage,
                         turn["scan_id"],
@@ -395,7 +406,7 @@ class AnalysisTurnRuntime:
                         plan,
                         scoped_inventory_paths,
                         batch_size=self.batch_size,
-                        max_evidence=self.max_candidate_evidence,
+                        max_evidence=min(self.max_candidate_evidence, mode_budget),
                         cancel_check=self.cancel_check,
                     )
                     self._publish(
@@ -535,17 +546,36 @@ class AnalysisTurnRuntime:
                     list(turn_result.get("warnings") or []) + [warning]
                 ))
 
-            self._publish(
-                turn, "running", "verifying", 80, "正在逐条核验结论、数字、引用和反证"
-            )
-            verification = self._verify(
-                turn_id, plan, turn_result, tool_results, batch_summary
-            )
+            if not modes.intersection({"casual", "creative", "general_qa"}):
+                self._publish(
+                    turn, "running", "verifying", 80, "正在逐条核验结论、数字、引用和反证"
+                )
+                verification = self._verify(
+                    turn_id, plan, turn_result, tool_results, batch_summary
+                )
+            else:
+                # Conversational and creative turns are not package-backed
+                # factual claims. Do not let an empty evidence set rewrite a
+                # valid natural-language response as "insufficient".
+                verification = {
+                    "schema_version": "claim-verification/2.0",
+                    "status": "not_required",
+                    "needs_revision": False,
+                    "warnings": [],
+                    "ledger": {
+                        "schema_version": "evidence-ledger/1.0",
+                        "claims": [],
+                    },
+                    "quality_metrics": {
+                        "verification_status": "not_required",
+                        "citation_count": 0,
+                    },
+                }
             revision_attempts = 0
             while (
                 verification.get("needs_revision")
                 and revision_attempts < self.max_revision_attempts
-                and "casual" not in modes
+                and not modes.intersection({"casual", "creative", "general_qa"})
             ):
                 revision_attempts += 1
                 self._publish(
@@ -606,7 +636,7 @@ class AnalysisTurnRuntime:
                 )
                 plan = repair_plan
 
-            if verification.get("needs_revision") and "casual" not in modes:
+            if verification.get("needs_revision") and not modes.intersection({"casual", "creative", "general_qa"}):
                 turn_result = self.verifier.guard_result(turn_result, verification)
                 verification = self.verifier.verify(
                     turn_result,
@@ -628,6 +658,33 @@ class AnalysisTurnRuntime:
                 else "checked_scope"
             )
             turn_result["analysis_tools"] = self._tool_summaries(tool_results)
+            final_status = str(turn_result.get("status") or "")
+            turn_result["task_status"] = (
+                "fulfilled" if final_status == "answered"
+                else "partially_fulfilled" if final_status == "partial"
+                else "not_fulfilled"
+            )
+            # Relationship questions must expose the same persisted edges as
+            # reports and graphs.  Rule-based tool output remains useful for
+            # explaining text frames, but it is never substituted for this
+            # cross-file catalog.
+            if "relationship" in modes and hasattr(self.storage, "get_relationship_catalog"):
+                citation_paths = {
+                    str(item.get("archive_source_path") or item.get("source_path") or "")
+                    for item in (turn_result.get("citations") or [])
+                }
+                edges = []
+                for path in sorted(path for path in citation_paths if path)[:40]:
+                    edges.extend(self.storage.get_relationship_catalog(
+                        turn["scan_id"], source_path=path, limit=100,
+                    ).get("items") or [])
+                unique_edges = {edge.get("relation_key"): edge for edge in edges}
+                turn_result["relationship_catalog"] = {
+                    "schema_version": "relationship-catalog/1.0",
+                    "items": list(unique_edges.values())[:500],
+                    "matched_source_count": len(citation_paths),
+                    "feature_index_is_recall_only": True,
+                }
             verification_warnings = list(verification.get("warnings") or [])
             stale_fragments = (
                 "事实性陈述没有通过", "陈述只得到部分支持", "数字结论无法",

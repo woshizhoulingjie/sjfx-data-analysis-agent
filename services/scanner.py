@@ -419,25 +419,29 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
 
 
 def scan_inventory_slice(root, cursor=None, slice_entries=1000, slice_seconds=20,
-                         max_depth=32, max_directories=1_000_000,
+                         max_depth=32, max_files=1_000_000, max_directories=1_000_000,
                          max_nodes=2_000_000, cancel_check=None,
-                         yield_check=None, activity_callback=None):
+                         yield_check=None, activity_callback=None,
+                         manifest_dir=None):
     """Enumerate one durable, lexically ordered inventory slice.
 
-    The cursor stores only the active directory stack and the last processed
-    name in each directory. Callers persist returned records and the cursor in
-    one transaction. Reopening a directory on resume is intentional: source
-    directory handles must never be kept across Worker processes.
+    When ``manifest_dir`` is supplied, each directory is enumerated and sorted
+    exactly once into a durable local manifest. Subsequent slices continue from
+    a byte offset instead of rescanning and resorting a huge flat directory.
     """
     root = Path(root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError("目录不存在或不是文件夹")
     max_depth = max(1, min(256, int(max_depth or 32)))
+    max_files = max(1, min(1_000_000, int(max_files or 1_000_000)))
     max_directories = max(1, min(1_000_000, int(max_directories or 1_000_000)))
     max_nodes = max(2, min(2_000_000, int(max_nodes or 2_000_000)))
     slice_entries = max(1, min(10000, int(slice_entries or 1000)))
     slice_seconds = max(1.0, min(300.0, float(slice_seconds or 20)))
     started = time.monotonic()
+    manifest_root = Path(manifest_dir).expanduser().resolve() if manifest_dir else None
+    if manifest_root is not None:
+        manifest_root.mkdir(parents=True, exist_ok=True)
 
     state = dict(cursor or {})
     if state and state.get("version") != 1:
@@ -472,26 +476,83 @@ def scan_inventory_slice(root, cursor=None, slice_entries=1000, slice_seconds=20
             or (yield_check is not None and bool(yield_check()))
         )
 
+    def next_manifest_item(frame, directory_path):
+        manifest_path = frame.get("manifest_path")
+        if not manifest_path:
+            try:
+                with os.scandir(str(directory_path)) as iterator:
+                    names = [entry.name for entry in iterator]
+            except (OSError, PermissionError) as exc:
+                state["errors"].append({"path": frame["path"], "error": str(exc)[:1000]})
+                return None
+            names.sort(key=lambda value: (value.casefold(), value))
+            after = tuple(frame.get("after_key") or ())
+            digest = hashlib.sha256(
+                (str(root) + "\0" + str(frame["path"])).encode("utf-8", errors="replace")
+            ).hexdigest()
+            target = manifest_root / (digest + ".jsonl")
+            temporary = manifest_root / (digest + ".{}.tmp".format(os.getpid()))
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                for position, name in enumerate(names):
+                    key = (name.casefold(), name)
+                    if after and key <= after:
+                        continue
+                    handle.write(json.dumps([position, name], ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temporary), str(target))
+            frame["manifest_path"] = str(target)
+            frame["manifest_offset"] = 0
+            manifest_path = str(target)
+        manifest_path = Path(manifest_path).resolve()
+        try:
+            manifest_path.relative_to(manifest_root)
+        except ValueError as exc:
+            raise ValueError("扫描清单游标指向了状态目录之外") from exc
+        try:
+            with manifest_path.open("rb") as handle:
+                handle.seek(max(0, int(frame.get("manifest_offset") or 0)))
+                line = handle.readline()
+                frame["manifest_offset"] = handle.tell()
+        except FileNotFoundError:
+            # A state-disk cleanup invalidates only the directory manifest. It
+            # is safe to rebuild from after_key without losing saved records.
+            frame.pop("manifest_path", None)
+            frame.pop("manifest_offset", None)
+            return next_manifest_item(frame, directory_path)
+        if not line:
+            try:
+                manifest_path.unlink()
+            except OSError:
+                pass
+            return None
+        position, name = json.loads(line.decode("utf-8"))
+        key = (str(name).casefold(), str(name))
+        return int(position), str(name), key
+
     while state["stack"]:
         if cancel_check is not None:
             cancel_check()
         frame = state["stack"][-1]
         directory_path = root if frame["path"] == "." else root / frame["path"]
-        try:
-            with os.scandir(str(directory_path)) as iterator:
-                names = [entry.name for entry in iterator]
-        except (OSError, PermissionError) as exc:
-            state["errors"].append({"path": frame["path"], "error": str(exc)[:1000]})
-            state["stack"].pop()
-            continue
-        names.sort(key=lambda value: (value.casefold(), value))
-        after = tuple(frame.get("after_key") or ())
-        next_item = None
-        for position, name in enumerate(names):
-            key = (name.casefold(), name)
-            if not after or key > after:
-                next_item = (position, name, key)
-                break
+        if manifest_root is not None:
+            next_item = next_manifest_item(frame, directory_path)
+        else:
+            try:
+                with os.scandir(str(directory_path)) as iterator:
+                    names = [entry.name for entry in iterator]
+            except (OSError, PermissionError) as exc:
+                state["errors"].append({"path": frame["path"], "error": str(exc)[:1000]})
+                state["stack"].pop()
+                continue
+            names.sort(key=lambda value: (value.casefold(), value))
+            after = tuple(frame.get("after_key") or ())
+            next_item = None
+            for position, name in enumerate(names):
+                key = (name.casefold(), name)
+                if not after or key > after:
+                    next_item = (position, name, key)
+                    break
         if next_item is None:
             state["stack"].pop()
             continue
@@ -552,7 +613,7 @@ def scan_inventory_slice(root, cursor=None, slice_entries=1000, slice_seconds=20
                 if should_ignore_file(name):
                     state["ignored_file_count"] += 1
                     continue
-                if state["node_count"] >= max_nodes:
+                if state["file_count"] >= max_files or state["node_count"] >= max_nodes:
                     raise ValueError("文件清单超过已配置的安全上限，扫描未完成")
                 payload = _file_metadata(item_path, root, item_stat)
                 records.append({
@@ -687,6 +748,9 @@ def extract_text(path, max_chars=60000):
                 parser = "openpyxl"
             except ImportError:
                 warnings.append("未安装 openpyxl，当前只能读取文件元数据")
+        elif ext in {".doc", ".xls", ".ppt"}:
+            metadata["capability"] = "out_of_scope_legacy_office"
+            warnings.append("旧版 Office 格式当前仅登记元数据；正文解析需要 LibreOffice/专用转换器")
         else:
             warnings.append("该文件类型尚未配置正文解析器")
     except Exception as exc:

@@ -3,6 +3,12 @@ const state = {
   selected: null,
   summary: null,
   analysis: null,
+  processing: null,
+  fileWorkflowPage: null,
+  fileWorkflowFilter: 'all',
+  fileWorkflowOffset: 0,
+  fileWorkflowRequestSeq: 0,
+  fileWorkflowAbortController: null,
   progressiveAnalysis: null,
   progressiveRefreshKey: null,
   analysisTreeOriginal: null,
@@ -11,6 +17,8 @@ const state = {
   jobId: null,
   modelGenerationEnabled: null,
   lastRetrievalId: null,
+  retrievalScope: 'package',
+  pendingEvidenceLocation: null,
   selectedNodes: new Map(),
   treeEdits: [],
   jobs: new Map(),
@@ -158,6 +166,95 @@ function escapeHtml(value) {
 }
 
 
+const SUMMARY_TOPIC_WORDS = [
+  'shadow', 'shadows', 'cipher', 'spaces', 'exploiting', 'tweak',
+  'hardware', 'memory', 'encryption', 'attack', 'attacks', 'security',
+  'privacy', 'cryptography', 'method', 'methods', 'experiment', 'results',
+  'system', 'data', 'analysis', 'network', 'language', 'model', 'research',
+  'evaluation'
+];
+
+function splitSummaryTopic(value) {
+  const text = String(value || '').trim();
+  if (!text || /\s|[,，、;；/|]/.test(text) || text.length < 18) return text ? [text] : [];
+  const source = text.toLowerCase();
+  const words = [...SUMMARY_TOPIC_WORDS].sort((a, b) => b.length - a.length);
+  const parts = [];
+  let index = 0;
+  while (index < source.length) {
+    const match = words.find((word) => source.startsWith(word, index));
+    if (match) {
+      parts.push(text.slice(index, index + match.length));
+      index += match.length;
+      continue;
+    }
+    let end = index + 1;
+    while (end < source.length && !words.some((word) => source.startsWith(word, end))) end += 1;
+    parts.push(text.slice(index, end));
+    index = end;
+  }
+  const covered = parts.join('').length;
+  return parts.length > 1 && covered >= text.length * 0.8 ? parts : [text];
+}
+
+function summaryTopicValues(value) {
+  const values = Array.isArray(value) ? value : [value];
+  const output = [];
+  values.forEach((item) => {
+    if (Array.isArray(item)) {
+      output.push(...summaryTopicValues(item));
+      return;
+    }
+    String(item || '')
+      .split(/[,，、;；/|\n]+/)
+      .map((part) => part.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .forEach((part) => splitSummaryTopic(part).forEach((piece) => {
+        if (piece && !output.some((existing) => existing.toLowerCase() === piece.toLowerCase())) output.push(piece);
+      }));
+  });
+  return output.slice(0, 16);
+}
+
+function summaryParagraphsHtml(value) {
+  const paragraphs = String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .split(/\n{2,}|\n/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return paragraphs.map((part) => `<p class="summary-paragraph">${escapeHtml(part)}</p>`).join('');
+}
+
+function summaryStructureHtml(value) {
+  const structure = value && typeof value === 'object' ? value : {};
+  const rows = [];
+  const addRow = (label, item) => {
+    if (item == null || item === '' || (Array.isArray(item) && !item.length)) return;
+    const rendered = Array.isArray(item)
+      ? item.map((entry) => typeof entry === 'object' ? JSON.stringify(entry) : String(entry)).join('、')
+      : typeof item === 'object' ? '' : String(item);
+    if (rendered) rows.push(`<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(rendered)}</strong></div>`);
+  };
+  addRow('文档标题', structure.title || structure.document_title);
+  addRow('文档类型', structure.document_type || structure.type);
+  addRow('页数 / 张数', structure.page_count ?? structure.pages);
+  addRow('表格数量', structure.table_count ?? structure.tables);
+  addRow('图片数量', structure.picture_count ?? structure.image_count ?? structure.images);
+  addRow('字符数', structure.character_count ?? structure.char_count ?? structure.characters);
+  const coverage = structure.coverage;
+  if (coverage && typeof coverage === 'object') {
+    const ratio = coverage.coverage_ratio != null ? `${Math.round(Number(coverage.coverage_ratio) * 10000) / 100}%` : '';
+    addRow('正文覆盖', ratio || (coverage.complete === false ? '部分覆盖' : coverage.complete === true ? '完整' : '—'));
+  }
+  const sections = structure.sections || structure.headings || structure.chapter_titles || [];
+  let html = rows.length ? `<div class="summary-structure-grid">${rows.join('')}</div>` : '';
+  if (Array.isArray(sections) && sections.length) {
+    html += `<div class="summary-sections"><span>章节 / 结构</span><ul>${sections.slice(0, 40).map((section) => `<li>${escapeHtml(typeof section === 'object' ? (section.title || section.name || JSON.stringify(section)) : section)}</li>`).join('')}</ul></div>`;
+  }
+  return html || '<p class="muted">未提取到可展示的结构字段。</p>';
+}
+
+
 function icon(node) {
   if (node.kind === 'evidence') {
     return '⌁';
@@ -253,6 +350,7 @@ function rememberCurrentScan(scanId) {
   if (!value) return;
   try {
     window.localStorage.setItem(CURRENT_SCAN_KEY, value);
+    window.dispatchEvent(new CustomEvent('sjfx-scan-changed', { detail: { scanId: value } }));
   } catch (_) {
     // The current page remains usable when browser storage is unavailable.
   }
@@ -264,6 +362,7 @@ function forgetCurrentScan(scanId = '') {
     const stored = window.localStorage.getItem(CURRENT_SCAN_KEY) || '';
     if (!scanId || stored === String(scanId)) {
       window.localStorage.removeItem(CURRENT_SCAN_KEY);
+      window.dispatchEvent(new CustomEvent('sjfx-scan-changed', { detail: { scanId: '' } }));
     }
   } catch (_) {
     // There is nothing else to clean up when browser storage is unavailable.
@@ -947,6 +1046,7 @@ async function selectNode(
 
   state.selected = node;
   state.summary = null;
+  renderEvidenceScopeControl();
 
   /*
    * 换节点以后，
@@ -1118,6 +1218,7 @@ async function selectNode(
       renderDocument(
         data.document
       );
+      focusPendingEvidenceLocation(node.path);
 
     } catch (e) {
       if (!selectionStillCurrent()) return;
@@ -1216,6 +1317,25 @@ function evidenceHtml(items) {
             insufficient: '证据不足'
           })[item.support_status] || '';
 
+          const matchType = ({
+            fulltext: '全文命中',
+            full_text: '全文命中',
+            summary: '摘要命中',
+            metadata: '元数据命中',
+            relationship: '关系命中',
+            relation: '关系命中',
+          })[String(item.match_type || '').toLowerCase()] || item.match_type || '';
+
+          const sourcePath = item.source_path || item.archive_source_path || '';
+          const sourceLocation = {
+            page: item.page ?? null,
+            section: item.section || '',
+            paragraph_index: item.paragraph_index ?? null,
+            block_index: item.block_index ?? null,
+            char_start: item.char_start ?? null,
+            char_end: item.char_end ?? null
+          };
+
           return (
             `<article class="evidence-card">`
             +
@@ -1226,12 +1346,18 @@ function evidenceHtml(items) {
               )
             }</div>`
             +
+            (matchType ? `<span class="evidence-match-type">${escapeHtml(matchType)}</span>` : '')
+            +
             `<strong>${
               escapeHtml(
                 loc
                 || '未知位置'
               )
             }</strong>`
+            +
+            (sourcePath
+              ? `<span class="evidence-card-actions"><button type="button" class="evidence-source-link" data-evidence-source="${escapeHtml(sourcePath)}" data-evidence-location="${escapeHtml(JSON.stringify(sourceLocation))}">回查原文</button><button type="button" class="evidence-prioritize-link" data-evidence-prioritize="${escapeHtml(sourcePath)}">优先深析</button></span>`
+              : '')
             +
             `<p>${
               escapeHtml(
@@ -1286,6 +1412,35 @@ function evidenceHtml(items) {
       ).join('')
     }</div>`
   );
+}
+
+function retrievalStatusHtml(result) {
+  const status = result?.search_status || {};
+  const code = String(status.code || (result?.result_count ? 'matched' : 'no_match'));
+  const labels = {
+    matched: '已找到可回查证据',
+    no_match: '当前范围未发现匹配证据',
+    partial_index: '检索范围尚未完成索引',
+    index_unavailable: '检索索引暂不可用',
+  };
+  const coverage = status.coverage || result?.coverage || {};
+  const types = result?.match_type_counts || {};
+  const typeLabels = { fulltext: '全文', full_text: '全文', summary: '摘要', metadata: '元数据', relationship: '关系', relation: '关系' };
+  const typeSummary = Object.entries(types)
+    .filter(([, count]) => Number(count) > 0)
+    .map(([type, count]) => `${typeLabels[String(type).toLowerCase()] || type} ${count}`)
+    .join(' · ');
+  const coverageSummary = [
+    coverage.searchable_files != null ? `可搜索 ${coverage.searchable_files}` : '',
+    coverage.scope_files != null ? `范围文件 ${coverage.scope_files}` : '',
+    coverage.deep_analyzed_files != null ? `深析 ${coverage.deep_analyzed_files}` : '',
+  ].filter(Boolean).join(' · ');
+  return `<div class="retrieval-status retrieval-status-${escapeHtml(code)}" role="status">
+    <strong>${escapeHtml(labels[code] || '检索状态')}</strong>
+    <span>${escapeHtml(status.message || (code === 'no_match' ? '这不代表未处理文件中不存在相关内容；可继续深析或扩大范围。' : ''))}</span>
+    ${typeSummary ? `<small>命中来源：${escapeHtml(typeSummary)}</small>` : ''}
+    ${coverageSummary ? `<small>覆盖：${escapeHtml(coverageSummary)}</small>` : ''}
+  </div>`;
 }
 
 
@@ -1449,6 +1604,32 @@ function renderDocument(doc) {
     html;
 }
 
+function focusPendingEvidenceLocation(path) {
+  const pending = state.pendingEvidenceLocation;
+  if (!pending || pending.path !== path) return;
+  state.pendingEvidenceLocation = null;
+  const location = pending.location || {};
+  const preview = $('summary')?.querySelector('pre');
+  if (!preview) return;
+  const text = preview.textContent || '';
+  let start = Number(location.char_start);
+  let end = Number(location.char_end);
+  if (!Number.isFinite(start) && Number.isFinite(Number(location.paragraph_index))) {
+    const index = Math.max(0, Number(location.paragraph_index));
+    const lines = text.split(/\r?\n/);
+    start = lines.slice(0, index).reduce((total, line) => total + line.length + 1, 0);
+    end = start + (lines[index] || '').length;
+  }
+  if (Number.isFinite(start) && start >= 0 && start < text.length) {
+    end = Number.isFinite(end) && end > start ? Math.min(end, text.length) : Math.min(text.length, start + 320);
+    preview.innerHTML = `${escapeHtml(text.slice(0, start))}<mark class="evidence-location-highlight">${escapeHtml(text.slice(start, end))}</mark>${escapeHtml(text.slice(end))}`;
+    const mark = preview.querySelector('.evidence-location-highlight');
+    window.requestAnimationFrame(() => mark?.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+    return;
+  }
+  window.requestAnimationFrame(() => preview.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+}
+
 
 function renderSummary(
   data,
@@ -1472,15 +1653,26 @@ function renderSummary(
       )
     }</h2>`;
 
+  const generatedBy = String(data.generated_by || '').toLowerCase();
+  const analysisDepth = String(data.analysis_depth || '').toLowerCase();
+  const isModelDeep = generatedBy === 'model-deep-analysis'
+    || generatedBy === 'model'
+    || data.deep_analysis === true;
+  const provenanceLabel = isModelDeep
+    ? (analysisDepth === 'deep_folder' ? '模型深度分析 · 节点范围' : '模型深度分析 · 全文')
+    : generatedBy === 'local-unified-parser'
+      ? '本地解析预览'
+      : generatedBy === 'local-inventory'
+        ? '文件盘点信息'
+        : '本地降级结果';
+  html += `<div class="summary-provenance ${isModelDeep ? 'is-deep' : 'is-preview'}"><span>${escapeHtml(provenanceLabel)}</span>${data.parser_info?.degraded ? '<small>部分步骤未达到完整性门槛，请查看覆盖与告警</small>' : ''}</div>`;
+
   const summary =
     data.summary
     || data.core_summary;
 
   if (summary) {
-    html +=
-      `<p>${
-        escapeHtml(summary)
-      }</p>`;
+    html += summaryParagraphsHtml(summary);
   }
 
   const scopeCoverage =
@@ -1539,16 +1731,12 @@ function renderSummary(
       `</div>`;
   }
 
-  if (
-    data.topics?.length
-  ) {
+  const topicValues = summaryTopicValues(data.topics);
+  if (topicValues.length) {
     html +=
-      `<h3>内容主题</h3><div>${
-        data.topics
-          .map(
-            x =>
-              `<span class="tag">${escapeHtml(x)}</span>`
-          )
+      `<h3>内容主题</h3><div class="summary-topic-list">${
+        topicValues
+          .map((x) => `<span class="tag">${escapeHtml(x)}</span>`)
           .join('')
       }</div>`;
   }
@@ -1591,16 +1779,7 @@ function renderSummary(
   ) {
     html +=
       `<h3>结构概览</h3>`
-      +
-      `<pre>${
-        escapeHtml(
-          JSON.stringify(
-            data.structure_overview,
-            null,
-            2
-          )
-        )
-      }</pre>`;
+      + summaryStructureHtml(data.structure_overview);
   }
 
   if (
@@ -1873,12 +2052,204 @@ function updateStats() {
     const labels = { readability: '可读性', completeness: '完整性', uniqueness: '独特性', topic_concentration: '主题集中度', evidence_density: '证据密度', structured_quality: '结构化质量' };
     $('scanStats').innerHTML += `<div class="coverage-card"><strong>价值维度：</strong>${Object.entries(judgment.dimensions).map(([key, value]) => `${escapeHtml(labels[key] || key)} ${escapeHtml(value?.score ?? '—')}`).join(' · ')}</div>`;
   }
+  renderPackageProcessing();
+}
+
+
+function formatRatio(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${Math.round(number * 10000) / 100}%` : '—';
+}
+
+
+function packageSelectedPaths() {
+  const values = [...state.selectedNodes.values(), state.selected].filter(Boolean);
+  const paths = [];
+  values.forEach((item) => {
+    if (item.kind === 'file' && item.path) paths.push(String(item.path));
+    (item.member_paths || []).forEach((path) => paths.push(String(path)));
+  });
+  return [...new Set(paths)];
+}
+
+
+function renderPackageProcessing() {
+  if (!state.scan || !$('scanStats')) return;
+  const currentQuery = $('packagePriorityQuery')?.value || '';
+  const keepRunning = $('packageContinueFull')?.checked ?? true;
+  const processing = state.processing || {};
+  const status = String(processing.state || 'running');
+  const active = Boolean(processing.active_job_id);
+  const pending = Number(processing.deep_pending_files || 0);
+  const retryWaiting = Number(processing.retry_waiting_files || 0);
+  const needsAttention = Number(processing.needs_attention_files || 0);
+  const selectionCount = packageSelectedPaths().length;
+  const labels = { running: 'RUNNING', paused: 'PAUSED', completed: 'COMPLETED' };
+  const stateText = {
+    running: active ? '正在连续处理' : '等待下一批',
+    paused: '已安全暂停',
+    completed: '全部完成',
+  }[status] || '准备中';
+  $('scanStats').insertAdjacentHTML('beforeend',
+    `<section class="package-processing-panel" aria-label="大数据包连续处理">` +
+      `<div class="package-processing-heading"><div><span class="section-kicker">PROGRESSIVE FULL ANALYSIS</span><h3>大数据包连续处理</h3></div><span class="status-chip" data-status="${escapeHtml(status)}">${escapeHtml(labels[status] || 'WAITING')}</span></div>` +
+      `<div class="package-processing-metrics">` +
+        `<div><b>${processing.inventory_files ?? state.scan.file_count ?? 0}</b><span>全量盘点文件</span></div>` +
+        `<div><b>${formatRatio(processing.foundation_searchable_ratio)}</b><span>基础可搜索</span></div>` +
+        `<div><b>${processing.deep_completed_files ?? 0}/${processing.logical_total_files ?? processing.inventory_files ?? 0}</b><span>逻辑文件深析</span></div>` +
+        `<div><b>${formatRatio(processing.deep_completion_ratio)}</b><span>深析完成率</span></div>` +
+      `</div>` +
+      `<p><strong>${escapeHtml(stateText)}</strong> · 可立即处理 ${pending} · 等待重试 ${retryWaiting} · 需要处理 ${needsAttention} · 策略排除 ${processing.terminal_excluded_files || 0} · 单批最多 ${processing.batch_file_limit || 500} 个，并受工作量上限保护。</p>` +
+      `${processing.reason ? `<small class="package-processing-reason">${escapeHtml(processing.reason)}</small>` : ''}` +
+      `<div class="package-processing-actions">` +
+        `<button class="primary" data-package-action="continue" ${active || !pending ? 'disabled' : ''}>从断点继续全量</button>` +
+        `<button class="secondary" data-package-action="recall" ${active || !pending ? 'disabled' : ''}>自动召回关联文件</button>` +
+        `<button data-package-action="selection" ${active || !pending || !selectionCount ? 'disabled' : ''}>已勾选文件优先${selectionCount ? `（${selectionCount}）` : ''}</button>` +
+        `<button class="danger" data-package-action="pause" ${!active ? 'disabled' : ''}>结束本次运行</button>` +
+      `</div>` +
+      `<div class="package-priority-query"><input id="packagePriorityQuery" maxlength="1000" value="${escapeHtml(currentQuery)}" placeholder="关键词、人物、机构、编号、时间范围或自然语言研究要求"><button class="secondary" data-package-action="query" ${active || !pending ? 'disabled' : ''}>搜索并优先处理</button></div>` +
+      `<label class="package-continue-option"><input id="packageContinueFull" type="checkbox" ${keepRunning ? 'checked' : ''}><span>优先范围完成后继续处理全部剩余文件</span></label>` +
+      `<small class="package-processing-note">召回、检索和手选只改变队列顺序，不删除普通待处理文件；暂停后已完成结果永久保留。</small>` +
+    `</section>`
+  );
+  renderFileWorkflowPanel();
+}
+
+const FILE_WORKFLOW_LABELS = {
+  all: '全部文件', pending: '待处理', processing: '处理中', completed: '完成',
+  partial: '部分完成', failed: '失败', retry_waiting: '等待重试', out_of_scope: '范围外'
+};
+
+function normalizedFileStatus(item) {
+  const raw = String(item?.display_status || item?.status || item?.workflow_state || '').toLowerCase();
+  if (raw.includes('retry') || raw.includes('wait')) return 'retry_waiting';
+  if (raw.includes('fail') || raw.includes('error')) return 'failed';
+  if (raw.includes('scope') || raw.includes('unsupported') || raw.includes('excluded')) return 'out_of_scope';
+  if (raw.includes('partial') || raw.includes('incomplete')) return 'partial';
+  if (raw.includes('process') || raw.includes('running')) return 'processing';
+  if (raw.includes('complete') || raw.includes('ready') || raw.includes('evidence')) return 'completed';
+  return 'pending';
+}
+
+function fileWorkflowStatusFilter() {
+  return $('fileWorkflowFilter')?.value || state.fileWorkflowFilter || 'all';
+}
+
+function renderFileWorkflowPanel() {
+  const host = $('fileWorkflowPanel');
+  if (!host || !state.scan) return;
+  const packageView = document.querySelector('[data-view="packages"]');
+  if (packageView && host.parentElement !== packageView) packageView.appendChild(host);
+  const page = state.fileWorkflowPage || {};
+  const allItems = Array.isArray(page.items) ? page.items : [];
+  const filter = fileWorkflowStatusFilter();
+  const items = filter === 'all'
+    ? allItems
+    : allItems.filter((item) => normalizedFileStatus(item) === filter);
+  const rows = items.map((item) => {
+    const status = normalizedFileStatus(item);
+    const path = item.node_path || item.path || '';
+    const reason = item.reason || item.error || item.failure_reason || item.workflow_reason || '';
+    const retry = item.next_retry_at ? ` · 下次重试 ${item.next_retry_at}` : '';
+    const retryAction = ['failed', 'retry_waiting', 'partial'].includes(status) && item.accounting_role !== 'container_only'
+      ? `<button type="button" class="file-workflow-retry" data-file-retry="${escapeHtml(path)}" title="重新分析此文件">重试</button>`
+      : '';
+    return `<div class="file-workflow-row" data-file-status="${status}">
+      <button type="button" class="file-workflow-path" data-file-open="${escapeHtml(path)}" title="打开文件详情">${escapeHtml(path || '未命名文件')}</button>
+      <span class="file-workflow-actions"><span class="file-workflow-status status-${status}">${FILE_WORKFLOW_LABELS[status]}</span>${retryAction}</span>
+      <small>${escapeHtml(reason || `尝试 ${item.attempt_count ?? item.attempts ?? 0} 次${retry}`)}</small>
+    </div>`;
+  }).join('');
+  const total = Number(page.total ?? items.length);
+  const offset = Number(state.fileWorkflowOffset || 0);
+  host.innerHTML = `<div class="file-workflow-heading"><div><span class="section-kicker">AUDITABLE FILE QUEUE</span><h3>逐文件状态与异常</h3></div>
+    <span class="file-workflow-total">${total} 个逻辑文件</span></div>
+    <div class="file-workflow-tools"><select id="fileWorkflowFilter" aria-label="文件处理状态筛选">
+      ${Object.entries(FILE_WORKFLOW_LABELS).map(([value, label]) => `<option value="${value}" ${value === filter ? 'selected' : ''}>${label}</option>`).join('')}
+    </select><button type="button" class="secondary" data-file-workflow-refresh>刷新</button></div>
+    <div class="file-workflow-list">${rows || '<div class="file-workflow-empty">当前页没有符合筛选状态的文件；可翻页继续查看。</div>'}</div>
+    <div class="file-workflow-pagination"><button type="button" data-file-workflow-page="prev" ${offset <= 0 ? 'disabled' : ''}>上一页</button>
+      <span>${total ? `${offset + 1}-${Math.min(offset + allItems.length, total)} / ${total}` : '0 / 0'}</span>
+      <button type="button" data-file-workflow-page="next" ${offset + allItems.length >= total ? 'disabled' : ''}>下一页</button></div>`;
+  $('fileWorkflowFilter').onchange = () => {
+    state.fileWorkflowFilter = $('fileWorkflowFilter').value;
+    state.fileWorkflowOffset = 0;
+    loadFileWorkflowPage();
+  };
+}
+
+async function loadFileWorkflowPage() {
+  if (!state.scan?.scan_id) return;
+  const requestedScanId = state.scan.scan_id;
+  const requestSeq = ++state.fileWorkflowRequestSeq;
+  state.fileWorkflowAbortController?.abort();
+  const controller = new AbortController();
+  state.fileWorkflowAbortController = controller;
+  const filter = fileWorkflowStatusFilter();
+  const params = new URLSearchParams({
+    offset: String(state.fileWorkflowOffset || 0), limit: '50'
+  });
+  // Filter by the canonical presentation state. The server still accepts the
+  // old selection_state parameter for older clients, but it cannot distinguish
+  // previewed, failed, and delayed files reliably.
+  if (filter && filter !== 'all') params.set('status', filter);
+  try {
+    const page = await api(`/api/file-workflow/${encodeURIComponent(requestedScanId)}?${params}`, { signal: controller.signal });
+    if (state.scan?.scan_id !== requestedScanId || state.fileWorkflowRequestSeq !== requestSeq) return;
+    state.fileWorkflowPage = page;
+    renderFileWorkflowPanel();
+  } catch (error) {
+    if (error?.name === 'AbortError' || state.scan?.scan_id !== requestedScanId || state.fileWorkflowRequestSeq !== requestSeq) return;
+    const host = $('fileWorkflowPanel');
+    if (host) host.innerHTML = `<div class="file-workflow-empty">状态清单暂时不可用：${escapeHtml(error.message || '读取失败')}</div>`;
+  } finally {
+    if (state.fileWorkflowRequestSeq === requestSeq) state.fileWorkflowAbortController = null;
+  }
+}
+
+async function retryFileWorkflow(path, button) {
+  if (!state.scan?.scan_id || !path) return;
+  setBusy(button, true, '提交中…');
+  try {
+    const data = await api(`/api/file-workflow/${encodeURIComponent(state.scan.scan_id)}/retry`, {
+      method: 'POST', body: JSON.stringify({ path })
+    });
+    if (data.job_id) {
+      toast(`已重新加入处理队列（${data.batch_files || 0} 个文件）`);
+      await pollJob(data.job_id);
+    } else {
+      toast(data.message || '当前文件未进入队列');
+    }
+    await loadFileWorkflowPage();
+  } catch (error) {
+    toast(error.message || '文件重试失败', true);
+  } finally {
+    if (button?.isConnected) setBusy(button, false);
+  }
+}
+
+function openEvidenceSource(path, location) {
+  if (!state.scan || !path) return;
+  const node = { kind: 'file', path, name: path.split(/[\\/]/).pop(), extension: path.includes('.') ? `.${path.split('.').pop()}` : '' };
+  state.pendingEvidenceLocation = { path, location: location || {} };
+  state.selected = node;
+  if (window.SJFXShell) window.SJFXShell.activate('physical');
+  selectNode(node, document.createElement('div'));
+  const loc = location || {};
+  const note = [loc.page ? `第 ${loc.page} 页` : '', loc.section, loc.paragraph_index != null ? `第 ${Number(loc.paragraph_index) + 1} 段` : '', loc.char_start != null ? `字符 ${loc.char_start}-${loc.char_end ?? '?'}` : ''].filter(Boolean).join(' · ');
+  if (note) toast(`已打开原文位置：${note}`);
 }
 
 
 async function refreshScan(scanId = state.scan?.scan_id) {
   if (!scanId) {
     return;
+  }
+  const previousScanId = state.scan?.scan_id;
+  if (previousScanId && previousScanId !== scanId) {
+    state.fileWorkflowRequestSeq += 1;
+    state.fileWorkflowAbortController?.abort();
+    state.fileWorkflowAbortController = null;
   }
   const data =
     await api(
@@ -1887,11 +2258,19 @@ async function refreshScan(scanId = state.scan?.scan_id) {
 
   state.scan =
     data.scan;
+  if ($('rootPath') && state.scan) {
+    const resolvedRoot = state.scan.root || state.scan.root_path || state.scan.path;
+    if (resolvedRoot) $('rootPath').value = resolvedRoot;
+  }
   rememberCurrentScan(state.scan?.scan_id || scanId);
   restoreNodeSelections(state.scan?.scan_id || scanId);
 
   state.analysis =
     data.analysis;
+  state.processing = data.processing || null;
+  state.fileWorkflowPage = null;
+  state.fileWorkflowOffset = 0;
+  loadFileWorkflowPage();
   state.progressiveAnalysis = data.progressive_analysis || null;
   state.treeEdits = data.tree_edits || data.analysis?.manual_tree_edits || [];
   state.analysisTreeOriginal = data.analysis?.analysis_tree || null;
@@ -2158,7 +2537,7 @@ function renderTaskCenter() {
       + '<div class="task-list-actions">'
       + (active ? `<button type="button" class="text-button" data-job-watch="${escapeHtml(job.id)}">查看实时进度</button>` : '')
       + (canOpenResult ? `<button type="button" class="text-button" data-job-open="${escapeHtml(job.id)}">打开分析结果</button>` : '')
-      + (active ? `<button type="button" class="danger compact" data-job-cancel="${escapeHtml(job.id)}" ${cancelling ? 'disabled' : ''}>${cancelling ? '正在取消…' : (status === 'queued' ? '取消排队' : '取消任务')}</button>` : '')
+      + (active ? `<button type="button" class="danger compact" data-job-cancel="${escapeHtml(job.id)}" ${cancelling ? 'disabled' : ''}>${cancelling ? '正在暂停…' : (['scan_and_analyze', 'analyze_package'].includes(job.task_type) ? '结束本次运行' : (status === 'queued' ? '取消排队' : '取消任务'))}</button>` : '')
       + '</div></article>';
   }).join('');
 
@@ -2311,7 +2690,10 @@ function updateJobControls(job = {}) {
     const button = $(id);
     if (!button) return;
     button.disabled = !active || cancelling;
-    button.textContent = cancelling ? '正在取消…' : '取消当前任务';
+    const packageJob = ['scan_and_analyze', 'analyze_package'].includes(job.task_type);
+    button.textContent = cancelling
+      ? (packageJob ? '正在安全暂停…' : '正在取消…')
+      : (packageJob ? '结束本次运行' : '取消当前任务');
   });
   if ($('jobStatusChip')) {
     $('jobStatusChip').textContent = (status || 'idle').toUpperCase();
@@ -2351,6 +2733,45 @@ async function cancelCurrentJob() {
 }
 
 
+async function prioritizeEvidenceSource(path, button) {
+  const scanId = state.scan?.scan_id;
+  const targetPath = String(path || '').trim();
+  if (!scanId || !targetPath) return;
+  const previous = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = '正在加入…';
+  }
+  try {
+    const response = await api(
+      `/api/package-processing/${encodeURIComponent(scanId)}/resume`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          mode: 'selection',
+          target_paths: [targetPath],
+          continue_full: true,
+        })
+      }
+    );
+    state.processing = response.processing || state.processing;
+    if (!response.accepted || !response.job_id) {
+      toast(response.message || '该文件当前不需要继续深析。');
+      return;
+    }
+    toast(`已将 ${targetPath} 加入下一批优先深析。`);
+    await pollJob(response.job_id);
+  } catch (error) {
+    toast(error.message || '无法将检索结果加入深析队列', true);
+  } finally {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = previous || '优先深析';
+    }
+  }
+}
+
+
 async function openJobResult(jobId) {
   let job = state.jobs.get(String(jobId || '')) || null;
   if (!job) {
@@ -2364,6 +2785,116 @@ async function openJobResult(jobId) {
   if (window.SJFXShell) window.SJFXShell.activate(route);
   toast(route === 'analysis' ? '已恢复智能分析目录' : '已恢复原始目录');
 }
+
+
+async function runPackageProcessingAction(action, button) {
+  if (!state.scan?.scan_id) return;
+  const scanId = encodeURIComponent(state.scan.scan_id);
+  setBusy(button, true, action === 'pause' ? '正在安全暂停…' : '正在生成下一批…');
+  try {
+    if (action === 'pause') {
+      const data = await api(`/api/package-processing/${scanId}/pause`, {
+        method: 'POST', body: JSON.stringify({ reason: '用户结束本次运行' })
+      });
+      state.processing = data.processing || data.control || state.processing;
+      await refreshScan(state.scan.scan_id);
+      toast('已安全暂停：完成结果已保留，未完成文件仍在待处理池。');
+      return;
+    }
+    const payload = {
+      mode: action,
+      continue_full: $('packageContinueFull')?.checked ?? true,
+    };
+    if (action === 'query') {
+      payload.query = String($('packagePriorityQuery')?.value || '').trim();
+      if (!payload.query) throw new Error('请输入关键词或自然语言研究要求');
+    }
+    if (action === 'selection') {
+      payload.target_paths = packageSelectedPaths();
+      if (!payload.target_paths.length) throw new Error('请先在目录树中勾选文件');
+    }
+    const data = await api(`/api/package-processing/${scanId}/resume`, {
+      method: 'POST', body: JSON.stringify(payload)
+    });
+    state.processing = data.processing || state.processing;
+    if (!data.accepted || !data.job_id) {
+      updateStats();
+      toast(data.message || '当前没有符合条件的未处理文件。');
+      return;
+    }
+    toast(action === 'continue'
+      ? `已从断点生成下一批（${data.batch_files}个逻辑文件）`
+      : `已找到${data.preferred_matches || 0}个优先文件，开始处理下一批`);
+    await pollJob(data.job_id);
+  } catch (error) {
+    toast(error.message || '无法更新处理队列', true);
+  } finally {
+    if (button?.isConnected) setBusy(button, false);
+  }
+}
+
+
+document.addEventListener('click', (event) => {
+  const sourceButton = event.target.closest('[data-evidence-source]');
+  if (sourceButton) {
+    event.preventDefault();
+    let location = {};
+    try { location = JSON.parse(sourceButton.dataset.evidenceLocation || '{}'); } catch (_) { /* malformed optional location */ }
+    openEvidenceSource(sourceButton.dataset.evidenceSource, location);
+    return;
+  }
+  const prioritizeButton = event.target.closest('[data-evidence-prioritize]');
+  if (prioritizeButton) {
+    event.preventDefault();
+    if (!prioritizeButton.disabled) {
+      prioritizeEvidenceSource(
+        prioritizeButton.dataset.evidencePrioritize,
+        prioritizeButton
+      );
+    }
+    return;
+  }
+  const fileButton = event.target.closest('[data-file-open]');
+  if (fileButton) {
+    event.preventDefault();
+    openEvidenceSource(fileButton.dataset.fileOpen, {});
+    return;
+  }
+  const retryFileButton = event.target.closest('[data-file-retry]');
+  if (retryFileButton) {
+    event.preventDefault();
+    if (!retryFileButton.disabled) retryFileWorkflow(retryFileButton.dataset.fileRetry, retryFileButton);
+    return;
+  }
+  const workflowRefresh = event.target.closest('[data-file-workflow-refresh]');
+  if (workflowRefresh) {
+    event.preventDefault();
+    loadFileWorkflowPage();
+    return;
+  }
+  const workflowPage = event.target.closest('[data-file-workflow-page]');
+  if (workflowPage && !workflowPage.disabled) {
+    event.preventDefault();
+    const page = state.fileWorkflowPage || {};
+    const size = Array.isArray(page.items) && page.items.length ? page.items.length : 50;
+    state.fileWorkflowOffset = Math.max(0, Number(state.fileWorkflowOffset || 0) + (workflowPage.dataset.fileWorkflowPage === 'next' ? size : -size));
+    loadFileWorkflowPage();
+    return;
+  }
+  const button = event.target.closest('[data-package-action]');
+  if (!button) return;
+  event.preventDefault();
+  if (button.disabled) return;
+  runPackageProcessingAction(button.dataset.packageAction, button);
+});
+
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' || event.target?.id !== 'packagePriorityQuery') return;
+  event.preventDefault();
+  const button = document.querySelector('[data-package-action="query"]');
+  if (button && !button.disabled) runPackageProcessingAction('query', button);
+});
 
 
 document.addEventListener('click', (event) => {
@@ -2666,6 +3197,18 @@ $('scanBtn').onclick =
     const btn =
       $('scanBtn');
 
+    // Detach the previous package before a new import starts.  This keeps the
+    // shell, overview, translation and relationship modules from presenting
+    // stale results while the new inventory is being built.
+    forgetCurrentScan();
+    state.fileWorkflowRequestSeq += 1;
+    state.fileWorkflowAbortController?.abort();
+    state.fileWorkflowAbortController = null;
+    if ($('scanStats')) {
+      $('scanStats').className = 'stats empty';
+      $('scanStats').textContent = '正在导入新的数据包…';
+    }
+
     setBusy(
       btn,
       true,
@@ -2690,13 +3233,17 @@ $('scanBtn').onclick =
     // A new scan starts a new UI session; clear selections from the prior package.
     state.scan = null;
     state.analysis = null;
+    state.processing = null;
     state.progressiveAnalysis = null;
     state.progressiveRefreshKey = null;
     state.summary = null;
     state.summaries = new Map();
     state.selected = null;
+    state.retrievalScope = 'package';
+    state.pendingEvidenceLocation = null;
     state.selectedNodes = new Map();
     state.activeTree = 'physical';
+    if ($('workspaceName')) $('workspaceName').textContent = '尚未导入数据包';
     $('tree').className = 'tree';
     renderInitialPhysicalTree($('rootPath').value);
     $('analysisTreeBtn').classList.remove('active');
@@ -2707,6 +3254,7 @@ $('scanBtn').onclick =
     $('retrievalBtn').disabled = true;
     if ($('numericQuestionBtn')) $('numericQuestionBtn').disabled = true;
     updateSelectionCart();
+    renderEvidenceScopeControl();
 
     try {
       const data =
@@ -2719,8 +3267,10 @@ $('scanBtn').onclick =
               path:
                 $('rootPath').value,
 
-              parse_mode:
-                $('parseMode').value
+              // The public workflow is a single Smart Parse action.  The
+              // backend performs per-file routing; keep the hidden control for
+              // backwards compatibility with older saved sessions.
+              parse_mode: 'auto'
             })
           }
         );
@@ -2780,8 +3330,7 @@ $('reanalyzeBtn').onclick =
               scan_id:
                 state.scan.scan_id,
 
-              parse_mode:
-                $('parseMode').value
+              parse_mode: 'auto'
             })
           }
         );
@@ -2951,6 +3500,22 @@ $('testBtn').onclick =
     }
   };
 
+
+$('evidenceScopeAllBtn').onclick = () => {
+  state.retrievalScope = 'package';
+  state.lastRetrievalId = null;
+  renderEvidenceScopeControl();
+};
+$('evidenceScopeSelectionBtn').onclick = () => {
+  if (!state.selected || (!state.selected.path && !state.selected.node_id)) {
+    toast('请先从资料目录选择一个文件、目录或主题', true);
+    return;
+  }
+  state.retrievalScope = 'selection';
+  state.lastRetrievalId = null;
+  renderEvidenceScopeControl();
+};
+renderEvidenceScopeControl();
 
 /*
  * ============================================================
@@ -3256,6 +3821,42 @@ $('exportBtn').onclick =
   };
 
 
+function selectedRetrievalScope() {
+  const selected = state.selected;
+  const canUseSelection = Boolean(selected && (selected.path || selected.node_id));
+  if (state.retrievalScope !== 'selection' || !canUseSelection) {
+    return { mode: 'package', path: '.', label: '整个数据包', selected: null };
+  }
+  return {
+    mode: 'selection',
+    path: selected.path || '.',
+    nodeId: selected.kind === 'group' && selected.node_id ? selected.node_id : null,
+    label: selected.name || selected.path || '当前选择',
+    selected
+  };
+}
+
+function renderEvidenceScopeControl() {
+  const chip = $('evidenceScopeChip');
+  const all = $('evidenceScopeAllBtn');
+  const selection = $('evidenceScopeSelectionBtn');
+  if (!chip || !all || !selection) return;
+  const scope = selectedRetrievalScope();
+  const canUseSelection = Boolean(state.selected && (state.selected.path || state.selected.node_id));
+  chip.textContent = scope.mode === 'selection' ? `当前选择 · ${scope.label}` : '整个数据包';
+  all.classList.toggle('is-active', scope.mode === 'package');
+  selection.classList.toggle('is-active', scope.mode === 'selection');
+  selection.disabled = !canUseSelection;
+  selection.title = canUseSelection ? `限定到：${state.selected.name || state.selected.path}` : '请先从资料目录选择一个文件、目录或主题';
+}
+
+function applyRetrievalScope(payload) {
+  const scope = selectedRetrievalScope();
+  payload.path = scope.path;
+  if (scope.nodeId) payload.node_id = scope.nodeId;
+  return scope;
+}
+
 /*
  * ============================================================
  * 本地 RAG
@@ -3303,11 +3904,6 @@ $('retrievalBtn').onclick =
         query:
           query,
 
-        path:
-          state.selected
-            ?.path
-          || '.',
-
         top_k:
           12,
 
@@ -3315,20 +3911,7 @@ $('retrievalBtn').onclick =
           state.lastRetrievalId
       };
 
-      /*
-       * 当前选中的是主题节点。
-       */
-      if (
-        state.selected
-          ?.kind
-          === 'group'
-        &&
-        state.selected
-          ?.node_id
-      ) {
-        payload.node_id =
-          state.selected.node_id;
-      }
+      const requestedScope = applyRetrievalScope(payload);
 
       const data =
         await api(
@@ -3353,18 +3936,7 @@ $('retrievalBtn').onclick =
       $('summary').className =
         'summary';
 
-      const scopeLabel =
-        result.node_name
-        ||
-        (
-          state.selected
-            ?.kind
-            === 'group'
-
-            ? state.selected.name
-
-            : result.scope
-        );
+      const scopeLabel = result.node_name || requestedScope.label || result.scope;
 
       $('summary').innerHTML =
         `<div class="summary-kicker">本地混合检索 RAG</div>`
@@ -3395,6 +3967,8 @@ $('retrievalBtn').onclick =
         } 个证据块。`
         +
         `</p>`
+        +
+        retrievalStatusHtml(result)
         +
         evidenceHtml(
           result.results
@@ -3456,9 +4030,9 @@ $('numericQuestionBtn').onclick =
       const payload = {
         scan_id: state.scan.scan_id,
         question,
-        path: state.selected?.path || '.'
+        path: '.'
       };
-      if (state.selected?.node_id) payload.node_id = state.selected.node_id;
+      applyRetrievalScope(payload);
       const data = await api('/api/ask', {
         method: 'POST',
         body: JSON.stringify(payload)
@@ -3487,6 +4061,20 @@ $('numericQuestionBtn').onclick =
     }
   };
 
+
+// Present one user-facing Smart Parse action while retaining the legacy
+// hidden select so old state hydration remains compatible.
+const smartParseBox = document.querySelector('.parse-mode-box');
+if (smartParseBox && !smartParseBox.querySelector('.smart-parse-choice')) {
+  const label = smartParseBox.querySelector('label');
+  if (label) label.textContent = '解析方式';
+  const choice = document.createElement('div');
+  choice.className = 'smart-parse-choice';
+  choice.innerHTML = '<span class="status-dot"></span><b>智能解析（自动分流）</b><small>系统会按文件类型、文本层、版面复杂度和 OCR 置信度自动选择快速或高精度解析。</small>';
+  smartParseBox.appendChild(choice);
+  const help = $('parseModeHelp');
+  if (help) help.textContent = '普通文件优先快速解析；扫描件、复杂版面和低置信度文件自动进入高精度队列。';
+}
 
 $('parseMode').onchange =
   () => {

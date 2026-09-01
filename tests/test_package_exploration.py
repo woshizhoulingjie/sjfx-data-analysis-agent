@@ -213,6 +213,7 @@ class PackageExplorationTests(unittest.TestCase):
             self.assertEqual(
                 decisions[duplicate_path]["reasons"], ["exact_duplicate_non_primary"]
             )
+            self.assertFalse(decisions[duplicate_path]["promotion_allowed"])
             self.assertNotIn(duplicate_path, content_map["representative_paths"])
 
     def test_content_map_is_diverse_bounded_and_promotable(self):
