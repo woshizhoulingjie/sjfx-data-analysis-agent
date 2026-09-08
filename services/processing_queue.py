@@ -66,7 +66,16 @@ def deep_processing_eligible(workflow_state, analysis_state=None, now=None):
     analysis_state = analysis_state or {}
     now = time.time() if now is None else float(now)
     if str(analysis_state.get("status") or "") == "completed":
-        return False
+        # The first import pass marks parser/evidence work as completed, but it
+        # is still only the searchable light layer. Such files must remain
+        # promotable until a model-backed deep summary is durable.
+        light_only = (
+            str(workflow_state.get("priority_source") or "") == "preprocessing_light"
+            and str(workflow_state.get("light_index_status") or "") == "ready"
+            and str(workflow_state.get("selection_state") or "") != "excluded"
+        )
+        if not light_only:
+            return False
     if str(analysis_state.get("status") or "") == "needs_attention":
         return False
     if not bool(workflow_state.get("promotion_allowed", True)):

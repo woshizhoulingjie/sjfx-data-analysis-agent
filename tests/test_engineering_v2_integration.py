@@ -492,6 +492,15 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
 
     def test_async_conversation_turn_api_persists_and_can_cancel(self):
         scan_id, _scan = self._save_scan_with_files(["contract.txt"])
+        # A turn now requires some durable retrieval material.  Seed one
+        # evidence record so this test stays focused on turn creation and
+        # cancellation rather than the index-readiness precondition.
+        self.storage.replace_evidence_index(scan_id, [{
+            "evidence_id": "contract-evidence-1",
+            "source_path": "contract.txt",
+            "label": "paragraph",
+            "text": "Contract evidence for the asynchronous turn.",
+        }])
         owner = self.app_module.Config.OWNER_ID
         session = self.app_module.conversation_engine.new_session(
             scan_id, scope=self.app_module.ConversationScope("package"), title="合同分析"
@@ -555,10 +564,15 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
             response, status = self.app_module.create_conversation_turn(
                 session.session_id
             )
-        self.assertEqual(status, 409)
-        self.assertEqual(
-            response.get_json()["code"], "search_index_rebuild_required"
-        )
+        # Persisted documents are usable with partial coverage even before a
+        # complete evidence index has been rebuilt.  This is important for
+        # historical scans whose source directory no longer exists.
+        self.assertEqual(status, 202)
+        turn_payload = response.get_json()
+        self.assertEqual(turn_payload["coverage_mode"], "partial")
+        self.assertFalse(turn_payload["search_index"]["ready"])
+        # The explicit rebuild path below must not be queued behind this turn.
+        self.storage.cancel_job(turn_payload["job_id"])
 
         with self.app_module.app.test_request_context(
             "/api/scans/{}/rebuild-search-index".format(scan_id),

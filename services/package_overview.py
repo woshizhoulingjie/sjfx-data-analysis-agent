@@ -135,6 +135,20 @@ def _unique_labels(values, limit=64):
     return output
 
 
+def _credible_person_label(value):
+    """Reject sentence fragments misclassified as people by preview regexes."""
+    item = _label(value, 120)
+    if not item or any(char in item for char in ".,:;!?[]{}()=/"):
+        return False
+    words = item.split()
+    if len(words) == 1:
+        return bool(re.fullmatch(r"[\u4e00-\u9fff]{2,8}", item))
+    if not 2 <= len(words) <= 4:
+        return False
+    common = {"the", "this", "that", "das", "las", "los", "versiones", "affected", "allows", "vulnerability"}
+    return all(word[:1].isupper() for word in words) and not any(word.casefold() in common for word in words)
+
+
 def _extension(source, path):
     extension = str((source or {}).get("extension") or "").strip().lower()
     if extension in {"[无扩展名]", "[no-extension]", "[none]"}:
@@ -646,10 +660,12 @@ class PackageOverviewAggregator:
                     kind = str(entity.get("type") or entity.get("category") or "").casefold()
                     name = _label(entity.get("name") or entity.get("text") or entity.get("label"))
                     if name and kind in person_keys:
-                        people.append(name)
+                        if _credible_person_label(name):
+                            people.append(name)
                     elif name and kind in organization_keys:
                         organizations.append(name)
-        return _unique_labels(people, 128), _unique_labels(organizations, 128)
+        people = [value for value in _unique_labels(people, 128) if _credible_person_label(value)]
+        return people, _unique_labels(organizations, 128)
 
     def _ingest_relationship(self, relation, default_source=None):
         if not isinstance(relation, dict):

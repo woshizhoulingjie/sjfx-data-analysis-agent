@@ -6,28 +6,13 @@
   const $ = (id) => document.getElementById(id);
   const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-  function token(value) {
-    value = String(value || '').trim();
-    return /^[\x21-\x7e]+$/.test(value) ? value : '';
-  }
-
   async function api(url, options) {
     options = options || {};
     const headers = Object.assign({'Content-Type': 'application/json'}, options.headers || {});
-    let credential = token(window.sessionStorage.getItem('sjfx_api_token'));
-    if (credential) headers['X-SJFX-Token'] = credential;
-    let response = await window.fetch(url, Object.assign({}, options, {headers}));
-    if (response.status === 401) {
-      credential = token(window.prompt('请输入 SJFX API Token', '') || '');
-      if (credential) {
-        window.sessionStorage.setItem('sjfx_api_token', credential);
-        headers['X-SJFX-Token'] = credential;
-        response = await window.fetch(url, Object.assign({}, options, {headers}));
-      }
-    }
+    const response = await window.SJFXAuth.request(url, Object.assign({}, options, {headers}));
     let body = {};
     try { body = await response.json(); } catch (_) {}
-    if (!response.ok || !body.ok) throw new Error(body.error || `请求失败（HTTP ${response.status}）`);
+    if (!response.ok || !body.ok) throw new Error(body.error || `\u8bf7\u6c42\u5931\u8d25\uff08HTTP ${response.status}\uff09`);
     return body;
   }
 
@@ -49,7 +34,7 @@
     // Clear every result mount immediately when the active package changes.
     // Otherwise the previous package remains visible while the new request is
     // in flight, which is especially misleading for the ledger and relations.
-    ['homogeneousMetrics', 'homogeneousSchema', 'homogeneousLedger', 'homogeneousCases', 'homogeneousRelations', 'homogeneousAnomalies'].forEach((id) => {
+    ['homogeneousMetrics', 'homogeneousSchema', 'homogeneousLedger', 'homogeneousCases', 'homogeneousRelations', 'homogeneousAnomalies', 'homogeneousEntities', 'homogeneousCommunication'].forEach((id) => {
       const node = $(id);
       if (node) node.innerHTML = '';
     });
@@ -70,6 +55,8 @@
       : '<tr><td colspan="6">尚无分析结果</td></tr>';
     if ($('homogeneousSchema')) $('homogeneousSchema').innerHTML = scanId ? '<div class="homogeneous-empty">正在读取公共字段…</div>' : '<div class="homogeneous-empty">导入后显示公共字段覆盖率。</div>';
     if ($('homogeneousCases')) $('homogeneousCases').innerHTML = '<div class="homogeneous-empty">尚未生成事项线程。</div>';
+    if ($('homogeneousEntities')) $('homogeneousEntities').innerHTML = '<div class="homogeneous-empty">尚未识别实体。</div>';
+    if ($('homogeneousCommunication')) $('homogeneousCommunication').innerHTML = '<div class="homogeneous-empty">尚未生成通邮统计。</div>';
     if ($('homogeneousRelations')) $('homogeneousRelations').innerHTML = '<div class="homogeneous-empty">尚未识别文件关系。</div>';
     if ($('homogeneousAnomalies')) $('homogeneousAnomalies').innerHTML = '<div class="homogeneous-empty">尚未发现需要核对的项目。</div>';
   }
@@ -97,13 +84,14 @@
   function metricsMarkup(metrics) {
     const integrity = (state.data && state.data.summary && state.data.summary.integrity) || {};
     const items = [
-      ['结构化文件', metrics.document_count || 0],
-      ['文件关系', metrics.relationship_count || 0],
+      ['分析文件', metrics.document_count || 0],
+      ['邮件关系', metrics.relationship_count || 0],
       ['事项线程', metrics.case_count || 0],
-      ['待核对项', metrics.anomaly_count || 0],
-      ['关系证据覆盖', `${Math.round(Number(metrics.relation_evidence_coverage || 0) * 100)}%`],
+      ['重点实体', metrics.unique_entity_count || 0],
+      ['通邮组合', metrics.communication_pair_count || 0],
+      ['附件', metrics.attachment_count || 0],
       ['待确认关系', integrity.relation_candidate_count || 0],
-      ['截断文件', integrity.text_truncated_files || 0],
+      ['待核对项', metrics.anomaly_count || 0],
     ];
     return items.map(([label, value]) => `<div class="homogeneous-metric"><span>${esc(label)}</span><b>${esc(value)}</b></div>`).join('');
   }
@@ -115,8 +103,36 @@
       return `<div class="homogeneous-schema-row"><span>${esc(field.label)}</span><span class="homogeneous-schema-track"><i style="width:${percent}%"></i></span><b>${percent}%</b></div>`;
     }).join('')}</div>` : '<div class="homogeneous-empty">没有识别到公共字段。</div>';
     const badge = $('homogeneousEligibility');
-    badge.textContent = summary.eligible ? '可用于关联' : '结构不足';
-    badge.dataset.status = summary.eligible ? 'completed' : 'failed';
+    const relationEligible = summary.relation_eligible !== undefined ? summary.relation_eligible : summary.eligible;
+    badge.textContent = relationEligible ? '可分析' : '等待信号';
+    badge.dataset.status = relationEligible ? 'completed' : 'failed';
+    const note = summary.structured_eligible !== false
+      ? '结构化字段充足，已启用结构与邮件关系双通道。'
+      : '公共字段不足，但邮件头、正文和实体仍可用于关系挖掘。';
+    $('homogeneousSchema').insertAdjacentHTML('afterbegin', `<p class="homogeneous-schema-note">${esc(note)}</p>`);
+  }
+
+  function renderEntities(items) {
+    const host = $('homogeneousEntities');
+    if (!host) return;
+    if (!items.length) {
+      host.innerHTML = '<div class="homogeneous-empty">没有识别到可聚合实体。</div>';
+      return;
+    }
+    const labels = {email: '邮箱', phone: '电话', ip: 'IP', identifier: '编号', url: '网址'};
+    host.innerHTML = `<div class="homogeneous-signal-list">${items.slice(0, 12).map((item) => `
+      <div class="homogeneous-signal-row"><div><b>${esc(labels[item.kind] || item.kind)}</b><button type="button" class="homogeneous-signal-value" data-record-path="${esc((item.sample_paths || [])[0] || '')}">${esc(item.value || item.key)}</button></div><span>${esc(item.mention_count || 0)} 封</span></div>`).join('')}</div>`;
+  }
+
+  function renderCommunication(items) {
+    const host = $('homogeneousCommunication');
+    if (!host) return;
+    if (!items.length) {
+      host.innerHTML = '<div class="homogeneous-empty">没有识别到完整的发件方和收件方。</div>';
+      return;
+    }
+    host.innerHTML = `<div class="homogeneous-signal-list">${items.slice(0, 10).map((item) => `
+      <div class="homogeneous-signal-row"><div><b>${esc(item.sender)}</b><span class="homogeneous-arrow">→</span><b>${esc(item.recipient)}</b><small>${esc(item.first_date || '日期不明')} 至 ${esc(item.last_date || '日期不明')}</small></div><strong>${esc(item.message_count || 0)} 次</strong></div>`).join('')}</div>`;
   }
 
   function renderLedger(page) {
@@ -141,7 +157,9 @@
       const fields = record.fields || {};
       const relationCount = relationCounts.get(record.path) || 0;
       const anomaly = anomalyByPath.get(record.path);
-      const understanding = record.content_understanding || {};
+        const understanding = record.content_understanding || {};
+        const attachments = Array.isArray(record.attachments) ? record.attachments : [];
+        const translation = record.analysis_translation || {};
       const role = understanding.document_role_label || '';
       const meaning = [
         role ? `<span class="homogeneous-role-badge">${esc(role)}</span>` : '',
@@ -188,6 +206,8 @@
     const summary = analysis.summary || {};
     $('homogeneousMetrics').innerHTML = metricsMarkup(summary.metrics || {});
     renderSchema(summary);
+    renderEntities(analysis.entity_statistics || []);
+    renderCommunication(analysis.communication_statistics || []);
     renderLedger(analysis.records || {items: [], total: 0, offset: 0});
     renderCases(analysis.cases || []);
     renderRelations(analysis.relations || []);
@@ -267,7 +287,7 @@
     const button = $('homogeneousAnalyzeBtn');
     button.disabled = true;
     setLoading(true);
-    setMessage('正在提交同构文件关联任务…', 'running');
+    setMessage('正在提交邮件内容与关系挖掘任务…', 'running');
     try {
       const response = await api(`/api/homogeneous-analysis/${encodeURIComponent(state.scanId)}`, {method: 'POST', body: '{}'});
       watchJob(response.job_id);
@@ -297,16 +317,32 @@
       const response = await api(`/api/homogeneous-record/${encodeURIComponent(requestedScanId)}?path=${encodeURIComponent(path)}`);
       if (state.scanId !== requestedScanId || state.requestToken !== requestToken) return;
       const record = response.record || {}, fields = record.fields || {}, evidence = record.field_evidence || {};
-      const labels = {document_number:'文件编号',date:'日期',sender:'发件方',recipient:'收件方',subject:'主题事项',matter_id:'事项编号',deadline:'回复期限',signer:'签发人',message_id:'邮件标识',in_reply_to:'回复邮件标识'};
+      const labels = {document_number:'文件编号',date:'日期',sender:'发件方',recipient:'收件方',subject:'主题事项',matter_id:'事项编号',deadline:'回复期限',signer:'签发人',message_id:'邮件标识',in_reply_to:'回复邮件标识',cc:'抄送人',bcc:'密送人',reply_to:'回复地址',references_header:'邮件引用链'};
       const custom = record.custom_fields || {}, customEvidence = record.custom_field_evidence || {};
       const understanding = record.content_understanding || {};
+      const legacySupports = Array.isArray(understanding.evidence_units) ? understanding.evidence_units : [];
+      const conclusions = Array.isArray(understanding.conclusions) && understanding.conclusions.length
+        ? understanding.conclusions
+        : (Array.isArray(understanding.key_conclusions) ? understanding.key_conclusions : []).map((text, index) => ({
+          conclusion_id: `LEGACY-${index}`,
+          type: '事实',
+          text,
+          support_level: 'direct',
+          support_label: '原有结果',
+          supports: legacySupports[index] ? [{text: legacySupports[index], source: 'body', locator: '正文'}] : [],
+        }));
+      const attachments = Array.isArray(record.attachments) ? record.attachments : [];
+      const translation = record.analysis_translation || {};
       const listMarkup = (items) => (Array.isArray(items) && items.length)
         ? `<ul class="homogeneous-understanding-list">${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>`
         : '<span class="muted">未从正文识别</span>';
       const truncation = record.text_truncated
         ? `<div class="homogeneous-integrity-warning">正文已截断：已扫描 ${esc(record.scanned_char_count || 0)} / ${esc(record.source_char_count || 0)} 字符，引用关系可能不完整。</div>`
         : '';
-      host.innerHTML = `<button class="homogeneous-detail-close">关闭</button><span class="section-kicker">DOCUMENT DETAIL</span><h2>${esc(record.name || path)}</h2><small>${esc(path)}</small>${truncation}<p>${esc(record.summary)}</p><section class="homogeneous-understanding"><h3>内容理解</h3><dl class="homogeneous-detail-grid"><dt>文件角色</dt><dd>${esc(understanding.document_role_label || '未识别')}</dd><dt>文件意图</dt><dd>${esc(understanding.intent || '未识别')}</dd><dt>请求动作</dt><dd>${esc(understanding.requested_action || '无明确请求')}</dd><dt>是否需要回复</dt><dd>${understanding.response_requested ? '是' : '未识别为需要回复'}</dd><dt>关键事实</dt><dd>${listMarkup(understanding.key_facts)}</dd><dt>主要结论</dt><dd>${listMarkup(understanding.key_conclusions)}</dd></dl><h4>正文证据</h4>${listMarkup(understanding.evidence_units)}</section><dl class="homogeneous-detail-grid">${Object.keys(labels).map((key) => `<dt>${labels[key]}</dt><dd>${esc(fields[key] || '—')}</dd>`).join('')}${Object.keys(custom).map((key) => `<dt>${esc(key)}</dt><dd>${esc(custom[key])}</dd>`).join('')}</dl><h3>字段原文依据</h3>${Object.keys(evidence).length || Object.keys(customEvidence).length ? Object.keys(evidence).map((key) => `<div class="homogeneous-evidence"><b>${esc(labels[key] || key)}</b><br>${esc(evidence[key])}</div>`).concat(Object.keys(customEvidence).map((key) => `<div class="homogeneous-evidence"><b>${esc(key)}</b><br>${esc(customEvidence[key])}</div>`)).join('') : '<p class="muted">暂无字段位置证据。</p>'}<h3>上下游关系</h3>${(response.relations || []).length ? (response.relations || []).map((item) => `<div class="homogeneous-relation"><b>${esc(item.relation_label)} · ${Math.round(Number(item.confidence || 0) * 100)}% <span class="homogeneous-relation-status">${esc(item.relation_status === 'validated' ? '已确认' : item.relation_status === 'candidate' ? '待确认' : '推断')}</span></b><small>${esc(item.source_path)} → ${esc(item.target_path)}<br>${esc((item.reasons || []).join('；'))}${item.evidence ? `<br>证据：${esc(item.evidence)}` : ''}</small></div>`).join('') : '<p class="muted">尚未识别关联文件。</p>'}`;
+      const attachmentMarkup = attachments.length ? `<h3>附件</h3><ul class="homogeneous-attachment-list">${attachments.map((item) => `<li><b>${esc(item.name || '未命名附件')}</b><small>${esc(item.type || '未知类型')}${item.text_available ? ' · 已提取文本' : ''}</small></li>`).join('')}</ul>` : '';
+      const translationMarkup = translation && (translation.status || translation.source_language) ? `<h3>翻译状态</h3><p class="homogeneous-translation-note">${esc(translation.source_language || '未知语言')} → ${esc(translation.target_language || 'zh-CN')} · ${esc(translation.status || '未请求')} · 原文已保留</p>` : '';
+      const conclusionMarkup = conclusions.length ? `<section class="homogeneous-conclusions"><div class="homogeneous-section-title"><h3>文件结论</h3><small>结论均来自本文件原文</small></div>${conclusions.map((item) => `<article class="homogeneous-conclusion" data-support-level="${esc(item.support_level || 'direct')}"><div class="homogeneous-conclusion-head"><span class="homogeneous-conclusion-type">${esc(item.type || '结论')}</span><span class="homogeneous-conclusion-level">${esc(item.support_label || '直接支撑')}</span></div><p>${esc(item.text || '')}</p><div class="homogeneous-support-label">原文支撑</div>${(item.supports || []).map((support) => `<blockquote class="homogeneous-support"><span>“${esc(support.text || '')}”</span><small>${esc(support.source === 'body' ? '正文' : support.source || '原文')} · ${esc(support.locator || '原文')}</small></blockquote>`).join('')}</article>`).join('')}</section>` : '<section class="homogeneous-conclusions"><div class="homogeneous-section-title"><h3>文件结论</h3></div><p class="muted">未从正文识别出带有明确原文支撑的结论。</p></section>';
+      host.innerHTML = `<button class="homogeneous-detail-close">关闭</button><span class="section-kicker">MAIL / LETTER DETAIL</span><h2>${esc(record.name || path)}</h2><small>${esc(path)}</small>${truncation}<p>${esc(record.summary)}</p>${conclusionMarkup}${translationMarkup}${attachmentMarkup}<section class="homogeneous-understanding"><h3>内容概览</h3><dl class="homogeneous-detail-grid"><dt>文件角色</dt><dd>${esc(understanding.document_role_label || '未识别')}</dd><dt>文件意图</dt><dd>${esc(understanding.intent || '未识别')}</dd><dt>请求动作</dt><dd>${esc(understanding.requested_action || '无明确请求')}</dd><dt>是否需要回复</dt><dd>${understanding.response_requested ? '是' : '未识别为需要回复'}</dd></dl></section><dl class="homogeneous-detail-grid">${Object.keys(labels).map((key) => `<dt>${labels[key]}</dt><dd>${esc(fields[key] || '—')}</dd>`).join('')}${Object.keys(custom).map((key) => `<dt>${esc(key)}</dt><dd>${esc(custom[key])}</dd>`).join('')}</dl><h3>字段原文依据</h3>${Object.keys(evidence).length || Object.keys(customEvidence).length ? Object.keys(evidence).map((key) => `<div class="homogeneous-evidence"><b>${esc(labels[key] || key)}</b><br>${esc(evidence[key])}</div>`).concat(Object.keys(customEvidence).map((key) => `<div class="homogeneous-evidence"><b>${esc(key)}</b><br>${esc(customEvidence[key])}</div>`)).join('') : '<p class="muted">暂无字段位置证据。</p>'}<h3>上下游关系</h3>${(response.relations || []).length ? (response.relations || []).map((item) => `<div class="homogeneous-relation"><b>${esc(item.relation_label)} · ${Math.round(Number(item.confidence || 0) * 100)}% <span class="homogeneous-relation-status">${esc(item.relation_status === 'validated' ? '已确认' : item.relation_status === 'candidate' ? '待确认' : '推断')}</span></b><small>${esc(item.source_path)} → ${esc(item.target_path)}<br>${esc((item.reasons || []).join('；'))}${item.evidence ? `<br>关系依据：${esc(item.evidence)}` : ''}</small></div>`).join('') : '<p class="muted">尚未识别关联文件。</p>'}`;
       host.querySelector('.homogeneous-detail-close')?.focus();
     } catch (error) {
       if (state.scanId === requestedScanId && state.requestToken === requestToken) host.innerHTML = `<button class="homogeneous-detail-close">关闭</button><p>${esc(error.message || '读取失败')}</p>`;
@@ -338,10 +374,16 @@
     $('homogeneousPrevBtn').addEventListener('click', () => load(Math.max(0, state.offset - PAGE_SIZE)));
     $('homogeneousNextBtn').addEventListener('click', () => load(state.offset + PAGE_SIZE));
     $('homogeneousLedger').addEventListener('click', (event) => { const row = event.target.closest('[data-record-path]'); if (row) openRecord(row.dataset.recordPath); });
-    $('homogeneousLedger').addEventListener('keydown', (event) => {
+      $('homogeneousLedger').addEventListener('keydown', (event) => {
       const row = event.target.closest('[data-record-path]');
       if (row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); openRecord(row.dataset.recordPath); }
-    });
+      });
+      ['homogeneousEntities', 'homogeneousCommunication'].forEach((id) => {
+        $(id)?.addEventListener('click', (event) => {
+          const item = event.target.closest('[data-record-path]');
+          if (item?.dataset.recordPath) openRecord(item.dataset.recordPath);
+        });
+      });
     $('homogeneousCases').addEventListener('click', (event) => { const button = event.target.closest('[data-case-id]'); if (button) { state.selectedCase = button.dataset.caseId; renderCases((state.data && state.data.cases) || []); } });
     $('homogeneousRelations').addEventListener('click', (event) => { const item = event.target.closest('[data-record-path]'); if (item) openRecord(item.dataset.recordPath); });
     $('homogeneousAnomalies').addEventListener('click', (event) => { const item = event.target.closest('[data-record-path]'); if (item) openRecord(item.dataset.recordPath); });

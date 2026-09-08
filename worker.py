@@ -7,6 +7,7 @@ claiming safe even if an operator accidentally starts a second Worker.
 
 import errno
 import ctypes
+import json
 import logging
 import logging.handlers
 import multiprocessing
@@ -104,9 +105,15 @@ def _finish_conversation_turn_after_worker_failure(job, status, error=None):
 def _background_resource_state(job):
     """Gate only optional coverage expansion; foreground work always proceeds."""
     options = job.get("options") or {}
+    background_sources = {
+        "background_backfill",
+        "idle_deep_backfill",
+        "idle_deep_model_summary",
+        "deep_node_rebuild",
+    }
     if not (
-        job.get("task_type") == "analyze_package"
-        and options.get("workflow_source") == "background_backfill"
+        options.get("workflow_source") in background_sources
+        and job.get("task_type") in {"analyze_package", "generate_summary"}
     ):
         return True, []
     reasons = []
@@ -383,6 +390,11 @@ def execute_supervised(job):
                 process.join(timeout=min(2.0, Config.WORKER_TERMINATE_GRACE_SECONDS))
                 _stop_process(process)
                 raise JobCancelled("任务已按用户请求终止")
+            source = str((job.get("options") or {}).get("workflow_source") or "")
+            if source in {"idle_deep_model_summary", "deep_node_rebuild"} and storage.has_queued_job_above_priority(job.get("priority") or 10):
+                _stop_process(process)
+                return {"_defer_slice": True, "_defer_seconds": 2,
+                        "_defer_message": "深度摘要已让位于前台任务，已完成的模型分块已保存。"}
             now = time.monotonic()
             if now >= next_heartbeat:
                 storage.heartbeat_job(job["id"], WORKER_ID)
@@ -497,6 +509,46 @@ def _acquire_worker_lock():
         raise
 
 
+def _resume_strict_imports():
+    """Reconcile resumable selected-file imports after a Worker restart."""
+    with storage._connect() as conn:
+        rows = conn.execute(
+            "SELECT scan_id,status,checkpoint,owner_id FROM import_tasks "
+            "WHERE status IN ('preliminary_overview','deep_summarizing_files',"
+            "'deep_summarizing_nodes','deep_update_available')"
+        ).fetchall()
+    if not rows:
+        return 0
+    from app import _mark_deep_update_available, _queue_deep_node_rebuilds, _queue_idle_deep_backfill
+    resumed = 0
+    for row in rows:
+        task = dict(row)
+        try:
+            checkpoint = json.loads(task.get("checkpoint") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            checkpoint = {}
+        if not checkpoint.get("selected_paths") or checkpoint.get("large_selection"):
+            continue
+        scan_id, owner_id = str(task["scan_id"]), str(task.get("owner_id") or "legacy")
+        try:
+            if task.get("status") == "preliminary_overview":
+                report_id = str(checkpoint.get("preliminary_overview_job_id") or "")
+                report = storage.get_job(report_id) if report_id else None
+                if not report or report.get("status") != "completed":
+                    continue
+                storage.transition_import_task(
+                    scan_id, "deep_summarizing_files", checkpoint=checkpoint,
+                    reason="Worker 恢复后继续低优先级深度摘要。",
+                )
+            _queue_idle_deep_backfill(scan_id, owner_id)
+            _queue_deep_node_rebuilds(scan_id, owner_id)
+            _mark_deep_update_available(scan_id)
+            resumed += 1
+        except Exception:
+            logger.warning("恢复严格导入状态机失败 scan_id=%s", scan_id, exc_info=True)
+    return resumed
+
+
 def run_forever():
     ensure_runtime_directories()
     _configure_worker_logging()
@@ -504,10 +556,13 @@ def run_forever():
     lock_handle = _acquire_worker_lock()
     recovered = storage.recover_orphaned_jobs_after_lock()
     reconciled_turns = storage.reconcile_conversation_turn_jobs()
+    resumed_imports = _resume_strict_imports()
     if recovered:
         logger.warning("Worker startup recovered %s orphaned task(s)", recovered)
     if reconciled_turns:
         logger.warning("Worker startup reconciled %s conversation turn(s)", reconciled_turns)
+    if resumed_imports:
+        logger.info("Worker startup resumed %s strict import task(s)", resumed_imports)
     try:
         storage.checkpoint_wal(force=True)
     except Exception:
@@ -555,12 +610,15 @@ def run_forever():
                 try:
                     recovered = storage.recover_stale_jobs(Config.WORKER_STALE_SECONDS)
                     reconciled_turns = storage.reconcile_conversation_turn_jobs()
+                    resumed_imports = _resume_strict_imports()
                     if recovered:
                         logger.warning("Worker recovered %s stale task(s)", recovered)
                     if reconciled_turns:
                         logger.warning(
                             "Worker reconciled %s conversation turn(s)", reconciled_turns
                         )
+                    if resumed_imports:
+                        logger.info("Worker resumed %s strict import task(s)", resumed_imports)
                 except Exception:
                     logger.warning("周期性失联任务恢复失败，将继续运行", exc_info=True)
                 last_recovery = time.monotonic()
@@ -603,9 +661,119 @@ def run_forever():
                         logger.info("Worker yielded checkpointed slice id=%s", job_id)
                         continue
                 storage.finalize_job(job_id, result=result)
+                if job.get("task_type") == "generate_report":
+                    try:
+                        source = str((job.get("options") or {}).get("workflow_source") or "")
+                        if source == "preliminary_results_report":
+                            from app import _queue_idle_deep_backfill
+                            task_state = storage.get_import_task(job.get("scan_id")) or {}
+                            checkpoint = dict(task_state.get("checkpoint") or {})
+                            storage.transition_import_task(job.get("scan_id"), "deep_summarizing_files", checkpoint=checkpoint, reason="初步智能目录和情报概览已完成，开始低优先级深度摘要。")
+                            _queue_idle_deep_backfill(job.get("scan_id"), job.get("owner_id"))
+                        elif source == "deep_results_report":
+                            task_state = storage.get_import_task(job.get("scan_id")) or {}
+                            if task_state.get("status") == "deep_overview_updating":
+                                resume = (job.get("options") or {}).get("resume_state") or "deep_update_available"
+                                storage.transition_import_task(job.get("scan_id"), resume)
+                                from app import _queue_idle_deep_backfill, _mark_deep_update_available
+                                _queue_idle_deep_backfill(job.get("scan_id"), job.get("owner_id"))
+                                _mark_deep_update_available(job.get("scan_id"))
+                    except Exception:
+                        logger.warning("初步概览完成后启动深度摘要失败 scan_id=%s", job.get("scan_id"), exc_info=True)
+                # A resumed foreground batch can have all of its file
+                # summaries already persisted, so no new ``generate_summary``
+                # row is created in this slice.  Still run the idempotent node
+                # reconciliation hook; otherwise a Worker restart could leave
+                # the node layer permanently unqueued.
+                if job.get("task_type") in {"analyze_package", "scan_and_analyze"}:
+                    try:
+                        source = str((job.get("options") or {}).get("workflow_source") or "")
+                        if source in {"manual_selection", "idle_deep_backfill"}:
+                            options = job.get("options") or {}
+                            if source == "manual_selection":
+                                from app import _queue_preliminary_file_summaries, _queue_preliminary_node_summaries
+                                _queue_preliminary_file_summaries(
+                                    job.get("scan_id"), job.get("owner_id")
+                                )
+                                _queue_preliminary_node_summaries(
+                                    job.get("scan_id"), job.get("owner_id")
+                                )
+                            else:
+                                from app import _queue_deep_node_rebuilds, _queue_idle_deep_backfill
+                                _queue_deep_node_rebuilds(
+                                    job.get("scan_id"), job.get("owner_id"),
+                                    batch_id=options.get("deep_batch_id"),
+                                    scope_paths=options.get("target_paths") or options.get("paths"),
+                                    full_inventory=False,
+                                )
+                                _queue_idle_deep_backfill(
+                                    job.get("scan_id"), job.get("owner_id")
+                                )
+                    except Exception:
+                        logger.warning(
+                            "分析任务完成后同步节点队列失败 scan_id=%s",
+                            job.get("scan_id"), exc_info=True,
+                        )
+                if job.get("task_type") == "generate_summary":
+                    try:
+                        from app import (
+                            _queue_candidate_node_summaries,
+                            _queue_preliminary_file_summaries,
+                            _queue_preliminary_node_summaries,
+                            _queue_preliminary_overview,
+                            _queue_idle_deep_backfill,
+                            _queue_deep_node_rebuilds,
+                            _mark_deep_update_available,
+                        )
+                        source = str((job.get("options") or {}).get("workflow_source") or "")
+                        options = job.get("options") or {}
+                        if source in {"candidate_preview_model_summary", "candidate_preview"}:
+                            _queue_candidate_node_summaries(job.get("scan_id"), job.get("owner_id"))
+                        if source in {"candidate_preview_model_summary", "candidate_preview", "candidate_node_summary"}:
+                            _queue_idle_deep_backfill(job.get("scan_id"), job.get("owner_id"))
+                        elif source in {"preliminary_model_summary", "preliminary_node_summary"}:
+                            _queue_preliminary_file_summaries(job.get("scan_id"), job.get("owner_id"))
+                            _queue_preliminary_node_summaries(job.get("scan_id"), job.get("owner_id"))
+                            _queue_preliminary_overview(job.get("scan_id"), job.get("owner_id"))
+                            _queue_idle_deep_backfill(job.get("scan_id"), job.get("owner_id"))
+                        elif source in {"deep_parse_model_summary", "idle_deep_model_summary"}:
+                            _queue_deep_node_rebuilds(
+                                job.get("scan_id"), job.get("owner_id"),
+                                batch_id=options.get("deep_batch_id"),
+                                scope_paths=options.get("target_paths") or options.get("paths"),
+                                full_inventory=False,
+                            )
+                        if source not in {"preliminary_model_summary", "preliminary_node_summary"}:
+                            storage.reconcile_import_task_after_summary(job.get("scan_id"))
+                        if source in {"deep_parse_model_summary", "deep_node_rebuild"}:
+                            task_state = storage.get_import_task(job.get("scan_id")) or {}
+                            strict_import = bool((task_state.get("checkpoint") or {}).get("selected_paths")) and not (task_state.get("checkpoint") or {}).get("large_selection")
+                            if not strict_import and str(task_state.get("status") or "") in {"completed", "partial"}:
+                                with storage._connect() as conn:
+                                    report_active = conn.execute(
+                                        "SELECT 1 FROM analysis_jobs WHERE scan_id=? AND task_type='generate_report' AND status IN ('queued','running','cancelling') LIMIT 1",
+                                        (str(job.get("scan_id")),),
+                                    ).fetchone()
+                                if not report_active:
+                                    storage.create_or_get_typed_job(
+                                        job.get("scan_id"), "generate_report",
+                                        options={"workflow_source": "deep_results_report"},
+                                        owner_id=job.get("owner_id") or "legacy",
+                                    )
+                        if source in {"deep_parse_model_summary", "idle_deep_model_summary", "deep_node_rebuild"}:
+                            _queue_idle_deep_backfill(job.get("scan_id"), job.get("owner_id"))
+                            _mark_deep_update_available(job.get("scan_id"))
+                    except Exception:
+                        logger.warning(
+                            "深度摘要完成后同步导入任务状态失败 scan_id=%s",
+                            job.get("scan_id"), exc_info=True,
+                        )
             except Exception as exc:
                 if isinstance(exc, JobCancelled) or exc.__class__.__name__ == "ParseIsolationCancelled":
                     _finish_conversation_turn_after_worker_failure(job, "cancelled", exc)
+                    batch_id = str((job.get("options") or {}).get("deep_batch_id") or "")
+                    if batch_id:
+                        storage.update_deep_parse_batch(batch_id, "cancelled", error_code="job_cancelled", error_message="任务已取消")
                     if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
                         storage.update_analysis_progress_status(
                             job.get("scan_id"), "cancelled", "分析已取消；已完成的文件检查点仍保留。", "cancelled"
@@ -649,6 +817,18 @@ def run_forever():
                 else:
                     logger.exception("Worker task failed id=%s type=%s", job_id, job.get("task_type"))
                 _finish_conversation_turn_after_worker_failure(job, "failed", exc)
+                job_options = job.get("options") or {}
+                batch_id = str(job_options.get("deep_batch_id") or "")
+                if batch_id and job.get("task_type") == "generate_summary":
+                    item_path = str(job_options.get("path") or "").strip()
+                    if item_path:
+                        storage.update_deep_parse_item(
+                            batch_id, item_path, "failed",
+                            error_code=exc.__class__.__name__,
+                            error_message=str(exc),
+                        )
+                if batch_id:
+                    storage.update_deep_parse_batch(batch_id, "failed", error_code=exc.__class__.__name__, error_message=str(exc))
                 if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
                     storage.update_analysis_progress_status(
                         job.get("scan_id"), "failed",

@@ -5,6 +5,7 @@ import hmac
 import importlib.util
 import itertools
 import logging
+import mimetypes
 import logging.handlers
 import os
 import re
@@ -27,15 +28,18 @@ from web_compat import (
 
 from config import Config, ensure_runtime_directories
 from services.ollama import LocalModelError, OllamaClient, OllamaEmbeddingClient
-from services.document_analysis import analyze_document
-from services.evidence import embedding_mode, select_evidence, set_embedding_provider, verify_claim_evidence
+from services.vllm import VLLMClient, VLLMEmbeddingClient
+from services.document_analysis import analyze_document, analyze_document_preview, analyze_document_previews_batch
+from services.import_pipeline import parse_plan
+from services.import_state_machine import summary_type as staged_summary_type
+from services.evidence import build_file_claims, embedding_mode, select_evidence, set_embedding_provider, verify_claim_evidence
 from services.exporter import create_report_docx, export_node, safe_name
 from services.folder_analysis import analyze_folder
 from services.package_analysis import (
     analyze_package, checkpoint_fingerprint, refresh_package_coverage, _parse_with_limits,
     _restore_source_provenance, _logical_source_snapshot, _secure_source_snapshot,
 )
-from services.large_package import inventory_by_path, package_resource_plan
+from services.large_package import build_policy, inventory_by_path, package_resource_plan
 from services.processing_queue import (
     deep_processing_eligible,
     ranked_pending_paths,
@@ -77,7 +81,9 @@ from services.conversation import (
 )
 from services.turn_runtime import AnalysisTurnRuntime
 from services.package_overview import build_package_overview_from_storage
-from services.package_exploration import preview_as_document
+from services.package_exploration import (
+    classify_preview, preview_as_document, preview_matches_category,
+)
 from services.homogeneous_documents import analyze_homogeneous_documents
 from services.logical_units import iter_logical_units
 
@@ -171,15 +177,27 @@ _token_owner_alias = (
     hashlib.sha256(Config.API_ACCESS_TOKEN.encode("utf-8")).hexdigest()[:24]
     if Config.API_ACCESS_TOKEN else None
 )
-# The deployment is intentionally local-only: all generation uses Ollama on this host.
-llm_transport = OllamaClient(
-    base_url=Config.OLLAMA_BASE_URL,
-    model=Config.OLLAMA_MODEL,
-    timeout=Config.SHARED_OLLAMA_REQUEST_TIMEOUT,
-    max_concurrency=Config.LLM_MAX_CONCURRENCY,
-)
-ACTIVE_LLM_BACKEND = "ollama"
-llm_generation_enabled = Config.ENABLE_SHARED_OLLAMA
+# The deployment is intentionally local-only: all generation uses the selected
+# serving backend on this host. vLLM is the production default; Ollama remains
+# available through LLM_BACKEND=ollama for rollback.
+if Config.LLM_BACKEND == "vllm":
+    llm_transport = VLLMClient(
+        base_url=Config.VLLM_BASE_URL,
+        model=Config.VLLM_MODEL,
+        timeout=Config.VLLM_REQUEST_TIMEOUT,
+        max_concurrency=Config.LLM_MAX_CONCURRENCY,
+        api_key=Config.VLLM_API_KEY,
+    )
+    ACTIVE_LLM_BACKEND = "vllm"
+else:
+    llm_transport = OllamaClient(
+        base_url=Config.OLLAMA_BASE_URL,
+        model=Config.OLLAMA_MODEL,
+        timeout=Config.SHARED_OLLAMA_REQUEST_TIMEOUT,
+        max_concurrency=Config.LLM_MAX_CONCURRENCY,
+    )
+    ACTIVE_LLM_BACKEND = "ollama"
+llm_generation_enabled = Config.LLM_ENABLED
 llm = PydanticAgentRuntime(llm_transport)
 translation_transport = None
 if Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "offline_nllb":
@@ -247,27 +265,36 @@ _translation_execution_lock = threading.RLock()
 def _translate_document_serialized(document, **kwargs):
     with _translation_execution_lock:
         return translation_service.translate_document(document, **kwargs)
-# 完整分析专用的文档级 embedding。
-# 只用于 analyze_package 中的一文档一向量语义聚类，
-# 不受 evidence embedding 开关影响。
-if isinstance(llm_transport, OllamaClient):
+# 完整分析专用的文档级 embedding，以及交互式证据检索 embedding。
+# 优先使用独立 CPU vLLM 服务，避免占用 8001 的 GPU 生成模型；Ollama
+# 仅作为显式兼容回退。任一服务不可用时，evidence.py 会快速回退词法检索，
+# 不得阻塞导入或分析任务。
+_package_embedding_client = None
+_embedding_client = None
+ACTIVE_EMBEDDING_BACKEND = "disabled"
+if Config.ENABLE_VLLM_EMBEDDINGS:
+    _package_embedding_client = VLLMEmbeddingClient(
+        Config.VLLM_EMBED_BASE_URL,
+        Config.VLLM_EMBED_MODEL,
+        timeout=Config.VLLM_EMBED_TIMEOUT_SECONDS,
+        max_batch_size=Config.VLLM_EMBED_MAX_BATCH_SIZE,
+        max_chars=Config.VLLM_EMBED_MAX_CHARS,
+        api_key=Config.VLLM_API_KEY,
+    )
+    ACTIVE_EMBEDDING_BACKEND = "vllm-embedding"
+elif Config.ENABLE_SHARED_OLLAMA_EMBEDDINGS:
     _package_embedding_client = OllamaEmbeddingClient(
         Config.OLLAMA_BASE_URL,
         Config.OLLAMA_EMBED_MODEL,
+        timeout=Config.SHARED_OLLAMA_REQUEST_TIMEOUT,
+        num_gpu=Config.OLLAMA_EMBED_NUM_GPU,
     )
-else:
-    _package_embedding_client = None
+    ACTIVE_EMBEDDING_BACKEND = "ollama-embedding"
 
-# evidence embedding 单独控制。
-# 默认关闭，避免打开文件/节点时同步计算大量 evidence embedding。
-if (
-    _package_embedding_client is not None
-    and Config.ENABLE_SHARED_OLLAMA_EMBEDDINGS
-):
+if _package_embedding_client is not None:
     _embedding_client = _package_embedding_client
-    set_embedding_provider(_embedding_client.embed)
+    set_embedding_provider(_embedding_client.embed, mode=ACTIVE_EMBEDDING_BACKEND)
 else:
-    _embedding_client = None
     set_embedding_provider(None)
 parser = UnifiedDocumentParser(Config.DOCLING_ARTIFACTS_DIR, Config.RAPIDOCR_MODEL_DIR, Config.MAX_FULL_DOCUMENT_CHARS)
 
@@ -399,6 +426,20 @@ def _walk_analysis_nodes(node):
             yield item
 
 
+def evidence_is_formal(item):
+    """Return whether one evidence record is usable in the formal directory."""
+    if not isinstance(item, dict):
+        return False
+    if not (item.get("evidence_id") or item.get("id")):
+        return False
+    source = item.get("source_path") or item.get("path")
+    quote = item.get("supporting_quote") or item.get("text") or item.get("content")
+    if not source or not quote:
+        return False
+    status = str(item.get("support_status") or item.get("status") or "supported").lower()
+    return status not in {"unsupported", "rejected", "unverified", "pending"}
+
+
 def _find_analysis_node(scan_id, node_id):
     """
     根据 node_id 找到分析树中的虚拟主题/类别节点。
@@ -410,6 +451,14 @@ def _find_analysis_node(scan_id, node_id):
     tree = analysis.get("analysis_tree") or {}
 
     for node in _walk_analysis_nodes(tree):
+        if node.get("node_id") == node_id:
+            return node
+
+    # Candidate topics are computed from persisted preview summaries and are
+    # not necessarily present in the older analysis tree. Resolve them here so
+    # selecting a provisional node still expands to its concrete files.
+    preview_directory = _build_candidate_preview_directory(scan_id)
+    for node in (preview_directory or {}).get("topics") or []:
         if node.get("node_id") == node_id:
             return node
 
@@ -460,11 +509,300 @@ def _inventory_by_path(scan_result):
 def _requested_member_paths(scan_result, node_path):
     """Resolve a UI file/folder selection, including virtual logical files."""
     node_path = str(node_path or ".")
-    logical_node = _inventory_by_path(scan_result).get(node_path)
+    if scan_result.get("inventory_mode") == "durable_paged_v1":
+        logical_node = storage.get_inventory_entry(
+            scan_result.get("_scan_id") or scan_result.get("scan_id"), node_path
+        )
+    else:
+        logical_node = _inventory_by_path(scan_result).get(node_path)
     if logical_node and logical_node.get("logical_unit"):
         resolve_under(scan_result["root"], logical_node.get("container_path") or "")
         return [node_path]
     return _physical_scope_member_paths(scan_result, node_path)
+
+
+def _selection_row_preview(row):
+    """Merge one joined inventory row into the bounded classifier contract."""
+    payload = dict(row.get("payload") or {})
+    preview = dict(row.get("preview") or {})
+    merged = {**payload, **preview}
+    path = str(row.get("path") or merged.get("path") or "").replace("\\", "/")
+    merged.setdefault("path", path)
+    merged.setdefault("name", Path(path).name)
+    merged.setdefault("extension", Path(path).suffix.lower())
+    return merged
+
+
+def _selection_filter_matches(row, selection_filter):
+    """Match a lazy type/category node without materialising its members."""
+    selection_filter = selection_filter or {}
+    kind = str(selection_filter.get("kind") or "").casefold()
+    candidate = _selection_row_preview(row)
+    path = str(candidate.get("path") or row.get("path") or "").replace("\\", "/")
+    extension = str(candidate.get("extension") or Path(path).suffix or "").casefold()
+    if kind == "extension":
+        wanted = str(selection_filter.get("extension") or "").casefold()
+        if wanted in {"[no_extension]", "[无扩展名]"}:
+            return not extension
+        return extension == wanted
+    if kind == "content_category":
+        return preview_matches_category(
+            candidate, str(selection_filter.get("category_id") or "")
+        )
+    if kind in {"path_prefix", "directory"}:
+        wanted = str(selection_filter.get("path") or ".").replace("\\", "/").rstrip("/")
+        return wanted in {"", "."} or path == wanted or path.startswith(wanted + "/")
+    if kind in {"topic", "keyword", "content_term"}:
+        terms = selection_filter.get("terms") or selection_filter.get("term") or []
+        if isinstance(terms, str):
+            terms = [terms]
+        terms = [str(item).casefold() for item in terms if str(item)]
+        if not terms and selection_filter.get("keyword"):
+            terms = [str(selection_filter.get("keyword")).casefold()]
+        haystack = " ".join([
+            path,
+            str(candidate.get("name") or ""),
+            " ".join(str(item) for item in candidate.get("keywords") or []),
+            str(candidate.get("preview_text") or "")[:12000],
+        ]).casefold()
+        return any(term and term in haystack for term in terms)
+    return True
+
+
+def _iter_selection_rows(scan_id, node=None, requested_paths=None):
+    """Yield selection candidates lazily from durable inventory rows."""
+    node = node or {}
+    selection_filter = node.get("selection_filter") or {}
+    member_paths = [
+        str(path) for path in (requested_paths or node.get("member_paths") or [])
+        if str(path)
+    ]
+    lazy = bool(node.get("member_paths_lazy") or selection_filter)
+    if not lazy and member_paths:
+        for path in dict.fromkeys(member_paths):
+            payload = storage.get_inventory_entry(scan_id, path)
+            if not payload:
+                continue
+            yield {
+                "path": path,
+                "kind": "file",
+                "payload": payload,
+                "preview": storage.get_file_preview(scan_id, path),
+                "workflow": storage.get_file_workflow_state(scan_id, path) or {},
+                "analysis_status": (storage.get_file_state(scan_id, path) or {}).get("status"),
+            }
+        return
+    if hasattr(storage, "iter_inventory_selection_entries"):
+        for row in storage.iter_inventory_selection_entries(
+            scan_id, kind="file", batch_size=500
+        ):
+            if _selection_filter_matches(row, selection_filter):
+                yield row
+        return
+    # Compatibility path for old non-paged scans. It is only used for small
+    # packages, because large scans always have durable inventory rows.
+    scan = require_scan(scan_id)
+    inventory = _inventory_by_path(scan)
+    requested_set = set(member_paths) if member_paths else None
+    for path, payload in inventory.items():
+        if requested_set is not None and path not in requested_set:
+            continue
+        row = {
+            "path": path,
+            "kind": "file",
+            "payload": payload,
+            "preview": storage.get_file_preview(scan_id, path),
+            "workflow": storage.get_file_workflow_state(scan_id, path) or {},
+            "analysis_status": (storage.get_file_state(scan_id, path) or {}).get("status"),
+        }
+        if _selection_filter_matches(row, selection_filter):
+            yield row
+
+
+def _large_selection_rank(row):
+    """Score one selected file for bounded parsing and model promotion."""
+    candidate = _selection_row_preview(row)
+    classification = classify_preview(candidate)
+    workflow = row.get("workflow") or {}
+    score = float(workflow.get("selection_score") or 0.0)
+    score += float(classification.get("confidence") or 0.0) * 20.0
+    score += min(18.0, len(str(candidate.get("preview_text") or "")) / 700.0)
+    score += min(12.0, len(candidate.get("keywords") or []) * 1.2)
+    if str(candidate.get("extension") or "").casefold() in {
+        ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
+        ".xml", ".html", ".htm", ".log", ".sql", ".pdf", ".doc", ".docx",
+        ".ppt", ".pptx", ".xls", ".xlsx", ".xlsm",
+    }:
+        score += 8.0
+    if str(classification.get("primary_category_id") or "") in {
+        "security_risk", "research_reports", "policy_compliance",
+    }:
+        score += 5.0
+    return round(score, 6), classification
+
+
+def _build_large_selection_plan(scan_id, node=None, requested_paths=None, label=""):
+    """Build an auditable bounded plan for a potentially huge selection."""
+    scan = require_scan(scan_id)
+    analysis = storage.get_analysis(scan_id) or {}
+    policy = (
+        (analysis.get("policy") or {}).get("large_package")
+        or build_policy(scan, _package_large_options())
+    )
+    parse_limit = max(
+        100,
+        int(policy.get("selected_parse_max_files") or Config.LARGE_PACKAGE_SELECTED_PARSE_MAX_FILES),
+    )
+    parse_bytes_limit = max(
+        256 * 1024 * 1024,
+        int(policy.get("selected_parse_max_bytes") or Config.LARGE_PACKAGE_SELECTED_PARSE_MAX_BYTES),
+    )
+    model_limit = max(
+        12,
+        int(policy.get("selected_model_file_limit") or Config.LARGE_PACKAGE_SELECTED_MODEL_FILE_LIMIT),
+    )
+    model_bytes_limit = max(
+        64 * 1024 * 1024,
+        int(policy.get("selected_model_max_bytes") or Config.LARGE_PACKAGE_SELECTED_MODEL_MAX_BYTES),
+    )
+    batch_limit = max(
+        50,
+        min(500, int(policy.get("selected_batch_files") or Config.LARGE_PACKAGE_SELECTED_BATCH_FILES)),
+    )
+    # One selection request is one resumable work slice. Further files remain
+    # explicitly deferred and can be selected again, so a single click never
+    # creates an implicit multi-hour continuation chain.
+    parse_limit = min(parse_limit, batch_limit)
+    pool_limit = max(1000, min(12000, max(parse_limit * 3, model_limit * 8)))
+    import heapq
+
+    heap = []
+    candidate_count = 0
+    candidate_bytes = 0
+    excluded_count = 0
+    excluded_bytes = 0
+    for row in _iter_selection_rows(
+        scan_id, node=node, requested_paths=requested_paths
+    ):
+        workflow = row.get("workflow") or {}
+        candidate = _selection_row_preview(row)
+        size = max(0, int(candidate.get("size") or 0))
+        if (
+            workflow.get("promotion_allowed") is False
+            or str(workflow.get("safety_status") or "") in {"restricted", "rejected"}
+        ):
+            excluded_count += 1
+            excluded_bytes += size
+            continue
+        analysis_status = str(row.get("analysis_status") or "").casefold()
+        if analysis_status in {"completed", "needs_attention"}:
+            # Existing deep/parser results remain represented in the category,
+            # but are not re-enqueued by a new selection.
+            excluded_count += 1
+            excluded_bytes += size
+            continue
+        path = str(candidate.get("path") or row.get("path") or "")
+        if not path:
+            continue
+        score, classification = _large_selection_rank(row)
+        record = {
+            "path": path,
+            "size": size,
+            "score": score,
+            "extension": str(candidate.get("extension") or "").casefold(),
+            "category_id": classification.get("primary_category_id"),
+            "classification_confidence": classification.get("confidence"),
+            "preview_characters": int(
+                candidate.get("preview_characters")
+                or len(str(candidate.get("preview_text") or ""))
+            ),
+        }
+        candidate_count += 1
+        candidate_bytes += size
+        if len(heap) < pool_limit:
+            heapq.heappush(heap, (score, path, record))
+        elif (score, path) > (heap[0][0], heap[0][1]):
+            heapq.heapreplace(heap, (score, path, record))
+    ranked = [
+        item[2]
+        for item in sorted(heap, key=lambda item: (-item[0], item[1]))
+    ]
+
+    def choose_bounded(limit, byte_limit, source):
+        chosen = []
+        chosen_paths = set()
+        used_bytes = 0
+        seen_extensions = set()
+        # Reserve a small spread across formats first, then fill by score.
+        for diversity_pass in (True, False):
+            for record in source:
+                path = record["path"]
+                if len(chosen) >= limit or path in chosen_paths:
+                    continue
+                if diversity_pass and record.get("extension") in seen_extensions:
+                    continue
+                if used_bytes + record["size"] > byte_limit:
+                    continue
+                chosen.append(record)
+                chosen_paths.add(path)
+                used_bytes += record["size"]
+                seen_extensions.add(record.get("extension"))
+        return chosen, used_bytes
+
+    parse_records, parse_bytes = choose_bounded(
+        parse_limit, parse_bytes_limit, ranked
+    )
+    parse_paths = [item["path"] for item in parse_records]
+    parse_set = set(parse_paths)
+    model_source = [item for item in ranked if item["path"] in parse_set]
+    model_source.sort(key=lambda item: (
+        -float(item.get("score") or 0),
+        -int(item.get("preview_characters") or 0),
+        item["path"],
+    ))
+    model_records, model_bytes = choose_bounded(
+        model_limit, model_bytes_limit, model_source
+    )
+    model_paths = [item["path"] for item in model_records]
+    deferred_count = max(0, candidate_count - len(parse_records))
+    deferred_bytes = max(0, candidate_bytes - parse_bytes)
+    return {
+        "schema_version": "large-selection-plan/1.0",
+        "strategy": "full_inventory_category_match_then_value_bounded_parse_and_model",
+        "label": str(label or (node or {}).get("name") or "大数据包选择")[:240],
+        "node_id": (node or {}).get("node_id"),
+        "selection_filter": (node or {}).get("selection_filter") or {},
+        "selected_file_count": candidate_count,
+        "selected_bytes": candidate_bytes,
+        "selected_size_human": human_size(candidate_bytes),
+        "excluded_file_count": excluded_count,
+        "excluded_bytes": excluded_bytes,
+        "normal_parse_file_count": len(parse_records),
+        "normal_parse_bytes": parse_bytes,
+        "normal_parse_size_human": human_size(parse_bytes),
+        "model_candidate_file_count": len(model_records),
+        "model_candidate_bytes": model_bytes,
+        "model_candidate_size_human": human_size(model_bytes),
+        "deferred_file_count": deferred_count,
+        "deferred_bytes": deferred_bytes,
+        "parse_file_limit": parse_limit,
+        "parse_byte_limit": parse_bytes_limit,
+        "model_file_limit": model_limit,
+        "model_byte_limit": model_bytes_limit,
+        "batch_file_limit": batch_limit,
+        "parse_paths": parse_paths,
+        "model_paths": model_paths,
+        "representative_paths": [item["path"] for item in ranked[:100]],
+        "coverage": {
+            "membership_scan_complete": True,
+            "selected_scope_files": candidate_count,
+            "normal_parse_ratio": round(len(parse_records) / float(candidate_count or 1), 6),
+            "model_ratio_of_selected": round(len(model_records) / float(candidate_count or 1), 6),
+            "model_ratio_of_parsed": round(len(model_records) / float(len(parse_records) or 1), 6),
+            "deferred_visible": True,
+            "claim_scope": "model conclusions apply only to model_candidate_paths; category counts apply to the full selected scope",
+        },
+    }
 
 
 def _package_documents(scan_id, canonical_only=False):
@@ -480,17 +818,42 @@ def _package_documents(scan_id, canonical_only=False):
     return documents
 
 
-def _virtual_node_context(scan_id, node, max_files=30):
+def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
     """
     根据虚拟主题节点的 member_paths，
     构造只属于这个节点的分析上下文。
     """
+    declared_member_count = int(node.get("file_count") or 0)
     member_paths = set(node.get("member_paths") or [])
+    scope_limited = bool(node.get("member_paths_lazy"))
+    if scope_limited:
+        # A lazy large-package category is only eligible for a node summary
+        # after its bounded selection plan has been created.  Use the model
+        # candidate paths (or the parsed paths as a fallback) rather than the
+        # category's full membership, which may contain millions of files.
+        task = storage.get_import_task(scan_id) or {}
+        plan = (task.get("checkpoint") or {}).get("selection_plan") or {}
+        if str(plan.get("node_id") or "") == str(node.get("node_id") or ""):
+            planned = plan.get("model_paths") or plan.get("parse_paths") or []
+            if planned:
+                member_paths = {str(path) for path in planned if str(path)}
+        if not member_paths:
+            raise ValueError("该大数据包类别尚未生成有界分析计划，请先选择该类别进入解析")
 
     if not member_paths:
         raise ValueError("当前主题节点没有关联文件")
 
-    all_documents = _package_documents(scan_id, canonical_only=True)
+    if scope_limited and hasattr(storage, "iter_documents_for_paths"):
+        # Large-package category membership is lazy.  Hydrate only the
+        # bounded model/parse subset selected for this node; loading the
+        # package-wide document table defeats the bounded workflow.
+        all_documents = list(
+            storage.iter_documents_for_paths(
+                scan_id, sorted(member_paths), hydrate=True
+            )
+        )
+    else:
+        all_documents = _package_documents(scan_id, canonical_only=True)
 
     documents = [
         item
@@ -505,7 +868,12 @@ def _virtual_node_context(scan_id, node, max_files=30):
             "total_size": int(node.get("total_size") or 0),
             "total_size_human": node.get("total_size_human") or "0.0 B",
             "type_counts": {}, "sample_truncated": True,
-            "coverage": node.get("coverage") or {
+            "coverage": {
+                **(node.get("coverage") or {}),
+                "category_file_count": declared_member_count or len(member_paths),
+                "analyzed_scope_files": len(member_paths),
+                "scope_limited": scope_limited,
+            } or {
                 "status": "待分析", "inventory_files": len(member_paths),
                 "parsed_files": 0, "pending_files": len(member_paths),
             },
@@ -536,6 +904,94 @@ def _virtual_node_context(scan_id, node, max_files=30):
 
     else:
         sampled_documents = documents
+
+    # Node summaries must be built from the persisted file summaries, not only
+    # from a few raw-document evidence snippets. Keep every member addressable
+    # while bounding each field so the node prompt remains responsive.
+    file_summaries = []
+    missing_file_summaries = []
+    non_deep_file_summaries = []
+    for path in sorted(member_paths):
+        summary_type = (
+            staged_summary_type(summary_stage, "file")
+            if summary_stage else "file"
+        )
+        summary = storage.get_summary(scan_id, path, summary_type) or {}
+        if not summary:
+            missing_file_summaries.append(path)
+            continue
+        def _short(value, limit):
+            return " ".join(str(value or "").split())[:limit]
+        level = str(summary.get("analysis_level") or summary.get("analysis_depth") or "unknown").lower()
+        deep_ready = bool(summary.get("deep_analysis")) and level in {"unknown", "deep", "deep_document", "deep_folder"}
+        if summary_stage == "deep" and not deep_ready:
+            non_deep_file_summaries.append(path)
+        raw_file_conclusions = summary.get("file_conclusions") or summary.get("conclusions") or []
+        compact_file_conclusions = []
+        for item in raw_file_conclusions[:3]:
+            if isinstance(item, dict):
+                raw_status = str(
+                    item.get("support_status")
+                    or item.get("verification_status")
+                    or item.get("status")
+                    or "unknown"
+                ).lower()
+                supports = []
+                for support in (item.get("supports") or item.get("evidence") or []):
+                    if not isinstance(support, dict):
+                        continue
+                    text = support.get("text") or support.get("supporting_quote") or support.get("quote")
+                    if not text:
+                        continue
+                    supports.append({
+                        "evidence_id": str(support.get("evidence_id") or ""),
+                        "text": _short(text, 260),
+                        "supporting_quote": _short(support.get("supporting_quote") or text, 260),
+                        "source_path": support.get("source_path") or path,
+                        "page": support.get("page"),
+                        "section": _short(support.get("section"), 80),
+                        "support_status": str(support.get("support_status") or "supported"),
+                        "support_score": support.get("support_score"),
+                    })
+                    if len(supports) >= 2:
+                        break
+                compact_file_conclusions.append({
+                    "statement": _short(item.get("statement") or item.get("claim") or item.get("text"), 300),
+                    "type": str(item.get("type") or "observation"),
+                    "support_status": {
+                        "verified": "supported",
+                        "supported": "supported",
+                        "partially_verified": "partially_supported",
+                        "inferred": "partially_supported",
+                    }.get(raw_status, raw_status),
+                    "supports": supports,
+                })
+            elif item:
+                compact_file_conclusions.append({
+                    "statement": _short(item, 300),
+                    "type": "observation",
+                    "support_status": "unknown",
+                    "supports": [],
+                })
+        file_summaries.append({
+            "path": path,
+            "title": _short(summary.get("title") or summary.get("core_summary"), 160),
+            "summary": _short(summary.get("summary") or summary.get("core_summary"), 500),
+            "topics": [str(item)[:50] for item in (summary.get("topics") or [])[:4]],
+            "key_facts": [_short(item.get("text") if isinstance(item, dict) else item, 120) for item in (summary.get("key_facts") or [])[:2]],
+            "arguments": [_short(item.get("text") if isinstance(item, dict) else item, 120) for item in (summary.get("arguments") or [])[:2]],
+            # conclusions 与 file_conclusions 高度重复；节点模型只消费已带证据的版本。
+            "file_conclusions": compact_file_conclusions,
+            "limitations": [_short(item.get("text") if isinstance(item, dict) else item, 120) for item in (summary.get("limitations") or summary.get("file_limitations") or [])[:2]],
+            "analysis_level": level,
+            "deep_ready": deep_ready,
+            "verification_status": str(summary.get("verification_status") or "unknown"),
+            "evidence_ids": [
+                str(item.get("evidence_id"))
+                for item in (summary.get("evidence_chain") or [])[:6]
+                if isinstance(item, dict) and item.get("evidence_id")
+            ],
+        })
 
     type_counts = Counter()
 
@@ -629,10 +1085,18 @@ def _virtual_node_context(scan_id, node, max_files=30):
         ],
 
         "documents": sampled_documents,
+        "file_summaries": file_summaries,
+        "file_summary_count": len(file_summaries),
+        "missing_file_summaries": missing_file_summaries,
+        "non_deep_file_summaries": non_deep_file_summaries,
+        "file_summaries_complete": not missing_file_summaries and len(file_summaries) == len(member_paths),
+        "deep_file_summaries_complete": not missing_file_summaries and not non_deep_file_summaries and len(file_summaries) == len(member_paths),
 
         "sampled_files": len(sampled_documents),
 
         "total_files": len(documents),
+        "category_file_count": declared_member_count or len(member_paths),
+        "scope_limited": scope_limited,
 
         # 这是语义主题，不是真实文件夹
         "total_dirs": 0,
@@ -676,6 +1140,9 @@ def _virtual_node_context(scan_id, node, max_files=30):
                 / float(len(documents) or 1),
                 6
             ),
+            "category_file_count": declared_member_count or len(member_paths),
+            "analyzed_scope_files": len(member_paths),
+            "scope_limited": scope_limited,
             **(node.get("coverage") or {}),
         },
 
@@ -688,6 +1155,35 @@ def _virtual_node_summary(scan_id, node, context=None):
     context = context or _virtual_node_context(scan_id, node)
     conclusions = list(node.get("conclusion_evidence") or [])
     evidence = list(node.get("evidence_chain") or [])
+    if not evidence:
+        for file_summary in context.get("file_summaries") or []:
+            for conclusion in file_summary.get("file_conclusions") or []:
+                for support in conclusion.get("supports") or []:
+                    if not isinstance(support, dict) or not support.get("text"):
+                        continue
+                    item = dict(support)
+                    item.setdefault("source_path", file_summary.get("path"))
+                    item.setdefault("file_conclusion", conclusion.get("statement"))
+                    item.setdefault("evidence_origin", "file_summary")
+                    evidence.append(item)
+    if not conclusions:
+        file_claims = []
+        for file_summary in context.get("file_summaries") or []:
+            for conclusion in file_summary.get("file_conclusions") or []:
+                statement = str(conclusion.get("statement") or "").strip()
+                if statement:
+                    file_claims.append({
+                        "statement": statement,
+                        "type": conclusion.get("type") or "observation",
+                        "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("file_conclusion") == statement],
+                    })
+        if file_claims:
+            conclusions = [{
+                "question": "该节点下各文件共同支持哪些结论？",
+                "value": "汇总文件级分析结果并保留原文回溯",
+                "answer": "；".join(item["statement"] for item in file_claims[:4]),
+                "claims": file_claims[:8],
+            }]
     if not evidence:
         for conclusion in conclusions:
             evidence.extend(conclusion.get("evidence", []))
@@ -718,7 +1214,12 @@ def _virtual_node_summary(scan_id, node, context=None):
             item = evidence_by_id.get(evidence_id)
             if not item:
                 continue
-            verification = verify_claim_evidence(statement, item)
+            verification = (
+                {"support_status": str(item.get("support_status") or "supported"),
+                 "support_reason": "继承文件摘要结论的已验证支撑原文"}
+                if item.get("evidence_origin") == "file_summary"
+                else verify_claim_evidence(statement, item)
+            )
             status = verification.get("support_status")
             statuses.append(status)
             if status in {"supported", "partially_supported"}:
@@ -731,6 +1232,7 @@ def _virtual_node_summary(scan_id, node, context=None):
         claim_status = (
             "supported" if "supported" in statuses
             else "partially_supported" if "partially_supported" in statuses
+            else "candidate" if "candidate" in statuses
             else "insufficient"
         )
         claims.append({
@@ -745,11 +1247,17 @@ def _virtual_node_summary(scan_id, node, context=None):
         evidence_status = "supported"
     elif supported_claims or partial_claims:
         evidence_status = "partially_supported"
+    elif any(item.get("support_status") == "candidate" for item in claims):
+        evidence_status = "candidate"
     else:
         evidence_status = "insufficient"
     answer = primary.get("answer") or node.get("summary") or "暂无足够证据形成回答。"
     if evidence_status == "insufficient":
-        answer = "证据不足，当前不能形成可靠回答。"
+        if evidence:
+            evidence_status = "partially_supported"
+            answer = primary.get("answer") or node.get("summary") or "已有文件级证据，但节点综合结论仍需人工复核。"
+        else:
+            answer = "证据不足，当前不能形成可靠回答。"
     qa = {
         "contract": "question-answer-evidence/3.0",
         "question": primary.get("question") or primary.get("analysis_question") or "该节点主要包含哪些内容，哪些方向值得继续下钻？",
@@ -889,7 +1397,8 @@ def _combined_export_context(scan_id, scan_result, analysis, payload):
 
 def require_local_model_enabled():
     if not llm_generation_enabled:
-        raise ValueError("本地模型生成未启用，请将 ENABLE_SHARED_OLLAMA 设置为 1 后重试")
+        flag = "ENABLE_VLLM" if Config.LLM_BACKEND == "vllm" else "ENABLE_SHARED_OLLAMA"
+        raise ValueError("本地模型生成未启用，请将 {} 设置为 1 后重试".format(flag))
 
 
 class JobCancelled(Exception):
@@ -1080,7 +1589,7 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
         return report_data, None, {}, "模型研究方向分析失败：{}。报告未使用关键词规则替代。".format(exc)
 
 
-def _write_local_overview(scan_id, owner_id=None, job_id=None):
+def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=None):
     scan_result = require_scan(scan_id)
     analysis = dict(storage.get_analysis(scan_id) or {})
     # Reports consume the same edge contract exposed to graph/search/dialogue
@@ -1093,15 +1602,164 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None):
         for key in ("schema_version", "relationship_count", "truncated", "contract")
     }
     summaries = storage.list_summaries(scan_id)
+    if summary_stage in {"preliminary", "deep"}:
+        allowed_types = {staged_summary_type(summary_stage, "file"), staged_summary_type(summary_stage, "node")}
+        summaries = [item for item in summaries if item.get("type") in allowed_types]
+        analysis["summary_stage"] = summary_stage
+        analysis["summary_stage_only"] = True
+    import_task = storage.get_import_task(scan_id) or {}
+    checkpoint = import_task.get("checkpoint") or {}
+    selected_paths = {
+        str(path) for path in (
+            checkpoint.get("selected_paths")
+            or checkpoint.get("deep_selected_paths")
+            or []
+        ) if str(path)
+    }
+    if selected_paths:
+        # A selected-scope report must not silently reintroduce summaries from
+        # files that were only inventoried. Keep file and node evidence inside
+        # the current selection; metadata inventory remains available separately.
+        scoped = []
+        for item in summaries:
+            node_path = str((item.get("payload") or {}).get("node_path") or item.get("path") or "")
+            if node_path in selected_paths:
+                scoped.append(item)
+                continue
+            members = {
+                str(path) for path in ((item.get("payload") or {}).get("member_paths") or []) if str(path)
+            }
+            if node_path.startswith("node:") and members and members.issubset(selected_paths):
+                scoped.append(item)
+        summaries = scoped
+        analysis["selected_scope_paths"] = sorted(selected_paths)
+        analysis["selected_scope_only"] = True
     report_data = build_local_report(scan_result, summaries, analysis)
-    report_data, model_name, model_usage, warning = _analyze_report_with_model(
-        scan_result, summaries, analysis, report_data
-    )
+    if summary_stage == "parsed":
+        report_data["summary_stage"] = "parsed"
+        model_name, model_usage, warning = None, {}, "解析版概览仅使用已解析内容与证据，不调用摘要模型。"
+    else:
+        report_data, model_name, model_usage, warning = _analyze_report_with_model(scan_result, summaries, analysis, report_data)
+    if selected_paths:
+        # The report is a selected-scope projection.  ``build_local_report``
+        # also exposes package-wide metrics for legacy flows; leaving those in
+        # place here falsely labels a completed selected-file deep summary as
+        # zero coverage simply because unselected inventory files were not read.
+        inventory = _inventory_by_path(scan_result)
+        selected = sorted(selected_paths)
+        selected_bytes = sum(int((inventory.get(path) or {}).get("size") or 0) for path in selected)
+        parsed_count = sum(1 for path in selected if storage.get_document(scan_id, path))
+        stage_type = (
+            staged_summary_type(summary_stage, "file")
+            if summary_stage in {"preliminary", "deep"} else None
+        )
+        summary_count = (
+            sum(1 for path in selected if storage.get_summary(scan_id, path, stage_type))
+            if stage_type else parsed_count
+        )
+        stage_label = {
+            "parsed": "已解析内容版",
+            "preliminary": "初步摘要版",
+            "deep": "深度证据版",
+        }.get(summary_stage, "选中范围版")
+        stage_deep_count = summary_count if summary_stage == "deep" else 0
+        report_data["summary_stage"] = summary_stage or "selected"
+        report_data["report_scope"] = {
+            "kind": "selected_files",
+            "selected_paths": selected,
+            "selected_file_count": len(selected),
+            "selected_bytes": selected_bytes,
+            "selection_version": int(checkpoint.get("selection_version") or 0),
+            "package_inventory_files": int(scan_result.get("file_count") or len(inventory)),
+            "package_inventory_bytes": int(scan_result.get("total_size") or 0),
+        }
+        coverage = dict(report_data.get("coverage") or {})
+        coverage.update({
+            "mode": "selected_import",
+            "status": stage_label,
+            "selected_scope_only": True,
+            "selected_scope_files": len(selected),
+            "selected_scope_bytes": selected_bytes,
+            "package_inventory_files": int(scan_result.get("file_count") or len(inventory)),
+            "inventory_files": len(selected),
+            "scanned_files": len(selected),
+            "parsed_files": parsed_count,
+            "document_records": parsed_count,
+            "sampled_files": parsed_count,
+            "deep_analyzed_files": stage_deep_count,
+            "pending_files": max(0, len(selected) - (stage_deep_count or parsed_count)),
+            "parsed_file_ratio": round(parsed_count / float(len(selected) or 1), 6),
+            "content_parse_ratio": round(parsed_count / float(len(selected) or 1), 6),
+            "deep_analysis_ratio": round(stage_deep_count / float(len(selected) or 1), 6),
+            "scope_notice": "本报告仅覆盖用户选择的文件；包内其余清点文件不会被视为解析失败或摘要缺失。",
+        })
+        pipeline = dict(coverage.get("pipeline_coverage") or {})
+        pipeline["content_parse"] = {
+            "complete": parsed_count == len(selected), "eligible_files": len(selected),
+            "completed_files": parsed_count, "pending_files": max(0, len(selected) - parsed_count),
+            "coverage_ratio": round(parsed_count / float(len(selected) or 1), 6),
+        }
+        pipeline["deep_analysis"] = {
+            "complete": summary_stage == "deep" and stage_deep_count == len(selected),
+            "eligible_files": len(selected), "completed_files": stage_deep_count,
+            "pending_files": max(0, len(selected) - stage_deep_count),
+            "coverage_ratio": round(stage_deep_count / float(len(selected) or 1), 6),
+        }
+        coverage["pipeline_coverage"] = pipeline
+        report_data["coverage"] = coverage
+        report_data["basic_information"] = [
+            item for item in (report_data.get("basic_information") or [])
+            if not str(item).startswith(("内容分类覆盖：", "分析覆盖："))
+        ] + [
+            "报告范围：用户选择 {} 个文件（数据包完整清单 {} 个文件）。".format(
+                len(selected), int(scan_result.get("file_count") or len(inventory))
+            ),
+            "当前阶段：{}；已解析 {} / {}，本阶段摘要 {} / {}。".format(
+                stage_label, parsed_count, len(selected), summary_count, len(selected)
+            ),
+        ]
+        report_data["limitations"] = [
+            item for item in (report_data.get("limitations") or [])
+            if "尚未完成正文解析" not in str(item)
+            and not (summary_stage == "deep" and "抽样/首轮概览" in str(item))
+        ]
+        report_data["limitations"].insert(
+            0, "本报告只对已选择范围作出结论；未选择文件保留在清单中，不参与本轮结论。"
+        )
+        value_judgment = dict(report_data.get("value_judgment") or {})
+        value_judgment["limitations"] = list(report_data["limitations"])
+        report_data["value_judgment"] = value_judgment
+    # Keep the large-package taxonomy visible even when the optional report
+    # model returns a compact narrative. These categories are metadata/rule
+    # classifications over the full inventory, not model claims about every
+    # file in the category.
+    content_map = storage.get_content_map(scan_id) or {}
+    if content_map and not selected_paths:
+        report_data["content_categories"] = list(content_map.get("content_categories") or [])
+        report_data["research_directions"] = list(content_map.get("research_directions") or [])
+        report_data["content_taxonomy"] = content_map.get("content_taxonomy") or {}
+        report_data["global_categories"] = [
+            {
+                "name": item.get("name") or item.get("category_id"),
+                "file_count": int(item.get("file_count") or 0),
+                "total_bytes": int(item.get("total_bytes") or 0),
+                "description": item.get("description") or "",
+                "research_value": item.get("research_value") or "",
+                "classification_basis": item.get("classification_basis") or [],
+            }
+            for item in (content_map.get("content_categories") or [])
+        ]
+        report_data.setdefault("coverage", {}).update({
+            "inventory_files": int((content_map.get("inventory") or {}).get("file_count") or 0),
+            "inventory_bytes": int((content_map.get("inventory") or {}).get("total_bytes") or 0),
+            "classification_coverage": float((content_map.get("coverage") or {}).get("classification_coverage") or 1.0),
+            "directory_stage": "formal_taxonomy_with_bounded_model_evidence",
+        })
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     name = "情况概览报告_{}_{}_自动.docx".format(safe_name(Path(scan_result["root"]).name), stamp)
     create_report_docx(report_data, scan_result, Config.OUTPUT_DIR / name)
     storage.save_artifact(name, owner_id, scan_id=scan_id, job_id=job_id, kind="overview_report")
-    storage.save_summary(scan_id, ".", "report", report_data)
+    storage.save_summary(scan_id, ".", "{}_report".format(summary_stage) if summary_stage else "report", report_data)
     return {
         "file_name": name,
         "download_url": "/outputs/{}".format(name),
@@ -1112,6 +1770,26 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None):
     }
 
 
+def _published_deep_scope(scan_id):
+    """Return the deep file scope explicitly published by a report."""
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = dict(task.get("checkpoint") or {})
+    selected = {str(path) for path in (checkpoint.get("selected_paths") or []) if str(path)}
+    report = storage.get_summary(scan_id, ".", "deep_report") or {}
+    if not report:
+        return set(), False
+    scope = dict(report.get("report_scope") or {})
+    published = {str(path) for path in (scope.get("selected_paths") or []) if str(path)}
+    if selected:
+        if published != selected:
+            return set(), False
+        current_version = int(checkpoint.get("selection_version") or 0)
+        report_version = int(scope.get("selection_version") or 0)
+        if current_version and report_version and current_version != report_version:
+            return set(), False
+    return published, True
+
+
 def _package_large_options():
     return {
         "threshold_bytes": Config.LARGE_PACKAGE_THRESHOLD_BYTES,
@@ -1119,8 +1797,15 @@ def _package_large_options():
         "initial_parse_files": Config.LARGE_PACKAGE_INITIAL_PARSE_FILES,
         "deepen_batch_files": Config.LARGE_PACKAGE_DEEPEN_BATCH_FILES,
         "batch_files": Config.LARGE_PACKAGE_BATCH_FILES,
-        "preview_bytes_per_file": Config.LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE,
-        "preview_total_bytes": Config.LARGE_PACKAGE_PREVIEW_TOTAL_BYTES,
+        "large_directory_mode": Config.LARGE_PACKAGE_DIRECTORY_MODE,
+        "directory_model_file_limit": Config.LARGE_PACKAGE_DIRECTORY_MODEL_FILE_LIMIT,
+        "preview_bytes_per_file": Config.LARGE_PACKAGE_DIRECTORY_PREVIEW_BYTES_PER_FILE,
+        "preview_total_bytes": Config.LARGE_PACKAGE_DIRECTORY_PREVIEW_TOTAL_BYTES,
+        "selected_parse_max_files": Config.LARGE_PACKAGE_SELECTED_PARSE_MAX_FILES,
+        "selected_parse_max_bytes": Config.LARGE_PACKAGE_SELECTED_PARSE_MAX_BYTES,
+        "selected_model_file_limit": Config.LARGE_PACKAGE_SELECTED_MODEL_FILE_LIMIT,
+        "selected_model_max_bytes": Config.LARGE_PACKAGE_SELECTED_MODEL_MAX_BYTES,
+        "selected_batch_files": Config.LARGE_PACKAGE_SELECTED_BATCH_FILES,
         "preview_zip_members": Config.LARGE_PACKAGE_PREVIEW_ZIP_MEMBERS,
         "preview_zip_member_bytes": Config.LARGE_PACKAGE_PREVIEW_ZIP_MEMBER_BYTES,
         "overview_chars_per_file": Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE,
@@ -1141,7 +1826,9 @@ def _package_processing_status(scan_id, scan_result=None):
     state_counts = storage.file_status_counts(scan_id, include_container_only=False)
     queue_counts = storage.package_processing_counts(scan_id)
     foundation_total = int(state_counts.get("total") or 0)
-    completed_files = int(state_counts.get("completed") or 0)
+    parser_completed_files = int(state_counts.get("completed") or 0)
+    deep_summary_counts = storage.deep_summary_counts(scan_id)
+    completed_files = int(deep_summary_counts.get("file") or 0)
     pending_files = int(state_counts.get("pending") or 0)
     processing_files = int(state_counts.get("processing") or 0)
     partial_files = int(state_counts.get("partial") or 0)
@@ -1152,13 +1839,52 @@ def _package_processing_status(scan_id, scan_result=None):
     if not foundation_total and inventory_files:
         pending_files = inventory_files
     logical_total = max(0, foundation_total - excluded_files)
+    preview_counts = storage.file_preview_counts(scan_id)
+    previewed_files = int(preview_counts.get("previewed") or 0) + int(
+        preview_counts.get("restricted") or 0
+    )
+    evidence_indexed_files = storage.evidence_indexed_file_count(scan_id)
     active_job = storage.get_active_package_job(scan_id)
     control = storage.get_package_processing_control(scan_id)
+    selection = storage.get_scan_selection(scan_id) or {}
+    import_task_status = str((storage.get_import_task(scan_id) or {}).get("status") or "").lower()
+    all_eligible_complete = bool(
+        (
+            foundation_total == 0
+            and bool(scan_result.get("inventory_complete", not scan_result.get("truncated")))
+            and not inventory_files
+        )
+        or (
+            foundation_total > 0
+            and not incomplete_files
+            and not retry_waiting_files
+        )
+    )
+    # Legacy scans may have durable analysis rows without workflow rows. Once
+    # the queue is idle, close a stale running control record deterministically.
+    if (
+        control.get("state") == "running"
+        and not active_job
+        and all_eligible_complete
+        and foundation_total > 0
+    ):
+        control = storage.set_package_processing_state(
+            scan_id, "completed", "检测到全部有效逻辑文件已完成。"
+        )
     return {
         **control,
         "inventory_files": inventory_files,
         "inventory_complete": bool(scan_result.get("inventory_complete", not scan_result.get("truncated"))),
+        "discovery_progress": 1.0 if bool(scan_result.get("inventory_complete", not scan_result.get("truncated"))) else 0.0,
         "foundation_total_files": foundation_total,
+        "previewed_files": previewed_files,
+        "preview_completion_ratio": round(
+            previewed_files / float(inventory_files or 1), 6
+        ),
+        "evidence_indexed_files": evidence_indexed_files,
+        "evidence_index_ratio": round(
+            evidence_indexed_files / float(logical_total or 1), 6
+        ),
         "foundation_searchable_files": int(state_counts.get("light_ready") or 0),
         "foundation_searchable_ratio": round(
             int(state_counts.get("light_ready") or 0)
@@ -1181,17 +1907,17 @@ def _package_processing_status(scan_id, scan_result=None):
         "deep_completion_ratio": round(
             completed_files / float(logical_total or 1), 6
         ),
+        "parser_completed_files": parser_completed_files,
+        "deep_summary_files": int(deep_summary_counts.get("file") or 0),
+        "deep_summary_nodes": int(deep_summary_counts.get("folder") or 0),
         "batch_file_limit": max(1, min(500, int(Config.LARGE_PACKAGE_BATCH_FILES))),
         "active_job_id": active_job.get("id") if active_job else None,
         "active_job_status": active_job.get("status") if active_job else None,
-        "all_eligible_complete": bool(
-            (foundation_total == 0 and bool(scan_result.get("inventory_complete")))
-            or (
-                foundation_total > 0
-                and not incomplete_files
-                and not retry_waiting_files
-            )
-        ),
+        "all_eligible_complete": all_eligible_complete,
+        "selection_status": selection.get("status") or ("awaiting_selection" if control.get("state") == "awaiting_selection" else None),
+        "selection_version": int(selection.get("version") or 0),
+        "selected_files": int(selection.get("included_count") or 0),
+        "excluded_files": int(selection.get("excluded_count") or 0),
     }
 
 
@@ -1329,18 +2055,703 @@ def _publish_analysis_progress(scan_id, scan_result, percent, message, stage="an
     })
 
 
+def _queue_candidate_node_summaries(scan_id, owner_id=None):
+    """Queue initial node summaries after every candidate file summary exists."""
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = task.get("checkpoint") or {}
+    paths = {str(path) for path in (checkpoint.get("candidate_paths") or []) if str(path)}
+    if not paths:
+        return []
+    # The parser may refresh the cheap file projection after candidate model jobs finish.
+    # Use durable candidate job state as the gate instead.
+    preview_job_ids = [str(item) for item in (checkpoint.get("candidate_preview_job_ids") or []) if str(item)]
+    if preview_job_ids:
+        with storage._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(",".join("?" for _ in preview_job_ids)),
+                [str(scan_id)] + preview_job_ids,
+            ).fetchall()
+        states = {str(row["id"]): str(row["status"] or "") for row in rows}
+        if any(states.get(job_id) != "completed" for job_id in preview_job_ids):
+            return []
+    else:
+        for path in paths:
+            summary = storage.get_summary(scan_id, path, "file") or {}
+            source = str(summary.get("generated_by") or "").lower()
+            if str(summary.get("analysis_level") or "").lower() != "preview" and source not in {"model-preview-analysis", "model-preview-batch-analysis", "model-candidate-summary"}:
+                return []
+    directory = _build_candidate_preview_directory(scan_id) or {}
+    nodes = list(directory.get("topics") or [])
+    analysis_tree = (storage.get_analysis(scan_id) or {}).get("analysis_tree") or {}
+    existing_ids = {str(node.get("node_id") or "") for node in nodes}
+    for tree_node in _walk_analysis_nodes(analysis_tree):
+        tree_id = str(tree_node.get("node_id") or "")
+        tree_members = tree_node.get("member_paths") or tree_node.get("source_paths") or []
+        if tree_id and tree_id not in existing_ids and tree_members:
+            nodes.append(tree_node)
+            existing_ids.add(tree_id)
+    jobs = []
+    seen_nodes = set()
+    for node in nodes:
+        node_id = str(node.get("node_id") or "")
+        if not node_id or node_id in seen_nodes:
+            continue
+        seen_nodes.add(node_id)
+        members = {str(path) for path in (node.get("member_paths") or node.get("source_paths") or []) if str(path)}
+        if not members or not members.issubset(paths):
+            continue
+        node_path = "node:{}".format(node.get("node_id"))
+        existing = storage.get_summary(scan_id, node_path, "folder") or {}
+        existing_level = str(existing.get("analysis_level") or existing.get("analysis_depth") or "").lower()
+        # A preview job must never downgrade a durable deep node result.
+        if (
+            existing_level == "deep"
+            or bool(existing.get("deep_analysis"))
+            or str(existing.get("workflow_source") or "") == "candidate_node_summary"
+            or str(existing.get("generated_by") or "") == "model-preview-node-summary"
+        ):
+            continue
+        job_id, _created = storage.create_or_get_typed_job(
+            scan_id, "generate_summary",
+            options={
+                "scan_id": scan_id,
+                "node_id": node.get("node_id"),
+                "node_name": node.get("name") or node.get("title"),
+                "member_paths": sorted(members),
+                "kind": "group",
+                "workflow_source": "candidate_node_summary",
+                "analysis_level": "preview",
+            },
+            owner_id=owner_id or "legacy",
+        )
+        jobs.append(job_id)
+    return jobs
+
+
+def _queue_preliminary_file_summaries(scan_id, owner_id=None):
+    """Reconcile the selected-file preliminary lane after retries or restarts."""
+    task = storage.get_import_task(scan_id) or {}
+    if task.get("status") not in {"parsed_overview", "preliminary_summarizing"}:
+        return []
+    checkpoint = dict(task.get("checkpoint") or {})
+    selected = [
+        str(path) for path in (
+            checkpoint.get("selected_paths")
+            or checkpoint.get("deep_selected_paths")
+            or []
+        ) if str(path)
+    ]
+    if not selected:
+        return []
+    prior_ids = [str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or []) if str(item)]
+    with storage._connect() as conn:
+        rows = conn.execute(
+            "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(
+                ",".join("?" for _ in prior_ids) or "NULL"
+            ),
+            [str(scan_id)] + prior_ids,
+        ).fetchall() if prior_ids else []
+    states = {str(row["id"]): str(row["status"] or "") for row in rows}
+    retained = [job_id for job_id in prior_ids if states.get(job_id) in {"queued", "running", "completed", "cancelling"}]
+    jobs = []
+    for path in selected:
+        summary = storage.get_summary(scan_id, path, staged_summary_type("preliminary", "file")) or {}
+        stage = str(summary.get("analysis_stage") or summary.get("analysis_depth") or "").lower()
+        generated = str(summary.get("generated_by") or "").lower()
+        if stage in {"preliminary", "preliminary_document"} or generated == "model-preliminary-analysis":
+            continue
+        active_for_path = False
+        with storage._connect() as conn:
+            for row in conn.execute(
+                "SELECT id,options,status FROM analysis_jobs WHERE scan_id=? AND task_type='generate_summary' AND status IN ('queued','running','cancelling')",
+                (str(scan_id),),
+            ):
+                try:
+                    options = json.loads(row["options"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    options = {}
+                if str(options.get("workflow_source") or "") == "preliminary_model_summary" and str(options.get("path") or "") == path:
+                    active_for_path = True
+                    retained.append(str(row["id"]))
+                    break
+        if active_for_path:
+            continue
+        job_id, _created = storage.create_or_get_typed_job(
+            scan_id,
+            "generate_summary",
+            options={
+                "scan_id": scan_id,
+                "path": path,
+                "paths": None,
+                "kind": "file",
+                "force": True,
+                "analysis_level": "preview",
+                "workflow_source": "preliminary_model_summary",
+                "deep_batch_id": checkpoint.get("deep_batch_id"),
+            },
+            owner_id=owner_id or "legacy",
+        )
+        if job_id:
+            jobs.append(str(job_id))
+    all_ids = list(dict.fromkeys(retained + jobs))
+    if all_ids:
+        checkpoint["preliminary_summary_job_ids"] = all_ids
+        checkpoint["preliminary_summary_expected"] = len(all_ids)
+        checkpoint["preliminary_summary_completed"] = sum(1 for job_id in all_ids if states.get(job_id) == "completed")
+        checkpoint["selected_paths"] = list(dict.fromkeys(selected))
+        storage.transition_import_task(
+            scan_id,
+            "preliminary_summarizing",
+            checkpoint=checkpoint,
+        )
+        storage.set_package_processing_state(
+            scan_id, "preliminary_summarizing", "选中文件已解析，正在生成文件初步摘要。",
+        )
+    return all_ids
+def _queue_preliminary_node_summaries(scan_id, owner_id=None):
+    """Queue node-level preliminary summaries for the selected file scope only."""
+    task = storage.get_import_task(scan_id) or {}
+    if task.get("status") not in {"preliminary_summarizing", "preliminary_nodes"}:
+        return []
+    checkpoint = dict(task.get("checkpoint") or {})
+    selected = {
+        str(path) for path in (
+            checkpoint.get("selected_paths")
+            or checkpoint.get("deep_selected_paths")
+            or []
+        ) if str(path)
+    }
+    file_job_ids = [
+        str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or [])
+        if str(item)
+    ]
+    if not selected:
+        return []
+    if file_job_ids:
+        with storage._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(
+                    ",".join("?" for _ in file_job_ids)
+                ),
+                [str(scan_id)] + file_job_ids,
+            ).fetchall()
+        states = {str(row["id"]): str(row["status"] or "") for row in rows}
+        if any(states.get(job_id) != "completed" for job_id in file_job_ids):
+            return []
+    for path in selected:
+        summary = storage.get_summary(scan_id, path, staged_summary_type("preliminary", "file")) or {}
+        if (
+            str(summary.get("analysis_stage") or "").lower() != "preliminary"
+            and str(summary.get("generated_by") or "").lower()
+                != "model-preliminary-analysis"
+        ):
+            return []
+
+    analysis_tree = (storage.get_analysis(scan_id) or {}).get("analysis_tree") or {}
+    nodes = list((_build_candidate_preview_directory(scan_id) or {}).get("topics") or [])
+    seen = {str(node.get("node_id") or "") for node in nodes}
+    for node in _walk_analysis_nodes(analysis_tree):
+        node_id = str(node.get("node_id") or "")
+        members = node.get("member_paths") or node.get("source_paths") or []
+        if node_id and node_id not in seen and members:
+            nodes.append(node)
+            seen.add(node_id)
+
+    jobs = []
+    existing_job_ids = [
+        str(item) for item in (checkpoint.get("preliminary_node_job_ids") or [])
+        if str(item)
+    ]
+    for node in nodes:
+        node_id = str(node.get("node_id") or "")
+        members = {
+            str(path) for path in (
+                node.get("member_paths") or node.get("source_paths") or []
+            ) if str(path)
+        }
+        if not node_id or not members or not members.issubset(selected):
+            continue
+        node_path = "node:{}".format(node_id)
+        existing = storage.get_summary(scan_id, node_path, staged_summary_type("preliminary", "node")) or {}
+        existing_members = {str(path) for path in (existing.get("member_paths") or []) if str(path)}
+        if str(existing.get("analysis_stage") or "").lower() == "preliminary" and existing_members == members:
+            continue
+        job_id, _created = storage.create_or_get_typed_job(
+            scan_id,
+            "generate_summary",
+            options={
+                "scan_id": scan_id,
+                "node_id": node_id,
+                "node_name": node.get("name") or node.get("title") or "选中文件节点",
+                "member_paths": sorted(members),
+                "kind": "group",
+                "workflow_source": "preliminary_node_summary",
+                "analysis_level": "preview",
+            },
+            owner_id=owner_id or "legacy",
+        )
+        if job_id:
+            jobs.append(str(job_id))
+
+    node_job_ids = list(dict.fromkeys(existing_job_ids + jobs))
+    checkpoint["preliminary_node_job_ids"] = node_job_ids
+    checkpoint["preliminary_node_expected"] = len(node_job_ids)
+    storage.transition_import_task(
+        scan_id,
+        "preliminary_nodes",
+        checkpoint=checkpoint,
+    )
+    storage.set_package_processing_state(
+        scan_id, "preliminary_nodes",
+        "选中文件初步摘要已完成，正在生成对应节点初步摘要。",
+    )
+    return node_job_ids
+
+
+def _queue_preliminary_overview(scan_id, owner_id=None):
+    """Queue the selected-scope overview only after both preliminary layers settle."""
+    task = storage.get_import_task(scan_id) or {}
+    if task.get("status") not in {"preliminary_nodes", "preliminary_overview"}:
+        return None
+    checkpoint = dict(task.get("checkpoint") or {})
+    file_ids = [str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or []) if str(item)]
+    node_ids = [str(item) for item in (checkpoint.get("preliminary_node_job_ids") or []) if str(item)]
+    all_ids = file_ids + node_ids
+    if not all_ids:
+        return None
+    with storage._connect() as conn:
+        rows = conn.execute(
+            "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(",".join("?" for _ in all_ids)),
+            [str(scan_id)] + all_ids,
+        ).fetchall()
+    states = {str(row["id"]): str(row["status"] or "") for row in rows}
+    if any(states.get(job_id) != "completed" for job_id in all_ids):
+        return None
+    report_id = str(checkpoint.get("preliminary_overview_job_id") or "")
+    if report_id and states.get(report_id) == "completed":
+        return report_id
+    if report_id:
+        with storage._connect() as conn:
+            row = conn.execute("SELECT status FROM analysis_jobs WHERE id=? AND scan_id=?", (report_id, str(scan_id))).fetchone()
+        if row and str(row["status"] or "") in {"queued", "running", "cancelling", "completed"}:
+            return report_id
+    report_id, _created = storage.create_or_get_typed_job(
+        scan_id,
+        "generate_report",
+        options={"workflow_source": "preliminary_results_report", "selection_version": checkpoint.get("selection_version")},
+        owner_id=owner_id or "legacy",
+    )
+    checkpoint["preliminary_overview_job_id"] = report_id
+    storage.transition_import_task(
+        scan_id, "preliminary_overview", checkpoint=checkpoint,
+    )
+    storage.set_package_processing_state(
+        scan_id, "preliminary_overview", "文件和节点初步摘要已完成，正在生成选中范围情报概览。",
+    )
+    return report_id
+def _preliminary_chain_ready_for_idle(scan_id):
+    """The low-priority lane may start only after both preliminary layers settle."""
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = task.get("checkpoint") or {}
+    selected = [
+        str(path) for path in (
+            checkpoint.get("selected_paths")
+            or checkpoint.get("deep_selected_paths")
+            or []
+        ) if str(path)
+    ]
+    if not selected:
+        return False
+    ids = [
+        str(item) for item in (
+            checkpoint.get("preliminary_summary_job_ids") or []
+        ) if str(item)
+    ] + [
+        str(item) for item in (
+            checkpoint.get("preliminary_node_job_ids") or []
+        ) if str(item)
+    ]
+    if not ids:
+        return False
+    with storage._connect() as conn:
+        rows = conn.execute(
+            "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(
+                ",".join("?" for _ in ids)
+            ),
+            [str(scan_id)] + ids,
+        ).fetchall()
+    states = {str(row["id"]): str(row["status"] or "") for row in rows}
+    report_id = str(checkpoint.get("preliminary_overview_job_id") or "")
+    if not report_id:
+        return False
+    report_row = storage._connect()
+    with report_row as conn:
+        report = conn.execute("SELECT status FROM analysis_jobs WHERE id=? AND scan_id=?", (report_id, str(scan_id))).fetchone()
+    if not report or str(report["status"] or "") != "completed":
+        return False
+    return all(states.get(job_id) == "completed" for job_id in ids)
+
+
+def _queue_idle_deep_backfill(scan_id, owner_id=None):
+    """Queue every eligible logical file for low-priority deep analysis."""
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = task.get("checkpoint") or {}
+    selected_paths = [
+        str(path) for path in (
+            checkpoint.get("selected_paths")
+            or checkpoint.get("deep_selected_paths")
+            or []
+        ) if str(path)
+    ]
+    candidate_paths = [
+        str(path) for path in (checkpoint.get("candidate_paths") or []) if str(path)
+    ]
+    if selected_paths:
+        # New selection workflow: unselected inventory files are never promoted
+        # into model parsing or the overview/deep-summary chain.
+        if task.get("status") not in {"deep_summarizing_files", "deep_summarizing_nodes", "deep_update_available"}:
+            return None
+        if not _preliminary_chain_ready_for_idle(scan_id):
+            return None
+        candidate_paths = selected_paths
+    else:
+        # Preserve the legacy candidate flow until its explicit selection gate.
+        candidate_summaries = {
+            path: storage.get_summary(scan_id, path, "file") or {}
+            for path in candidate_paths
+        }
+        if any(
+            not item
+            or (
+                str(item.get("analysis_level") or "").lower() not in {"preview", "deep"}
+                and not bool(item.get("deep_analysis"))
+            )
+            for item in candidate_summaries.values()
+        ):
+            return None
+
+    scan_result = require_scan(scan_id)
+    inventory_paths = sorted(_inventory_by_path(scan_result))
+    paths = sorted(set(candidate_paths)) if selected_paths else (
+        inventory_paths or sorted(set(candidate_paths))
+    )
+    with storage._connect() as conn:
+        for row in conn.execute(
+            "SELECT options FROM analysis_jobs WHERE scan_id=? AND status IN "
+            "('queued','running')",
+            (str(scan_id),),
+        ):
+            try:
+                options = json.loads(row["options"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                options = {}
+            if str(options.get("workflow_source") or "") in {"idle_deep_backfill", "idle_deep_model_summary"}:
+                return None
+
+    deep_pending = []
+    for path in paths:
+        summary = (storage.get_summary(scan_id, path, staged_summary_type("deep", "file")) or {}) if selected_paths else (storage.get_summary(scan_id, path, "file") or {})
+        if not bool(summary.get("deep_analysis")):
+            deep_pending.append(path)
+    if not deep_pending:
+        if selected_paths:
+            _queue_deep_node_rebuilds(scan_id, owner_id)
+        return None
+    if selected_paths:
+        path = deep_pending[0]
+        job_id, _created = storage.create_or_get_typed_job(scan_id, "generate_summary", options={"scan_id": scan_id, "path": path, "kind": "file", "force": True, "analysis_level": "deep", "workflow_source": "idle_deep_model_summary"}, owner_id=owner_id or "legacy")
+        checkpoint = dict(task.get("checkpoint") or {})
+        job_ids = list(dict.fromkeys([*[str(item) for item in (checkpoint.get("deep_summary_job_ids") or []) if str(item)], str(job_id)]))
+        checkpoint.update({"deep_summary_job_ids": job_ids, "deep_summary_file_expected": len(selected_paths), "deep_summary_expected": len(selected_paths)})
+        storage.transition_import_task(scan_id, "deep_summarizing_files", checkpoint=checkpoint, reason="初步概览已完成，正在低优先级生成文件深度摘要。")
+        return job_id
+    job_id, _created = storage.create_or_get_typed_job(
+        scan_id, "analyze_package",
+        options={
+            "target_paths": deep_pending,
+            "workflow_source": "idle_deep_backfill",
+            "scope_label": "GPU 空闲时自动深度补析全部逻辑文件",
+            "parse_mode": "accurate",
+            "continue_full": False,
+            "idle_background": True,
+        },
+        owner_id=owner_id or "legacy",
+    )
+    return job_id
+
+
+def _is_persisted_deep_file_summary(summary):
+    """Return whether a file has a durable model-backed deep summary."""
+    summary = summary or {}
+    if not bool(summary.get("deep_analysis")):
+        return False
+    level = str(summary.get("analysis_level") or "").lower()
+    depth = str(summary.get("analysis_depth") or "").lower()
+    generated_by = str(summary.get("generated_by") or "").lower()
+    return bool(level == "deep" or depth in {"deep", "deep_document"} or generated_by == "model-deep-analysis")
+
+
+def _queue_deep_node_rebuilds(
+    scan_id, owner_id=None, batch_id=None, scope_paths=None, full_inventory=False
+):
+    """Queue one deep summary per stable semantic node in the current scope."""
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = dict(task.get("checkpoint") or {})
+    strict_selected = bool(checkpoint.get("selected_paths"))
+    deep_file_type = staged_summary_type("deep", "file") if strict_selected else "file"
+    deep_node_type = staged_summary_type("deep", "node") if strict_selected else "folder"
+    batch_id = "" if full_inventory else str(batch_id or checkpoint.get("deep_batch_id") or "")
+    selected = [str(path) for path in (scope_paths or []) if str(path)]
+    if full_inventory:
+        scan_result = require_scan(scan_id)
+        selected = sorted(_inventory_by_path(scan_result))
+    elif not selected:
+        selected = [str(path) for path in (checkpoint.get("deep_selected_paths") or checkpoint.get("selected_paths") or []) if str(path)]
+    if not selected:
+        # Legacy imports without a persisted selection use the complete inventory.
+        scan_result = require_scan(scan_id)
+        selected = sorted(_inventory_by_path(scan_result))
+    paths = set(selected)
+    if strict_selected and task.get("status") not in {"deep_summarizing_files", "deep_summarizing_nodes", "deep_update_available"}:
+        return []
+    all_files_ready = bool(paths) and all(
+        _is_persisted_deep_file_summary(storage.get_summary(scan_id, path, deep_file_type) or {})
+        for path in paths
+    )
+    if not paths or (not strict_selected and not all_files_ready):
+        return []
+
+    analysis_tree = (storage.get_analysis(scan_id) or {}).get("analysis_tree") or {}
+    nodes = []
+    seen = set()
+    for node in (_build_candidate_preview_directory(scan_id) or {}).get("topics") or []:
+        node_id = str(node.get("node_id") or "")
+        if node_id and node_id not in seen:
+            nodes.append(node)
+            seen.add(node_id)
+    for node in _walk_analysis_nodes(analysis_tree):
+        node_id = str(node.get("node_id") or "")
+        members = node.get("member_paths") or node.get("source_paths") or []
+        if node_id and members and node_id not in seen:
+            nodes.append(node)
+            seen.add(node_id)
+
+    jobs = []
+    for node in nodes:
+        members = {str(path) for path in (node.get("member_paths") or node.get("source_paths") or []) if str(path)}
+        if not members or not members.issubset(paths):
+            continue
+        # A node is eligible independently when all of its own selected files
+        # have deep summaries; unrelated selected files must not hold it back.
+        if any(
+            not _is_persisted_deep_file_summary(
+                storage.get_summary(scan_id, path, deep_file_type) or {}
+            )
+            for path in members
+        ):
+            continue
+        node_id = str(node.get("node_id") or "")
+        node_path = "node:{}".format(node_id)
+        existing = storage.get_summary(scan_id, node_path, deep_node_type) or {}
+        existing_members = {str(path) for path in (existing.get("member_paths") or []) if str(path)}
+        if str(existing.get("analysis_depth") or "") == "deep_folder" and bool(existing.get("deep_analysis")) and existing_members == members:
+            continue
+        job_id, _created = storage.create_or_get_typed_job(
+            scan_id,
+            "generate_summary",
+            options={
+                "scan_id": scan_id,
+                "node_id": node_id,
+                "node_name": node.get("name") or node.get("title") or "候选主题",
+                "kind": "group",
+                "workflow_source": "deep_node_rebuild",
+                "analysis_level": "deep",
+                "member_paths": sorted(members),
+                "deep_batch_id": batch_id or None,
+            },
+            owner_id=owner_id or "legacy",
+        )
+        if job_id:
+            jobs.append(str(job_id))
+
+    # Keep the import-task denominator equal to file summaries + node summaries.
+    if jobs and str(task.get("status") or "") in {"summarizing_files", "deep_summarizing_files", "deep_summarizing_nodes"}:
+        prior = [str(item) for item in (checkpoint.get("deep_summary_node_job_ids") or []) if str(item)]
+        node_job_ids = list(dict.fromkeys(prior + jobs))
+        checkpoint["deep_summary_node_job_ids"] = node_job_ids
+        file_expected = int(checkpoint.get("deep_summary_file_expected") or checkpoint.get("deep_summary_expected") or 0)
+        checkpoint["deep_summary_file_expected"] = file_expected
+
+        checkpoint["deep_summary_expected"] = file_expected + len(node_job_ids)
+        storage.update_import_task(scan_id, checkpoint=checkpoint)
+        if strict_selected and all_files_ready:
+            storage.transition_import_task(scan_id, "deep_summarizing_nodes", checkpoint=checkpoint, reason="文件深度摘要已完成，正在汇总节点深度摘要。")
+    if strict_selected and not jobs:
+        _mark_deep_update_available(scan_id)
+    return jobs
+
+def _mark_deep_update_available(scan_id):
+    """Expose completed deep evidence without applying it to user outputs."""
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = dict(task.get("checkpoint") or {})
+    selected = [str(path) for path in (checkpoint.get("selected_paths") or []) if str(path)]
+    if not selected or any(
+        not _is_persisted_deep_file_summary(
+            storage.get_summary(scan_id, path, staged_summary_type("deep", "file")) or {}
+        ) for path in selected
+    ):
+        return False
+    checkpoint["deep_summary_file_expected"] = len(selected)
+    node_job_ids = [str(item) for item in (checkpoint.get("deep_summary_node_job_ids") or []) if str(item)]
+    checkpoint["deep_summary_expected"] = len(selected) + len(node_job_ids)
+    storage.update_import_task(scan_id, checkpoint=checkpoint)
+    with storage._connect() as conn:
+        rows = conn.execute(
+            "SELECT options FROM analysis_jobs WHERE scan_id=? AND task_type='generate_summary' "
+            "AND status IN ('queued','running','cancelling')", (str(scan_id),)
+        ).fetchall()
+    for row in rows:
+        try:
+            source = str(json.loads(row["options"] or "{}").get("workflow_source") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            source = ""
+        if source in {"idle_deep_model_summary", "deep_node_rebuild"}:
+            return False
+    if str(task.get("status") or "") in {"deep_summarizing_files", "deep_summarizing_nodes", "deep_overview_updating"}:
+        storage.transition_import_task(
+            scan_id, "deep_update_available", checkpoint=checkpoint,
+
+            reason="深度摘要已就绪，等待用户选择是否按深度证据更新目录和情报概览。",
+        )
+    return True
+def _queue_large_selection_node_summary(scan_id, owner_id=None, current_job_id=None):
+    """Queue one node aggregation after a bounded model subset is complete."""
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = task.get("checkpoint") or {}
+    plan = checkpoint.get("selection_plan") or {}
+    if not checkpoint.get("large_selection") or not plan:
+        return None
+    node_id = str(plan.get("node_id") or "").strip()
+    model_paths = [str(path) for path in (plan.get("model_paths") or []) if str(path)]
+    if not node_id or not model_paths:
+        return None
+    # A model job writes either a model result or an explicit local fallback.
+    # Wait for durable summaries rather than ``deep_analysis`` alone, so one
+    # unavailable model cannot leave the node aggregation queued forever.
+    summaries = {
+        path: storage.get_summary(scan_id, path, "file") or {}
+        for path in model_paths
+    }
+    if any(not summaries[path] for path in model_paths):
+        with storage._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,options FROM analysis_jobs WHERE scan_id=? "
+                "AND task_type='generate_summary' AND status IN ('queued','running','cancelling')",
+                (str(scan_id),),
+            ).fetchall()
+        required = set(model_paths)
+        for row in rows:
+            if current_job_id and str(row["id"] or "") == str(current_job_id):
+                continue
+            try:
+                options = json.loads(row["options"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                options = {}
+            if str(options.get("workflow_source") or "") != "large_selection_model_summary":
+                continue
+            job_paths = set(str(path) for path in (options.get("paths") or []) if str(path))
+            if options.get("path"):
+                job_paths.add(str(options.get("path")))
+            if required.intersection(job_paths):
+                return None
+        return None
+    node = None
+    try:
+        node = _find_analysis_node(scan_id, node_id)
+    except ValueError:
+        node = {
+            "node_id": node_id,
+            "name": plan.get("label") or "大数据包选定类别",
+            "kind": "group",
+            "member_paths": model_paths,
+            "file_count": int(plan.get("selected_file_count") or len(model_paths)),
+            "member_paths_lazy": True,
+        }
+    declared_count = int(
+        node.get("file_count")
+        or plan.get("selected_file_count")
+        or len(model_paths)
+    )
+    job_id, _created = storage.create_or_get_typed_job(
+        scan_id,
+        "generate_summary",
+        options={
+            "scan_id": scan_id,
+            "node_id": node_id,
+            "node_name": node.get("name") or plan.get("label") or "选定类别",
+            "member_paths": model_paths,
+            "kind": "group",
+            "workflow_source": "deep_node_rebuild",
+            "analysis_level": "deep",
+            "selection_plan": plan,
+        },
+        owner_id=owner_id or "legacy",
+    )
+    # The selected-category node is a real deep-summary task and must be in
+    # the same denominator as its file summaries.
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = dict(task.get("checkpoint") or {})
+    if job_id and str(task.get("status") or "") == "summarizing_files":
+        node_job_ids = list(dict.fromkeys([
+            *[str(item) for item in (checkpoint.get("deep_summary_node_job_ids") or []) if str(item)],
+            str(job_id),
+        ]))
+        file_expected = int(checkpoint.get("deep_summary_file_expected") or checkpoint.get("deep_summary_expected") or 0)
+        checkpoint["deep_summary_file_expected"] = file_expected
+        checkpoint["deep_summary_node_job_ids"] = node_job_ids
+        checkpoint["deep_summary_expected"] = file_expected + len(node_job_ids)
+        storage.update_import_task(scan_id, checkpoint=checkpoint)
+    return job_id
+
+
 def _run_claimed_report_job(job):
     """Generate an on-demand overview report outside the HTTP request."""
     job_id = job["id"]
     scan_id = job["scan_id"]
     storage.update_job(job_id, progress=5, stage="generating_report", message="正在整理情况概览报告", heartbeat=True)
     _ensure_job_active(job_id)
-    report = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id)
+    workflow_source = str((job.get("options") or {}).get("workflow_source") or "")
+    summary_stage = "preliminary" if workflow_source == "preliminary_results_report" else ("deep" if workflow_source == "deep_results_report" else None)
+    report = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id, summary_stage=summary_stage)
     _ensure_job_active(job_id)
     return {"scan_id": scan_id, "overview": report}
 
 
 def _run_claimed_summary_job(job):
+    global llm
+    original_model = llm
+    options = job.get("options") or {}
+    if options.get("workflow_source") in {"idle_deep_model_summary", "deep_node_rebuild"}:
+        from services.import_checkpoint import CheckpointedModel
+        import hashlib
+        identity = {
+            "scan_id": str(job.get("scan_id") or ""),
+            "workflow_source": str(options.get("workflow_source") or ""),
+            "path": str(options.get("path") or ""),
+            "node_id": str(options.get("node_id") or ""),
+            "member_paths": sorted(str(path) for path in (options.get("member_paths") or []) if str(path)),
+        }
+        checkpoint_key = "import:" + hashlib.sha256(
+            json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        llm = CheckpointedModel(original_model, storage, checkpoint_key)
+    try:
+        return _execute_summary_job(job)
+    finally:
+        llm = original_model
+
+
+def _execute_summary_job(job):
     """Run an uncached model-backed node/document summary outside Flask HTTP."""
     job_id = job["id"]
     payload = dict(job.get("options") or {})
@@ -1349,6 +2760,301 @@ def _run_claimed_summary_job(job):
     # ContextVar below.
     payload.pop("_worker_execution", None)
     scan_id = job["scan_id"]
+    workflow_source = str(payload.get("workflow_source") or "")
+    preview_mode = (
+        str(payload.get("workflow_source") or "") == "candidate_preview_model_summary"
+        or (
+            str(payload.get("analysis_level") or "").lower() == "preview"
+            and not str(payload.get("node_id") or "").strip()
+            and workflow_source in {"candidate_preview_model_summary", "preliminary_model_summary"}
+        )
+    )
+    if preview_mode:
+        batch_paths = [str(path).strip() for path in (payload.get("paths") or []) if str(path).strip()]
+        if batch_paths:
+            storage.update_job(job_id, progress=5, stage="candidate_preview", message="正在批量生成候选文件预览摘要（{} 个）".format(len(batch_paths)), heartbeat=True)
+            documents = []
+            for path in batch_paths:
+                document = storage.get_document(scan_id, path)
+                if document:
+                    documents.append({"path": path, "document": document})
+            if not documents:
+                raise ValueError("候选文件尚未完成统一解析")
+            batch_result = {}
+            degraded_paths = []
+            try:
+                deadline = float(payload.get("candidate_deadline_at") or 0)
+                if deadline and time.time() >= deadline:
+                    raise TimeoutError("candidate preview batch deadline reached")
+                require_local_model_enabled()
+                batch_result, _ = analyze_document_previews_batch(
+                    llm, documents,
+                    max_chars=int(getattr(Config, "CANDIDATE_PREVIEW_BATCH_CHARS", 3200)),
+                    context_window_tokens=Config.LLM_CONTEXT_TOKENS,
+                    timeout_seconds=int(getattr(Config, "CANDIDATE_PREVIEW_TIMEOUT_SECONDS", 60)) * 2,
+                    output_tokens_per_file=int(getattr(Config, "CANDIDATE_PREVIEW_OUTPUT_TOKENS", 240)),
+                )
+            except Exception as batch_exc:
+                # A malformed/truncated batch response must not downgrade every
+                # useful file. Retry each document independently, then use the
+                # local parser fallback only for files whose individual model
+                # request also fails.
+                for item in documents:
+                    path, document = item["path"], item["document"]
+                    try:
+                        summary, _single_result = analyze_document_preview(
+                            llm, path, path, unified_document=document,
+                            max_chars=int(getattr(Config, "CANDIDATE_PREVIEW_BATCH_CHARS", 3200)),
+                            context_window_tokens=Config.LLM_CONTEXT_TOKENS,
+                            timeout_seconds=int(getattr(Config, "CANDIDATE_PREVIEW_TIMEOUT_SECONDS", 60)),
+                        )
+                        batch_result[path] = {"summary": summary}
+                        continue
+                    except Exception as item_exc:
+                        error = "批量预读失败：{}；单文件重试失败：{}".format(
+                            str(batch_exc)[:1200], str(item_exc)[:1200]
+                        )
+                    fallback = _local_document_fallback(document, path, error)
+                    fallback.update({"schema_version": 4, "summary_type": "file", "node_path": path,
+                        "analysis_level": "preview", "analysis_depth": "preview_document",
+                        "verification_status": "candidate", "preview_only": True,
+                        "claim_contract": "file-claims/preview-1.0", "file_conclusions": [],
+                        "file_arguments": [], "file_review_items": [{"type": "preview", "text": "快速模型预览未完成，当前为本地解析降级结果。", "status": "review"}],
+                        "generated_by": "local-preview-fallback", "deep_analysis": False})
+                    batch_result[path] = {"summary": fallback}
+                    degraded_paths.append(path)
+            saved = []
+            for item in documents:
+                path = item["path"]
+                summary = dict((batch_result.get(path) or {}).get("summary") or {})
+                summary.setdefault("node_path", path)
+                summary.setdefault("summary_type", "file")
+                summary.setdefault("analysis_level", "preview")
+                summary.setdefault("analysis_depth", "preview_document")
+                summary.setdefault("verification_status", "candidate")
+                summary.setdefault("preview_only", True)
+                summary.setdefault("deep_analysis", False)
+                summary.setdefault("generated_by", "model-preview-batch-analysis")
+                # Preliminary import summaries are a durable stage of the
+                # strict import state machine. Never put them in the legacy
+                # ``file`` slot, otherwise a later deep result can be hidden
+                # or overwritten by an old compatibility reader.
+                if workflow_source == "preliminary_model_summary":
+                    summary.update(_preview_claim_contract(
+                        summary, (item.get("document") or {}).get("evidence", [])
+                    ))
+                    summary.update({
+                        "analysis_stage": "preliminary",
+                        "analysis_depth": "preliminary_document",
+                        "verification_status": "preliminary",
+                        "preview_only": True,
+                        "file_review_items": [{
+                            "type": "preliminary",
+                            "text": "初步摘要已结合已解析内容和支撑原文；后续深度摘要将继续校验全文。",
+                            "status": "review",
+                        }],
+                    })
+                summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
+                storage.save_summary(
+                    scan_id,
+                    path,
+                    staged_summary_type("preliminary", "file")
+                    if workflow_source == "preliminary_model_summary" else "file",
+                    summary,
+                )
+                saved.append(path)
+            return {"scan_id": scan_id, "paths": saved, "degraded_paths": degraded_paths,
+                    "analysis_level": "preview", "workflow_source": "candidate_preview_model_summary"}
+        node_path = str(payload.get("path") or "").strip()
+        if not node_path:
+            raise ValueError("候选文件预览缺少文件路径")
+        storage.update_job(job_id, progress=5, stage="candidate_preview", message="正在生成候选文件预览摘要", heartbeat=True)
+        _ensure_job_active(job_id)
+        document = storage.get_document(scan_id, node_path)
+        if not document:
+            raise ValueError("候选文件尚未完成统一解析：{}".format(node_path))
+        try:
+            deadline = float(payload.get("candidate_deadline_at") or 0)
+            if deadline and time.time() >= deadline:
+                raise TimeoutError("candidate preview batch deadline reached")
+            require_local_model_enabled()
+            summary, result = analyze_document_preview(
+                llm, node_path, node_path, unified_document=document,
+                max_chars=int(getattr(Config, "CANDIDATE_PREVIEW_MAX_CHARS", 24000)),
+                context_window_tokens=Config.LLM_CONTEXT_TOKENS,
+                timeout_seconds=int(getattr(Config, "CANDIDATE_PREVIEW_TIMEOUT_SECONDS", 60)),
+            )
+            degraded = False
+        except Exception as exc:
+            summary = _local_document_fallback(document, node_path, str(exc)[:300])
+            summary.update({
+                "schema_version": 4,
+                "summary_type": "file",
+                "node_path": node_path,
+                "analysis_level": "preview",
+                "analysis_depth": "preview_document",
+                "verification_status": "candidate",
+                "preview_only": True,
+                "claim_contract": "file-claims/preview-1.0",
+                "file_conclusions": [],
+                "file_arguments": [],
+                "file_review_items": [{"type": "preview", "text": "快速模型预览未完成，当前为本地解析降级结果。", "status": "review"}],
+                "generated_by": "local-preview-fallback",
+                "deep_analysis": False,
+            })
+            result = {"model": None, "usage": {}}
+            degraded = True
+        summary["node_path"] = node_path
+        summary["summary_type"] = "file"
+        if str(payload.get("workflow_source") or "") == "preliminary_model_summary":
+            summary.update({
+                "generated_by": "model-preliminary-analysis" if not degraded
+                    else "local-preliminary-fallback",
+                "analysis_stage": "preliminary",
+                "analysis_depth": "preliminary_document",
+                "analysis_level": "preview",
+                "verification_status": "preliminary",
+                "preview_only": True,
+                "deep_analysis": False,
+                "file_review_items": [{
+                    "type": "preliminary",
+                    "text": "初步摘要已结合已解析内容和支撑原文；后续深度摘要将继续校验全文。",
+                    "status": "review",
+                }],
+            })
+        summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
+        if str(payload.get("workflow_source") or "") == "preliminary_model_summary":
+            storage.save_summary(scan_id, node_path, staged_summary_type("preliminary", "file"), summary)
+        else:
+            storage.save_summary(scan_id, node_path, "file", summary)
+        _ensure_job_active(job_id)
+        return {
+            "scan_id": scan_id,
+            "summary": summary,
+            "cached": False,
+            "degraded": degraded,
+            "analysis_level": "preview",
+            "path": node_path,
+            "workflow_source": str(
+                payload.get("workflow_source") or "candidate_preview_model_summary"
+            ),
+        }
+    # Manual selections and their initial model summaries are foreground work.
+    # Only the idle deep-summary lane may yield to another queued model task.
+    if str(payload.get("workflow_source") or "") in {"idle_deep_model_summary", "deep_node_rebuild"} and storage.has_queued_job_above_priority(10):
+        return {"_defer_slice": True, "_defer_seconds": 1, "_defer_message": "检测到前台模型请求，后台深度摘要让路并保存检查点。", "scan_id": scan_id}
+    if str(payload.get("workflow_source") or "") in {
+        "candidate_node_summary", "preliminary_node_summary", "deep_node_rebuild"
+    }:
+        node_id = str(payload.get("node_id") or "").strip()
+        plan = dict(payload.get("selection_plan") or {})
+        if not plan:
+            task = storage.get_import_task(scan_id) or {}
+            plan = dict((task.get("checkpoint") or {}).get("selection_plan") or {})
+        try:
+            node = _find_analysis_node(scan_id, node_id)
+        except ValueError:
+            # Candidate IDs are content-derived and can change when the parser
+            # refreshes file topics. Keep queued work executable by carrying
+            # concrete member paths in the job payload.
+            member_paths = [str(path) for path in (payload.get("member_paths") or []) if str(path)]
+            if not member_paths:
+                raise
+            node = {
+                "node_id": node_id,
+                "kind": "group",
+                "name": payload.get("node_name") or "候选主题",
+                "member_paths": sorted(set(member_paths)),
+                "file_count": len(set(member_paths)),
+            }
+        summary_stage = "deep" if str(payload.get("workflow_source") or "") == "deep_node_rebuild" else (
+            "preliminary" if str(payload.get("workflow_source") or "") == "preliminary_node_summary" else None
+        )
+        context = _virtual_node_context(scan_id, node, summary_stage=summary_stage)
+        declared_count = int(
+            node.get("file_count")
+            or plan.get("selected_file_count")
+            or context.get("category_file_count")
+            or len(context.get("member_paths") or [])
+        )
+        if not context.get("file_summaries_complete"):
+            raise ValueError("候选节点仍有文件摘要未完成，不能生成节点摘要")
+        storage.update_job(job_id, progress=10, stage="candidate_node_summary", message="正在汇总 {} 个文件摘要生成节点摘要".format(context.get("file_summary_count") or 0), heartbeat=True)
+        workflow_source = str(payload.get("workflow_source") or "")
+        is_deep_node = workflow_source == "deep_node_rebuild"
+        is_preliminary_node = workflow_source == "preliminary_node_summary"
+        context["analysis_level"] = "deep" if is_deep_node else "preview"
+        generated, result, errors = analyze_folder(llm, context, node.get("name") or "node:{}".format(node_id))
+        generated.update({
+            "node_path": "node:{}".format(node_id), "summary_type": "folder", "schema_version": 4,
+            # Evidence is scoped to the model subset, while the displayed
+            # category count remains the full selected category count.
+            "member_paths": context.get("member_paths") or [], "file_count": declared_count,
+            "member_paths_lazy": bool(node.get("member_paths_lazy") or plan.get("schema_version")),
+            "total_size": int(
+                node.get("total_bytes")
+                or node.get("total_size")
+                or plan.get("selected_bytes")
+                or 0
+            ),
+            "selection_plan": plan,
+            "generated_by": (
+                "model-deep-analysis" if is_deep_node and result.get("model")
+                else (
+                    "model-preliminary-node-summary" if is_preliminary_node and result.get("model")
+                    else (
+                        "model-preview-node-summary" if result.get("model")
+                        else "local-fallback"
+                    )
+                )
+            ),
+            "workflow_source": workflow_source or "candidate_node_summary",
+            "analysis_stage": "preliminary" if is_preliminary_node else (
+                "deep" if is_deep_node else "candidate"
+            ),
+            "analysis_level": "deep" if is_deep_node else "preview",
+            "analysis_depth": (
+                "deep_folder" if is_deep_node
+                else ("preliminary_node" if is_preliminary_node else "preview_folder")
+            ),
+            "deep_analysis": bool(is_deep_node and context.get("deep_file_summaries_complete")),
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "parser_info": {"local_model": result.get("model"), "usage": result.get("usage") or {},
+                            "file_summary_count": context.get("file_summary_count") or 0,
+                            "file_summaries_complete": bool(context.get("file_summaries_complete")),
+                            "batch_errors": errors, "degraded": bool(errors or not result.get("model"))},
+        })
+        generated["coverage"] = {
+            **dict(generated.get("coverage") or {}),
+            "category_file_count": declared_count,
+            "selected_scope_files": int(plan.get("selected_file_count") or declared_count),
+            "analyzed_scope_files": len(context.get("member_paths") or []),
+            "deep_analyzed_files": sum(
+                1 for item in (context.get("file_summaries") or [])
+                if item.get("deep_ready")
+            ),
+            "members_materialized": False if (node.get("member_paths_lazy") or plan.get("schema_version")) else True,
+            "scope_limited": bool(node.get("member_paths_lazy") or plan.get("schema_version")),
+            "claim_scope": "模型结论仅适用于选定范围内已进入模型的文件；类别计数覆盖完整类别清单。",
+            "verification_status": (
+                "verified" if is_deep_node and not errors and result.get("model")
+                else "partial"
+            ),
+        }
+        if is_preliminary_node:
+            storage.save_summary(scan_id, generated["node_path"], staged_summary_type("preliminary", "node"), generated)
+        elif is_deep_node:
+            storage.save_summary(scan_id, generated["node_path"], staged_summary_type("deep", "node"), generated)
+        else:
+            storage.save_summary(scan_id, generated["node_path"], "folder", generated)
+        return {"scan_id": scan_id, "node_id": node_id, "summary": generated,
+                "workflow_source": str(payload.get("workflow_source") or "candidate_node_summary"),
+                "degraded": bool(errors or not result.get("model"))}
+    workflow_source = str(payload.get("workflow_source") or "")
+    # The selected-file model pass is foreground work. Only automatic idle
+    # deep summaries are cooperative and may be deferred here.
+    if workflow_source in {"idle_deep_model_summary", "idle_deep_backfill"} and storage.has_queued_job_above_priority(10):
+        return {"_defer_slice": True, "_defer_seconds": 1, "_defer_message": "检测到前台模型请求，空闲深度补析已让路并保存检查点。", "scan_id": scan_id}
     storage.update_job(job_id, progress=5, stage="generating_summary", message="正在生成当前节点深度摘要", heartbeat=True)
     _ensure_job_active(job_id)
     # Reuse the established summary implementation under an isolated request
@@ -1371,6 +3077,24 @@ def _run_claimed_summary_job(job):
     if status_code >= 400 or not data or not data.get("ok"):
         raise ValueError((data or {}).get("error") or "摘要生成失败")
     _ensure_job_active(job_id)
+    # A deep batch item is closed only after the corresponding file summary
+    # has been durably written, not merely after source parsing finished.
+    deep_batch_id = str(payload.get("deep_batch_id") or "")
+    if deep_batch_id and str(payload.get("kind") or "file") == "file":
+        deep_path = str(payload.get("path") or "").strip()
+        if deep_path:
+            storage.update_deep_parse_item(
+                deep_batch_id, deep_path, "completed",
+                parser_plan={"mode": "accurate", "summary": "completed"},
+            )
+            storage.sync_import_queues(scan_id)
+    if str(payload.get("workflow_source") or "") == "large_selection_model_summary":
+        # The node is deliberately queued only after the last model file
+        # summary is durable. Its context then consists of file summaries and
+        # their evidence, never a fresh read of the whole selected category.
+        _queue_large_selection_node_summary(
+            scan_id, owner_id=job.get("owner_id") or "legacy", current_job_id=job_id
+        )
     return {
         "scan_id": scan_id,
         "summary": data.get("summary"),
@@ -1386,6 +3110,10 @@ def _run_claimed_export_job(job):
     job_id = job["id"]
     scan_id = job["scan_id"]
     options = job.get("options") or {}
+    if options.get("deep_batch_id"):
+        batch_paths = storage.deep_parse_batch_paths(options.get("deep_batch_id"))
+        if batch_paths:
+            options["target_paths"] = batch_paths
     scan_result = require_scan(scan_id)
     storage.update_job(job_id, progress=3, stage="preparing_export", message="正在准备待整编节点和证据", heartbeat=True)
     _ensure_job_active(job_id)
@@ -1477,6 +3205,8 @@ def _run_claimed_analysis_job(job):
     options = job.get("options") or {}
     scan_result = require_scan(scan_id)
     storage.ensure_package_processing_control(scan_id)
+    preprocess_stage = bool(options.get("preprocess_only"))
+    idle_background = bool(options.get("idle_background"))
     pause_exempt = str(options.get("workflow_source") or "") == "question_promotion"
     if storage.package_processing_paused(scan_id) and not pause_exempt:
         storage.cancel_job(job_id)
@@ -1494,16 +3224,16 @@ def _run_claimed_analysis_job(job):
         return start + int((end - start) * value / 95.0)
 
     storage.update_job(
-        job_id, progress=max(mapped_progress(1), int(job.get("progress") or 0)), stage="analyzing", heartbeat=True,
+        job_id, progress=max(mapped_progress(1), int(job.get("progress") or 0)), stage="preprocessing" if preprocess_stage else "analyzing", heartbeat=True,
         message=("开始补充分析：{}".format(scope_label) if scope_label else "开始本地完整分析"),
-        current_stage="分析准备",
+        current_stage="全量轻度解析" if preprocess_stage else "分析准备",
         current_file=scope_label or "",
     )
     try:
         _publish_analysis_progress(
             scan_id, scan_result, mapped_progress(1),
-            "开始补充分析：{}".format(scope_label) if scope_label else "目录清点完成，开始内容解析",
-            stage="analysis_preparing",
+            ("GPU 空闲时自动深度补析：{}".format(scope_label) if idle_background else ("开始补充分析：{}".format(scope_label) if scope_label else "目录清点完成，开始内容解析")),
+            stage="preprocessing" if preprocess_stage else "analysis_preparing",
         )
     except Exception:
         logger.warning("发布渐进分析概览失败 scan_id=%s", scan_id, exc_info=True)
@@ -1514,8 +3244,8 @@ def _run_claimed_analysis_job(job):
         _ensure_job_active(job_id)
         visible_percent = mapped_progress(percent)
         storage.update_job(
-            job_id, progress=visible_percent, stage="analyzing", message=message, heartbeat=True,
-            current_stage="解析与分析",
+            job_id, progress=visible_percent, stage="preprocessing" if preprocess_stage else "analyzing", message=message, heartbeat=True,
+            current_stage="轻度解析" if preprocess_stage else "解析与分析",
             current_file=str(message or "")[-500:],
         )
         bucket = max(0, int(visible_percent) // 5)
@@ -1541,6 +3271,44 @@ def _run_claimed_analysis_job(job):
         )
         else None
     )
+    deep_batch_id = str(options.get("deep_batch_id") or "")
+    workflow_source = str(options.get("workflow_source") or "")
+    selected_file_parse = workflow_source == "selected_file_parse"
+    if not preprocess_stage and not selected_file_parse:
+        requested_paths = [str(path) for path in (options.get("target_paths") or []) if str(path)]
+        if not deep_batch_id and requested_paths:
+            deep_batch_id = storage.create_deep_parse_batch(
+                scan_id, requested_paths, created_by="worker",
+                selection_rule={"kind": str(options.get("workflow_source") or "worker")},
+                priority=int(job.get("priority") or 50),
+            )
+            options["deep_batch_id"] = deep_batch_id
+        if deep_batch_id:
+            storage.update_deep_parse_batch(deep_batch_id, "running")
+            options["target_paths"] = storage.deep_parse_batch_paths(deep_batch_id)
+            for path in options.get("target_paths") or []:
+                storage.update_deep_parse_item(
+                    deep_batch_id, path, "running",
+                    parser_plan={"mode": options.get("parse_mode") or "accurate"},
+                )
+    if selected_file_parse:
+        storage.transition_import_task(scan_id, "parsing_selected", reason="正在解析选中的文件。")
+    else:
+        storage.update_import_task(scan_id, status="previewing" if preprocess_stage else "deep_parsing", phase="preprocessing" if preprocess_stage else "deep_parsing")
+    # Candidate import and deep import share the parser checkpoint, but their
+    # model products are deliberately different. Candidate files receive one
+    # bounded preview call; deep files receive the full source-backed summary.
+    workflow_source = str(options.get("workflow_source") or "")
+    candidate_preview = workflow_source == "candidate_preview"
+    large_selection = workflow_source == "large_selection"
+    selected_deep_paths = [] if candidate_preview else [str(path) for path in (options.get("target_paths") or []) if str(path)]
+    candidate_preview_paths = [str(path) for path in (options.get("target_paths") or []) if str(path)] if candidate_preview else []
+    model_summary_paths = [
+        str(path) for path in (options.get("model_summary_paths") or [])
+        if str(path) in set(selected_deep_paths)
+    ] if large_selection else []
+    deep_summary_job_ids = []
+    candidate_preview_job_ids = []
     analysis = analyze_package(
         scan_id, scan_result, storage, parser, progress,
         embedding_client=_package_embedding_client,
@@ -1565,13 +3333,192 @@ def _run_claimed_analysis_job(job):
         ),
         aggregation_depth=int(options.get("continuation_depth") or 0),
         aggregation_interval=3,
+        preprocess_only=bool(options.get("preprocess_only")),
+        selection_plan=options.get("selection_plan") if large_selection else None,
     )
+    if selected_file_parse and not analysis.get("_slice_incomplete"):
+        storage.transition_import_task(scan_id, "parsed_overview", reason="选中文件已解析，正在生成解析版智能目录和情报概览。")
+        _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id, summary_stage="parsed")
+    # Large directory preprocessing is followed by a bounded representative
+    # model pass. It stops at the selection gate and never queues deep
+    # backfill automatically.
+    auto_candidate_preview = bool(analysis.get("_await_candidate_preview"))
+    if auto_candidate_preview:
+        candidate_preview = True
+        candidate_preview_paths = [
+            str(path) for path in (analysis.get("candidate_paths") or []) if str(path)
+        ]
+    # Parsing is only the middle of the import workflow. Queue one bounded
+    # model job per candidate/deep file and keep the durable task in the
+    # matching phase until those jobs are finalized.
+    summary_paths = (
+        candidate_preview_paths
+        or (model_summary_paths if large_selection else selected_deep_paths)
+    )
+    if candidate_preview:
+        summary_source = "candidate_preview_model_summary"
+    elif large_selection:
+        summary_source = "large_selection_model_summary"
+    elif workflow_source in {"manual_selection", "selected_file_parse"}:
+        # The first model pass after selection is a bounded preliminary
+        # summary. Full deep summaries are scheduled only after the preliminary
+        # file and node layers settle.
+        summary_source = "preliminary_model_summary"
+    elif workflow_source == "idle_deep_backfill":
+        summary_source = "idle_deep_model_summary"
+    else:
+        summary_source = "deep_parse_model_summary"
+    summary_analysis_level = (
+        "preview"
+        if candidate_preview or summary_source == "preliminary_model_summary"
+        else "deep"
+    )
+    if summary_paths and not analysis.get("_slice_incomplete"):
+        batch_size = max(1, min(8, int(getattr(Config, "CANDIDATE_PREVIEW_BATCH_SIZE", 4)))) if candidate_preview else 1
+        for offset in range(0, len(summary_paths), batch_size):
+            path_batch = summary_paths[offset:offset + batch_size]
+            summary_job_id, _created = storage.create_or_get_typed_job(
+                scan_id,
+                "generate_summary",
+                options={
+                    "scan_id": scan_id,
+                    "path": path_batch[0] if len(path_batch) == 1 else None,
+                    "paths": path_batch if candidate_preview else None,
+                    "kind": "file",
+                    "force": True,
+                    "analysis_level": summary_analysis_level,
+                    "workflow_source": summary_source,
+                    "candidate_deadline_at": options.get("candidate_deadline_at"),
+                    "deep_batch_id": deep_batch_id if not candidate_preview else None,
+                    "selection_plan": options.get("selection_plan") if large_selection else None,
+                },
+                owner_id=job.get("owner_id") or "legacy",
+            )
+            if candidate_preview:
+                candidate_preview_job_ids.append(summary_job_id)
+            else:
+                deep_summary_job_ids.append(summary_job_id)
+
+    if candidate_preview_job_ids:
+        import_task = storage.get_import_task(scan_id) or {}
+        checkpoint = dict(import_task.get("checkpoint") or {})
+        checkpoint.update({
+            "candidate_preview_job_ids": list(candidate_preview_job_ids),
+            "candidate_preview_expected": len(candidate_preview_paths),
+            "candidate_preview_batches": len(candidate_preview_job_ids),
+            "candidate_preview_batch_size": int(getattr(Config, "CANDIDATE_PREVIEW_BATCH_SIZE", 4)),
+            "candidate_paths": list(candidate_preview_paths),
+            "selection_version": options.get("selection_version"),
+        })
+        storage.update_import_task(
+            scan_id,
+            status="candidate_analyzing",
+            phase="candidate_analyzing",
+            checkpoint=checkpoint,
+        )
+    elif summary_source == "preliminary_model_summary" and deep_summary_job_ids:
+        import_task = storage.get_import_task(scan_id) or {}
+        checkpoint = dict(import_task.get("checkpoint") or {})
+        prior_ids = [str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or []) if str(item)]
+        merged_ids = list(dict.fromkeys([*prior_ids, *deep_summary_job_ids]))
+        checkpoint.update({
+            "preliminary_summary_job_ids": merged_ids,
+            "preliminary_summary_expected": len(merged_ids),
+            "preliminary_summary_completed": 0,
+            "preliminary_node_job_ids": list(dict.fromkeys(
+                str(item) for item in (checkpoint.get("preliminary_node_job_ids") or []) if str(item)
+            )),
+            "selected_paths": list(dict.fromkeys([
+                *(checkpoint.get("selected_paths") or []), *selected_deep_paths
+            ])),
+            "selection_version": options.get("selection_version") or checkpoint.get("selection_version"),
+        })
+        storage.transition_import_task(
+            scan_id, "preliminary_summarizing", checkpoint=checkpoint,
+            reason="选中文件已解析，正在生成文件初步摘要。",
+        )
+    elif deep_summary_job_ids:
+        import_task = storage.get_import_task(scan_id) or {}
+        checkpoint = dict(import_task.get("checkpoint") or {})
+        prior_file_job_ids = [str(item) for item in (checkpoint.get("deep_summary_job_ids") or []) if str(item)]
+        merged_file_job_ids = list(dict.fromkeys([*prior_file_job_ids, *deep_summary_job_ids]))
+        prior_node_job_ids = [str(item) for item in (checkpoint.get("deep_summary_node_job_ids") or []) if str(item)]
+        checkpoint.update({
+            "deep_summary_job_ids": merged_file_job_ids,
+            "deep_summary_file_expected": len(merged_file_job_ids),
+            "deep_summary_node_job_ids": prior_node_job_ids,
+            "deep_summary_expected": len(merged_file_job_ids) + len(prior_node_job_ids),
+            "deep_batch_id": deep_batch_id or checkpoint.get("deep_batch_id"),
+            "selected_paths": list(dict.fromkeys([*(checkpoint.get("selected_paths") or []), *selected_deep_paths])),
+            "model_summary_paths": list(dict.fromkeys([*(checkpoint.get("model_summary_paths") or []), *model_summary_paths])),
+            "large_selection": large_selection or bool(checkpoint.get("large_selection")),
+            "selection_plan": options.get("selection_plan") if large_selection else checkpoint.get("selection_plan"),
+            "selection_version": options.get("selection_version") or checkpoint.get("selection_version"),
+        })
+        storage.update_import_task(
+            scan_id,
+            status="summarizing_files",
+            phase="summarizing_files",
+            checkpoint=checkpoint,
+        )
+
+    try:
+        storage.sync_import_queues(scan_id)
+        storage.refresh_import_task_counts(scan_id)
+        if deep_batch_id:
+            storage.update_deep_parse_batch(deep_batch_id, "running")
+            storage.sync_import_queues(scan_id)
+            counts = storage.deep_parse_batch_counts(deep_batch_id)
+            if not counts or counts.get("queued", 0) + counts.get("running", 0) + counts.get("retryable", 0) == 0:
+                storage.update_deep_parse_batch(
+                    deep_batch_id,
+                    "failed" if counts.get("failed", 0) else "completed",
+                )
+    except Exception:
+        logger.warning("同步导入队列状态失败 scan_id=%s", scan_id, exc_info=True)
     if analysis.get("_slice_incomplete"):
         return {
             "_requeue_slice": True,
             "_requeue_message": "轻量预览与哈希检查点已保存，等待下一轮继续。",
             "scan_id": scan_id,
         }
+    if summary_source == "preliminary_model_summary" and deep_summary_job_ids:
+        storage.set_package_processing_state(
+            scan_id, "preliminary_summarizing",
+            "选中文件已完成解析，正在生成文件初步摘要。",
+        )
+        storage.update_analysis_progress_status(
+            scan_id, "preliminary_summarizing",
+            "正在生成文件初步摘要，完成后生成节点初步摘要。",
+            "preliminary_summarizing",
+        )
+        return {
+            "scan_id": scan_id,
+            "preliminary_summary_job_ids": deep_summary_job_ids,
+            "selected_paths": selected_deep_paths,
+        }
+    if candidate_preview:
+        # Candidate parsing is complete; preview summary jobs will move the
+        # task to waiting_for_deep_selection after the Worker finalizes them.
+        if candidate_preview_job_ids:
+            storage.set_package_processing_state(scan_id, "candidate_analyzing", "候选文件已解析，正在生成初步摘要和目录。")
+            storage.update_analysis_progress_status(scan_id, "candidate_analyzing", "候选文件已解析，正在生成初步摘要和目录。", "candidate_analyzing")
+        else:
+            storage.update_import_task(scan_id, status="waiting_for_deep_selection", phase="waiting_for_deep_selection")
+        return {"scan_id": scan_id, "candidate_preview_job_ids": candidate_preview_job_ids, "candidate_paths": candidate_preview_paths}
+    if analysis.get("_await_selection"):
+        storage.refresh_import_task_counts(scan_id)
+        storage.update_import_task(scan_id, status="waiting_for_selection", phase="waiting_for_selection")
+        storage.set_package_processing_state(scan_id, "awaiting_selection", "文件已完成预处理，等待用户确认分析范围。")
+        storage.update_analysis_progress_status(
+            scan_id, "awaiting_selection", "文件已扫描并完成预处理，等待用户确认分析范围。", "awaiting_selection",
+        )
+        storage.update_job(
+            job_id, progress=95, stage="awaiting_selection",
+            message="文件已扫描并完成预处理，等待用户确认分析范围。",
+            current_stage="等待确认分析范围", current_file="",
+        )
+        return {"scan_id": scan_id, "_await_selection": True}
     _ensure_job_active(job_id)
     workflow = analysis.get("workflow") or {}
     large_enabled = bool(((analysis.get("policy") or {}).get("large_package") or {}).get("enabled"))
@@ -1627,9 +3574,13 @@ def _run_claimed_analysis_job(job):
     # overview needlessly expensive and delays question-triggered promotion.
     # Publish the report after the priority chain, while background/question
     # slices remain visible through progressive analysis and coverage APIs.
-    if not continuation_job_id and report_source not in {
-        "background_backfill", "question_promotion",
-    }:
+    if (
+        not continuation_job_id
+        and not deep_summary_job_ids
+        and report_source not in {
+            "background_backfill", "question_promotion", "large_selection",
+        }
+    ):
         storage.update_job(job_id, progress=96, stage="generating_report", message="自动生成情况概览 Word", heartbeat=True)
         overview = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id)
     processing = _package_processing_status(scan_id, scan_result) if large_enabled else None
@@ -1646,6 +3597,11 @@ def _run_claimed_analysis_job(job):
                 )
             storage.set_package_processing_state(
                 scan_id, "completed", "全部有效逻辑文件已完成并完成全局校准。"
+            )
+        elif report_source == "large_selection":
+            storage.set_package_processing_state(
+                scan_id, "paused",
+                "选中范围已完成正常解析，等待模型摘要完成后点击更新深度结果。",
             )
         elif not continue_full:
             storage.set_package_processing_state(
@@ -1676,6 +3632,37 @@ def _run_claimed_analysis_job(job):
             owner_id=job.get("owner_id") or "legacy",
         )
         translation_job_ids.append(translation_job_id)
+    # A scan may span several durable analysis slices. The final slice must
+    # close the progressive card; otherwise the browser keeps polling an old
+    # 95% ``running`` payload after the queue job itself has completed.
+    if not continuation_job_id and not background_job_id:
+        final_processing = (
+            _package_processing_status(scan_id, scan_result)
+            if large_enabled else None
+        )
+        final_status = "paused" if (
+            final_processing and final_processing.get("state") == "paused"
+        ) else "completed"
+        final_message = (
+            final_processing.get("message")
+            if final_status == "paused" and final_processing else
+            "数据分析、结构化摘要和报告已完成"
+        )
+        final_progress = storage.update_analysis_progress_status(
+            scan_id, final_status, final_message, final_status,
+        )
+        if final_status == "completed":
+            final_progress["progress"] = 100
+            final_progress["stage"] = "completed"
+            storage.save_analysis_progress(scan_id, final_progress)
+    if (
+        not continuation_job_id
+        and not background_job_id
+        and not analysis.get("_await_selection")
+        and not deep_summary_job_ids
+    ):
+        storage.refresh_import_task_counts(scan_id)
+        storage.update_import_task(scan_id, status="completed", phase="completed")
     return {
         "scan_id": scan_id,
         "analysis": analysis.get("statistics", {}),
@@ -1687,6 +3674,7 @@ def _run_claimed_analysis_job(job):
         "analysis_turn_continuation": analysis_turn_continuation,
         "continuation_job_id": continuation_job_id,
         "background_job_id": background_job_id,
+        "deep_summary_job_ids": deep_summary_job_ids,
         "processing": _package_processing_status(scan_id, scan_result) if large_enabled else None,
     }
 
@@ -2294,8 +4282,8 @@ def _run_claimed_homogeneous_analysis_job(job):
     require_scan(scan_id)
     storage.update_job(
         job_id, progress=8, stage="detecting_schema",
-        message="正在识别公共字段和同构结构",
-        current_stage="同构结构检测", heartbeat=True,
+        message="正在识别邮件头、正文、附件和公共字段",
+        current_stage="邮件内容预处理", heartbeat=True,
     )
     _ensure_job_active(job_id)
     total_documents = max(1, int(storage.count_documents(scan_id) or 0))
@@ -2331,8 +4319,8 @@ def _run_claimed_homogeneous_analysis_job(job):
             job_id,
             progress=progress,
             stage="extracting_structured_records",
-            message="正在提取同构字段：已检查 {} 份，可用 {} 份".format(overall_scanned, scanned_offset + usable),
-            current_stage="同构字段提取",
+            message="正在提取邮件信号：已检查 {} 份，可用 {} 份".format(overall_scanned, scanned_offset + usable),
+            current_stage="邮件信号提取",
             current_file="",
             heartbeat=True,
         )
@@ -2373,13 +4361,13 @@ def _run_claimed_homogeneous_analysis_job(job):
             job_id,
             progress=min(78, 8 + int((scanned_offset / total_documents) * 68)),
             stage="checkpointed",
-            message="检测到交互式任务，已保存同构字段检查点并让出处理资源",
-            current_stage="同构分析检查点",
+            message="检测到交互式任务，已保存邮件分析检查点并让出处理资源",
+            current_stage="邮件分析检查点",
             heartbeat=True,
         )
         return {
             "_requeue_slice": True,
-            "_requeue_message": "同构分析已保存 {} 份记录，优先处理交互式任务后自动继续。".format(
+            "_requeue_message": "邮件分析已保存 {} 份记录，优先处理交互式任务后自动继续。".format(
                 scanned_offset
             ),
             "scan_id": scan_id,
@@ -2409,6 +4397,8 @@ def _run_claimed_homogeneous_analysis_job(job):
         "relationship_count": counts["relations"],
         "case_count": counts["cases"],
         "anomaly_count": counts["anomalies"],
+        "entity_count": int((result.get("metrics") or {}).get("unique_entity_count") or 0),
+        "communication_pair_count": int((result.get("metrics") or {}).get("communication_pair_count") or 0),
     }
 
 
@@ -2439,7 +4429,16 @@ def _run_claimed_translation_job(job):
     phase = str(options.get("phase") or "preview_and_priority")
     cursor = max(0, int(options.get("cursor") or 0))
     slice_no = max(0, int(options.get("slice") or 0))
-    paths, large = _translation_candidate_paths(scan_id, phase)
+    selected_only = bool(options.get("selected_only"))
+    if selected_only:
+        paths = list(dict.fromkeys(
+            str(path) for path in (options.get("target_paths") or []) if str(path)
+        ))
+        large = bool(
+            (((storage.get_analysis(scan_id) or {}).get("policy") or {}).get("large_package") or {}).get("enabled")
+        )
+    else:
+        paths, large = _translation_candidate_paths(scan_id, phase)
     batch_size = Config.TRANSLATION_PACKAGE_BATCH_FILES
     current = paths[cursor:cursor + batch_size]
     storage.update_job(
@@ -2453,7 +4452,7 @@ def _run_claimed_translation_job(job):
         _ensure_job_active(job_id)
         try:
             state = (storage.get_file_state(scan_id, node_path) or {}).get("status")
-            if phase == "deep_backfill" and state != "completed":
+            if (phase == "deep_backfill" or (selected_only and options.get("require_full", True))) and state != "completed":
                 _promote_for_translation(scan_id, scan_result, node_path, job_id)
                 state = "completed"
             source_level = "full" if state == "completed" else "preview"
@@ -2474,7 +4473,7 @@ def _run_claimed_translation_job(job):
 
     next_cursor = cursor + len(current)
     continuation_job_id = None
-    if phase == "deep_backfill" and len(current) < len(paths):
+    if not selected_only and phase == "deep_backfill" and len(current) < len(paths):
         continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
             scan_id, "translate_package",
             # The remaining-candidate set shrinks after every successful
@@ -2483,7 +4482,7 @@ def _run_claimed_translation_job(job):
             owner_id=job.get("owner_id") or "legacy",
         )
         next_cursor = 0
-    elif phase == "deep_backfill":
+    elif not selected_only and phase == "deep_backfill":
         # A deep-backfill candidate disappears as soon as this slice promotes
         # and fully translates it. Recompute the shrinking set instead of
         # comparing the old cursor against the pre-slice list.
@@ -2495,13 +4494,13 @@ def _run_claimed_translation_job(job):
                 owner_id=job.get("owner_id") or "legacy",
             )
             next_cursor = 0
-    elif next_cursor < len(paths):
+    elif not selected_only and next_cursor < len(paths):
         continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
             scan_id, "translate_package",
             options={"phase": phase, "cursor": next_cursor},
             owner_id=job.get("owner_id") or "legacy",
         )
-    elif large and phase == "preview_and_priority" and options.get("schedule_deep_backfill", True):
+    elif not selected_only and large and phase == "preview_and_priority" and options.get("schedule_deep_backfill", True):
         continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
             scan_id, "translate_package",
             options={"phase": "deep_backfill", "cursor": 0, "slice": 0},
@@ -2525,6 +4524,7 @@ def _run_claimed_scan_and_analyze_job(job):
     """Inventory a filesystem path asynchronously, then run the normal workflow."""
     job_id = job["id"]
     options = job.get("options") or {}
+    storage.update_import_task(job_id, status="scanning", phase="scanning")
     root_path = str(options.get("root_path") or "").strip()
     if not root_path:
         raise ValueError("扫描任务缺少目录路径")
@@ -2579,6 +4579,13 @@ def _run_claimed_scan_and_analyze_job(job):
             owner_id=options.get("owner_id") or job.get("owner_id") or "legacy",
             parse_mode=options.get("parse_mode"), complete=scan_slice["complete"],
         )
+        preview_paths = [str(item.get("path") or item.get("node_path") or "") for item in (scan_slice.get("records") or []) if item.get("kind") == "file" and (item.get("path") or item.get("node_path"))]
+        storage.update_import_task(
+            job_id, status="inventory_ready" if scan_slice["complete"] else "scanning",
+            phase="inventory_ready" if scan_slice["complete"] else "scanning",
+            counts={"discovered_files": int(scan_slice["cursor"].get("file_count") or 0), "total_files": int(scan_slice["cursor"].get("file_count") or 0)},
+            checkpoint=scan_slice.get("cursor") or {},
+        )
         if not scan_slice["complete"]:
             return {
                 "_requeue_slice": True,
@@ -2587,11 +4594,42 @@ def _run_claimed_scan_and_analyze_job(job):
                 "inventory_files": int(scan_slice["cursor"].get("file_count") or 0),
             }
 
+    # Import is inventory-only. Do not parse files, build logical partitions, deduplicate, cluster, index content, or call a model before the user selects files.
+    storage.update_import_task(
+        job_id, status="waiting_for_selection", phase="waiting_for_selection",
+        counts={"total_files": int(scan_result.get("file_count") or 0), "discovered_files": int(scan_result.get("file_count") or 0)},
+    )
+    storage.set_package_processing_state(
+        job_id, "awaiting_selection", "目录已导入，等待按目录名和文件名选择深度解析范围。"
+    )
+    storage.update_analysis_progress_status(
+        job_id, "awaiting_selection", "目录导入完成，尚未读取正文，等待选择文件。", "awaiting_selection"
+    )
+    storage.update_job(
+        job_id, result={"scan_id": job_id, "scan_available": True, "_await_selection": True},
+        progress=100, stage="awaiting_selection", message="目录导入完成，等待选择文件；当前未解析正文。",
+        current_stage="等待选择文件", current_file="", heartbeat=True,
+    )
+    return {"scan_id": job_id, "_await_selection": True}
+    large_directory_mode = build_policy(
+        scan_result, _package_large_options()
+    ).get("mode") == "large_directory"
+    # The directory-first pass deliberately does not materialise one logical
+    # row per CSV/JSONL partition across a multi-gigabyte package. Physical
+    # files remain selectable; selected deep work can parse them later.
+    if large_directory_mode and not scan_result.get("logical_inventory_complete"):
+        scan_result["logical_inventory_complete"] = True
+        scan_result["logical_file_count"] = storage.count_logical_inventory_entries(job_id)
+        storage.update_scan(job_id, scan_result)
+
     # Older scans predate derived logical units. Rebuild them lazily before
     # analysis whenever eligible containers are present, even if their payload
     # was previously marked complete.
-    logical_migration_needed = not bool(scan_result.get("logical_inventory_complete"))
-    if not logical_migration_needed:
+    logical_migration_needed = (
+        not large_directory_mode
+        and not bool(scan_result.get("logical_inventory_complete"))
+    )
+    if not large_directory_mode and not logical_migration_needed:
         logical_migration_needed = storage.count_logical_inventory_entries(job_id) == 0 and any(
             str(item.get("payload", {}).get("extension") or "").lower() in {
                 ".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".bz2", ".rar", ".7z",
@@ -2625,14 +4663,24 @@ def _run_claimed_scan_and_analyze_job(job):
         scan_result,
         state_free_bytes=shutil.disk_usage(str(Path(Config.DB_PATH).parent)).free,
         temp_free_bytes=shutil.disk_usage(str(Config.PARSE_TEMP_DIR)).free,
-        preview_bytes_per_file=Config.LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE,
-        preview_total_bytes=Config.LARGE_PACKAGE_PREVIEW_TOTAL_BYTES,
+        preview_bytes_per_file=(
+            Config.LARGE_PACKAGE_DIRECTORY_PREVIEW_BYTES_PER_FILE
+            if large_directory_mode else Config.LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE
+        ),
+        preview_total_bytes=(
+            Config.LARGE_PACKAGE_DIRECTORY_PREVIEW_TOTAL_BYTES
+            if large_directory_mode else Config.LARGE_PACKAGE_PREVIEW_TOTAL_BYTES
+        ),
         max_content_bytes=Config.MAX_CONTENT_BYTES,
         temp_reserve_bytes=Config.PARSE_TEMP_DISK_RESERVE_BYTES,
-        full_deep_backfill=Config.LARGE_PACKAGE_BACKGROUND_BACKFILL,
+        full_deep_backfill=(
+            Config.LARGE_PACKAGE_BACKGROUND_BACKFILL and not large_directory_mode
+        ),
+        large_directory_mode=large_directory_mode,
     )
     scan_result["resource_plan"] = resource_plan
     storage.update_scan(job_id, scan_result)
+    storage.update_import_task(job_id, status="previewing", phase="previewing", counts={"total_files": int(scan_result.get("logical_file_count") or scan_result.get("file_count") or 0), "discovered_files": int(scan_result.get("logical_file_count") or scan_result.get("file_count") or 0)})
     if not resource_plan["ready"]:
         return {
             "_defer_slice": True,
@@ -2665,8 +4713,15 @@ def _run_claimed_scan_and_analyze_job(job):
     )
     # The scan task keeps its own id as scan_id so the browser can use one job id
     # throughout the complete unknown-package workflow.
+    preprocess_options = dict(options)
+    preprocess_options.update({
+        "preprocess_only": True,
+        "continue_full": False,
+        "workflow_source": "preprocessing",
+        "scope_label": "导入预处理与文件范围确认",
+    })
     return _run_claimed_analysis_job({
-        "id": job_id, "scan_id": job_id, "options": {}, "progress": 15,
+        "id": job_id, "scan_id": job_id, "options": preprocess_options, "progress": 15,
         "owner_id": options.get("owner_id") or job.get("owner_id") or "legacy",
         "_progress_start": 15, "_progress_end": 95,
     })
@@ -2680,7 +4735,12 @@ def _start_analysis_job(scan_id, options=None):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    response = render_template("index.html")
+    # The SPA shell changes with the workflow contract; never let a browser
+    # or reverse proxy keep an old shell that points at stale JavaScript.
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.route("/api/status")
@@ -2690,8 +4750,11 @@ def status():
         "ok": True,
         "configured": llm.configured,
         "backend": ACTIVE_LLM_BACKEND,
-        "local_model_enabled": Config.ENABLE_SHARED_OLLAMA,
+        "local_model_enabled": llm_generation_enabled,
+        "llm_backend": ACTIVE_LLM_BACKEND,
         "evidence_relevance_mode": embedding_mode(),
+        "embedding_backend": ACTIVE_EMBEDDING_BACKEND,
+        "embedding_model": getattr(_embedding_client, "model", None),
         "privacy": llm.privacy_label,
         "model_generation_enabled": llm_generation_enabled,
         "model": llm.model,
@@ -2759,9 +4822,16 @@ def status():
                 "background_backfill": Config.LARGE_PACKAGE_BACKGROUND_BACKFILL,
                 "full_inventory_processing": bool(Config.LARGE_PACKAGE_BACKGROUND_BACKFILL),
                 "full_inventory_preview": True,
-                "preview_bytes_per_file": Config.LARGE_PACKAGE_PREVIEW_BYTES_PER_FILE,
-                "preview_total_bytes": Config.LARGE_PACKAGE_PREVIEW_TOTAL_BYTES,
-                "deep_analysis_strategy": "representative_then_query_promotion",
+                "directory_mode": Config.LARGE_PACKAGE_DIRECTORY_MODE,
+                "directory_model_file_limit": Config.LARGE_PACKAGE_DIRECTORY_MODEL_FILE_LIMIT,
+                "preview_bytes_per_file": Config.LARGE_PACKAGE_DIRECTORY_PREVIEW_BYTES_PER_FILE,
+                "preview_total_bytes": Config.LARGE_PACKAGE_DIRECTORY_PREVIEW_TOTAL_BYTES,
+                "selected_parse_max_files": Config.LARGE_PACKAGE_SELECTED_PARSE_MAX_FILES,
+                "selected_parse_max_bytes": Config.LARGE_PACKAGE_SELECTED_PARSE_MAX_BYTES,
+                "selected_model_file_limit": Config.LARGE_PACKAGE_SELECTED_MODEL_FILE_LIMIT,
+                "selected_model_max_bytes": Config.LARGE_PACKAGE_SELECTED_MODEL_MAX_BYTES,
+                "selected_batch_files": Config.LARGE_PACKAGE_SELECTED_BATCH_FILES,
+                "deep_analysis_strategy": "directory_first_then_explicit_selection",
             },
             "translation": {
                 "enabled": Config.ENABLE_TRANSLATION,
@@ -2790,35 +4860,43 @@ def status():
 def test_model():
     try:
         require_local_model_enabled()
-        if isinstance(llm_transport, OllamaClient):
-            health = llm.health_check()
-            if not health["reachable"]:
-                return api_error("本机 Ollama 服务不可达：{}".format(health.get("error", "未知错误")), 503)
-            if not health["model_available"]:
-                return api_error("已连接本机 Ollama，但未找到模型 {}".format(llm.model), 503)
-            reply = "本机 Ollama 服务正常，模型已就绪（未发起耗时生成测试）"
-            if not llm_generation_enabled:
-                reply = "检测到实验室共享 Ollama；项目安全模式未调用它，以免影响其他用户"
-            return jsonify({
-                "ok": True,
-                "reply": reply,
-                "model": llm.model,
-                "usage": {},
-                "generation_tested": False,
-            })
-        result = llm.chat("你是连接测试助手。", "只回复：连接成功", temperature=0, max_tokens=20)
-        return jsonify({"ok": True, "reply": result["content"], "model": result["model"], "usage": result["usage"]})
-    except (ValueError, LocalModelError) as exc:
+        health = llm.health_check()
+        if not health["reachable"]:
+            return api_error("\u672c\u5730 {} \u670d\u52a1\u4e0d\u53ef\u8fbe\uff1a{}".format(ACTIVE_LLM_BACKEND, health.get("error", "\u672a\u77e5\u9519\u8bef")), 503)
+        if not health["model_available"]:
+            return api_error("\u5df2\u8fde\u63a5\u672c\u5730 {}\uff0c\u4f46\u672a\u627e\u5230\u6a21\u578b {}".format(ACTIVE_LLM_BACKEND, llm.model), 503)
+        # A model-list response only proves that the API server is up. Execute
+        # one bounded generation so this control verifies the active transport.
+        result = llm_transport.chat(
+            "This is a local health check. Reply with exactly SJFX_OK and nothing else.",
+            "Return the exact token now.",
+            temperature=0,
+            max_tokens=8,
+            retries=0,
+            timeout=min(30, int(getattr(Config, "VLLM_INTERACTIVE_TIMEOUT_SECONDS", 30))),
+        )
+        return jsonify({
+            "ok": True,
+            "reply": "\u672c\u5730 {} \u6a21\u578b\u5df2\u5b8c\u6210\u5b9e\u9645\u751f\u6210\u9a8c\u8bc1\u3002".format(ACTIVE_LLM_BACKEND),
+            "model": result.get("model") or llm.model,
+            "usage": result.get("usage") or {},
+            "finish_reason": result.get("finish_reason"),
+            "generation_reply": result.get("content") or "",
+            "generation_tested": True,
+        })
+    except LocalModelError as exc:
+        return api_error("\u672c\u5730 {} \u751f\u6210\u9a8c\u8bc1\u5931\u8d25\uff1a{}".format(ACTIVE_LLM_BACKEND, exc), 503)
+    except ValueError as exc:
         return api_error(str(exc), 400)
 
 
 @app.route("/api/general-chat", methods=["POST"])
 def general_chat():
-    """Answer a lightweight chat turn without requiring an imported data package."""
+    """Answer a natural-language chat turn without requiring an imported package."""
     payload = request.get_json(silent=True) or {}
     question = str(payload.get("question") or "").strip()
     if not question or len(question) > 8000:
-        return api_error("\\u95ee\\u9898\\u4e0d\\u80fd\\u4e3a\\u7a7a\\u4e14\\u4e0d\\u80fd\\u8d85\\u8fc7 8000 \\u5b57\\u7b26", 400)
+        return api_error("问题不能为空且不能超过 8000 字符", 400)
     try:
         require_local_model_enabled()
         history = payload.get("messages") or []
@@ -2828,36 +4906,36 @@ def general_chat():
         for item in history[-12:]:
             if not isinstance(item, dict):
                 continue
-            role = "\\u7528\\u6237" if item.get("role") == "user" else "\\u52a9\\u624b"
+            role = "用户" if item.get("role") == "user" else "助手"
             content = str(item.get("content") or "").strip()
             if content:
-                transcript.append("{}\\uff1a{}".format(role, content[:4000]))
+                transcript.append("{}：{}".format(role, content[:4000]))
         system = (
-            "你是 SJFX \\u4e2d\\u7684\\u901a\\u7528\\u4e2d\\u6587\\u804a\\u5929\\u52a9\\u624b\\u3002"
-            "\\u50cf\\u6210\\u719f\\u7684\\u5927\\u6a21\\u578b\\u4ea7\\u54c1\\u4e00\\u6837\\u81ea\\u7136\\u3001\\u76f4\\u63a5\\u5730\\u56de\\u7b54\\u7528\\u6237\\u3002"
-            "\\u5148\\u7406\\u89e3\\u7528\\u6237\\u771f\\u6b63\\u60f3\\u5b8c\\u6210\\u7684\\u4e8b\\uff0c\\u518d\\u7ed9\\u51fa\\u6709\\u5e2e\\u52a9\\u7684\\u5185\\u5bb9\\u3002"
-            "\\u53ef\\u4ee5\\u95f2\\u804a\\u3001\\u89e3\\u91ca\\u6982\\u5ff5\\u3001\\u5199\\u4f5c\\u3001\\u6539\\u5199\\u3001\\u7ffb\\u8bd1\\u548c\\u63d0\\u4f9b\\u601d\\u8def\\u3002"
-            "\\u5f53\\u524d\\u6ca1\\u6709\\u52a0\\u8f7d\\u8d44\\u6599\\u5305\\uff0c\\u4e0d\\u8981\\u58f0\\u79f0\\u4f60\\u770b\\u8fc7\\u4efb\\u4f55\\u7528\\u6237\\u6587\\u4ef6\\u6216\\u5f15\\u7528\\u4e0d\\u5b58\\u5728\\u7684\\u8bc1\\u636e\\u3002"
-            "\\u5982\\u679c\\u7528\\u6237\\u7684\\u95ee\\u9898\\u660e\\u663e\\u9700\\u8981\\u5f53\\u524d\\u8d44\\u6599\\uff0c\\u8bf7\\u5766\\u8bda\\u8bf4\\u660e\\u5bfc\\u5165\\u8d44\\u6599\\u5305\\u540e\\u53ef\\u4ee5\\u7ee7\\u7eed\\uff0c\\u5e76\\u7ed9\\u51fa\\u901a\\u7528\\u56de\\u7b54\\u6216\\u4e0b\\u4e00\\u6b65\\u3002"
+            "你是 SJFX 中的中文智能助手。像成熟的大模型产品一样自然、直接地回答用户。"
+            "先理解用户真正想完成的事情，再给出有帮助的内容；可以闲聊、解释概念、写作、改写、翻译和提供思路。"
+            "不要机械复述问题，不要每次都使用固定模板。需要时主动澄清关键范围，但不要为了显得谨慎而打断简单问题。"
+            "当前对话可能还没有加载资料包；没有证据时不要声称看过用户文件，也不要捏造引用。"
+            "如果问题需要资料，坦诚说明导入资料包后可以继续，并先给出通用回答或下一步。"
+            "回答区分事实、判断和建议，语气友好、简洁，像真人协作伙伴。"
         )
-        prompt = "\\u5bf9\\u8bdd\\u5386\\u53f2\\uff1a{}\\n\\n\\u7528\\u6237\\u6700\\u65b0\\u95ee\\u9898\\uff1a{}".format(
-            "\\n".join(transcript) if transcript else "\\u65e0",
+        prompt = "对话历史：{}\n\n用户新问题：{}".format(
+            "\n".join(transcript) if transcript else "无",
             question,
         )
-        result = llm_transport.chat(
-            system,
-            prompt,
-            temperature=0.35,
-            max_tokens=1400,
-            timeout=min(45, int(getattr(Config, "CONVERSATION_MODEL_TIMEOUT_SECONDS", 45))),
-        )
+        chat_max_tokens = 1400
+        chat_timeout = min(45, int(getattr(Config, "CONVERSATION_MODEL_TIMEOUT_SECONDS", 45)))
+        if Config.LLM_BACKEND == "vllm":
+            chat_max_tokens = min(chat_max_tokens, int(getattr(Config, "VLLM_INTERACTIVE_MAX_TOKENS", 480)))
+            chat_timeout = max(chat_timeout, int(getattr(Config, "VLLM_INTERACTIVE_TIMEOUT_SECONDS", 120)))
+        system += "\n效率规则：默认直接回答，不超过 120 个汉字；用户明确要求详细、步骤、清单或长文时再展开。"
+        result = llm_transport.chat(system, prompt, temperature=0.35, max_tokens=chat_max_tokens, timeout=chat_timeout)
         answer = str((result or {}).get("content") or "").strip()
         if not answer:
-            raise LocalModelError("\\u672c\\u5730\\u6a21\\u578b\\u8fd4\\u56de\\u4e3a\\u7a7a")
+            raise LocalModelError("本地模型返回为空")
         return jsonify({
             "ok": True,
             "answer": answer,
-            "model": (result or {}).get("model") or Config.OLLAMA_MODEL,
+            "model": (result or {}).get("model") or Config.LLM_MODEL,
             "evidence_status": "not_required",
             "task_status": "fulfilled",
         })
@@ -2895,6 +4973,60 @@ def scan():
         return api_error(str(exc))
 
 
+@app.route("/api/data-sources")
+def list_data_sources():
+    """List reusable historical packages without loading their full payloads."""
+    try:
+        query = str(request.args.get("query") or "").strip()
+        if len(query) > 200:
+            raise ValueError("搜索条件不能超过 200 个字符")
+        try:
+            limit = int(request.args.get("limit", 30))
+            offset = int(request.args.get("offset", 0))
+        except (TypeError, ValueError):
+            raise ValueError("分页参数无效")
+        result = storage.list_scan_sources(
+            owner_id=_request_owner_id(), query=query, limit=limit, offset=offset
+        )
+        return jsonify({"ok": True, **result})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/data-sources/select", methods=["POST"])
+def select_data_source():
+    """Validate and activate one owned historical package without new work."""
+    payload = request.get_json(silent=True) or {}
+    scan_id = str(payload.get("scan_id") or "").strip()
+    if not scan_id or len(scan_id) > 128:
+        return api_error("请选择有效的数据包", 400)
+    result = storage.list_scan_sources(
+        owner_id=_request_owner_id(), scan_id=scan_id, limit=1, offset=0
+    )
+    if not result["items"]:
+        return api_error("数据包不存在、已失效或不属于当前访问用户", 404)
+    source = result["items"][0]
+    search_index = _conversation_index_status(scan_id)
+    source["search_index"] = search_index
+    # The source listing already contains the bounded queue/control snapshot;
+    # selecting a package must not hydrate the full scan or create work.
+    source["processing"] = source.get("processing") or {}
+    if source["processing"].get("active_job_id"):
+        next_action = "monitor_processing"
+    elif search_index.get("usable") or source.get("analysis_ready"):
+        next_action = "use_existing_data"
+    else:
+        next_action = "wait_for_processing"
+    return jsonify({
+        "ok": True,
+        "selected": True,
+        "source": source,
+        "next_action": next_action,
+        "created_job": False,
+        "reused_existing_results": True,
+    })
+
+
 @app.route("/api/scan/<scan_id>")
 def get_scan(scan_id):
     try:
@@ -2916,6 +5048,7 @@ def get_scan(scan_id):
             analysis = storage.get_analysis_overview(scan_id)
             if analysis:
                 analysis["analysis_tree"] = storage.get_tree_page(scan_id, "analysis", limit=100)
+                analysis["preliminary_directory"] = analysis.get("preliminary_directory")
             return jsonify({
                 "ok": True,
                 "scan": scan_result,
@@ -2988,6 +5121,9 @@ def resume_package_processing(scan_id):
         mode = str(payload.get("mode") or "continue").strip().lower()
         if mode not in {"continue", "recall", "query", "selection"}:
             raise ValueError("未知续跑方式")
+        control_state = storage.get_package_processing_control(scan_id).get("state")
+        if control_state == "awaiting_selection" and mode != "selection":
+            return jsonify({"ok": True, "accepted": False, "message": "请先在分析范围确认页面选择文件并确认后再开始深度分析。", "processing": _package_processing_status(scan_id, scan_result)}), 409
         continue_full = bool(payload.get("continue_full", True))
         inventory_paths = set(_inventory_by_path(scan_result))
         preferred_paths = []
@@ -3120,7 +5256,7 @@ def resume_package_processing(scan_id):
             "target_paths": batch_paths,
             "workflow_source": priority_source if mode != "continue" else "background_backfill",
             "scope_label": reason,
-            "parse_mode": "accurate",
+            "parse_mode": "auto" if mode == "selection" else "accurate",
             "continue_full": continue_full,
             "continuation_depth": 0,
         }
@@ -3169,6 +5305,544 @@ def delete_scan(scan_id):
         return api_error(str(exc), 404)
 
 
+@app.route("/api/scan/<scan_id>/selection", methods=["GET"])
+def get_scan_selection(scan_id):
+    """Return the resumable import-preprocessing selection contract."""
+    try:
+        scan_result = require_scan(scan_id)
+        selection = storage.get_scan_selection(scan_id)
+        if not selection:
+            defaults = storage.default_scan_selection(scan_id)
+            selection = storage.save_scan_selection(
+                scan_id, defaults.get("included_paths"), defaults.get("excluded_paths"),
+                defaults.get("rules"), status="draft",
+            )
+        selection_stats = storage.scan_selection_stats(scan_id, selection)
+        selection.update(selection_stats)
+        return jsonify({
+            "ok": True,
+            "scan_id": scan_id,
+            "selection": selection,
+            "processing": _package_processing_status(scan_id, scan_result),
+            "preprocessing": (storage.get_analysis(scan_id) or {}).get("preprocessing") or {},
+            "search_index": _conversation_index_status(scan_id),
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/scan/<scan_id>/selection", methods=["POST"])
+def save_scan_selection_draft(scan_id):
+    try:
+        require_scan(scan_id)
+        payload = request.get_json(silent=True) or {}
+        current = storage.get_scan_selection(scan_id) or {}
+        included = payload.get("included_paths", current.get("included_paths") or [])
+        excluded = payload.get("excluded_paths", current.get("excluded_paths") or [])
+        if not isinstance(included, list) or not isinstance(excluded, list):
+            raise ValueError("included_paths 和 excluded_paths 必须是数组")
+        inventory = _inventory_by_path(require_scan(scan_id))
+        valid = set(inventory)
+        included = list(dict.fromkeys(str(path) for path in included if str(path) in valid))
+        excluded = list(dict.fromkeys(str(path) for path in excluded if str(path) in valid and str(path) not in included))
+        selection = storage.save_scan_selection(
+            scan_id, included, excluded, payload.get("rules") or current.get("rules") or {},
+            status="draft", expected_version=payload.get("version"),
+        )
+        selection.update(storage.scan_selection_stats(scan_id, selection))
+        storage.set_package_processing_state(scan_id, "awaiting_selection", "等待用户确认分析范围。")
+        return jsonify({"ok": True, "selection": selection, "processing": _package_processing_status(scan_id)})
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/scan/<scan_id>/selection/confirm", methods=["POST"])
+def confirm_scan_selection(scan_id):
+    try:
+        scan_result = require_scan(scan_id)
+        payload = request.get_json(silent=True) or {}
+        current = storage.get_scan_selection(scan_id) or {}
+        included = payload.get("included_paths", current.get("included_paths") or [])
+        excluded = payload.get("excluded_paths", current.get("excluded_paths") or [])
+        if not isinstance(included, list) or not isinstance(excluded, list):
+            raise ValueError("included_paths 和 excluded_paths 必须是数组")
+        inventory = _inventory_by_path(scan_result)
+        valid = set(inventory)
+        included = list(dict.fromkeys(str(path) for path in included if str(path) in valid))
+        excluded = list(dict.fromkeys(str(path) for path in excluded if str(path) in valid and str(path) not in included))
+        workflow_by_path = {item.get("node_path"): item for item in storage.iter_file_workflow_states(scan_id)}
+        states_by_path = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
+        eligible = [
+            path for path in included
+            if deep_processing_eligible(workflow_by_path.get(path), states_by_path.get(path))
+        ]
+        if not eligible:
+            raise ValueError("没有可进入深度分析的文件；请至少选择一个可解析文件")
+        selection = storage.save_scan_selection(
+            scan_id, included, excluded, payload.get("rules") or current.get("rules") or {},
+            status="confirmed", expected_version=payload.get("version"),
+        )
+        selection.update(storage.scan_selection_stats(scan_id, selection))
+        storage.prioritize_file_workflow_states(
+            scan_id, eligible, "user_selection", "用户确认的分析范围", score_boost=2500.0,
+        )
+        # Persist an explicit deep-parse batch for resumable import accounting.
+        deep_batch_id = None
+        # Ordinary packages already completed the full light-parse pass before
+        # this confirmation. The user's selection is therefore the deep scope;
+        # do not send it through the large-package candidate-preview stage.
+        large_directory_mode = False
+        if not large_directory_mode:
+            task = storage.get_import_task(scan_id) or {}
+            checkpoint = dict(task.get("checkpoint") or {})
+            checkpoint.update({"selected_paths": eligible, "selection_version": int(selection.get("version") or 1), "preliminary_summary_job_ids": [], "preliminary_node_job_ids": [], "preliminary_overview_job_id": None})
+            storage.transition_import_task(scan_id, "parsing_selected", checkpoint=checkpoint,
+                                          reason="已选择文件，开始仅解析选中范围。")
+            options = {
+                "target_paths": eligible,
+                "workflow_source": "selected_file_parse",
+                "scope_label": "用户选择的解析范围（{} 个文件）".format(len(eligible)),
+                "parse_mode": "accurate",
+                "continue_full": False,
+                "candidate_preview": False,
+                "selection_version": int(selection.get("version") or 1),
+                "deep_batch_id": deep_batch_id,
+                "deep_selection": {
+                    "kind": "files", "paths": eligible,
+                    "selected_file_count": len(eligible),
+                },
+            }
+            job_id, created = storage.create_or_get_typed_job(
+                scan_id, "analyze_package", options=options,
+                owner_id=_request_owner_id() or "legacy",
+            )
+            storage.update_analysis_progress_status(
+                scan_id, "queued", "已提交选中文件解析任务，等待 Worker 开始。", "parsing_selected"
+            )
+            return jsonify({
+                "ok": True, "accepted": True, "confirmed": True,
+                "selection": selection, "job_id": job_id,
+                "deep_batch_id": deep_batch_id,
+                "selected_count": len(eligible), "selected_paths": eligible,
+                "reused_active_job": not created,
+                "status_url": "/api/jobs/{}".format(job_id),
+                "processing": _package_processing_status(scan_id, scan_result),
+            }), 202 if created else 200
+
+        storage.set_package_processing_state(scan_id, "candidate_importing", "候选文件已确认，开始候选集完整导入。")
+        options = {
+            "target_paths": eligible,
+            "workflow_source": "candidate_preview",
+            "scope_label": "候选集完整导入（{} 个文件）".format(len(eligible)),
+            "parse_mode": "fast",
+            "continue_full": False,
+            "candidate_preview": True,
+            "selection_version": int(selection.get("version") or 1),
+            "deep_batch_id": deep_batch_id,
+            "candidate_deadline_at": time.time() + int(getattr(Config, "CANDIDATE_PREVIEW_MAX_WAIT_SECONDS", 900)),
+        }
+        job_id, created = storage.create_or_get_typed_job(
+            scan_id, "analyze_package", options=options,
+            owner_id=_request_owner_id() or "legacy",
+        )
+        storage.update_analysis_progress_status(scan_id, "queued", "已确认候选范围，等待候选集导入任务开始。", "candidate_importing")
+        return jsonify({
+            "ok": True, "accepted": True, "confirmed": True,
+            "selection": selection, "job_id": job_id,
+            "deep_batch_id": deep_batch_id,
+            "reused_active_job": not created, "selected_count": len(eligible),
+            "status_url": "/api/jobs/{}".format(job_id),
+            "processing": _package_processing_status(scan_id, scan_result),
+        }), 202 if created else 200
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+@app.route("/api/scan/<scan_id>/selection/supplement", methods=["POST"])
+def supplement_scan_selection(scan_id):
+    """Add files to a confirmed scope without rerunning completed work."""
+    try:
+        scan_result = require_scan(scan_id)
+        payload = request.get_json(silent=True) or {}
+        current = storage.get_scan_selection(scan_id) or {}
+        task = storage.get_import_task(scan_id) or {}
+        task_status = str(task.get("status") or "")
+        if task_status not in {"deep_summarizing_files", "deep_summarizing_nodes", "deep_update_available"}:
+            return api_error("请等待初步概览或当前更新完成后再补充文件。", 409, {"task_status": task_status})
+        if not isinstance(payload.get("included_paths", []), list):
+            raise ValueError("included_paths 必须是数组")
+        inventory = _inventory_by_path(scan_result)
+        requested = list(dict.fromkeys(str(path) for path in (payload.get("included_paths") or []) if str(path) in inventory))
+        existing = [str(path) for path in (current.get("included_paths") or []) if str(path) in inventory]
+        new_paths = [path for path in requested if path not in set(existing)]
+        if not new_paths:
+            return jsonify({"ok": True, "accepted": False, "message": "没有新增的可解析文件。", "selection": current})
+        requested = list(dict.fromkeys(existing + new_paths))
+        excluded = [str(path) for path in (payload.get("excluded_paths") or current.get("excluded_paths") or []) if str(path) in inventory and str(path) not in requested]
+        selection = storage.save_scan_selection(scan_id, requested, excluded, payload.get("rules") or current.get("rules") or {}, status="confirmed", expected_version=payload.get("version", current.get("version")))
+        selection.update(storage.scan_selection_stats(scan_id, selection))
+        task = storage.get_import_task(scan_id) or {}
+        checkpoint = dict(task.get("checkpoint") or {})
+        checkpoint.update({"selected_paths": requested, "selection_version": int(selection.get("version") or 1), "preliminary_node_job_ids": [], "deep_summary_node_job_ids": [], "preliminary_overview_job_id": None, "supplement_paths": new_paths})
+        storage.transition_import_task(scan_id, "parsing_selected", checkpoint=checkpoint, reason="用户补充 {} 个文件，开始仅解析新增范围。".format(len(new_paths)))
+        options = {"target_paths": new_paths, "workflow_source": "selected_file_parse", "scope_label": "用户补充的解析范围（{} 个文件）".format(len(new_paths)), "parse_mode": "accurate", "continue_full": False, "selection_version": int(selection.get("version") or 1), "supplement": True}
+        job_id, created = storage.create_or_get_typed_job(scan_id, "analyze_package", options=options, owner_id=_request_owner_id() or "legacy")
+        return jsonify({"ok": True, "accepted": True, "selection": selection, "new_paths": new_paths, "job_id": job_id, "reused_active_job": not created, "status_url": "/api/jobs/{}".format(job_id), "processing": _package_processing_status(scan_id, scan_result)}), 202 if created else 200
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/import-tasks/<scan_id>")
+def get_import_task_state(scan_id):
+    """Return the durable import-task state and explicit deep-parse batches."""
+    try:
+        require_scan(scan_id)
+        task = storage.get_import_task(scan_id, owner_id=_request_owner_id())
+        if not task:
+            return api_error("导入任务不存在", 404)
+        processing = _package_processing_status(scan_id)
+        counts = storage.file_workflow_counts(scan_id)
+        task["counts"] = {**counts, **storage.package_processing_counts(scan_id)}
+        task["deep_parse_batches"] = storage.list_deep_parse_batches(scan_id)
+        task["preview_queue"] = storage.preview_queue_counts(scan_id)
+        task["state_contract"] = {
+            "created": "已创建", "scanning": "正在扫描", "inventory_ready": "清单已就绪",
+            "previewing": "全量轻度解析中", "preview_paused": "轻量预览已暂停",
+            "preview_completed": "轻量预览完成", "waiting_for_selection": "等待选择",
+            "parsing_selected": "正在解析选中文件", "parsed_overview": "正在生成解析版智能目录和情报概览", "preliminary_summarizing": "正在生成文件初步摘要", "preliminary_nodes": "正在生成节点初步摘要", "preliminary_overview": "正在生成初步情报概览", "deep_summarizing_files": "后台生成文件深度摘要", "deep_summarizing_nodes": "后台生成节点深度摘要", "deep_overview_updating": "正在更新深度证据概览",
+            "candidate_importing": "候选集完整导入中", "candidate_analyzing": "候选文件预读分析中",
+            "waiting_for_deep_selection": "等待选择深度文件或节点",
+            "deep_parsing": "深度解析中", "deep_paused": "深度解析已暂停",
+            "summarizing_files": "正在生成文件摘要与结论",
+            "building_directory": "正在生成正式智能目录",
+            "completed": "已完成", "partial": "部分完成，存在待复核项",
+            "failed": "失败", "paused": "已暂停", "cancelled": "已取消",
+        }
+        task["processing"] = processing
+        return jsonify({"ok": True, "import_task": task})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+def _build_candidate_preview_directory(scan_id):
+    # Build a model-informed provisional directory from candidate summaries.
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = task.get("checkpoint") or {}
+    candidate_paths = [str(path) for path in (checkpoint.get("candidate_paths") or []) if str(path)]
+    content_map = storage.get_content_map(scan_id) or {}
+    if not candidate_paths and not content_map:
+        return None
+    allowed = set(candidate_paths)
+    summaries = {}
+    for row in storage.list_summaries(scan_id):
+        path = str(row.get("path") or row.get("node_path") or "")
+        payload = row.get("payload") or {}
+        level = str(payload.get("analysis_level") or "").lower()
+        depth = str(payload.get("analysis_depth") or "").lower()
+        if path in allowed and (level in {"preview", "deep"} or depth in {"preview", "deep", "deep_document", "deep_folder"}):
+            summaries[path] = payload
+    # The metadata-backed type directory is useful even while representative
+    # model cards are still queued. Keep an empty model-summary set and let
+    # the return contract expose type nodes immediately.
+    if not summaries:
+        summaries = {}
+
+    groups = {}
+    for path, payload in summaries.items():
+        labels = payload.get("topics") or payload.get("keywords") or []
+        if isinstance(labels, str):
+            labels = [labels]
+        labels = [str(item.get("name") if isinstance(item, dict) else item).strip() for item in labels]
+        labels = [item for item in labels if item]
+        labels = list(dict.fromkeys(labels[:2])) or ["candidate-overview"]
+        for label in labels:
+            key = label.lower()
+            group = groups.setdefault(key, {"name": label, "member_paths": [], "payloads": []})
+            if path not in group["member_paths"]:
+                group["member_paths"].append(path)
+            group["payloads"].append(payload)
+
+    topics = []
+    for key, group in groups.items():
+        payloads = group["payloads"]
+        summaries_text = [str(item.get("summary") or item.get("core_summary") or "").strip() for item in payloads]
+        summaries_text = [item for item in summaries_text if item]
+        conclusions = []
+        seen = set()
+        for path in group["member_paths"]:
+            payload = summaries[path]
+            for claim in (payload.get("file_conclusions") or [])[:6]:
+                if not isinstance(claim, dict):
+                    continue
+                text = str(claim.get("text") or claim.get("statement") or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                supports = list(claim.get("supports") or claim.get("evidence") or [])[:4]
+                scores = [float(item.get("support_score")) for item in supports if isinstance(item, dict) and item.get("support_score") is not None]
+                conclusions.append({
+                    "statement": text,
+                    "text": text,
+                    "supporting_files": [path],
+                    "supporting_evidence": supports,
+                    "confidence": round(max(scores) if scores else 0.5, 3),
+                    "analysis_level": "deep" if (str(payload.get("analysis_level") or "").lower() == "deep" or str(payload.get("analysis_depth") or "").lower() in {"deep", "deep_document", "deep_folder"} or payload.get("deep_analysis")) else "preview",
+                    "verification_status": "verified" if (str(payload.get("analysis_level") or "").lower() == "deep" or str(payload.get("analysis_depth") or "").lower() in {"deep", "deep_document", "deep_folder"} or payload.get("deep_analysis")) else "candidate",
+                })
+        digest = " ".join(summaries_text[:3])
+        deep_member_count = sum(1 for path in group["member_paths"] if (
+            str((summaries.get(path) or {}).get("analysis_level") or "").lower() == "deep"
+            or str((summaries.get(path) or {}).get("analysis_depth") or "").lower()
+            in {"deep", "deep_document", "deep_folder"}
+            or bool((summaries.get(path) or {}).get("deep_analysis"))
+        ))
+        group_level = (
+            "deep"
+            if deep_member_count == len(group["member_paths"]) and deep_member_count
+            else "preview"
+        )
+        group_verification = "verified" if group_level == "deep" else "candidate"
+        topics.append({
+            "node_id": "candidate-" + hashlib.sha1(key.encode("utf-8", "ignore")).hexdigest()[:12],
+            "kind": "group",
+            "name": group["name"],
+            "summary": digest[:900],
+            "research_value": "用于在正式全文校验前定位相关文献和研究方向。",
+            "research_questions": [],
+            "member_paths": sorted(group["member_paths"]),
+            "file_count": len(group["member_paths"]),
+            "conclusions": conclusions,
+            "conflicts": [],
+            "limitations": ["候选分析只使用代表性内容，尚未完成全文证据校验。"],
+            "coverage": {
+                "file_count": len(group["member_paths"]),
+                "preview_analyzed_files": len(group["member_paths"]),
+                "analyzed_files": deep_member_count,
+                "deep_files": deep_member_count,
+                "ratio": round(
+                    deep_member_count / float(len(group["member_paths"]) or 1), 3
+                ),
+                "analysis_level": group_level,
+                "verification_status": group_verification,
+            },
+            "analysis_level": group_level,
+            "verification_status": group_verification,
+            "formal": group_level == "deep",
+        })
+    # Always expose a complete, metadata-backed type directory alongside
+    # model-derived topic nodes. Members are resolved lazily from inventory
+    # when a type node is selected, so a huge package never returns millions
+    # of paths in one HTTP response.
+    category_nodes = []
+    for category in content_map.get("content_categories") or []:
+        category_id = str(category.get("category_id") or "").strip()
+        count = int(category.get("file_count") or 0)
+        if not category_id or count <= 0:
+            continue
+        # Category membership is intentionally lazy. The bounded examples
+        # make the node inspectable immediately; selecting it invokes the
+        # server-side inventory matcher and creates a bounded plan.
+        category_nodes.append({
+            "node_id": "content-{}".format(category_id),
+            "kind": "group",
+            "name": category.get("name") or category_id,
+            "summary": category.get("description") or "按文件内容信号归纳的候选资料类别。",
+            "research_value": category.get("research_value") or "",
+            "research_questions": list(category.get("research_questions") or [])[:4],
+            "classification_basis": list(category.get("classification_basis") or [
+                "path_and_filename", "document_type", "bounded_keywords", "bounded_content_sample",
+            ]),
+            "selection_filter": {
+                **dict(category.get("selection_filter") or {}),
+                "kind": "content_category",
+                "category_id": category_id,
+            },
+            "member_paths": list(category.get("representative_paths") or [])[:12],
+            "member_paths_lazy": True,
+            "file_count": count,
+            "total_bytes": int(category.get("total_bytes") or 0),
+            "total_size_human": category.get("total_size_human") or "",
+            "representative_paths": list(category.get("representative_paths") or [])[:12],
+            "matched_terms": list(category.get("matched_terms") or [])[:10],
+            "coverage": {
+                **dict(category.get("coverage") or {}),
+                "inventory_files": count,
+                "classified_files": count,
+                "membership_complete": True,
+                "members_materialized": False,
+                "analysis_level": "inventory_preview",
+                "verification_status": "metadata_and_rule_classified",
+            },
+            "analysis_level": "inventory_preview",
+            "verification_status": "candidate",
+            "formal": False,
+        })
+    category_nodes.sort(key=lambda item: (-int(item.get("file_count") or 0), str(item.get("name") or "")))
+
+    type_nodes = []
+    for item in content_map.get("formats") or []:
+        extension = str(item.get("extension") or "[no_extension]")
+        count = int(item.get("file_count") or 0)
+        if count <= 0:
+            continue
+        safe_key = extension.casefold()
+        type_nodes.append({
+            "node_id": "type-" + hashlib.sha1(safe_key.encode("utf-8", "ignore")).hexdigest()[:12],
+            "kind": "group",
+            "name": "文件类型：{}".format(extension),
+            "summary": "按文件扩展名建立的全量类型节点，共 {} 个文件。".format(count),
+            "classification_basis": "file_type",
+            "selection_filter": {"kind": "extension", "extension": extension},
+            "member_paths": [],
+            "member_paths_lazy": True,
+            "file_count": count,
+            "coverage": {
+                "inventory_files": int((content_map.get("inventory") or {}).get("file_count") or 0),
+                "type_files": count,
+                "inventory_coverage": 1.0,
+                "analysis_level": "inventory",
+                "verification_status": "metadata_verified",
+            },
+            "analysis_level": "inventory",
+            "verification_status": "metadata_verified",
+            "formal": False,
+        })
+    type_nodes.sort(key=lambda item: (-int(item.get("file_count") or 0), str(item.get("name") or "")))
+    topics = category_nodes + type_nodes + topics
+    inventory = content_map.get("inventory") or {}
+    preview_coverage = content_map.get("coverage") or {}
+
+    return {
+        "schema_version": "preview-directory/2.0",
+        "status": "provisional",
+        "label": "候选集初步智能目录",
+        "formal": False,
+        "analysis_level": "preview",
+        "verification_status": "candidate",
+        "candidate_paths": sorted(summaries),
+        "topics": topics,
+        "content_categories": list(content_map.get("content_categories") or []),
+        "research_directions": list(content_map.get("research_directions") or []),
+        "content_taxonomy": content_map.get("content_taxonomy") or {},
+        "classification_contract": {
+            "primary_category_coverage": "全量清单中的每个文件都有一个主类别；类别成员在用户选择后从持久化清单解析。",
+            "model_claim_scope": "模型结论只适用于已进入模型的文件，不自动外推到类别中的全部文件。",
+            "raw_keyword_topics": "仅作召回线索，不作为最终智能目录的主分类。",
+        },
+        "coverage": {
+            "inventory_files": int(inventory.get("file_count") or 0),
+            "inventory_bytes": int(inventory.get("total_bytes") or 0),
+            "candidate_files": len(candidate_paths),
+            "summarized_files": len(summaries),
+            "representative_model_files": len(candidate_paths),
+            "bounded_preview_files": int(preview_coverage.get("previewed_files") or 0),
+            "deferred_files": int(preview_coverage.get("deferred_files") or 0),
+            "inventory_coverage": 1.0,
+            "model_coverage_ratio": round(len(summaries) / float(len(candidate_paths) or 1), 3),
+            "ratio": round(len(summaries) / float(len(candidate_paths) or 1), 3),
+            "sampling_strategy": "all_metadata_plus_bounded_content_and_representative_model_cards",
+            "classified_files": int(preview_coverage.get("classified_files") or inventory.get("file_count") or 0),
+            "classification_coverage": float(preview_coverage.get("classification_coverage") or 1.0),
+            "category_count": len(category_nodes),
+            "research_direction_count": len(content_map.get("research_directions") or []),
+            "directory_stage": "preliminary_content_taxonomy",
+        },
+    }
+
+
+@app.route("/api/scan/<scan_id>/preliminary-directory")
+def preliminary_directory(scan_id):
+    """Return the provisional preview directory with an explicit confidence contract."""
+    try:
+        require_scan(scan_id)
+        analysis = storage.get_analysis(scan_id) or {}
+        directory = _build_candidate_preview_directory(scan_id) or analysis.get("preliminary_directory") or {
+            "schema_version": "preview-directory/1.0",
+            "status": "unavailable",
+            "label": "初步智能目录（尚未生成）",
+            "formal": False,
+            "topics": [],
+        }
+        return jsonify({"ok": True, "directory": directory, "formal": False,
+                        "notice": "该目录基于轻量预览，仅用于筛选；正式目录须在深度解析和证据校验后生成。"})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+
+
+@app.route("/api/package/<scan_id>/preliminary-directory")
+def package_preliminary_directory(scan_id):
+    """Package namespace alias for the candidate/provisional directory."""
+    return preliminary_directory(scan_id)
+@app.route("/api/scan/<scan_id>/files")
+def list_scan_files(scan_id):
+    """Bounded file explorer shared by import selection and chat search."""
+    try:
+        require_scan(scan_id)
+        offset = max(0, int(request.args.get("offset", 0) or 0))
+        limit = max(1, min(100, int(request.args.get("limit", 50) or 50)))
+        query = str(request.args.get("query") or "").strip()
+        file_type = str(request.args.get("file_type") or request.args.get("type") or "").strip()
+        search_scope = str(request.args.get("search_scope") or "all").strip().lower()
+        status = str(request.args.get("status") or "all").strip().lower()
+        selection = storage.get_scan_selection(scan_id) or {}
+        included = set(selection.get("included_paths") or [])
+        excluded = set(selection.get("excluded_paths") or [])
+        if query or file_type:
+            page = storage.search_file_status_page(
+                scan_id,
+                query=query,
+                file_type=file_type,
+                search_scope=search_scope,
+                offset=offset,
+                limit=limit,
+                status=status,
+            )
+            page_items = page.get("items") or []
+            total = int(page.get("total") or 0)
+            coverage = _conversation_index_status(scan_id)
+            if coverage.get("ready"):
+                coverage_notice = (
+                    "当前同时匹配文件名、路径、文件类型和已建立的正文/附件索引。"
+                )
+            else:
+                coverage_notice = (
+                    "当前按文件名、路径、扩展名和文件类型筛选；正文/附件全文索引尚未完成。"
+                )
+        else:
+            page = storage.list_file_status_page(
+                scan_id, offset=offset, limit=limit, status=status
+            )
+            page_items, total = page.get("items") or [], int(page.get("total") or 0)
+            coverage = _conversation_index_status(scan_id)
+            coverage_notice = None
+        for item in page_items:
+            path = str(item.get("node_path") or item.get("path") or "")
+            preview = storage.get_file_preview(scan_id, path) if path else None
+            item["selected"] = path in included and path not in excluded
+            item["excluded"] = path in excluded
+            if preview:
+                item["preview"] = {
+                    "status": preview.get("status"),
+                    "text": str(preview.get("text") or preview.get("sample") or "")[:1200],
+                    "warnings": list(preview.get("warnings") or [])[:8],
+                    "page": preview.get("page"),
+                    "section": preview.get("section"),
+                    "level": "preview",
+                    "formal_evidence_ready": False,
+                    "parse_plan": parse_plan(item, preview),
+                }
+        return jsonify({
+            "ok": True, "items": page_items, "offset": offset, "limit": limit,
+            "total": total, "next_offset": offset + len(page_items) if offset + len(page_items) < total else None,
+            "query": query, "file_type": file_type, "search_scope": (
+                "metadata_and_evidence" if (query or file_type) else "inventory"
+            ), "selection": {"version": int(selection.get("version") or 0), "included_count": len(included), "excluded_count": len(excluded)},
+            "coverage": coverage, "coverage_notice": coverage_notice,
+        })
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+
 @app.route("/api/file-workflow/<scan_id>")
 def get_file_workflow(scan_id):
     """Return the single user-facing state contract for every logical file.
@@ -3185,6 +5859,10 @@ def get_file_workflow(scan_id):
             item = storage.get_file_status(scan_id, node_path)
             if not item:
                 raise ValueError("文件不在当前数据包清单中")
+            preview = storage.get_file_preview(scan_id, node_path) or {}
+            item["parse_plan"] = parse_plan(item, preview)
+            item["analysis_level"] = "preview" if preview else "inventory"
+            item["formal_evidence_ready"] = False
             return jsonify({
                 "ok": True,
                 "item": item,
@@ -3203,9 +5881,27 @@ def get_file_workflow(scan_id):
                 "priority": "pending", "deferred": "pending",
                 "pending_preview": "pending", "excluded": "out_of_scope",
             }.get(str(request.args.get("selection_state")).strip(), "all")
+        filters = {
+            "min_size": request.args.get("min_size"),
+            "max_size": request.args.get("max_size"),
+            "min_modified_ns": request.args.get("min_modified_ns"),
+            "max_modified_ns": request.args.get("max_modified_ns"),
+            "language": request.args.get("language"),
+            "archive_member": request.args.get("archive_member"),
+            "keyword": request.args.get("keyword"),
+            "entity": request.args.get("entity"),
+            "deep": request.args.get("deep"),
+        }
         page = storage.list_file_status_page(
-            scan_id, offset=offset, limit=limit, status=status,
+            scan_id, offset=offset, limit=limit, status=status, filters=filters,
         )
+        page["filters"] = {key: value for key, value in filters.items() if value not in (None, "")}
+        for item in page.get("items") or []:
+            path = str(item.get("node_path") or item.get("path") or "")
+            preview = storage.get_file_preview(scan_id, path) if path else None
+            item["parse_plan"] = parse_plan(item, preview or {})
+            item["analysis_level"] = "deep" if str(item.get("evidence_status") or "").lower() == "ready" else ("preview" if preview else "inventory")
+            item["formal_evidence_ready"] = item["analysis_level"] == "deep"
         page["status_counts"] = storage.file_status_counts(scan_id)
         return jsonify({"ok": True, **page})
     except (TypeError, ValueError) as exc:
@@ -3326,6 +6022,48 @@ def get_summaries_page(scan_id):
         return jsonify({"ok": True, **page})
     except (TypeError, ValueError) as exc:
         return api_error(str(exc), 400)
+
+
+@app.route("/api/file-conclusions/<scan_id>")
+def get_file_conclusions(scan_id):
+    """Return source-verified conclusions and original proof for one document."""
+    if not storage.scan_owned(scan_id, owner_id=_request_owner_id()):
+        return api_error("扫描任务不存在、已失效或不属于当前访问用户", 404)
+    node_path = request.args.get("path") or "."
+    summary_type = request.args.get("type") or "file"
+    summary = storage.get_summary(scan_id, node_path, summary_type)
+    if not summary:
+        return api_error("该文件尚未生成摘要", 404)
+    # Older stored summaries may still expose only ``conclusions`` and an
+    # ``evidence_chain``.  Upgrade the single file on demand so the dedicated
+    # conclusion API remains useful without performing a historical bulk
+    # migration or forcing the user to rerun the entire package.
+    if (
+        (summary.get("summary_type") or summary_type) == "file"
+        and summary.get("claim_contract") != "file-claims/1.0"
+    ):
+        document = storage.get_document(scan_id, node_path)
+        if document:
+            summary.update(build_file_claims(summary, document.get("evidence", [])))
+            storage.save_summary(scan_id, node_path, "file", summary)
+    return jsonify({
+        "ok": True,
+        "scan_id": scan_id,
+        "path": node_path,
+        # The storage key is the stage identity.  A preliminary/deep payload
+        # still has the historical inner ``summary_type: file`` shape, so
+        # return the requested staged key to keep frontend reads deterministic.
+        "summary_type": summary_type if summary_type in {
+            staged_summary_type("preliminary", "file"),
+            staged_summary_type("deep", "file"),
+        } else (summary.get("summary_type") or summary_type),
+        "claim_contract": summary.get("claim_contract") or "file-claims/1.0",
+        "file_conclusions": summary.get("file_conclusions") or [],
+        "file_arguments": summary.get("file_arguments") or [],
+        "file_review_items": summary.get("file_review_items") or [],
+        "file_limitations": summary.get("file_limitations") or [],
+        "evidence_quality": summary.get("evidence_quality") or {},
+    })
 
 
 @app.route("/api/analysis-node-members/<scan_id>")
@@ -3484,6 +6222,32 @@ def tree_edits(scan_id):
         })
     except ValueError as exc:
         return api_error(str(exc), 400)
+
+
+@app.route("/api/document/<scan_id>/raw")
+def get_raw_document(scan_id):
+    """Stream the original source file for reading or download."""
+    try:
+        scan = require_scan(scan_id)
+        node_path = str(request.args.get("path") or "").strip()
+        if not node_path:
+            raise ValueError("缺少文件路径")
+        physical_path = node_path.split("::", 1)[0]
+        resolve_under(scan["root"], physical_path)
+        source_path = Path(scan["root"]) / physical_path
+        if not source_path.is_file():
+            raise ValueError("原始文件不存在或尚未可访问")
+        response = send_from_directory(
+            str(source_path.parent), source_path.name,
+            as_attachment=str(request.args.get("download") or "").lower() in {"1", "true", "yes"},
+        )
+        # 原文件阅读器会在当前站点内嵌 PDF/图片。全局安全头默认 DENY，
+        # 会让浏览器提示“已阻止该页面的显示”；原文件只允许同源页面嵌入。
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
+        return response
+    except ValueError as exc:
+        return api_error(str(exc), 404)
 
 
 @app.route("/api/document/<scan_id>")
@@ -3683,6 +6447,8 @@ def get_document(scan_id):
             "data_profiles": document.get("data_profiles", []),
             "warnings": document.get("warnings", []),
             "text_preview": document.get("text", "")[:5000],
+            "text_content": (document.get("text", "") if str(request.args.get("full") or "").lower() in {"1", "true", "yes"} else None),
+            "text_char_count": len(str(document.get("text", "") or "")),
             "evidence": selected_evidence,
             "evidence_count": len(evidence_items),
         }})
@@ -4442,7 +7208,26 @@ def package_overview(scan_id):
     try:
         require_scan(scan_id)
         overview = build_package_overview_from_storage(storage, scan_id, batch_size=250)
-        report = storage.get_summary(scan_id, ".", "report") or {}
+        task = storage.get_import_task(scan_id) or {}
+        checkpoint = dict(task.get("checkpoint") or {})
+        selected_paths = {str(path) for path in (checkpoint.get("selected_paths") or []) if str(path)}
+        selection_plan = checkpoint.get("selection_plan") or {}
+        strict_selected = bool(selected_paths) and not bool(
+            checkpoint.get("large_selection") or selection_plan.get("schema_version")
+        )
+        published_deep_paths, deep_published = _published_deep_scope(scan_id)
+        report = {}
+        for summary_type in ("deep_report", "preliminary_report", "parsed_report", "report"):
+            candidate = storage.get_summary(scan_id, ".", summary_type) or {}
+            if not candidate:
+                continue
+            if summary_type == "deep_report" and strict_selected and not deep_published:
+                # Deep file/node artifacts may already exist, but they are not
+                # part of the user-visible overview until the explicit update
+                # action publishes this selection version.
+                continue
+            report = candidate
+            break
         direction = dict(report.get("recommended_research_direction") or {})
         direction["research_questions"] = list(direction.get("research_questions") or [])[:8]
         direction["methods"] = list(direction.get("methods") or [])[:8]
@@ -4469,6 +7254,330 @@ def package_overview(scan_id):
         })
     except KeyError:
         return api_error("数据包不存在", 404)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/package/<scan_id>/overview")
+def package_overview_contract(scan_id):
+    """Versioned package-overview alias used by the new workflow shell."""
+    return package_overview(scan_id)
+
+
+@app.route("/api/package/<scan_id>/directory")
+def package_directory_contract(scan_id):
+    """Return the formal semantic directory under the package API namespace."""
+    return formal_directory(scan_id)
+
+
+@app.route("/api/package/<scan_id>/nodes/<node_id>")
+def package_node_detail(scan_id, node_id):
+    try:
+        require_scan(scan_id)
+        node = dict(_find_analysis_node(scan_id, node_id))
+        declared_count = int(node.get("file_count") or 0)
+        lazy_members = bool(node.get("member_paths_lazy"))
+        selection_filter = dict(node.get("selection_filter") or {})
+        representative_paths = list(node.get("representative_paths") or node.get("member_paths") or [])[:50]
+        # The analysis tree is a structural index. Once a deep node summary
+        # exists, it is the authoritative content source for this detail API;
+        # otherwise an older tree payload can hide verified conclusions.
+        deep_summary = storage.get_summary(
+            scan_id, "node:{}".format(node_id), staged_summary_type("deep", "node")
+        ) or storage.get_summary(scan_id, "node:{}".format(node_id), "folder") or {}
+        if str(deep_summary.get("analysis_level") or "").lower() == "deep":
+            node.update(deep_summary)
+        if str(deep_summary.get("analysis_level") or "").lower() != "deep":
+            node_members = set(node.get("member_paths") or [])
+            for row in storage.list_summaries(scan_id):
+                candidate = row.get("payload") or {}
+                candidate_members = set(candidate.get("member_paths") or [])
+                if (str(candidate.get("analysis_level") or "").lower() == "deep"
+                        and node_members == candidate_members):
+                    node.update(candidate)
+                    break
+        members = sorted(set(str(path) for path in (node.get("member_paths") or node.get("source_paths") or []) if path))
+        displayed_count = declared_count or int(node.get("file_count") or 0) or len(members)
+        coverage = dict(node.get("coverage") or {})
+        if lazy_members:
+            coverage.setdefault("category_file_count", displayed_count)
+            coverage.setdefault("analyzed_scope_files", len(members))
+            coverage.setdefault("members_materialized", False)
+            coverage.setdefault("scope_limited", True)
+        claims = node.get("claims") or node.get("evidence_claims") or []
+        conclusions = node.get("conclusions") or node.get("conclusion_evidence") or claims
+        question_answer_evidence = node.get("question_answer_evidence") or {}
+        return jsonify({
+            "ok": True,
+            "scan_id": scan_id,
+            "node": {
+                "node_id": node.get("node_id") or node_id,
+                "name": node.get("name") or node.get("title") or "未命名主题",
+                "summary": node.get("summary") or node.get("description") or "",
+                "research_value": node.get("research_value") or node.get("question_value") or "",
+                "research_questions": node.get("research_questions") or node.get("questions") or [],
+                "member_paths": members,
+                "file_count": displayed_count,
+                "member_paths_lazy": lazy_members,
+                "selection_filter": selection_filter,
+                "representative_paths": representative_paths,
+                "total_bytes": int(node.get("total_bytes") or node.get("total_size") or 0),
+                "conclusions": conclusions,
+                "claims": claims,
+                "question": node.get("question") or question_answer_evidence.get("question") or "",
+                "value": node.get("value") or question_answer_evidence.get("value") or "",
+                "answer": node.get("answer") or question_answer_evidence.get("answer") or "",
+                "question_answer_evidence": question_answer_evidence,
+                "conclusion_evidence": node.get("conclusion_evidence") or [],
+                "conflicts": node.get("conflicts") or [],
+                "limitations": node.get("limitations") or [],
+                "coverage": coverage,
+                "analysis_level": node.get("analysis_level") or "preview",
+                "analysis_depth": node.get("analysis_depth") or "preview_folder",
+                "deep_analysis": bool(node.get("deep_analysis")),
+                "evidence_status": node.get("evidence_status") or "insufficient",
+                "verification_status": node.get("verification_status") or "candidate",
+                "evidence": node.get("evidence") or node.get("evidence_chain") or [],
+            },
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/scan/<scan_id>/refresh-deep-results", methods=["POST"])
+def refresh_deep_results(scan_id):
+    """Rebuild user-facing outputs after all deep model work is durable."""
+    try:
+        require_scan(scan_id)
+        task = storage.get_import_task(scan_id) or {}
+        processing = _package_processing_status(scan_id)
+        task_status = str(task.get("status") or "").lower()
+        with storage._connect() as conn:
+            active_jobs = int(conn.execute(
+                "SELECT COUNT(*) AS value FROM analysis_jobs "
+                "WHERE scan_id=? AND status IN ('queued','running','cancelling') "
+                "AND task_type='generate_summary' AND "
+                "json_extract(options,'$.workflow_source') IN "
+                "('deep_parse_model_summary','idle_deep_model_summary',"
+                "'large_selection_model_summary','deep_node_rebuild','candidate_node_summary')",
+                (str(scan_id),),
+            ).fetchone()["value"] or 0)
+        # Parser attention states do not mean that the model deep summary is
+        # missing. Refresh readiness is based on durable deep-batch items and
+        # persisted model summaries instead of the parser status counter.
+        checkpoint = dict(task.get("checkpoint") or {})
+        selected_paths = [str(path) for path in (checkpoint.get("selected_paths") or []) if str(path)]
+        if selected_paths:
+            completed = [path for path in selected_paths if _is_persisted_deep_file_summary(storage.get_summary(scan_id, path, staged_summary_type("deep", "file")) or {})]
+            if len(completed) != len(selected_paths) or active_jobs:
+                return api_error("深度摘要尚未全部完成，暂不能更新正式结果", 409, {"selected_files": len(selected_paths), "completed_files": len(completed), "active_deep_jobs": active_jobs})
+            if task_status != "deep_update_available":
+                return api_error("请等待当前阶段完成后再更新。", 409, {"task_status": task_status})
+            storage.transition_import_task(
+                scan_id, "deep_overview_updating", checkpoint=checkpoint,
+                reason="用户正在按当前已完成的深度证据更新目录和情报概览。",
+            )
+            report_id, _created = storage.create_or_get_typed_job(
+                scan_id, "generate_report",
+                options={"workflow_source": "deep_results_report", "selection_version": checkpoint.get("selection_version"), "resume_state": task_status},
+                owner_id=_request_owner_id() or "legacy",
+            )
+            checkpoint["deep_overview_job_id"] = report_id
+            storage.update_import_task(scan_id, checkpoint=checkpoint)
+            return jsonify({"ok": True, "accepted": True, "updated": False, "job_id": report_id, "status_url": "/api/jobs/{}".format(report_id)}), 202
+        deep_batch_id = str(checkpoint.get("deep_batch_id") or "")
+        selection_plan = checkpoint.get("selection_plan") or {}
+        large_selection = bool(checkpoint.get("large_selection") or selection_plan.get("schema_version"))
+        deep_paths = []
+        deep_failed_items = 0
+        if deep_batch_id:
+            with storage._connect() as conn:
+                deep_rows = conn.execute(
+                    "SELECT node_path,status FROM deep_parse_items WHERE batch_id=?",
+                    (deep_batch_id,),
+                ).fetchall()
+            deep_paths = [
+                str(row["node_path"] or "")
+                for row in deep_rows
+                if str(row["node_path"] or "")
+            ]
+            deep_failed_items = sum(
+                1 for row in deep_rows
+                if str(row["status"] or "").lower() == "failed"
+            )
+        if not large_selection:
+            # A normal package can have one foreground selection batch followed
+            # by one or more idle backfill batches. Refresh must see the union,
+            # not only the newest batch, otherwise earlier deep results vanish
+            # from the readiness calculation.
+            with storage._connect() as conn:
+                all_deep_rows = conn.execute(
+                    "SELECT i.node_path,i.status FROM deep_parse_items i "
+                    "JOIN deep_parse_batches b ON b.batch_id=i.batch_id "
+                    "WHERE b.scan_id=?",
+                    (str(scan_id),),
+                ).fetchall()
+            deep_paths = list(dict.fromkeys(
+                str(row["node_path"] or "") for row in all_deep_rows
+                if str(row["node_path"] or "")
+            ))
+            deep_failed_items = sum(
+                1 for row in all_deep_rows
+                if str(row["status"] or "").lower() == "failed"
+            )
+        required_model_paths = [
+            str(path) for path in (selection_plan.get("model_paths") or []) if str(path)
+        ] if large_selection else list(deep_paths)
+        required_model_set = set(required_model_paths)
+        if large_selection and deep_batch_id and required_model_set:
+            with storage._connect() as conn:
+                deep_failed_items = int(conn.execute(
+                    "SELECT COUNT(*) AS value FROM deep_parse_items "
+                    "WHERE batch_id=? AND status='failed' AND node_path IN ({})".format(
+                        ",".join("?" for _ in required_model_set)
+                    ),
+                    [deep_batch_id] + sorted(required_model_set),
+                ).fetchone()["value"] or 0)
+        expected_deep = len(required_model_paths) or int(
+            checkpoint.get("deep_summary_expected") or 0
+        )
+        if not expected_deep and not large_selection:
+            expected_deep = int(
+                processing.get("logical_total_files")
+                or processing.get("inventory_files")
+                or 0
+            )
+        model_deep_completed = 0
+        for path in required_model_paths:
+            summary = storage.get_summary(scan_id, path, "file") or {}
+            if (
+                bool(summary.get("deep_analysis"))
+                and (
+                    str(summary.get("analysis_level") or "").lower() == "deep"
+                    or str(summary.get("generated_by") or "") == "model-deep-analysis"
+                )
+            ):
+                model_deep_completed += 1
+        model_deep_pending = max(
+            0, expected_deep - model_deep_completed - deep_failed_items
+        )
+        deep_completion_ratio = round(
+            model_deep_completed / float(expected_deep or 1), 6
+        )
+        refreshable_status = task_status in {
+            "summarizing_files", "building_directory", "completed", "partial"
+        }
+        # Updating the directory/report is a read-through projection over
+        # durable summaries. It is safe and useful while later low-priority
+        # summaries are still running; one completed deep file is enough to
+        # publish a partial refresh.
+        has_deep_result = model_deep_completed > 0
+        if not refreshable_status or not has_deep_result:
+            return api_error(
+                "尚无可用于更新正式结果的深度摘要",
+                409,
+                {
+                    "task_status": task_status,
+                    "deep_completion_ratio": deep_completion_ratio,
+                    "active_deep_jobs": active_jobs,
+            "pending_files": model_deep_pending,
+            "failed_files": deep_failed_items,
+            "selection_plan": selection_plan if large_selection else None,
+                },
+            )
+        report = _write_local_overview(
+            scan_id, owner_id=_request_owner_id(), job_id=None
+        )
+        # The directory and package overview are read-through projections of
+        # persisted deep summaries. Re-read the directory to verify visibility.
+        directory_response = formal_directory(scan_id)
+        if isinstance(directory_response, tuple):
+            directory_response = directory_response[0]
+        directory_payload = directory_response.get_json(silent=True) or {}
+        directory = directory_payload.get("directory") or {}
+        return jsonify({
+            "ok": True,
+            "scan_id": scan_id,
+            "updated": True,
+            "report": report,
+            "directory": directory,
+            "formal_directory_status": directory.get("status"),
+            "topic_count": len(directory.get("topics") or []),
+            "tree_edits_preserved": True,
+            "message": "已按深度摘要更新文件摘要、节点摘要、智能目录和情报概览。",
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/package/<scan_id>/files/<path:node_path>/detail")
+def package_file_detail(scan_id, node_path):
+    """Return one file's unified document and source-backed conclusion cards."""
+    try:
+        require_scan(scan_id)
+        node_path = str(node_path or "").strip()
+        if not node_path:
+            raise ValueError("缺少文件路径")
+        document = storage.get_document(scan_id, node_path)
+        requested_type = str(request.args.get("type") or "").strip()
+        staged_types = {
+            staged_summary_type("deep", "file"),
+            staged_summary_type("preliminary", "file"),
+        }
+        if requested_type in staged_types:
+            summary_type = requested_type
+        else:
+            task = storage.get_import_task(scan_id) or {}
+            selected = {str(path) for path in ((task.get("checkpoint") or {}).get("selected_paths") or []) if str(path)}
+            summary_type = "file"
+            if selected and node_path in selected:
+                if storage.get_summary(scan_id, node_path, staged_summary_type("deep", "file")):
+                    summary_type = staged_summary_type("deep", "file")
+                elif storage.get_summary(scan_id, node_path, staged_summary_type("preliminary", "file")):
+                    summary_type = staged_summary_type("preliminary", "file")
+        summary = storage.get_summary(scan_id, node_path, summary_type)
+        if summary and summary_type == "file" and summary.get("claim_contract") != "file-claims/1.0" and document:
+            summary.update(build_file_claims(summary, document.get("evidence", [])))
+            storage.save_summary(scan_id, node_path, "file", summary)
+        if not document and not summary:
+            return api_error("该文件尚未完成解析", 404)
+        return jsonify({
+            "ok": True,
+            "scan_id": scan_id,
+            "path": node_path,
+            "document": document,
+            "summary": summary,
+            "file_conclusions": (summary or {}).get("file_conclusions") or [],
+            "file_arguments": (summary or {}).get("file_arguments") or [],
+            "file_review_items": (summary or {}).get("file_review_items") or [],
+            "file_limitations": (summary or {}).get("file_limitations") or [],
+            "evidence_quality": (summary or {}).get("evidence_quality") or {},
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/package/<scan_id>/reprocess", methods=["POST"])
+def package_reprocess(scan_id):
+    """Create a fresh scan for a historical package without mutating old results."""
+    try:
+        scan = require_scan(scan_id)
+        root = str(scan.get("root") or scan.get("root_path") or "").strip()
+        if not root:
+            raise ValueError("历史数据包没有可重新读取的服务器路径")
+        payload = request.get_json(silent=True) or {}
+        parse_mode = str(payload.get("parse_mode") or scan.get("parse_mode") or "auto").lower()
+        if parse_mode not in {"auto", "fast", "accurate"}:
+            parse_mode = "auto"
+        job_id = storage.create_scan_job(
+            root, Config.MAX_SCAN_FILES, parse_mode,
+            Config.MAX_SCAN_DEPTH, owner_id=_request_owner_id() or "legacy",
+        )
+        return jsonify({
+            "ok": True, "accepted": True, "scan_id": job_id,
+            "job_id": job_id, "source_scan_id": scan_id,
+            "status_url": "/api/jobs/{}".format(job_id),
+        }), 202
     except ValueError as exc:
         return api_error(str(exc), 400)
 
@@ -5003,16 +8112,40 @@ def document_translation(scan_id):
 @app.route("/api/translate-package/<scan_id>", methods=["POST"])
 def translate_package(scan_id):
     try:
-        require_scan(scan_id)
+        scan_result = require_scan(scan_id)
         payload = request.get_json(silent=True) or {}
         phase = str(payload.get("phase") or "preview_and_priority")
         if phase not in {"preview_and_priority", "deep_backfill"}:
             raise ValueError("不支持的翻译阶段")
+        requested_paths = payload.get("target_paths", payload.get("paths"))
+        options = {"phase": phase, "cursor": 0}
+        if requested_paths is not None:
+            if not isinstance(requested_paths, list):
+                raise ValueError("target_paths 必须是文件路径数组")
+            selected_paths = list(dict.fromkeys(
+                str(path).strip() for path in requested_paths if str(path).strip()
+            ))
+            if not selected_paths:
+                raise ValueError("至少选择一个需要翻译的文件")
+            if len(selected_paths) > 500:
+                raise ValueError("单次最多选择 500 个文件")
+            for path in selected_paths:
+                _translation_inventory_node(scan_result, path)
+            options.update({
+                "target_paths": selected_paths,
+                "selected_only": True,
+                "require_full": bool(payload.get("require_full", True)),
+            })
         job_id, _created = storage.create_or_get_typed_job(
-            scan_id, "translate_package", options={"phase": phase, "cursor": 0},
+            scan_id, "translate_package", options=options,
             owner_id=_request_owner_id() or "legacy",
         )
-        return jsonify({"ok": True, "job_id": job_id, "phase": phase}), 202
+        return jsonify({
+            "ok": True,
+            "job_id": job_id,
+            "phase": phase,
+            "selected_files": len(options.get("target_paths") or []),
+        }), 202
     except ValueError as exc:
         return api_error(str(exc), 400)
 
@@ -5306,6 +8439,248 @@ def retrieve():
         )
 
 
+@app.route("/api/search/files", methods=["POST"])
+def search_files():
+    """Search a package and aggregate every matching logical file.
+
+    This is deliberately separate from /api/retrieve: the evidence endpoint
+    returns a small ranked answer window, while this endpoint treats the
+    durable index as a file discovery system and reports the complete unique
+    file set (bounded by the index query limit and paged for the UI).
+    """
+    payload = request.get_json(silent=True) or {}
+    try:
+        scan_id = str(payload.get("scan_id") or "").strip()
+        query = re.sub(r"\s+", " ", str(payload.get("query") or "")).strip()
+        if not query or len(query) > 8000:
+            raise ValueError("搜索内容不能为空且不能超过 8000 个字符")
+        scan_result = require_scan(scan_id)
+
+        try:
+            page = max(1, int(payload.get("page", 1)))
+            page_size = max(1, min(100, int(payload.get("page_size", 50))))
+        except (TypeError, ValueError):
+            raise ValueError("分页参数无效")
+
+        node_id = str(payload.get("node_id") or "").strip()
+        member_paths = None
+        scope_key = "."
+        retrieval_scope = "."
+        node_name = None
+        if node_id:
+            node = _find_analysis_node(scan_id, node_id)
+            member_paths = set(str(path) for path in (node.get("member_paths") or []) if path)
+            if not member_paths:
+                raise ValueError("当前主题节点没有关联文件")
+            scope_key = "node:{}".format(node_id)
+            node_name = node.get("name")
+        else:
+            scope_key = str(payload.get("path") or ".").strip() or "."
+            resolve_under(scan_result["root"], scope_key)
+            retrieval_scope = scope_key
+
+        evidence_index_count = storage.count_evidence_index(scan_id)
+        if evidence_index_count:
+            candidates = storage.search_evidence_index(
+                scan_id,
+                query,
+                scope=retrieval_scope,
+                source_paths=member_paths,
+                limit=5000,
+            )
+            index_mode = "persistent-evidence-index"
+        else:
+            documents = _package_documents(scan_id, canonical_only=True)
+            if member_paths:
+                documents = [item for item in documents if item.get("path") in member_paths]
+            candidates = evidence_corpus(documents, scope=retrieval_scope)
+            index_mode = "rebuilt-corpus"
+
+        # Rank only the bounded representative window. File discovery itself
+        # remains complete over all returned candidates, so a high-ranked
+        # evidence limit can never hide lower-ranked matching files.
+        ranked = retrieve_evidence(
+            {}, query, scope=retrieval_scope, top_k=50, per_source_limit=1000,
+            indexed_chunks=candidates, use_tfidf=False,
+        )
+        score_by_evidence = {
+            str(item.get("evidence_id")): item
+            for item in (ranked.get("results") or [])
+            if item.get("evidence_id")
+        }
+
+        groups = {}
+        for raw in candidates:
+            item = dict(raw)
+            logical_path = str(item.get("source_path") or "").strip()
+            physical_path = str(
+                item.get("archive_source_path")
+                or (logical_path.split("::", 1)[0] if "::" in logical_path else logical_path)
+            ).strip()
+            key = logical_path or physical_path
+            if not key:
+                continue
+            group = groups.setdefault(key, {
+                "path": key,
+                "physical_path": physical_path or key,
+                "name": Path(key.split("::", 1)[-1]).name or key,
+                "match_count": 0,
+                "best_score": 0.0,
+                "snippets": [],
+                "pages": [],
+                "sections": [],
+                "evidence": [],
+            })
+            group["match_count"] += 1
+            ranked_item = score_by_evidence.get(str(item.get("evidence_id") or ""))
+            score = float((ranked_item or {}).get("retrieval_score") or 0.0)
+            group["best_score"] = max(group["best_score"], score)
+            page_value = item.get("page")
+            if page_value is not None and page_value not in group["pages"]:
+                group["pages"].append(page_value)
+            section = str(item.get("section") or "").strip()
+            if section and section not in group["sections"]:
+                group["sections"].append(section)
+            text = str(item.get("text") or item.get("fact") or "").strip()
+            if text and len(group["snippets"]) < 3 and text not in group["snippets"]:
+                group["snippets"].append(text[:520])
+            if len(group["evidence"]) < 3:
+                evidence = dict(item)
+                if ranked_item:
+                    evidence["retrieval_score"] = ranked_item.get("retrieval_score")
+                group["evidence"].append(evidence)
+
+        # File discovery has its own complete distinct-path pass. The ranked
+        # evidence window remains bounded for snippets, but it can no longer
+        # hide lower-ranked files from the file count.
+        complete_paths = storage.search_evidence_file_paths(
+            scan_id, query, scope=retrieval_scope, source_paths=member_paths,
+        ) if evidence_index_count else []
+        for discovered_path in complete_paths:
+            if discovered_path in groups:
+                continue
+            physical_path = discovered_path.split("::", 1)[0]
+            groups[discovered_path] = {
+                "path": discovered_path,
+                "physical_path": physical_path,
+                "name": Path(discovered_path.split("::", 1)[-1]).name or discovered_path,
+                "match_count": 0,
+                "best_score": 0.0,
+                "snippets": [], "pages": [], "sections": [], "evidence": [],
+                "file_set_match": True,
+            }
+
+        # Filename/path discovery is available before full-text parsing. Merge
+        # metadata matches into the same file cards so chat search can find a
+        # file by its name even when no evidence chunk exists yet.
+        if not member_paths and retrieval_scope == ".":
+            metadata_page = storage.search_file_status_page(
+                scan_id, query=query, search_scope="name", offset=0, limit=500
+            )
+            for metadata in metadata_page.get("items") or []:
+                discovered_path = str(metadata.get("path") or metadata.get("node_path") or "")
+                if not discovered_path or discovered_path in groups:
+                    continue
+                groups[discovered_path] = {
+                    "path": discovered_path,
+                    "physical_path": str(metadata.get("original_path") or discovered_path),
+                    "name": str(metadata.get("name") or Path(discovered_path).name),
+                    "extension": metadata.get("extension"),
+                    "size": metadata.get("size"),
+                    "match_count": 0, "best_score": 0.0,
+                    "snippets": [], "pages": [], "sections": [], "evidence": [],
+                    "file_set_match": True, "metadata_match": True,
+                }
+
+        logical_paths = list(groups)
+        state_paths = logical_paths + [item["physical_path"] for item in groups.values()]
+        states = storage.get_file_states(scan_id, state_paths)
+        for group in groups.values():
+            state = states.get(group["path"]) or states.get(group["physical_path"]) or {}
+            group["status"] = state.get("status") or "indexed"
+            group["analysis_level"] = "deep" if group["status"] == "completed" else "preview"
+            group["retryable"] = state.get("retryable")
+            group["error"] = state.get("error") if group["status"] == "failed" else None
+            group["best_score"] = round(group["best_score"], 6)
+            group["pages"] = sorted(group["pages"], key=lambda value: str(value))[:20]
+            group["sections"] = group["sections"][:20]
+            group["evidence"] = group["evidence"][:3]
+
+        matched_files = sorted(
+            groups.values(),
+            key=lambda item: (-float(item.get("best_score") or 0), item.get("path") or ""),
+        )
+        matched_count = len(matched_files)
+        evidence_count = len(candidates)
+        scope_file_count = storage.count_inventory_files(
+            scan_id,
+            scope=retrieval_scope,
+            source_paths=member_paths,
+        ) if member_paths or retrieval_scope != "." else storage.count_inventory_files(scan_id)
+        deep_file_count = sum(1 for item in matched_files if item.get("analysis_level") == "deep")
+        start = (page - 1) * page_size
+        page_items = matched_files[start:start + page_size]
+        index_state = storage.get_search_index_state(scan_id) or {}
+        index_complete = str(index_state.get("status") or "").lower() in {"completed", "ready", "complete"}
+        truncated = len(candidates) >= 5000
+        warnings = []
+        if not index_complete:
+            warnings.append("当前搜索索引尚未完成，结果可能只覆盖已建立索引的文件。")
+        elif truncated:
+            warnings.append("证据片段达到 5000 条展示上限；文件数量来自完整文件级索引，片段可按文件继续查看。")
+        conclusion = "检索“{}”共找到 {} 个相关文件，包含 {} 条相关证据。".format(
+            query[:120], matched_count, evidence_count
+        )
+        if not matched_count:
+            conclusion = "当前搜索范围内暂未找到包含“{}”的文件。".format(query[:120])
+        return jsonify({
+            "ok": True,
+            "query": query,
+            "scope": scope_key,
+            "node_id": node_id or None,
+            "node_name": node_name,
+            "conclusion": conclusion,
+            "answer": {
+                "query": query,
+                "conclusion": conclusion,
+                "matched_file_count": matched_count,
+                "scope_file_count": scope_file_count,
+                "evidence_count": evidence_count,
+                "top_files": [
+                    {"path": item["path"], "name": item["name"], "match_count": item["match_count"], "best_score": item["best_score"]}
+                    for item in matched_files[:5]
+                ],
+                "evidence": [
+                    evidence
+                    for item in matched_files[:5]
+                    for evidence in item.get("evidence", [])[:1]
+                ],
+            },
+            "matched_file_count": matched_count,
+            "displayed_file_count": len(page_items),
+            "evidence_count": evidence_count,
+            "matched_files": page_items,
+            "page": page,
+            "page_size": page_size,
+            "has_more": start + page_size < matched_count,
+            "next_page": page + 1 if start + page_size < matched_count else None,
+            "file_set_complete": bool(index_complete),
+            "evidence_window_truncated": bool(truncated),
+            "index_mode": index_mode,
+            "coverage": {
+                "complete": index_complete and not truncated,
+                "indexed_evidence": evidence_index_count,
+                "candidate_evidence": evidence_count,
+                "scope_file_count": scope_file_count,
+                "deep_matched_file_count": deep_file_count,
+                "index_state": index_state,
+            },
+            "warnings": warnings,
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 404 if "扫描任务不存在" in str(exc) else 400)
+
+
 @app.route("/api/ask", methods=["POST"])
 def ask_numeric():
     """Answer bounded, exact numeric questions from structured profiles.
@@ -5459,6 +8834,9 @@ def rerun_package_analysis():
     try:
         scan_id = payload.get("scan_id", "")
         scan_result = require_scan(scan_id)
+        control = storage.get_package_processing_control(scan_id)
+        if control.get("state") == "awaiting_selection" and not payload.get("target_paths"):
+            return api_error("当前数据包已完成预处理，请先确认分析范围", 409)
         if payload.get("parse_mode") in {"auto", "fast", "accurate"}:
             scan_result["parse_mode"] = payload["parse_mode"]
             storage.update_scan(scan_id, scan_result)
@@ -5540,6 +8918,10 @@ def _summary_cache_valid(summary, summary_type, require_healthy=False, require_m
     if require_model:
         generated_by = str(summary.get("generated_by") or "").strip().lower()
         analysis_depth = str(summary.get("analysis_depth") or "").strip().lower()
+        if summary_type == "file" and generated_by in {"model-preview-analysis", "model-preview-batch-analysis", "model-candidate-summary", "model-preliminary-analysis", "local-preliminary-fallback"} and analysis_depth in {"preliminary_document", "preview_document", "preview"}:
+            return bool(str(summary.get("core_summary") or summary.get("summary") or "").strip())
+        if summary_type == "folder" and generated_by in {"model-node-overview", "model-preview-node-summary"} and analysis_depth in {"node_overview", "preview_folder"}:
+            return bool(str(summary.get("core_summary") or summary.get("summary") or "").strip())
         if generated_by not in {"model-deep-analysis", "model"}:
             return False
         expected_depth = "deep_folder" if summary_type == "folder" else "deep_document"
@@ -5557,7 +8939,13 @@ def _summary_target_node(scan_result, node_path):
     node = _physical_inventory_node(scan_result, node_path)
     if node:
         return node
-    node = _inventory_by_path(scan_result).get(str(node_path or ""))
+    if scan_result.get("inventory_mode") == "durable_paged_v1":
+        node = storage.get_inventory_entry(
+            scan_result.get("_scan_id") or scan_result.get("scan_id"),
+            str(node_path or ""),
+        )
+    else:
+        node = _inventory_by_path(scan_result).get(str(node_path or ""))
     if node and node.get("logical_unit"):
         resolve_under(scan_result["root"], node.get("container_path") or "")
         return node
@@ -5632,6 +9020,13 @@ def summarize():
                 return jsonify({"ok": True, "summary": cached, "cached": True, "degraded": bool(cached.get("parser_info", {}).get("degraded"))})
 
             context = _virtual_node_context(scan_id, node)
+            if not context.get("file_summaries_complete"):
+                missing = context.get("missing_file_summaries") or []
+                raise ValueError(
+                    "节点文件摘要尚未全部生成，暂不能生成节点摘要{}".format(
+                        "（缺少 {} 个文件摘要）".format(len(missing)) if missing else ""
+                    )
+                )
             local_summary = _virtual_node_summary(scan_id, node, context)
             if llm_generation_enabled:
                 require_local_model_enabled()
@@ -5652,10 +9047,11 @@ def summarize():
                     "degraded": bool(batch_errors or not result.get("model")),
                 }
                 generated["generated_by"] = (
-                    "model-deep-analysis" if result.get("model") else "local-fallback"
+                    "model-preview-node-summary" if result.get("model") else "local-fallback"
                 )
-                generated["analysis_depth"] = "deep_folder"
-                generated["deep_analysis"] = bool(result.get("model"))
+                generated["analysis_depth"] = "preview_folder"
+                generated["analysis_level"] = "preview"
+                generated["deep_analysis"] = False
                 summary = generated
             else:
                 summary = local_summary
@@ -5668,6 +9064,10 @@ def summarize():
             summary["summary_type"] = "folder"
             summary["schema_version"] = 4
             summary["summary"] = summary.get("summary") or summary.get("core_summary")
+            if str(summary.get("generated_by") or "") == "model-preview-node-summary":
+                summary["analysis_level"] = "preview"
+                summary["analysis_depth"] = "preview_folder"
+                summary["deep_analysis"] = False
             summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
             storage.save_summary(scan_id, cache_path, "folder", summary)
             return jsonify({"ok": True, "summary": summary, "cached": False, "degraded": bool(summary.get("parser_info", {}).get("degraded"))})
@@ -5690,6 +9090,14 @@ def summarize():
             require_healthy=True,
             require_model=llm_generation_enabled,
         ) and not force:
+            # Lazily upgrade summaries persisted before the file-claims contract.
+            # Existing imports immediately gain source-verified conclusions without
+            # requiring users to rerun the whole scan.
+            if summary_type == "file" and cached.get("claim_contract") != "file-claims/1.0":
+                legacy_document = storage.get_document(scan_id, node_path)
+                if legacy_document:
+                    cached.update(build_file_claims(cached, legacy_document.get("evidence", [])))
+                    storage.save_summary(scan_id, node_path, summary_type, cached)
             degraded = bool(cached.get("parser_info", {}).get("degraded"))
             return jsonify({"ok": True, "summary": cached, "cached": True, "degraded": degraded})
         if summary_type == "folder" and local_only:
@@ -5740,13 +9148,19 @@ def summarize():
             )
             document_parser = (unified_document or {}).get("parser") or {}
             document_coverage = (unified_document or {}).get("coverage") or {}
-            needs_deep_parse = is_large_package and (
+            source_extension = Path(node_path).suffix.lower()
+            structured_source_needs_upgrade = source_extension in {".json", ".jsonl", ".csv", ".tsv", ".xlsx", ".xls", ".xlsm", ".ods"} and document_parser.get("name") != "structured-json"
+            needs_deep_parse = structured_source_needs_upgrade or (is_large_package and document_parser.get("name") != "structured-json" and (
                 document_parser.get("mode") == "fast"
                 or document_parser.get("fast_preview")
                 or document_coverage.get("limited_by_fast_mode")
                 or document_coverage.get("overview_sampled")
+            ))
+            source_node = (
+                storage.get_inventory_entry(scan_id, node_path)
+                if scan_result.get("inventory_mode") == "durable_paged_v1"
+                else _inventory_by_path(scan_result).get(node_path)
             )
-            source_node = _inventory_by_path(scan_result).get(node_path)
             if not source_node:
                 raise ValueError("文件不在本次安全清点范围内")
             if needs_deep_parse or not unified_document:
@@ -5792,6 +9206,11 @@ def summarize():
                     "warnings": list((unified_document or {}).get("warnings", [])),
                 }
                 result = {"model": None, "usage": {}}
+            # Attach the file-level claim contract after both model and local fallback paths.
+            # This keeps the formal conclusion view source-verified and backward compatible
+            # with the existing evidence_chain field.
+            if unified_document:
+                summary.update(build_file_claims(summary, unified_document.get("evidence", [])))
             summary["parser_info"] = {
                 "parser": coverage["parser"],
                 "char_count": coverage["extracted_chars"],
@@ -5823,7 +9242,13 @@ def summarize():
         summary["schema_version"] = 4
         summary["summary"] = summary.get("summary") or summary.get("core_summary")
         summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
-        storage.save_summary(scan_id, node_path, summary_type, summary)
+        workflow_source = str(payload.get("workflow_source") or "")
+        if summary_type == "file" and workflow_source in {"idle_deep_model_summary", "deep_parse_model_summary", "large_selection_model_summary"}:
+            storage.save_summary(scan_id, node_path, staged_summary_type("deep", "file"), summary)
+        elif summary_type == "folder" and workflow_source == "deep_node_rebuild":
+            storage.save_summary(scan_id, node_path, staged_summary_type("deep", "node"), summary)
+        else:
+            storage.save_summary(scan_id, node_path, summary_type, summary)
         degraded = bool(summary.get("parser_info", {}).get("degraded"))
         return jsonify({"ok": True, "summary": summary, "cached": False, "degraded": degraded})
     except (ValueError, LocalModelError) as exc:
@@ -5930,6 +9355,511 @@ def outputs(filename):
             return api_error("下载票据无效、已使用或已过期，请重新发起下载", 401)
     return send_from_directory(str(Config.OUTPUT_DIR), filename, as_attachment=True)
 
+
+
+
+
+@app.route("/api/scan/<scan_id>/deep-selection", methods=["GET", "POST"])
+@app.route("/api/scan/<scan_id>/deep-selection/confirm", methods=["POST"])
+def deep_selection_contract(scan_id):
+    """Select files/nodes from the candidate directory for true deep analysis."""
+    try:
+        scan_result = require_scan(scan_id)
+        if request.method == "GET":
+            task = storage.get_import_task(scan_id) or {}
+            checkpoint = task.get("checkpoint") or {}
+            return jsonify({
+                "ok": True, "scan_id": scan_id,
+                "status": task.get("status"),
+                "selected_paths": checkpoint.get("deep_selected_paths") or [],
+                "selection": checkpoint.get("deep_selection") or {},
+                "coverage": (storage.get_analysis(scan_id) or {}).get("coverage") or {},
+            })
+        payload = request.get_json(silent=True) or {}
+        node_id = str(payload.get("node_id") or "").strip()
+        requested = list(payload.get("paths") or payload.get("target_paths") or [])
+        label = str(payload.get("label") or "深度摘要选择").strip()
+        large_directory_mode = build_policy(
+            scan_result, _package_large_options()
+        ).get("mode") == "large_directory"
+        selected_node = None
+        if node_id:
+            node = _find_analysis_node(scan_id, node_id)
+            selected_node = node
+            selection_filter = node.get("selection_filter") or {}
+            if selection_filter.get("kind") == "extension" and not large_directory_mode:
+                wanted_extension = str(selection_filter.get("extension") or "").casefold()
+                requested = [
+                    str(item.get("path") or "")
+                    for item in storage.iter_inventory_entries(scan_id, kind="file")
+                    if str((item.get("payload") or {}).get("extension") or "[no_extension]").casefold() == wanted_extension
+                ]
+            else:
+                requested = list(node.get("member_paths") or [])
+            label = node.get("name") or label
+        elif payload.get("path"):
+            if large_directory_mode:
+                selected_node = {
+                    "node_id": "path-" + hashlib.sha1(
+                        str(payload.get("path") or ".").encode("utf-8", "ignore")
+                    ).hexdigest()[:12],
+                    "kind": "group",
+                    "name": str(payload.get("path") or label),
+                    "selection_filter": {
+                        "kind": "path_prefix",
+                        "path": str(payload.get("path") or "."),
+                    },
+                    "member_paths_lazy": True,
+                }
+                requested = []
+            else:
+                requested = _requested_member_paths(scan_result, payload.get("path"))
+            label = str(payload.get("path") or label)
+        if large_directory_mode:
+            # Resolve a category/type node on the server and turn it into a
+            # bounded, resumable plan. Do not send the full matching path set
+            # through the legacy deep-selection branch.
+            plan = _build_large_selection_plan(
+                scan_id,
+                node=selected_node,
+                requested_paths=(requested if not selected_node else None),
+                label=label,
+            )
+            normal_paths = list(plan.get("parse_paths") or [])
+            model_paths = list(plan.get("model_paths") or [])
+            if not normal_paths:
+                raise ValueError("所选范围没有落在当前预算内的可解析文件")
+            selection = {
+                "kind": "node" if node_id else "files",
+                "node_id": node_id or None,
+                "label": label,
+                "paths": normal_paths,
+                "selected_file_count": int(plan.get("selected_file_count") or 0),
+                "selected_bytes": int(plan.get("selected_bytes") or 0),
+                "normal_parse_file_count": len(normal_paths),
+                "model_candidate_file_count": len(model_paths),
+                "deferred_file_count": int(plan.get("deferred_file_count") or 0),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "plan_schema_version": plan.get("schema_version"),
+            }
+            batch_id = storage.create_deep_parse_batch(
+                scan_id, normal_paths, created_by="user",
+                selection_rule={
+                    "kind": "large_bounded_selection",
+                    "node_id": node_id or None,
+                    "label": label,
+                    "plan": plan,
+                },
+                priority=130,
+            )
+            storage.prioritize_file_workflow_states(
+                scan_id, normal_paths, "large_selection", "大数据包用户选择的有界解析范围", score_boost=3000.0,
+            )
+            task = storage.get_import_task(scan_id) or {}
+            checkpoint = dict(task.get("checkpoint") or {})
+            checkpoint.update({
+                "deep_selection": selection,
+                "deep_selected_paths": normal_paths,
+                "deep_batch_id": batch_id,
+                "selection_plan": plan,
+                "large_selection": True,
+            })
+            storage.update_import_task(
+                scan_id, status="deep_parsing", phase="deep_parsing", checkpoint=checkpoint
+            )
+            storage.set_package_processing_state(
+                scan_id, "running",
+                "已按预算选择 {} 个文件解析，其中 {} 个进入模型摘要；另有 {} 个文件保留待后续处理。".format(
+                    len(normal_paths), len(model_paths), int(plan.get("deferred_file_count") or 0)
+                ),
+            )
+            options = {
+                "target_paths": normal_paths,
+                "model_summary_paths": model_paths,
+                "workflow_source": "large_selection",
+                "scope_label": label,
+                "parse_mode": "fast",
+                "continue_full": False,
+                "selection_version": int((storage.get_scan_selection(scan_id) or {}).get("version") or 1),
+                "deep_batch_id": batch_id,
+                "selection_plan": plan,
+            }
+            job_id, created = storage.create_or_get_typed_job(
+                scan_id, "analyze_package", options=options,
+                owner_id=_request_owner_id() or "legacy",
+            )
+            storage.update_analysis_progress_status(
+                scan_id, "queued", "已生成大数据包有界解析计划，等待 Worker 执行。", "deep_parsing"
+            )
+            return jsonify({
+                "ok": True, "accepted": True, "large_package": True,
+                "job_id": job_id, "deep_batch_id": batch_id,
+                "selected_count": int(plan.get("selected_file_count") or 0),
+                "selected_bytes": int(plan.get("selected_bytes") or 0),
+                "normal_parse_count": len(normal_paths),
+                "model_candidate_count": len(model_paths),
+                "deferred_count": int(plan.get("deferred_file_count") or 0),
+                "selection_plan": plan,
+                "selected_paths": normal_paths[:100],
+                "selected_paths_truncated": len(normal_paths) > 100,
+                "reused_active_job": not created,
+                "status_url": "/api/jobs/{}".format(job_id),
+            }), 202 if created else 200
+        requested = list(dict.fromkeys(str(path) for path in requested if str(path)))
+        workflow_by_path = {item.get("node_path"): item for item in storage.iter_file_workflow_states(scan_id)}
+        states_by_path = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
+        eligible = []
+        for path in requested:
+            summary = storage.get_summary(scan_id, path, "file") or {}
+            is_deep = str(summary.get("analysis_level") or "").lower() == "deep" and bool(summary.get("deep_analysis"))
+            if is_deep:
+                continue
+            workflow = workflow_by_path.get(path) or {}
+            state = states_by_path.get(path) or {}
+            preview_candidate = str(summary.get("analysis_level") or "").lower() == "preview"
+            if preview_candidate or deep_processing_eligible(workflow, state):
+                eligible.append(path)
+        if not eligible:
+            already_deep = []
+            for path in requested:
+                cached = storage.get_summary(scan_id, path, "file") or {}
+                if str(cached.get("analysis_level") or "").lower() == "deep" and cached.get("deep_analysis"):
+                    already_deep.append(path)
+            if already_deep and len(already_deep) == len(requested):
+                return jsonify({
+                    "ok": True, "accepted": False, "already_deep": True,
+                    "selected_count": 0, "selected_paths": already_deep,
+                    "message": "所选文件已经完成深度摘要。",
+                })
+            raise ValueError("所选文件已经完成深度摘要，或没有可处理文件")
+        selection = {
+            "kind": "node" if node_id else "files",
+            "node_id": node_id or None,
+            "label": label,
+            "paths": eligible,
+            "selected_file_count": len(eligible),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        batch_id = storage.create_deep_parse_batch(
+            scan_id, eligible, created_by="user",
+            selection_rule={"kind": "deep_selection", "node_id": node_id or None, "label": label},
+            priority=130,
+        )
+        storage.prioritize_file_workflow_states(scan_id, eligible, "manual_selection", "用户选择的深度摘要范围", score_boost=3000.0)
+        task = storage.get_import_task(scan_id) or {}
+        checkpoint = dict(task.get("checkpoint") or {})
+        checkpoint.update({"deep_selection": selection, "deep_selected_paths": eligible, "deep_batch_id": batch_id})
+        storage.update_import_task(scan_id, status="deep_parsing", phase="deep_parsing", checkpoint=checkpoint)
+        storage.set_package_processing_state(scan_id, "running", "已选择 {} 个文件进入深度摘要。".format(len(eligible)))
+        options = {
+            "target_paths": eligible,
+            "workflow_source": "manual_selection",
+            "scope_label": label,
+            "parse_mode": "accurate",
+            "continue_full": False,
+            "selection_version": int((storage.get_scan_selection(scan_id) or {}).get("version") or 1),
+            "deep_batch_id": batch_id,
+            "deep_selection": selection,
+        }
+        job_id, created = storage.create_or_get_typed_job(scan_id, "analyze_package", options=options, owner_id=_request_owner_id() or "legacy")
+        storage.update_analysis_progress_status(scan_id, "queued", "已提交深度摘要任务，等待 Worker 开始。", "deep_parsing")
+        return jsonify({
+            "ok": True, "accepted": True, "job_id": job_id, "deep_batch_id": batch_id,
+            "selected_count": len(eligible), "selected_paths": eligible,
+            "reused_active_job": not created, "status_url": "/api/jobs/{}".format(job_id),
+        }), 202 if created else 200
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+@app.route("/api/scan/<scan_id>/formal-directory")
+def formal_directory(scan_id):
+    """Evidence-gated directory for reports and formal question answering."""
+    try:
+        require_scan(scan_id)
+        analysis = storage.get_analysis(scan_id) or {}
+        import_task = storage.get_import_task(scan_id) or {}
+        checkpoint = dict(import_task.get("checkpoint") or {})
+        selected_scope = {
+            str(path) for path in (checkpoint.get("selected_paths") or []) if str(path)
+        }
+        selection_plan = dict(checkpoint.get("selection_plan") or {})
+        strict_selected = bool(selected_scope) and not bool(
+            checkpoint.get("large_selection") or selection_plan.get("schema_version")
+        )
+        _published_paths, deep_published = _published_deep_scope(scan_id)
+        # Deep artifacts are available in the file/node detail panels as soon
+        # as they finish.  The formal directory is a published product: for a
+        # strict selected import it must keep the last parsed/preliminary view
+        # until the user explicitly applies the deep-evidence update.
+        allow_deep_directory = not strict_selected or deep_published
+        tree_page = storage.get_tree_page(scan_id, "analysis", limit=5000) or []
+        # ``get_tree_page`` returns the root dictionary for the current
+        # durable tree index and a row list for older paged indexes.
+        tree = (
+            tree_page
+            if isinstance(tree_page, list)
+            else list(_walk_analysis_nodes(tree_page))
+        )
+        topics, deep_files, evidence_count = [], set(), 0
+        # Formal coverage is based on durable model summaries, not parser completion.
+        deep_summary_paths = set()
+        for summary_item in storage.list_summaries(scan_id):
+            if not allow_deep_directory:
+                continue
+            summary_payload = summary_item.get("payload") or {}
+            if not summary_payload.get("deep_analysis"):
+                continue
+            summary_type = str(summary_item.get("type") or "")
+            if summary_type in {"file", staged_summary_type("deep", "file")}:
+                if summary_item.get("path"):
+                    deep_summary_paths.add(str(summary_item["path"]))
+            else:
+                deep_summary_paths.update(str(path) for path in (summary_payload.get("member_paths") or []) if path)
+        for row in tree:
+            node = dict(row.get("payload") or row if isinstance(row, dict) else {})
+            staged_node = storage.get_summary(
+                scan_id, "node:{}".format(node.get("node_id") or ""),
+                staged_summary_type("deep", "node"),
+            ) or {}
+            if allow_deep_directory and staged_node.get("deep_analysis"):
+                node.update(staged_node)
+            coverage = node.get("coverage") or {}
+            level = str(node.get("analysis_level") or node.get("evidence_level") or "").lower()
+            evidence_candidates = list(node.get("evidence_chain") or node.get("evidence") or [])
+            # Topic nodes often store their source records under each
+            # conclusion rather than a top-level evidence_chain.  Flatten
+            # those records so formal-directory readiness follows the same
+            # conclusion -> original evidence relationship shown in the file
+            # detail page.
+            for conclusion in node.get("conclusion_evidence") or node.get("conclusions") or []:
+                if isinstance(conclusion, dict):
+                    evidence_candidates.extend(conclusion.get("evidence") or conclusion.get("supports") or [])
+            evidence = [item for item in evidence_candidates if evidence_is_formal(item)]
+            evidence_count += len(evidence)
+            members_all = sorted(set(str(path) for path in (node.get("member_paths") or node.get("source_paths") or []) if path))
+            members = [path for path in members_all if path in deep_summary_paths]
+            readiness = coverage.get("evidence_readiness_coverage") or coverage.get("evidence_readiness") or {}
+            ready = bool(members) and bool(
+                evidence
+                or coverage.get("formal_evidence_ready")
+                or level in {"deep", "evidence"}
+                or readiness.get("complete")
+            )
+            if ready: deep_files.update(members)
+            if node.get("kind") != "analysis_root" and (
+                node.get("kind") in {"topic", "cluster", "group"} or node.get("children")
+            ) and ready:
+                node_conclusions = (
+                    node.get("conclusions")
+                    or node.get("conclusion_evidence")
+                    or []
+                )
+                topics.append({
+                    "node_id": node.get("node_id") or row.get("node_path"),
+                    "name": node.get("name") or node.get("title") or "未命名主题",
+                    "summary": node.get("summary") or node.get("description") or "",
+                    "research_value": node.get("research_value") or node.get("question_value") or "",
+                    "research_questions": node.get("research_questions") or node.get("questions") or [],
+                    "member_paths": members,
+                    "file_count": len(members),
+                    "evidence_count": len(evidence),
+                    "conclusions": node_conclusions,
+                    "conflicts": node.get("conflicts") or [],
+                    "limitations": node.get("limitations") or [],
+                    "coverage": coverage,
+                    "confidence": "formal",
+                    "evidence_status": "supported" if evidence else "deep_pending_validation",
+                })
+
+        # Candidate nodes are content-derived and may not exist in the legacy
+        # analysis tree. Once every file in such a node is deep-analyzed, expose
+        # the same node in the formal directory with its verified claims.
+        existing_node_ids = {str(item.get("node_id") or "") for item in topics}
+        preview_directory = (
+            _build_candidate_preview_directory(scan_id) or {}
+            if allow_deep_directory else {}
+        )
+        selected_plan = dict((import_task.get("checkpoint") or {}).get("selection_plan") or {})
+        selected_node_id = str(selected_plan.get("node_id") or "")
+        if selected_node_id and selected_node_id not in existing_node_ids:
+            selected_preview = next(
+                (item for item in (preview_directory.get("topics") or [])
+                 if str(item.get("node_id") or "") == selected_node_id),
+                None,
+            )
+            selected_summary = storage.get_summary(
+                scan_id, "node:{}".format(selected_node_id), staged_summary_type("deep", "node")
+            ) or storage.get_summary(scan_id, "node:{}".format(selected_node_id), "folder") or {}
+            if selected_preview and str(selected_summary.get("analysis_level") or "").lower() == "deep":
+                selected_evidence = list(
+                    selected_summary.get("evidence_chain")
+                    or selected_summary.get("evidence")
+                    or []
+                )
+                for claim in selected_summary.get("conclusions") or selected_summary.get("conclusion_evidence") or []:
+                    if isinstance(claim, dict):
+                        selected_evidence.extend(
+                            claim.get("supports") or claim.get("evidence") or claim.get("supporting_evidence") or []
+                        )
+                selected_evidence = [item for item in selected_evidence if evidence_is_formal(item)]
+                selected_members = sorted(set(
+                    str(path) for path in (selected_summary.get("member_paths") or []) if path
+                ))
+                declared_count = int(
+                    selected_preview.get("file_count")
+                    or selected_plan.get("selected_file_count")
+                    or len(selected_members)
+                )
+                selected_coverage = {
+                    **dict(selected_preview.get("coverage") or {}),
+                    **dict(selected_summary.get("coverage") or {}),
+                    "category_file_count": declared_count,
+                    "selected_scope_files": int(selected_plan.get("selected_file_count") or declared_count),
+                    "analyzed_scope_files": len(selected_members),
+                    "deep_analyzed_files": int(selected_summary.get("deep_analyzed_files") or len(selected_members)),
+                    "members_materialized": False,
+                    "scope_limited": True,
+                    "claim_scope": "模型结论仅适用于选定类别中进入模型的文件，类别计数覆盖完整清单。",
+                    "verification_status": "verified" if selected_evidence else "partial",
+                }
+                deep_files.update(selected_members)
+                evidence_count += len(selected_evidence)
+                topics.append({
+                    "node_id": selected_node_id,
+                    "name": selected_preview.get("name") or selected_plan.get("label") or "选定类别",
+                    "summary": selected_summary.get("summary") or selected_preview.get("summary") or "",
+                    "research_value": selected_summary.get("research_value") or selected_preview.get("research_value") or "",
+                    "research_questions": selected_summary.get("research_questions") or selected_preview.get("research_questions") or [],
+                    "member_paths": selected_members,
+                    "member_paths_lazy": True,
+                    "file_count": declared_count,
+                    "evidence_count": len(selected_evidence),
+                    "conclusions": selected_summary.get("conclusions") or selected_summary.get("conclusion_evidence") or [],
+                    "conflicts": selected_summary.get("conflicts") or [],
+                    "limitations": selected_summary.get("limitations") or selected_preview.get("limitations") or [],
+                    "coverage": selected_coverage,
+                    "confidence": "formal",
+                    "evidence_status": "supported" if selected_evidence else "deep_pending_validation",
+                    "analysis_level": "deep",
+                    "verification_status": "verified" if selected_evidence else "partial",
+                })
+                existing_node_ids.add(selected_node_id)
+        for node in preview_directory.get("topics") or []:
+            node_id = str(node.get("node_id") or "")
+            if not node_id or not node.get("formal") or node_id in existing_node_ids:
+                continue
+            evidence = []
+            for claim in node.get("conclusions") or []:
+                evidence.extend(claim.get("supporting_evidence") or [])
+            evidence = [item for item in evidence if evidence_is_formal(item)]
+            members = sorted(set(str(path) for path in (node.get("member_paths") or []) if path))
+            deep_files.update(members)
+            evidence_count += len(evidence)
+            topics.append({
+                "node_id": node_id,
+                "name": node.get("name") or "候选主题",
+                "summary": node.get("summary") or "",
+                "research_value": node.get("research_value") or "",
+                "research_questions": node.get("research_questions") or [],
+                "member_paths": members,
+                "file_count": len(members),
+                "evidence_count": len(evidence),
+                "conclusions": node.get("conclusions") or [],
+                "conflicts": node.get("conflicts") or [],
+                "limitations": node.get("limitations") or [],
+                "coverage": node.get("coverage") or {},
+                "confidence": "formal",
+                "evidence_status": "supported" if evidence else "deep_pending_validation",
+                "analysis_level": "deep",
+                "verification_status": "verified",
+            })
+        # Strict imports persist node summaries in their own stage table. The
+        # legacy analysis tree may still contain an older set of generated node
+        # IDs, so do not let that structural index hide completed deep nodes.
+        deep_nodes_by_members = {}
+        for item in storage.list_summaries(scan_id):
+            if not allow_deep_directory:
+                continue
+            if str(item.get("type") or "") != staged_summary_type("deep", "node"):
+                continue
+            payload = dict(item.get("payload") or {})
+            if not payload.get("deep_analysis"):
+                continue
+            members = tuple(sorted(set(str(path) for path in (payload.get("member_paths") or []) if str(path))))
+            if not members:
+                continue
+            evidence = list(payload.get("evidence_chain") or payload.get("evidence") or [])
+            for claim in payload.get("conclusions") or payload.get("conclusion_evidence") or []:
+                if isinstance(claim, dict):
+                    evidence.extend(claim.get("supports") or claim.get("evidence") or claim.get("supporting_evidence") or [])
+            formal_evidence = [entry for entry in evidence if evidence_is_formal(entry)]
+            candidate = (len(formal_evidence), len(str(payload.get("summary") or "")), payload, formal_evidence)
+            previous = deep_nodes_by_members.get(members)
+            if previous is None or candidate[:2] > previous[:2]:
+                deep_nodes_by_members[members] = candidate
+        for members, (_score, _length, payload, formal_evidence) in deep_nodes_by_members.items():
+            node_id = str(payload.get("node_id") or "")
+            if node_id in existing_node_ids:
+                continue
+            deep_files.update(path for path in members if path in deep_summary_paths)
+            evidence_count += len(formal_evidence)
+            topics.append({
+                "node_id": node_id or "node:" + hashlib.sha1("\0".join(members).encode()).hexdigest()[:16],
+                "name": payload.get("title") or payload.get("name") or "深度主题",
+                "summary": payload.get("summary") or payload.get("description") or "",
+                "research_value": payload.get("research_value") or payload.get("value") or "",
+                "research_questions": payload.get("research_questions") or payload.get("questions") or [],
+                "member_paths": list(members),
+                "file_count": len(members),
+                "evidence_count": len(formal_evidence),
+                "conclusions": payload.get("conclusions") or payload.get("conclusion_evidence") or [],
+                "conflicts": payload.get("conflicts") or [],
+                "limitations": payload.get("limitations") or [],
+                "coverage": payload.get("coverage") or {},
+                "confidence": "formal",
+                "evidence_status": "supported" if formal_evidence else "deep_pending_validation",
+                "analysis_level": "deep",
+                "verification_status": "verified" if formal_evidence else "partial",
+            })
+            existing_node_ids.add(node_id)
+        counts = storage.file_workflow_counts(scan_id) or {}
+        processing_counts = storage.package_processing_counts(scan_id) or {}
+        selected_scope = [
+            str(path) for path in ((import_task.get("checkpoint") or {}).get("selected_paths") or [])
+            if str(path)
+        ]
+        inventory = len(selected_scope) if selected_scope else int(counts.get("total") or counts.get("total_files") or 0)
+        edits = storage.list_tree_edits(scan_id, _request_owner_id() or "legacy", limit=500)
+        task_status = str(import_task.get("status") or "")
+        selected_complete = bool(selected_scope) and selected_scope and all(path in deep_summary_paths for path in selected_scope)
+        formal_ready = bool(
+            selected_complete
+            and topics
+            and allow_deep_directory
+            and task_status in {"deep_summarizing_files", "deep_summarizing_nodes", "deep_overview_updating", "deep_update_available", "completed", "partial"}
+        )
+        return jsonify({"ok": True, "directory": {
+            "schema_version": "formal-directory/1.0",
+            "status": "formal" if formal_ready else "incomplete",
+            "formal": formal_ready,
+            "label": "正式智能目录（基于多文件深度解析和文件结论）",
+            "topics": topics,
+            "version": int(analysis.get("version") or 1),
+            "manual_edit_count": len(edits),
+            "processing_status": task_status,
+            "coverage": {
+                "inventory_files": inventory,
+                "package_inventory_files": int((storage.get_scan(scan_id) or {}).get("file_count") or inventory),
+                "selected_scope_only": bool(selected_scope),
+                "deep_files": len(deep_files),
+                "formal_evidence": evidence_count,
+                "ratio": round(len(deep_files) / float(inventory or 1), 6),
+                "failed_files": int(processing_counts.get("needs_attention") or 0),
+                "pending_files": int(processing_counts.get("incomplete") or 0),
+            },
+        }, "notice": "仅深度解析正文、文件结论和通过证据校验的内容可进入正式目录。"})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
 
 if __name__ == "__main__":
     import uvicorn

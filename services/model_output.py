@@ -49,12 +49,13 @@ def extract_json_value(content):
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             errors.append(str(exc))
 
-    # Last-resort recovery: locate a JSON value start and let JSONDecoder find its
-    # true endpoint.  We never guess an endpoint from a closing brace.
+    # Last-resort recovery: locate the first JSON value start and let JSONDecoder
+    # find its true endpoint. Do not scan subsequent starts: when an object is
+    # truncated, that would incorrectly promote a nested array/object to the
+    # top-level result and hide the real generation failure.
     decoder = json.JSONDecoder()
-    for index, char in enumerate(raw):
-        if char not in "{[":
-            continue
+    index = next((i for i, char in enumerate(raw) if char in "{["), None)
+    if index is not None:
         try:
             value, _end = decoder.raw_decode(raw[index:])
             return value
@@ -63,6 +64,58 @@ def extract_json_value(content):
 
     detail = errors[-1] if errors else "未发现 JSON 对象或数组"
     raise ModelOutputError("模型未返回可解析的 JSON：{}".format(detail))
+
+
+_FIELD_ALIASES = {
+    # These aliases are deliberately narrow.  They cover recurring, equivalent
+    # summary names without inventing analytical content or accepting an
+    # arbitrary model field as a required application field.
+    "core_summary": ("summary", "section_summary", "abstract", "overview"),
+    "section_summary": ("summary", "core_summary", "abstract", "overview"),
+    "translation": ("translated_text", "translated", "text"),
+    "recommended_research_direction": (
+        "research_direction",
+        "recommended_direction",
+        "research_recommendation",
+    ),
+}
+
+
+def repair_json_object(value, required_fields=None):
+    """Apply only lossless compatibility repairs to a parsed JSON response.
+
+    vLLM is asked for a strict JSON object, but an interrupted or older model
+    response can still occasionally wrap one valid object in a one-item list.
+    Unwrapping that exact shape is safe; multi-item lists are never guessed at.
+    Known semantic aliases are copied only when a caller explicitly requires the
+    canonical field.
+    """
+    if isinstance(value, list):
+        if len(value) != 1 or not isinstance(value[0], dict):
+            return value
+        value = dict(value[0])
+    elif isinstance(value, dict):
+        value = dict(value)
+    else:
+        return value
+
+    # A few providers place the actual object under a generic envelope.  Only
+    # unwrap it when it is the sole field, so no independently returned content
+    # is discarded.
+    if len(value) == 1:
+        wrapped = next(iter(value.values()))
+        if next(iter(value.keys())) in {"result", "data", "output", "analysis"} and isinstance(wrapped, dict):
+            value = dict(wrapped)
+
+    for field in (required_fields or ()):
+        if value.get(field) not in (None, ""):
+            continue
+        for alias in _FIELD_ALIASES.get(field, ()):
+            candidate = value.get(alias)
+            if candidate not in (None, ""):
+                value[field] = candidate
+                break
+    return value
 
 
 def validate_json_object(value, required_fields=None, context="模型输出"):

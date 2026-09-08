@@ -4,6 +4,8 @@ This stateful stage is kept separate from semantic package analysis so its
 I/O, resume and yield behaviour can evolve without growing analyze_package().
 """
 
+import hashlib
+import json
 import time
 
 from config import Config
@@ -18,6 +20,7 @@ from services.package_exploration import (
     preview_relation_features,
 )
 from services.parse_isolation import ParseIsolationCancelled
+from services.import_pipeline import parse_plan
 from services.retrieval import evidence_corpus
 
 
@@ -46,6 +49,10 @@ def explore_large_package(
     """Persist one bounded preview per inventory entry and build a content map."""
     progress = progress or (lambda percent, message: None)
     deep_paths = set(deep_paths or [])
+    try:
+        storage.reconcile_file_versions(scan_id)
+    except Exception:
+        pass
     existing = {
         item["path"]: item for item in storage.iter_file_preview_states(scan_id)
     }
@@ -79,13 +86,25 @@ def explore_large_package(
     # correctness cap. Every non-restricted inventory item must receive its
     # own bounded preview, otherwise later files become invisible merely due
     # to lexical order. The per-file bound keeps memory and state predictable.
+    # Large directory mode uses a stable path hash order so a hard sample cap
+    # is distributed across the package instead of favouring the first tree
+    # branch returned by the filesystem.
+    if policy.get("large_directory_mode"):
+        files = sorted(
+            files,
+            key=lambda item: hashlib.sha1(
+                str(item.get("path") or "").encode("utf-8", "ignore")
+            ).hexdigest(),
+        )
     per_file_preview_bytes = max(1, int(policy.get("preview_bytes_per_file") or 1))
     required_preview_bytes = sum(
         min(max(0, int(item.get("size") or 0)), per_file_preview_bytes)
         for item in files
     )
-    effective_preview_budget = max(
-        int(policy.get("preview_total_bytes") or 0), required_preview_bytes
+    effective_preview_budget = (
+        max(0, int(policy.get("preview_total_bytes") or 0))
+        if policy.get("large_directory_mode")
+        else max(int(policy.get("preview_total_bytes") or 0), required_preview_bytes)
     )
     budget = PreviewBudget(
         effective_preview_budget,
@@ -123,9 +142,14 @@ def explore_large_package(
             pending_previews,
             [],
             pending_states,
+            # Lightweight previews are navigation/search hints only. Do not
+            # publish them into the formal evidence index: a bounded sample
+            # cannot support a whole-document claim. Deep parsing is the only
+            # stage allowed to create formal evidence.
             evidence_by_path=[
                 (path, evidence_corpus({path: document}))
                 for path, document in pending_documents
+                if not bool((document.get("coverage") or {}).get("preview_only"))
             ],
             remove_document_paths=[path for path, _document in pending_documents],
         )
@@ -158,12 +182,27 @@ def explore_large_package(
             flush()
             raise ParseIsolationCancelled("任务已取消，已保存完成的轻量预览检查点")
         path = file_node.get("path")
+        try:
+            storage.update_preview_queue_item(scan_id, path, "running")
+        except Exception:
+            pass
         prior = existing.get(path)
         preserve_deep = path in deep_paths and _preview_matches_inventory(
             prior, file_node
         )
         if _preview_matches_inventory(prior, file_node):
             reused += 1
+            try:
+                storage.update_preview_queue_item(
+                    scan_id, path, "completed",
+                    preview_bytes=int(prior.get("sampled_bytes") or 0),
+                    cursor=json.dumps({
+                        "source_sha256": prior.get("source_sha256"),
+                        "modified_at_ns": prior.get("modified_at_ns"),
+                    }, ensure_ascii=False),
+                )
+            except Exception:
+                pass
         else:
             try:
                 preview = preview_file_func(
@@ -175,12 +214,30 @@ def explore_large_package(
                     zip_member_bytes=policy.get("preview_zip_member_bytes"),
                     cancel_check=cancel_check,
                     yield_check=yield_check,
+                    hash_source=str(policy.get("preview_hash_mode") or "full") != "metadata",
                 )
             except PreviewSliceYield:
                 flush()
                 return save_slice_checkpoint(index - 1, "higher_priority_job")
             pending_previews.append((path, preview))
             existing[path] = preview
+            try:
+                queue_status = (
+                    "completed" if preview.get("status") in {"previewed", "restricted"}
+                    else ("failed" if preview.get("status") in {"failed", "out_of_scope"} else "queued")
+                )
+                storage.update_preview_queue_item(
+                    scan_id, path, queue_status,
+                    preview_bytes=int(preview.get("sampled_bytes") or 0),
+                    cursor=json.dumps({
+                        "source_sha256": preview.get("source_sha256"),
+                        "modified_at_ns": preview.get("modified_at_ns"),
+                    }, ensure_ascii=False),
+                    error_code=("preview_failed" if queue_status == "failed" else None),
+                    error_message=("; ".join(preview.get("warnings") or []) if queue_status == "failed" else None),
+                )
+            except Exception:
+                pass
             previewed += 1
             if (
                 not preserve_deep
@@ -269,6 +326,12 @@ def explore_large_package(
         preview_stream(), representative_limit=policy.get("initial_parse_files"),
     )
     selection_decisions = content_map.pop("selection_decisions", [])
+    preview_by_path = {str(item.get("path")): item for item in existing.values() if item.get("path")}
+    for decision in selection_decisions:
+        path = str(decision.get("path") or "")
+        decision["parse_plan"] = parse_plan(preview_by_path.get(path) or {"path": path}, preview_by_path.get(path) or {})
+        decision["evidence_status"] = "preview_candidate"
+        decision["analysis_level"] = "preview"
     storage.save_file_workflow_states(scan_id, selection_decisions)
     for duplicate in content_map.get("duplicates") or []:
         if duplicate.get("kind") != "exact_sha256":
@@ -283,7 +346,10 @@ def explore_large_package(
         "preview_bytes_per_file": policy.get("preview_bytes_per_file"),
         "preview_total_bytes": policy.get("preview_total_bytes"),
         "effective_preview_total_bytes": effective_preview_budget,
-        "preview_total_is_capacity_floor": True,
+        "preview_total_is_capacity_floor": not bool(policy.get("large_directory_mode")),
+        "preview_total_is_hard_sample_cap": bool(policy.get("large_directory_mode")),
+        "hash_mode": policy.get("preview_hash_mode") or "full",
+        "sampling_order": "stable_path_hash_v1" if policy.get("large_directory_mode") else "inventory_order",
         "representative_limit": policy.get("initial_parse_files"),
         "selection_basis": "主题覆盖、格式/目录/语言覆盖、信息量、独特性与关系价值",
     }

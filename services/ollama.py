@@ -276,7 +276,7 @@ class OllamaClient(LocalModelClient):
             LocalModelClient._backoff(attempt)
         raise LocalModelError("本机 Ollama 流式调用失败")
 
-    def chat_json(self, system_prompt, user_prompt, max_tokens=2400, strict=True, retries=2, timeout=None, required_fields=None, output_context="模型输出"):
+    def chat_json(self, system_prompt, user_prompt, max_tokens=2400, strict=True, retries=2, timeout=None, required_fields=None, output_context="模型输出", long_output=False):
         prompt = system_prompt + "\n你必须只输出一个合法 JSON 对象，不要输出 Markdown 代码围栏。"
         result = self._stream_request({
             "model": self.model,
@@ -301,10 +301,12 @@ class OllamaClient(LocalModelClient):
 class OllamaEmbeddingClient:
     """Bounded client for Ollama's small local embedding model."""
 
-    def __init__(self, base_url, model, timeout=60):
+    def __init__(self, base_url, model, timeout=60, num_gpu=0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = max(10, int(timeout))
+        # Ollama uses num_gpu=0 to force CPU execution for this small model.
+        self.num_gpu = max(0, int(num_gpu))
         self._semaphore = threading.BoundedSemaphore(1)
 
     @property
@@ -320,6 +322,7 @@ class OllamaEmbeddingClient:
             "model": self.model,
             "input": values,
             "keep_alive": "30s",
+            "options": {"num_gpu": self.num_gpu},
         }, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             native_base.rstrip("/") + "/api/embed",

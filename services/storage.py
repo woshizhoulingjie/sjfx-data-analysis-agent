@@ -15,6 +15,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from config import Config, _mount_filesystem
+from services.import_state_machine import (
+    STRICT_IMPORT_STATES,
+    can_transition,
+    processing_state,
+)
 from services.schema import normalize_summary
 from services.tree_editor import apply_tree_edits
 from services.translation import document_translation_fingerprint
@@ -150,6 +155,60 @@ class Storage:
                     owner_id TEXT NOT NULL DEFAULT 'legacy',
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS import_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    scan_id TEXT NOT NULL UNIQUE,
+                    root_path TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'created',
+                    total_files INTEGER NOT NULL DEFAULT 0,
+                    discovered_files INTEGER NOT NULL DEFAULT 0,
+                    previewed_files INTEGER NOT NULL DEFAULT 0,
+                    deep_parsed_files INTEGER NOT NULL DEFAULT 0,
+                    failed_files INTEGER NOT NULL DEFAULT 0,
+                    current_phase TEXT NOT NULL DEFAULT 'created',
+                    checkpoint TEXT NOT NULL DEFAULT '{}',
+                    paused_at REAL,
+                    owner_id TEXT NOT NULL DEFAULT 'legacy',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_import_tasks_status ON import_tasks(status, updated_at);
+                CREATE TABLE IF NOT EXISTS deep_parse_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    import_task_id TEXT NOT NULL,
+                    scan_id TEXT NOT NULL,
+                    created_by TEXT NOT NULL DEFAULT 'system',
+                    selection_rule TEXT NOT NULL DEFAULT '{}',
+                    selected_file_count INTEGER NOT NULL DEFAULT 0,
+                    selected_bytes INTEGER NOT NULL DEFAULT 0,
+                    priority INTEGER NOT NULL DEFAULT 50,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS preview_queue_items (
+                    scan_id TEXT NOT NULL, file_id TEXT NOT NULL, node_path TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 50, status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0, cursor TEXT, preview_bytes INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT, error_message TEXT, updated_at REAL NOT NULL,
+                    PRIMARY KEY(scan_id, file_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_preview_queue_ready ON preview_queue_items(scan_id,status,priority);
+                CREATE TABLE IF NOT EXISTS deep_parse_items (
+                    batch_id TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    node_path TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 50,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    parser_plan TEXT NOT NULL DEFAULT '{}',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    started_at REAL,
+                    finished_at REAL,
+                    error_code TEXT,
+                    error_message TEXT,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(batch_id, file_id)
+                );
                 CREATE TABLE IF NOT EXISTS summaries (
                     scan_id TEXT NOT NULL,
                     node_path TEXT NOT NULL,
@@ -202,6 +261,20 @@ class Storage:
                     reason TEXT,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS scan_selections (
+                    scan_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    included_paths TEXT NOT NULL DEFAULT '[]',
+                    excluded_paths TEXT NOT NULL DEFAULT '[]',
+                    rules TEXT NOT NULL DEFAULT '{}',
+                    inventory_fingerprint TEXT,
+                    confirmed_at TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_scan_selections_status
+                    ON scan_selections(status, updated_at);
                 CREATE TABLE IF NOT EXISTS file_analysis_states (
                     scan_id TEXT NOT NULL,
                     node_path TEXT NOT NULL,
@@ -700,6 +773,15 @@ class Storage:
             scan_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scans)").fetchall()}
             if "owner_id" not in scan_columns:
                 conn.execute("ALTER TABLE scans ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'")
+            deep_batch_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(deep_parse_batches)").fetchall()
+            }
+            for name, definition in {
+                "error_code": "TEXT",
+                "error_message": "TEXT",
+            }.items():
+                if name not in deep_batch_columns:
+                    conn.execute("ALTER TABLE deep_parse_batches ADD COLUMN {} {}".format(name, definition))
             conversation_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()
             }
@@ -763,6 +845,17 @@ class Storage:
             conn.execute(
                 "CREATE INDEX idx_analysis_jobs_queue "
                 "ON analysis_jobs(status, available_at, priority DESC, created_at)"
+            )
+            # Historical-package pages resolve the current and last package job
+            # through correlated lookups. Keep those lookups indexed so a large
+            # job history cannot turn a metadata-only request into a scan.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_analysis_jobs_scan_kind_status "
+                "ON analysis_jobs(scan_id, task_type, status, priority DESC, updated_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_analysis_jobs_scan_kind_recent "
+                "ON analysis_jobs(scan_id, task_type, created_at DESC)"
             )
             try:
                 conn.execute(
@@ -1497,6 +1590,16 @@ class Storage:
             ).fetchone()
         return int(row["value"] if row else 0)
 
+    def evidence_indexed_file_count(self, scan_id):
+        """Count distinct source files represented in the formal evidence index."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT COALESCE(NULLIF(archive_source_path,''), source_path)) AS value "
+                "FROM evidence_index WHERE scan_id=?",
+                (str(scan_id),),
+            ).fetchone()
+        return int(row["value"] if row else 0)
+
     def get_search_index_state(self, scan_id):
         with self._connect() as conn:
             row = conn.execute(
@@ -1776,6 +1879,42 @@ class Storage:
             output.append(item)
         return output
 
+    def search_evidence_file_paths(self, scan_id, query, scope=".", source_paths=None):
+        """Return the complete distinct file set for a query.
+
+        Evidence snippets remain bounded elsewhere; this file-level pass deliberately
+        has no evidence-window limit so a popular keyword cannot undercount files.
+        """
+        terms = self._retrieval_terms(query)
+        if not terms:
+            return []
+        scan_id = str(scan_id)
+        scope = str(scope or ".")
+        source_paths = sorted(set(str(item) for item in (source_paths or []) if item))
+        paths = set()
+        with self._connect() as conn:
+            clauses = ["scan_id=?"]
+            values = [scan_id]
+            clauses.append("(" + " OR ".join("payload LIKE ?" for _ in terms) + ")")
+            values.extend("%{}%".format(term) for term in terms)
+            if scope != ".":
+                clauses.append("(source_path=? OR source_path LIKE ? OR source_path LIKE ? OR archive_source_path=? OR archive_source_path LIKE ?)")
+                values.extend((scope, scope.rstrip("/") + "/%", scope + "::%", scope, scope.rstrip("/") + "/%"))
+            rows = conn.execute(
+                "SELECT source_path,archive_source_path FROM evidence_index WHERE " + " AND ".join(clauses), values,
+            ).fetchall()
+        allowed = set(source_paths)
+        for row in rows:
+            path = str(row["source_path"] or "").strip()
+            physical = str(row["archive_source_path"] or path.split("::", 1)[0]).strip()
+            candidate = path or physical
+            if not candidate:
+                continue
+            if allowed and not any(candidate == source or candidate.startswith(source + "/") or candidate.startswith(source + "::") or physical == source for source in allowed):
+                continue
+            paths.add(candidate)
+        return sorted(paths)
+
     def list_evidence_index(self, scan_id):
         with self._connect() as conn:
             rows = conn.execute(
@@ -1886,7 +2025,7 @@ class Storage:
             "value_judgment", "structured_data_overview", "model_telemetry", "policy",
             "classification_dimensions", "semantic_cluster_threshold",
             "semantic_naming_model", "subtopic_naming_model", "semantic_cluster_error",
-            "analysis_tree_version", "analysis_tree_identity_contract",
+            "analysis_tree_version", "analysis_tree_identity_contract", "preliminary_directory",
         )
         result = {key: source.get(key) for key in keys if key in source}
         if "coverage" in result:
@@ -2783,6 +2922,170 @@ class Storage:
         result["scan_id"] = str(scan_id)
         return result
 
+    def list_scan_sources(self, owner_id=None, query="", limit=50, offset=0,
+                          scan_id=None):
+        """List bounded, reusable data-package metadata without hydrating scans."""
+        limit = max(1, min(100, int(limit or 50)))
+        offset = max(0, min(100000, int(offset or 0)))
+        query = str(query or "").strip()[:200]
+        clauses = []
+        values = []
+        if owner_id is not None:
+            clauses.append("s.owner_id=?")
+            values.append(str(owner_id))
+        if scan_id:
+            clauses.append("s.id=?")
+            values.append(str(scan_id))
+        if query:
+            pattern = "%{}%".format(query.casefold())
+            clauses.append(
+                "(LOWER(s.id) LIKE ? OR LOWER(s.root_path) LIKE ? OR "
+                "LOWER(COALESCE(json_extract(o.payload,'$.root'),'')) LIKE ? OR "
+                "LOWER(COALESCE(json_extract(o.payload,'$.tree_root.name'),'')) LIKE ?)"
+            )
+            values.extend([pattern] * 4)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        projection = (
+            "SELECT s.id,s.root_path,s.created_at,o.payload AS overview,"
+            "a.scan_id AS analysis_id,a.created_at AS analysis_created_at,"
+            "p.payload AS progress_payload,p.updated_at AS progress_updated_at,"
+            "c.state AS control_state,c.reason AS control_reason,"
+            "si.status AS index_status,si.expected_documents,si.processed_documents,"
+            "si.failed_documents,si.evidence_records,si.updated_at AS index_updated_at,"
+            "it.status AS import_status,it.current_phase AS import_phase,"
+            "active.id AS active_job_id,active.status AS active_job_status,"
+            "active.stage AS active_job_stage,active.progress AS active_job_progress,"
+            "active.message AS active_job_message,"
+            "last_job.status AS last_job_status,last_job.error AS last_job_error,"
+            "last_job.updated_at AS last_job_updated_at "
+            "FROM scans s "
+            "LEFT JOIN scan_overviews o ON o.scan_id=s.id "
+            "LEFT JOIN package_analyses a ON a.scan_id=s.id "
+            "LEFT JOIN analysis_progress p ON p.scan_id=s.id "
+            "LEFT JOIN package_processing_controls c ON c.scan_id=s.id "
+            "LEFT JOIN search_index_states si ON si.scan_id=s.id "
+            "LEFT JOIN import_tasks it ON it.scan_id=s.id "
+            "LEFT JOIN analysis_jobs active ON active.id=("
+            "SELECT j.id FROM analysis_jobs j WHERE j.scan_id=s.id "
+            "AND j.task_type IN ('scan_and_analyze','analyze_package') "
+            "AND j.status IN ('queued','running','cancelling') "
+            "ORDER BY CASE WHEN j.status IN ('running','cancelling') THEN 0 ELSE 1 END,"
+            "j.priority DESC,j.rowid LIMIT 1) "
+            "LEFT JOIN analysis_jobs last_job ON last_job.id=("
+            "SELECT j.id FROM analysis_jobs j WHERE j.scan_id=s.id "
+            "AND j.task_type IN ('scan_and_analyze','analyze_package') "
+            "ORDER BY j.rowid DESC LIMIT 1)"
+        )
+        with self._connect() as conn:
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS value FROM scans s "
+                "LEFT JOIN scan_overviews o ON o.scan_id=s.id{}".format(where),
+                values,
+            ).fetchone()
+            rows = conn.execute(
+                projection + where +
+                " ORDER BY COALESCE(s.created_at,'') DESC,s.id DESC LIMIT ? OFFSET ?",
+                values + [limit, offset],
+            ).fetchall()
+
+        sources = []
+        for row in rows:
+            item = dict(row)
+            try:
+                overview = json.loads(item.pop("overview") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                overview = {}
+            try:
+                progress = json.loads(item.pop("progress_payload") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                progress = {}
+            root = str(overview.get("root") or item.get("root_path") or "")
+            name = str(overview.get("name") or overview.get("tree_root", {}).get("name") or "")
+            if not name:
+                name = Path(root.rstrip("/\\")).name or root or str(item["id"])
+            active_status = item.get("active_job_status")
+            control_state = item.get("control_state") or "running"
+            index_status = item.get("index_status")
+            analysis_ready = bool(item.get("analysis_id"))
+            import_status = str(item.get("import_status") or "").strip()
+            if import_status in {
+                "created", "scanning", "previewing", "waiting_for_selection",
+                "deep_parsing", "summarizing_files", "building_directory",
+                "paused", "partial", "failed", "completed",
+            }:
+                status = import_status
+            elif active_status:
+                status = "processing"
+            elif control_state == "paused":
+                status = "paused"
+            elif control_state == "awaiting_selection":
+                status = "awaiting_selection"
+            elif item.get("last_job_status") == "failed":
+                status = "failed"
+            elif analysis_ready and (control_state == "completed" or index_status == "ready"):
+                status = "ready"
+            elif index_status in {"ready", "legacy_ready"}:
+                status = "searchable"
+            elif overview:
+                status = "scanned"
+            else:
+                status = "pending"
+            documents = int(item.get("expected_documents") or 0)
+            processed = int(item.get("processed_documents") or 0)
+            sources.append({
+                "scan_id": str(item["id"]),
+                "name": name,
+                "root": root,
+                "created_at": item.get("created_at"),
+                "status": status,
+                "usable": bool(
+                    item.get("evidence_records") or processed or analysis_ready
+                ),
+                "analysis_ready": analysis_ready,
+                "analysis_updated_at": item.get("analysis_created_at"),
+                "file_count": int(overview.get("file_count") or 0),
+                "directory_count": int(overview.get("directory_count") or 0),
+                "total_size": int(overview.get("total_size") or 0),
+                "total_size_human": overview.get("total_size_human"),
+                "inventory_complete": bool(
+                    overview.get("inventory_complete", not overview.get("truncated"))
+                ),
+                "search_index": {
+                    "status": index_status or "rebuild_required",
+                    "expected_documents": documents,
+                    "processed_documents": processed,
+                    "failed_documents": int(item.get("failed_documents") or 0),
+                    "evidence_records": int(item.get("evidence_records") or 0),
+                    "updated_at": item.get("index_updated_at"),
+                },
+                "analysis_progress": {
+                    key: progress.get(key)
+                    for key in ("status", "progress", "stage", "message", "updated_at")
+                    if progress.get(key) is not None
+                },
+                "processing": {
+                    "state": control_state,
+                    "reason": item.get("control_reason"),
+                    "active_job_id": item.get("active_job_id"),
+                    "active_job_status": active_status,
+                    "active_job_stage": item.get("active_job_stage"),
+                    "active_job_progress": item.get("active_job_progress"),
+                    "active_job_message": item.get("active_job_message"),
+                },
+                "last_error": item.get("last_job_error"),
+                "last_updated_at": item.get("last_job_updated_at")
+                    or item.get("index_updated_at")
+                    or item.get("progress_updated_at"),
+            })
+        return {
+            "items": sources,
+            "offset": offset,
+            "limit": limit,
+            "total": int(total_row["value"] or 0),
+            "next_offset": offset + len(sources)
+                if offset + len(sources) < int(total_row["value"] or 0) else None,
+        }
+
     def update_scan(self, scan_id, payload):
         with self.lock, self._connect() as conn:
             conn.execute(
@@ -2802,14 +3105,34 @@ class Storage:
             conn.execute("DELETE FROM package_overviews WHERE scan_id=?", (str(scan_id),))
 
     def save_summary(self, scan_id, node_path, summary_type, payload):
+        payload = dict(payload or {})
         with self.lock, self._connect() as conn:
+            existing_row = conn.execute(
+                "SELECT payload FROM summaries WHERE scan_id=? AND node_path=? AND summary_type=?",
+                (scan_id, node_path, summary_type),
+            ).fetchone()
+            if existing_row:
+                try:
+                    existing = json.loads(existing_row["payload"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing = {}
+                incoming_stage = str(payload.get("analysis_stage") or payload.get("analysis_depth") or "").lower()
+                existing_stage = str(existing.get("analysis_stage") or existing.get("analysis_depth") or "").lower()
+                incoming_deep = bool(payload.get("deep_analysis")) or incoming_stage in {"deep", "deep_document", "deep_folder"}
+                existing_deep = bool(existing.get("deep_analysis")) or existing_stage in {"deep", "deep_document", "deep_folder"}
+                incoming_preliminary = incoming_stage in {"preliminary", "preliminary_document", "preliminary_node"} or str(payload.get("generated_by") or "").startswith("model-preliminary")
+                existing_preliminary = existing_stage in {"preliminary", "preliminary_document", "preliminary_node"} or str(existing.get("generated_by") or "").startswith("model-preliminary")
+                if incoming_deep and existing_preliminary:
+                    payload.setdefault("preliminary_snapshot", existing)
+                elif incoming_preliminary and existing_deep:
+                    payload.setdefault("deep_snapshot", existing)
             conn.execute(
                 "INSERT OR REPLACE INTO summaries(scan_id,node_path,summary_type,payload) VALUES (?,?,?,?)",
                 (scan_id, node_path, summary_type, json.dumps(payload, ensure_ascii=False)),
             )
-
     def save_summaries(self, scan_id, summaries):
         """Publish many local summaries in one transaction.
+
 
         Large inventories can contain tens of thousands of nodes. Committing
         one SQLite transaction per node makes the 82% stage look stalled and
@@ -2999,6 +3322,106 @@ class Storage:
                             "payload": self._load_document_payload(
                                 row["payload"], hydrate=hydrate
                             ),
+                        }
+            finally:
+                cursor.close()
+
+    def iter_documents_for_paths(self, scan_id, paths, hydrate=True, batch_size=100):
+        """Yield only the requested document rows.
+
+        Large-package selection must not scan or deserialize every document in
+        the package just to parse a bounded user scope.  The caller already
+        owns a bounded path list, so chunk the ``IN`` predicate below SQLite's
+        variable limit and preserve the requested order.
+        """
+        paths = list(dict.fromkeys(str(path) for path in (paths or []) if str(path)))
+        batch_size = max(1, min(800, int(batch_size or 100)))
+        if not paths:
+            return
+        with self._connect() as conn:
+            for start in range(0, len(paths), 800):
+                batch = paths[start:start + 800]
+                rows = conn.execute(
+                    "SELECT node_path,payload FROM unified_documents "
+                    "WHERE scan_id=? AND node_path IN ({})".format(
+                        ",".join("?" for _ in batch)
+                    ),
+                    [str(scan_id)] + batch,
+                ).fetchall()
+                by_path = {
+                    str(row["node_path"]): row for row in rows
+                }
+                for path in batch:
+                    row = by_path.get(path)
+                    if not row:
+                        continue
+                    yield {
+                        "path": row["node_path"],
+                        "payload": self._load_document_payload(
+                            row["payload"], hydrate=hydrate
+                        ),
+                    }
+
+    def iter_inventory_selection_entries(self, scan_id, kind="file", batch_size=500):
+        """Stream inventory rows with preview and queue metadata for selection.
+
+        Large-package category selection must not build an in-memory map of the
+        whole inventory.  This joined iterator keeps one bounded row at a time
+        while still allowing the selector to use content samples when they are
+        available and metadata when a preview was deferred.
+        """
+        batch_size = max(1, min(2000, int(batch_size or 500)))
+        values = [str(scan_id)]
+        where = "i.scan_id=?"
+        if kind:
+            where += " AND i.kind=?"
+            values.append(str(kind))
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT i.node_path,i.parent_path,i.position,i.kind,i.payload AS inventory_payload,"
+                "p.status AS preview_status,p.payload AS preview_payload,"
+                "w.workflow_state,w.selection_state,w.selection_score,w.safety_status,"
+                "w.promotion_allowed,a.status AS analysis_status "
+                "FROM inventory_entries i "
+                "LEFT JOIN file_previews p ON p.scan_id=i.scan_id AND p.node_path=i.node_path "
+                "LEFT JOIN file_workflow_states w ON w.scan_id=i.scan_id AND w.node_path=i.node_path "
+                "LEFT JOIN file_analysis_states a ON a.scan_id=i.scan_id AND a.node_path=i.node_path "
+                "WHERE {} ORDER BY i.node_path".format(where),
+                values,
+            )
+            try:
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        try:
+                            inventory_payload = json.loads(row["inventory_payload"] or "{}")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            inventory_payload = {}
+                        preview = None
+                        if row["preview_payload"]:
+                            preview = self._load_preview_payload(row["preview_payload"]) or {}
+                            if row["preview_status"]:
+                                preview["status"] = str(row["preview_status"])
+                        yield {
+                            "path": row["node_path"],
+                            "parent_path": row["parent_path"],
+                            "position": int(row["position"] or 0),
+                            "kind": row["kind"],
+                            "payload": inventory_payload,
+                            "preview": preview,
+                            "workflow": {
+                                "workflow_state": row["workflow_state"],
+                                "selection_state": row["selection_state"],
+                                "selection_score": float(row["selection_score"] or 0),
+                                "safety_status": row["safety_status"],
+                                "promotion_allowed": (
+                                    None if row["promotion_allowed"] is None
+                                    else bool(row["promotion_allowed"])
+                                ),
+                            },
+                            "analysis_status": row["analysis_status"],
                         }
             finally:
                 cursor.close()
@@ -3241,10 +3664,17 @@ class Storage:
     def get_file_preview(self, scan_id, node_path):
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT payload FROM file_previews WHERE scan_id=? AND node_path=?",
+                "SELECT status,payload FROM file_previews WHERE scan_id=? AND node_path=?",
                 (str(scan_id), str(node_path)),
             ).fetchone()
-        return self._load_preview_payload(row["payload"]) if row else None
+        if not row:
+            return None
+        payload = self._load_preview_payload(row["payload"]) or {}
+        # The durable status column is authoritative for invalidation and
+        # recovery. Overlay it on legacy payloads that still say previewed.
+        if row["status"]:
+            payload["status"] = str(row["status"])
+        return payload
 
     def iter_file_previews(self, scan_id, statuses=None, batch_size=500):
         batch_size = max(1, min(2000, int(batch_size or 500)))
@@ -4224,6 +4654,9 @@ class Storage:
         records = [json.loads(row["payload"]) for row in record_rows]
         return {
             "summary": summary,
+            "entity_statistics": summary.get("entity_statistics") or [],
+            "communication_statistics": summary.get("communication_statistics") or [],
+            "content_profile": summary.get("content_profile") or {},
             "records": {
                 "items": records, "offset": offset, "limit": limit, "total": total,
                 "next_offset": offset + len(records) if offset + len(records) < total else None,
@@ -4942,7 +5375,7 @@ class Storage:
                 "selection_score=excluded.selection_score,score_components=excluded.score_components,"
                 "reasons=excluded.reasons,safety_status=excluded.safety_status,"
                 "light_index_status=excluded.light_index_status,language_code=excluded.language_code,"
-                "ocr_candidate=excluded.ocr_candidate,promotion_allowed=excluded.promotion_allowed,"
+                "ocr_candidate=excluded.ocr_candidate,parse_status=excluded.parse_status,evidence_status=excluded.evidence_status,promotion_allowed=excluded.promotion_allowed,priority_source=excluded.priority_source,"
                 "updated_at=CURRENT_TIMESTAMP",
                 rows,
             )
@@ -5045,6 +5478,7 @@ class Storage:
         raw = dict(row)
         now = time.time() if now is None else float(now)
         inventory = cls._json_object(raw.pop("inventory_payload", None))
+        preview_payload = cls._json_object(raw.get("preview_payload"))
         reasons = cls._json_object(raw.pop("workflow_reasons", None))
         # ``reasons`` is stored as an array rather than object.  Keep the
         # tolerant decoder above for old rows, then decode the normal shape.
@@ -5162,6 +5596,14 @@ class Storage:
             "name": str(inventory.get("name") or Path(node_path).name or node_path),
             "extension": str(inventory.get("extension") or Path(original_path).suffix).lower(),
             "size": int(inventory.get("size") or raw.get("source_size") or 0),
+            "modified_at": inventory.get("modified_at") or preview_payload.get("modified_at"),
+            "modified_at_ns": int(inventory.get("modified_at_ns") or raw.get("source_modified_at_ns") or 0),
+            "language": preview_payload.get("language") or {"code": raw.get("preview_language")} if raw.get("preview_language") else None,
+            "language_code": str(raw.get("preview_language") or (preview_payload.get("language") or {}).get("code") or ""),
+            "entities": preview_payload.get("entities") or {},
+            "keywords": preview_payload.get("keywords") or [],
+            "archive_members": preview_payload.get("archive_members") or [],
+            "version_changed": str(raw.get("preview_status") or "") == "stale",
             "inventory_kind": raw.get("inventory_kind") or "file",
             "logical": bool(raw.get("inventory_kind") == "logical_file" or inventory.get("logical_unit")),
             "logical_kind": inventory.get("logical_kind"),
@@ -5233,6 +5675,9 @@ class Storage:
                     analysis.error_class, analysis.retryable, analysis.attempt_count,
                     analysis.next_retry_at, analysis.updated_at AS analysis_updated_at,
                     preview.status AS preview_status, preview.source_size,
+                    preview.source_modified_at_ns,
+                    preview.language_code AS preview_language,
+                    preview.payload AS preview_payload,
                     preview.updated_at AS preview_updated_at,
                     translation.status AS translation_status,
                     translation.source_language AS translation_source_language,
@@ -5272,7 +5717,7 @@ class Storage:
         # when SQL statement caching is disabled by a deployment.
         return source, status
 
-    def list_file_status_page(self, scan_id, offset=0, limit=100, status=None):
+    def list_file_status_page(self, scan_id, offset=0, limit=100, status=None, filters=None):
         """Return a paged, user-facing projection of every logical file.
 
         This is deliberately a database page, not a Python list of the whole
@@ -5286,10 +5731,53 @@ class Storage:
         # distinguish a delayed automatic retry from an immediately queueable
         # retry.  Keep the values adjacent to the SQL for auditability.
         base_values = [str(scan_id)] * 6 + [time.time()] + [str(scan_id)] * 5
-        where = "" if status == "all" else " WHERE status_key=?"
+        filters = dict(filters or {})
+        clauses = []
         values = list(base_values)
         if status != "all":
+            clauses.append("status_key=?")
             values.append(status)
+        def _num(name):
+            try:
+                return int(filters.get(name))
+            except (TypeError, ValueError):
+                return None
+        min_size, max_size = _num("min_size"), _num("max_size")
+        if min_size is not None:
+            clauses.append("CAST(COALESCE(json_extract(inventory_payload,'$.size'),source_size,0) AS INTEGER)>=?")
+            values.append(max(0, min_size))
+        if max_size is not None:
+            clauses.append("CAST(COALESCE(json_extract(inventory_payload,'$.size'),source_size,0) AS INTEGER)<=?")
+            values.append(max(0, max_size))
+        min_modified, max_modified = _num("min_modified_ns"), _num("max_modified_ns")
+        if min_modified is not None:
+            clauses.append("CAST(COALESCE(json_extract(inventory_payload,'$.modified_at_ns'),source_modified_at_ns,0) AS INTEGER)>=?")
+            values.append(max(0, min_modified))
+        if max_modified is not None:
+            clauses.append("CAST(COALESCE(json_extract(inventory_payload,'$.modified_at_ns'),source_modified_at_ns,0) AS INTEGER)<=?")
+            values.append(max(0, max_modified))
+        language = str(filters.get("language") or "").strip().lower()
+        if language and language not in {"all", "*"}:
+            clauses.append("lower(COALESCE(preview_language,json_extract(preview_payload,'$.language.code'),''))=?")
+            values.append(language)
+        archive_member = str(filters.get("archive_member") or "").strip().lower()
+        if archive_member:
+            clauses.append("lower(COALESCE(preview_payload,'')) LIKE ?")
+            values.append("%" + archive_member + "%")
+        for key in ("keyword", "entity"):
+            value = str(filters.get(key) or "").strip().lower()
+            if value:
+                clauses.append(
+                    "EXISTS (SELECT 1 FROM file_relation_features rf WHERE rf.scan_id=? "
+                    "AND rf.node_path=projected.node_path AND lower(rf.feature_value) LIKE ?)"
+                )
+                values.extend([str(scan_id), "%" + value + "%"])
+        deep = str(filters.get("deep") or "").strip().lower()
+        if deep in {"1", "true", "yes", "completed", "done"}:
+            clauses.append("status_key='completed'")
+        elif deep in {"0", "false", "no", "pending"}:
+            clauses.append("status_key<>'completed'")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self._connect() as conn:
             total = int(conn.execute(
                 query + " SELECT COUNT(*) AS value FROM projected" + where,
@@ -5311,6 +5799,125 @@ class Storage:
             "total": total,
             "next_offset": offset + len(items) if offset + len(items) < total else None,
             "status": status,
+        }
+
+
+    @staticmethod
+    def _file_type_extensions(file_type):
+        """Expand a UI file-type filter into normalized extensions."""
+        value = str(file_type or "").strip().lower()
+        if not value or value in {"all", "*"}:
+            return []
+        aliases = {
+            "document": {".pdf", ".doc", ".docx", ".txt", ".md", ".rtf", ".odt"},
+            "documents": {".pdf", ".doc", ".docx", ".txt", ".md", ".rtf", ".odt"},
+            "文档": {".pdf", ".doc", ".docx", ".txt", ".md", ".rtf", ".odt"},
+            "spreadsheet": {".csv", ".tsv", ".xls", ".xlsx", ".ods"},
+            "spreadsheet/表格": {".csv", ".tsv", ".xls", ".xlsx", ".ods"},
+            "table": {".csv", ".tsv", ".xls", ".xlsx", ".ods"},
+            "表格": {".csv", ".tsv", ".xls", ".xlsx", ".ods"},
+            "image": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"},
+            "图片": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"},
+            "archive": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"},
+            "压缩包": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"},
+            "email": {".eml", ".msg", ".pst", ".mbox"},
+            "邮件": {".eml", ".msg", ".pst", ".mbox"},
+        }
+        if value in aliases:
+            return sorted(aliases[value])
+        return [value if value.startswith(".") else "." + value]
+
+    def search_file_status_page(
+        self, scan_id, query="", file_type="", offset=0, limit=100, status=None,
+        search_scope="all",
+    ):
+        """Search inventory metadata and, when available, evidence text."""
+        query_text = str(query or "").strip().lower()
+        search_scope = str(search_scope or "all").strip().lower()
+        if search_scope not in {"all", "name", "content"}:
+            search_scope = "all"
+        type_extensions = self._file_type_extensions(file_type)
+        terms = self._retrieval_terms(query_text) if query_text else []
+        # Always retain the literal compact query so filename/path matching
+        # works for one-character names and queries containing spaces.
+        compact_query = ''.join(query_text.split())
+        if compact_query:
+            terms = list(dict.fromkeys([compact_query] + terms))
+        if not terms and not type_extensions:
+            return self.list_file_status_page(
+                scan_id, offset=offset, limit=limit, status=status
+            )
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(500, int(limit or 100)))
+        projection, status_value = self._file_status_projection_query(status)
+        values = [str(scan_id)] * 6 + [time.time()] + [str(scan_id)] * 5
+        clauses = []
+        if terms:
+            term_clauses = []
+            for term in terms[:64]:
+                like = "%{}%".format(str(term).lower())
+                if search_scope == "name":
+                    term_clauses.append(
+                        "(lower(COALESCE(p.node_path,'')) LIKE ? "
+                        "OR lower(COALESCE(json_extract(p.inventory_payload, '$.name'),'')) LIKE ? "
+                        "OR lower(COALESCE(json_extract(p.inventory_payload, '$.extension'),'')) LIKE ? "
+                        "OR lower(COALESCE(json_extract(p.inventory_payload, '$.mime_type'),'')) LIKE ?)"
+                    )
+                    values.extend((like, like, like, like))
+                elif search_scope == "content":
+                    term_clauses.append(
+                        "EXISTS (SELECT 1 FROM evidence_index e WHERE e.scan_id=? AND "
+                        "(e.source_path=p.node_path OR e.source_path LIKE p.node_path || '::%' OR "
+                        "e.archive_source_path=p.node_path) AND lower(e.payload) LIKE ?)"
+                    )
+                    values.extend((str(scan_id), like))
+                else:
+                    term_clauses.append(
+                        "(lower(COALESCE(p.node_path,'')) LIKE ? "
+                        "OR lower(COALESCE(json_extract(p.inventory_payload, '$.name'),'')) LIKE ? "
+                        "OR lower(COALESCE(json_extract(p.inventory_payload, '$.extension'),'')) LIKE ? "
+                        "OR lower(COALESCE(json_extract(p.inventory_payload, '$.mime_type'),'')) LIKE ? "
+                        "OR EXISTS (SELECT 1 FROM evidence_index e WHERE e.scan_id=? AND "
+                        "(e.source_path=p.node_path OR e.source_path LIKE p.node_path || '::%' OR "
+                        "e.archive_source_path=p.node_path) AND lower(e.payload) LIKE ?))"
+                    )
+                    values.extend((like, like, like, like, str(scan_id), like))
+            clauses.append("(" + " OR ".join(term_clauses) + ")")
+        if type_extensions:
+            extension_clauses = []
+            for extension in type_extensions:
+                extension_clauses.append(
+                    "lower(COALESCE(json_extract(p.inventory_payload, '$.extension'),''))=?"
+                )
+                values.append(extension.lower())
+            clauses.append("(" + " OR ".join(extension_clauses) + ")")
+        if status_value != "all":
+            clauses.append("p.status_key=?")
+            values.append(status_value)
+        where = " WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            total = int(conn.execute(
+                projection + " SELECT COUNT(*) AS value FROM projected AS p" + where,
+                values,
+            ).fetchone()["value"] or 0)
+            rows = conn.execute(
+                projection + " SELECT p.* FROM projected AS p" + where +
+                " ORDER BY CASE p.status_key WHEN 'failed' THEN 0 WHEN 'retry_waiting' THEN 1 "
+                "WHEN 'processing' THEN 2 WHEN 'pending' THEN 3 WHEN 'partial' THEN 4 "
+                "WHEN 'completed' THEN 5 ELSE 6 END, "
+                "COALESCE(p.updated_at,p.analysis_updated_at,p.preview_updated_at) DESC,p.node_path "
+                "LIMIT ? OFFSET ?",
+                values + [limit, offset],
+            ).fetchall()
+        items = [self._file_status_item(row) for row in rows]
+        return {
+            "items": items,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "next_offset": offset + len(items) if offset + len(items) < total else None,
+            "status": status_value,
+            "metadata_search": True,
         }
 
     def get_file_status(self, scan_id, node_path):
@@ -5338,7 +5945,7 @@ class Storage:
         query, _status = self._file_status_projection_query("all")
         values = [str(scan_id)] * 6 + [time.time()] + [str(scan_id)] * 5
         container_condition = (
-            "(workflow_state='logical_container' OR "
+            "(COALESCE(workflow_state,'')='logical_container' OR "
             "COALESCE(workflow_reasons_json,'') LIKE '%logical_container_replaced_by_children%')"
         )
         where = "" if include_container_only else " WHERE NOT " + container_condition
@@ -5447,6 +6054,26 @@ class Storage:
         )
         return result
 
+    def deep_summary_counts(self, scan_id):
+        """Count durable model summaries separately from parser completion."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT summary_type,payload FROM summaries WHERE scan_id=?",
+                (str(scan_id),),
+            ).fetchall()
+        counts = {"file": 0, "folder": 0, "total": 0}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or not payload.get("deep_analysis"):
+                continue
+            kind = "folder" if str(row["summary_type"] or "") in {"folder", "deep_node_summary"} else "file"
+            counts[kind] += 1
+            counts["total"] += 1
+        return counts
+
     def get_active_package_job(self, scan_id):
         with self._connect() as conn:
             row = conn.execute(
@@ -5525,6 +6152,137 @@ class Storage:
                     updated += int(result.rowcount or 0)
         return updated
 
+    def get_scan_selection(self, scan_id):
+        """Return the bounded user selection snapshot for a scan."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scan_selections WHERE scan_id=?", (str(scan_id),)
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        for key, default in (("included_paths", []), ("excluded_paths", []), ("rules", {})):
+            try:
+                item[key] = json.loads(item.get(key) or json.dumps(default))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item[key] = default
+        item["version"] = int(item.get("version") or 1)
+        item["included_count"] = len(item.get("included_paths") or [])
+        item["excluded_count"] = len(item.get("excluded_paths") or [])
+        stats = self.scan_selection_stats(scan_id, item)
+        item["selected_file_count"] = int(stats.get("selected_count") or 0)
+        item["selected_bytes"] = int(stats.get("selected_total_size") or 0)
+        if not item.get("inventory_fingerprint"):
+            item["inventory_fingerprint"] = self.inventory_fingerprint(scan_id)
+        return item
+
+    def save_scan_selection(self, scan_id, included_paths=None, excluded_paths=None,
+                            rules=None, status="draft", expected_version=None):
+        """Persist a resumable selection draft or immutable confirmed snapshot."""
+        allowed = {"draft", "confirmed", "running", "completed"}
+        status = str(status or "draft").strip().lower()
+        if status not in allowed:
+            raise ValueError("未知分析范围状态")
+        included = list(dict.fromkeys(str(path) for path in (included_paths or []) if str(path)))
+        excluded = list(dict.fromkeys(str(path) for path in (excluded_paths or []) if str(path)))
+        overlap = set(included) & set(excluded)
+        if overlap:
+            excluded = [path for path in excluded if path not in overlap]
+        rules = dict(rules or {})
+        inventory_fingerprint = self.inventory_fingerprint(scan_id)
+        with self.lock, self._connect() as conn:
+            current = conn.execute(
+                "SELECT version,status FROM scan_selections WHERE scan_id=?", (str(scan_id),)
+            ).fetchone()
+            current_version = int(current["version"] or 0) if current else 0
+            if expected_version is not None and current and current_version != int(expected_version):
+                raise ValueError("分析范围已被其他操作更新，请刷新后重试")
+            version = current_version + 1 if current else 1
+            conn.execute(
+                "INSERT INTO scan_selections(scan_id,status,version,included_paths,excluded_paths,rules,inventory_fingerprint,confirmed_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,CASE WHEN ?='confirmed' THEN CURRENT_TIMESTAMP ELSE NULL END,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(scan_id) DO UPDATE SET status=excluded.status,version=excluded.version,"
+                "included_paths=excluded.included_paths,excluded_paths=excluded.excluded_paths,rules=excluded.rules,"
+                "inventory_fingerprint=excluded.inventory_fingerprint,"
+                "confirmed_at=CASE WHEN excluded.status='confirmed' THEN CURRENT_TIMESTAMP ELSE scan_selections.confirmed_at END,"
+                "updated_at=CURRENT_TIMESTAMP",
+                (str(scan_id), status, version, json.dumps(included, ensure_ascii=False),
+                 json.dumps(excluded, ensure_ascii=False), json.dumps(rules, ensure_ascii=False),
+                 inventory_fingerprint, status),
+            )
+        return self.get_scan_selection(scan_id)
+
+    def inventory_fingerprint(self, scan_id):
+        """Return a stable fingerprint for the current physical inventory."""
+        digest = hashlib.sha256()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT node_path, payload FROM inventory_entries WHERE scan_id=? ORDER BY node_path",
+                (str(scan_id),),
+            )
+            for row in rows:
+                path = str(row["node_path"] or "")
+                try:
+                    payload = json.loads(row["payload"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                digest.update(path.encode("utf-8", "ignore"))
+                digest.update(b"\0")
+                digest.update(str(payload.get("size") or 0).encode("ascii"))
+                digest.update(b"\0")
+                digest.update(str(payload.get("mtime_ns") or payload.get("mtime") or 0).encode("ascii"))
+                digest.update(b"\n")
+        return digest.hexdigest()
+
+    def default_scan_selection(self, scan_id):
+        """Compute safe defaults without hydrating documents or previews."""
+        included, excluded = [], []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT node_path,selection_state,promotion_allowed,safety_status,reasons "
+                "FROM file_workflow_states WHERE scan_id=? ORDER BY node_path", (str(scan_id),)
+            )
+            for row in rows:
+                path = str(row["node_path"] or "")
+                if not path:
+                    continue
+                try:
+                    reasons = json.loads(row["reasons"] or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    reasons = []
+                exact_duplicate = "exact_duplicate_non_primary" in reasons
+                if (not bool(row["promotion_allowed"]) or
+                        str(row["safety_status"] or "") in {"restricted", "rejected"} or
+                        str(row["selection_state"] or "") == "excluded" or exact_duplicate):
+                    excluded.append(path)
+                else:
+                    included.append(path)
+        return {"included_paths": included, "excluded_paths": excluded,
+                "rules": {"default": "parseable_only", "duplicates": "exclude_non_primary"}}
+
+    def scan_selection_stats(self, scan_id, selection=None):
+        selection = selection or self.get_scan_selection(scan_id) or {}
+        included = list(dict.fromkeys(str(path) for path in (selection.get("included_paths") or []) if str(path)))
+        total_size = 0
+        with self._connect() as conn:
+            for start in range(0, len(included), 500):
+                batch = included[start:start + 500]
+                if not batch:
+                    continue
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(CAST(json_extract(payload,'$.size') AS INTEGER)),0) AS value "
+                    "FROM inventory_entries WHERE scan_id=? AND node_path IN ({})".format(",".join("?" for _ in batch)),
+                    [str(scan_id)] + batch,
+                ).fetchone()
+                total_size += int(row["value"] or 0)
+        return {
+            "selected_count": len(included),
+            "selected_total_size": total_size,
+            "selected_file_count": len(included),
+            "selected_bytes": total_size,
+            "inventory_fingerprint": self.inventory_fingerprint(scan_id),
+        }
+
     def ensure_package_processing_control(self, scan_id, state="running"):
         with self.lock, self._connect() as conn:
             conn.execute(
@@ -5551,7 +6309,18 @@ class Storage:
 
     def set_package_processing_state(self, scan_id, state, reason=None):
         state = str(state or "running")
-        if state not in {"running", "paused", "completed"}:
+        # The package control row is also the durable phase indicator consumed
+        # by the UI. Keep the older coarse states for compatibility, but accept
+        # every phase in the three-level import pipeline.
+        if state not in {
+            "running", "paused", "completed", "awaiting_selection",
+            "candidate_importing", "candidate_analyzing",
+            "awaiting_deep_selection", "deep_parsing",
+            "preliminary_summarizing", "preliminary_nodes", "preliminary_overview",
+            "parsing_selected", "parsed_overview", "deep_summarizing_files", "deep_summarizing_nodes", "deep_update_available",
+            "deep_overview_updating", "summarizing_files", "building_directory",
+            "partial", "failed", "cancelled",
+        }:
             raise ValueError("未知数据包处理状态")
         pause_requested = 1 if state == "paused" else 0
         with self.lock, self._connect() as conn:
@@ -5599,6 +6368,17 @@ class Storage:
                 "AND status IN ('running','cancelling')",
                 (message, str(scan_id)),
             ).rowcount
+            conn.execute(
+                "UPDATE deep_parse_items SET status='queued',updated_at=? "
+                "WHERE batch_id IN (SELECT batch_id FROM deep_parse_batches WHERE scan_id=?) "
+                "AND status IN ('queued','running','retryable')",
+                (now, str(scan_id)),
+            )
+            conn.execute(
+                "UPDATE deep_parse_batches SET status='paused',updated_at=? "
+                "WHERE scan_id=? AND status IN ('queued','running')",
+                (now, str(scan_id)),
+            )
         return {
             "control": self.get_package_processing_control(scan_id),
             "queued_cancelled": int(queued or 0),
@@ -5819,14 +6599,583 @@ class Storage:
             result = conn.execute("DELETE FROM tree_edits WHERE scan_id=? AND edit_id=?", (str(scan_id), str(edit_id)))
         return bool(result.rowcount)
 
+    def create_import_task(self, scan_id, root_path, owner_id="legacy"):
+        now=time.time(); task_id=str(scan_id)
+        with self.lock, self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO import_tasks(task_id,scan_id,root_path,status,current_phase,owner_id,created_at,updated_at) VALUES (?,?,?,'created','created',?,?,?)",(task_id,str(scan_id),str(root_path),owner_id or "legacy",now,now))
+        return task_id
+
+    def get_import_task(self, scan_id, owner_id=None):
+        scan_id = str(scan_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM import_tasks WHERE scan_id=?", (scan_id,)
+            ).fetchone()
+        if row and (not owner_id or (row["owner_id"] or "legacy") == owner_id):
+            item = dict(row)
+            try:
+                item["checkpoint"] = json.loads(item.get("checkpoint") or "{}")
+            except Exception:
+                item["checkpoint"] = {}
+            if item["checkpoint"].get("legacy_migrated") and not self.preview_queue_counts(scan_id):
+                with self._connect() as conn:
+                    legacy_rows = conn.execute(
+                        "SELECT node_path FROM file_analysis_states WHERE scan_id=? "
+                        "UNION SELECT node_path FROM file_workflow_states WHERE scan_id=?",
+                        (scan_id, scan_id),
+                    ).fetchall()
+                legacy_paths = [str(row["node_path"] or "") for row in legacy_rows if str(row["node_path"] or "") not in {"", "."}]
+                if legacy_paths:
+                    self.ensure_preview_queue(scan_id, legacy_paths)
+            return item
+        if row:
+            return None
+
+        # Legacy scans predate import_tasks and the durable preview queue. Create
+        # the compatibility envelope lazily from persisted inventory metadata;
+        # this never rereads the source directory or changes historical results.
+        with self._connect() as conn:
+            scan_row = conn.execute(
+                "SELECT payload,owner_id FROM scans WHERE id=?", (scan_id,)
+            ).fetchone()
+        if not scan_row:
+            return None
+        stored_owner = scan_row["owner_id"] or "legacy"
+        if owner_id and stored_owner != owner_id:
+            return None
+        try:
+            payload = json.loads(scan_row["payload"] or "{}")
+        except Exception:
+            payload = {}
+        root_path = str(payload.get("root") or payload.get("root_path") or "")
+        self.create_import_task(scan_id, root_path, owner_id=stored_owner)
+        self.update_import_task(scan_id, checkpoint={"legacy_migrated": True})
+        paths = [
+            str(item.get("node_path") or "")
+            for item in self.iter_inventory_entries(scan_id)
+            if str(item.get("kind") or "") in {"file", "logical_file"}
+            and str(item.get("node_path") or "") not in {"", "."}
+        ]
+        # Older scans stored their complete file list only in the analysis
+        # checkpoint tables. Use that persisted list when inventory_entries was
+        # introduced later, so migration never depends on the source directory.
+        if not paths:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT node_path FROM file_analysis_states WHERE scan_id=? "
+                    "UNION SELECT node_path FROM file_workflow_states WHERE scan_id=?",
+                    (scan_id, scan_id),
+                ).fetchall()
+            paths = [str(row["node_path"] or "") for row in rows if str(row["node_path"] or "") not in {"", "."}]
+        if paths:
+            self.ensure_preview_queue(scan_id, paths)
+        self.set_package_processing_state(
+            scan_id,
+            "completed" if payload.get("analysis_complete") else "running",
+            "兼容迁移：已从历史扫描记录恢复导入任务、预览队列和可恢复状态",
+        )
+        with self._connect() as conn:
+            migrated = conn.execute(
+                "SELECT * FROM import_tasks WHERE scan_id=?", (scan_id,)
+            ).fetchone()
+        if not migrated:
+            return None
+        item = dict(migrated)
+        try:
+            item["checkpoint"] = json.loads(item.get("checkpoint") or "{}")
+        except Exception:
+            item["checkpoint"] = {}
+        return item
+
+    def update_import_task(self, scan_id, status=None, phase=None, checkpoint=None, counts=None, paused_at=None):
+        fields=["updated_at=?"]; values=[time.time()]
+        if status is not None: fields += ["status=?"]; values += [str(status)]
+        if phase is not None: fields += ["current_phase=?"]; values += [str(phase)]
+        if checkpoint is not None: fields += ["checkpoint=?"]; values += [json.dumps(checkpoint or {},ensure_ascii=False)]
+        if counts:
+            for key in ("total_files","discovered_files","previewed_files","deep_parsed_files","failed_files"):
+                if key in counts: fields += [key+"=?"]; values += [max(0,int(counts[key] or 0))]
+        if paused_at is not None: fields += ["paused_at=?"]; values += [paused_at]
+        values.append(str(scan_id))
+        with self.lock, self._connect() as conn: conn.execute("UPDATE import_tasks SET "+",".join(fields)+" WHERE scan_id=?",values)
+
+    def transition_import_task(self, scan_id, status, checkpoint=None, counts=None,
+                               reason=None, resume_from=None):
+        """Advance a new import through its only allowed state transition."""
+        task = self.get_import_task(scan_id)
+        if not task:
+            raise ValueError("import task does not exist")
+        current = str(resume_from or task.get("status") or "created")
+        target = str(status or current)
+        if current in STRICT_IMPORT_STATES and target in STRICT_IMPORT_STATES and not can_transition(current, target):
+            raise ValueError("invalid import state transition: {} -> {}".format(current, target))
+        result = self.update_import_task(scan_id, status=target, phase=target,
+                                         checkpoint=checkpoint, counts=counts)
+        self.set_package_processing_state(scan_id, processing_state(target), reason)
+        return self.get_import_task(scan_id)
+
+    def ensure_preview_queue(self, scan_id, paths):
+        now=time.time(); paths=[str(x) for x in (paths or []) if x]
+        with self.lock, self._connect() as conn:
+            for idx,path in enumerate(paths):
+                file_id=hashlib.sha256((str(scan_id)+"\0"+path).encode()).hexdigest()[:32]
+                conn.execute("INSERT OR IGNORE INTO preview_queue_items(scan_id,file_id,node_path,priority,status,updated_at) VALUES (?,?,?,?,?,?)",(str(scan_id),file_id,path,max(1,100000-idx),"queued",now))
+        return len(paths)
+
+    def update_preview_queue_item(self, scan_id, node_path, status, preview_bytes=0, cursor=None, error_code=None, error_message=None):
+        with self.lock, self._connect() as conn:
+            conn.execute("UPDATE preview_queue_items SET status=?,preview_bytes=?,cursor=?,error_code=?,error_message=?,updated_at=? WHERE scan_id=? AND node_path=?",(str(status),max(0,int(preview_bytes or 0)),cursor,error_code,error_message,time.time(),str(scan_id),str(node_path)))
+
+    def preview_queue_counts(self, scan_id):
+        with self._connect() as conn: rows=conn.execute("SELECT status,COUNT(*) AS value FROM preview_queue_items WHERE scan_id=? GROUP BY status",(str(scan_id),)).fetchall()
+        return {str(r["status"]):int(r["value"] or 0) for r in rows}
+
+    def create_deep_parse_batch(self, scan_id, paths, created_by="user", selection_rule=None, priority=100):
+        batch_id=uuid.uuid4().hex[:16]; paths=[str(x) for x in (paths or []) if x]
+        scan=self.get_scan(scan_id) or {}
+        # A large scan can have millions of inventory rows.  When the caller
+        # already supplied a bounded selection, fetch only those payloads
+        # instead of materialising the complete inventory to calculate bytes.
+        file_map={}
+        if paths:
+            with self._connect() as conn:
+                for start in range(0, len(paths), 500):
+                    batch = paths[start:start + 500]
+                    rows = conn.execute(
+                        "SELECT node_path,payload FROM inventory_entries WHERE scan_id=? AND node_path IN ({})".format(
+                            ",".join("?" for _ in batch)
+                        ),
+                        [str(scan_id)] + batch,
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            file_map[str(row["node_path"])] = json.loads(row["payload"] or "{}")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            file_map[str(row["node_path"])] = {}
+        if not file_map:
+            file_map={str(x.get("path") or x.get("node_path") or ""):x for x in (scan.get("files") or [])}
+        if not file_map and not paths:
+            file_map={str(row.get("node_path") or ""): (row.get("payload") or {}) for row in self.iter_inventory_entries(scan_id)}
+        total_bytes=sum(max(0,int((file_map.get(p) or {}).get("size") or 0)) for p in paths); task=self.get_import_task(scan_id); now=time.time()
+        with self.lock, self._connect() as conn:
+            conn.execute("INSERT INTO deep_parse_batches(batch_id,import_task_id,scan_id,created_by,selection_rule,selected_file_count,selected_bytes,priority,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",(batch_id,task["task_id"] if task else str(scan_id),str(scan_id),str(created_by or "user"),json.dumps(selection_rule or {},ensure_ascii=False),len(paths),total_bytes,int(priority),"queued",now,now))
+            for idx,path in enumerate(paths):
+                file_id=hashlib.sha256((str(scan_id)+"\0"+path).encode()).hexdigest()[:32]
+                conn.execute("INSERT OR REPLACE INTO deep_parse_items(batch_id,file_id,node_path,priority,status,updated_at) VALUES (?,?,?,?,?,?)",(batch_id,file_id,path,int(priority)-idx,"queued",now))
+        return batch_id
+
+    def deep_parse_batch_paths(self, batch_id):
+        with self._connect() as conn:
+            rows=conn.execute("SELECT node_path FROM deep_parse_items WHERE batch_id=? AND status IN ('queued','retryable','running') ORDER BY priority DESC",(str(batch_id),)).fetchall()
+        return [str(r["node_path"]) for r in rows]
+
+    def update_deep_parse_batch(self, batch_id, status=None, error_code=None, error_message=None):
+        """Atomically advance one durable deep-parse batch and its file items."""
+        batch_id = str(batch_id or "")
+        if not batch_id:
+            return None
+        allowed = {"queued", "running", "paused", "completed", "failed", "cancelled"}
+        status = str(status or "").strip().lower() or None
+        if status and status not in allowed:
+            raise ValueError("未知深度批次状态")
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            assignments = ["updated_at=?"]
+            values = [now]
+            if status:
+                assignments.append("status=?")
+                values.append(status)
+                if status == "running":
+                    conn.execute(
+                        "UPDATE deep_parse_items SET status='running',started_at=COALESCE(started_at,?),"
+                        "updated_at=? WHERE batch_id=? AND status IN ('queued','retryable')",
+                        (now, now, batch_id),
+                    )
+                elif status == "paused":
+                    conn.execute(
+                        "UPDATE deep_parse_items SET status='queued',updated_at=? "
+                        "WHERE batch_id=? AND status IN ('queued','running','retryable')",
+                        (now, batch_id),
+                    )
+                elif status == "cancelled":
+                    conn.execute(
+                        "UPDATE deep_parse_items SET status='cancelled',finished_at=?,updated_at=? "
+                        "WHERE batch_id=? AND status IN ('queued','running','retryable')",
+                        (now, now, batch_id),
+                    )
+            if error_code is not None:
+                assignments.append("error_code=?")
+                values.append(str(error_code)[:200])
+            if error_message is not None:
+                assignments.append("error_message=?")
+                values.append(str(error_message)[:2000])
+            values.append(batch_id)
+            conn.execute(
+                "UPDATE deep_parse_batches SET {} WHERE batch_id=?".format(",".join(assignments)),
+                values,
+            )
+            row = conn.execute(
+                "SELECT * FROM deep_parse_batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_deep_parse_item(self, batch_id, node_path, status, parser_plan=None,
+                               error_code=None, error_message=None):
+        batch_id, node_path = str(batch_id or ""), str(node_path or "")
+        status = str(status or "queued").strip().lower()
+        allowed = {"queued", "classified", "running", "completed", "failed", "retryable", "cancelled"}
+        if status not in allowed:
+            raise ValueError("未知深度文件状态")
+        now = time.time()
+        with self.lock, self._connect() as conn:
+            assignments = ["status=?", "updated_at=?"]
+            values = [status, now]
+            if status == "running":
+                assignments.append("started_at=COALESCE(started_at,?)")
+                values.append(now)
+            if status in {"completed", "failed", "cancelled"}:
+                assignments.append("finished_at=?")
+                values.append(now)
+            if parser_plan is not None:
+                assignments.append("parser_plan=?")
+                values.append(json.dumps(parser_plan or {}, ensure_ascii=False))
+            if error_code is not None:
+                assignments.append("error_code=?")
+                values.append(str(error_code)[:200])
+            if error_message is not None:
+                assignments.append("error_message=?")
+                values.append(str(error_message)[:2000])
+            values.extend([batch_id, node_path])
+            conn.execute(
+                "UPDATE deep_parse_items SET {} WHERE batch_id=? AND node_path=?".format(
+                    ",".join(assignments)
+                ),
+                values,
+            )
+        return True
+
+    def deep_parse_batch_counts(self, batch_id):
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status,COUNT(*) AS value FROM deep_parse_items "
+                "WHERE batch_id=? GROUP BY status", (str(batch_id),)
+            ).fetchall()
+        return {str(row["status"]): int(row["value"] or 0) for row in rows}
+
+    def reconcile_file_versions(self, scan_id):
+        """Mark preview/deep records stale when the persisted source fingerprint changes."""
+        scan = self.get_scan(scan_id) or {}
+        root = Path(str(scan.get("root") or ""))
+        stale = []
+        for item in self.iter_inventory_entries(scan_id):
+            node = item.get("payload") or {}
+            path = str(node.get("path") or item.get("node_path") or "")
+            preview = self.get_file_preview(scan_id, path)
+            if not preview or not path:
+                continue
+            try:
+                current = (root / path).resolve()
+                stat = current.stat()
+            except (OSError, ValueError):
+                stale.append(path)
+                continue
+            old_size = int(preview.get("size") or preview.get("source_size") or -1)
+            old_mtime = int(preview.get("modified_at_ns") or preview.get("source_modified_at_ns") or -1)
+            if old_size != int(stat.st_size) or old_mtime != int(stat.st_mtime_ns):
+                stale.append(path)
+                self.update_preview_queue_item(
+                    scan_id, path, "stale",
+                    preview_bytes=int(preview.get("sampled_bytes") or 0),
+                    cursor=json.dumps({"reason": "source_version_changed", "previous": preview.get("source_sha256")}, ensure_ascii=False),
+                    error_code="source_version_changed",
+                    error_message="源文件版本指纹已变化，等待重新预览",
+                )
+                with self.lock, self._connect() as conn:
+                    conn.execute(
+                        "UPDATE file_previews SET status='stale',updated_at=CURRENT_TIMESTAMP WHERE scan_id=? AND node_path=?",
+                        (str(scan_id), path),
+                    )
+                    conn.execute(
+                        "UPDATE file_analysis_states SET status='retryable',error='源文件版本已变化，需重新深析',"
+                        "updated_at=CURRENT_TIMESTAMP WHERE scan_id=? AND node_path=? AND status='completed'",
+                        (str(scan_id), path),
+                    )
+                    conn.execute(
+                        "UPDATE file_workflow_states SET parse_status='stale',evidence_status='stale',"
+                        "workflow_state='preview_queued',light_index_status='pending',updated_at=CURRENT_TIMESTAMP "
+                        "WHERE scan_id=? AND node_path=?",
+                        (str(scan_id), path),
+                    )
+        return stale
+
+    def refresh_import_task_counts(self, scan_id):
+        """Reconcile task counters from durable inventory and queue state."""
+        task = self.get_import_task(scan_id)
+        if not task:
+            return None
+        scan = self.get_scan(scan_id) or {}
+        preview = self.preview_queue_counts(scan_id)
+        # Queue rows were introduced after the original file_previews table.
+        # Reconcile counters from both durable representations so historical
+        # scans and partially migrated tasks report the same progress.
+        try:
+            preview_records = self.file_preview_counts(scan_id)
+        except Exception:
+            preview_records = {}
+        try:
+            status_counts = self.file_status_counts(scan_id, include_container_only=False)
+        except Exception:
+            status_counts = {}
+        previewed = max(
+            int(preview.get("completed") or 0),
+            int(preview_records.get("previewed") or 0)
+            + int(preview_records.get("restricted") or 0),
+        )
+        failed = (
+            int(status_counts.get("failed") or 0)
+            + int(preview.get("failed") or 0)
+            + int(preview_records.get("failed") or 0)
+        )
+        counts = {
+            "total_files": int(scan.get("logical_file_count") or scan.get("file_count") or task.get("total_files") or 0),
+            "discovered_files": int(scan.get("logical_file_count") or scan.get("file_count") or task.get("discovered_files") or 0),
+            "previewed_files": previewed,
+            "deep_parsed_files": int(status_counts.get("completed") or 0),
+            "failed_files": failed,
+        }
+        return self.update_import_task(scan_id, counts=counts)
+
+    def reconcile_import_task_after_summary(self, scan_id):
+        """Close the user-facing import task after deep file summaries finish.
+
+        Package parsing and model summaries are intentionally separate queue
+        jobs.  The old workflow marked the import complete as soon as the
+        parser job ended, which made the UI report completion while the
+        selected files were still waiting for their claim summaries.  Keep the
+        reconciliation in storage so the Worker can run it after durable job
+        finalization without importing the Flask application into its parent
+        process.
+        """
+        scan_id = str(scan_id or "")
+        task = self.get_import_task(scan_id)
+        task_status = str((task or {}).get("status") or "")
+        if not task:
+            return task
+        if task_status == "candidate_analyzing":
+            preview_jobs = []
+            package_active = False
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT status,options FROM analysis_jobs WHERE scan_id=? AND task_type='generate_summary'",
+                    (scan_id,),
+                ).fetchall()
+                package_active = bool(conn.execute(
+                    "SELECT 1 FROM analysis_jobs WHERE scan_id=? AND task_type IN ('scan_and_analyze','analyze_package') AND status IN ('queued','running','cancelling') LIMIT 1",
+                    (scan_id,),
+                ).fetchone())
+            for row in rows:
+                try:
+                    options = json.loads(row["options"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    options = {}
+                if str(options.get("workflow_source") or "") != "candidate_preview_model_summary":
+                    continue
+                preview_jobs.append({"status": str(row["status"] or ""), "options": options})
+            if package_active or any(item["status"] in {"queued", "running", "cancelling"} for item in preview_jobs):
+                return task
+            checkpoint = dict(task.get("checkpoint") or {})
+            candidate_paths = [str(path) for path in (checkpoint.get("candidate_paths") or []) if str(path)]
+            completed_paths = []
+            degraded_paths = []
+            for path in candidate_paths:
+                summary = self.get_summary(scan_id, path, "file") or {}
+                if (str(summary.get("analysis_level") or "").lower() == "preview" or str(summary.get("analysis_depth") or "").lower() in {"preview", "preview_document"} or str(summary.get("generated_by") or "") in {"model-preview-analysis", "model-preview-batch-analysis", "model-candidate-summary", "local-preview-fallback"}):
+                    completed_paths.append(path)
+                if str(summary.get("generated_by") or "") == "local-preview-fallback":
+                    degraded_paths.append(path)
+            failed = [item for item in preview_jobs if item["status"] in {"failed", "cancelled"}]
+            expected = int(checkpoint.get("candidate_preview_expected") or len(candidate_paths) or len(preview_jobs))
+            checkpoint.update({
+                "candidate_preview_completed": len(completed_paths),
+                "candidate_preview_completed_paths": completed_paths,
+                "candidate_preview_failed": max(len(failed), max(0, expected - len(completed_paths) - len(degraded_paths))),
+                "candidate_preview_degraded": len(degraded_paths),
+                "candidate_preview_degraded_paths": degraded_paths,
+                "candidate_preview_ready": True,
+                "candidate_preview_partial": bool(failed or degraded_paths or (expected and len(completed_paths) < expected)),
+            })
+            self.update_import_task(
+                scan_id,
+                status="waiting_for_deep_selection",
+                phase="waiting_for_deep_selection",
+                checkpoint=checkpoint,
+            )
+            self.set_package_processing_state(
+                scan_id,
+                "awaiting_deep_selection",
+                "候选文件初步摘要和智能目录已生成，请选择需要深度处理的文件或节点。",
+            )
+            self.update_analysis_progress_status(
+                scan_id,
+                "waiting_for_deep_selection",
+                "候选文件初步摘要和智能目录已生成，请选择需要深度处理的文件或节点。",
+                "waiting_for_deep_selection",
+            )
+            return self.get_import_task(scan_id)
+        if task_status != "summarizing_files":
+            return task
+        deep_jobs = []
+        package_active = False
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status,options FROM analysis_jobs "
+                "WHERE scan_id=? AND task_type='generate_summary'",
+                (scan_id,),
+            ).fetchall()
+            package_active = bool(conn.execute(
+                "SELECT 1 FROM analysis_jobs WHERE scan_id=? "
+                "AND task_type IN ('scan_and_analyze','analyze_package') "
+                "AND status IN ('queued','running','cancelling') LIMIT 1",
+                (scan_id,),
+            ).fetchone())
+        for row in rows:
+            try:
+                options = json.loads(row["options"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                options = {}
+            if str(options.get("workflow_source") or "") not in {"deep_parse_model_summary", "large_selection_model_summary", "idle_deep_model_summary", "deep_node_rebuild"}:
+                continue
+            deep_jobs.append({"status": str(row["status"] or ""), "options": options})
+        active = [
+            item for item in deep_jobs
+            if item["status"] in {"queued", "running", "cancelling"}
+        ]
+        deep_node_active = False
+        with self._connect() as conn:
+            for row in conn.execute(
+                "SELECT options FROM analysis_jobs WHERE scan_id=? AND task_type='generate_summary' "
+                "AND status IN ('queued','running')", (scan_id,)
+            ):
+                try:
+                    options = json.loads(row["options"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    options = {}
+                if str(options.get("workflow_source") or "") == "deep_node_rebuild":
+                    deep_node_active = True
+                    break
+        if active or package_active or deep_node_active:
+            return task
+
+        failed = [
+            item for item in deep_jobs
+            if item["status"] in {"failed", "cancelled"}
+        ]
+        completed = [
+            item for item in deep_jobs
+            if item["status"] == "completed"
+        ]
+        checkpoint = dict(task.get("checkpoint") or {})
+        expected = max(int(checkpoint.get("deep_summary_expected") or 0), len(deep_jobs))
+        batch_counts = {}
+        batch_id = str(checkpoint.get("deep_batch_id") or "")
+        if batch_id:
+            batch_counts = self.deep_parse_batch_counts(batch_id)
+        # A missing summary, a parser failure, or a file that still needs
+        # attention is visible as partial rather than silently becoming a
+        # completed package.
+        selection_plan = checkpoint.get("selection_plan") or {}
+        large_selection_partial = bool(
+            checkpoint.get("large_selection")
+            or int(selection_plan.get("deferred_file_count") or 0)
+            or int(selection_plan.get("selected_file_count") or 0)
+            > int(selection_plan.get("normal_parse_file_count") or 0)
+        )
+        partial = bool(
+            failed
+            or int(batch_counts.get("failed") or 0)
+            or (expected and len(completed) < expected)
+            or large_selection_partial
+        )
+        final_status = "partial" if partial else "completed"
+        checkpoint.update({
+            "deep_summary_completed": len(completed),
+            "deep_summary_failed": len(failed),
+            "large_selection_model_completed": len(completed) if large_selection_partial else None,
+            "large_selection_deferred_files": int(selection_plan.get("deferred_file_count") or 0),
+            "formal_directory_ready": True,
+        })
+        self.update_import_task(
+            scan_id,
+            status=final_status,
+            phase="completed" if final_status == "completed" else "partial",
+            checkpoint=checkpoint,
+        )
+        self.set_package_processing_state(
+            scan_id,
+            "completed",
+            "文件摘要和正式智能目录已生成。" if final_status == "completed"
+            else "正式智能目录已生成，但部分文件或结论需要复核。",
+        )
+        self.update_analysis_progress_status(
+            scan_id,
+            final_status,
+            "文件摘要和正式智能目录已生成。" if final_status == "completed"
+            else "正式智能目录已生成，但部分文件或结论需要复核。",
+            final_status,
+        )
+        return self.get_import_task(scan_id)
+
+    def sync_import_queues(self, scan_id):
+        now=time.time(); preview_counts=self.preview_queue_counts(scan_id)
+        with self.lock, self._connect() as conn:
+            preview_rows=conn.execute("SELECT node_path FROM preview_queue_items WHERE scan_id=?",(str(scan_id),)).fetchall()
+            for row in preview_rows:
+                path=str(row["node_path"])
+                pv=conn.execute("SELECT status FROM file_previews WHERE scan_id=? AND node_path=?",(str(scan_id),path)).fetchone()
+                st=str((pv["status"] if pv else "queued") or "queued")
+                mapped="completed" if st in {"previewed","restricted"} else ("failed" if st in {"failed","out_of_scope"} else ("stale" if st == "stale" else "queued"))
+                conn.execute("UPDATE preview_queue_items SET status=?,updated_at=? WHERE scan_id=? AND node_path=?",(mapped,now,str(scan_id),path))
+            deep_rows=conn.execute("SELECT batch_id,node_path FROM deep_parse_items WHERE status IN ('queued','running','retryable') AND batch_id IN (SELECT batch_id FROM deep_parse_batches WHERE scan_id=?)",(str(scan_id),)).fetchall()
+            for row in deep_rows:
+                st=conn.execute("SELECT status FROM file_analysis_states WHERE scan_id=? AND node_path=?",(str(scan_id),str(row["node_path"]))).fetchone()
+                fs=str((st["status"] if st else "queued") or "queued")
+                mapped="completed" if fs in {"completed","needs_attention"} else ("failed" if fs == "failed" else "running")
+                conn.execute("UPDATE deep_parse_items SET status=?,updated_at=? WHERE batch_id=? AND node_path=?",(mapped,now,str(row["batch_id"]),str(row["node_path"])))
+            conn.execute("UPDATE deep_parse_batches SET status=CASE WHEN EXISTS(SELECT 1 FROM deep_parse_items i WHERE i.batch_id=deep_parse_batches.batch_id AND i.status IN ('queued','running','retryable')) THEN CASE WHEN EXISTS(SELECT 1 FROM deep_parse_items i WHERE i.batch_id=deep_parse_batches.batch_id AND i.status='running') THEN 'running' ELSE 'queued' END WHEN EXISTS(SELECT 1 FROM deep_parse_items i WHERE i.batch_id=deep_parse_batches.batch_id AND i.status='failed') THEN 'failed' ELSE 'completed' END,updated_at=? WHERE scan_id=?",(now,str(scan_id)))
+        return {"preview":self.preview_queue_counts(scan_id),"batches":self.list_deep_parse_batches(scan_id)}
+
+    def list_deep_parse_batches(self, scan_id):
+        with self._connect() as conn: rows=conn.execute("SELECT * FROM deep_parse_batches WHERE scan_id=? ORDER BY created_at DESC",(str(scan_id),)).fetchall()
+        return [dict(r) for r in rows]
+
     @staticmethod
     def _job_priority(task_type, options=None):
         # New package imports and explicit supplement analysis are the primary
         # workflow. Optional summaries/reports must not indefinitely hide them
         # behind a long FIFO tail. A running task is never pre-empted.
         options = options or {}
+        if str(task_type or "") == "generate_report" and str(options.get("workflow_source") or "") == "deep_results_report":
+            return 100
+        if str(task_type or "") == "generate_summary":
+            source = str(options.get("workflow_source") or "")
+            if source in {"candidate_preview_model_summary", "candidate_preview"}:
+                return 105
+            if source in {"candidate_node_summary"}:
+                return 45
+            if source in {
+                "deep_parse_model_summary", "large_selection_model_summary",
+                "manual_selection", "preliminary_model_summary",
+                "preliminary_node_summary",
+            }:
+                return 110
+            if source in {"idle_deep_backfill", "idle_deep_model_summary", "deep_node_rebuild"}:
+                return 10
+            if source == "background_backfill":
+                return 20
         if str(task_type or "") == "analyze_package":
             source = str(options.get("workflow_source") or "")
+            if source == "idle_deep_backfill":
+                return 10
             if (
                 source == "question_promotion"
                 or options.get("conversation_session_id")
@@ -5835,6 +7184,10 @@ class Storage:
                 return 130
             if source == "manual_selection":
                 return 110
+            if source == "large_selection":
+                return 110
+            if source == "candidate_preview":
+                return 105
             if source == "index_rebuild":
                 return 110
             if source == "initial_overview":
@@ -5880,10 +7233,17 @@ class Storage:
             # question must not get trapped behind an existing background job
             # merely because both currently reference the same files.
             scope = (options or {}).get("target_paths") or []
+            workflow_source = str((options or {}).get("workflow_source") or "")
+            # Node summaries are keyed by logical node and stage. Membership can
+            # change while preview analysis refreshes, so it is not a job identity.
+            node_summary_keyed = (
+                task_type == "generate_summary"
+                and workflow_source in {"candidate_node_summary", "deep_node_rebuild"}
+            )
             scope_key = (
                 json.dumps({
                     "paths": sorted(set(str(item) for item in scope)),
-                    "workflow_source": str((options or {}).get("workflow_source") or ""),
+                    "workflow_source": workflow_source,
                     "conversation_session_id": str(
                         (options or {}).get("conversation_session_id") or ""
                     ),
@@ -5891,7 +7251,15 @@ class Storage:
                         (options or {}).get("conversation_turn_id") or ""
                     ),
                 }, ensure_ascii=False, sort_keys=True)
-                if task_type == "analyze_package" else options_json
+                if task_type == "analyze_package"
+                else (
+                    json.dumps({
+                        "workflow_source": workflow_source,
+                        "node_id": str((options or {}).get("node_id") or ""),
+                        "analysis_level": str((options or {}).get("analysis_level") or ""),
+                    }, ensure_ascii=False, sort_keys=True)
+                    if node_summary_keyed else options_json
+                )
             )
             rows = conn.execute(
                 "SELECT id, options, owner_id FROM analysis_jobs WHERE scan_id=? AND task_type=? "
@@ -5904,12 +7272,17 @@ class Storage:
                     candidate_options = json.loads(candidate["options"] or "{}")
                 except (TypeError, ValueError):
                     candidate_options = {}
+                candidate_workflow_source = str(candidate_options.get("workflow_source") or "")
+                candidate_node_summary_keyed = (
+                    task_type == "generate_summary"
+                    and candidate_workflow_source in {"candidate_node_summary", "deep_node_rebuild"}
+                )
                 candidate_scope = (
                     json.dumps({
                         "paths": sorted(set(str(item) for item in (
                             candidate_options.get("target_paths") or []
                         ))),
-                        "workflow_source": str(candidate_options.get("workflow_source") or ""),
+                        "workflow_source": candidate_workflow_source,
                         "conversation_session_id": str(
                             candidate_options.get("conversation_session_id") or ""
                         ),
@@ -5918,7 +7291,15 @@ class Storage:
                         ),
                     }, ensure_ascii=False, sort_keys=True)
                     if task_type == "analyze_package"
-                    else json.dumps(candidate_options, ensure_ascii=False, sort_keys=True)
+                    else (
+                        json.dumps({
+                            "workflow_source": candidate_workflow_source,
+                            "node_id": str(candidate_options.get("node_id") or ""),
+                            "analysis_level": str(candidate_options.get("analysis_level") or ""),
+                        }, ensure_ascii=False, sort_keys=True)
+                        if candidate_node_summary_keyed
+                        else json.dumps(candidate_options, ensure_ascii=False, sort_keys=True)
+                    )
                 )
                 candidate_owner = candidate["owner_id"] or "legacy"
                 if candidate_scope == scope_key and (not owner_id or candidate_owner == owner_id):
@@ -5944,8 +7325,11 @@ class Storage:
             "parse_mode": str(parse_mode),
             "max_depth": int(max_depth),
             "owner_id": owner_id or "legacy",
+            "preprocess_only": True,
+            "continue_full": False,
         }
         priority = self._job_priority("scan_and_analyze", options)
+        self.create_import_task(job_id, root_path, owner_id=owner_id)
         with self.lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
@@ -6030,13 +7414,22 @@ class Storage:
             worker_clause = ", worker_id=COALESCE(worker_id,?)"
             values.append(str(worker_id))
         values.append(job_id)
-        with self.lock, self._connect() as conn:
-            cursor = conn.execute(
-                "UPDATE analysis_jobs SET heartbeat_at=?{} "
-                "WHERE id=? AND status IN ('running','cancelling')".format(worker_clause),
-                values,
-            )
-            return cursor.rowcount == 1
+        try:
+            with self.lock, self._connect() as conn:
+                cursor = conn.execute(
+                    "UPDATE analysis_jobs SET heartbeat_at=?{} "
+                    "WHERE id=? AND status IN ('running','cancelling')".format(worker_clause),
+                    values,
+                )
+                return cursor.rowcount == 1
+        except sqlite3.OperationalError as exc:
+            # A heartbeat is advisory.  A long parser/model transaction may
+            # briefly hold SQLite's write lock; that must not turn a healthy
+            # analysis into a failed job.  The next heartbeat retries it.
+            if "locked" in str(exc).casefold() or "busy" in str(exc).casefold():
+                LOGGER.warning("Skipping locked heartbeat for job %s", job_id)
+                return False
+            raise
 
     def is_job_cancel_requested(self, job_id):
         """Cheap cooperative cancellation probe for parser/model loops."""

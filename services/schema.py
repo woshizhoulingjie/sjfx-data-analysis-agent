@@ -16,6 +16,14 @@ def normalize_summary(payload):
         result["evidence"] = result["evidence_chain"]
     if not isinstance(result.get("topics"), list):
         result["topics"] = []
+    # File-level claim contract is additive; normalize old summaries so callers
+    # can consume one stable shape during rolling upgrades.
+    for key in ("file_conclusions", "file_arguments", "file_review_items", "file_limitations"):
+        if not isinstance(result.get(key), list):
+            result[key] = []
+    if not isinstance(result.get("evidence_quality"), dict):
+        result["evidence_quality"] = {}
+    result.setdefault("claim_contract", "file-claims/1.0")
     return normalize_conclusion_evidence(result)
 
 

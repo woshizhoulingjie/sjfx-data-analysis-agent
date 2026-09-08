@@ -5,7 +5,9 @@ from collections import Counter, defaultdict
 from services.evidence import evidence_quality
 
 
-TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}")
+TOKEN_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9]*(?:[_.-][A-Za-z0-9]+)*|[\u4e00-\u9fff]{2,}"
+)
 
 
 def _tokens(text):
@@ -16,7 +18,10 @@ def _tokens(text):
             for size in (2, 3):
                 output.extend(value[index:index + size] for index in range(max(0, len(value) - size + 1)))
         else:
-            output.append(value)
+            # Do not keep one-character Latin noise, and do not absorb
+            # sentence punctuation into the searchable token.
+            if len(value) > 1:
+                output.append(value)
     return output[:20000]
 
 
@@ -60,6 +65,15 @@ def evidence_corpus(documents, scope="."):
                 for index in range(0, len(text), 1200)
             ]
         for item in evidence:
+            # Preview snippets are searchable discovery material.  They remain
+            # explicitly marked preview_only and are never counted as formal
+            # evidence, but the corpus must retain them for candidate search.
+            is_preview = bool(item.get("preview_only"))
+            item_coverage = item.get("coverage") or {}
+            if str(item_coverage.get("level") or "").lower() == "preview" and not is_preview:
+                continue
+            if "formal_evidence_ready" in item_coverage and not bool(item_coverage.get("formal_evidence_ready")):
+                continue
             item_source = item.get("archive_source_path") or item.get("source_path") or path
             if not (_in_scope(path, scope) or _in_scope(str(item_source), scope)):
                 continue
@@ -69,8 +83,11 @@ def evidence_corpus(documents, scope="."):
             quality = evidence_quality(item)
             # Interactive search must not promote headings/question prompts as
             # evidence merely because they repeat the user's query words.
-            if not quality.get("eligible"):
+            if not quality.get("eligible") and not is_preview:
                 continue
+            if is_preview:
+                quality = dict(quality)
+                quality.update({"eligible": True, "preview_only": True, "reason": quality.get("reason") or "轻量预览候选"})
             key = (path, item.get("page"), item.get("section"), item.get("content_sha256") or text)
             if key in seen:
                 continue
@@ -138,7 +155,10 @@ def _bm25_scores(tokenized, query_tokens, k1=1.5, b=0.75):
 def _tfidf_scores(texts, query):
     # BM25 remains useful for large corpora; do not allocate a dense feature
     # vocabulary for every evidence block while Docling is using the same RAM.
-    if len(texts) > 2500:
+    # Character TF-IDF is useful for a small result set, but becomes
+    # disproportionately expensive for broad file searches. BM25 remains
+    # deterministic and fast for larger corpora.
+    if len(texts) > 250:
         return [0.0] * len(texts), False
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
@@ -178,7 +198,8 @@ def _match_type(item):
 
 
 def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
-                      candidate_evidence_ids=None, indexed_chunks=None):
+                      candidate_evidence_ids=None, indexed_chunks=None,
+                      use_tfidf=True):
     query = re.sub(r"\s+", " ", str(query or "")).strip()
     if not query:
         raise ValueError("检索问题不能为空")
@@ -217,7 +238,7 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
     ]
     tokenized = [_tokens(text) for text in texts]
     bm25 = _bm25_scores(tokenized, _tokens(query))
-    vectors, vector_ready = _tfidf_scores(texts, query)
+    vectors, vector_ready = _tfidf_scores(texts, query) if use_tfidf else ([0.0] * len(texts), False)
     ranked = []
     for index, item in enumerate(chunks):
         lexical = bm25[index]

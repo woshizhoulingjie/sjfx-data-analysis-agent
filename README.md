@@ -1,5 +1,56 @@
 # SJFX 数据分析智能体操作手册
 
+## 当前实现：统一导入状态机（2026-09-08）
+
+普通资料包不再沿用“导入后自动全量解析、聚类和深析”的旧链路。新导入的唯一流程由
+`services/import_state_machine.py` 定义，Web API、Worker 和 SQLite 持久化状态都使用相同的阶段：
+
+```text
+仅盘点目录和文件元数据
+  -> 等待用户选择文件
+  -> 只解析选中文件
+  -> 依据解析内容生成第一版智能目录和情报概览
+  -> 文件初步摘要
+  -> 节点初步摘要
+  -> 自动更新智能目录和情报概览
+  -> 低优先级、可让路、可恢复的文件深度摘要
+  -> 节点深度摘要
+  -> 等待用户点击“使用深度证据更新”
+  -> 更新正式智能目录和情报概览
+```
+
+对应的持久化状态为：`waiting_for_selection`、`parsing_selected`、`parsed_overview`、
+`preliminary_summarizing`、`preliminary_nodes`、`preliminary_overview`、
+`deep_summarizing_files`、`deep_summarizing_nodes`、`deep_update_available` 和
+`deep_overview_updating`。非法跳阶段会被状态转换校验拒绝；补充文件会回到“只解析新增选择”
+的阶段，而不是重新扫描或解析整包。
+
+### 分阶段摘要和证据
+
+摘要不再写入同一条记录。每个文件或节点按阶段独立保存：
+
+| 阶段 | 文件摘要 | 节点摘要 | 使用范围 |
+| --- | --- | --- | --- |
+| 初步 | `preliminary_file_summary` | `preliminary_node_summary` | 已解析内容和代表性原文证据；结论明确标记为待全文校验。 |
+| 深度 | `deep_file_summary` | `deep_node_summary` | 完整解析、分块分析和更严格的证据校验。 |
+
+两类文件摘要都提供同一类界面结构：**文件可支撑的结论、主要论点/方法依据、每条结论的原文证据、
+来源位置和待复核项**。初步摘要的支撑状态为“初步支持”，不冒充全文核验；深度摘要生成后，文件
+和节点详情始终按“深度 > 初步 > 兼容旧摘要”的优先级展示，初步摘要不会覆盖深度摘要。
+
+深度摘要完成本身不会自动发布正式目录或情报概览。用户点击“使用深度证据更新”后，系统才以当前
+选择版本的深度文件/节点摘要生成 `deep_report`；如果之后补充了文件，旧 `deep_report` 的范围版本
+不再用于新选择范围，直到新的深度更新完成。
+
+### 两条入口保持隔离
+
+- **普通导入分析**：适合用户已经知道需要关注哪些文件的资料包，严格执行上述选择式状态机。
+- **大数据包处理**：保留独立的大包盘点、轻量目录、候选筛选和分批深析能力；它不复用普通导入的
+  选中文件状态，也不会让旧的全量 `analyze_package` 链路穿透普通导入流程。
+
+本仓库只提交源码、配置模板、测试和文档。真实资料、数据库、模型、运行输出、测试包和服务器备份
+均被 `.gitignore` 排除，不能上传到 GitHub。
+
 SJFX 用来处理“一批拿回来但还不知道里面有什么”的本地资料。系统会先建立原始目录和数据概览，再生成主题目录、价值判断、问题—回答—证据链，最后把用户选中的主题、文档或证据导出为可交给整编人员/整编 Agent 的资料包。
 
 本手册面向第一次接触项目的使用者。按照“5 分钟启动”配置后，即可在浏览器完成导入、分析、深挖、检索和导出。
@@ -108,7 +159,7 @@ SQLite WAL（任务、进度、结果、检查点）
   ↓
 独立 Worker（worker.py，扫描、解析、分析、报告、导出）
   ↓
-本地 Ollama / 本地解析器
+本地 vLLM / 本地解析器
 ```
 
 Web 与 Worker 必须同时运行。只启动 `app.py` 时页面可以打开，但分析任务不会被执行。Worker 启动时不再导入 Web 应用；只有真正领取任务时才懒加载分析执行器，因此可选 Docling/OCR 依赖损坏不会让任务队列连启动都失败。项目默认只允许一个 Worker，以免多个任务同时占用共享 GPU。
@@ -121,7 +172,7 @@ Web 与 Worker 必须同时运行。只启动 `app.py` 时页面可以打开，�
 - Python 3.10 或更高版本（当前服务器使用 Python 3.12）；
 - 至少 8 GB 内存，处理 Docling/OCR 或大包时建议 16 GB 以上；
 - 足够存放原始资料、解析侧存和导出包的磁盘空间；
-- 可选的本地 Ollama，用于主题命名和深度摘要；
+- 本地 vLLM，用于主题命名和深度摘要；
 - 可选的本地 Docling/RapidOCR 模型，用于高精度版面、表格和 OCR。
 
 Ubuntu/Debian 服务器建议先安装解析器所需的系统库（没有图像/PDF任务时也可以先跳过）：
@@ -137,7 +188,7 @@ sudo apt-get install -y qpdf
 仍可工作，但图片或扫描 PDF 可能在导入阶段失败。生产部署应把 Python 直接依赖
 和系统库一起写入镜像/运维脚本，不要在任务运行时临时联网安装。
 
-没有 Ollama 时，扫描、基础解析、本地规则概览、目录和证据组织仍可工作，但模型增强摘要会降级。没有 Docling 离线模型时，系统会尝试其他可用解析器并标记解析覆盖情况。
+没有 vLLM 时，扫描、基础解析、本地规则概览、目录和证据组织仍可工作，但模型增强摘要会降级。没有 Docling 离线模型时，系统会尝试其他可用解析器并标记解析覆盖情况。
 
 ## 5. 5 分钟启动
 
@@ -187,7 +238,7 @@ python -c "import onnxruntime as o; print(o.get_available_providers())"
 
 Docling 会带来 PyTorch/ONNX 等原生依赖。不要在同一个虚拟环境中随意混装不同
 CUDA 版 `torch`、`onnxruntime-gpu` 或 FAISS；本项目默认使用 CPU Docling/RapidOCR，
-Qwen 的 GPU 由本地 Ollama 独占。更换芯片或 CUDA 后应先单独验证上述命令。
+Qwen 的 GPU 由本地 vLLM 独占。更换芯片或 CUDA 后应先单独验证上述命令。
 
 ### 第三步：创建配置
 
@@ -206,13 +257,13 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 最小的服务器配置示例：
 
 ```env
-OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
-OLLAMA_MODEL=qwen-agent:latest
-OLLAMA_EMBED_MODEL=qwen-embed:latest
-
-# 专用 Ollama 可以设为 1；多人共享 Ollama 时先保持 0，避免抢占他人 GPU。
-ENABLE_SHARED_OLLAMA=1
-ENABLE_SHARED_OLLAMA_EMBEDDINGS=0
+LLM_BACKEND=vllm
+ENABLE_VLLM=1
+VLLM_BASE_URL=http://127.0.0.1:8001/v1
+VLLM_MODEL=qwen3.6:27b
+VLLM_MODEL_PATH=/home/your-user/sjfx-data-analysis-agent/models/Qwen3.6-27B
+VLLM_API_KEY=
+VLLM_REQUEST_TIMEOUT=600
 LLM_MAX_CONCURRENCY=1
 
 HOST=0.0.0.0
@@ -247,14 +298,20 @@ MAX_CONTENT_BYTES=10737418240
   取消或崩溃后由父进程和陈旧目录清理机制回收项目自有临时项。
 - `.env` 修改后需要重启 Web 和 Worker 才会生效。
 
-### 第四步：检查 Ollama（需要模型增强时）
+### 第四步：启动并检查 vLLM（需要模型增强时）
 
 ```bash
-ollama list
-curl http://127.0.0.1:11434/api/tags
+# 仅启动一个 vLLM 实例；VLLM_MODEL_PATH 必须是 Transformers/Safetensors 格式的 Qwen3.6-27B 权重
+nohup .venv/bin/vllm serve /home/your-user/sjfx-data-analysis-agent/models/Qwen3.6-27B \
+  --host 127.0.0.1 --port 8001 \
+  --served-model-name qwen3.6:27b \
+  --max-model-len 32768 --max-num-seqs 1 \
+  --gpu-memory-utilization 0.82 > logs/vllm.log 2>&1 &
+
+curl http://127.0.0.1:8001/v1/models
 ```
 
-`.env` 中的 `OLLAMA_MODEL` 必须与 `ollama list` 显示的模型名称完全一致，包括标签。若使用专用模型，可按自己的部署方式创建或拉取；项目不会把大模型文件提交到 GitHub。
+`.env` 中的 `VLLM_MODEL` 必须与 vLLM 的 `--served-model-name` 完全一致。Ollama 的 GGUF blob 不能直接当作稳定的 Qwen3.6 vLLM 模型目录使用；需要先准备对应的 Hugging Face/Transformers 权重。若服务器仍运行共享 Ollama，不要停止它；vLLM 需要独立的 GPU 显存预算。
 
 ### 第五步：启动 Web 和 Worker
 

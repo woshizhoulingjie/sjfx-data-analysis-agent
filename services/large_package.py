@@ -52,6 +52,10 @@ def build_policy(scan, options=None):
     background_backfill = bool(options.get("background_backfill", True))
     overview_chars = max(1000, min(12000, int(options.get("overview_chars_per_file") or 4000)))
     overview_evidence = max(1, min(20, int(options.get("overview_evidence_per_file") or 6)))
+    # User-selected deep files retain a larger bounded context for model
+    # analysis; previews remain small and cheap.
+    deep_model_chars = max(12000, min(500000, int(options.get("deep_model_chars") or 120000)))
+    deep_model_evidence = max(10, min(200, int(options.get("deep_model_evidence") or 80)))
     preview_bytes = max(4096, min(1024 * 1024, int(options.get("preview_bytes_per_file") or 96 * 1024)))
     preview_total_bytes = max(
         preview_bytes,
@@ -59,16 +63,48 @@ def build_policy(scan, options=None):
     )
     preview_zip_members = max(1, min(1000, int(options.get("preview_zip_members") or 80)))
     preview_zip_member_bytes = max(256, min(64 * 1024, int(options.get("preview_zip_member_bytes") or 8192)))
-    enabled = total_size >= threshold_bytes or file_count >= threshold_files
+    threshold_enabled = total_size >= threshold_bytes or file_count >= threshold_files
+    enabled = bool(options.get("force_enabled")) or threshold_enabled
+    large_directory_mode = enabled and bool(options.get("large_directory_mode", True))
+    directory_model_limit = max(12, min(500, int(
+        options.get("directory_model_file_limit") or 120
+    )))
+    if large_directory_mode:
+        # The large-package entry point is a directory-building pass. It must
+        # never silently turn into an all-file deep backfill. Deep analysis is
+        # started only by an explicit selection after this pass.
+        initial_limit = min(initial_limit, directory_model_limit)
+        background_backfill = False
     return {
-        "mode": "large_package" if enabled else "standard",
+        "mode": "large_directory" if large_directory_mode else ("large_package" if enabled else "standard"),
         "enabled": enabled,
+        "large_directory_mode": large_directory_mode,
+        "directory_model_file_limit": directory_model_limit,
+        "selected_parse_max_files": max(
+            100, min(10000, int(options.get("selected_parse_max_files") or 2000))
+        ),
+        "selected_parse_max_bytes": max(
+            256 * 1024 * 1024,
+            int(options.get("selected_parse_max_bytes") or 4 * 1024 * 1024 * 1024),
+        ),
+        "selected_model_file_limit": max(
+            12, min(500, int(options.get("selected_model_file_limit") or directory_model_limit))
+        ),
+        "selected_model_max_bytes": max(
+            64 * 1024 * 1024,
+            int(options.get("selected_model_max_bytes") or 1024 * 1024 * 1024),
+        ),
+        "selected_batch_files": max(
+            50, min(500, int(options.get("selected_batch_files") or 250))
+        ),
+        "preview_hash_mode": "metadata" if large_directory_mode else "full",
         "threshold_bytes": threshold_bytes,
         "threshold_files": threshold_files,
         "initial_parse_files": initial_limit,
         "deepen_batch_files": deepen_limit,
         "batch_files": batch_files,
         "full_inventory_processing": background_backfill,
+        "deep_analysis_requires_selection": True,
         "full_inventory_preview": True,
         "classification_scope": "all_bounded_previews",
         "preview_bytes_per_file": preview_bytes,
@@ -77,6 +113,8 @@ def build_policy(scan, options=None):
         "preview_zip_member_bytes": preview_zip_member_bytes,
         "overview_chars_per_file": overview_chars,
         "overview_evidence_per_file": overview_evidence,
+        "deep_model_chars": deep_model_chars,
+        "deep_model_evidence": deep_model_evidence,
         "inventory_files": file_count,
         "inventory_bytes": total_size,
         "inventory_size_human": human_size(total_size),
@@ -86,6 +124,15 @@ def build_policy(scan, options=None):
         "batch_checkpoint_scope": "per_file",
         "deep_batch_contract": "one_logical_batch_up_to_500_files_with_bounded_subtasks",
         "background_backfill": background_backfill,
+        "selection_gate": "required_before_deep_parse",
+        "directory_contract": (
+            "full_inventory_metadata_bounded_preview_representative_model_cards"
+            if large_directory_mode else "standard_large_package"
+        ),
+        "coverage_contract": (
+            "inventory_100_percent_metadata_100_percent_bounded_content_sample"
+            if large_directory_mode else "large_package_foundation"
+        ),
         "pause_behavior": "安全停止后保留逐文件检查点；再次启动同一扫描可续跑",
         "deep_analysis_strategy": "全量基础索引后每批最多500个逻辑文件连续深析；用户意图与关系召回只调整顺序，不删除剩余文件",
     }
@@ -95,17 +142,21 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
                           preview_bytes_per_file=96 * 1024,
                           preview_total_bytes=8 * 1024 * 1024 * 1024,
                           max_content_bytes=10 * 1024 * 1024 * 1024,
-                          temp_reserve_bytes=0, full_deep_backfill=False):
+                          temp_reserve_bytes=0, full_deep_backfill=False,
+                          large_directory_mode=False):
     """Estimate durable state and worst-case parser scratch before content I/O."""
     file_count = max(0, int(scan.get("file_count") or 0))
     inventory_bytes = max(0, int(scan.get("total_size") or 0))
-    # Capacity must cover one bounded foundation preview for every file.  The
-    # operator value is a reserve floor, not a reason to make tail files
-    # unsearchable after an arbitrary package-wide byte cap is reached.
-    preview_source_bytes = max(
-        max(0, int(preview_total_bytes)),
-        file_count * max(4096, int(preview_bytes_per_file)),
-    )
+    # Standard large-package mode reserves a preview for every file. The
+    # dedicated directory mode deliberately uses a hard sampled-content cap;
+    # the remaining files are still represented by complete metadata cards.
+    if large_directory_mode:
+        preview_source_bytes = max(0, int(preview_total_bytes))
+    else:
+        preview_source_bytes = max(
+            max(0, int(preview_total_bytes)),
+            file_count * max(4096, int(preview_bytes_per_file)),
+        )
     # Preview sidecars are gzip-compressed; evidence keeps three bounded text
     # windows. The multiplier includes SQLite rows, FTS and WAL headroom.
     preview_state = int(preview_source_bytes * 0.60)
@@ -114,7 +165,18 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
     base_state = preview_state + inventory_state + evidence_state
     deep_state = int(inventory_bytes * 1.5) if full_deep_backfill else 0
     required_state = int(base_state * 1.35) + deep_state + 512 * 1024 * 1024
-    required_temp = int(max_content_bytes) * 2 + int(temp_reserve_bytes)
+    # Scratch space is needed for the largest source object that can be read
+    # during this scan, not for the global 10 GiB safety ceiling. This keeps a
+    # small package from being deferred just because its per-file hard limit is
+    # large, while a genuinely huge single-file package remains protected.
+    scratch_source_bytes = (
+        max(4096, int(preview_bytes_per_file))
+        if large_directory_mode else min(
+            max(4096, int(max_content_bytes)),
+            max(inventory_bytes, int(preview_bytes_per_file)),
+        )
+    )
+    required_temp = scratch_source_bytes * 2 + int(temp_reserve_bytes)
     state_free_bytes = max(0, int(state_free_bytes or 0))
     temp_free_bytes = max(0, int(temp_free_bytes or 0))
     blockers = []
@@ -128,7 +190,7 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
         "blockers": blockers,
         "inventory_files": file_count,
         "source_bytes": inventory_bytes,
-        "mandatory_hash_read_bytes": inventory_bytes,
+        "mandatory_hash_read_bytes": 0 if large_directory_mode else inventory_bytes,
         "full_deep_backfill": bool(full_deep_backfill),
         "estimated_deep_state_bytes": deep_state,
         "preview_source_budget_bytes": preview_source_bytes,
@@ -140,8 +202,12 @@ def package_resource_plan(scan, state_free_bytes, temp_free_bytes,
             "preview_gzip_ratio": 0.60,
             "preview_windows_per_file": 3,
             "state_safety_multiplier": 1.35,
-            "full_sha256_requires_one_complete_source_read": True,
-            "preview_total_is_capacity_floor": True,
+            "full_sha256_requires_one_complete_source_read": not large_directory_mode,
+            "metadata_fingerprint_for_unselected_files": bool(large_directory_mode),
+            "scratch_scales_to_scan_size": not large_directory_mode,
+            "directory_scratch_scales_to_single_preview": bool(large_directory_mode),
+            "preview_total_is_capacity_floor": not large_directory_mode,
+            "preview_total_is_hard_sample_cap": bool(large_directory_mode),
         },
     }
 

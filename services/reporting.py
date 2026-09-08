@@ -936,6 +936,9 @@ def compact_summary_context(summaries, limit=12):
             "summary": (payload.get("summary") or payload.get("core_summary") or "")[:1800],
             "topics": payload.get("topics", [])[:10],
             "key_facts": payload.get("key_facts", [])[:12],
+            "file_conclusions": payload.get("file_conclusions", [])[:8],
+            "file_arguments": payload.get("file_arguments", [])[:6],
+            "evidence_quality": payload.get("evidence_quality", {}),
             "evidence_chain": payload.get("evidence_chain", [])[:5],
         })
         if len(output) >= limit:

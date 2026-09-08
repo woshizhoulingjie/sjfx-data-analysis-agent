@@ -228,8 +228,8 @@ class ContextWindowPolicy:
     max_recent_messages: int = 10
     max_recent_chars: int = 7000
     max_summary_chars: int = 2400
-    max_prompt_evidence: int = 8
-    max_evidence_chars: int = 1000
+    max_prompt_evidence: int = 16
+    max_evidence_chars: int = 1800
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_recent_messages", max(2, int(self.max_recent_messages)))
@@ -392,6 +392,13 @@ class IntentRouter:
         r"group\s+by|how many",
         re.I,
     )
+    FILE_SEARCH_RE = re.compile(
+        r"(?:搜索|查找|找一下|找出|找到|列出|显示|筛选)\s*\S+"
+        r"|(?:包含|命中|有关|关于).{0,80}(?:文件|资料|文档)"
+        r"|(?:文件|资料|文档).{0,40}(?:搜索|查找|列表|清单|在哪|有哪些|包含|命中)"
+        r"|\bfiles?\b",
+        re.I,
+    )
     SUMMARY_RE = re.compile(r"总结|概括|概览|综述|梳理|主要(?:讲|内容|发现)|重点是什么|摘要|overview|summari[sz]e", re.I)
     CASUAL_RE = re.compile(
         r"^(?:你好|您好|嗨|hi|hello|谢谢|感谢|辛苦了|再见|你是谁|你能做什么|怎么用|帮助)(?:[呀啊吗呢！!。.？?\s]*)$",
@@ -435,6 +442,7 @@ class IntentRouter:
             return IntentDecision(name="general_qa", confidence=0.96, reason="general question outside active document scope")
         matched_intents = [
             name for name, pattern in (
+                ("file_search", self.FILE_SEARCH_RE),
                 ("translation", self.TRANSLATION_RE),
                 ("relationship", self.RELATION_RE),
                 ("structured", self.STRUCTURED_RE),
@@ -450,6 +458,7 @@ class IntentRouter:
                 reason="multiple intents: {}".format(",".join(matched_intents)),
             )
         for name, pattern, reason in (
+            ("file_search", self.FILE_SEARCH_RE, "问题要求查找、列出或筛选相关文件"),
             ("translation", self.TRANSLATION_RE, "问题明确要求原文、中文翻译或双语对照"),
             ("relationship", self.RELATION_RE, "问题要求分析人物、机构、事件或文件之间的联系"),
             ("structured", self.STRUCTURED_RE, "问题包含可验证的统计或聚合操作"),
@@ -458,7 +467,7 @@ class IntentRouter:
         ):
             if pattern.search(text):
                 return IntentDecision(name=name, confidence=0.98, reason=reason)
-        if is_follow_up and previous_intent in {"translation", "relationship", "structured", "summary", "retrieval", "analysis", "casual", "creative", "general_qa"}:
+        if is_follow_up and previous_intent in {"file_search", "translation", "relationship", "structured", "summary", "retrieval", "analysis", "casual", "creative", "general_qa"}:
             return IntentDecision(
                 name=str(previous_intent),
                 confidence=0.78,
@@ -605,7 +614,7 @@ class ChatTranslationProvider:
         user = "源语言：{}\n上下文：{}\n待翻译文本：\n{}".format(
             source_language or "自动识别", _clean_text(context, 300) or "无", text
         )
-        return _model_text(self.chat_model, system, user, max_tokens=1800)
+        return _model_text(self.chat_model, system, user, max_tokens=1800, interactive=False)
 
 
 @dataclass(frozen=True)
@@ -748,9 +757,25 @@ def _model_text(
     user_prompt: str,
     max_tokens: int = 1800,
     timeout: Optional[int] = None,
+    interactive: bool = True,
 ) -> str:
     if model is None:
         return ""
+    if interactive and getattr(Config, "LLM_BACKEND", "") == "vllm":
+        # The 32K input context is retained, while UI replies are bounded so
+        # a single RTX 3090 does not hit legacy 20-45 second Ollama deadlines.
+        max_tokens = min(
+            int(max_tokens),
+            int(getattr(Config, "VLLM_INTERACTIVE_MAX_TOKENS", 480)),
+        )
+        timeout = max(
+            int(timeout or 0),
+            int(getattr(Config, "VLLM_INTERACTIVE_TIMEOUT_SECONDS", 120)),
+        )
+        system_prompt = (
+            str(system_prompt or "")
+            + "\n效率规则：默认直接给出不超过 120 个汉字的单段答案；用户明确要求详细、步骤、清单或长文时才展开。用户要求“一句话”时严格只返回一句。不要复述问题，不要说明自己无法访问底层服务或建议查看外部文档。"
+        )
     if hasattr(model, "chat"):
         value = model.chat(
             system_prompt,
@@ -875,6 +900,7 @@ class ConversationEngine:
 
     INTENT_INSTRUCTIONS = {
         "retrieval": "直接回答用户问题，优先给出可核验事实。",
+        "file_search": "这是文件发现请求。只说明命中的文件和关键片段，不要把没有正文证据改写成证据不足的资料结论。",
         "relationship": "说明实体/文件之间的关系、方向、时间与依据；证据只能证明共现时，不得声称因果。",
         "summary": "概括当前会话范围的主要内容，并明确这只是命中证据的概览。",
         "analysis": "先回答，再分开列出资料依据与进一步分析；推断必须明确标为分析判断。",
@@ -890,7 +916,7 @@ class ConversationEngine:
         intent_router: Optional[IntentRouter] = None,
         follow_up_resolver: Optional[FollowUpResolver] = None,
         context_policy: Optional[ContextWindowPolicy] = None,
-        top_k: int = 8,
+        top_k: int = 16,
         coverage_threshold: float = 0.45,
         max_translation_citations: int = 4,
     ):
@@ -903,7 +929,7 @@ class ConversationEngine:
         self.intent_router = intent_router or IntentRouter()
         self.follow_up_resolver = follow_up_resolver or FollowUpResolver()
         self.context_policy = context_policy or ContextWindowPolicy()
-        self.top_k = max(1, min(20, int(top_k)))
+        self.top_k = max(1, min(50, int(top_k)))
         self.coverage_threshold = min(1.0, max(0.0, float(coverage_threshold)))
         self.max_translation_citations = max(1, min(10, int(max_translation_citations)))
 
@@ -976,6 +1002,11 @@ class ConversationEngine:
             turn = self._answer_general_qa(session, resolution, decision, effective_scope, context)
         elif decision.name == "structured":
             turn = self._answer_structured(session, resolution, decision, effective_scope, context, coverage)
+        elif decision.name == "file_search":
+            turn = self._answer_file_search(
+                session, resolution, decision, effective_scope, context, coverage,
+                retrieval_override=retrieval_override,
+            )
         elif decision.name == "multi_task":
             # Combination requests must use the same evidence/coverage path as
             # single-purpose requests.  The previous implementation attempted
@@ -1205,6 +1236,70 @@ class ConversationEngine:
             values = result.get("evidence") or result.get("items") or []
         return values if isinstance(values, (list, tuple)) else []
 
+    def _answer_file_search(
+        self,
+        session: ConversationSession,
+        resolution: FollowUpResolution,
+        decision: IntentDecision,
+        scope: ConversationScope,
+        context: str,
+        coverage_override: Optional[Mapping[str, Any]],
+        retrieval_override: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Return a concise file-discovery response without requiring a conclusion."""
+        file_query = re.sub(
+            r"^(?:请|帮我|麻烦|给我|可以)?\s*"
+            r"(?:搜索|查找|找一下|帮我找|找到|找出|列出|显示|搜索一下)\s*"
+            r"(?:有关|关于|包含|命中)?\s*",
+            "",
+            resolution.resolved_query,
+            flags=re.I,
+        )
+        file_query = re.sub(
+            r"(?:的)?(?:文件|资料|文档)(?:列表|清单)?[。！？!?]*$",
+            "",
+            file_query,
+            flags=re.I,
+        ).strip()
+        if file_query and file_query != resolution.resolved_query:
+            resolution = FollowUpResolution(
+                original_question=resolution.original_question,
+                resolved_query=file_query,
+                is_follow_up=resolution.is_follow_up,
+                antecedent=resolution.antecedent,
+            )
+        turn = self._answer_from_retrieval(
+            session,
+            resolution,
+            decision,
+            scope,
+            context,
+            coverage_override,
+            retrieval_override=retrieval_override,
+        )
+        paths = []
+        for citation in turn.get("citations") or []:
+            path = str(citation.get("source_path") or "").strip()
+            if path and path not in paths:
+                paths.append(path)
+        if paths:
+            turn["answer"] = (
+                "我先把相关文件找出来了，共 {} 个。你可以点“阅读”查看原文，"
+                "需要进一步梳理内容时，再把文件加入深度分析。"
+            ).format(len(paths))
+        else:
+            query = resolution.resolved_query or resolution.original_question
+            turn["answer"] = (
+                "我在当前数据包里暂时没有找到与“{}”匹配的文件。"
+                "可以换一个更短或更具体的关键词再试一次。"
+            ).format(_clean_text(query, 120))
+        turn["status"] = "answered"
+        turn["task_status"] = "fulfilled"
+        turn["evidence_status"] = "not_required"
+        turn["promotion_request"] = None
+        turn["file_search"] = True
+        return turn
+
     def _answer_from_retrieval(
         self,
         session: ConversationSession,
@@ -1229,6 +1324,27 @@ class ConversationEngine:
             retrieval,
             coverage_override,
         )
+        # Keep an auditable manifest of what actually entered this model turn.
+        # The UI can distinguish candidate files from evidence truly supplied to
+        # the model instead of presenting a precomputed package-wide chain as a
+        # complete answer.
+        selected_paths = []
+        selected_chars = 0
+        for item in citations:
+            path = str(item.get("source_path") or "").strip()
+            if path and path not in selected_paths:
+                selected_paths.append(path)
+            selected_chars += len(str(item.get("original_text") or ""))
+        input_manifest = {
+            "candidate_files": len(retrieval.get("candidate_paths") or retrieval.get("paths") or []),
+            "selected_files": len(selected_paths),
+            "selected_paths": selected_paths[:100],
+            "selected_evidence": len(citations),
+            "selected_characters": selected_chars,
+            "evidence_limit": self.context_policy.max_prompt_evidence,
+            "evidence_char_limit": self.context_policy.max_evidence_chars,
+            "deferred_files": list((retrieval.get("deferred_paths") or retrieval.get("promotion_candidates") or []))[:100],
+        }
         promotion = self._promotion(
             resolution.resolved_query, scope, coverage, len(citations), retrieval=retrieval
         )
@@ -1308,7 +1424,7 @@ class ConversationEngine:
 
         status = "partial" if promotion else "answered"
         evidence_status = "partial" if promotion else "supported"
-        return self._base_turn(
+        turn = self._base_turn(
             session, resolution, decision, scope, answer, citations,
             status=status,
             evidence_status=evidence_status,
@@ -1316,6 +1432,8 @@ class ConversationEngine:
             promotion=promotion,
             warnings=warnings,
         )
+        turn["input_manifest"] = input_manifest
+        return turn
 
     def _advisory_answer(self, question: str, context: str) -> Tuple[str, List[str]]:
         system = (
@@ -1426,12 +1544,17 @@ class ConversationEngine:
         instruction = self.INTENT_INSTRUCTIONS.get(intent, self.INTENT_INSTRUCTIONS["retrieval"])
         user_prompt = (
             "任务类型：{intent}\n任务要求：{instruction}\n会话上下文：\n{context}\n\n"
-            "当前问题：{query}\n\n编号证据（仅这些内容可作为事实依据）：\n{evidence}"
+            "当前问题：{query}\n\n本轮实际输入范围：{manifest}\n\n编号证据（仅这些内容可作为事实依据）：\n{evidence}"
         ).format(
             intent=intent,
             instruction=instruction,
             context=context or "无",
             query=query,
+            manifest=json.dumps({
+                "selected_files": len({str(item.get("source_path") or "") for item in citations}),
+                "selected_evidence": len(citations),
+                "note": "未列出的文件不得被假定为已分析",
+            }, ensure_ascii=False),
             evidence=json.dumps(evidence_payload, ensure_ascii=False, indent=2),
         )
         warnings: List[str] = []

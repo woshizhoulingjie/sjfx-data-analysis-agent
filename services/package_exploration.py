@@ -27,8 +27,8 @@ from services.unified_parser import (
 )
 
 
-PREVIEW_SCHEMA = "file-preview/1.3"
-CONTENT_MAP_SCHEMA = "package-content-map/2.1"
+PREVIEW_SCHEMA = "file-preview/1.4"
+CONTENT_MAP_SCHEMA = "package-content-map/3.0"
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
@@ -67,6 +67,187 @@ DOCUMENT_TYPES = {
     ".7z": "压缩包", ".png": "图片", ".jpg": "图片",
     ".jpeg": "图片", ".tif": "图片", ".tiff": "图片",
     ".bmp": "图片", ".webp": "图片",
+}
+
+# A large package needs a stable, explainable taxonomy before any model call.
+# These categories are deliberately coarse: they are navigation buckets and
+# research leads, not claims about the whole package.  The model may refine a
+# selected bucket later, but it must not be responsible for discovering every
+# category in a 100 GB input.
+CONTENT_CATEGORY_DEFINITIONS = (
+    {
+        "category_id": "security_risk",
+        "name": "安全风险与漏洞",
+        "description": "漏洞、攻击面、恶意行为、补丁和风险处置资料。",
+        "terms": (
+            "security", "vulnerability", "vulnerabilities", "cve", "cvss",
+            "cwe", "exploit", "attack", "malware", "threat", "incident",
+            "patch", "漏洞", "安全", "风险", "攻击", "恶意", "补丁",
+        ),
+        "extensions": (),
+        "document_types": (),
+        "priority": 100,
+        "research_value": "优先核对风险影响范围、受影响对象和修复优先级。",
+        "research_questions": (
+            "哪些风险有直接原文证据，影响范围是否被低估？",
+            "哪些漏洞、事件或补丁之间存在时间或对象上的关联？",
+        ),
+    },
+    {
+        "category_id": "operations_events",
+        "name": "运行日志与事件",
+        "description": "系统日志、审计记录、运行事件、异常和时间线资料。",
+        "terms": (
+            "log", "logs", "event", "events", "error", "warning", "audit",
+            "incident", "trace", "exception", "timestamp", "access", "日志",
+            "事件", "异常", "审计", "运行", "访问", "时间线",
+        ),
+        "extensions": (".log",),
+        "document_types": (),
+        "priority": 90,
+        "research_value": "适合还原事件时间线、异常模式和需要进一步核查的操作。",
+        "research_questions": (
+            "关键事件按时间如何演化，是否存在集中异常窗口？",
+            "哪些错误、访问或审计记录值得关联调查？",
+        ),
+    },
+    {
+        "category_id": "business_records",
+        "name": "业务与交易记录",
+        "description": "财务、订单、客户、合同履行和业务过程数据。",
+        "terms": (
+            "invoice", "payment", "finance", "budget", "transaction", "revenue",
+            "sales", "customer", "order", "account", "contract", "business",
+            "发票", "付款", "财务", "预算", "交易", "收入", "销售", "客户",
+            "订单", "账户", "合同", "业务",
+        ),
+        "extensions": (),
+        "document_types": ("合同",),
+        "priority": 80,
+        "research_value": "适合核对业务规模、交易关系、责任边界和异常记录。",
+        "research_questions": (
+            "数据中有哪些业务主体、交易链条或金额异常？",
+            "合同或业务记录能否支持明确的责任与履行结论？",
+        ),
+    },
+    {
+        "category_id": "people_organization",
+        "name": "人员与组织信息",
+        "description": "人员、联系人、组织、角色和通信关系资料。",
+        "terms": (
+            "employee", "personnel", "staff", "user", "contact", "author",
+            "sender", "recipient", "member", "department", "人员", "联系人",
+            "作者", "发件人", "收件人", "成员", "部门", "组织", "负责人",
+        ),
+        "extensions": (),
+        "document_types": ("信件", "邮件归档"),
+        "priority": 70,
+        "research_value": "适合梳理角色、组织边界和资料来源关系。",
+        "research_questions": (
+            "哪些人员或组织在多个文件中反复出现，承担什么角色？",
+            "通信、联系人或组织关系是否能形成可核验的事项链？",
+        ),
+    },
+    {
+        "category_id": "technical_project",
+        "name": "项目与技术资料",
+        "description": "项目说明、代码、接口、配置、部署和技术设计资料。",
+        "terms": (
+            "project", "readme", "api", "code", "deploy", "deployment", "config",
+            "architecture", "specification", "schema", "database", "service",
+            "项目", "技术", "接口", "代码", "部署", "配置", "架构", "数据库",
+            "服务", "方案",
+        ),
+        "extensions": (".py", ".js", ".ts", ".java", ".sql", ".yaml", ".yml", ".md"),
+        "document_types": (),
+        "priority": 60,
+        "research_value": "适合理解系统结构、数据流、依赖和实施风险。",
+        "research_questions": (
+            "系统或项目的核心组件、数据流和依赖关系是什么？",
+            "哪些配置、接口或实现细节可能形成安全或运行风险？",
+        ),
+    },
+    {
+        "category_id": "research_reports",
+        "name": "研究与报告",
+        "description": "研究报告、论文、实验、分析和结论性文字资料。",
+        "terms": (
+            "research", "paper", "abstract", "methodology", "experiment", "result",
+            "report", "analysis", "finding", "conclusion", "研究", "论文", "摘要",
+            "方法", "实验", "结果", "报告", "分析", "发现", "结论",
+        ),
+        "extensions": (),
+        "document_types": ("报告",),
+        "priority": 55,
+        "research_value": "适合核对报告结论、方法依据、数据局限和可复现实验。",
+        "research_questions": (
+            "报告的核心结论由哪些原文、数据或方法直接支撑？",
+            "不同报告之间有哪些一致、冲突或需要复核的判断？",
+        ),
+    },
+    {
+        "category_id": "policy_compliance",
+        "name": "法规制度与合规",
+        "description": "政策、制度、法规、标准、协议和合规要求资料。",
+        "terms": (
+            "policy", "regulation", "compliance", "legal", "agreement", "standard",
+            "law", "requirement", "governance", "制度", "法规", "合规", "法律",
+            "协议", "标准", "要求", "治理", "规定",
+        ),
+        "extensions": (),
+        "document_types": ("合同",),
+        "priority": 50,
+        "research_value": "适合核对适用规则、义务边界、例外条款和缺口。",
+        "research_questions": (
+            "哪些条款或制度要求能直接约束当前业务或项目？",
+            "资料中是否存在要求与实际执行之间的缺口？",
+        ),
+    },
+    {
+        "category_id": "structured_data",
+        "name": "结构化数据与指标",
+        "description": "表格、JSON、CSV、数据库导出和可统计记录。",
+        "terms": (
+            "record", "records", "row", "column", "field", "value", "metric",
+            "统计", "记录", "字段", "指标", "数据表",
+        ),
+        "extensions": (".csv", ".tsv", ".json", ".jsonl", ".xml", ".xlsx", ".xls", ".xlsm"),
+        "document_types": ("数据表", "结构化数据"),
+        "priority": 45,
+        "research_value": "适合先做数据质量、时间范围、指标分布和异常值核查。",
+        "research_questions": (
+            "记录覆盖哪些时间、主体和指标，是否存在缺失或异常分布？",
+            "哪些字段关系或统计结果值得进入后续深度分析？",
+        ),
+    },
+    {
+        "category_id": "media_scans",
+        "name": "图片与扫描资料",
+        "description": "图片、扫描件、OCR 候选和其他需要视觉解析的资料。",
+        "terms": ("image", "scan", "ocr", "photo", "picture", "图片", "扫描", "照片", "影像"),
+        "extensions": tuple(sorted(IMAGE_EXTENSIONS | {".pdf"})),
+        "document_types": ("图片",),
+        "priority": 30,
+        "research_value": "适合从扫描件、图表和影像资料中补充文字证据。",
+        "research_questions": (
+            "哪些扫描件或图表可能包含尚未进入文字索引的关键证据？",
+        ),
+    },
+    {
+        "category_id": "general_documents",
+        "name": "其他文档与资料",
+        "description": "暂未命中明确主题规则的可解析文档，保留待人工筛选。",
+        "terms": (),
+        "extensions": (),
+        "document_types": (),
+        "priority": 1,
+        "research_value": "适合按目录、文件名和代表性样本继续细分。",
+        "research_questions": ("哪些未分类资料可能补充其他主题的关键证据？",),
+    },
+)
+
+CONTENT_CATEGORY_BY_ID = {
+    item["category_id"]: item for item in CONTENT_CATEGORY_DEFINITIONS
 }
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}|[\u4e00-\u9fff]{2,10}")
@@ -336,10 +517,125 @@ def _document_type(path):
     return DOCUMENT_TYPES.get(extension, "其他文件")
 
 
+def _taxonomy_signal(value):
+    """Normalize a bounded metadata/content signal for deterministic matching."""
+    value = str(value or "").casefold()
+    # Keep CJK characters intact while making filenames and English phrases
+    # comparable without allowing punctuation to join unrelated words.
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", value).strip()
+
+
+def _taxonomy_term_hit(signal, term):
+    term_signal = _taxonomy_signal(term)
+    if not signal or not term_signal:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", term_signal):
+        return term_signal in signal
+    # English terms are matched on token boundaries.  This avoids classifying
+    # an arbitrary filename such as ``catalog.csv`` as an operations log just
+    # because it contains the substring ``log``.
+    return bool(re.search(
+        r"(?<![a-z0-9]){}(?![a-z0-9])".format(re.escape(term_signal)),
+        signal,
+    ))
+
+
+def classify_preview(preview):
+    """Classify one file into a stable primary content category.
+
+    The classifier is intentionally explainable and bounded.  It uses file
+    metadata, a small keyword list and (when available) the bounded preview
+    text.  It never treats an arbitrary JSON field name as a package topic.
+    """
+    preview = preview or {}
+    path = str(preview.get("path") or preview.get("name") or "")
+    name = str(preview.get("name") or PurePosixPath(path).name)
+    extension = str(preview.get("extension") or Path(name).suffix or "").casefold()
+    document_type = str(preview.get("document_type") or "")
+    keywords = [str(item) for item in (preview.get("keywords") or []) if item]
+    archive_members = [str(item) for item in (preview.get("archive_members") or []) if item]
+    body = str(preview.get("preview_text") or "")[:16000]
+    metadata_signal = _taxonomy_signal(" ".join((path, name, extension, document_type, *archive_members[:40])))
+    keyword_signal = _taxonomy_signal(" ".join(keywords[:40]))
+    body_signal = _taxonomy_signal(body)
+
+    ranked = []
+    for definition in CONTENT_CATEGORY_DEFINITIONS:
+        category_id = definition["category_id"]
+        score = 0.0
+        matched = []
+        for term in definition.get("terms") or ():
+            hit_metadata = _taxonomy_term_hit(metadata_signal, term)
+            hit_keywords = _taxonomy_term_hit(keyword_signal, term)
+            hit_body = _taxonomy_term_hit(body_signal, term)
+            if not (hit_metadata or hit_keywords or hit_body):
+                continue
+            # A term seen in extracted keywords is stronger than a path-only
+            # hint; a body hit remains useful but is deliberately lower weight
+            # because the body is only a sample in large-package mode.
+            term_score = (1.5 if hit_metadata else 0.0)
+            term_score += (2.5 if hit_keywords else 0.0)
+            term_score += (1.0 if hit_body else 0.0)
+            score += term_score
+            matched.append(str(term))
+        if extension in {str(item).casefold() for item in definition.get("extensions") or ()}:
+            score += 2.25
+            matched.append("扩展名:{}".format(extension))
+        if document_type and document_type in set(definition.get("document_types") or ()):
+            score += 2.0
+            matched.append("文档类型:{}".format(document_type))
+        if score:
+            ranked.append((score, int(definition.get("priority") or 0), category_id, matched))
+
+    if not ranked:
+        fallback = "general_documents"
+        if extension in {".csv", ".tsv", ".json", ".jsonl", ".xml", ".xlsx", ".xls", ".xlsm"}:
+            fallback = "structured_data"
+        ranked = [(0.5, CONTENT_CATEGORY_BY_ID[fallback].get("priority", 1), fallback, [])]
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    top_score, _priority, primary_id, primary_terms = ranked[0]
+    # Secondary labels are navigation hints only.  Keep them sparse so a file
+    # cannot inflate every category in the directory.
+    secondary = [
+        item[2] for item in ranked[1:]
+        if item[0] >= max(2.0, top_score * 0.52)
+        and item[2] != "general_documents"
+    ][:2]
+    category_ids = [primary_id] + [item for item in secondary if item != primary_id]
+    fallback_only = top_score <= 0.5
+    confidence = 0.55 if fallback_only else min(0.98, 0.42 + min(0.52, top_score / 20.0))
+    basis = ["path_and_filename", "document_type"]
+    if keywords:
+        basis.append("bounded_keywords")
+    if body.strip():
+        basis.append("bounded_content_sample")
+    return {
+        "primary_category_id": primary_id,
+        "category_ids": category_ids,
+        "matched_terms": list(dict.fromkeys(primary_terms))[:10],
+        "confidence": round(confidence, 4),
+        "score": round(float(top_score), 4),
+        "basis": basis,
+        "secondary_category_ids": secondary,
+    }
+
+
+def preview_matches_category(preview, category_id):
+    """Return whether a preview belongs to a category's primary bucket."""
+    classification = preview.get("content_classification") if isinstance(preview, dict) else None
+    if not isinstance(classification, dict):
+        classification = classify_preview(preview)
+    return str(classification.get("primary_category_id") or "") == str(category_id or "")
+
+
 def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
                  zip_member_limit=80, zip_member_bytes=8192,
-                 cancel_check=None, yield_check=None):
-    """Create a bounded preview plus an exact, streaming source digest."""
+                 cancel_check=None, yield_check=None, hash_source=True):
+    """Create a bounded preview; optionally avoid a full-source hash.
+
+    Large-directory mode uses metadata fingerprints during the map-building
+    pass. A full content hash is reserved for files promoted to deep analysis.
+    """
     root = Path(root).resolve()
     relative_path = str(file_node.get("path") or "").replace("\\", "/")
     path = (root / relative_path).resolve()
@@ -358,6 +654,15 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
     text = ""
     status = "previewed"
     source_sha256 = ""
+    source_hash_kind = "full" if hash_source else "metadata"
+    if not hash_source:
+        source_sha256 = hashlib.sha256(json.dumps({
+            "path": relative_path,
+            "size": size,
+            "modified_at_ns": int(file_node.get("modified_at_ns") or 0),
+            "inode": file_node.get("inode"),
+            "device": file_node.get("device"),
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
     if extension in OUT_OF_SCOPE_MEDIA_EXTENSIONS:
         status = "out_of_scope"
@@ -367,9 +672,10 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
         warning.append("敏感文件仅登记元数据，未读取正文。")
     elif budget is not None and budget.exhausted:
         try:
-            source_sha256 = _stream_source_sha256(
-                path, cancel_check=cancel_check, yield_check=yield_check
-            )
+            if hash_source:
+                source_sha256 = _stream_source_sha256(
+                    path, cancel_check=cancel_check, yield_check=yield_check
+                )
             status = "deferred"
             warning.append("本轮轻量读取预算已用尽，文件保留为后续可恢复任务。")
         except (OSError, RuntimeError) as exc:
@@ -377,9 +683,10 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
             warning.append("流式哈希失败：{}".format(str(exc)[:300]))
     else:
         try:
-            source_sha256 = _stream_source_sha256(
-                path, cancel_check=cancel_check, yield_check=yield_check
-            )
+            if hash_source:
+                source_sha256 = _stream_source_sha256(
+                    path, cancel_check=cancel_check, yield_check=yield_check
+                )
             if extension in OFFICE_EXTENSIONS or extension == ".zip":
                 text, member_names, sampled_bytes = _bounded_zip_members(
                     path, zip_member_limit, zip_member_bytes, budget=budget,
@@ -505,6 +812,16 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
     entities = _preview_entities(text)
     emails = sorted(set(EMAIL_RE.findall(text)))[:20]
     dates = sorted(set(DATE_RE.findall(text)))[:20]
+    keywords = _keywords("{} {}".format(path.stem, text))
+    content_classification = classify_preview({
+        "path": relative_path,
+        "name": path.name,
+        "extension": extension,
+        "document_type": _document_type(path),
+        "keywords": keywords,
+        "archive_members": member_names[:200],
+        "preview_text": text,
+    })
     return {
         "schema_version": PREVIEW_SCHEMA,
         "path": relative_path,
@@ -524,13 +841,19 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
         "sample_sha256": content_sample_sha256,
         "content_sample_sha256": content_sample_sha256,
         "source_sha256": source_sha256,
-        "hash_status": "out_of_scope" if status == "out_of_scope" else ("completed" if source_sha256 else (
-            "restricted" if status == "restricted" else "failed"
-        )),
+        "source_hash_kind": source_hash_kind,
+        "hash_status": "out_of_scope" if status == "out_of_scope" else (
+            "metadata_only" if not hash_source else ("completed" if source_sha256 else (
+                "restricted" if status == "restricted" else "failed"
+            ))
+        ),
         "preview_fingerprint": preview_fingerprint,
         "encoding": encoding,
         "language": language,
-        "keywords": _keywords("{} {}".format(path.stem, text)),
+        "keywords": keywords,
+        "content_classification": content_classification,
+        "primary_content_category": content_classification.get("primary_category_id"),
+        "content_category_ids": content_classification.get("category_ids") or [],
         "entities": {**entities, "email_addresses": emails},
         "dates": dates,
         "archive_members": member_names[:200],
@@ -612,7 +935,17 @@ def preview_as_document(preview):
         "structure": {"title": Path(path).stem, "headings": [], "page_count": None, "table_count": 0, "picture_count": 0},
         "text": text,
         "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        "coverage": dict(preview.get("coverage") or {}),
+        "coverage": {
+            **dict(preview.get("coverage") or {}),
+            "level": "preview",
+            "preview_only": True,
+            "formal_evidence_ready": False,
+            "deep_parse_complete": False,
+        },
+        # Preview snippets remain available for navigation and candidate search,
+        # but are explicitly marked as non-formal evidence.
+        "evidence_status": "preview_candidate",
+        "evidence_level": "preview",
         "evidence": evidence,
         "warnings": list(preview.get("warnings") or []),
         "classification": {
@@ -639,6 +972,10 @@ def preview_relation_features(preview):
     values.extend(("email", value, 4.0) for value in entities.get("email_addresses") or [])
     values.extend(("date", value, 1.5) for value in (preview.get("dates") or [])[:20])
     values.append(("document_type", preview.get("document_type"), 0.3))
+    classification = preview.get("content_classification") or classify_preview(preview)
+    primary_category = str(classification.get("primary_category_id") or "")
+    if primary_category:
+        values.append(("content_category", primary_category, 2.0))
     seen = set()
     for kind, value, weight in values:
         normalized = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
@@ -757,6 +1094,11 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
             "document_type": source.get("document_type"),
             "language": dict(source.get("language") or {}),
             "keywords": list(source.get("keywords") or [])[:20],
+            "name": source.get("name"),
+            "archive_members": list(source.get("archive_members") or [])[:40],
+            "content_classification": dict(
+                source.get("content_classification") or classify_preview(source)
+            ),
             "entities": {
                 key: list(values or [])[:20]
                 for key, values in (source.get("entities") or {}).items()
@@ -776,6 +1118,30 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
     language_frequency = Counter(str((item.get("language") or {}).get("code") or "unknown") for item in previews)
     extension_frequency = Counter(str(item.get("extension") or "[无扩展名]") for item in previews)
     topic_frequency = Counter(topic for item in previews for topic in item.get("keywords") or [])
+    category_buckets = {}
+    for definition in CONTENT_CATEGORY_DEFINITIONS:
+        category_buckets[definition["category_id"]] = {
+            "definition": definition,
+            "file_count": 0,
+            "total_bytes": 0,
+            "previewed_files": 0,
+            "matched_terms": Counter(),
+            "ranked": [],
+        }
+    for item in previews:
+        classification = item.get("content_classification") or classify_preview(item)
+        primary_id = str(classification.get("primary_category_id") or "general_documents")
+        bucket = category_buckets.setdefault(primary_id, {
+            "definition": CONTENT_CATEGORY_BY_ID.get(primary_id, CONTENT_CATEGORY_BY_ID["general_documents"]),
+            "file_count": 0, "total_bytes": 0, "previewed_files": 0,
+            "matched_terms": Counter(), "ranked": [],
+        })
+        bucket["file_count"] += 1
+        bucket["total_bytes"] += max(0, int(item.get("size") or 0))
+        if str(item.get("status") or "") == "previewed":
+            bucket["previewed_files"] += 1
+        for term in classification.get("matched_terms") or []:
+            bucket["matched_terms"][str(term)] += 1
     people_frequency = Counter(
         person
         for item in previews
@@ -836,6 +1202,20 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
             item, topic_frequency, type_frequency, language_frequency, duplicate_frequency,
         )
         scored.append((score, str(item.get("path")), item))
+        classification = item.get("content_classification") or classify_preview(item)
+        primary_category_id = str(
+            classification.get("primary_category_id") or "general_documents"
+        )
+        category_buckets.setdefault(primary_category_id, {
+            "definition": CONTENT_CATEGORY_BY_ID.get(
+                primary_category_id, CONTENT_CATEGORY_BY_ID["general_documents"]
+            ),
+            "file_count": 0,
+            "total_bytes": 0,
+            "previewed_files": 0,
+            "matched_terms": Counter(),
+            "ranked": [],
+        })["ranked"].append((score, path))
         value_score, components = _selection_scorecard(
             item, topic_frequency, type_frequency, language_frequency,
             extension_frequency, directory_frequency, duplicate_frequency,
@@ -859,6 +1239,9 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
             "light_index_status": "ready" if item.get("status") == "previewed" else str(item.get("status") or "unknown"),
             "language_code": str((item.get("language") or {}).get("code") or "unknown"),
             "ocr_candidate": str(item.get("extension") or "").lower() in IMAGE_EXTENSIONS | {".pdf"},
+            "content_category_id": primary_category_id,
+            "content_category_ids": list(classification.get("category_ids") or [primary_category_id])[:3],
+            "content_classification_confidence": float(classification.get("confidence") or 0.0),
         }
     scored.sort(key=lambda row: (-row[0], row[1]))
 
@@ -957,6 +1340,91 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
         if path_degree[str(item.get("path"))] == 0 and duplicate_frequency[str(item.get("sample_sha256") or "")] == 1
     )
 
+    content_categories = []
+    for category_id, bucket in category_buckets.items():
+        if not int(bucket.get("file_count") or 0):
+            continue
+        definition = bucket.get("definition") or CONTENT_CATEGORY_BY_ID["general_documents"]
+        ranked_paths = sorted(
+            bucket.get("ranked") or [],
+            key=lambda item: (-float(item[0]), str(item[1])),
+        )
+        representatives = [str(item[1]) for item in ranked_paths[:12] if str(item[1])]
+        file_count = int(bucket.get("file_count") or 0)
+        previewed_files = int(bucket.get("previewed_files") or 0)
+        content_categories.append({
+            "category_id": category_id,
+            "name": definition.get("name") or category_id,
+            "description": definition.get("description") or "",
+            "file_count": file_count,
+            "total_bytes": int(bucket.get("total_bytes") or 0),
+            "total_size_human": human_size(bucket.get("total_bytes") or 0),
+            "previewed_files": previewed_files,
+            "sampled_files": previewed_files,
+            "representative_paths": representatives,
+            # Only a bounded sample is returned. The complete membership is
+            # resolved from the durable inventory after the user selects it.
+            "member_paths": representatives,
+            "member_paths_lazy": True,
+            "paths_truncated": file_count > len(representatives),
+            "selection_filter": {
+                "kind": "content_category",
+                "category_id": category_id,
+                "match": "primary",
+                "terms": list(definition.get("terms") or [])[:24],
+            },
+            "matched_terms": [
+                term for term, _count in bucket["matched_terms"].most_common(10)
+            ],
+            "confidence": round(
+                min(0.98, 0.55 + 0.4 * (previewed_files / float(file_count or 1))),
+                4,
+            ),
+            "classification_basis": [
+                "path_and_filename", "document_type", "bounded_keywords",
+                "bounded_content_sample",
+            ],
+            "research_value": definition.get("research_value") or "",
+            "research_questions": list(definition.get("research_questions") or [])[:4],
+            "coverage": {
+                "inventory_files": file_count,
+                "classified_files": file_count,
+                "preview_analyzed_files": previewed_files,
+                "classification_ratio": 1.0,
+                "content_sample_ratio": round(previewed_files / float(file_count or 1), 6),
+                "membership_complete": True,
+                "members_materialized": False,
+                "verification_status": "metadata_and_rule_classified",
+            },
+            "analysis_level": "inventory_preview",
+            "verification_status": "candidate",
+            "formal": False,
+        })
+    content_categories.sort(
+        key=lambda item: (-int(item.get("file_count") or 0), item.get("category_id") or "")
+    )
+    research_directions = []
+    for category in content_categories[:8]:
+        definition = CONTENT_CATEGORY_BY_ID.get(category.get("category_id"), {})
+        research_directions.append({
+            "direction_id": "direction-{}".format(category.get("category_id")),
+            "title": category.get("name") or "待研究方向",
+            "description": category.get("research_value") or category.get("description") or "",
+            "basis": "内容分类覆盖 {} 个文件；分类来自全量元数据与有界样本规则。".format(category.get("file_count") or 0),
+            "category_id": category.get("category_id"),
+            "candidate_file_count": int(category.get("file_count") or 0),
+            "candidate_bytes": int(category.get("total_bytes") or 0),
+            "representative_paths": list(category.get("representative_paths") or [])[:6],
+            "questions": list(definition.get("research_questions") or [])[:4],
+            "status": "candidate",
+            "coverage": {
+                "inventory_files": int(category.get("file_count") or 0),
+                "preview_analyzed_files": int(category.get("previewed_files") or 0),
+                "deep_analyzed_files": 0,
+                "claim_status": "requires_selected_file_analysis",
+            },
+        })
+
     return {
         "schema_version": CONTENT_MAP_SCHEMA,
         "generated_at": _utc_now(),
@@ -971,6 +1439,16 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
         "languages": [{"code": key, "file_count": value} for key, value in language_frequency.most_common()],
         "directories": [{"path": key, "file_count": value} for key, value in directory_frequency.most_common(500)],
         "topics": [{"name": key, "file_count": value} for key, value in topic_frequency.most_common(200)],
+        "content_categories": content_categories,
+        "research_directions": research_directions,
+        "content_taxonomy": {
+            "schema_version": "content-taxonomy/1.0",
+            "classification": "one_primary_category_per_file_plus_bounded_secondary_hints",
+            "primary_category_count": len(content_categories),
+            "category_membership_is_lazy": True,
+            "content_sample_is_bounded": True,
+            "raw_keyword_topics_are_recall_only": True,
+        },
         "entities": {
             "people": [{"name": key, "file_count": value} for key, value in people_frequency.most_common(200)],
             "organizations": [
@@ -1015,6 +1493,12 @@ def build_content_map(previews, representative_limit=700, relation_limit=1200):
             "all_inventory_accounted": sum(statuses.values()) == len(previews),
             "relationship_status": "preview_inferred_requires_deep_validation",
             "duplicate_status": "exact_sha256_with_sample_candidates",
+            "classified_files": sum(int(item.get("file_count") or 0) for item in content_categories),
+            "classification_coverage": round(
+                sum(int(item.get("file_count") or 0) for item in content_categories)
+                / float(len(previews) or 1), 6
+            ),
+            "content_category_status": "full_inventory_rule_classification",
         },
     }
 

@@ -42,12 +42,23 @@ logs/
 # Local backups and working files
 work/
 .codex-backups/
+.codex*/
+*.codex-backup-*
+*.codex-pre-*
+*.pre-large-*
+*.predeploy-*
 wx/
 *.bak*
 *.pre_*
 *_old.txt
+*_tmp.py
 .gitignore.save
 .gitignore.save.*
+
+# Local smoke packages and copied benchmark artifacts. These are useful for
+# server-side verification but are neither source nor distributable fixtures.
+/benchmark-vllm-2.2.1/
+/benchmark-vllm-2.2.1-r1/
 
 # Editor and operating-system files
 .vscode/

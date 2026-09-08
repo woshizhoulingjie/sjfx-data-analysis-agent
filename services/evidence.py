@@ -44,6 +44,7 @@ RELATION_CANONICAL = {
 }
 NEGATIVE_RELATIONS = {"不支持", "无法支持", "不能支持", "尚未支持", "未支持", "阻止"}
 _EMBEDDING_PROVIDER = None
+_EMBEDDING_MODE = "lexical-fallback"
 _EMBEDDING_CACHE = {}
 _EMBEDDING_CACHE_LIMIT = 512
 
@@ -55,15 +56,16 @@ def _semantic_evidence_text(item):
     return str(item.get("translated_text") or item.get("text") or "")
 
 
-def set_embedding_provider(provider):
+def set_embedding_provider(provider, mode=None):
     """Install an optional batch provider returning one vector per text."""
-    global _EMBEDDING_PROVIDER
+    global _EMBEDDING_PROVIDER, _EMBEDDING_MODE
     _EMBEDDING_PROVIDER = provider
+    _EMBEDDING_MODE = str(mode or "semantic+lexical") if provider else "lexical-fallback"
     _EMBEDDING_CACHE.clear()
 
 
 def embedding_mode():
-    return "ollama-embedding" if _EMBEDDING_PROVIDER else "lexical-fallback"
+    return _EMBEDDING_MODE
 
 
 def _cosine(left, right):
@@ -273,7 +275,7 @@ def compact_evidence(item, max_chars=520):
 NAVIGATION_LABELS = {"title", "section_header", "heading"}
 WEAK_NAVIGATION_RE = re.compile(r"^(?:第?[一二三四五六七八九十\d]+[章节部分、.]?\s*)?.{1,80}[?？]$")
 FACTUAL_CUE_RE = re.compile(
-    r"(?:是|为|具有|通过|采用|支持|提供|实现|包括|导致|提升|降低|减少|增加|能够|可以|用于|依赖|需[要须]|应当|必须|表明|显示|发现|证明|说明|源于|结果|优势|特点|机制|原因|影响|风险|限制|缺陷|许可|安全|成本|性能)"
+    r"(?:是|为|具有|通过|采用|支持|提供|实现|包括|导致|提升|降低|减少|增加|能够|可以|用于|依赖|需[要须]|应当|必须|表明|显示|发现|证明|说明|源于|结果|优势|特点|机制|原因|影响|风险|限制|缺陷|许可|安全|成本|性能|最高|最低|第一|排名|达到|占比|合计|均值|平均|同比|环比|显著)"
 )
 
 
@@ -381,7 +383,7 @@ def _claim_match(item, topics, semantic_score=0.0, indirect_signals=None):
             "support_reason": "正文包含与问题对应的可核查信号：{}；需要结合上下文理解。".format("、".join(indirect[:4])),
             "matched_terms": [],
         }
-    if float(semantic_score or 0.0) >= 0.62:
+    if float(semantic_score or 0.0) >= 0.92:
         return {
             "supports_claim": True,
             "support_type": "语义证据",
@@ -402,6 +404,12 @@ def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexic
         payload["verification_contract"] = "claim-evidence/3.0"
         return payload
 
+    if bool(item.get("preview_only")) or str((item.get("coverage") or {}).get("level") or "").lower() == "preview":
+        return result({
+            "support_status": "insufficient",
+            "support_score": 0.0,
+            "support_reason": "轻量预览只能用于候选检索，不能作为正式证据",
+        })
     quality = evidence_quality(item)
     if not quality.get("eligible"):
         return result({
@@ -469,7 +477,7 @@ def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexic
             "support_reason": match.get("support_reason"),
             "support_relation": "indirect",
         })
-    if semantic >= 0.78:
+    if semantic >= 0.92:
         return result({
             "support_status": "partially_supported",
             "support_score": round(min(0.75, semantic), 3),
@@ -483,7 +491,10 @@ def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexic
     })
 
 
-def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=520):
+def select_evidence(
+    items, topics=None, max_items=48, per_source=4, max_chars=1800,
+    use_embeddings=True,
+):
     """Select diverse, topic-aligned evidence from a larger local corpus."""
     candidates = []
     seen = set()
@@ -495,6 +506,8 @@ def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=52
             indirect_signals.update(signals)
     for index, item in enumerate(items or []):
         if not isinstance(item, dict) or not item.get("text"):
+            continue
+        if bool(item.get("preview_only")) or str((item.get("coverage") or {}).get("level") or "").lower() == "preview":
             continue
         key = item.get("evidence_id") or (
             item.get("source_path"), item.get("page"), item.get("section"), item.get("text")
@@ -520,7 +533,7 @@ def select_evidence(items, topics=None, max_items=24, per_source=2, max_chars=52
 
     semantic_scores = {}
     relevance_mode = "lexical-fallback"
-    if _EMBEDDING_PROVIDER and terms and candidates:
+    if use_embeddings and _EMBEDDING_PROVIDER and terms and candidates:
         ordered = sorted(candidates, key=lambda value: (-value[0], value[1]))
         pool_size = min(256, len(ordered))
         pool = ordered[:pool_size]
@@ -866,3 +879,230 @@ def attach_claim_evidence(summary, items, fields=None, max_items=3):
         summary["evidence_claims"] = claims
 
     return summary
+
+
+def _claim_text(value):
+    if isinstance(value, dict):
+        return str(value.get("claim") or value.get("text") or value.get("statement") or "").strip()
+    return str(value or "").strip()
+
+
+def _evidence_locator(item):
+    parts = []
+    source = item.get("source_path") or item.get("file_id") or item.get("archive_member")
+    if source:
+        parts.append(str(source))
+    if item.get("page") is not None:
+        parts.append("第{}页".format(item.get("page")))
+    if item.get("section"):
+        parts.append("章节：{}".format(item.get("section")))
+    if item.get("paragraph_index") is not None:
+        parts.append("段落{}".format(int(item.get("paragraph_index")) + 1))
+    if item.get("char_start") is not None and item.get("char_end") is not None:
+        parts.append("字符{}-{}".format(item.get("char_start"), item.get("char_end")))
+    return " · ".join(parts) or "正文位置待解析"
+
+
+def _claim_supports(claim, evidence_items, max_items=3):
+    """Return only source excerpts that passed the shared claim verifier."""
+    candidates = []
+    for index, item in enumerate(evidence_items or []):
+        if not isinstance(item, dict) or not item.get("text"):
+            continue
+        if not validate_evidence_location(item)["valid"]:
+            continue
+        verification = verify_claim_evidence(claim, item)
+        status = verification.get("support_status")
+        if status not in {"supported", "partially_supported"}:
+            continue
+        # File-level claims keep named-object precision without changing the
+        # broader retrieval verifier used by legacy direction recommendations.
+        anchor_match = re.match(r"([\u4e00-\u9fff]{2,8})", claim)
+        if anchor_match:
+            anchor = anchor_match.group(1)[:2]
+            generic_anchors = {"本文", "该文", "研究", "结果", "通过", "本次", "整体", "文件", "数据", "内容"}
+            evidence_text = _semantic_evidence_text(item)
+            if anchor not in generic_anchors and anchor not in evidence_text and anchor not in str(item.get("section") or ""):
+                continue
+        quality = evidence_quality(item)
+        candidates.append((
+            float(verification.get("support_score") or 0),
+            float(quality.get("score") or 0),
+            -index,
+            item,
+            verification,
+        ))
+    candidates.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    output = []
+    seen = set()
+    for _score, _quality_score, _index, item, verification in candidates:
+        key = item.get("evidence_id") or (item.get("source_path"), item.get("page"), item.get("char_start"), item.get("text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        compact = compact_evidence(item, max_chars=520)
+        compact["locator"] = _evidence_locator(item)
+        compact["support_status"] = verification.get("support_status")
+        compact["support_score"] = verification.get("support_score", 0)
+        compact["support_reason"] = verification.get("support_reason") or "已通过原文一致性校验"
+        compact["support_relation"] = verification.get("support_relation") or ("direct" if verification.get("support_status") == "supported" else "indirect")
+        compact["supporting_quote"] = _supporting_quote(_semantic_evidence_text(item), _claim_terms([claim]), max_chars=280)
+        if item.get("translated_text"):
+            compact["supporting_quote_original"] = _supporting_quote(item.get("text"), set(), max_chars=280)
+        output.append(compact)
+        if len(output) >= max(1, max_items):
+            break
+    return output
+
+
+def build_file_claims(summary, evidence_items, max_claims=24, max_supports=3):
+    """Build a bounded file-level conclusion/argument contract from source-verified claims.
+
+    Model prose remains a candidate only. A formal claim is emitted when at least
+    one original evidence unit passes ``verify_claim_evidence``; other candidates
+    are exposed as review items so the UI never presents unsupported prose as fact.
+    """
+    source = summary if isinstance(summary, dict) else {}
+    evidence_items = [item for item in (evidence_items or []) if isinstance(item, dict)]
+    fields = (
+        ("conclusions", "conclusion", "文件结论"),
+        ("key_facts", "fact", "关键事实"),
+        ("arguments", "argument", "主要论点"),
+        ("methodology", "method", "方法依据"),
+    )
+    seen = set()
+    formal = []
+    arguments = []
+    review_items = []
+    considered = 0
+    for field, claim_type, label in fields:
+        values = source.get(field)
+        if not isinstance(values, list):
+            continue
+        for raw in values:
+            claim = _claim_text(raw)
+            normalized = re.sub(r"\s+", " ", claim).strip()
+            if not normalized:
+                continue
+            key = normalized.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            considered += 1
+            supports = _claim_supports(normalized, evidence_items, max_items=max_supports)
+            if not supports:
+                review_items.append({
+                    "type": claim_type,
+                    "label": label,
+                    "text": normalized,
+                    "status": "review",
+                    "reason": "未找到通过一致性校验的原文证明，不能作为正式文件结论。",
+                })
+                continue
+            best = max(supports, key=lambda item: float(item.get("support_score") or 0))
+            all_direct = any(item.get("support_status") == "supported" for item in supports)
+            support_level = "direct" if all_direct else "inferred"
+            support_label = "原文直接支持" if all_direct else "多条原文归纳，需复核"
+            record = {
+                "conclusion_id": "FILE-%03d" % (len(formal) + len(arguments) + 1),
+                "type": claim_type,
+                "label": label,
+                "text": normalized,
+                "status": "verified" if all_direct else "partially_verified",
+                "support_level": support_level,
+                "support_label": support_label,
+                "confidence": round(float(best.get("support_score") or 0), 3),
+                "supports": supports,
+            }
+            if claim_type in {"argument", "method"}:
+                arguments.append(record)
+            else:
+                formal.append(record)
+            if len(formal) + len(arguments) >= max(1, max_claims):
+                break
+        if len(formal) + len(arguments) >= max(1, max_claims):
+            break
+    limitations = []
+    for field in ("uncertainties", "limitations", "warnings"):
+        values = source.get(field)
+        if not isinstance(values, list):
+            continue
+        for raw in values:
+            text = _claim_text(raw)
+            if text and text not in {item.get("text") for item in limitations}:
+                limitations.append({"type": field, "text": text, "status": "review"})
+            if len(limitations) >= 12:
+                break
+    all_formal = formal + arguments
+    verified_count = sum(1 for item in all_formal if item.get("status") == "verified")
+    partial_count = sum(1 for item in all_formal if item.get("status") == "partially_verified")
+    quality_count = sum(1 for item in evidence_items if evidence_quality(item).get("eligible"))
+    quality = {
+        "claims_considered": considered,
+        "formal_claim_count": len(all_formal),
+        "verified_count": verified_count,
+        "partial_count": partial_count,
+        "unsupported_count": len(review_items),
+        "eligible_evidence_count": quality_count,
+        "coverage_ratio": round(len(all_formal) / considered, 3) if considered else 0.0,
+        "complete": bool(considered == 0 or not review_items),
+        "status": "verified" if all_formal and not review_items else ("partial" if all_formal else "insufficient"),
+    }
+    return {
+        "file_conclusions": formal,
+        "file_arguments": arguments,
+        "file_review_items": review_items,
+        "file_limitations": limitations,
+        "evidence_quality": quality,
+        "claim_contract": "file-claims/1.0",
+    }
+
+
+# Structured claim/evidence helpers used by deep analysis and conversation.
+def decompose_claim(claim):
+    """Split a compound statement into auditable atomic claims."""
+    text = " ".join(str(claim or "").split())
+    parts = [x.strip(" ，,；;。") for x in re.split(r"[。！？；;]|(?:，|,)(?=(?:主要原因|因为|由于|其中|同时))", text) if x.strip()]
+    result = []
+    for i, part in enumerate(parts):
+        result.append({"claim_id": "atomic-%03d" % (i + 1), "text": part, "numbers": sorted(_claim_numbers(part)), "relations": _relation_frames(part), "negated": bool(NEGATION_RE.search(part))})
+    return result or [{"claim_id": "atomic-001", "text": text, "numbers": sorted(_claim_numbers(text)), "relations": _relation_frames(text), "negated": bool(NEGATION_RE.search(text))}]
+
+def validate_evidence_location(item, source_text=None):
+    """Validate provenance fields before an evidence item can be formal."""
+    if not isinstance(item, dict): return {"valid": False, "errors": ["invalid_item"]}
+    errors=[]
+    if not item.get("source_path") and not item.get("file_id"): errors.append("missing_source")
+    if item.get("page") is not None and (not isinstance(item.get("page"), int) or item.get("page") < 1): errors.append("invalid_page")
+    for key in ("paragraph_index", "block_index", "char_start", "char_end", "row_index"):
+        if item.get(key) is not None:
+            try:
+                if int(item[key]) < 0: errors.append("invalid_%s" % key)
+            except (TypeError, ValueError): errors.append("invalid_%s" % key)
+    if item.get("char_start") is not None and item.get("char_end") is not None and int(item["char_end"]) < int(item["char_start"]): errors.append("reversed_char_range")
+    if source_text is not None and item.get("text"):
+        needle=" ".join(str(item["text"]).split())[:500]
+        hay=" ".join(str(source_text).split())
+        if needle and needle not in hay: errors.append("text_not_in_source")
+    return {"valid": not errors, "errors": errors}
+
+def build_evidence_graph(claim, evidence_items):
+    """Create a deterministic claim→evidence graph after verification."""
+    atoms=decompose_claim(claim); links=[]; conflicts=0; sources=set()
+    for atom in atoms:
+        matches=[]
+        for item in evidence_items or []:
+            if not isinstance(item, dict) or item.get("preview_only"): continue
+            check=validate_evidence_location(item)
+            if not check["valid"]: continue
+            verification=verify_claim_evidence(atom["text"], item)
+            status=verification.get("support_status")
+            if status in {"supported", "partially_supported", "contradicted"}:
+                relation="contradicts" if status == "contradicted" else ("direct_support" if status == "supported" else "context_support")
+                matches.append({"claim_id": atom["claim_id"], "evidence_id": item.get("evidence_id"), "relation": relation, "verification": verification})
+                if item.get("source_path"): sources.add(str(item["source_path"]))
+                if status == "contradicted": conflicts += 1
+        links.extend(matches)
+    supported=sum(1 for atom in atoms if any(x["claim_id"] == atom["claim_id"] and x["relation"] != "contradicts" for x in links))
+    status="supported" if supported == len(atoms) and not conflicts else ("partially_supported" if supported else "insufficient")
+    return {"schema_version":"evidence-graph/1.0", "claim_text":str(claim or ""), "atomic_claims":atoms, "evidence_links":links, "support_level":status, "independent_source_count":len(sources), "conflict_count":conflicts}

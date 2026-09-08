@@ -91,6 +91,21 @@ class HomogeneousDocumentAnalysisTests(unittest.TestCase):
         self.assertIn("目前付款正在审批", understanding["key_facts"])
         self.assertNotIn("回复期限", understanding["key_conclusions"])
 
+    def test_content_conclusions_include_original_support(self):
+        record = extract_record("letters/conclusion.txt", document(
+            "文件编号：甲函〔2026〕1号\n"
+            "发件单位：甲单位\n收件单位：乙单位\n主题：付款安排\n"
+            "请贵方在十个工作日内回复付款安排。\n目前付款正在审批。",
+            "conclusion.txt",
+        ))
+        conclusions = record["content_understanding"]["conclusions"]
+        self.assertTrue(conclusions)
+        action = next(item for item in conclusions if item["type"] == "动作")
+        self.assertEqual(action["support_level"], "direct")
+        self.assertIn("十个工作日", action["supports"][0]["text"])
+        self.assertGreaterEqual(action["supports"][0]["char_end"], action["supports"][0]["char_start"])
+        self.assertTrue(any(item["type"] == "事实" and "付款正在审批" in item["text"] for item in conclusions))
+
     def test_builds_reply_followup_and_case_timeline(self):
         result = analyze_homogeneous_documents(self.documents)
         self.assertTrue(result["eligible"])
@@ -153,6 +168,9 @@ class HomogeneousDocumentAnalysisTests(unittest.TestCase):
         self.assertIn('data-view="homogeneous"', template)
         self.assertIn("homogeneous: 'homogeneous'", shell)
         self.assertIn("/api/homogeneous-analysis/", client)
+        self.assertIn("文件结论", client)
+        self.assertIn("原文支撑", client)
+        self.assertIn("support_level", client)
 
 
     def test_shared_subject_different_matters_stays_candidate(self):
@@ -176,6 +194,66 @@ class HomogeneousDocumentAnalysisTests(unittest.TestCase):
         self.assertNotIn("甲函〔2026〕1号", result["records"][0]["references"])
         self.assertFalse(any(item["type"] == "missing_reference" for item in result["anomalies"]))
         self.assertFalse(any(item["type"] == "possible_unanswered" and item["path"] == "b.txt" for item in result["anomalies"]))
+
+    def test_email_headers_entities_and_evidence_are_normalized(self):
+        result = analyze_homogeneous_documents([
+            {"path": "mail/a.eml", "payload": document(
+                "Message-ID: <a@example.com>\n"
+                "From: Alice <alice@example.com>\n"
+                "To: Bob <bob@example.com>\n"
+                "Cc: Carol <carol@example.com>\n"
+                "Reply-To: reply@example.com\n"
+                "References: <old@example.com>\n"
+                "Subject: 足球资料\n"
+                "Date: 2026-03-01\n"
+                "事项编号：FB-100\n联系电话：13800138000\n发送IP：10.0.0.1",
+                "a.eml")},
+            {"path": "mail/b.eml", "payload": document(
+                "Message-ID: <b@example.com>\n"
+                "In-Reply-To: <a@example.com>\n"
+                "From: Bob <bob@example.com>\n"
+                "To: Alice <alice@example.com>\n"
+                "Subject: Re: 足球资料\n"
+                "Date: 2026-03-02\n"
+                "事项编号：FB-100",
+                "b.eml")},
+        ])
+        record = result["records"][0]
+        self.assertEqual(record["record_type"], "email")
+        self.assertEqual(record["fields"]["cc"], "Carol <carol@example.com>")
+        self.assertEqual(record["fields"]["reply_to"], "reply@example.com")
+        self.assertIn("13800138000", record["entity_keys"])
+        reply = next(item for item in result["relations"] if item["relation_type"] == "reply_to")
+        self.assertGreaterEqual(len(reply["evidence_refs"]), 2)
+        self.assertTrue(result["integrity"]["email_record_count"] == 2)
+
+    def test_unrelated_adjacent_correspondence_is_not_linked(self):
+        result = analyze_homogeneous_documents([
+            {"path": "a.txt", "payload": document(
+                "文件编号：甲函〔2026〕1号\n日期：2026年1月1日\n发件单位：甲\n收件单位：乙\n主题：采购设备\n请处理。",
+                "a.txt")},
+            {"path": "b.txt", "payload": document(
+                "文件编号：乙函〔2026〕2号\n日期：2026年6月1日\n发件单位：乙\n收件单位：甲\n主题：人员培训\n请处理。",
+                "b.txt")},
+        ])
+        self.assertFalse(any(item["relation_type"] == "correspondence_flow" for item in result["relations"]))
+
+    def test_mail_channel_runs_without_common_schema_and_aggregates_signals(self):
+        result = analyze_homogeneous_documents([
+            {"path": "mail/a.eml", "payload": document(
+                "Message-ID: <a@example.com>\nFrom: alice@example.com\nTo: bob@example.com\n"
+                "Subject: 设备采购\nDate: 2026-04-01\n联系电话：13800138000\n发送IP：10.0.0.1\n请确认采购安排。", "a.eml")},
+            {"path": "mail/b.eml", "payload": document(
+                "Message-ID: <b@example.com>\nIn-Reply-To: <a@example.com>\n"
+                "From: bob@example.com\nTo: alice@example.com\nSubject: Re: 设备采购\n"
+                "Date: 2026-04-02\n回复如下：已确认。", "b.eml")},
+        ])
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["structured_eligible"])
+        self.assertTrue(result["relation_eligible"])
+        self.assertGreaterEqual(result["metrics"]["unique_entity_count"], 4)
+        self.assertGreaterEqual(result["metrics"]["communication_pair_count"], 2)
+        self.assertTrue(any(item["relation_type"] == "reply_to" for item in result["relations"]))
 
     def test_custom_conflict_and_truncation_are_explicit(self):
         base = "文件编号：A1\n日期：2026-01-01\n发件单位：甲\n收件单位：乙\n主题：测试\n客户-编号：X\n客户编号：Y"

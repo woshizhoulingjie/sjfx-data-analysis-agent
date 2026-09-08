@@ -3,7 +3,7 @@
  * changes where the user sees those capabilities. */
 (function () {
   const routeNames = {
-    dashboard: ['工作台', '数据概览'], packages: ['数据包', '导入与任务'],
+    dashboard: ['工作台', '数据概览'], source: ['数据包', '选择资料来源'], packages: ['数据包', '导入与任务'],
     physical: ['原始目录', '物理资料树'], analysis: ['智能分析', '主题与证据'],
     homogeneous: ['同构文件关联', '台账与事项脉络'],
     chat: ['资料问答', '持续对话'], translation: ['全文翻译', '原文与中文'],
@@ -11,7 +11,7 @@
     exports: ['导出中心', '交接成果'], tasks: ['任务中心', '运行状态'],
     settings: ['系统设置', '本地运行环境']
   };
-  const viewFor = { dashboard: 'dashboard', packages: 'packages', physical: 'explore', analysis: 'explore', homogeneous: 'homogeneous', chat: 'chat', translation: 'translation', evidence: 'evidence', overview: 'overview', exports: 'exports', tasks: 'tasks', settings: 'settings' };
+  const viewFor = { dashboard: 'dashboard', source: 'source', packages: 'packages', physical: 'explore', analysis: 'explore', homogeneous: 'homogeneous', chat: 'chat', translation: 'translation', evidence: 'evidence', overview: 'overview', exports: 'exports', tasks: 'tasks', settings: 'settings' };
   let activeRoute = 'dashboard';
   let navigationRestoreTarget = null;
 
@@ -190,6 +190,8 @@
   }
 
   function activate(route) {
+    // Legacy links to the former evidence page now open the unified materials chat.
+    if (route === 'evidence') route = 'chat';
     route = routeNames[route] ? route : 'dashboard';
     const routeChanged = activeRoute !== route;
     activeRoute = route;
@@ -207,6 +209,18 @@
     if (route === 'tasks') window.SJFXTasks?.refresh();
     if (route === 'homogeneous') window.SJFXHomogeneous?.activate();
     window.SJFXEngineering?.activate(route);
+    if (route === 'packages') {
+      let focus = '';
+      try { focus = window.sessionStorage.getItem('sjfx-package-entry-focus-v1') || ''; } catch (_) {}
+      if (focus) {
+        try { window.sessionStorage.removeItem('sjfx-package-entry-focus-v1'); } catch (_) {}
+        window.setTimeout(() => {
+          const target = focus === 'new' ? $('newImportCard') : $('dataSourcePanel');
+          target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          if (focus === 'new') $('rootPath')?.focus();
+        }, 0);
+      }
+    }
     syncDashboard();
     // Route changes should reveal the new module from its beginning. A smooth
     // page-level scroll leaves the next view half-way down during navigation,
@@ -219,7 +233,12 @@
   function bind() {
     ensureTaskControls();
     document.querySelectorAll('[data-route]').forEach((el) => el.addEventListener('click', () => activate(el.dataset.route)));
-    document.querySelectorAll('[data-go-route]').forEach((el) => el.addEventListener('click', () => activate(el.dataset.goRoute)));
+    document.querySelectorAll('[data-go-route]').forEach((el) => el.addEventListener('click', () => {
+      if (el.dataset.entryFocus) {
+        try { window.sessionStorage.setItem('sjfx-package-entry-focus-v1', el.dataset.entryFocus); } catch (_) {}
+      }
+      activate(el.dataset.goRoute);
+    }));
     document.querySelectorAll('[data-forward]').forEach((el) => el.addEventListener('click', () => $(el.dataset.forward)?.click()));
     $('rootPath')?.addEventListener('input', syncDashboard);
     $('scanBtn')?.addEventListener('click', syncDashboard, true);
@@ -239,7 +258,18 @@
     window.addEventListener('resize', () => {
       if (!isCompactNavigation()) setNavigationOpen(false, false);
     }, { passive: true });
-    const resetToken = () => { window.sessionStorage.removeItem('sjfx_api_token'); window.location.reload(); };
+    const resetToken = () => {
+      const auth = window.SJFXAuth;
+      if (!auth || typeof auth.ensureToken !== 'function') {
+        window.sessionStorage.removeItem('sjfx_api_token');
+        window.location.reload();
+        return;
+      }
+      try {
+        auth.ensureToken({ force: true });
+        window.location.reload();
+      } catch (_) { /* cancelled: keep the page usable and do not issue anonymous requests */ }
+    };
     $('headerTokenBtn')?.addEventListener('click', resetToken);
     $('headerTokenBtnSecondary')?.addEventListener('click', resetToken);
     const stats = $('scanStats');

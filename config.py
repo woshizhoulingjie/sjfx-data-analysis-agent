@@ -158,7 +158,7 @@ def _local_model_url(raw):
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in {"http", "https"} or host not in {"127.0.0.1", "localhost", "::1"}:
         raise RuntimeError(
-            "物理断网部署只允许本机 Ollama 地址（127.0.0.1/localhost/::1），拒绝远程模型地址"
+            "物理断网部署只允许本机模型地址（127.0.0.1/localhost/::1），拒绝远程模型地址"
         )
     return value
 
@@ -185,19 +185,67 @@ class Config:
     PARSE_TEMP_STALE_SECONDS = max(
         60, int(os.getenv("PARSE_TEMP_STALE_SECONDS", "21600"))
     )
-    # The server already provides a local Ollama instance. Keep local mode as
-    # the default so an absent .env can never send document text to the internet.
+    # Select the local serving backend. vLLM is the default; Ollama remains
+    # available as an explicit compatibility option during migration.
+    LLM_BACKEND = os.getenv("LLM_BACKEND", "vllm").strip().lower()
+    if LLM_BACKEND not in {"vllm", "ollama"}:
+        raise RuntimeError("LLM_BACKEND 只能是 vllm 或 ollama")
+    ENABLE_VLLM = os.getenv("ENABLE_VLLM", "1").strip().lower() in {"1", "true", "yes", "on"}
+    VLLM_BASE_URL = _local_model_url(os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8001/v1"))
+    VLLM_MODEL = os.getenv("VLLM_MODEL", "qwen3.6:27b").strip()
+    VLLM_MODEL_PATH = os.getenv("VLLM_MODEL_PATH", str(BASE_DIR / "models" / "Qwen3.6-27B")).strip()
+    VLLM_API_KEY = os.getenv("VLLM_API_KEY", "").strip()
+    VLLM_REQUEST_TIMEOUT = max(60, int(os.getenv("VLLM_REQUEST_TIMEOUT", "600")))
+    # Keep single-GPU vLLM replies within a responsive output budget while
+    # preserving the configured 32K input context window.
+    VLLM_INTERACTIVE_MAX_TOKENS = max(128, min(800, int(os.getenv("VLLM_INTERACTIVE_MAX_TOKENS", "480"))))
+    VLLM_INTERACTIVE_TIMEOUT_SECONDS = max(60, min(300, int(os.getenv("VLLM_INTERACTIVE_TIMEOUT_SECONDS", "120"))))
+    # Analysis routes request JSON rather than prose. The legacy Ollama
+    # budgets (1,400--3,200 generated tokens) make a single 24 GiB GPU appear
+    # hung even when the backend is healthy, so ordinary structured work is
+    # constrained to a compact response contract. A caller can explicitly
+    # opt out for a real long-form task (for example, translation).
+    VLLM_STRUCTURED_MAX_TOKENS = max(
+        256, min(1200, int(os.getenv("VLLM_STRUCTURED_MAX_TOKENS", "640")))
+    )
+    VLLM_STRUCTURED_TIMEOUT_SECONDS = max(
+        90, min(600, int(os.getenv("VLLM_STRUCTURED_TIMEOUT_SECONDS", "180")))
+    )
+
+    # Embeddings run in a separate CPU vLLM process so the GPU generation
+    # server remains isolated. Retrieval must degrade quickly if it is down.
+    ENABLE_VLLM_EMBEDDINGS = os.getenv("ENABLE_VLLM_EMBEDDINGS", "1").strip().lower() in {"1", "true", "yes", "on"}
+    VLLM_EMBED_BASE_URL = _local_model_url(os.getenv("VLLM_EMBED_BASE_URL", "http://127.0.0.1:8002/v1"))
+    VLLM_EMBED_MODEL = os.getenv("VLLM_EMBED_MODEL", "multilingual-e5-small").strip()
+    VLLM_EMBED_TIMEOUT_SECONDS = max(2, min(60, int(os.getenv("VLLM_EMBED_TIMEOUT_SECONDS", "12"))))
+    VLLM_EMBED_MAX_BATCH_SIZE = max(1, min(64, int(os.getenv("VLLM_EMBED_MAX_BATCH_SIZE", "8"))))
+    VLLM_EMBED_MAX_CHARS = max(128, min(4000, int(os.getenv("VLLM_EMBED_MAX_CHARS", "1200"))))
+
+    # The server also provides a local Ollama instance for rollback. Keep its
+    # settings intact so LLM_BACKEND=ollama remains a safe fallback.
     ENABLE_SHARED_OLLAMA = os.getenv("ENABLE_SHARED_OLLAMA", "0").strip().lower() in {"1", "true", "yes"}
     OLLAMA_BASE_URL = _local_model_url(os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"))
     OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen-agent:latest")
     OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "qwen-embed:latest")
+    # Keep the embedding model on CPU so the vLLM generation model retains the GPU.
+    OLLAMA_EMBED_NUM_GPU = max(0, int(os.getenv("OLLAMA_EMBED_NUM_GPU", "0")))
     LLM_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1")))
     # The available Ollama service is shared by the laboratory. Do not send
     # long document prompts to it unless a dedicated scheduling decision was made.
     ENABLE_SHARED_OLLAMA_EMBEDDINGS = os.getenv("ENABLE_SHARED_OLLAMA_EMBEDDINGS", "0").strip().lower() in {"1", "true", "yes"}
     SHARED_OLLAMA_REQUEST_TIMEOUT = max(60, int(os.getenv("SHARED_OLLAMA_REQUEST_TIMEOUT", "600")))
     SHARED_OLLAMA_MAX_CHARS = max(4000, int(os.getenv("SHARED_OLLAMA_MAX_CHARS", "48000")))
-    LLM_CONTEXT_TOKENS = max(8192, int(os.getenv("LLM_CONTEXT_TOKENS", "65536")))
+    # Keep the prompt budget aligned with the serving engine.  This project's
+    # vLLM service is intentionally configured for a 32K context window on the
+    # single RTX 3090; using the old 64K Ollama default can overfill long
+    # document prompts before they reach the model.
+    _default_context_tokens = "32768" if LLM_BACKEND == "vllm" else "65536"
+    LLM_CONTEXT_TOKENS = max(
+        8192, int(os.getenv("LLM_CONTEXT_TOKENS", _default_context_tokens))
+    )
+    LLM_MODEL = VLLM_MODEL if LLM_BACKEND == "vllm" else OLLAMA_MODEL
+    LLM_BASE_URL = VLLM_BASE_URL if LLM_BACKEND == "vllm" else OLLAMA_BASE_URL
+    LLM_ENABLED = ENABLE_VLLM if LLM_BACKEND == "vllm" else ENABLE_SHARED_OLLAMA
     ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "1").strip().lower() in {"1", "true", "yes", "on"}
     # Translation is local-only by default. Set TRANSLATION_PROVIDER=ollama
     # explicitly to retain the legacy Ollama adapter.
@@ -252,7 +300,7 @@ class Config:
         1, min(8, int(os.getenv("TRANSLATION_PIPELINE_PARSE_MAX_CONCURRENCY", "1")))
     )
     ENABLE_IMPORT_TRANSLATION = os.getenv(
-        "ENABLE_IMPORT_TRANSLATION", "1"
+        "ENABLE_IMPORT_TRANSLATION", "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
     IMPORT_TRANSLATION_MAX_FILES = max(
         1, min(500, int(os.getenv("IMPORT_TRANSLATION_MAX_FILES", "30")))
@@ -335,7 +383,7 @@ class Config:
     _cpu_count = max(1, int(os.cpu_count() or multiprocessing.cpu_count() or 1))
     PARSE_MAX_CONCURRENCY = max(
         1,
-        min(8, int(os.getenv("PARSE_MAX_CONCURRENCY", "2"))),
+        min(8, int(os.getenv("PARSE_MAX_CONCURRENCY", "4"))),
     )
     PARSE_MAX_CONCURRENCY = min(PARSE_MAX_CONCURRENCY, max(1, _cpu_count - 2))
     ENABLE_PARSE_PROCESS_ISOLATION = os.getenv("ENABLE_PARSE_PROCESS_ISOLATION", "1").strip().lower() in {
@@ -346,6 +394,15 @@ class Config:
         DOCLING_DEVICE = "cpu"
     DOCLING_CPU_THREADS = max(1, min(64, int(os.getenv("DOCLING_CPU_THREADS", "4"))))
     MAX_DOCUMENT_CHUNKS = max(4, min(256, int(os.getenv("MAX_DOCUMENT_CHUNKS", "64"))))
+    # Candidate previews are intentionally bounded: one short model call per
+    # file and a batch deadline after which local parser output is sufficient
+    # to unlock the provisional directory.
+    CANDIDATE_PREVIEW_MAX_CHARS = max(2000, min(16000, int(os.getenv("CANDIDATE_PREVIEW_MAX_CHARS", "8000"))))
+    CANDIDATE_PREVIEW_BATCH_SIZE = max(1, min(8, int(os.getenv("CANDIDATE_PREVIEW_BATCH_SIZE", "4"))))
+    CANDIDATE_PREVIEW_BATCH_CHARS = max(2000, min(8000, int(os.getenv("CANDIDATE_PREVIEW_BATCH_CHARS", "3200"))))
+    CANDIDATE_PREVIEW_OUTPUT_TOKENS = max(160, min(360, int(os.getenv("CANDIDATE_PREVIEW_OUTPUT_TOKENS", "240"))))
+    CANDIDATE_PREVIEW_MAX_WAIT_SECONDS = max(60, min(3600, int(os.getenv("CANDIDATE_PREVIEW_MAX_WAIT_SECONDS", "900"))))
+    CANDIDATE_PREVIEW_TIMEOUT_SECONDS = max(15, min(180, int(os.getenv("CANDIDATE_PREVIEW_TIMEOUT_SECONDS", "60"))))
     # ZIP64 and streaming writes support a complete 10 GiB handoff without
     # loading the source package into memory.
     MAX_EXPORT_BYTES = content_byte_limit("MAX_EXPORT_BYTES")
@@ -376,6 +433,58 @@ class Config:
     SIDECAR_PAYLOAD_BYTES = int(os.getenv("SIDECAR_PAYLOAD_BYTES", str(256 * 1024)))
     LARGE_PACKAGE_THRESHOLD_BYTES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_BYTES", str(1024 * 1024 * 1024)))
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
+    # Packages at or above the normal large-package threshold use a separate
+    # directory-first workflow. It builds a complete map and bounded model
+    # cards, then waits for an explicit deep-analysis selection.
+    LARGE_PACKAGE_DIRECTORY_MODE = os.getenv(
+        "LARGE_PACKAGE_DIRECTORY_MODE", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    LARGE_PACKAGE_DIRECTORY_MODEL_FILE_LIMIT = max(
+        12, min(500, int(os.getenv("LARGE_PACKAGE_DIRECTORY_MODEL_FILE_LIMIT", "120")))
+    )
+    LARGE_PACKAGE_DIRECTORY_PREVIEW_BYTES_PER_FILE = max(
+        8192, min(256 * 1024, int(os.getenv("LARGE_PACKAGE_DIRECTORY_PREVIEW_BYTES_PER_FILE", str(64 * 1024))))
+    )
+    LARGE_PACKAGE_DIRECTORY_PREVIEW_TOTAL_BYTES = max(
+        LARGE_PACKAGE_DIRECTORY_PREVIEW_BYTES_PER_FILE,
+        int(os.getenv("LARGE_PACKAGE_DIRECTORY_PREVIEW_TOTAL_BYTES", str(8 * 1024 * 1024 * 1024))),
+    )
+    LARGE_PACKAGE_DIRECTORY_BATCH_FILES = max(
+        100, min(5000, int(os.getenv("LARGE_PACKAGE_DIRECTORY_BATCH_FILES", "1000")))
+    )
+    # Explicit selections are parsed in bounded, resumable slices. Keep these
+    # values in Config because API/status and the planner both expose them.
+    LARGE_PACKAGE_SELECTED_PARSE_MAX_FILES = max(
+        100,
+        min(10000, int(os.getenv("LARGE_PACKAGE_SELECTED_PARSE_MAX_FILES", "2000"))),
+    )
+    LARGE_PACKAGE_SELECTED_PARSE_MAX_BYTES = max(
+        256 * 1024 * 1024,
+        min(
+            TEN_GIB_BYTES,
+            int(os.getenv("LARGE_PACKAGE_SELECTED_PARSE_MAX_BYTES", str(4 * 1024 * 1024 * 1024))),
+        ),
+    )
+    LARGE_PACKAGE_SELECTED_MODEL_FILE_LIMIT = max(
+        12,
+        min(
+            500,
+            int(os.getenv(
+                "LARGE_PACKAGE_SELECTED_MODEL_FILE_LIMIT",
+                os.getenv("LARGE_PACKAGE_DIRECTORY_MODEL_FILE_LIMIT", "120"),
+            )),
+        ),
+    )
+    LARGE_PACKAGE_SELECTED_MODEL_MAX_BYTES = max(
+        64 * 1024 * 1024,
+        min(
+            TEN_GIB_BYTES,
+            int(os.getenv("LARGE_PACKAGE_SELECTED_MODEL_MAX_BYTES", str(1024 * 1024 * 1024))),
+        ),
+    )
+    LARGE_PACKAGE_SELECTED_BATCH_FILES = max(
+        50, min(500, int(os.getenv("LARGE_PACKAGE_SELECTED_BATCH_FILES", "250"))),
+    )
     LARGE_PACKAGE_INITIAL_PARSE_FILES = max(
         1, min(500, int(os.getenv("LARGE_PACKAGE_INITIAL_PARSE_FILES", "500")))
     )

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 
 from services.ollama import LocalModelError
-from services.evidence import select_evidence
+from services.evidence import build_file_claims, select_evidence
 from services.scanner import extract_text
 
 
@@ -292,9 +292,450 @@ def _local_merge(node_path, chunks, chunk_results, warnings):
     }, "\n".join(summaries + facts + conclusions), node_path)
 
 
+def _model_metadata(unified_document):
+    """Build compact metadata so models understand tables without raw-table overload."""
+    metadata = dict((unified_document or {}).get("structure", {}) or {})
+    profile = (unified_document or {}).get("data_profile") or {}
+    if profile:
+        columns = {}
+        for name, item in list((profile.get("columns") or {}).items())[:120]:
+            item = item or {}
+            column = {"inferred_type": item.get("inferred_type"), "missing_ratio": item.get("missing_ratio"), "unique_count": item.get("unique_count"), "sample_values": list(item.get("sample_values") or [])[:8]}
+            for key in ("min", "max", "sum", "mean", "median", "count", "outlier_count"):
+                if key in item:
+                    column[key] = item[key]
+            columns[str(name)] = column
+        metadata["data_profile"] = {"row_count": profile.get("row_count"), "column_count": profile.get("column_count"), "columns": columns, "numeric_columns": list(profile.get("numeric_columns") or [])[:120], "temporal_columns": list(profile.get("temporal_columns") or [])[:120], "coverage": profile.get("coverage") or {}, "limits": profile.get("limits") or {}}
+    return metadata
+
+
+
+
+def _preview_input(unified_document, max_chars=24000):
+    """Build a bounded, structure-aware model input for candidate analysis.
+
+    Candidate analysis intentionally does not read the entire document.  It
+    samples the title/structure, the beginning and end, and a few source
+    evidence blocks so the first directory is useful without paying the cost
+    of a deep, chunk-by-chunk analysis.
+    """
+    document = unified_document or {}
+    source = document.get("source") or {}
+    structure = document.get("structure") or {}
+    title = structure.get("title") or source.get("name") or ""
+    headings = [str(item).strip() for item in (structure.get("headings") or []) if str(item).strip()]
+    raw = " ".join(str(document.get("text") or "").split())
+    pieces = []
+    if title:
+        pieces.append("标题：{}".format(title))
+    if headings:
+        pieces.append("章节：{}".format("、".join(headings[:36])))
+    if raw:
+        head = raw[: max(1500, int(max_chars * 0.30))]
+        tail = raw[-max(1500, int(max_chars * 0.24)) :]
+        pieces.append("正文开头：{}".format(head))
+        if tail and tail != head:
+            pieces.append("正文结尾：{}".format(tail))
+    seen = set()
+    evidence_parts = []
+    for item in sorted(
+        [item for item in (document.get("evidence") or []) if str(item.get("text") or "").strip()],
+        key=lambda item: (int(item.get("page") or 0), int(item.get("char_start") or 0)),
+    ):
+        text = " ".join(str(item.get("text") or "").split())
+        key = text[:500].casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        locator = item.get("page") and "第 {} 页".format(item.get("page")) or item.get("section") or "正文片段"
+        evidence_parts.append("[{}] {}".format(locator, text[:1200]))
+        if len(evidence_parts) >= 8:
+            break
+    if evidence_parts:
+        pieces.append("代表性原文片段：\n{}".format("\n".join(evidence_parts)))
+    text = "\n\n".join(pieces)
+    return text[:max(2000, int(max_chars))]
+
+
+def _preview_claim_contract(summary, evidence_items):
+    """Expose preview claims in the same shape as deep claims, without
+    pretending that the sampled input has passed full source verification."""
+    source = summary if isinstance(summary, dict) else {}
+    evidence_items = [item for item in (evidence_items or []) if isinstance(item, dict)]
+    groups = (
+        ("conclusions", "conclusion", "文件结论"),
+        ("key_facts", "fact", "关键事实"),
+        ("arguments", "argument", "主要论点"),
+        ("methodology", "method", "方法依据"),
+    )
+    formal = []
+    arguments = []
+    seen = set()
+    for field, claim_type, label in groups:
+        for raw in source.get(field) or []:
+            text = raw.get("text") if isinstance(raw, dict) else str(raw or "")
+            text = " ".join(str(text).split()).strip()
+            if not text or text.casefold() in seen:
+                continue
+            seen.add(text.casefold())
+            supports = select_evidence(evidence_items, topics=[text], max_items=2, per_source=2, max_chars=360)
+            record = {
+                "conclusion_id": "PREVIEW-%03d" % (len(formal) + len(arguments) + 1),
+                "type": claim_type,
+                "label": label,
+                "statement": text,
+                "text": text,
+                "status": "candidate",
+                "support_status": "candidate",
+                "verification_status": "candidate",
+                "evidence_ids": [
+                    str(item.get("evidence_id") or "")
+                    for item in supports if item.get("evidence_id")
+                ],
+                "support_level": "preview",
+                "support_label": "初步支持（未完成全文校验）",
+                "support_score": None,
+                "support_score_type": "preview_estimate",
+                "supports": supports,
+                "preview_only": True,
+            }
+            (arguments if claim_type in {"argument", "method"} else formal).append(record)
+            if len(formal) + len(arguments) >= 18:
+                break
+        if len(formal) + len(arguments) >= 18:
+            break
+    return {
+        "file_conclusions": formal,
+        "file_arguments": arguments,
+        "file_review_items": [],
+        "file_limitations": [{"type": "preview", "text": "候选分析只使用代表性内容，深度摘要后需重新校验结论。", "status": "review"}],
+        "evidence_quality": {
+            "status": "preview",
+            "claims_considered": len(formal) + len(arguments),
+            "formal_claim_count": 0,
+            "preview_claim_count": len(formal) + len(arguments),
+            "complete": False,
+        },
+        "claim_contract": "file-claims/preview-1.0",
+    }
+
+
+def analyze_document_preview(llm, path, node_path, unified_document=None,
+                             max_chars=24000, context_window_tokens=32768,
+                             timeout_seconds=60):
+    """Run one bounded model call for candidate/import preview analysis."""
+    if unified_document is None:
+        raise ValueError("候选分析缺少统一文档内容")
+    selected_text = _preview_input(unified_document, max_chars=max_chars)
+    if not selected_text.strip():
+        raise ValueError("未能从该文件提取候选分析内容")
+    metadata = _model_metadata(unified_document)
+    prompt = """你正在进行文献候选集预读。输入只包含文件的结构和代表性片段，不是全文。
+请只根据给定内容生成与正式文件摘要相同类型的结果；不要把未提供的全文内容当成事实。
+候选结论必须标记为待深度校验，输出要简洁，不能写成长篇报告。
+
+文件：{path}
+解析元数据：{metadata}
+代表性内容：
+{text}
+
+输出 JSON：
+{{"title":"标题","structure_overview":{{"sections":["章节"],"document_type":"类型"}},"core_summary":"摘要","key_facts":["事实"],"arguments":["论点"],"methodology":["方法"],"conclusions":["候选结论"],"uncertainties":["不确定信息"],"warnings":["预览限制"],"recommended_research_direction":{{"title":"方向","rationale":"理由","questions":["问题"]}}}}
+""".format(path=node_path, metadata=json.dumps(metadata, ensure_ascii=False), text=selected_text)
+    result = llm.chat_json(
+        "你是严谨的文献预读助手。只根据代表性内容提炼候选摘要和论点，不得冒充全文校验结论。",
+        prompt,
+        max_tokens=600,
+        long_output=False,
+        strict=True,
+        retries=0,
+        timeout=max(15, int(timeout_seconds or 60)),
+        allow_short_timeout=True,
+        required_fields=("core_summary",),
+        output_context="候选文件预读分析",
+    )
+    summary = _normalise_summary_topics(result["json"], selected_text, node_path)
+    summary["summary"] = summary.get("summary") or summary.get("core_summary") or ""
+    summary["evidence_chain"] = select_evidence(
+        unified_document.get("evidence", []),
+        topics=summary.get("topics") or summary.get("structure_overview", {}).get("sections", []),
+        max_items=3,
+        per_source=3,
+        max_chars=360,
+    )
+    summary.update(_preview_claim_contract(summary, unified_document.get("evidence", [])))
+    summary.update({
+        "schema_version": 4,
+        "summary_type": "file",
+        "node_path": node_path,
+        "generated_by": "model-preview-analysis",
+        "analysis_depth": "preview_document",
+        "analysis_level": "preview",
+        "verification_status": "candidate",
+        "deep_analysis": False,
+        "preview_only": True,
+        "preview_input_chars": len(selected_text),
+        "preview_source_chars": len(str(unified_document.get("text") or "")),
+        "preview_coverage": {"mode": "selective", "selected_chars": len(selected_text), "complete": False},
+        "parser_info": {
+            "parser": (unified_document.get("parser") or {}).get("name", "本地解析"),
+            "coverage": unified_document.get("coverage") or {},
+            "local_model": result.get("model"),
+            "usage": result.get("usage") or {},
+            "model_calls": [_model_call_profile("candidate_preview", result, 640, context_window_tokens, 1)],
+            "degraded": False,
+        },
+        "generated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+    })
+    return summary, result
+
+
+
+def analyze_document_previews_batch(llm, documents, max_chars=8000,
+                                    context_window_tokens=32768,
+                                    timeout_seconds=90,
+                                    output_tokens_per_file=240):
+    """Analyze a small candidate batch with one bounded model request.
+
+    The batch contract keeps each file independently addressable while removing
+    one 27B generation queue wait per file. Missing/invalid entries are left to
+    the caller's local fallback path.
+    """
+    rows = []
+    for item in documents or []:
+        path = str((item or {}).get("path") or "").strip()
+        document = (item or {}).get("document") or {}
+        if not path:
+            continue
+        selected = _preview_input(document, max_chars=max_chars)
+        if selected.strip():
+            rows.append({"path": path, "input": selected})
+    if not rows:
+        raise ValueError("未能从候选文件提取预览内容")
+    prompt_rows = "\n\n".join(
+        "文件 %d：%s\n代表性内容：\n%s" % (index, row["path"], row["input"])
+        for index, row in enumerate(rows, 1)
+    )
+    prompt = """你正在进行文献候选集预读。下面包含多个文件的结构和代表性片段，
+不是全文。请严格依据每个文件自己的内容分别输出简洁候选摘要，不要把文件之间的内容混合，
+也不要把候选结论写成全文校验结论。所有 title、core_summary、topics、key_facts、arguments、
+methodology、conclusions、uncertainties、warnings 必须使用简体中文；专业术语可在中文后保留英文缩写。
+
+%s
+
+只输出 JSON：{"documents":[{"path":"原文件路径","title":"标题","core_summary":"摘要",
+"topics":["主题"],"key_facts":["事实"],"arguments":["论点"],"methodology":["方法"],
+"conclusions":["候选结论"],"uncertainties":["不确定信息"],"warnings":["预览限制"]}]}""" % prompt_rows
+    per_file_tokens = max(160, min(360, int(output_tokens_per_file or 240)))
+    result = llm.chat_json(
+        "你是严谨的文献预读助手。一次处理多个文件，每个文件独立返回结果。",
+        prompt,
+        max_tokens=max(per_file_tokens, min(1600, per_file_tokens * len(rows))),
+        # A multi-file object needs its per-file output budget; the ordinary
+        # structured cap is sized for one compact object and caused truncation.
+        long_output=True,
+        strict=True,
+        retries=0,
+        timeout=max(20, int(timeout_seconds or 90)),
+        allow_short_timeout=True,
+        required_fields=("documents",),
+        output_context="候选文件批量预读分析",
+    )
+    payload = result.get("json") or {}
+    values = payload.get("documents") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        raise ValueError("候选批量预读返回格式无效")
+    by_path = {str(item.get("path") or ""): item for item in values if isinstance(item, dict)}
+    output = {}
+    for row in rows:
+        path = row["path"]
+        raw = dict(by_path.get(path) or {})
+        # Models sometimes omit the path or normalize it; use positional fallback
+        # only when there is no collision with another returned path.
+        if not raw:
+            index = rows.index(row)
+            if index < len(values) and isinstance(values[index], dict):
+                raw = dict(values[index])
+        summary = _normalise_summary_topics(raw, row["input"], path)
+        summary["summary"] = summary.get("summary") or summary.get("core_summary") or ""
+        summary["path"] = path
+        summary["evidence_chain"] = select_evidence(
+            (documents[rows.index(row)].get("document") or {}).get("evidence") or [],
+            topics=summary.get("topics") or [], max_items=3, per_source=3,
+            max_chars=360,
+        )
+        summary.update(_preview_claim_contract(
+            summary, (documents[rows.index(row)].get("document") or {}).get("evidence") or []
+        ))
+        summary.update({
+            "schema_version": 4,
+            "summary_type": "file",
+            "node_path": path,
+            "generated_by": "model-preview-batch-analysis",
+            "analysis_depth": "preview_document",
+            "analysis_level": "preview",
+            "verification_status": "candidate",
+            "deep_analysis": False,
+            "preview_only": True,
+            "preview_input_chars": len(row["input"]),
+            "preview_coverage": {"mode": "selective", "selected_chars": len(row["input"]), "complete": False},
+            "parser_info": {"model": result.get("model"), "usage": result.get("usage") or {}, "batch_size": len(rows)},
+            "generated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        })
+        output[path] = {"summary": summary, "usage": result.get("usage") or {},
+                        "model": result.get("model")}
+    return output, result
+
+
+def _structured_record_input(unified_document, max_chars=52000):
+    """Build a bounded, source-addressable prompt for structured data."""
+    document = unified_document or {}
+    parser = document.get("parser") or {}
+    structure = document.get("structure") or {}
+    profile = document.get("data_profile") or {}
+    evidence = [
+        item for item in (document.get("evidence") or [])
+        if isinstance(item, dict) and str(item.get("text") or "").strip()
+    ]
+    preferred = [
+        item for item in evidence
+        if "CVSS：" in str(item.get("text") or "")
+        or "漏洞类型：" in str(item.get("text") or "")
+    ]
+    selected = []
+    seen = set()
+
+    def add(item):
+        key = str(item.get("evidence_id") or item.get("text") or "")
+        if key and key not in seen:
+            seen.add(key)
+            selected.append(item)
+
+    for item in preferred[:36]:
+        add(item)
+    remaining = max(12, min(96, len(evidence)))
+    if evidence:
+        positions = sorted(set(
+            round(index * (len(evidence) - 1) / float(max(1, remaining - 1)))
+            for index in range(remaining)
+        ))
+        for index in positions:
+            add(evidence[index])
+
+    rows = []
+    for item in selected:
+        rows.append({
+            "evidence_id": item.get("evidence_id"),
+            "source_path": item.get("source_path"),
+            "section": item.get("section") or "JSON记录",
+            "record_id": item.get("record_id"),
+            "text": " ".join(str(item.get("text") or "").split())[:620],
+        })
+    metadata = {
+        "parser": parser,
+        "structure": structure,
+        "data_profile": profile,
+        "record_count": parser.get("record_count") or len(evidence),
+        "evidence_record_count": len(evidence),
+        "sampled_record_count": len(rows),
+        "source_coverage": (document.get("coverage") or {}).get(
+            "structured_records_complete", True
+        ),
+    }
+    payload = "解析元数据：{}\n记录级原文证据：{}".format(
+        json.dumps(metadata, ensure_ascii=False),
+        json.dumps(rows, ensure_ascii=False),
+    )
+    # Structured files can contain millions of records. Keep model input bounded
+    # while retaining complete record counts and coverage metadata for claims.
+
+    input_limit = min(24000, max(12000, int(max_chars or 12000)))
+    return payload[:input_limit], rows, metadata
+
+def _analyze_structured_document(llm, node_path, unified_document,
+                                 context_window_tokens):
+    """Analyze structured JSON/JSONL without prose chunk explosion."""
+    selected_text, evidence_rows, metadata = _structured_record_input(
+        unified_document
+    )
+    if not evidence_rows:
+        raise ValueError("结构化文件未生成可回查的记录级证据")
+    prompt = """请分析结构化数据文件“{path}”。解析器已对源文件进行完整记录遍历，
+下面的 evidence_id 对应源文件中的记录级原文。请只根据给定记录和解析元数据作答，
+不要把抽样记录写成文件的全部记录，不要引入外部事实。
+
+{content}
+
+输出 JSON：
+{{"title":"数据集标题","structure_overview":{{"sections":["字段或内容类型"],"document_type":"结构化漏洞数据"}},
+"core_summary":"说明数据集记录的实际主题、覆盖范围和主要风险类型",
+"key_facts":["可由记录直接核验的事实"],"arguments":["基于多条记录的归纳"],
+"methodology":["数据中体现的分类或统计口径"],"conclusions":["谨慎的文件级结论"],
+"uncertainties":["记录或覆盖范围的限制"],"warnings":["需要复核的限制"],
+"recommended_research_direction":{{"title":"方向","rationale":"理由","questions":["问题"]}}}}
+
+要求：最多输出 8 条事实、6 条结论；每条结论尽量包含可核验的产品、漏洞类型、CVE 或统计信息；
+不要声称没有提供的数据；不要把 evidence_id 写入正文列表。""".format(
+        path=node_path,
+        content=selected_text,
+    )
+    result = llm.chat_json(
+        "你是严谨的结构化漏洞数据分析助手，必须区分记录事实与跨记录归纳。",
+        prompt,
+        max_tokens=3200,
+        long_output=True,
+        strict=True,
+        retries=1,
+        timeout=180,
+        required_fields=("core_summary",),
+        output_context="结构化文件深度分析",
+    )
+    summary = _normalise_summary_topics(
+        result["json"], selected_text, node_path
+    )
+    evidence_items = (unified_document or {}).get("evidence", [])
+    summary["evidence_chain"] = select_evidence(
+        evidence_items,
+        topics=(summary.get("topics") or [])
+        + list(summary.get("conclusions") or [])[:4],
+        max_items=12,
+        per_source=12,
+        max_chars=520,
+    )
+    coverage = {
+        "parser": "structured-json",
+        "extracted_chars": len(str((unified_document or {}).get("text") or "")),
+        "document_chunks": 1,
+        "successfully_analyzed_chunks": 1,
+        "failed_chunks": [],
+        "local_limit_truncated": False,
+        "structured_record_count": metadata.get("record_count") or 0,
+        "structured_evidence_record_count": metadata.get("evidence_record_count") or 0,
+        "structured_sampled_record_count": metadata.get("sampled_record_count") or 0,
+        "structured_records_complete": bool(metadata.get("source_coverage")),
+        "metadata": metadata,
+        "warnings": list((unified_document or {}).get("warnings", [])),
+        "model_calls": [_model_call_profile(
+            "structured_record_analysis", result, 3200,
+            context_window_tokens, 1,
+        )],
+    }
+    _attach_call_statistics(coverage)
+    return summary, coverage, result
+
 def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
                      unified_document=None, preferred_chunk_chars=42000,
                      context_window_tokens=65536):
+    parser_name = str((unified_document or {}).get("parser", {}).get("name") or "").lower()
+    structured_evidence = any(
+        isinstance(item, dict) and item.get("label") == "json_record"
+        for item in (unified_document or {}).get("evidence") or []
+    )
+    structured_path = str(path or node_path or "").lower().endswith((".json", ".jsonl"))
+    if unified_document and (parser_name == "structured-json" or (structured_path and structured_evidence)) :
+        return _analyze_structured_document(
+            llm, node_path, unified_document, context_window_tokens
+        )
     if unified_document:
         raw_text = unified_document.get("text", "")
         unified_coverage = dict(unified_document.get("coverage", {}))
@@ -306,7 +747,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             "text": raw_text[:max_chars],
             "parser": unified_document.get("parser", {}).get("name", "Docling"),
             "warnings": warnings,
-            "metadata": dict(unified_document.get("structure", {}), coverage=unified_coverage),
+            "metadata": dict(_model_metadata(unified_document), coverage=unified_coverage),
             "char_count": min(len(raw_text), max_chars),
             "truncated": truncated,
         }
@@ -353,6 +794,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             "你是严谨的全文文献分析助手，需要覆盖研究问题、方法、主要论点、结论和局限。",
             prompt,
             max_tokens=3200,
+            long_output=True,
             strict=True,
             retries=1,
             timeout=150,
@@ -376,6 +818,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
                 per_source=12,
                 max_chars=520,
             )
+        summary.update(build_file_claims(summary, (unified_document or {}).get("evidence", [])))
         return summary, coverage, result
 
     def analyze_chunk(chunk):
@@ -388,6 +831,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             "你正在进行全文分块阅读。不要猜测其他块内容，只提取当前块的事实和论证。",
             prompt,
             max_tokens=1800,
+            long_output=True,
             strict=True,
             retries=1,
             timeout=150,
@@ -439,6 +883,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             "你是全文文献综合分析助手。必须综合所有分块，区分作者结论、事实和局限。",
             merge_prompt,
             max_tokens=3200,
+            long_output=True,
             strict=True,
             retries=1,
             timeout=180,
@@ -469,4 +914,5 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             per_source=12,
             max_chars=520,
         )
+    summary.update(build_file_claims(summary, (unified_document or {}).get("evidence", [])))
     return summary, coverage, final_result

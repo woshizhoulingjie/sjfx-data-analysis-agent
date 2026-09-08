@@ -911,13 +911,22 @@ class UnifiedDocumentParser:
                 self._add_fallback_evidence(base)
             return base
 
-        if mode == "fast":
+        if ext in {".json", ".jsonl"}:
+            # JSON and JSONL use the record projection in every parse mode.
+            # Accurate model analysis consumes the same source-addressable
+            # records instead of falling back to a truncated text dump.
+            self._structured_json_projection(parse_path, base)
+            if not base.get("text"):
+                self._fallback(parse_path, base, ocr_empty_pdf=False)
+            base["parser"]["requested_mode"] = requested_mode
+            base["parser"]["mode"] = mode
+        elif mode == "fast":
             self._fast_parse(parse_path, base)
             base["parser"]["mode"] = "fast"
         # Plain text formats do not benefit from layout models; they are still
         # normalised into the exact same schema and evidence representation.
         docling_formats = {".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".html", ".htm", ".md", ".csv"}
-        if mode != "fast" and ext in docling_formats and self.docling_available:
+        if ext not in {".json", ".jsonl"} and mode != "fast" and ext in docling_formats and self.docling_available:
             try:
                 with self._lock:
                     result = self._get_converter().convert(str(parse_path))
@@ -941,7 +950,7 @@ class UnifiedDocumentParser:
             except Exception as exc:
                 base["warnings"].append("Docling 解析失败，已切换本地兼容解析器：{}".format(exc))
                 self._fallback(parse_path, base)
-        elif mode != "fast":
+        elif mode != "fast" and ext not in {".json", ".jsonl"}:
             if ext in docling_formats and not self.docling_available:
                 base["warnings"].append("Docling 未安装，已切换本地兼容解析器。")
             self._fallback(parse_path, base)
@@ -1495,6 +1504,204 @@ class UnifiedDocumentParser:
             base["parser"]["degraded"] = True
             base["warnings"].append("压缩包中没有找到可解析的文本/办公文档成员。")
 
+    def _structured_json_projection(self, path, base):
+        """Build bounded, record-level evidence for JSON data packages."""
+        ext = Path(path).suffix.lower()
+        records = []
+        parse_errors = 0
+        non_object_records = 0
+        try:
+            if ext == ".jsonl":
+                with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        if line.strip():
+                            try:
+                                value = json.loads(line)
+                            except json.JSONDecodeError:
+                                parse_errors += 1
+                                continue
+                            records.append(value)
+            else:
+                with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+                    value = json.load(handle)
+                if isinstance(value, list):
+                    records = value
+                elif isinstance(value, dict):
+                    list_values = [item for item in value.values() if isinstance(item, list)]
+                    records = max(list_values, key=len) if list_values else [value]
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if not records:
+            return
+
+        def text_value(value, limit=360):
+            if isinstance(value, str):
+                return _short_text(value, limit)
+            if value is None or isinstance(value, (bool, int, float)):
+                return str(value) if value is not None else ""
+            return _short_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")), limit)
+
+        def first_description(record):
+            values = record.get("descriptions") or record.get("description") or []
+            if isinstance(values, str):
+                return text_value(values, 620)
+            if isinstance(values, dict):
+                values = [values]
+            for item in values:
+                if isinstance(item, dict) and str(item.get("lang") or "").lower() in {"en", "zh", "zh-cn"}:
+                    value = text_value(item.get("value"), 620)
+                    if value:
+                        return value
+            for item in values:
+                if isinstance(item, dict):
+                    value = text_value(item.get("value"), 620)
+                    if value:
+                        return value
+            return ""
+
+        def affected_text(record):
+            chunks = []
+            for affected in record.get("affected") or []:
+                if not isinstance(affected, dict):
+                    continue
+                for item in affected.get("affectedData") or affected.get("products") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    vendor = text_value(item.get("vendor"), 90)
+                    product = text_value(item.get("product"), 120)
+                    versions = []
+                    for version in item.get("versions") or []:
+                        if isinstance(version, dict):
+                            value = text_value(version.get("version"), 80)
+                            status = text_value(version.get("status"), 40)
+                            if value:
+                                versions.append(value + ("/" + status if status else ""))
+                    label = " ".join(value for value in (vendor, product) if value)
+                    if versions:
+                        label += " [" + ", ".join(versions[:5]) + "]"
+                    if label:
+                        chunks.append(label)
+            return _short_text("；".join(chunks), 420)
+
+        def weakness_text(record):
+            chunks = []
+            for weakness in record.get("weaknesses") or []:
+                if not isinstance(weakness, dict):
+                    continue
+                for item in weakness.get("description") or []:
+                    if isinstance(item, dict) and item.get("value"):
+                        chunks.append(text_value(item.get("value"), 90))
+            return _short_text("、".join(dict.fromkeys(chunks)), 180)
+
+        def cvss_text(record):
+            metrics = record.get("metrics") or {}
+            if not isinstance(metrics, dict):
+                return ""
+            for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                for metric in metrics.get(key) or []:
+                    if not isinstance(metric, dict):
+                        continue
+                    data = metric.get("cvssData") or {}
+                    score = data.get("baseScore")
+                    severity = data.get("baseSeverity")
+                    vector = data.get("vectorString")
+                    if score is not None or severity or vector:
+                        parts = []
+                        if score is not None:
+                            parts.append("分数=" + str(score))
+                        if severity:
+                            parts.append("等级=" + str(severity))
+                        if vector:
+                            parts.append("向量=" + text_value(vector, 150))
+                        return "，".join(parts)
+            return ""
+
+        projected = []
+        evidence = []
+        for index, record in enumerate(records, 1):
+            if not isinstance(record, dict):
+                non_object_records += 1
+                continue
+            record_id = text_value(record.get("id") or record.get("cve_id") or record.get("name"), 80)
+            description = first_description(record)
+            affected = affected_text(record)
+            weakness = weakness_text(record)
+            cvss = cvss_text(record)
+            parts = []
+            if record_id:
+                parts.append("记录：" + record_id)
+            if description:
+                parts.append("漏洞描述：" + description)
+            if affected:
+                parts.append("受影响产品：" + affected)
+            if weakness:
+                parts.append("漏洞类型：" + weakness)
+            if cvss:
+                parts.append("CVSS：" + cvss)
+            if not parts:
+                continue
+            snippet = "；".join(parts)
+            projected.append(snippet)
+            if len(evidence) < 3000:
+                evidence.append({
+                    "evidence_id": "E-{}-{:05d}".format(base["source"]["sha256"][:10], len(evidence) + 1),
+                    "source_path": base["source"]["path"],
+                    "section": "JSON记录 {}{}".format(index, "（" + record_id + "）" if record_id else ""),
+                    "label": "json_record",
+                    "text": _short_text(snippet, 900),
+                    "record_index": index,
+                    "record_id": record_id,
+                    "parser": "structured-json",
+                    "source_sha256": base["source"]["sha256"],
+                    "content_sha256": _digest_text(snippet),
+                })
+        if not projected:
+            return
+        text = "\n\n".join(projected)
+        base["text"] = text[: self.max_chars] if hasattr(self, "max_chars") else text
+        base["evidence"] = evidence
+        base["parser"] = {
+            "name": "structured-json",
+            "degraded": False,
+            "ocr": False,
+            "mode": "fast",
+            "remote_services_enabled": False,
+            "record_count": len(records),
+            "projected_record_count": len(projected),
+        }
+        base["structure"]["title"] = base["structure"].get("title") or Path(path).stem
+        projected_complete = bool(
+            records
+            and projected
+            and not parse_errors
+            and not non_object_records
+            and len(projected) == len(records)
+        )
+        stored_complete = len(base["text"]) >= len(text)
+        base["coverage"].update({
+            "extracted_characters": len(text),
+            "stored_characters": len(base["text"]),
+            # Structured completeness is record-based. The bounded text projection
+            # may be shorter than the source while every record remains represented.
+            "complete": bool(projected_complete),
+            "stored_projection_complete": bool(stored_complete),
+            "truncated_by_limit": bool(not stored_complete),
+            "coverage_ratio": round(len(base["text"]) / float(len(text) or 1), 6),
+            "structured_records_complete": projected_complete,
+            "structured_record_count": len(records),
+            "structured_projected_record_count": len(projected),
+            "structured_parse_errors": parse_errors,
+            "structured_non_object_records": non_object_records,
+        })
+        if not projected_complete:
+            base["warnings"].append(
+                "结构化 JSON 记录投影存在未覆盖记录：总记录 {}，已投影 {}，解析错误 {}，非对象记录 {}。".format(
+                    len(records), len(projected), parse_errors, non_object_records
+                )
+            )
+        elif not stored_complete:
+            base["warnings"].append("结构化 JSON 正文达到本地字符上限；记录级证据仍按已读取记录保留。")
+
     def _fast_parse(self, path, base):
         """Low-latency parsing for inventory and first-pass evidence discovery.
 
@@ -1502,8 +1709,18 @@ class UnifiedDocumentParser:
         use RapidOCR. Image-only PDFs OCR only a small leading sample and are
         explicitly marked incomplete so the UI cannot present them as fully read.
         """
-        self._fallback(path, base, ocr_empty_pdf=False)
         ext = path.suffix.lower()
+        if ext in {".json", ".jsonl"}:
+            # Structured data is projected directly from records. Calling the
+            # generic text fallback first would read and truncate the raw JSON,
+            # then incorrectly leave its truncation flag on the full projection.
+            self._structured_json_projection(path, base)
+            if not base.get("text"):
+                self._fallback(path, base, ocr_empty_pdf=False)
+            base["warnings"].append("当前使用结构化记录快速解析；未执行 Docling 版面模型或 TableFormer。")
+            base["parser"]["mode"] = "fast"
+            return
+        self._fallback(path, base, ocr_empty_pdf=False)
         base["warnings"].append("当前使用快速解析模式；未执行 Docling 版面模型或 TableFormer。")
         if self.fast_office_ocr and ext in {".docx", ".pptx", ".xlsx", ".xlsm"}:
             self._rapidocr_office_images(path, base)
@@ -1788,7 +2005,41 @@ class UnifiedDocumentParser:
             "table_count": table_count,
             "picture_count": picture_count,
         })
-        base["evidence"] = evidence
+        base["evidence"] = self._coalesce_evidence(evidence)
+
+    @staticmethod
+    def _coalesce_evidence(items):
+        """Merge Docling line/word items into contextual, addressable blocks."""
+        merged=[]
+        for item in items or []:
+            text=" ".join(str(item.get("text") or "").split())
+            if not text: continue
+            label=str(item.get("label") or "")
+            # Keep tables, figures and headings as structural units.
+            structural=label in {"title","section_header","heading","table","picture","figure","image"}
+            if merged and not structural:
+                prev=merged[-1]
+                same_page=prev.get("page")==item.get("page") and prev.get("section")==item.get("section")
+                prev_struct=prev.get("label") in {"title","section_header","heading","table","picture","figure","image"}
+                if same_page and not prev_struct and len(prev.get("text", ""))+len(text)+1 <= 900:
+                    prev["text"] += " " + text
+                    prev["content_sha256"] = _digest_text(prev["text"])
+                    # Preserve a bounding envelope when both coordinates are available.
+                    a,b=prev.get("bbox"),item.get("bbox")
+                    if isinstance(a,dict) and isinstance(b,dict):
+                        if "l" in a and "l" in b: a["l"] = min(a["l"], b["l"])
+                        if "t" in a and "t" in b: a["t"] = min(a["t"], b["t"])
+                        if "r" in a and "r" in b: a["r"] = max(a["r"], b["r"])
+                        if "b" in a and "b" in b: a["b"] = max(a["b"], b["b"])
+                    continue
+            copy=dict(item); copy["text"]=text; copy["content_sha256"]=_digest_text(text); merged.append(copy)
+        for i,item in enumerate(merged,1):
+            item["evidence_id"]="E-{}-{:05d}".format(str(item.get("source_sha256") or "unknown")[:10],i)
+            item["block_index"]=i-1
+            # A coalesced block is also a stable paragraph-like unit for citations.
+            item["paragraph_index"]=i-1
+            item["evidence_role"]="structure" if item.get("label") in {"title","section_header","heading"} else "body"
+        return merged
 
     def _fallback(self, path, base, ocr_empty_pdf=True):
         extracted = extract_text(path, max_chars=self.max_chars)

@@ -42,6 +42,13 @@ class AnalysisPlanner:
         r"^(?:你好|您好|嗨|hi|hello|谢谢|感谢|再见|你是谁|怎么用|帮助)[！!。.？?\s]*$",
         re.I,
     )
+    FILE_SEARCH_RE = re.compile(
+        r"(?:搜索|查找|找一下|找出|找到|列出|显示|筛选)\s*\S+"
+        r"|(?:包含|命中|有关|关于).{0,80}(?:文件|资料|文档)"
+        r"|(?:文件|资料|文档).{0,40}(?:搜索|查找|列表|清单|在哪|有哪些|包含|命中)"
+        r"|\bfiles?\b",
+        re.I,
+    )
     TRANSLATION_RE = re.compile(r"翻译|译成|双语|中英对照|translate|translation", re.I)
     # Structured execution is reserved for aggregation across records/files.
     # A bare value lookup such as ``预算多少`` or ``episodeSteps 是多少`` is a
@@ -91,6 +98,7 @@ class AnalysisPlanner:
         general_qa = bool(self.GENERAL_QA_RE.search(question)) and not bool(self.DOCUMENT_HINT_RE.search(question))
         modes: List[str] = []
         checks = (
+            ("file_search", self.FILE_SEARCH_RE),
             ("translation", self.TRANSLATION_RE),
             ("structured", self.STRUCTURED_RE),
             ("comparison", self.COMPARE_RE),
@@ -164,6 +172,17 @@ class AnalysisPlanner:
             add("answer_composer", "按照用户要求组织最终分析结果")
 
         query_variants = [objective]
+        if "file_search" in modes:
+            file_query = re.sub(
+                r"^(?:请|帮我|麻烦|给我|可以)?\s*"
+                r"(?:搜索|查找|找一下|帮我找|找到|找出|列出|显示|搜索一下)\s*"
+                r"(?:有关|关于|包含|命中)?\s*",
+                "",
+                question,
+                flags=re.I,
+            )
+            file_query = re.sub(r"(?:的)?(?:文件|资料|文档)(?:列表|清单)?[。！？!?]*$", "", file_query, flags=re.I).strip()
+            query_variants = [file_query or objective]
         if not casual and set(modes).intersection({"comparison", "contradiction", "risk", "research"}):
             query_variants.append("{} 例外 反向证据 不一致".format(objective))
         if "timeline" in modes:

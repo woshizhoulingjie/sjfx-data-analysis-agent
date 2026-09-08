@@ -1,0 +1,23 @@
+[Unit]
+Description=SJFX local vLLM server
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=zhoulingjie
+Group=gpuuser
+WorkingDirectory=/home/nas511/zhoulingjie/sjfx
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+Environment=CUDA_VISIBLE_DEVICES=0
+ExecStart=/home/nas511/zhoulingjie/sjfx/.venv/bin/vllm serve /home/nas511/zhoulingjie/sjfx/models/Qwen3.6-27B --host 127.0.0.1 --port 8001 --served-model-name qwen3.6:27b --max-model-len 32768 --max-num-seqs 1 --gpu-memory-utilization 0.82
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillMode=control-group
+Environment=VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+[Install]
+WantedBy=default.target

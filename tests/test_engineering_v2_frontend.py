@@ -18,17 +18,19 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         ids = re.findall(r'\bid="([^"]+)"', self.html)
         self.assertEqual(len(ids), len(set(ids)), "HTML element ids must remain unique")
         self.assertIn('/static/engineering-v2.css?v=6', self.html)
-        self.assertIn('/static/engineering-v2.js?v=10', self.html)
+        self.assertIn('/static/engineering-v2.js?v=11', self.html)
         self.assertNotRegex(self.script, r'https?://|\bcdn\b')
         self.assertNotRegex(self.style, r'@import|https?://')
 
     def test_api_token_is_normalized_before_becoming_a_request_header(self):
         app_script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn('/static/app.js?v=23', self.html)
-        for script in (app_script, self.script):
-            self.assertIn('normalizeApiToken', script)
-            self.assertIn("removeItem('sjfx_api_token')", script)
-            self.assertIn(r'/^[\x21-\x7e]+$/', script)
+        self.assertIn('normalizeApiToken', app_script)
+        self.assertIn("SJFX_API_TOKEN_KEY", app_script)
+        self.assertIn("removeItem(SJFX_API_TOKEN_KEY)", app_script)
+        self.assertIn(r'/^[\x21-\x7e]+$/', app_script)
+        self.assertIn("window.SJFXAuth.request", self.script)
+        self.assertNotIn("window.prompt(", self.script)
 
     def test_shell_exposes_dedicated_chat_translation_and_package_overview_routes(self):
         for route in ("chat", "translation", "overview"):

@@ -25,6 +25,7 @@ from services.evidence import (
     embedding_mode,
     evidence_quality,
     evidence_support,
+    set_embedding_provider,
     select_evidence,
     verify_claim_evidence,
 )
@@ -44,6 +45,7 @@ from services.package_exploration import (
     preview_file,
 )
 from services.large_package_runtime import explore_large_package
+from services.import_pipeline import parse_plan, build_preview_directory
 from services.processing_queue import estimated_work_units, ranked_pending_paths
 from services.unified_parser import compact_document
 from services.unified_parser import UnifiedDocumentParser
@@ -338,6 +340,49 @@ def _optional_llm_enrichment_enabled():
     return str(os.getenv("ENABLE_OPTIONAL_LLM_ENRICHMENT", "true")).strip().lower() not in {
         "0", "false", "no", "off", "disabled",
     }
+
+
+def _bounded_timeout_seconds(value, default, minimum=0.1, maximum=300.0):
+    """Normalize a local stage budget without allowing an accidental unbound wait."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float(default)
+    if not math.isfinite(result):
+        result = float(default)
+    return max(float(minimum), min(float(maximum), result))
+
+
+def _call_with_timeout(callable_obj, timeout_seconds, *args, **kwargs):
+    """Run a blocking local call with a caller-visible hard deadline.
+
+    Python cannot safely kill an in-flight HTTP request.  A daemon worker lets
+    the analysis stage return to its deterministic fallback immediately while
+    the transport finishes or releases its own resources in the background.
+    """
+    timeout = _bounded_timeout_seconds(timeout_seconds, 1.0)
+    result = {}
+    completed = threading.Event()
+
+    def invoke():
+        try:
+            result["value"] = callable_obj(*args, **kwargs)
+        except BaseException as exc:  # propagate the original failure type
+            result["error"] = exc
+        finally:
+            completed.set()
+
+    worker = threading.Thread(
+        target=invoke,
+        name="sjfx-bounded-stage-call",
+        daemon=True,
+    )
+    worker.start()
+    if not completed.wait(timeout):
+        raise TimeoutError("本地模型阶段超过 {:.1f} 秒".format(timeout))
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}")
@@ -1375,6 +1420,9 @@ def _group_similar(documents, exact_groups, max_distance=8):
 
 
 def _document_topics(document, limit=8):
+    structured = _structured_topics(document, limit)
+    if structured:
+        return structured
     source = document.get("source", {})
     structure = document.get("structure", {})
     sample = " ".join([
@@ -1387,6 +1435,9 @@ def _document_topics(document, limit=8):
 
 def _content_topics(document, limit=8):
     """Extract topics only from parsed content, never from file metadata."""
+    structured = _structured_topics(document, limit)
+    if structured:
+        return structured
     structure = document.get("structure", {})
     text = _analysis_text(document)
     # A bounded head/middle/tail sample avoids classifying a long report only
@@ -1406,6 +1457,93 @@ def _content_topics(document, limit=8):
         text,
     ])
     return [word for word, _ in Counter(_tokens(sample)).most_common(limit)]
+
+
+_STRUCTURED_FIELD_NOISE = {
+    "id", "name", "source", "sourceidentifier", "published", "lastmodified",
+    "records", "record", "files", "file", "data", "dataset", "content",
+    "value", "values", "items", "item", "metadata", "references", "tags",
+    "status", "vulnstatus", "cvssdata", "vectorstring", "version", "versions",
+    "affected", "affecteddata", "configurations", "nodes", "metrics",
+}
+_CVE_ID_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.I)
+_CWE_RE = re.compile(r"\bCWE-\d+\b", re.I)
+_STRUCTURED_PRODUCT_RE = re.compile(
+    r"(?<![.!?])\b([A-Za-z0-9][A-Za-z0-9_.&'/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9_.&'/-]*){0,5})"
+    r"\s+\[[^\]]{1,180}\]"
+)
+_STRUCTURED_PLATFORM_TERMS = (
+    "WordPress", "Linux", "Windows", "macOS", "Android", "MySQL", "GitLab",
+    "Kubernetes", "Apache", "Oracle", "IBM", "Microsoft", "Chrome", "Firefox",
+)
+
+
+def _structured_topics(document, limit=8):
+    """Return semantic labels for structured records instead of JSON field noise."""
+    profile = document.get("data_profile")
+    if not isinstance(profile, dict):
+        return []
+    columns = profile.get("columns") or {}
+    evidence = document.get("evidence") or []
+    record_text = " ".join(
+        str(item.get("text") or "") for item in evidence
+        if isinstance(item, dict) and item.get("label") == "json_record"
+    )
+    fields = " ".join(str(name) for name in columns)
+    signal = (fields + " " + record_text + " " + _analysis_text(document)[:24000]).casefold()
+    is_cve = bool(
+        _CVE_ID_RE.search(record_text or _analysis_text(document))
+        or "cve_items" in signal
+        or ("cvss" in signal and "vulnerability" in signal)
+    )
+    output = []
+
+    def add(value):
+        value = " ".join(str(value or "").replace("_", " ").split()).strip(" -/:;")
+        if not value or value.casefold() in {item.casefold() for item in output}:
+            return
+        output.append(value)
+
+    if is_cve:
+        add("CVE vulnerability records")
+        if "affected" in signal or "product" in signal:
+            add("Affected products")
+        if _CWE_RE.search(record_text) or "weakness" in signal:
+            add("CWE weakness types")
+        if "cvss" in signal or "basescore" in signal:
+            add("CVSS risk scores")
+        if any(term in signal for term in ("attackvector", "privilegesrequired", "userinteraction", "vectorstring")):
+            add("Attack surface and impact")
+
+        products = Counter()
+        for match in _STRUCTURED_PRODUCT_RE.finditer(record_text):
+            candidate = " ".join(match.group(1).split())
+            words = candidate.split()
+            folded = candidate.casefold()
+            if (
+                not 1 <= len(words) <= 6
+                or folded.startswith(("the ", "a ", "an ", "this ", "when ", "which "))
+                or any(token in folded for token in (" vulnerability", " attacker ", " allows ", " whereby "))
+                or "cve-" in folded
+            ):
+                continue
+            products[candidate] += 1
+        for candidate, _count in products.most_common(6):
+            add(candidate)
+
+        for term in _STRUCTURED_PLATFORM_TERMS:
+            if re.search(r"\b{}\b".format(re.escape(term)), record_text, re.I):
+                add(term)
+    else:
+        for name in columns:
+            label = str(name or "").strip()
+            if label.casefold().replace("_", "") in _STRUCTURED_FIELD_NOISE:
+                continue
+            add(label)
+            if len(output) >= limit:
+                break
+
+    return output[:max(1, int(limit))]
 
 
 def _looks_like_structured_content(text):
@@ -1702,7 +1840,13 @@ def _stable_group_node_id(dimension, name, member_paths):
     )
 
 
-def _node_evidence(documents, member_paths, topics=None, max_items=6):
+def _node_evidence(
+    documents,
+    member_paths,
+    topics=None,
+    max_items=6,
+    use_embeddings=True,
+):
     """Select a bounded, traceable evidence set for one virtual analysis node."""
     candidates = []
     for path in member_paths:
@@ -1713,6 +1857,7 @@ def _node_evidence(documents, member_paths, topics=None, max_items=6):
         max_items=max_items,
         per_source=2,
         max_chars=520,
+        use_embeddings=use_embeddings,
     )
     if topics:
         return [item for item in selected if item.get("support_status") == "supported"]
@@ -2103,7 +2248,16 @@ def _name_subtopic_nodes(tree, documents, llm):
     if not descriptors:
         return tree, None
 
-    prompt = """你正在改善未知数据包中“主题下的子方向”名称。
+    # Preserve the deterministic names before any optional model call.
+    for _node_id, (_topic, subtopic) in nodes.items():
+        subtopic.setdefault("naming_source", "local_fallback")
+        subtopic.setdefault("naming_status", "degraded")
+        subtopic.setdefault(
+            "naming_degradation_reason",
+            "模型增强未完成，已保留本地确定性名称",
+        )
+
+    prompt_template = """你正在改善未知数据包中“主题下的子方向”名称。
 成员文件、证据和 node_id 已由本地算法确定，绝不能改变成员、合并节点或编造材料外事实。
 请把过泛的词（例如 security相关资料、can相关资料）改成用户能理解的中文研究方向。
 
@@ -2118,25 +2272,88 @@ def _name_subtopic_nodes(tree, documents, llm):
 {}
 
 输出 JSON：
-{{"subtopics":[{{"node_id":"group-...","name":"子方向名称","summary":"一句话说明","question":"有价值的分析问题","answer":"有证据支撑的谨慎回答"}}]}}""".format(
-        json.dumps(descriptors, ensure_ascii=False)
+{{"subtopics":[{{"node_id":"group-...","name":"子方向名称","summary":"一句话说明","question":"有价值的分析问题","answer":"有证据支撑的谨慎回答"}}]}}"""
+    named = {}
+    successful_results = []
+    failed_batches = 0
+    batch_size = 2
+    # Subtopic labels are optional presentation metadata. Give the whole
+    # stage a hard wall-clock budget so a slow/busy generation model can never
+    # hold the import task at the visible 88% progress marker.
+    stage_timeout = _bounded_timeout_seconds(
+        os.getenv("SUBTOPIC_NAMING_TIMEOUT_SECONDS", "45"),
+        45.0,
+        minimum=2.0,
+        maximum=120.0,
     )
-    try:
-        result = llm.chat_json(
-            "你是严谨的情报资料目录组织助手。只根据给定代表材料和证据改善目录名称。",
-            prompt,
-            max_tokens=1800,
-            strict=True,
-            retries=0,
-            timeout=180,
-            required_fields=("subtopics",),
-            output_context="子方向命名",
+    stage_deadline = time.monotonic() + stage_timeout
+    timed_out = False
+    for offset in range(0, len(descriptors), batch_size):
+        remaining = stage_deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            failed_batches += max(1, (len(descriptors) - offset + batch_size - 1) // batch_size)
+            break
+        batch = descriptors[offset:offset + batch_size]
+        batch_prompt = prompt_template.format(
+            json.dumps(batch, ensure_ascii=False)
         )
-        named = {
-            item.get("node_id"): item
-            for item in result.get("json", {}).get("subtopics", [])
-            if isinstance(item, dict) and item.get("node_id") in nodes
+        try:
+            batch_result = _call_with_timeout(
+                llm.chat_json,
+                remaining,
+                "你是严谨的情报资料目录组织助手。只根据给定代表材料和证据改善目录名称。",
+                batch_prompt,
+                max_tokens=900,
+                long_output=True,
+                strict=True,
+                retries=0,
+                timeout=max(1, min(180, int(math.ceil(remaining)))),
+                required_fields=("subtopics",),
+                output_context="子方向命名",
+            )
+        except TimeoutError:
+            timed_out = True
+            failed_batches += 1
+            break
+        except Exception:
+            # A single busy/invalid response must not hold the whole import at 88%.
+            failed_batches += 1
+            continue
+        successful_results.append(batch_result)
+        for item in (batch_result.get("json") or {}).get("subtopics", []):
+            if isinstance(item, dict) and item.get("node_id") in nodes:
+                named[item["node_id"]] = item
+    if successful_results:
+        result = dict(successful_results[-1])
+    else:
+        result = {
+            "json": {"subtopics": []},
+            "model": getattr(llm, "model", None),
+            "usage": {},
         }
+    result["json"] = {"subtopics": list(named.values())}
+    result["batch_count"] = len(successful_results) + failed_batches
+    result["batch_failures"] = failed_batches
+    result["timed_out"] = timed_out
+    result["stage_timeout_seconds"] = stage_timeout
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for batch_result in successful_results:
+        for key in usage:
+            usage[key] += int((batch_result.get("usage") or {}).get(key) or 0)
+    result["usage"] = usage
+    if timed_out:
+        degradation_reason = "子方向命名阶段超过 {:.1f} 秒，已保留本地确定性名称".format(stage_timeout)
+    elif failed_batches:
+        degradation_reason = "子方向模型调用失败，已保留本地确定性名称"
+    else:
+        degradation_reason = "模型未返回该节点的有效命名，已保留本地确定性名称"
+    for node_id, (_topic, subtopic) in nodes.items():
+        if node_id not in named:
+            subtopic["naming_source"] = "local_fallback"
+            subtopic["naming_status"] = "degraded"
+            subtopic["naming_degradation_reason"] = degradation_reason
+    try:
         for node_id, item in named.items():
             topic, subtopic = nodes[node_id]
             name = _valid_semantic_name(item.get("name"))
@@ -2804,7 +3021,17 @@ def _semantic_document_clusters(
 
     for start in range(0, len(missing_paths), batch_size):
         batch_paths = missing_paths[start:start + batch_size]
-        batch_vectors = embedding_client.embed([profiles[path] for path in batch_paths])
+        embedding_timeout = _bounded_timeout_seconds(
+            os.getenv("SEMANTIC_EMBEDDING_TIMEOUT_SECONDS", "20"),
+            20.0,
+            minimum=0.5,
+            maximum=120.0,
+        )
+        batch_vectors = _call_with_timeout(
+            embedding_client.embed,
+            embedding_timeout,
+            [profiles[path] for path in batch_paths],
+        )
 
         if len(batch_vectors) != len(batch_paths):
             raise ValueError(
@@ -3584,7 +3811,16 @@ def _semantic_adaptive_tree(
         )
 
         for path in member_paths:
-            selected = _node_evidence(documents, [path], topics=[name], max_items=2)
+            # Clustering already paid for document-level embeddings. Evidence
+            # selection must stay lexical so a slow provider cannot re-block
+            # the tree after semantic clustering has completed.
+            selected = _node_evidence(
+                documents,
+                [path],
+                topics=[name],
+                max_items=2,
+                use_embeddings=False,
+            )
             documents[path].setdefault("classification", {}).update({
                 "primary_topic": name,
                 "topic_memberships": [name],
@@ -3990,13 +4226,191 @@ def _explore_large_package(scan_id, scan, files, storage, policy, deep_paths=Non
     )
 
 
+def _finish_large_selection_analysis(
+    scan_id, scan, storage, policy, documents, failures, target_paths,
+    selection_plan=None, parse_candidates=None, reusable_count=0,
+    used_work_units=0, workflow_source="large_selection", import_translation=None,
+):
+    """Persist a bounded selection without rebuilding package-wide objects.
+
+    The directory pass has already classified the complete inventory.  A user
+    selection therefore needs only selected documents and file summaries; the
+    package tree, content taxonomy and report remain unchanged until the
+    explicit deep-results refresh.  This is the critical large-package guard
+    against loading 100 GB worth of projected documents for a 250-file batch.
+    """
+    plan = dict(selection_plan or {})
+    target_paths = {str(path) for path in (target_paths or []) if str(path)}
+    previous = storage.get_analysis(scan_id) or {}
+    analysis = copy.deepcopy(previous)
+    if not analysis:
+        analysis = {
+            "schema_version": "package-analysis/2.1",
+            "scan_id": scan_id,
+            "root": scan.get("root"),
+            "analysis_tree": {},
+            "content_map": storage.get_content_map(scan_id) or {},
+            "policy": {"large_package": policy},
+        }
+
+    existing_model_sources = {
+        "model-preview-analysis", "model-preview-batch-analysis",
+        "model-candidate-summary", "model-deep-analysis",
+    }
+    summary_rows = []
+    parsed_bytes = 0
+    local_summary_count = 0
+    for path in sorted(documents):
+        document = documents[path]
+        parsed_bytes += int((document.get("source") or {}).get("size") or 0)
+        existing = storage.get_summary(scan_id, path, "file") or {}
+        if (
+            existing
+            and str(existing.get("generated_by") or "") in existing_model_sources
+        ):
+            continue
+        summary = _file_summary(path, document)
+        summary.update({
+            "analysis_level": "preview",
+            "analysis_depth": "parsed_file",
+            "verification_status": "candidate",
+            "deep_analysis": False,
+            "large_selection": True,
+            "generated_at": _now(),
+        })
+        summary_rows.append((path, "file", summary))
+        local_summary_count += 1
+    if summary_rows:
+        storage.save_summaries(scan_id, summary_rows)
+
+    model_paths = [
+        str(path) for path in (plan.get("model_paths") or [])
+        if str(path) in target_paths
+    ]
+    model_completed = 0
+    for path in model_paths:
+        summary = storage.get_summary(scan_id, path, "file") or {}
+        if (
+            bool(summary.get("deep_analysis"))
+            and str(summary.get("analysis_level") or "").lower() == "deep"
+        ):
+            model_completed += 1
+    selected_count = int(plan.get("selected_file_count") or 0)
+    selected_bytes = int(plan.get("selected_bytes") or 0)
+    normal_count = int(
+        plan.get("normal_parse_file_count") or len(target_paths)
+    )
+    deferred_count = int(plan.get("deferred_file_count") or max(
+        0, selected_count - normal_count
+    ))
+    deferred_bytes = int(plan.get("deferred_bytes") or 0)
+    parsed_count = len(documents)
+    failed_count = len(failures or [])
+
+    coverage = dict(analysis.get("coverage") or {})
+    coverage.update({
+        "status": "large_selection_pending_model",
+        "inventory_files": int(scan.get("file_count") or coverage.get("inventory_files") or 0),
+        "inventory_bytes": int(scan.get("total_size") or coverage.get("inventory_bytes") or 0),
+        "inventory_coverage": 1.0,
+        "selected_scope_files": selected_count,
+        "selected_scope_bytes": selected_bytes,
+        "selected_parsed_files": parsed_count,
+        "selected_parsed_bytes": parsed_bytes,
+        "selected_model_files": len(model_paths),
+        "selected_model_completed_files": model_completed,
+        "deferred_files": deferred_count,
+        "deferred_bytes": deferred_bytes,
+        "failed_selected_files": failed_count,
+        "complete_analysis": False,
+        "claim_scope": "模型结论只适用于选中范围内已进入模型的文件；类别总量来自全量清单。",
+        "refresh_required": True,
+        "selection_plan": plan,
+    })
+    coverage.setdefault(
+        "limitations", []
+    ).append("当前只完成选中范围的正常解析；模型摘要和正式目录需等待任务完成后点击更新。")
+    coverage["limitations"] = list(dict.fromkeys(coverage["limitations"]))
+
+    statistics = analysis.setdefault("statistics", {})
+    statistics.update({
+        "large_package_mode": True,
+        "large_selection_mode": True,
+        "selected_scope_files": selected_count,
+        "selected_scope_bytes": selected_bytes,
+        "selected_parsed_files": parsed_count,
+        "selected_model_files": len(model_paths),
+        "selected_model_completed_files": model_completed,
+        "selected_deferred_files": deferred_count,
+        "selected_failed_files": failed_count,
+        "deep_analysis_pending_files": max(0, len(model_paths) - model_completed),
+        "complete_analysis": False,
+        "newly_processed_files": len(parse_candidates or []),
+        "reused_parse_checkpoints": int(reusable_count or 0),
+        "parsed_bytes": parsed_bytes,
+        "local_file_summary_count": local_summary_count,
+        "estimated_work_units": int(used_work_units or 0),
+    })
+    analysis["status"] = "large_selection_pending_model"
+    analysis["coverage"] = coverage
+    analysis["import_translation"] = dict(import_translation or {})
+    analysis.setdefault("overview", {}).update({
+        "selected_scope_files": selected_count,
+        "selected_scope_bytes": selected_bytes,
+        "selected_parsed_files": parsed_count,
+        "selected_model_files": len(model_paths),
+        "selected_deferred_files": deferred_count,
+        "complete_analysis": False,
+        "limitations": coverage["limitations"],
+    })
+    analysis.setdefault("policy", {})["large_package"] = policy
+    analysis.setdefault("policy", {})["import_translation"] = dict(import_translation or {})
+    analysis["workflow"] = {
+        "schema_version": "large-package-workflow/1.0",
+        "source": workflow_source,
+        "large_selection": True,
+        "selection_plan": plan,
+        "batch_size": len(target_paths),
+        "processed_in_job": len(parse_candidates or []),
+        "estimated_work_units": int(used_work_units or 0),
+        "processed_paths": sorted(target_paths),
+        "model_summary_paths": model_paths,
+        "remaining_priority_paths": [],
+        "background_batch_paths": [],
+        "global_aggregation": "deferred_until_explicit_refresh",
+        "completion_contract": "selected_normal_parse_then_model_summary_then_explicit_refresh",
+    }
+    storage.save_analysis(scan_id, analysis)
+    scan["analysis"] = statistics
+    storage.update_scan(scan_id, scan)
+    return analysis
+
+
 def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_client=None, llm=None,
                     large_options=None, target_paths=None, cancel_check=None, parse_mode_override=None,
                     analysis_translation=None, workflow_source=None, yield_check=None,
-                    aggregation_depth=0, aggregation_interval=3, translation_pipeline=None):
+                    aggregation_depth=0, aggregation_interval=3, translation_pipeline=None,
+                    preprocess_only=False, selection_plan=None):
     progress = progress or (lambda percent, message: None)
-    durable_inventory = list(storage.iter_inventory_entries(scan_id, kind="file"))
-    logical_inventory = list(storage.iter_inventory_entries(scan_id, kind="logical_file"))
+    workflow_hint = str(workflow_source or "").strip().lower()
+    requested_selection_paths = list(dict.fromkeys(
+        str(path) for path in (target_paths or []) if str(path)
+    ))
+    large_selection_only = workflow_hint in {"large_selection", "manual_selection"} and bool(
+        requested_selection_paths
+    )
+    if large_selection_only and hasattr(storage, "get_inventory_entry"):
+        durable_inventory = []
+        for path in requested_selection_paths:
+            payload = storage.get_inventory_entry(scan_id, path)
+            if payload:
+                durable_inventory.append({
+                    "path": path, "kind": "file", "payload": payload,
+                })
+        logical_inventory = []
+    else:
+        durable_inventory = list(storage.iter_inventory_entries(scan_id, kind="file"))
+        logical_inventory = list(storage.iter_inventory_entries(scan_id, kind="logical_file"))
     files = (
         [item["payload"] for item in durable_inventory]
         if durable_inventory else list(_walk_files(scan["tree"]))
@@ -4009,7 +4423,19 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     }
     requested_scan_mode = str(scan.get("parse_mode") or "auto").strip().lower()
     parse_mode = requested_scan_mode if requested_scan_mode in {"fast", "accurate", "auto"} else "auto"
-    policy = build_policy(scan, large_options)
+    policy_options = dict(large_options or {})
+    if preprocess_only:
+        # ``preprocess_only`` is not a reason to turn a small package into a
+        # large-package workflow.  Older code forced the policy on here, which
+        # made sub-1-GiB imports skip their normal confirmation/analysis path.
+        threshold_bytes = int(policy_options.get("threshold_bytes") or 1024 * 1024 * 1024)
+        threshold_files = int(policy_options.get("threshold_files") or 3000)
+        policy_options["force_enabled"] = bool(
+            int(scan.get("total_size") or 0) >= threshold_bytes
+            or int(scan.get("file_count") or 0) >= threshold_files
+        )
+        policy_options["background_backfill"] = False
+    policy = build_policy(scan, policy_options)
     inventory = (
         {item["path"]: item["payload"] for item in durable_inventory}
         if durable_inventory else inventory_by_path(scan)
@@ -4020,7 +4446,11 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     workflow_source = str(workflow_source or (
         "manual_selection" if target_paths else "initial_overview"
     ))
-    prior_states = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
+    prior_states = (
+        storage.get_file_states(scan_id, target_paths)
+        if large_selection_only and hasattr(storage, "get_file_states")
+        else {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
+    )
     content_map = storage.get_content_map(scan_id) if policy.get("enabled") else None
     if policy.get("enabled") and not target_paths:
         deep_paths = {
@@ -4039,9 +4469,193 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 "scan_id": scan_id,
                 "_slice_incomplete": True,
                 "content_map": content_map,
+                "coverage": {
+                    "inventory_files": int(scan.get("file_count") or len(all_paths)),
+                    "parsed_files": int((content_map or {}).get("run", {}).get("previewed_files") or 0),
+                    "deep_analyzed_files": len(deep_paths),
+                    "pending_files": max(0, len(all_paths)-len(deep_paths)),
+                    "complete_analysis": False,
+                },
                 "workflow": {"source": workflow_source, "processed_paths": []},
             }
         prior_states = {item.get("node_path"): item for item in storage.iter_file_states(scan_id)}
+    if preprocess_only and not policy.get("enabled") and not requested_selection_paths:
+        # Normal packages must be searchable before the user confirms a deep
+        # scope.  The old gate returned here before the parser loop, leaving
+        # every file in ``discovered`` with no durable text/evidence index.
+        # Reuse the normal CPU-only parser path once, without embeddings or an
+        # LLM, then publish the confirmation gate below.  This is deliberately
+        # bounded to the local parser: model work starts only after selection.
+        progress(4, "开始全量轻度解析：建立可检索文本与证据索引")
+        # Inventory discovery creates rows for the physical files, but small
+        # packages historically skipped the workflow-state seed entirely.
+        # Seed explicit promotable rows before the parser updates their stage;
+        # otherwise the parser's durable documents exist while the UI still
+        # reports every file as ``discovered/pending``.
+        storage.save_file_workflow_states(
+            scan_id,
+            [
+                {
+                    "path": node.get("path"),
+                    "workflow_state": "discovered",
+                    "selection_state": "pending",
+                    "score": 0.0,
+                    "reasons": ["全量轻度解析"],
+                    "safety_status": "unknown",
+                    "light_index_status": "pending",
+                    "parse_status": "pending",
+                    "evidence_status": "pending",
+                    "promotion_allowed": True,
+                }
+                for node in files
+                if node.get("path") in all_paths
+            ],
+        )
+        analyze_package(
+            scan_id,
+            scan,
+            storage,
+            parser,
+            progress=progress,
+            embedding_client=None,
+            llm=None,
+            large_options=policy_options,
+            target_paths=None,
+            cancel_check=cancel_check,
+            parse_mode_override="fast",
+            analysis_translation=None,
+            workflow_source="preprocessing_light",
+            yield_check=yield_check,
+            aggregation_depth=aggregation_depth,
+            aggregation_interval=aggregation_interval,
+            translation_pipeline=None,
+            preprocess_only=False,
+            selection_plan=None,
+        )
+        # The recursive parser call persisted documents, file states and the
+        # evidence index.  Refresh the state snapshot used by the selection
+        # gate so eligibility/counts reflect that durable work immediately.
+        prior_states = {
+            item.get("node_path"): item
+            for item in storage.iter_file_states(scan_id)
+        }
+        progress(72, "全量轻度解析完成，准备确认分析范围")
+
+    if preprocess_only:
+        selection = storage.get_scan_selection(scan_id)
+        if not selection:
+            defaults = storage.default_scan_selection(scan_id)
+            selection = storage.save_scan_selection(
+                scan_id, defaults.get("included_paths"), defaults.get("excluded_paths"),
+                defaults.get("rules"), status="draft",
+            )
+        preview_counts = storage.file_preview_counts(scan_id)
+        selection_gate = {
+            "status": "awaiting_user_confirmation",
+            "message": "文件已扫描并完成预处理，等待用户确认分析范围。",
+            "included_count": int(selection.get("included_count") or 0),
+            "excluded_count": int(selection.get("excluded_count") or 0),
+            "preview_counts": preview_counts,
+            "selection_version": int(selection.get("version") or 1),
+        }
+        preprocessing = {
+            "schema_version": "package-preprocessing/1.0",
+            "status": "awaiting_selection",
+            "inventory_files": int(scan.get("file_count") or len(all_paths)),
+            "inventory_bytes": int(scan.get("total_size") or 0),
+            "preview_counts": preview_counts,
+            "selection_gate": selection_gate,
+            "checkpoint_resume": True,
+            "deep_analysis_started": False,
+        }
+        # Normal packages retain the existing confirmation gate. Large
+        # directory mode sends only bounded representatives through the model
+        # now, so the user can inspect an initial smart directory before
+        # selecting any deep-analysis scope.
+        auto_candidate_preview = policy.get("mode") == "large_directory"
+        preview_directory = {
+            "schema_version": "preview-directory/2.0",
+            "status": "waiting_for_candidate_model" if auto_candidate_preview else "waiting_for_selection",
+            "label": "候选模型分析后生成初步智能目录",
+            "formal": False,
+            "analysis_level": "inventory",
+            "verification_status": "not_started",
+            "topics": [],
+            "candidate_paths": list((content_map or {}).get("representative_paths") or []) if auto_candidate_preview else [],
+            "coverage": {
+                "inventory_files": int(scan.get("file_count") or len(all_paths)),
+                "summarized_files": 0,
+                "representative_model_files": len((content_map or {}).get("representative_paths") or []) if auto_candidate_preview else 0,
+                "ratio": 0.0,
+                "inventory_coverage": 1.0,
+                "content_sample_coverage": round(int(preview_counts.get("previewed") or 0) / float(len(all_paths) or 1), 6),
+            },
+        }
+        analysis = {
+            "schema_version": "package-analysis/2.1",
+            "scan_id": scan_id,
+            "root": scan.get("root"),
+            "status": "candidate_model_pending" if auto_candidate_preview else "awaiting_selection",
+            "started_from_scan_at": scan.get("scanned_at"),
+            "completed_at": _now(),
+            "statistics": {
+                "scanned_files": int(scan.get("file_count") or len(all_paths)),
+                "parsed_files": int(preview_counts.get("previewed") or 0),
+                "previewed_files": int(preview_counts.get("previewed") or 0),
+                "restricted_files": int(preview_counts.get("restricted") or 0),
+                "failed_files": int(preview_counts.get("failed") or 0),
+                "pending_files": int(preview_counts.get("deferred") or 0),
+                "deep_analyzed_files": 0,
+                "deep_analysis_pending_files": int(selection.get("included_count") or 0),
+                "complete_analysis": False,
+                "large_package_mode": True,
+                "large_directory_mode": auto_candidate_preview,
+                "representative_model_files": len((content_map or {}).get("representative_paths") or []) if auto_candidate_preview else 0,
+            },
+            "overview": {
+                "file_count": int(scan.get("file_count") or len(all_paths)),
+                "directory_count": int(scan.get("directory_count") or 0),
+                "total_size": int(scan.get("total_size") or 0),
+                "total_size_human": scan.get("total_size_human"),
+                "format_counts": scan.get("type_counts") or {},
+                "parsed_files": int(preview_counts.get("previewed") or 0),
+                "deep_analyzed_files": 0,
+                "pending_files": int(selection.get("included_count") or 0),
+                "complete_analysis": False,
+                "limitations": ["当前仅完成预处理与有限预览，尚未开始深度分析。"],
+            },
+            "coverage": {
+                "status": "等待确认分析范围",
+                "inventory_files": int(scan.get("file_count") or len(all_paths)),
+                "deep_analyzed_files": 0,
+                "deep_analysis_pending_files": int(selection.get("included_count") or 0),
+                "complete_analysis": False,
+                "preview_coverage": {
+                    "previewed_files": int(preview_counts.get("previewed") or 0),
+                    "restricted_files": int(preview_counts.get("restricted") or 0),
+                    "deferred_files": int(preview_counts.get("deferred") or 0),
+                    "failed_files": int(preview_counts.get("failed") or 0),
+                    "inventory_files": int(scan.get("file_count") or len(all_paths)),
+                    "complete": not bool(preview_counts.get("deferred")),
+                },
+                "limitations": ["深度分析结果尚未生成，当前搜索仅覆盖已建立的预览索引。"],
+            },
+            "preprocessing": preprocessing,
+            "preliminary_directory": preview_directory,
+            "content_map": content_map,
+            "selection": selection_gate,
+            "policy": {"analysis_mode": "preprocessing_only", "large_package": policy},
+            "workflow": {"schema_version": "large-package-workflow/1.0", "source": "preprocessing", "selection_gate": selection_gate, "processed_paths": [], "remaining_priority_paths": [], "background_batch_paths": []},
+            "retrieval": {"persistent_index": True, "package_queries_deferred": True, "coverage_notice": "当前搜索仅覆盖已建立索引范围。"},
+        }
+        scan["analysis"] = analysis["statistics"]
+        storage.save_analysis(scan_id, analysis)
+        storage.update_scan(scan_id, scan)
+        progress(95, "预处理完成，等待用户确认分析范围")
+        if auto_candidate_preview:
+            candidate_paths = [str(path) for path in ((content_map or {}).get("representative_paths") or []) if str(path)]
+            return {"scan_id": scan_id, "_await_candidate_preview": True, "candidate_paths": candidate_paths, "analysis": analysis, "workflow": analysis["workflow"]}
+        return {"scan_id": scan_id, "_await_selection": True, "analysis": analysis, "workflow": analysis["workflow"]}
     if policy.get("enabled") and logical_inventory:
         logical_states = []
         logical_containers = set()
@@ -4078,18 +4692,38 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             })
         storage.save_file_workflow_states(scan_id, logical_states)
     documents = {}
-    for item in storage.iter_documents(scan_id, hydrate=not policy.get("enabled")):
+    document_iterator = (
+        storage.iter_documents_for_paths(
+            scan_id, sorted(target_paths), hydrate=True,
+        )
+        if large_selection_only and hasattr(storage, "iter_documents_for_paths")
+        else storage.iter_documents(scan_id, hydrate=not policy.get("enabled"))
+    )
+    for item in document_iterator:
         if item.get("path") not in all_paths:
             continue
         payload = item["payload"]
         documents[item["path"]] = (
             storage.project_document(
                 payload,
-                text_limit=policy["overview_chars_per_file"],
-                evidence_limit=policy["overview_evidence_per_file"],
+                text_limit=(policy.get("deep_model_chars") if item["path"] in target_paths else policy["overview_chars_per_file"]),
+                evidence_limit=(policy.get("deep_model_evidence") if item["path"] in target_paths else policy["overview_evidence_per_file"]),
             )
             if policy.get("enabled") else payload
         )
+        # Persist source-addressable blocks for deep model context. Preview projections never enter this asset.
+        node_path = item["path"]
+        if documents.get(node_path) and not documents[node_path].get("content_blocks"):
+            from services.import_pipeline import content_blocks as _content_blocks
+            doc = documents[node_path]
+            raw_text = _analysis_text(doc)
+            if raw_text and str(doc.get("evidence_level") or "").lower() in {"deep", "evidence"}:
+                source = doc.get("source") or {}
+                doc["content_blocks"] = _content_blocks(raw_text, {
+                    "file_id": source.get("path") or node_path, "path": node_path,
+                    "source_path": node_path, "source_sha256": source.get("sha256"),
+                    "analysis_level": "L3",
+                })
         if (
             policy.get("enabled")
             and (prior_states.get(item["path"]) or {}).get("status") == "completed"
@@ -4121,9 +4755,13 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         actual_parse_mode = override_mode if override_mode in {"fast", "accurate", "auto"} else "accurate"
     elif policy.get("enabled"):
         # The all-file pass is handled by the bounded explorer above.  Files in
-        # this queue are representatives or user promotions and therefore get
-        # the accurate parser unless an operator explicitly overrides it.
-        actual_parse_mode = "accurate"
+        # this queue are normally representatives or background promotions.
+        # User-confirmed selections retain the smart parser; explicit deep
+        # analysis and backfill workflows continue to use the accurate parser.
+        if str(workflow_source or "").strip().lower() in {"user_selection", "manual_selection"}:
+            actual_parse_mode = "auto"
+        else:
+            actual_parse_mode = "accurate"
     else:
         actual_parse_mode = parse_mode
     parser_contract = _parser_checkpoint_contract(parser)
@@ -4138,6 +4776,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     reusable_count = 0
     for index, file_node in enumerate(candidates, 1):
         node_path = file_node["path"]
+        file_node = dict(file_node)
+        file_node["parse_plan"] = parse_plan(file_node, (documents.get(node_path) or {}).get("preview") if isinstance(documents.get(node_path), dict) else None)
         existing_state = prior_states.get(node_path)
         existing = documents.get(node_path)
         reusable = False
@@ -4233,6 +4873,15 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     "压缩包没有完成有效展开。{}。若文件正在复制，请等待完成后重新导入；"
                     "若文件已完整，请检查是否损坏、加密或属于分卷压缩包。".format(details or "未发现可解析成员")
                 )
+            coverage = document.setdefault("coverage", {})
+            coverage.update({
+                "level": "deep",
+                "preview_only": False,
+                "deep_parse_complete": bool(coverage.get("complete", True)),
+                "formal_evidence_ready": bool(document.get("evidence")) and bool(coverage.get("complete", True)),
+            })
+            document["evidence_level"] = "evidence" if coverage.get("formal_evidence_ready") else "deep"
+            document["parse_plan"] = file_node.get("parse_plan") or parse_plan(file_node)
             storage.save_document(scan_id, node_path, document)
             resolved_mode = str((document.get("parser") or {}).get("mode") or actual_parse_mode)
             fingerprint = file_fingerprint(
@@ -4244,8 +4893,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             documents[node_path] = (
                 storage.project_document(
                     document,
-                    text_limit=policy["overview_chars_per_file"],
-                    evidence_limit=policy["overview_evidence_per_file"],
+                    text_limit=(policy.get("deep_model_chars") if node_path in target_paths else policy["overview_chars_per_file"]),
+                    evidence_limit=(policy.get("deep_model_evidence") if node_path in target_paths else policy["overview_evidence_per_file"]),
                 )
                 if policy.get("enabled") else document
             )
@@ -4520,6 +5169,22 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 "limitations": ["导入期工作译本阶段异常，已回退原文分析：{}".format(str(exc)[:300])],
             })
 
+    if large_selection_only:
+        # The package-wide clustering/tree/report stages are intentionally
+        # skipped here.  They would deserialize the entire package for a small
+        # selected slice and would also publish a report before model summaries
+        # are durable.  The explicit refresh endpoint performs that final step.
+        progress(95, "选中范围已解析，等待文件模型摘要")
+        return _finish_large_selection_analysis(
+            scan_id, scan, storage, policy, documents, failures, target_paths,
+            selection_plan=selection_plan,
+            parse_candidates=parse_candidates,
+            reusable_count=reusable_count,
+            used_work_units=used_work_units,
+            workflow_source=workflow_source,
+            import_translation=import_translation,
+        )
+
     configured_aggregation_interval = max(1, int(aggregation_interval or 3))
     estimated_batches = int(math.ceil(
         len(all_paths) / float(max(1, min(500, int(policy.get("batch_files") or 500))))
@@ -4787,6 +5452,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         except Exception as exc:
             semantic_error = str(exc)
             semantic_clusters = []
+            # Disable the shared provider after a semantic-stage failure so
+            # every later evidence request takes the immediate lexical path.
+            set_embedding_provider(None)
 
     progress(82, "生成所有文件夹的本地摘要与证据链")
     node_summaries = {}
@@ -4802,6 +5470,16 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     def queue_summary(path, summary_type, summary):
         nonlocal summary_done, summary_batch
+        # A later package slice recomputes cheap parser summaries for every
+        # hydrated document. Never let that bookkeeping pass overwrite a
+        # model-backed candidate/deep result that the user already received.
+        existing = storage.get_summary(scan_id, path, summary_type)
+        existing_source = str((existing or {}).get("generated_by") or "")
+        new_source = str((summary or {}).get("generated_by") or "")
+        if existing and existing_source in {"model-preview-analysis", "model-preview-batch-analysis", "model-candidate-summary", "model-deep-analysis"} and new_source in {"local-unified-parser", "local-inventory"}:
+            node_summaries[path] = existing
+            summary_done += 1
+            return
         summary_batch.append((path, summary_type, summary))
         summary_done += 1
         if len(summary_batch) >= 250:
@@ -4883,7 +5561,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         )
         adaptive_tree = _enrich_analysis_tree(adaptive_tree, canonical_documents)
     progress(88, "生成可下钻子方向名称")
-    if llm is not None:
+    # Optional label enrichment must never block the core import.
+    if llm is not None and _optional_llm_enrichment_enabled():
         adaptive_tree, subtopic_naming_result = _name_subtopic_nodes(
             adaptive_tree,
             canonical_documents,
@@ -4976,6 +5655,15 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             list(package_coverage.get("limitations") or [])
             + list(import_translation.get("limitations") or [])
         ))
+    formal_evidence_ready = any(
+        bool((document.get("coverage") or {}).get("formal_evidence_ready"))
+        and bool(document.get("evidence"))
+        for document in documents.values()
+    )
+    package_coverage["formal_evidence_ready"] = formal_evidence_ready
+    package_coverage["evidence_status"] = "ready" if formal_evidence_ready else (
+        "preview_candidate" if documents else "insufficient"
+    )
     if policy.get("enabled"):
         preview_counts = storage.file_preview_counts(scan_id)
         package_coverage["preview_coverage"] = {
@@ -5257,7 +5945,17 @@ def refresh_package_progress_counts(scan_id, scan, storage):
     ratio = round(completed / float(logical_total or 1), 6)
     previews = storage.file_preview_counts(scan_id)
     coverage = analysis.setdefault("coverage", {})
+    formal_ready = False
+    try:
+        for doc in storage.iter_documents(scan_id, hydrate=False):
+            if bool((doc.get("coverage") or {}).get("formal_evidence_ready")) and int(doc.get("evidence_count") or len(doc.get("evidence") or [])) > 0:
+                formal_ready = True
+                break
+    except Exception:
+        formal_ready = bool(storage.count_evidence_index(scan_id))
     coverage.update({
+        "formal_evidence_ready": formal_ready,
+        "evidence_status": "ready" if formal_ready else ("preview_candidate" if previews.get("previewed") else "insufficient"),
         "inventory_files": int(scan.get("file_count") or 0),
         "logical_files": logical_total,
         "deep_analyzed_files": completed,

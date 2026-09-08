@@ -554,6 +554,7 @@ class OllamaTranslationProvider(TranslationProvider):
                 system_prompt, user_prompt,
                 max_tokens=max(1024, min(6000, int(len(str(text or "")) * 1.8) + 256)),
                 retries=retries, timeout=timeout,
+                long_output=True,
                 required_fields=["translation"], output_context="翻译模型输出",
             )
         except LocalModelError as exc:
@@ -595,6 +596,7 @@ class OllamaTranslationProvider(TranslationProvider):
                 system_prompt, user_prompt,
                 max_tokens=max(1024, min(6000, int(len(str(text or "")) * 1.8) + 256)),
                 retries=0, timeout=timeout,
+                long_output=True,
                 required_fields=["translation"], output_context="翻译复核模型输出",
             )
         except LocalModelError as exc:
