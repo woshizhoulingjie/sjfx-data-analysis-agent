@@ -896,6 +896,9 @@ class ConversationEngine:
         "除非用户明确要求其他语言，否则使用简体中文。"
         "每个事实性判断都应使用 [1] 形式引用；证据没有说明的内容必须明确说不知道。"
         "区分资料直接说明、模型分析判断和一般建议，不得伪造人物关系、数字、日期或文件内容。"
+        "回答要像耐心、懂行的人在和用户交流：先自然地回应问题，再在需要时补充依据；"
+        "避免模板化开场、机械复述问题、连续堆砌小标题和暴露检索/编排/模型内部流程。"
+        "资料不足时直接说明缺口，并告诉用户下一步能查什么；不要为了显得完整而编造结论。"
     )
 
     INTENT_INSTRUCTIONS = {
@@ -1246,58 +1249,36 @@ class ConversationEngine:
         coverage_override: Optional[Mapping[str, Any]],
         retrieval_override: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Return a concise file-discovery response without requiring a conclusion."""
+        """Find files deterministically; file discovery never needs the model."""
         file_query = re.sub(
-            r"^(?:请|帮我|麻烦|给我|可以)?\s*"
-            r"(?:搜索|查找|找一下|帮我找|找到|找出|列出|显示|搜索一下)\s*"
-            r"(?:有关|关于|包含|命中)?\s*",
-            "",
-            resolution.resolved_query,
-            flags=re.I,
+            r"^(?:请|帮我|麻烦|给我|可以)?\s*(?:搜索|查找|找一下|帮我找|找到|找出|列出|显示|搜索一下)\s*(?:有关|关于|包含|命中)?\s*",
+            "", resolution.resolved_query, flags=re.I,
         )
-        file_query = re.sub(
-            r"(?:的)?(?:文件|资料|文档)(?:列表|清单)?[。！？!?]*$",
-            "",
-            file_query,
-            flags=re.I,
-        ).strip()
+        file_query = re.sub(r"(?:的)?(?:文件|资料|文档)(?:列表|清单)?[。！？!?]*$", "", file_query, flags=re.I).strip()
         if file_query and file_query != resolution.resolved_query:
-            resolution = FollowUpResolution(
-                original_question=resolution.original_question,
-                resolved_query=file_query,
-                is_follow_up=resolution.is_follow_up,
-                antecedent=resolution.antecedent,
-            )
-        turn = self._answer_from_retrieval(
-            session,
-            resolution,
-            decision,
-            scope,
-            context,
-            coverage_override,
-            retrieval_override=retrieval_override,
+            resolution = FollowUpResolution(resolution.original_question, file_query, resolution.is_follow_up, resolution.antecedent)
+        retrieval = (dict(retrieval_override) if isinstance(retrieval_override, Mapping)
+                     else self._retrieve(session, resolution.resolved_query, scope, decision.name))
+        citations = _normalise_citations(self._retrieval_items(retrieval), limit=self.context_policy.max_prompt_evidence)
+        coverage = CoverageSnapshot.from_values(
+            retrieval.get('coverage') if isinstance(retrieval.get('coverage'), Mapping) else None,
+            retrieval, coverage_override,
         )
-        paths = []
-        for citation in turn.get("citations") or []:
-            path = str(citation.get("source_path") or "").strip()
-            if path and path not in paths:
-                paths.append(path)
-        if paths:
-            turn["answer"] = (
-                "我先把相关文件找出来了，共 {} 个。你可以点“阅读”查看原文，"
-                "需要进一步梳理内容时，再把文件加入深度分析。"
-            ).format(len(paths))
+        related = [str(path) for path in (retrieval.get('related_file_paths') or []) if path]
+        if not related:
+            related = list(dict.fromkeys(str(item.get('source_path') or '') for item in citations if item.get('source_path')))
+        if related:
+            answer = '我先把相关文件找出来了，共 {} 个。你可以阅读原文或下载；如果要把几份资料放在一起整理，勾选文件后创建新节点即可。'.format(len(related))
         else:
-            query = resolution.resolved_query or resolution.original_question
-            turn["answer"] = (
-                "我在当前数据包里暂时没有找到与“{}”匹配的文件。"
-                "可以换一个更短或更具体的关键词再试一次。"
-            ).format(_clean_text(query, 120))
-        turn["status"] = "answered"
-        turn["task_status"] = "fulfilled"
-        turn["evidence_status"] = "not_required"
-        turn["promotion_request"] = None
-        turn["file_search"] = True
+            answer = '我在当前范围里暂时没有找到与“{}”匹配的文件。可以换一个更短或更具体的关键词再试一次。'.format(_clean_text(file_query or resolution.original_question, 120))
+        turn = self._base_turn(
+            session, resolution, decision, scope, answer, citations, status='answered',
+            evidence_status='not_required', coverage=coverage, promotion=None, warnings=list(retrieval.get('warnings') or []),
+        )
+        turn['file_search'] = True
+        turn['related_file_paths'] = related[:5000]
+        turn['file_results_total'] = len(related)
+        turn['file_results_coverage'] = None
         return turn
 
     def _answer_from_retrieval(
@@ -1400,14 +1381,16 @@ class ConversationEngine:
                 )
             if decision.name == "multi_task":
                 answer, model_warnings = self._grounded_answer(
-                    decision.name, resolution.resolved_query, context, citations
+                    decision.name, resolution.resolved_query, context, citations,
+                    package_context=retrieval.get("package_context"),
                 )
                 warnings.extend(model_warnings)
             else:
                 answer = translation_answer
         else:
             answer, model_warnings = self._grounded_answer(
-                decision.name, resolution.resolved_query, context, citations
+                decision.name, resolution.resolved_query, context, citations,
+                package_context=retrieval.get("package_context"),
             )
             warnings.extend(model_warnings)
 
@@ -1433,6 +1416,14 @@ class ConversationEngine:
             warnings=warnings,
         )
         turn["input_manifest"] = input_manifest
+        related_paths = [str(path) for path in (retrieval.get("related_file_paths") or []) if path]
+        # Broad answers must expose the complete selected scope even when the bounded
+        # evidence window was assembled from a repair pass.
+        if not related_paths and scope.kind in {"package", "directory", "files"}:
+            package_context = retrieval.get("package_context") or {}
+            related_paths = [str(item.get("path")) for item in (package_context.get("file_summaries") or []) if item.get("path") and scope.contains_source(item.get("path"))]
+        turn["related_file_paths"] = list(dict.fromkeys(related_paths))[:5000]
+        turn["package_coverage"] = dict((retrieval.get("package_context") or {}).get("coverage") or {})
         return turn
 
     def _advisory_answer(self, question: str, context: str) -> Tuple[str, List[str]]:
@@ -1530,6 +1521,7 @@ class ConversationEngine:
         query: str,
         context: str,
         citations: Sequence[Mapping[str, Any]],
+        package_context: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[str, List[str]]:
         evidence_payload = [
             {
@@ -1542,13 +1534,22 @@ class ConversationEngine:
             for item in citations
         ]
         instruction = self.INTENT_INSTRUCTIONS.get(intent, self.INTENT_INSTRUCTIONS["retrieval"])
+        package_digest = ""
+        if package_context:
+            try:
+                from services.conversation_package_context import model_digest
+                package_digest = model_digest(package_context)
+            except Exception:
+                package_digest = json.dumps(dict(package_context), ensure_ascii=False)[:30000]
         user_prompt = (
             "任务类型：{intent}\n任务要求：{instruction}\n会话上下文：\n{context}\n\n"
+            "当前整个数据包上下文（摘要、解析状态和覆盖信息）：\n{package_context}\n\n"
             "当前问题：{query}\n\n本轮实际输入范围：{manifest}\n\n编号证据（仅这些内容可作为事实依据）：\n{evidence}"
         ).format(
             intent=intent,
             instruction=instruction,
             context=context or "无",
+            package_context=package_digest or "未能读取数据包上下文",
             query=query,
             manifest=json.dumps({
                 "selected_files": len({str(item.get("source_path") or "") for item in citations}),

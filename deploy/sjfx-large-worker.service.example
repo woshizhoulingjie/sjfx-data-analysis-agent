@@ -1,0 +1,25 @@
+[Unit]
+Description=SJFX Isolated Large Package Worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=zhoulingjie
+Group=gpuuser
+WorkingDirectory=/home/nas511/zhoulingjie/sjfx
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/nas511/zhoulingjie/sjfx/.venv/bin/python -u large_package_worker.py
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/nas511/zhoulingjie/sjfx/outputs /home/nas511/zhoulingjie/sjfx/data
+MemoryMax=8G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

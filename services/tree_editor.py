@@ -85,6 +85,35 @@ def apply_tree_edits(analysis, edits):
         if edit_id and edit_id in suppressed:
             continue
         payload = edit.get("payload") or {}
+        if operation == "create":
+            name = str(payload.get("name") or "").strip()
+            paths = sorted(set(str(value).replace("\\", "/") for value in payload.get("paths") or [] if value))
+            parent = _find(tree, payload.get("parent_id")) if payload.get("parent_id") else tree
+            if not parent or not name or not paths:
+                continue
+            node_id = _manual_id("create", [edit_id, name, *paths])
+            # Re-analysis may already contain a previously materialized manual
+            # node.  Replaying its edit must be idempotent; otherwise the same
+            # node is appended twice and the tree index hits its unique key.
+            if _find(tree, node_id):
+                continue
+            group = {
+                "kind": "group",
+                "node_id": node_id,
+                "dimension": str(payload.get("dimension") or "用户整理"),
+                "name": name[:120],
+                "member_paths": paths,
+                "file_count": len(paths),
+                "children": [_file_leaf(path) for path in paths],
+                "classification_status": "confirmed",
+                "classification_source": "human",
+                "manual_created": True,
+                "summary": "用户整理节点，共 {} 个文件。".format(len(paths)),
+                "evidence_chain": [],
+                "conclusion_evidence": [],
+            }
+            parent.setdefault("children", []).append(group)
+            continue
         if operation == "rename":
             node = _find(tree, payload.get("node_id"))
             if node and str(payload.get("name") or "").strip():

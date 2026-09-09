@@ -29,7 +29,12 @@ from web_compat import (
 from config import Config, ensure_runtime_directories
 from services.ollama import LocalModelError, OllamaClient, OllamaEmbeddingClient
 from services.vllm import VLLMClient, VLLMEmbeddingClient
-from services.document_analysis import analyze_document, analyze_document_preview, analyze_document_previews_batch
+from services.document_analysis import (
+    _preview_claim_contract,
+    analyze_document,
+    analyze_document_preview,
+    analyze_document_previews_batch,
+)
 from services.import_pipeline import parse_plan
 from services.import_state_machine import summary_type as staged_summary_type
 from services.evidence import build_file_claims, embedding_mode, select_evidence, set_embedding_provider, verify_claim_evidence
@@ -40,6 +45,7 @@ from services.package_analysis import (
     _restore_source_provenance, _logical_source_snapshot, _secure_source_snapshot,
 )
 from services.large_package import build_policy, inventory_by_path, package_resource_plan
+from services.large_package_isolated import LargePackageStore
 from services.processing_queue import (
     deep_processing_eligible,
     ranked_pending_paths,
@@ -78,6 +84,11 @@ from services.conversation import (
     ConversationEngine,
     ConversationScope,
     ConversationSession,
+)
+from services.conversation_package_context import (
+    build_large_context,
+    build_standard_context,
+    model_digest,
 )
 from services.turn_runtime import AnalysisTurnRuntime
 from services.package_overview import build_package_overview_from_storage
@@ -162,6 +173,7 @@ for _handler in logging.getLogger().handlers:
 logging.getLogger("docling").setLevel(logging.WARNING)
 logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 app.config["JSON_AS_ASCII"] = False
+large_package_store = LargePackageStore()
 storage = LazyStorage(
     lambda: Storage(
         Config.DB_PATH,
@@ -1845,6 +1857,30 @@ def _package_processing_status(scan_id, scan_result=None):
     )
     evidence_indexed_files = storage.evidence_indexed_file_count(scan_id)
     active_job = storage.get_active_package_job(scan_id)
+    if not active_job:
+        pipeline_sources = {
+            "candidate_preview_model_summary", "candidate_node_summary",
+            "preliminary_model_summary", "preliminary_node_summary",
+            "preliminary_results_report", "deep_parse_model_summary",
+            "idle_deep_model_summary", "deep_node_rebuild", "deep_results_report",
+            "large_selection_model_summary",
+        }
+        with storage._connect() as conn:
+            candidates = conn.execute(
+                "SELECT id,options FROM analysis_jobs WHERE scan_id=? "
+                "AND task_type IN ('generate_summary','generate_report') "
+                "AND status IN ('queued','running','cancelling') ORDER BY updated_at DESC LIMIT 20",
+                (str(scan_id),),
+            ).fetchall()
+        for candidate in candidates:
+            try:
+                options = json.loads(candidate["options"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                options = {}
+            if str(options.get("workflow_source") or "") in pipeline_sources:
+                active_job = storage.get_job(str(candidate["id"]))
+                if active_job:
+                    break
     control = storage.get_package_processing_control(scan_id)
     selection = storage.get_scan_selection(scan_id) or {}
     import_task_status = str((storage.get_import_task(scan_id) or {}).get("status") or "").lower()
@@ -2746,6 +2782,59 @@ def _run_claimed_summary_job(job):
         ).hexdigest()
         llm = CheckpointedModel(original_model, storage, checkpoint_key)
     try:
+        # Runtime-only coalescing for the foreground preliminary file-summary
+        # lane. The queue still contains one job per file; only the model call
+        # is shared, and every result returns through the original save path.
+        if (
+            str(options.get("workflow_source") or "") == "preliminary_model_summary"
+            and str(options.get("path") or "").strip()
+            and not options.get("_preliminary_prefetched_summary")
+        ):
+            try:
+                from services.preliminary_summary_batch import (
+                    analyze_preliminary_batch,
+                    collect_jobs,
+                    eligible_job,
+                )
+                if eligible_job(job):
+                    batch_jobs = collect_jobs(
+                        storage, job,
+                        limit=int(getattr(Config, "PRELIMINARY_SUMMARY_BATCH_SIZE", 4)),
+                    )
+                    batch_result, batch_ids = analyze_preliminary_batch(
+                        llm,
+                        storage,
+                        batch_jobs,
+                        max_chars=int(getattr(Config, "CANDIDATE_PREVIEW_MAX_CHARS", 8000)),
+                        context_window_tokens=Config.LLM_CONTEXT_TOKENS,
+                        output_tokens_per_file=int(getattr(Config, "CANDIDATE_PREVIEW_OUTPUT_TOKENS", 240)),
+                    )
+                    lead = batch_result.get(str(job.get("id") or ""))
+                    if lead:
+                        prepared = dict(job)
+                        prepared["options"] = dict(options)
+                        prepared["options"]["_preliminary_prefetched_summary"] = lead
+                        result = _execute_summary_job(prepared)
+                        if isinstance(result, dict):
+                            result["_preliminary_batch_prefetch"] = {
+                                job_id: batch_result[job_id]
+                                for job_id in batch_ids
+                                if job_id != str(job.get("id") or "") and job_id in batch_result
+                            }
+                            result["_preliminary_batch_size"] = len(batch_ids)
+                        logger.info(
+                            "Preliminary summary model batch completed lead=%s files=%s",
+                            job.get("id"), len(batch_ids),
+                        )
+                        return result
+            except Exception:
+                # Batching is an optimization only. A protocol, budget, or
+                # model error must return to the exact single-file path.
+                logger.warning(
+                    "Preliminary summary batch unavailable; falling back to single file id=%s",
+                    job.get("id"),
+                    exc_info=True,
+                )
         return _execute_summary_job(job)
     finally:
         llm = original_model
@@ -2761,6 +2850,7 @@ def _execute_summary_job(job):
     payload.pop("_worker_execution", None)
     scan_id = job["scan_id"]
     workflow_source = str(payload.get("workflow_source") or "")
+    prefetched_summary = payload.pop("_preliminary_prefetched_summary", None)
     preview_mode = (
         str(payload.get("workflow_source") or "") == "candidate_preview_model_summary"
         or (
@@ -2874,17 +2964,24 @@ def _execute_summary_job(job):
         if not document:
             raise ValueError("候选文件尚未完成统一解析：{}".format(node_path))
         try:
-            deadline = float(payload.get("candidate_deadline_at") or 0)
-            if deadline and time.time() >= deadline:
-                raise TimeoutError("candidate preview batch deadline reached")
-            require_local_model_enabled()
-            summary, result = analyze_document_preview(
-                llm, node_path, node_path, unified_document=document,
-                max_chars=int(getattr(Config, "CANDIDATE_PREVIEW_MAX_CHARS", 24000)),
-                context_window_tokens=Config.LLM_CONTEXT_TOKENS,
-                timeout_seconds=int(getattr(Config, "CANDIDATE_PREVIEW_TIMEOUT_SECONDS", 60)),
-            )
-            degraded = False
+            if prefetched_summary:
+                summary = dict(prefetched_summary.get("summary") or {})
+                result = dict(prefetched_summary.get("result") or {})
+                if not summary:
+                    raise ValueError("预取的初步摘要为空")
+                degraded = False
+            else:
+                deadline = float(payload.get("candidate_deadline_at") or 0)
+                if deadline and time.time() >= deadline:
+                    raise TimeoutError("candidate preview batch deadline reached")
+                require_local_model_enabled()
+                summary, result = analyze_document_preview(
+                    llm, node_path, node_path, unified_document=document,
+                    max_chars=int(getattr(Config, "CANDIDATE_PREVIEW_MAX_CHARS", 24000)),
+                    context_window_tokens=Config.LLM_CONTEXT_TOKENS,
+                    timeout_seconds=int(getattr(Config, "CANDIDATE_PREVIEW_TIMEOUT_SECONDS", 60)),
+                )
+                degraded = False
         except Exception as exc:
             summary = _local_document_fallback(document, node_path, str(exc)[:300])
             summary.update({
@@ -2907,6 +3004,11 @@ def _execute_summary_job(job):
         summary["node_path"] = node_path
         summary["summary_type"] = "file"
         if str(payload.get("workflow_source") or "") == "preliminary_model_summary":
+            # Keep the same preview claim/evidence contract for both the
+            # original single-file path and the runtime-batched path.
+            summary.update(_preview_claim_contract(
+                summary, (document or {}).get("evidence", []),
+            ))
             summary.update({
                 "generated_by": "model-preliminary-analysis" if not degraded
                     else "local-preliminary-fallback",
@@ -3312,11 +3414,18 @@ def _run_claimed_analysis_job(job):
     analysis = analyze_package(
         scan_id, scan_result, storage, parser, progress,
         embedding_client=_package_embedding_client,
-        llm=(llm if llm_generation_enabled else None),
+        # A user-selected import is a fast, bounded parse pass. Directory
+        # labels use the deterministic fallback here; model summaries remain
+        # queued separately after parsing, so this path is not held by a
+        # semantic naming request.
+        llm=(llm if llm_generation_enabled and not selected_file_parse else None),
         large_options=_package_large_options(),
         target_paths=options.get("target_paths"),
         cancel_check=lambda: storage.is_job_cancel_requested(job_id),
-        parse_mode_override=options.get("parse_mode"),
+        parse_mode_override=(
+            "auto" if selected_file_parse and str(options.get("parse_mode") or "").lower() == "accurate"
+            else options.get("parse_mode")
+        ),
         workflow_source=options.get("workflow_source"),
         analysis_translation=(
             lambda **kwargs: _prepare_import_translations(
@@ -4897,6 +5006,11 @@ def general_chat():
     question = str(payload.get("question") or "").strip()
     if not question or len(question) > 8000:
         return api_error("问题不能为空且不能超过 8000 字符", 400)
+    # 基础问候和功能导航是确定性响应，避免为简单问题排队等待模型。
+    if re.search(r"^(?:你好|您好|嗨|hi|hello)(?:[呀啊吗呢！!。.？?\s]*)$", question, re.I):
+        return jsonify({"ok": True, "answer": "你好，我可以帮你检索资料、概括内容、核对证据、统计表格，或继续追问某个文件。", "model": "deterministic", "evidence_status": "not_required", "task_status": "fulfilled"})
+    if re.search(r"(?:你是谁|你能做什么|怎么用|帮助)", question, re.I):
+        return jsonify({"ok": True, "answer": "我是资料分析助手。选择数据包或目录范围后直接提问，我会把自然回答和可回到原文的文件证据放在一起。", "model": "deterministic", "evidence_status": "not_required", "task_status": "fulfilled"})
     try:
         require_local_model_enabled()
         history = payload.get("messages") or []
@@ -5124,6 +5238,78 @@ def resume_package_processing(scan_id):
         control_state = storage.get_package_processing_control(scan_id).get("state")
         if control_state == "awaiting_selection" and mode != "selection":
             return jsonify({"ok": True, "accepted": False, "message": "请先在分析范围确认页面选择文件并确认后再开始深度分析。", "processing": _package_processing_status(scan_id, scan_result)}), 409
+        # A stopped ordinary import can leave preliminary summary children in
+        # ``cancelled``/``failed`` while the durable import task remains in a
+        # preliminary stage.  Explicitly continuing from the checkpoint should
+        # recreate only those children, preserving completed summaries and the
+        # original selected scope.
+        import_task = storage.get_import_task(scan_id) or {}
+        import_status = str(import_task.get("status") or "")
+        if mode == "continue" and import_status == "paused":
+            paused_checkpoint = dict(import_task.get("checkpoint") or {})
+            resume_status = str(paused_checkpoint.pop("paused_from_state") or "")
+            if resume_status:
+                storage.transition_import_task(
+                    scan_id, resume_status, checkpoint=paused_checkpoint,
+                    resume_from="paused", reason="用户从检查点继续上次暂停的导入任务。",
+                )
+                import_task = storage.get_import_task(scan_id) or {}
+                import_status = str(import_task.get("status") or "")
+        resumable_children = {
+            "preliminary_summarizing": ["preliminary_summary_job_ids"],
+            "preliminary_nodes": ["preliminary_node_job_ids"],
+            "preliminary_overview": ["preliminary_overview_job_id"],
+            "summarizing_files": ["deep_summary_job_ids", "deep_summary_node_job_ids"],
+            "deep_summarizing_files": ["deep_summary_job_ids"],
+            "deep_summarizing_nodes": ["deep_summary_node_job_ids"],
+            "deep_overview_updating": ["deep_overview_job_id"],
+            "candidate_analyzing": ["candidate_preview_job_ids"],
+        }
+        if mode == "continue" and import_status in resumable_children:
+            checkpoint = dict(import_task.get("checkpoint") or {})
+            replacement_ids = []
+            for key in resumable_children[import_status]:
+                scalar = key.endswith("_job_id") and not key.endswith("_job_ids")
+                old_ids = ([str(checkpoint.get(key))] if scalar and checkpoint.get(key) else []) if scalar else [
+                    str(item) for item in (checkpoint.get(key) or []) if str(item)
+                ]
+                updated_ids = []
+                for old_id in old_ids:
+                    old_job = storage.get_job(old_id)
+                    old_status = str((old_job or {}).get("status") or "")
+                    if not old_job or old_status not in {"failed", "cancelled", "cancelling"}:
+                        updated_ids.append(old_id)
+                        continue
+                    options = dict(old_job.get("options") or {})
+                    task_type = "generate_report" if str(old_job.get("task_type") or "") == "generate_report" else "generate_summary"
+                    new_id, _created = storage.create_or_get_typed_job(
+                        scan_id, task_type, options=options,
+                        owner_id=_request_owner_id() or "legacy",
+                    )
+                    updated_ids.append(str(new_id))
+                if scalar:
+                    if updated_ids:
+                        checkpoint[key] = updated_ids[0]
+                else:
+                    checkpoint[key] = list(dict.fromkeys(updated_ids))
+                replacement_ids.extend(updated_ids)
+            if "preliminary_summary_job_ids" in resumable_children[import_status]:
+                checkpoint["preliminary_summary_completed"] = sum(
+                    1 for item in checkpoint.get("preliminary_summary_job_ids") or []
+                    if (storage.get_job(str(item)) or {}).get("status") == "completed"
+                )
+            storage.update_import_task(scan_id, checkpoint=checkpoint)
+            storage.set_package_processing_state(scan_id, "running", "已从检查点恢复中断的摘要和概览任务。")
+            storage.update_analysis_progress_status(scan_id, "queued", "已从检查点恢复中断任务，继续生成摘要和情报概览。", "summary_resume")
+            queued = [item for item in replacement_ids if (storage.get_job(item) or {}).get("status") in {"queued", "running"}]
+            if queued:
+                return jsonify({
+                    "ok": True, "accepted": True, "job_id": queued[0],
+                    "reused_active_job": False, "mode": mode,
+                    "batch_files": len(queued), "preferred_matches": 0,
+                    "processing": _package_processing_status(scan_id, scan_result),
+                    "status_url": "/api/jobs/{}".format(queued[0]),
+                }), 202
         continue_full = bool(payload.get("continue_full", True))
         inventory_paths = set(_inventory_by_path(scan_result))
         preferred_paths = []
@@ -5466,8 +5652,18 @@ def supplement_scan_selection(scan_id):
         current = storage.get_scan_selection(scan_id) or {}
         task = storage.get_import_task(scan_id) or {}
         task_status = str(task.get("status") or "")
-        if task_status not in {"deep_summarizing_files", "deep_summarizing_nodes", "deep_update_available"}:
-            return api_error("请等待初步概览或当前更新完成后再补充文件。", 409, {"task_status": task_status})
+        # Supplement is deliberately available after a batch reaches a stable
+        # checkpoint as well. Users should be able to come back later and add
+        # the files that were left outside the first selection. Active model
+        # stages still remain protected so a second batch cannot race the
+        # current checkpoint.
+        supplementable = {"deep_summarizing_files", "deep_summarizing_nodes",
+                          "deep_update_available", "completed", "partial",
+                          "paused", "waiting_for_deep_selection",
+                          "preliminary_overview", "parsed_overview",
+                          "deep_paused"}
+        if task_status not in supplementable:
+            return api_error("请等待当前分析批次到达可补充状态后再添加文件。", 409, {"task_status": task_status})
         if not isinstance(payload.get("included_paths", []), list):
             raise ValueError("included_paths 必须是数组")
         inventory = _inventory_by_path(scan_result)
@@ -6040,12 +6236,26 @@ def get_file_conclusions(scan_id):
     # migration or forcing the user to rerun the entire package.
     if (
         (summary.get("summary_type") or summary_type) == "file"
-        and summary.get("claim_contract") != "file-claims/1.0"
+        and (
+            summary.get("claim_contract") not in {
+                "file-claims/1.0", "file-claims/preview-1.0"
+            }
+            or not summary.get("file_conclusions")
+        )
     ):
         document = storage.get_document(scan_id, node_path)
         if document:
-            summary.update(build_file_claims(summary, document.get("evidence", [])))
-            storage.save_summary(scan_id, node_path, "file", summary)
+            is_preliminary = (
+                summary_type == staged_summary_type("preliminary", "file")
+                or str(summary.get("analysis_stage") or "").lower() == "preliminary"
+            )
+            if is_preliminary:
+                summary.update(_preview_claim_contract(summary, document.get("evidence", [])))
+                save_type = staged_summary_type("preliminary", "file")
+            else:
+                summary.update(build_file_claims(summary, document.get("evidence", [])))
+                save_type = summary_type if summary_type == staged_summary_type("deep", "file") else "file"
+            storage.save_summary(scan_id, node_path, save_type, summary)
     return jsonify({
         "ok": True,
         "scan_id": scan_id,
@@ -6143,7 +6353,7 @@ def tree_edits(scan_id):
         payload = request.get_json(silent=True) or {}
         operation = str(payload.get("operation") or "").strip().lower()
         edit_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
-        allowed = {"rename", "confirm", "mount", "merge", "split", "undo", "redo"}
+        allowed = {"create", "rename", "confirm", "mount", "merge", "split", "undo", "redo"}
         if operation not in allowed:
             raise ValueError("不支持的目录树操作")
         analysis = storage.get_analysis(scan_id)
@@ -6160,6 +6370,17 @@ def tree_edits(scan_id):
         documents = {item.get("path") for item in storage.list_documents(scan_id, hydrate=False)}
         if operation in {"rename", "confirm", "mount", "split"} and str(edit_payload.get("node_id") or "") not in node_ids:
             raise ValueError("目录树节点不存在")
+        if operation == "create":
+            name = str(edit_payload.get("name") or "").strip()
+            paths = sorted(set(str(value).replace("\\", "/") for value in edit_payload.get("paths") or [] if value))
+            parent_id = str(edit_payload.get("parent_id") or "").strip()
+            if not name or not paths:
+                raise ValueError("新节点必须提供名称和文件")
+            if parent_id and parent_id not in node_ids:
+                raise ValueError("父节点不存在")
+            inventory = set(storage.inventory_paths_under(scan_id, "."))
+            if not set(paths).issubset(documents | inventory):
+                raise ValueError("只能整理当前数据包内的文件")
         if operation == "mount":
             path = str(edit_payload.get("path") or "").replace("\\", "/")
             if path not in documents:
@@ -6554,6 +6775,21 @@ def _conversation_projection_fallback(retrieval_request):
     }
 
 
+def _conversation_package_context(scan_id):
+    """Read the selected package's existing summaries and parsed artifacts.
+
+    This is intentionally a read-only conversation-side adapter.  It never
+    reparses, regenerates summaries, or writes to the ordinary analysis data.
+    """
+    try:
+        if str(scan_id).startswith("lp-"):
+            return build_large_context(large_package_store, str(scan_id))
+        return build_standard_context(storage, str(scan_id))
+    except Exception as exc:
+        logger.warning("conversation package context unavailable for %s: %s", scan_id, exc)
+        return {"package_id": str(scan_id), "coverage": {"scope": "package", "status": "unavailable"}, "file_summaries": [], "error": str(exc)[:240]}
+
+
 def _conversation_retrieve(retrieval_request):
     started_at = time.monotonic()
     cache_key = (
@@ -6574,6 +6810,56 @@ def _conversation_retrieve(retrieval_request):
             return copy.deepcopy(cached[1])
     query = retrieval_request.query
     scope = retrieval_request.scope
+    package_context = _conversation_package_context(retrieval_request.scan_id)
+    # Restrict model-facing summaries to the active directory/file scope.
+    if isinstance(package_context, dict) and scope.kind != "package":
+        scoped_files = [item for item in (package_context.get("file_summaries") or []) if scope.contains_source(item.get("path"))]
+        package_context = dict(package_context)
+        package_context["file_summaries"] = scoped_files
+        package_context["coverage"] = dict(package_context.get("coverage") or {})
+        package_context["coverage"]["scope"] = scope.kind
+        package_context["coverage"]["scope_files"] = len(scoped_files)
+    if str(retrieval_request.scan_id).startswith("lp-"):
+        # The isolated large-package store has no ordinary evidence_index.  Use
+        # its persisted quick/deep summaries as a read-only evidence corpus.
+        files = (package_context or {}).get("file_summaries") or []
+        raw_tokens = re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9_./-]+", str(query or "").casefold())
+        query_tokens = []
+        for token in raw_tokens:
+            if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 6:
+                query_tokens.extend(token[index:index + 2] for index in range(0, len(token) - 1, 2))
+            else:
+                query_tokens.append(token)
+        indexed = []
+        for file in files:
+            text = str(file.get("summary") or "")
+            haystack = "{} {}".format(file.get("path") or "", text).casefold()
+            if query_tokens and not all(token in haystack for token in query_tokens):
+                if not any(token in haystack for token in query_tokens):
+                    continue
+            indexed.append({
+                "evidence_id": "large:{}:{}".format(retrieval_request.scan_id, file.get("path")),
+                "source_path": file.get("path"),
+                "text": text,
+                "original_text": text,
+                "location": {"source": "file_summary"},
+                "evidence_role": "文件摘要",
+                "archive_source_path": file.get("path"),
+            })
+        if retrieval_request.intent in {"summary", "analysis", "comparison", "timeline", "relationship", "contradiction", "risk", "multi_task"} and not indexed:
+            indexed = [{
+                "evidence_id": "large:{}:{}".format(retrieval_request.scan_id, file.get("path")),
+                "source_path": file.get("path"), "text": file.get("summary") or "",
+                "original_text": file.get("summary") or "", "location": {"source": "file_summary"},
+                "evidence_role": "文件摘要", "archive_source_path": file.get("path"),
+            } for file in files]
+        result = retrieve_evidence({}, query, top_k=retrieval_request.top_k, indexed_chunks=indexed)
+        result["package_context"] = package_context
+        all_paths = [str(item.get("path")) for item in files if item.get("path")]
+        result["candidate_paths"] = all_paths
+        result["related_file_paths"] = all_paths if retrieval_request.intent in {"summary", "analysis", "multi_task"} else [str(item.get("source_path")) for item in result.get("results") or [] if item.get("source_path")]
+        result["coverage"] = {**(result.get("coverage") or {}), "scope": "package", "total_files": len(files), "candidate_files": len(files), "inspected_files": len(result.get("results") or []), "query_coverage": 1.0 if files else 0.0, "coverage_basis": "package_summary"}
+        return result
     if scope.kind in {"topic", "entity", "file_type"}:
         query = "{} {}".format(scope.value, query)
     elif scope.kind == "time":
@@ -6614,6 +6900,7 @@ def _conversation_retrieve(retrieval_request):
     result = retrieve_evidence(
         {}, query, top_k=retrieval_request.top_k, indexed_chunks=indexed,
     )
+    result["package_context"] = package_context
     # Evidence from archive members and structured-file partitions is stored
     # under the logical source path (for example
     # ``bundle.zip::letters/a.txt``).  Do not collapse that back to its
@@ -6634,6 +6921,26 @@ def _conversation_retrieve(retrieval_request):
             physical_by_evidence_path.setdefault(evidence_path, physical_path)
         if physical_path and physical_path not in physical_candidate_paths:
             physical_candidate_paths.append(physical_path)
+    # File discovery is complete at the file level even though the model sees
+    # only bounded evidence chunks.  Broad package questions attach every
+    # summarized file; focused questions use the complete FTS path pass.
+    broad_package_question = retrieval_request.scope.kind in {"package", "directory", "files"} and retrieval_request.intent in {
+        "summary", "analysis", "multi_task"
+    }
+    if broad_package_question:
+        result["related_file_paths"] = [
+            str(item.get("path")) for item in (package_context or {}).get("file_summaries") or []
+            if item.get("path")
+        ]
+    else:
+        try:
+            result["related_file_paths"] = storage.search_evidence_file_paths(
+                retrieval_request.scan_id, query, scope=scope.retrieval_path,
+                source_paths=source_paths,
+            )
+        except Exception:
+            result["related_file_paths"] = list(candidate_paths)
+    result["candidate_paths"] = list(candidate_paths)
     states = storage.get_file_states(
         retrieval_request.scan_id,
         candidate_paths + physical_candidate_paths,
@@ -6827,6 +7134,16 @@ conversation_engine = ConversationEngine(
 
 
 def _conversation_index_status(scan_id):
+    if str(scan_id).startswith("lp-"):
+        package = large_package_store.get(str(scan_id), owner_id=_request_owner_id() or "legacy")
+        if not package:
+            return {"usable": False, "ready": False, "status": "missing", "code": "index_unavailable", "total_files": 0}
+        counts = large_package_store.counts(str(scan_id)) or {}
+        status = str(package.get("status") or "queued")
+        total = int(counts.get("total_files") or 0)
+        quick = counts.get("quick") or {}
+        ready = status in {"waiting_for_selection", "completed"} and total > 0 and not int(quick.get("queued", 0) or 0) and not int(quick.get("running", 0) or 0)
+        return {"usable": bool(ready), "ready": bool(status == "completed"), "status": status, "code": "ready" if ready else "index_unavailable", "total_files": total, "indexed_files": int(quick.get("completed", 0) or 0), "failed_files": int(quick.get("failed", 0) or 0), "package_type": "large"}
     documents = storage.count_documents(scan_id)
     evidence = storage.count_evidence_index(scan_id)
     preview_counts = storage.file_preview_counts(scan_id)
@@ -7202,6 +7519,21 @@ def _resolved_conversation_scope(scan_id, scan_result, payload):
     return ConversationScope.from_dict(payload)
 
 
+def _conversation_package_record(scan_id, payload=None):
+    """Resolve either the ordinary scan or the isolated large package.
+
+    Conversation storage stays shared, while the source package remains
+    isolated; no ordinary scan tables are created for an ``lp-`` package.
+    """
+    package_type = str((payload or {}).get("package_type") or "").lower()
+    if package_type == "large" or str(scan_id).startswith("lp-"):
+        item = large_package_store.get(str(scan_id), owner_id=_request_owner_id() or "legacy")
+        if not item:
+            raise ValueError("大数据包不存在、已失效或不属于当前用户")
+        return {"root": item.get("root_path"), "package_type": "large", "large_package": item}
+    return require_scan(scan_id)
+
+
 @app.route("/api/package-overview/<scan_id>")
 def package_overview(scan_id):
     """Return only intrinsic facts about the imported data package."""
@@ -7536,9 +7868,28 @@ def package_file_detail(scan_id, node_path):
                 elif storage.get_summary(scan_id, node_path, staged_summary_type("preliminary", "file")):
                     summary_type = staged_summary_type("preliminary", "file")
         summary = storage.get_summary(scan_id, node_path, summary_type)
-        if summary and summary_type == "file" and summary.get("claim_contract") != "file-claims/1.0" and document:
-            summary.update(build_file_claims(summary, document.get("evidence", [])))
-            storage.save_summary(scan_id, node_path, "file", summary)
+        if summary and document and (
+            not summary.get("file_conclusions")
+            or summary.get("claim_contract") not in {
+                "file-claims/1.0", "file-claims/preview-1.0"
+            }
+        ):
+            is_preliminary = (
+                summary_type == staged_summary_type("preliminary", "file")
+                or str(summary.get("analysis_stage") or "").lower() == "preliminary"
+            )
+            if is_preliminary:
+                summary.update(_preview_claim_contract(summary, document.get("evidence", [])))
+                save_type = staged_summary_type("preliminary", "file")
+            elif summary_type == staged_summary_type("deep", "file"):
+                summary.update(build_file_claims(summary, document.get("evidence", [])))
+                save_type = summary_type
+            elif summary_type == "file":
+                summary.update(build_file_claims(summary, document.get("evidence", [])))
+                save_type = "file"
+            else:
+                save_type = summary_type
+            storage.save_summary(scan_id, node_path, save_type, summary)
         if not document and not summary:
             return api_error("该文件尚未完成解析", 404)
         return jsonify({
@@ -7655,7 +8006,7 @@ def create_conversation():
     payload = request.get_json(silent=True) or {}
     try:
         scan_id = str(payload.get("scan_id") or "")
-        scan_result = require_scan(scan_id)
+        scan_result = _conversation_package_record(scan_id, payload)
         scope = _resolved_conversation_scope(scan_id, scan_result, payload.get("scope") or {})
         session = conversation_engine.new_session(
             scan_id, scope=scope, title=str(payload.get("title") or "资料问答")[:200]
@@ -7673,7 +8024,7 @@ def create_conversation():
 @app.route("/api/conversations/<scan_id>")
 def conversations_for_scan(scan_id):
     try:
-        require_scan(scan_id)
+        _conversation_package_record(scan_id, request.args)
         return jsonify({
             "ok": True,
             "items": storage.list_conversations(scan_id, _request_owner_id() or "legacy"),
@@ -7686,7 +8037,7 @@ def conversations_for_scan(scan_id):
 def get_conversation(session_id):
     scan_id = str(request.args.get("scan_id", "") or "")
     try:
-        require_scan(scan_id)
+        _conversation_package_record(scan_id, request.args)
         message_limit = max(
             20, min(200, int(request.args.get("message_limit", 100) or 100))
         )
@@ -7718,7 +8069,7 @@ def create_conversation_turn(session_id):
     owner_id = _request_owner_id() or "legacy"
     try:
         scan_id = str(payload.get("scan_id") or "")
-        scan_result = require_scan(scan_id)
+        scan_result = _conversation_package_record(scan_id, payload)
         stored = storage.get_conversation(session_id, owner_id, scan_id=scan_id)
         if not stored:
             return api_error("会话不存在", 404)
@@ -7761,7 +8112,7 @@ def create_conversation_turn(session_id):
 @app.route("/api/scans/<scan_id>/rebuild-search-index", methods=["POST"])
 def rebuild_search_index(scan_id):
     try:
-        require_scan(scan_id)
+        _conversation_package_record(scan_id, request.args)
         options = {
             "workflow_source": "index_rebuild",
             "scope_label": "重建轻量预览与对话证据索引",
@@ -8712,6 +9063,13 @@ def ask_numeric():
 def _job_api_view(source, include_blocker=True, compact=False):
     job = dict(source or {})
     if compact:
+        # The compact task list intentionally omits the full options payload,
+        # but the UI still needs the workflow source to distinguish
+        # preliminary summaries from deep summaries. Expose only this stable
+        # display field; task execution continues to use the original options.
+        options = job.get("options") if isinstance(job.get("options"), dict) else {}
+        if options.get("workflow_source"):
+            job["workflow_source"] = str(options.get("workflow_source"))
         result = job.get("result")
         if isinstance(result, dict):
             allowed_result_fields = {
@@ -9860,6 +10218,209 @@ def formal_directory(scan_id):
         }, "notice": "仅深度解析正文、文件结论和通过证据校验的内容可进入正式目录。"})
     except ValueError as exc:
         return api_error(str(exc), 404)
+
+
+# ---------------------------------------------------------------------------
+# Isolated streaming large-package workflow.
+# These routes intentionally use large_package.db and never call the ordinary
+# scan/analyze task APIs.
+@app.route("/api/large-packages", methods=["POST"])
+def create_large_package():
+    payload = request.get_json(silent=True) or {}
+    try:
+        root = str(payload.get("path") or "").strip()
+        if not root:
+            raise ValueError("请输入要处理的大数据包目录")
+        item = large_package_store.create(root, owner_id=_request_owner_id() or "legacy")
+        return jsonify({"ok": True, "large_package": item, "package_id": item["id"]}), 202
+    except (ValueError, OSError) as exc:
+        return api_error(str(exc), 400)
+
+
+def _large_package_owned(package_id):
+    item = large_package_store.get(package_id, owner_id=_request_owner_id() or "legacy")
+    if not item:
+        raise ValueError("大数据包任务不存在、已失效或不属于当前访问用户")
+    return item
+
+
+@app.route("/api/large-packages/history")
+def list_large_package_history():
+    try:
+        query = str(request.args.get("query") or "").strip()
+        limit = int(request.args.get("limit", 8))
+        offset = int(request.args.get("offset", 0))
+        return jsonify({"ok": True, **large_package_store.list_history(
+            owner_id=_request_owner_id() or "legacy", query=query, limit=limit, offset=offset
+        )})
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/large-packages/<package_id>")
+def get_large_package(package_id):
+    try:
+        item = _large_package_owned(package_id)
+        item["counts"] = large_package_store.counts(package_id)
+        return jsonify({"ok": True, "large_package": item})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/files")
+def list_large_package_files(package_id):
+    try:
+        _large_package_owned(package_id)
+        try:
+            limit = max(1, min(500, int(request.args.get("limit", 100))))
+            offset = max(0, int(request.args.get("offset", 0)))
+        except (TypeError, ValueError):
+            limit, offset = 100, 0
+        rows = large_package_store.list_files(
+            package_id, limit=limit, offset=offset,
+            query=str(request.args.get("q") or "").strip(),
+            category=str(request.args.get("category") or "").strip(),
+        )
+        return jsonify({"ok": True, "files": rows, "counts": large_package_store.counts(package_id),
+                        "offset": offset, "limit": limit})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/file")
+def large_package_file(package_id):
+    """Read/download one file from an isolated large package."""
+    try:
+        item = _large_package_owned(package_id)
+        path = str(request.args.get("path") or "").replace("\\", "/").strip()
+        valid = set(large_package_store.existing_paths(package_id, [path]))
+        if not path or path not in valid:
+            return api_error("文件不属于当前大数据包", 404)
+        return send_from_directory(item["root_path"], path, as_attachment=str(request.args.get("download") or "") in {"1", "true", "yes"})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/nodes", methods=["GET", "POST"])
+def large_package_nodes(package_id):
+    try:
+        _large_package_owned(package_id)
+        if request.method == "GET":
+            return jsonify({"ok": True, "nodes": large_package_store.list_user_nodes(package_id)})
+        payload = request.get_json(silent=True) or {}
+        name = str(payload.get("name") or "").strip()
+        paths = payload.get("paths") or []
+        if not name or not isinstance(paths, list):
+            raise ValueError("节点名称和文件不能为空")
+        node = large_package_store.create_user_node(package_id, name, paths, payload.get("parent_id"))
+        return jsonify({"ok": True, "node": node}), 201
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/large-packages/<package_id>/catalog")
+def large_package_catalog(package_id):
+    try:
+        _large_package_owned(package_id)
+        catalog = large_package_store.catalog(package_id)
+        if not catalog:
+            return api_error("大数据包任务不存在", 404)
+        return jsonify({"ok": True, "catalog": catalog})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/select", methods=["POST"])
+def select_large_package_files(package_id):
+    try:
+        _large_package_owned(package_id)
+        payload = request.get_json(silent=True) or {}
+        paths = payload.get("paths") or payload.get("selected_paths") or []
+        if not isinstance(paths, list):
+            raise ValueError("paths 必须是文件相对路径数组")
+        valid = large_package_store.existing_paths(package_id, paths)
+        if not valid:
+            raise ValueError("没有选择有效文件；请先完成快速解析并选择文件")
+        selection = large_package_store.save_selection(
+            package_id, valid, rule=payload.get("rule") or {"kind": "manual"}
+        )
+        return jsonify({"ok": True, "selection": selection}), 202
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/large-packages/<package_id>/report")
+def large_package_report(package_id):
+    try:
+        from services.large_package_reporting import build_report
+        item = _large_package_owned(package_id)
+        return jsonify({"ok": True, "report": build_report(large_package_store, item)})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/report/download")
+def download_large_package_report(package_id):
+    try:
+        from services.large_package_reporting import export_report
+        item = _large_package_owned(package_id)
+        file_format = str(request.args.get("format") or "docx").lower()
+        if file_format not in {"docx", "json"}:
+            return api_error("仅支持 Word 或 JSON 概览下载", 400)
+        output = export_report(large_package_store, item, file_format)
+        return send_from_directory(str(output.parent), output.name, as_attachment=True)
+    except ValueError as exc:
+        message = str(exc)
+        return api_error(message, 409 if "深度摘要尚未完成" in message else 404)
+    except Exception:
+        logger.exception("大数据包概览导出失败")
+        return api_error("大数据包概览导出失败，请稍后重试", 500)
+
+
+@app.route("/api/large-packages/<package_id>/retry-failed", methods=["POST"])
+def retry_large_package_failed(package_id):
+    """Requeue only failed quick-parse files in the isolated large workflow."""
+    try:
+        item = _large_package_owned(package_id)
+        paths = large_package_store.retry_failed_quick(package_id)
+        refreshed = large_package_store.get(package_id, item["owner_id"])
+        return jsonify({"ok": True, "accepted": bool(paths), "retry_files": len(paths),
+                        "paths": paths[:100], "large_package": refreshed}), 202 if paths else 200
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/pause", methods=["POST"])
+def pause_large_package(package_id):
+    try:
+        item = _large_package_owned(package_id)
+        large_package_store.update_package(package_id, status="paused", message="已暂停；已完成文件和检查点保留")
+        return jsonify({"ok": True, "large_package": large_package_store.get(package_id, item["owner_id"])})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/resume", methods=["POST"])
+def resume_large_package(package_id):
+    try:
+        item = _large_package_owned(package_id)
+        if item.get("status") == "paused":
+            large_package_store.update_package(package_id, status="queued", message="已恢复，等待大数据包 Worker 继续处理")
+        return jsonify({"ok": True, "large_package": large_package_store.get(package_id, item["owner_id"])})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/cancel", methods=["POST"])
+def cancel_large_package(package_id):
+    try:
+        item = _large_package_owned(package_id)
+        large_package_store.update_package(package_id, status="cancelled", message="已取消；已完成结果保留")
+        return jsonify({"ok": True, "large_package": large_package_store.get(package_id, item["owner_id"])})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
 
 if __name__ == "__main__":
     import uvicorn

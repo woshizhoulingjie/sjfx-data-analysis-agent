@@ -496,6 +496,7 @@
       state.researchBrief = response.research_brief || {};
       state.reportArtifact = response.report_artifact || null;
       renderOverview(state.overview);
+      if ($("conversationScopeKind") && $("conversationScopeKind").value === "directory") renderScopeFields();
     } catch (error) {
       if (state.scanId === requestedScanId && state.overviewRequestSeq === requestSeq) setOverviewState(error.message || '无法加载数据包概览', 'error');
     } finally {
@@ -521,9 +522,16 @@
       host.innerHTML = '<label for="conversationScopeStart">开始时间</label><input id="conversationScopeStart" placeholder="例如 2020-01-01"><label for="conversationScopeEnd">结束时间</label><input id="conversationScopeEnd" placeholder="例如 2024-12-31">';
     } else if (kind === 'files') {
       host.innerHTML = '<label for="conversationScopeValue">文件路径（每行一个）</label><textarea id="conversationScopeValue" rows="5" placeholder="letters/a.eml\nreports/annual.pdf"></textarea>';
+    } else if (kind === 'directory') {
+      const directories = itemsOf(state.overview && state.overview.directories)
+        .filter((item) => item && item.path && item.path !== '.')
+        .slice(0, 80);
+      const options = ['<option value="">从内容地图选择目录节点</option>']
+        .concat(directories.map((item) => `<option value="${escapeHtml(item.path)}">${escapeHtml(item.path)} · ${integer(item.recursive_file_count)} 个文件</option>`));
+      host.innerHTML = `<label for="conversationScopeNode">目录节点</label><select id="conversationScopeNode">${options.join('')}</select><label for="conversationScopeValue">或输入相对目录路径</label><input id="conversationScopeValue" placeholder="例如：letters/2024">`;
     } else {
-      const labels = { topic: '主题名称', directory: '相对目录路径', entity: '人物或机构名称', file_type: '格式、文档类型或语言' };
-      const examples = { topic: '例如：项目交付', directory: '例如：letters/2024', entity: '例如：某某机构', file_type: '例如：.pdf 或 报告' };
+      const labels = { topic: '主题名称', entity: '人物或机构名称', file_type: '格式、文档类型或语言' };
+      const examples = { topic: '例如：项目交付', entity: '例如：某某机构', file_type: '例如：.pdf 或 报告' };
       host.innerHTML = `<label for="conversationScopeValue">${escapeHtml(labels[kind])}</label><input id="conversationScopeValue" placeholder="${escapeHtml(examples[kind])}">`;
     }
     updateContextChip();
@@ -551,8 +559,10 @@
       delete constraints.source_paths;
       return { kind: 'time', value: Object.assign({}, start ? { start } : {}, end ? { end } : {}), source_paths: sourcePaths, constraints };
     }
-    const value = ($('conversationScopeValue').value || '').trim();
-    if (!value) throw new Error(`请填写${scopeKindLabel(kind)}`);
+    const selectedNode = kind === 'directory' && $('conversationScopeNode')
+      ? ($('conversationScopeNode').value || '').trim() : '';
+    const value = selectedNode || (($('conversationScopeValue') && $('conversationScopeValue').value) || '').trim();
+    if (!value) throw new Error(`请选择或填写${scopeKindLabel(kind)}`);
     if (kind === 'files') {
       const paths = Array.from(new Set(value.split(/[\n,，]+/).map((item) => item.trim()).filter(Boolean)));
       if (!paths.length) throw new Error('请至少填写一个文件路径');
@@ -595,6 +605,9 @@
     if (scope.kind === 'time') {
       $('conversationScopeStart').value = `${scope.value}-01-01`;
       $('conversationScopeEnd').value = `${scope.value}-12-31`;
+    } else if (scope.kind === 'directory') {
+      if ($('conversationScopeNode')) $('conversationScopeNode').value = scope.value || '';
+      if ($('conversationScopeValue')) $('conversationScopeValue').value = scope.value || '';
     } else if ($('conversationScopeValue')) {
       $('conversationScopeValue').value = scope.value || '';
     }
@@ -810,14 +823,16 @@
     const evidenceStatus = turn && turn.evidence_status;
     const simpleFileSearch = intent === 'file_search' || Boolean(turn && turn.file_search);
     const fileResults = turn && Array.isArray(turn.file_results) ? turn.file_results : [];
-    const fileCards = fileResults.length ? `<section class="v2-file-results"><header><strong>相关文件</strong><span>${integer(turn.file_results_total || fileResults.length)} 个命中文件${turn.file_results_coverage ? ` · ${escapeHtml(turn.file_results_coverage)}` : ''}</span><button type="button" data-export-file-folder>导出资料夹</button></header>${fileResults.slice(0, 20).map((item) => {
+    const completePackageFiles = Boolean(turn && Array.isArray(turn.related_file_paths) && turn.related_file_paths.length);
+    const renderedFileResults = completePackageFiles ? fileResults : fileResults.slice(0, 20);
+    const fileCards = fileResults.length ? `<section class="v2-file-results"><header><div><strong>相关文件</strong><span>${integer(turn.file_results_total || fileResults.length)} 个命中文件${turn.file_results_coverage ? ` · ${escapeHtml(turn.file_results_coverage)}` : ''}</span></div><div class="v2-file-bulk-actions"><span class="v2-file-selection-status" data-file-selection-count>未选择文件</span><button type="button" data-select-all-files>全选</button><button type="button" data-create-node-selected disabled>选中后创建节点</button><button type="button" data-export-file-folder>导出资料夹</button></div></header>${renderedFileResults.map((item) => {
       const path = item.node_path || item.path || item.source_path || '';
       const snippets = Array.isArray(item.snippets) ? item.snippets.filter(Boolean) : [];
       const preview = item.preview || {};
       const previewText = preview.text || snippets.join(' … ');
       const pages = Array.isArray(item.pages) && item.pages.length ? ` · 页 ${item.pages.slice(0, 3).join(', ')}` : '';
       const status = item.analysis_level || item.status || '';
-      return `<article class="v2-file-card"><div><strong title="${escapeHtml(path)}">${escapeHtml(basename(path))}</strong><small>${escapeHtml(path)} · ${escapeHtml(item.extension || '未知类型')} · ${escapeHtml(formatBytes(item.size || 0))}${pages}${status ? ` · ${escapeHtml(status)}` : ''}</small>${previewText ? `<p>${escapeHtml(truncate(previewText, 260))}</p>` : ''}</div><div class="v2-file-card-actions"><button type="button" data-file-open="${escapeHtml(path)}">阅读原文</button><button type="button" data-file-download="${escapeHtml(path)}">下载原文件</button><button type="button" data-file-deep-summary="${escapeHtml(path)}">深度摘要</button><button type="button" data-file-collect="${escapeHtml(path)}">加入资料夹</button></div></article>`;
+      return `<article class="v2-file-card"><label class="v2-file-select"><input type="checkbox" data-file-select="${escapeHtml(path)}"><span class="sr-only">选择 ${escapeHtml(basename(path))}</span></label><div><strong title="${escapeHtml(path)}">${escapeHtml(basename(path))}</strong><small>${escapeHtml(path)} · ${escapeHtml(item.extension || '未知类型')} · ${escapeHtml(formatBytes(item.size || 0))}${pages}${status ? ` · ${escapeHtml(status)}` : ''}</small>${previewText ? `<p>${escapeHtml(truncate(previewText, 260))}</p>` : ''}</div><div class="v2-file-card-actions"><button type="button" data-file-open="${escapeHtml(path)}">阅读原文</button><button type="button" data-file-download="${escapeHtml(path)}">下载原文件</button><button type="button" data-file-deep-summary="${escapeHtml(path)}">深度摘要</button><button type="button" data-file-collect="${escapeHtml(path)}">加入资料夹</button><button type="button" data-file-node="${escapeHtml(path)}">归入新节点</button></div></article>`;
     }).join('')}</section>` : '';
     const meta = role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intentLabel(intent))}</span>${task ? `<span>${escapeHtml(task)}</span>` : ''}${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${evidenceStatus && evidenceStatus !== 'not_required' ? `<span>证据：${escapeHtml(evidenceStatus)}</span>` : ''}</div>` : '';
     const content = role === 'assistant' ? safeMarkdown(assistantDisplayText(message.content)) : `<p>${escapeHtml(message.content || '')}</p>`;
@@ -960,6 +975,11 @@
       state.turns.clear();
       registerAnalysisTurns(response.turns || []);
       for (const historicalTurn of (response.turns || [])) {
+        const storedResult = historicalTurn.result && typeof historicalTurn.result === 'object' ? historicalTurn.result : {};
+        if (Array.isArray(storedResult.related_file_paths) && storedResult.related_file_paths.length) {
+          await attachFileResults(historicalTurn.question, historicalTurn);
+          continue;
+        }
         const historicalIntent = historicalTurn.result && historicalTurn.result.intent;
         const intentName = historicalIntent && typeof historicalIntent === 'object' ? historicalIntent.name : historicalIntent;
         if (intentName === 'file_search' || /(?:搜索|查找|找出|找到|列出|显示|筛选).{0,80}(?:文件|资料|文档)?/.test(historicalTurn.question || '')) {
@@ -1167,8 +1187,11 @@
   async function downloadOriginalFile(path) {
     if (!state.scanId || !path) return;
     try {
+      const endpoint = String(state.scanId).startsWith('lp-')
+        ? `/api/large-packages/${encodeURIComponent(state.scanId)}/file?path=${encodeURIComponent(path)}&download=1`
+        : `/api/document/${encodeURIComponent(state.scanId)}/raw?path=${encodeURIComponent(path)}&download=1`;
       const response = await window.SJFXAuth.request(
-        `/api/document/${encodeURIComponent(state.scanId)}/raw?path=${encodeURIComponent(path)}&download=1`,
+        endpoint,
         { headers: { Accept: '*/*' } },
       );
       if (!response.ok) throw new Error('原文件下载失败');
@@ -1195,8 +1218,11 @@
     $('fileReaderContent').textContent = '';
     modal.dataset.path = path;
     try {
+      const endpoint = String(state.scanId).startsWith('lp-')
+        ? `/api/large-packages/${encodeURIComponent(state.scanId)}/file?path=${encodeURIComponent(path)}`
+        : `/api/document/${encodeURIComponent(state.scanId)}/raw?path=${encodeURIComponent(path)}`;
       const response = await window.SJFXAuth.request(
-        `/api/document/${encodeURIComponent(state.scanId)}/raw?path=${encodeURIComponent(path)}`,
+        endpoint,
         { headers: { Accept: '*/*' } },
       );
       if (!response.ok) throw new Error('原文件读取失败');
@@ -1273,8 +1299,85 @@
     } catch (error) { notify(error.message || '资料夹生成失败', true); }
   }
 
+  function askNodeName(paths) {
+    if (window.__sjfxNodeDialogPromise) return window.__sjfxNodeDialogPromise;
+    window.__sjfxNodeDialogPromise = new Promise((resolve) => {
+      const overlay = document.createElement('div');
+      overlay.className = 'v2-node-dialog';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.innerHTML = `<div class="v2-node-dialog-panel"><span class="section-kicker">ORGANIZE MATERIALS</span><h3>创建资料节点</h3><p>已选择 ${paths.length} 个文件。为它们命名一个新节点，之后可在智能目录中继续编辑。</p><label for="v2NodeName">节点名称</label><input id="v2NodeName" maxlength="120" value="待整理资料" autocomplete="off"><div class="v2-node-dialog-actions"><button type="button" data-node-cancel>取消</button><button type="button" class="primary" data-node-submit>创建节点</button></div></div>`;
+      document.body.appendChild(overlay);
+      const input = overlay.querySelector('#v2NodeName');
+      const finish = (value) => { overlay.remove(); window.__sjfxNodeDialogPromise = null; resolve(value); };
+      overlay.addEventListener('click', (event) => {
+        if (event.target === overlay || event.target.closest('[data-node-cancel]')) finish('');
+        if (event.target.closest('[data-node-submit]')) finish((input.value || '').trim());
+      });
+      input.addEventListener('keydown', (event) => { if (event.key === 'Enter') finish((input.value || '').trim()); if (event.key === 'Escape') finish(''); });
+      window.setTimeout(() => { input.focus(); input.select(); }, 0);
+    });
+    return window.__sjfxNodeDialogPromise;
+  }
+
+  async function createNodeFromFiles(paths, button) {
+    const selected = [...new Set((paths || []).filter(Boolean))];
+    if (!state.scanId || !selected.length) { notify('请先选择要整理的文件', true); return; }
+    const name = await askNodeName(selected);
+    if (!name) return;
+    if (button) { button.disabled = true; button.textContent = '创建中…'; }
+    try {
+      const endpoint = String(state.scanId).startsWith('lp-')
+        ? `/api/large-packages/${encodeURIComponent(state.scanId)}/nodes`
+        : `/api/tree-edits/${encodeURIComponent(state.scanId)}`;
+      const body = String(state.scanId).startsWith('lp-')
+        ? { name, paths: selected }
+        : { operation: 'create', payload: { name, paths: selected } };
+      const response = await api(endpoint, { method: 'POST', body: JSON.stringify(body) });
+      if (response.analysis) window.dispatchEvent(new CustomEvent('sjfx:analysis-updated', { detail: response.analysis }));
+      notify(`已创建节点“${name}”，并归入 ${selected.length} 个文件`);
+      document.querySelectorAll('[data-file-select]').forEach((item) => { item.checked = false; });
+      updateFileSelectionActions();
+      if (button) button.textContent = '已创建节点';
+    } catch (error) {
+      if (button) { button.disabled = false; button.textContent = '选中后创建节点'; }
+      notify(error.message || '创建节点失败', true);
+    }
+  }
+
+  function updateFileSelectionActions() {
+    const selected = [...document.querySelectorAll('[data-file-select]:checked')];
+    const label = selected.length ? `已选择 ${selected.length} 个文件` : '未选择文件';
+    document.querySelectorAll('[data-create-node-selected]').forEach((button) => {
+      button.disabled = selected.length === 0;
+      button.setAttribute('aria-label', selected.length ? `用已选择的 ${selected.length} 个文件创建节点` : '请先选择文件');
+    });
+    document.querySelectorAll('[data-file-selection-count]').forEach((item) => { item.textContent = label; });
+  }
+
+  async function createNodeFromFile(path, button) {
+    return createNodeFromFiles([path], button);
+  }
+
   async function attachFileResults(question, turn) {
     if (!state.scanId || !turn || !turn.assistant_message_id) return;
+    const stored = state.turns.get(turn.assistant_message_id);
+    const resultPayload = turn.result && typeof turn.result === 'object' ? turn.result : {};
+    const relatedPaths = Array.isArray(resultPayload.related_file_paths)
+      ? resultPayload.related_file_paths.filter(Boolean)
+      : (stored && Array.isArray(stored.related_file_paths) ? stored.related_file_paths.filter(Boolean) : []);
+    if (relatedPaths.length && stored) {
+      // The backend resolves the complete related-file set.  Keep this list
+      // independent from the bounded evidence window shown to the model.
+      stored.related_file_paths = relatedPaths;
+      stored.file_results = relatedPaths.map((path) => ({
+        path, node_path: path, name: basename(path), analysis_level: '已归集',
+      }));
+      stored.file_results_total = relatedPaths.length;
+      stored.file_results_coverage = null;
+      stored.file_search = true;
+      return;
+    }
     const text = String(question || '').trim();
     const intent = turn.intent && typeof turn.intent === 'object' ? turn.intent.name : turn.intent;
     if (intent !== 'file_search' && !/(?:搜索|查找|找一下|找出|找到|列出|显示|筛选).{0,80}(?:文件|资料|文档)?|(?:哪些|相关).{0,20}(?:文件|资料|文档)/.test(text)) return;
@@ -1285,15 +1388,15 @@
         method: 'POST',
         body: JSON.stringify({ scan_id: state.scanId, query, page: 1, page_size: 50 })
       });
-      const stored = state.turns.get(turn.assistant_message_id);
-      if (stored) {
-        stored.file_results = result.matched_files || [];
-        stored.file_results_total = result.matched_file_count || stored.file_results.length;
-        stored.file_results_coverage = result.coverage && result.coverage.complete === false
+      const target = state.turns.get(turn.assistant_message_id);
+      if (target) {
+        target.file_results = result.matched_files || [];
+        target.file_results_total = result.matched_file_count || target.file_results.length;
+        target.file_results_coverage = result.coverage && result.coverage.complete === false
           ? ((result.warnings || []).join('；') || '当前显示已建立索引范围内的结果')
           : null;
-        stored.file_search_query = query;
-        stored.file_search = true;
+        target.file_search_query = query;
+        target.file_search = true;
       }
     } catch (_) { /* File cards are an enhancement; the answer remains usable. */ }
   }
@@ -1807,7 +1910,10 @@
   function activate(route) {
     syncScan();
     if (route === 'overview') loadOverview(false);
-    if (route === 'chat') loadConversationList();
+    if (route === 'chat') {
+      loadConversationList();
+      if (state.scanId && !state.overview) loadOverview(false);
+    }
     if (route === 'translation') {
       loadTranslationList();
       const rememberedScan = window.sessionStorage.getItem(LAST_DOCUMENT_SCAN_KEY) || '';
@@ -1865,6 +1971,24 @@
       if (fileDownload) { downloadOriginalFile(fileDownload.dataset.fileDownload || ''); return; }
       const collectFile = event.target.closest('[data-file-collect]');
       if (collectFile) { collectFileForFolder(collectFile.dataset.fileCollect || '', collectFile); return; }
+      const nodeFile = event.target.closest('[data-file-node]');
+      if (nodeFile) { createNodeFromFile(nodeFile.dataset.fileNode || '', nodeFile); return; }
+      if (event.target.closest('[data-file-select]')) { updateFileSelectionActions(); return; }
+      if (event.target.closest('[data-select-all-files]')) {
+        const boxes = [...event.currentTarget.querySelectorAll('[data-file-select]')];
+        const shouldCheck = boxes.some((box) => !box.checked);
+        boxes.forEach((box) => { box.checked = shouldCheck; });
+        updateFileSelectionActions();
+        return;
+      }
+      if (event.target.closest('[data-create-node-selected]')) {
+        const button = event.target.closest('[data-create-node-selected]');
+        const selectedPaths = [...event.currentTarget.querySelectorAll('[data-file-select]:checked')]
+          .map((box) => box.dataset.fileSelect)
+          .filter(Boolean);
+        createNodeFromFiles(selectedPaths, button);
+        return;
+      }
       if (event.target.closest('[data-export-file-folder]')) { exportCollectedFolder(); return; }
       const deepSummary = event.target.closest('[data-file-deep-summary]');
       if (deepSummary) { queueFileDeepSummary(deepSummary.dataset.fileDeepSummary || '', deepSummary); return; }

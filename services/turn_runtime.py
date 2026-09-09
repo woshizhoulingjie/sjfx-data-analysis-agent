@@ -296,6 +296,8 @@ class AnalysisTurnRuntime:
             ordered_modes = list(plan.get("modes") or [])
             modes = set(ordered_modes)
             primary_mode = ordered_modes[0] if ordered_modes else "analysis"
+            # File discovery is a deterministic UX operation; factual modes still require verification.
+            verification_required = bool(modes - {"casual", "creative", "general_qa", "file_search"})
             scoped_inventory_paths = [
                 str(path) for path in inventory_paths or []
                 if scope.contains_source(path)
@@ -465,6 +467,11 @@ class AnalysisTurnRuntime:
                 return result
 
             turn_result = apply_scope_guard(turn_result)
+            # Keep the attachment rail complete for broad answers: evidence sent
+            # to the model is bounded, while the selected scope's file set is not.
+            if (modes & {"summary", "analysis", "multi_task"}) and execution_scope.kind in {"package", "directory", "files"}:
+                turn_result["related_file_paths"] = list(dict.fromkeys(scoped_inventory_paths))[:5000]
+                turn_result["file_results_total"] = len(turn_result["related_file_paths"])
 
             promotion = dict(turn_result.get("promotion_request") or {})
             inventory = set(scoped_inventory_paths)
@@ -546,7 +553,7 @@ class AnalysisTurnRuntime:
                     list(turn_result.get("warnings") or []) + [warning]
                 ))
 
-            if not modes.intersection({"casual", "creative", "general_qa"}):
+            if verification_required:
                 self._publish(
                     turn, "running", "verifying", 80, "正在逐条核验结论、数字、引用和反证"
                 )
@@ -575,7 +582,7 @@ class AnalysisTurnRuntime:
             while (
                 verification.get("needs_revision")
                 and revision_attempts < self.max_revision_attempts
-                and not modes.intersection({"casual", "creative", "general_qa"})
+                and verification_required
             ):
                 revision_attempts += 1
                 self._publish(
@@ -631,12 +638,19 @@ class AnalysisTurnRuntime:
                     analysis_plan=repair_plan,
                 )
                 turn_result = apply_scope_guard(turn_result)
+                if (modes & {"summary", "analysis", "multi_task"}) and execution_scope.kind in {"package", "directory", "files"}:
+                    turn_result["related_file_paths"] = list(dict.fromkeys(scoped_inventory_paths))[:5000]
+                    turn_result["file_results_total"] = len(turn_result["related_file_paths"])
                 verification = self._verify(
                     turn_id, repair_plan, turn_result, tool_results, batch_summary
                 )
                 plan = repair_plan
 
-            if verification.get("needs_revision") and not modes.intersection({"casual", "creative", "general_qa"}):
+            hard_unsupported = any(
+                item.get("status") == "unsupported"
+                for item in (verification.get("ledger") or {}).get("claims") or []
+            )
+            if verification.get("needs_revision") and verification_required and hard_unsupported:
                 turn_result = self.verifier.guard_result(turn_result, verification)
                 verification = self.verifier.verify(
                     turn_result,

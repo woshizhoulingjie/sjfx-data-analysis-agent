@@ -403,6 +403,9 @@ class Config:
     CANDIDATE_PREVIEW_OUTPUT_TOKENS = max(160, min(360, int(os.getenv("CANDIDATE_PREVIEW_OUTPUT_TOKENS", "240"))))
     CANDIDATE_PREVIEW_MAX_WAIT_SECONDS = max(60, min(3600, int(os.getenv("CANDIDATE_PREVIEW_MAX_WAIT_SECONDS", "900"))))
     CANDIDATE_PREVIEW_TIMEOUT_SECONDS = max(15, min(180, int(os.getenv("CANDIDATE_PREVIEW_TIMEOUT_SECONDS", "60"))))
+    # Runtime-only coalescing for preliminary file summaries. The queue and
+    # import state machine continue to create one task per file.
+    PRELIMINARY_SUMMARY_BATCH_SIZE = max(1, min(4, int(os.getenv("PRELIMINARY_SUMMARY_BATCH_SIZE", "4"))))
     # ZIP64 and streaming writes support a complete 10 GiB handoff without
     # loading the source package into memory.
     MAX_EXPORT_BYTES = content_byte_limit("MAX_EXPORT_BYTES")

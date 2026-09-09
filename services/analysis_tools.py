@@ -111,10 +111,18 @@ def merge_retrieval_results(
     searchable_files = 0
     deep_analyzed_files = 0
     deep_candidate_files = 0
+    related_file_paths: List[str] = []
+    package_context: Optional[Mapping[str, Any]] = None
     candidate_depth_values: List[float] = []
     coverage_bases = set()
     for result in results or []:
         result = dict(result or {})
+        if package_context is None and isinstance(result.get("package_context"), Mapping):
+            package_context = result.get("package_context")
+        for path in result.get("related_file_paths") or []:
+            path = str(path or "")
+            if path and path not in related_file_paths:
+                related_file_paths.append(path)
         result_items = list(result.get("results") or result.get("evidence") or [])
         for item in result_items:
             key = (
@@ -194,6 +202,8 @@ def merge_retrieval_results(
         warnings = [item for item in warnings if not stale_no_evidence.search(item)]
     return {
         "results": merged,
+        "related_file_paths": related_file_paths[:5000],
+        "package_context": dict(package_context or {}),
         "coverage": {
             "total_files": total_files or None,
             "scope_files": scope_files or None,

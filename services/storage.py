@@ -111,14 +111,15 @@ class Storage:
         return value
 
     @contextmanager
-    def _connect(self):
+    def _connect(self, timeout_ms=None):
+        busy_timeout_ms = self.sqlite_busy_timeout_ms if timeout_ms is None else max(0, int(timeout_ms))
         connection = sqlite3.connect(
-            self.db_path, timeout=self.sqlite_busy_timeout_ms / 1000.0
+            self.db_path, timeout=busy_timeout_ms / 1000.0
         )
         connection.row_factory = sqlite3.Row
         try:
             connection.execute(
-                "PRAGMA busy_timeout={}".format(self.sqlite_busy_timeout_ms)
+                "PRAGMA busy_timeout={}".format(busy_timeout_ms)
             )
             # These two pragmas are connection-local.  Applying them here
             # prevents a new API/Worker connection from silently reverting to
@@ -6343,6 +6344,35 @@ class Storage:
         """Pause the full-package chain while preserving per-file checkpoints."""
         message = str(reason or "用户结束本次运行；已完成检查点保留。")
         now = time.time()
+        task = self.get_import_task(scan_id) or {}
+        previous_status = str(task.get("status") or "")
+        checkpoint = dict(task.get("checkpoint") or {})
+        if previous_status and previous_status != "paused":
+            checkpoint["paused_from_state"] = previous_status
+        pipeline_sources = {
+            "candidate_preview_model_summary", "candidate_node_summary",
+            "preliminary_model_summary", "preliminary_node_summary",
+            "preliminary_results_report", "deep_parse_model_summary",
+            "idle_deep_model_summary", "deep_node_rebuild", "deep_results_report",
+            "large_selection_model_summary",
+        }
+        with self._connect() as conn:
+            pipeline_rows = conn.execute(
+                "SELECT id,task_type,options,status FROM analysis_jobs "
+                "WHERE scan_id=? AND status IN ('queued','running','cancelling')",
+                (str(scan_id),),
+            ).fetchall()
+        job_ids = []
+        for row in pipeline_rows:
+            if str(row["task_type"] or "") in {"scan_and_analyze", "analyze_package"}:
+                job_ids.append(str(row["id"]))
+                continue
+            try:
+                options = json.loads(row["options"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                options = {}
+            if str(options.get("workflow_source") or "") in pipeline_sources:
+                job_ids.append(str(row["id"]))
         with self.lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO package_processing_controls("
@@ -6352,22 +6382,29 @@ class Storage:
                 "reason=excluded.reason,updated_at=CURRENT_TIMESTAMP",
                 (str(scan_id), message[:1000]),
             )
-            queued = conn.execute(
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                queued = conn.execute(
                 "UPDATE analysis_jobs SET status='cancelled',stage='cancelled',"
                 "cancel_requested=1,message=?,current_stage='已暂停',current_file='',"
                 "worker_id=NULL,heartbeat_at=NULL,finished_at=?,updated_at=CURRENT_TIMESTAMP "
-                "WHERE scan_id=? AND task_type IN ('scan_and_analyze','analyze_package') "
-                "AND status='queued'",
-                (message, now, str(scan_id)),
-            ).rowcount
-            running = conn.execute(
+                "WHERE scan_id=? AND id IN ({}) AND status='queued'".format(placeholders),
+                [message, now, str(scan_id)] + job_ids,
+                ).rowcount
+                running = conn.execute(
                 "UPDATE analysis_jobs SET status='cancelling',stage='cancelling',"
                 "cancel_requested=1,message=?,current_stage='正在安全暂停',"
                 "updated_at=CURRENT_TIMESTAMP "
-                "WHERE scan_id=? AND task_type IN ('scan_and_analyze','analyze_package') "
-                "AND status IN ('running','cancelling')",
-                (message, str(scan_id)),
-            ).rowcount
+                "WHERE scan_id=? AND id IN ({}) AND status IN ('running','cancelling')".format(placeholders),
+                [message, str(scan_id)] + job_ids,
+                ).rowcount
+            else:
+                queued = running = 0
+            if previous_status and previous_status != "paused":
+                conn.execute(
+                    "UPDATE import_tasks SET status='paused',current_phase='paused',checkpoint=?,paused_at=?,updated_at=? WHERE scan_id=?",
+                    (json.dumps(checkpoint, ensure_ascii=False), now, now, str(scan_id)),
+                )
             conn.execute(
                 "UPDATE deep_parse_items SET status='queued',updated_at=? "
                 "WHERE batch_id IN (SELECT batch_id FROM deep_parse_batches WHERE scan_id=?) "
@@ -7399,11 +7436,21 @@ class Storage:
             fields.append("finished_at=?")
             values.append(time.time())
         values.append(job_id)
-        with self.lock, self._connect() as conn:
-            condition = "id=?"
-            if status not in {"cancelled", "cancelling"}:
-                condition += " AND status NOT IN ('cancelled','cancelling')"
-            conn.execute("UPDATE analysis_jobs SET {} WHERE {}".format(",".join(fields), condition), values)
+        # Progress is advisory. A large document commit may briefly hold the
+        # SQLite write lock; never make the parser fail or wait 30 seconds on
+        # a progress-only update. The next pulse/finalize call will publish it.
+        try:
+            with self.lock, self._connect(timeout_ms=2000) as conn:
+                condition = "id=?"
+                if status not in {"cancelled", "cancelling"}:
+                    condition += " AND status NOT IN ('cancelled','cancelling')"
+                conn.execute("UPDATE analysis_jobs SET {} WHERE {}".format(",".join(fields), condition), values)
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).casefold() or "busy" in str(exc).casefold():
+                LOGGER.warning("Skipping locked progress update for job %s", job_id)
+                return False
+            raise
+        return True
 
     def heartbeat_job(self, job_id, worker_id=None):
         """Refresh liveness without overwriting child-stage progress text."""

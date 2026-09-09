@@ -29,6 +29,7 @@ const state = {
   dataSources: [],
   dataSourceOffset: 0,
   dataSourceQuery: '',
+  dataSourceKind: 'standard',
   dataSourceTotal: 0,
   dataSourceRequestInFlight: false,
   fileSearchResult: null,
@@ -37,7 +38,8 @@ const state = {
   selectionFiles: [],
   selectionOffset: 0,
   selectionTotal: 0,
-  selectionNextOffset: null
+  selectionNextOffset: null,
+  selectionShowAll: true
 };
 
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running', 'cancelling']);
@@ -46,6 +48,16 @@ const CURRENT_SCAN_KEY = 'sjfx_current_scan_id_v1';
 const SELECTIONS_KEY_PREFIX = 'sjfx_export_selections_v1:';
 
 const $ = (id) => document.getElementById(id);
+
+// Leaving a package only detaches the page from its current poller. The
+// server-side job keeps its durable checkpoint and continues in the Worker,
+// so switching packages never cancels or loses the work already completed.
+function detachUiFromCurrentWork() {
+  state.jobId = null;
+  state.fileWorkflowRequestSeq += 1;
+  state.fileWorkflowAbortController?.abort();
+  state.fileWorkflowAbortController = null;
+}
 
 
 function toast(message, error = false) {
@@ -76,7 +88,7 @@ function normalizeApiToken(value) {
 }
 
 const SJFXAuth = (() => {
-  let promptAttempted = false;
+  let pendingTokenRequest = null;
 
   function storedToken() {
     const raw = window.sessionStorage.getItem(SJFX_API_TOKEN_KEY) || '';
@@ -86,7 +98,7 @@ const SJFXAuth = (() => {
   }
 
   function authError() {
-    const error = new Error('\u8bf7\u5148\u8bbe\u7f6e\u6709\u6548\u7684 SJFX API Token');
+    const error = new Error('请先设置有效的 数据分析智能体 API Token');
     error.status = 401;
     error.code = 'SJFX_AUTH_REQUIRED';
     return error;
@@ -96,34 +108,64 @@ const SJFXAuth = (() => {
     window.sessionStorage.removeItem(SJFX_API_TOKEN_KEY);
   }
 
-  function ensureToken({ force = false } = {}) {
-    if (force) {
-      clearToken();
-      promptAttempted = false;
-    }
-    const existing = storedToken();
-    if (existing) return existing;
-    if (promptAttempted) throw authError();
+  function tokenDialog() {
+    if (pendingTokenRequest) return pendingTokenRequest;
+    pendingTokenRequest = new Promise((resolve, reject) => {
+      const overlay = document.createElement('div');
+      overlay.className = 'sjfx-token-dialog';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.innerHTML = '<div class="sjfx-token-panel"><span class="sjfx-token-kicker">LOCAL ACCESS</span><h2>连接本地资料服务</h2><p>请输入服务器管理员提供的 API Token。Token 只保存在本次浏览器会话中。</p><label for="sjfxTokenInput">API Token</label><input id="sjfxTokenInput" type="password" autocomplete="off" spellcheck="false"><div class="sjfx-token-actions"><button type="button" data-token-cancel>稍后设置</button><button type="button" class="primary" data-token-submit>连接服务</button></div></div>';
+      if (!document.getElementById('sjfx-token-dialog-style')) {
+        const style = document.createElement('style');
+        style.id = 'sjfx-token-dialog-style';
+        style.textContent = '.sjfx-token-dialog{position:fixed;inset:0;z-index:10000;display:grid;place-items:center;padding:24px;background:rgba(4,10,18,.78);backdrop-filter:blur(14px)}.sjfx-token-panel{width:min(440px,100%);padding:30px;border:1px solid rgba(103,214,255,.28);border-radius:22px;background:linear-gradient(145deg,#111d2b,#0b111c);box-shadow:0 24px 90px rgba(0,0,0,.5);color:#edf7ff}.sjfx-token-panel h2{margin:8px 0 10px}.sjfx-token-panel p{color:#9eb2c7;line-height:1.6}.sjfx-token-panel label{display:block;margin:18px 0 7px;color:#b8ccdf}.sjfx-token-panel input{box-sizing:border-box;width:100%;padding:12px 14px;border:1px solid #31506b;border-radius:10px;background:#08111b;color:#fff}.sjfx-token-kicker{font-size:11px;letter-spacing:.18em;color:#66d5ff}.sjfx-token-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}.sjfx-token-actions button{padding:10px 15px;border:1px solid #31506b;border-radius:9px;background:#122235;color:#d7e9f7;cursor:pointer}.sjfx-token-actions .primary{border-color:#4fc9ed;background:#16728f;color:white}';
+        document.head.appendChild(style);
+      }
+      document.body.appendChild(overlay);
+      const input = overlay.querySelector('#sjfxTokenInput');
+      let closed = false;
+      const finish = (value) => {
+        if (closed) return;
+        closed = true;
+        overlay.remove();
+        pendingTokenRequest = null;
+        const token = normalizeApiToken(value);
+        if (token) { window.sessionStorage.setItem(SJFX_API_TOKEN_KEY, token); resolve(token); }
+        else reject(authError());
+      };
+      overlay.addEventListener('click', (event) => {
+        if (event.target === overlay || event.target.closest('[data-token-cancel]')) finish('');
+        if (event.target.closest('[data-token-submit]')) finish(input.value);
+      });
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') finish(input.value);
+        if (event.key === 'Escape') finish('');
+      });
+      window.setTimeout(() => input.focus(), 0);
+    });
+    return pendingTokenRequest;
+  }
 
-    promptAttempted = true;
-    const token = normalizeApiToken(
-      window.prompt('\u8bf7\u8f93\u5165 SJFX API Token\uff08\u4ec5\u4fdd\u5b58\u4e8e\u672c\u6b21\u6d4f\u89c8\u4f1a\u8bdd\uff09', '') || ''
-    );
-    if (!token) throw authError();
-    window.sessionStorage.setItem(SJFX_API_TOKEN_KEY, token);
-    return token;
+  async function ensureToken({ force = false } = {}) {
+    if (force) clearToken();
+    const existing = storedToken();
+    if (existing && !force) return existing;
+    return tokenDialog();
   }
 
   async function request(url, options = {}) {
     const headers = { ...(options.headers || {}) };
     let retried = false;
     while (true) {
-      headers['X-SJFX-Token'] = ensureToken();
+      const token = storedToken();
+      if (token) headers['X-SJFX-Token'] = token;
+      else delete headers['X-SJFX-Token'];
       const response = await window.fetch(url, { ...options, headers });
       if (response.status !== 401 || retried) return response;
       retried = true;
       clearToken();
-      ensureToken({ force: true });
+      headers['X-SJFX-Token'] = await ensureToken({ force: false });
     }
   }
 
@@ -132,8 +174,7 @@ const SJFXAuth = (() => {
 window.SJFXAuth = SJFXAuth;
 
 document.addEventListener('DOMContentLoaded', () => {
-  // Every API endpoint requires authentication. Ask once before polling starts.
-  try { SJFXAuth.ensureToken(); } catch (_) { /* user can set it from the header later */ }
+  // Authentication is negotiated lazily by the first API response.
 });
 
 async function api(url, options = {}) {
@@ -154,6 +195,7 @@ async function api(url, options = {}) {
   }
   return data;
 }
+window.sjfxApi = api;
 
 // Downloads cannot attach X-SJFX-Token to a plain navigation. Ask the API for
 // a short-lived one-use URL, then let the browser stream the response directly
@@ -2346,11 +2388,23 @@ function renderPackageProcessing() {
   const deepSummaryFiles = Number(processing.deep_summary_files || state.importTask?.checkpoint?.deep_summary_completed || 0);
   const refreshableImport = ['deep_summarizing_files', 'deep_summarizing_nodes', 'deep_update_available'].includes(importStatus);
   const deepReady = Boolean(deepSummaryFiles > 0 && refreshableImport);
-  const labels = { running: 'RUNNING', paused: 'PAUSED', completed: 'COMPLETED' };
+  const labels = {
+    running: '处理中', paused: '已暂停', completed: '当前批次完成', partial: '部分完成',
+    parsing_selected: '正在解析选中文件', parsed_overview: '正在生成情报概览',
+    preliminary_summarizing: '正在生成初步摘要', preliminary_nodes: '正在生成节点摘要',
+    preliminary_overview: '正在生成初步概览', deep_parsing: '正在深度解析',
+    deep_summarizing_files: '正在生成深度摘要', deep_summarizing_nodes: '正在生成节点深度摘要',
+    deep_update_available: '可更新正式结果', failed: '有失败项', cancelled: '已停止',
+  };
   const stateText = {
     running: active ? '正在深度解析' : '等待用户选择',
     paused: '已安全暂停',
     completed: '已完成当前批次',
+    partial: '当前批次已完成，仍有文件需要处理',
+    preliminary_summarizing: '正在生成选中文件的初步摘要',
+    preliminary_nodes: '正在生成选中文件的节点摘要',
+    preliminary_overview: '正在生成选中范围的情报概览',
+    deep_update_available: '已有深度结果，可补充文件或更新正式结果',
   }[status] || '准备中';
   $('scanStats').insertAdjacentHTML('beforeend',
     `<section class="package-processing-panel" aria-label="导入与深度解析进度">` +
@@ -2762,17 +2816,19 @@ function renderDataSources() {
   } else {
     stateEl.textContent = `共 ${state.dataSourceTotal} 个历史数据包；选择后直接复用已有处理结果。`;
     list.innerHTML = state.dataSources.map((source) => {
-      const status = String(source.status || 'pending');
+      const processingState = String(source.processing?.state || source.analysis_progress?.status || '').toLowerCase();
+      const activeProcessing = Boolean(source.processing?.active_job_id) || ['queued', 'running', 'candidate_importing', 'candidate_analyzing', 'preliminary_summarizing', 'preliminary_nodes', 'preliminary_overview', 'parsing_selected', 'deep_summarizing_files', 'deep_summarizing_nodes', 'deep_update_available'].includes(processingState);
+      const status = activeProcessing ? processingState : String(source.status || 'pending');
       const progress = source.analysis_progress || {};
       const active = source.processing?.active_job_id;
-      const detail = status === 'processing' && progress.progress != null
+      const detail = activeProcessing && progress.progress != null
         ? `${Math.max(0, Math.min(100, Number(progress.progress)))}% · ${progress.message || '后台处理中'}`
         : `${source.file_count || 0} 个文件 · ${dataSourceSize(source)}`;
-      const action = active ? '查看进度' : (source.usable || source.analysis_ready ? '使用此数据包' : '打开数据包');
+      const action = activeProcessing ? '查看进度' : (source.usable || source.analysis_ready ? '使用此数据包' : '打开数据包');
       return `<article class="data-source-item status-${escapeHtml(status)}">`
         + `<div class="data-source-main"><div class="data-source-title"><strong title="${escapeHtml(source.name || source.root || source.scan_id)}">${escapeHtml(source.name || source.scan_id)}</strong><span class="data-source-status">${escapeHtml(dataSourceStatusLabel(status))}</span></div>`
         + `<small title="${escapeHtml(source.root || '')}">${escapeHtml(source.root || '服务器目录未记录')}</small><span class="data-source-meta">${escapeHtml(detail)} · ${escapeHtml(source.created_at || '创建时间未知')}</span></div>`
-        + `<button type="button" class="secondary data-source-use" data-source-select="${escapeHtml(source.scan_id)}">${escapeHtml(action)}</button></article>`;
+        + `<button type="button" class="secondary data-source-use" ${source.kind === 'large' ? (source.status === 'completed' ? `data-large-result="${escapeHtml(source.large_package_id || source.scan_id)}"` : `data-large-select="${escapeHtml(source.large_package_id || source.scan_id)}"`) : `data-source-select="${escapeHtml(source.scan_id)}"`}>${escapeHtml(source.kind === 'large' ? (source.status === 'completed' ? '查看成果' : '打开处理') : action)}</button></article>`;
     }).join('');
   }
   const page = Math.floor(state.dataSourceOffset / 8) + 1;
@@ -2795,7 +2851,8 @@ async function refreshDataSources({ reset = false } = {}) {
       limit: '8',
       offset: String(state.dataSourceOffset)
     });
-    const data = await api(`/api/data-sources?${params.toString()}`);
+    const historyEndpoint = state.dataSourceKind === 'large' ? '/api/large-packages/history' : '/api/data-sources';
+    const data = await api(`${historyEndpoint}?${params.toString()}`);
     state.dataSources = data.items || [];
     state.dataSourceTotal = Number(data.total || 0);
     renderDataSources();
@@ -2810,6 +2867,7 @@ async function refreshDataSources({ reset = false } = {}) {
 
 async function selectDataSource(scanId, button) {
   if (!scanId) return;
+  detachUiFromCurrentWork();
   setBusy(button, true, '正在打开…');
   try {
     const data = await api('/api/data-sources/select', {
@@ -2822,7 +2880,13 @@ async function selectDataSource(scanId, button) {
       await pollJob(activeJobId);
     } else {
       await refreshScan(scanId);
-      if (window.SJFXShell) window.SJFXShell.activate(state.analysis?.analysis_tree ? 'analysis' : 'physical');
+      const importStatus = String(state.importTask?.status || '').toLowerCase();
+      if (state.processing?.state === 'awaiting_selection' || importStatus === 'waiting_for_selection') {
+        await openSelectionPanel(scanId);
+      } else if (['candidate_importing', 'candidate_analyzing', 'waiting_for_deep_selection', 'preliminary_summarizing', 'preliminary_nodes', 'preliminary_overview', 'deep_update_available'].includes(importStatus)) {
+        setPackageStage('analysis');
+        renderCandidatePreviewCard();
+      } else if (window.SJFXShell) window.SJFXShell.activate(state.analysis?.analysis_tree ? 'analysis' : 'physical');
     }
     toast(data.next_action === 'use_existing_data' ? '已切换到历史数据包，复用已有处理结果' : '已打开数据包');
     await refreshDataSources();
@@ -2849,13 +2913,16 @@ function renderSelectionPanel() {
   const selection = state.selection || {};
   const included = new Set(selection.included_paths || []);
   const excluded = new Set(selection.excluded_paths || []);
+  const visibleFiles = state.selectionShowAll
+    ? state.selectionFiles
+    : state.selectionFiles.filter((item) => !included.has(String(item.node_path || item.path || '')));
   const selectedSize = Number(selection.selected_total_size || state.selectionFiles.filter((item) => included.has(item.node_path || item.path)).reduce((sum, item) => sum + Number(item.size || item.source_size || 0), 0));
-  stats.textContent = `已选 ${included.size} 个文件 · ${selectionSize(selectedSize)} · 清单共 ${state.selectionTotal || 0} 个文件 · 版本 ${selection.version || 1}`;
-  if (!state.selectionFiles.length) {
-    list.innerHTML = '<div class="empty-state">当前筛选没有匹配文件。</div>';
+  stats.textContent = `已选 ${included.size} 个文件 · ${selectionSize(selectedSize)} · 清单共 ${state.selectionTotal || 0} 个文件 · 当前显示 ${visibleFiles.length} 个${state.selectionShowAll ? '全部文件' : '待补充文件'} · 版本 ${selection.version || 1}`;
+  if (!visibleFiles.length) {
+    list.innerHTML = state.selectionShowAll ? '<div class="empty-state">当前筛选没有匹配文件。</div>' : '<div class="empty-state">没有待补充文件；点击“查看全部文件”可调整已处理范围。</div>';
     return;
   }
-  list.innerHTML = state.selectionFiles.map((item) => {
+  list.innerHTML = visibleFiles.map((item) => {
     const path = String(item.node_path || item.path || '');
     const checked = included.has(path) && !excluded.has(path);
     const isExcluded = excluded.has(path) || item.status === 'out_of_scope';
@@ -2901,14 +2968,24 @@ function renderCandidatePreviewCard() {
   const failed = Number(checkpoint.candidate_preview_failed || 0);
   const paths = checkpoint.candidate_paths || [];
   const status = String(task.status || '').toLowerCase();
+  const inventoryTotal = Number(state.scan?.file_count || state.scan?.files_total || 0);
+  const processingPending = Number(state.processing?.deep_pending_files || state.processing?.pending_files || 0);
+  const remaining = Math.max(0, processingPending || inventoryTotal - paths.length);
   stats.innerHTML = [
     `<div class="candidate-preview-stat"><strong>${escapeHtml(paths.length || expected || 0)}</strong><span>候选文件</span></div>`,
     `<div class="candidate-preview-stat"><strong>${escapeHtml(completed)}/${escapeHtml(expected || paths.length || 0)}</strong><span>已生成初步摘要</span></div>`,
     `<div class="candidate-preview-stat"><strong>${escapeHtml(failed)}</strong><span>降级/失败</span></div>`,
+    `<div class="candidate-preview-stat"><strong>${escapeHtml(remaining)}</strong><span>待补充文件</span></div>`,
     `<div class="candidate-preview-stat"><strong>${escapeHtml(status === 'waiting_for_deep_selection' ? '可选择' : '分析中')}</strong><span>当前阶段</span></div>`,
   ].join('');
   const open = $('candidateOpenDirectoryBtn');
   if (open) open.disabled = status !== 'waiting_for_deep_selection' && status !== 'partial' && status !== 'completed';
+  const back = $('candidateBackSelectionBtn');
+  if (back) {
+    const supplementReady = ['waiting_for_deep_selection', 'partial', 'completed', 'deep_update_available', 'deep_summarizing_files', 'deep_summarizing_nodes', 'preliminary_overview'].includes(status);
+    back.textContent = supplementReady ? '补充或调整文件范围' : '等待当前阶段完成';
+    back.disabled = !supplementReady || ['queued', 'running', 'cancelling', 'candidate_importing', 'candidate_analyzing'].includes(status);
+  }
   const notice = $('candidatePreviewNotice');
   if (notice) notice.textContent = checkpoint.candidate_preview_partial
     ? '部分文件预览超时或降级；初步目录仍可使用，深度摘要时可重试。'
@@ -2983,6 +3060,13 @@ async function openSelectionPanel(scanId = state.scan?.scan_id) {
   state.scan = state.scan || { scan_id: scanId };
   const data = await api(`/api/scan/${encodeURIComponent(scanId)}/selection`);
   state.selection = data.selection || {};
+  const taskStatus = String(state.importTask?.status || state.processing?.import_task?.status || '').toLowerCase();
+  // On a later visit, show the files outside the previous batch first. The
+  // complete manifest remains one click away for corrections or reprocessing.
+  state.selectionShowAll = !(
+    state.selection && Number(state.selection.included_paths?.length || 0) > 0
+    && taskStatus && taskStatus !== 'waiting_for_selection'
+  );
   setPackageStage('selection');
   await loadSelectionFiles({ reset: true });
   $('selectionCard')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -3015,6 +3099,14 @@ function bindSelectionControls() {
     if ($('selectionFileType')) $('selectionFileType').value = '';
     loadSelectionFiles({ reset: true });
   });
+  $('selectionShowRemainingBtn')?.addEventListener('click', () => {
+    state.selectionShowAll = false;
+    renderSelectionPanel();
+  });
+  $('selectionShowAllBtn')?.addEventListener('click', () => {
+    state.selectionShowAll = true;
+    renderSelectionPanel();
+  });
   $('selectionSelectAllBtn')?.addEventListener('click', () => {
     if (!state.selection) return;
     const excluded = new Set(state.selection.excluded_paths || []);
@@ -3036,9 +3128,20 @@ function bindSelectionControls() {
     try {
       const importStatus = String(state.importTask?.status || '').toLowerCase();
       const endpoint = importStatus && importStatus !== 'waiting_for_selection' ? 'supplement' : 'confirm'; const data = await api(`/api/scan/${encodeURIComponent(state.scan.scan_id)}/selection/${endpoint}`, { method: 'POST', body: JSON.stringify({ included_paths: state.selection.included_paths || [], excluded_paths: state.selection.excluded_paths || [], rules: state.selection.rules || {}, version: state.selection.version }) });
-      state.selection = data.selection || state.selection; setPackageStage('analysis'); state.jobId = data.job_id; toast(endpoint === 'supplement' ? `已补充 ${data.new_paths?.length || 0} 个文件，开始解析与初步摘要。` : `已确认 ${data.selected_count || 0} 个文件，开始解析与初步摘要。`); await pollJob(data.job_id);
+      state.selection = data.selection || state.selection;
+      setPackageStage('analysis');
+      if (!data.accepted || !data.job_id) {
+        await refreshScan(state.scan.scan_id);
+        renderCandidatePreviewCard();
+        toast(data.message || '当前没有新增的可解析文件。');
+        return;
+      }
+      state.jobId = data.job_id;
+      toast(endpoint === 'supplement' ? `已补充 ${data.new_paths?.length || 0} 个文件，开始解析与初步摘要。` : `已确认 ${data.selected_count || 0} 个文件，开始解析与初步摘要。`);
+      await pollJob(data.job_id);
     } catch (error) { toast(error.message || '确认分析范围失败', true); } finally { if (button.isConnected) setBusy(button, false); }
   });
+  $('selectionSwitchPackageBtn')?.addEventListener('click', () => window.SJFXDataSources?.open('standard') || window.SJFXShell?.activate('packages'));
 }
 
 function bindDataSourceControls() {
@@ -3049,6 +3152,11 @@ function bindDataSourceControls() {
   const nextButton = $('dataSourceNextBtn');
   const searchInput = $('dataSourceSearch');
   const list = $('dataSourceList');
+  document.querySelectorAll('[data-source-kind]').forEach((button) => button.addEventListener('click', () => {
+    state.dataSourceKind = button.dataset.sourceKind || 'standard';
+    document.querySelectorAll('[data-source-kind]').forEach((item) => item.classList.toggle('active', item === button));
+    refreshDataSources({ reset: true });
+  }));
 
   refreshButton?.addEventListener('click', () => refreshDataSources());
   searchButton?.addEventListener('click', () => {
@@ -3061,6 +3169,7 @@ function bindDataSourceControls() {
     searchButton?.click();
   });
   importButton?.addEventListener('click', () => {
+    detachUiFromCurrentWork();
     setPackageStage('import');
     const card = $('newImportCard');
     card?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -3083,9 +3192,32 @@ function bindDataSourceControls() {
   list?.addEventListener('click', (event) => {
     const button = event.target.closest('.data-source-use');
     if (!button || button.disabled) return;
+    if (button.dataset.largeResult && window.SJFXLargeResult) {
+      window.SJFXLargeResult.activate(button.dataset.largeResult);
+      return;
+    }
+    if (button.dataset.largeSelect && window.openLargePackageHistory) {
+      window.openLargePackageHistory(button.dataset.largeSelect, button);
+      return;
+    }
     selectDataSource(button.dataset.sourceSelect, button);
   });
 }
+
+// Shared entry point for module-level “switch package” actions. Keeping the
+// filter selection here means a user leaving a large package lands directly
+// in the matching history list instead of having to rediscover the tab.
+window.SJFXDataSources = {
+  open(kind = 'standard') {
+    detachUiFromCurrentWork();
+    state.dataSourceKind = kind === 'large' ? 'large' : 'standard';
+    document.querySelectorAll('[data-source-kind]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.sourceKind === state.dataSourceKind);
+    });
+    if (window.SJFXShell) window.SJFXShell.activate('packages');
+    refreshDataSources({ reset: true });
+  }
+};
 
 
 function jobIdOf(job, fallbackId = '') {
@@ -3102,6 +3234,7 @@ function persistTaskRegistry() {
         id: job.id,
         scan_id: job.scan_id || '',
         task_type: job.task_type || '',
+        workflow_source: job.workflow_source || job.options?.workflow_source || '',
         status: job.status || 'queued',
         stage: job.stage || '',
         current_stage: job.current_stage || '',
@@ -3193,7 +3326,26 @@ function relativeHeartbeat(value, reportedAge = null) {
 }
 
 
-function jobTaskLabel(taskType) {
+function jobWorkflowSource(jobOrType = {}) {
+  if (!jobOrType || typeof jobOrType !== 'object') return '';
+  return String(
+    jobOrType.workflow_source
+      || jobOrType.options?.workflow_source
+      || jobOrType.result?.workflow_source
+      || ''
+  );
+}
+
+
+function jobTaskLabel(taskOrJob) {
+  const taskType = typeof taskOrJob === 'string' ? taskOrJob : taskOrJob?.task_type;
+  const source = jobWorkflowSource(taskOrJob);
+  if (taskType === 'generate_summary') {
+    if (source === 'preliminary_model_summary') return '生成初步摘要';
+    if (source === 'preliminary_node_summary') return '生成初步节点摘要';
+    if (source === 'deep_node_rebuild') return '生成深度节点摘要';
+    return '生成深度摘要';
+  }
   return ({
     scan_and_analyze: '导入与完整分析',
     analyze_package: '数据包分析',
@@ -3212,7 +3364,11 @@ function jobStatusLabel(status) {
 }
 
 
-function jobStageLabel(stage) {
+function jobStageLabel(stage, job = {}) {
+  const source = jobWorkflowSource(job);
+  if (stage === 'generating_summary' && source === 'preliminary_model_summary') return '生成初步摘要';
+  if (stage === 'generating_summary' && source === 'preliminary_node_summary') return '生成初步节点摘要';
+  if (stage === 'generating_summary' && source === 'deep_node_rebuild') return '生成深度节点摘要';
   return ({
     queued: '等待 Worker', claimed: 'Worker 已接收', scanning: '盘点目录',
     parsing: '解析文件', analyzing: '内容分析', generating_report: '生成概览',
@@ -3225,7 +3381,7 @@ function jobStageLabel(stage) {
 function jobActivityText(job = {}) {
   const stage = job.current_stage || job.stage || '';
   const currentFile = job.current_file || '';
-  const stageLabel = jobStageLabel(stage);
+  const stageLabel = jobStageLabel(stage, job);
   if (currentFile && currentFile !== stage) return `${stageLabel || '处理文件'} · ${currentFile}`;
   return job.message || stageLabel || jobStatusLabel(job.status) || '等待状态更新';
 }
@@ -3243,6 +3399,53 @@ function queueSummary(job = {}) {
 }
 
 
+function groupDisplayedJobs(jobs) {
+  const displayed = [];
+  let batch = null;
+  const flush = () => {
+    if (!batch) return;
+    if (batch.length === 1) {
+      displayed.push(batch[0]);
+    } else {
+      const lead = batch.find((item) => item.status === 'running' || item.status === 'cancelling') || batch[0];
+      const statuses = batch.map((item) => String(item.status || '').toLowerCase());
+      const status = statuses.includes('running') ? 'running'
+        : statuses.includes('cancelling') ? 'cancelling'
+        : statuses.includes('queued') ? 'queued'
+        : statuses.includes('failed') ? 'failed'
+        : statuses.every((item) => item === 'cancelled') ? 'cancelled' : 'completed';
+      displayed.push({
+        ...lead,
+        status,
+        progress: Math.round(batch.reduce((sum, item) => sum + Number(item.progress || 0), 0) / batch.length),
+        batch_count: batch.length,
+        batch_job_ids: batch.map((item) => item.id),
+        batch_paths: batch.map((item) => item.options?.path || item.current_file).filter(Boolean),
+        queue_position: Math.min(...batch.map((item) => Number(item.queue_position || 999999))),
+        message: status === 'queued'
+          ? `初步摘要批次：${batch.length} 个文件共用一次模型请求，等待 Worker 启动。`
+          : `初步摘要批次：${batch.length} 个文件共用一次模型请求。`,
+      });
+    }
+    batch = null;
+  };
+  for (const job of jobs) {
+    const isPreliminary = job.task_type === 'generate_summary'
+      && jobWorkflowSource(job) === 'preliminary_model_summary';
+    if (!isPreliminary) {
+      flush();
+      displayed.push(job);
+      continue;
+    }
+    if (!batch || batch.length >= 4) flush();
+    if (!batch) batch = [];
+    batch.push(job);
+  }
+  flush();
+  return displayed;
+}
+
+
 function renderTaskCenter() {
   const list = $('activeTaskList');
   if (!list) return;
@@ -3254,17 +3457,18 @@ function renderTaskCenter() {
     if (right.status === 'running' && left.status !== 'running') return 1;
     return Number(right.updated_local || 0) - Number(left.updated_local || 0);
   });
-  const activeCount = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
+  const displayJobs = groupDisplayedJobs(jobs);
+  const activeCount = displayJobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
   if ($('taskCenterActiveCount')) {
     $('taskCenterActiveCount').textContent = activeCount ? `${activeCount} 个活动任务` : '队列空闲';
   }
-  if (!jobs.length) {
+  if (!displayJobs.length) {
     list.className = 'task-list empty';
     list.innerHTML = '<div class="task-list-empty"><strong>当前没有任务</strong><span>导入数据包后，排队、运行、取消和失败状态会显示在这里。</span></div>';
     return;
   }
   list.className = 'task-list';
-  list.innerHTML = jobs.slice(0, 12).map((job) => {
+  list.innerHTML = displayJobs.slice(0, 12).map((job) => {
     const status = String(job.status || '').toLowerCase();
     const active = ACTIVE_JOB_STATUSES.has(status);
     const cancelling = status === 'cancelling';
@@ -3277,9 +3481,11 @@ function renderTaskCenter() {
     const canOpenResult = status === 'completed'
       && ['scan_and_analyze', 'analyze_package'].includes(job.task_type)
       && Boolean(job.result?.scan_id || job.scan_id || job.id);
+    const taskTitle = `${jobTaskLabel(job)}${job.batch_count > 1 ? `（${job.batch_count} 个文件）` : ''}`;
+    const cancelIds = (job.batch_job_ids || [job.id]).join(',');
     return `<article class="task-list-item status-${escapeHtml(status || 'unknown')}" data-task-id="${escapeHtml(job.id)}">`
       + '<div class="task-list-heading">'
-      + `<div><strong>${escapeHtml(jobTaskLabel(job.task_type))}</strong><span class="task-id">#${escapeHtml(String(job.id).slice(0, 12))}</span></div>`
+      + `<div><strong>${escapeHtml(taskTitle)}</strong><span class="task-id">#${escapeHtml(String(job.id).slice(0, 12))}</span></div>`
       + `<span class="task-state">${escapeHtml(jobStatusLabel(status))}</span></div>`
       + `<div class="task-list-progress"><i style="width:${progress}%"></i></div>`
       + `<div class="task-list-meta"><b>${progress}%</b><span>${escapeHtml(jobActivityText(job))}</span>${heartbeatHtml}</div>`
@@ -3289,14 +3495,14 @@ function renderTaskCenter() {
       + '<div class="task-list-actions">'
       + (active ? `<button type="button" class="text-button" data-job-watch="${escapeHtml(job.id)}">查看实时进度</button>` : '')
       + (canOpenResult ? `<button type="button" class="text-button" data-job-open="${escapeHtml(job.id)}">打开分析结果</button>` : '')
-      + (active ? `<button type="button" class="danger compact" data-job-cancel="${escapeHtml(job.id)}" ${cancelling ? 'disabled' : ''}>${cancelling ? '正在暂停…' : (['scan_and_analyze', 'analyze_package'].includes(job.task_type) ? '结束本次运行' : (status === 'queued' ? '取消排队' : '取消任务'))}</button>` : '')
+      + (active ? `<button type="button" class="danger compact" data-job-cancel="${escapeHtml(job.id)}" data-job-cancel-batch="${escapeHtml(cancelIds)}" ${cancelling ? 'disabled' : ''}>${cancelling ? '正在暂停…' : (['scan_and_analyze', 'analyze_package'].includes(job.task_type) ? '结束本次运行' : (status === 'queued' ? '取消排队' : '取消任务'))}</button>` : '')
       + '</div></article>';
   }).join('');
 
-  const latest = jobs[0];
+  const latest = displayJobs[0];
   if ($('dashboardActivity') && latest) {
     $('dashboardActivity').className = 'activity-task';
-    $('dashboardActivity').innerHTML = `<strong>${escapeHtml(jobTaskLabel(latest.task_type))}</strong>`
+    $('dashboardActivity').innerHTML = `<strong>${escapeHtml(jobTaskLabel(latest))}</strong>`
       + `<span>${escapeHtml(jobStatusLabel(latest.status))} · ${escapeHtml(jobActivityText(latest))}</span>`;
   }
 }
@@ -3390,6 +3596,13 @@ async function restoreWorkspace() {
   if (storedScanId) {
     try {
       await refreshScan(storedScanId);
+      const importStatus = String(state.importTask?.status || '').toLowerCase();
+      if (state.processing?.state === 'awaiting_selection' || importStatus === 'waiting_for_selection') {
+        await openSelectionPanel(storedScanId);
+      } else if (['candidate_importing', 'candidate_analyzing', 'waiting_for_deep_selection', 'preliminary_summarizing', 'preliminary_nodes', 'preliminary_overview', 'deep_update_available'].includes(importStatus)) {
+        setPackageStage('analysis');
+        renderCandidatePreviewCard();
+      }
       return;
     } catch (error) {
       if ([403, 404].includes(error.status)) forgetCurrentScan(storedScanId);
@@ -3418,8 +3631,12 @@ async function restoreWorkspace() {
   if (!scanId) return;
   try {
     await refreshScan(scanId);
-    if (state.processing?.state === 'awaiting_selection') {
+    const importStatus = String(state.importTask?.status || '').toLowerCase();
+    if (state.processing?.state === 'awaiting_selection' || importStatus === 'waiting_for_selection') {
       await openSelectionPanel(scanId);
+    } else if (['candidate_importing', 'candidate_analyzing', 'waiting_for_deep_selection', 'preliminary_summarizing', 'preliminary_nodes', 'preliminary_overview', 'deep_update_available'].includes(importStatus)) {
+      setPackageStage('analysis');
+      renderCandidatePreviewCard();
     }
   } catch (_) {
     forgetCurrentScan(scanId);
@@ -3459,7 +3676,7 @@ function updateJobControls(job = {}) {
 }
 
 
-async function cancelJob(jobId) {
+async function cancelJob(jobId, notify = true) {
   if (!jobId) {
     toast('当前没有可以取消的任务。');
     return;
@@ -3471,7 +3688,7 @@ async function cancelJob(jobId) {
     const data = await api(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
     const updated = rememberJob(data.job || { ...cancelling, status: 'cancelling', message: '已发送取消请求' }, jobId);
     if (state.jobId === jobId) updateJobControls(updated);
-    toast(updated.status === 'cancelled'
+    if (notify) toast(updated.status === 'cancelled'
       ? '排队任务已取消。'
       : '已发送取消请求，Worker 正在安全停止当前步骤。');
     refreshTaskCenter();
@@ -3694,8 +3911,13 @@ document.addEventListener('click', (event) => {
   if (cancelButton) {
     event.preventDefault();
     if (cancelButton.disabled) return;
-    const jobId = cancelButton.dataset.jobCancel || state.jobId;
-    cancelJob(jobId);
+    const batchIds = String(cancelButton.dataset.jobCancelBatch || '').split(',').map((id) => id.trim()).filter(Boolean);
+    if (batchIds.length > 1) {
+      Promise.allSettled(batchIds.map((id) => cancelJob(id, false)))
+        .then(() => { toast('已发送批次取消请求。'); refreshTaskCenter(); });
+    } else {
+      cancelJob(batchIds[0] || cancelButton.dataset.jobCancel || state.jobId);
+    }
     return;
   }
   const watchButton = event.target.closest('[data-job-watch]');
@@ -3932,6 +4154,8 @@ async function pollJob(jobId) {
 
       if (job.task_type === 'generate_summary') {
         const result = job.result || {};
+        const workflowSource = jobWorkflowSource(job) || String(result.workflow_source || '');
+        const preliminary = workflowSource === 'preliminary_model_summary';
         if (result.summary) {
           state.summary = result.summary;
           const resultPath = result.summary.node_path || state.selected?.path;
@@ -3939,13 +4163,15 @@ async function pollJob(jobId) {
           if (resultPath) state.summaries.set(summaryKey(resultPath, resultType), result.summary);
           renderSummary(
             result.summary,
-            result.node_id ? '主题节点深度摘要' : '模型深度摘要'
+            result.node_id
+              ? (workflowSource === 'preliminary_node_summary' ? '主题节点初步摘要' : '主题节点深度摘要')
+              : (preliminary ? '模型初步摘要' : '模型深度摘要')
           );
           }
         toast(
           result.degraded
-            ? '深度摘要已完成，但部分内容使用了本地保底结果'
-            : '深度摘要生成完成'
+            ? `${preliminary ? '初步摘要' : '深度摘要'}已完成，但部分内容使用了本地保底结果`
+            : `${preliminary ? '初步摘要' : '深度摘要'}生成完成`
         );
         state.jobId = null;
         updateJobControls({ ...job, status: 'completed', progress: 100 });
@@ -5012,6 +5238,7 @@ async function initializeApp() {
   $('candidateBackSelectionBtn')?.addEventListener('click', () => {
     openSelectionPanel(state.scan?.scan_id);
   });
+  $('candidateSwitchPackageBtn')?.addEventListener('click', () => window.SJFXDataSources?.open('standard') || window.SJFXShell?.activate('packages'));
   $('candidatePreviewTopics')?.addEventListener('click', async (event) => {
     const button = event.target.closest('[data-large-category-node]');
     if (!button || !state.scan?.scan_id) return;

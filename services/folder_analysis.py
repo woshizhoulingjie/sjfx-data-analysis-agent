@@ -12,6 +12,12 @@ from services.evidence import (
 )
 
 
+CHINESE_CONCLUSION_RULE = (
+    " 所有摘要、事实、论点、方法、结论、风险和不确定性必须使用简体中文表达；"
+    "原文专有名词、缩写、CVE、数字和文件路径可以保留原文。"
+)
+
+
 def _catalog_evidence_item(evidence, source_path=None):
     """Normalize an evidence card while retaining exact source locators."""
     item = compact_evidence(evidence, max_chars=520)
@@ -995,7 +1001,7 @@ def analyze_folder(
             (
                 "你是严谨的数据包节点概览分析助手。"
                 "必须基于给定证据提炼主题、关键发现、"
-                "异常和可验证的深入方向。"
+                "异常和可验证的深入方向。" + CHINESE_CONCLUSION_RULE
             ),
 
             prompt + (

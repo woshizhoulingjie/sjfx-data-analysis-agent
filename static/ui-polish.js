@@ -6,12 +6,12 @@
 
   const $ = (id) => document.getElementById(id);
   const routeTitles = {
-    dashboard: 'SJFX · 工作台', packages: 'SJFX · 数据包管理',
-    physical: 'SJFX · 原始目录', analysis: 'SJFX · 智能分析',
-    homogeneous: 'SJFX · 同构文件关联', overview: 'SJFX · 数据包概览',
-    evidence: 'SJFX · 证据问答', chat: 'SJFX · 资料问答',
-    translation: 'SJFX · 全文翻译', tasks: 'SJFX · 任务中心',
-    exports: 'SJFX · 导出中心', settings: 'SJFX · 系统设置'
+    dashboard: '数据分析智能体 · 工作台', packages: '数据分析智能体 · 数据包管理',
+    physical: '数据分析智能体 · 原始目录', analysis: '数据分析智能体 · 智能分析',
+    homogeneous: '数据分析智能体 · 同构文件关联', overview: '数据分析智能体 · 数据包概览',
+    evidence: '数据分析智能体 · 证据问答', chat: '数据分析智能体 · 资料问答',
+    translation: '数据分析智能体 · 全文翻译', tasks: '数据分析智能体 · 任务中心',
+    exports: '数据分析智能体 · 导出中心', settings: '数据分析智能体 · 系统设置'
   };
   const statusLabels = {
     idle: '等待导入', queued: '排队中', processing: '正在处理', running: '正在处理',

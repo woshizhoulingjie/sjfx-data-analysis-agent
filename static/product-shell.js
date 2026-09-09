@@ -5,15 +5,18 @@
   const routeNames = {
     dashboard: ['工作台', '数据概览'], source: ['数据包', '选择资料来源'], packages: ['数据包', '导入与任务'],
     physical: ['原始目录', '物理资料树'], analysis: ['智能分析', '主题与证据'],
+    'large-import': ['大数据包', '导入资料'], 'large-select': ['大数据包', '选择深度摘要'],
+    'large-catalog': ['大数据包', '原始目录与智能目录'], 'large-overview': ['大数据包', '情报概览'], 'large-result': ['大数据包', '情报概览'],
     homogeneous: ['同构文件关联', '台账与事项脉络'],
     chat: ['资料问答', '持续对话'], translation: ['全文翻译', '原文与中文'],
     evidence: ['证据问答', '可追溯检索'], overview: ['数据包概览', '内容地图'],
     exports: ['导出中心', '交接成果'], tasks: ['任务中心', '运行状态'],
     settings: ['系统设置', '本地运行环境']
   };
-  const viewFor = { dashboard: 'dashboard', source: 'source', packages: 'packages', physical: 'explore', analysis: 'explore', homogeneous: 'homogeneous', chat: 'chat', translation: 'translation', evidence: 'evidence', overview: 'overview', exports: 'exports', tasks: 'tasks', settings: 'settings' };
+  const viewFor = { dashboard: 'dashboard', source: 'source', packages: 'packages', physical: 'explore', analysis: 'explore', 'large-import': 'packages', 'large-select': 'packages', 'large-catalog': 'large-result', 'large-overview': 'large-result', 'large-result': 'large-result', homogeneous: 'homogeneous', chat: 'chat', translation: 'translation', evidence: 'evidence', overview: 'overview', exports: 'exports', tasks: 'tasks', settings: 'settings' };
   let activeRoute = 'dashboard';
   let navigationRestoreTarget = null;
+  const SIDEBAR_COLLAPSED_KEY = 'sjfx_sidebar_collapsed_v1';
 
   const $ = (id) => document.getElementById(id);
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -42,6 +45,34 @@
     window.dispatchEvent(new CustomEvent('sjfx-shell-state', {
       detail: { hasScan: hasRealScan(), scanId: storedScanId(), route: activeRoute }
     }));
+  }
+
+  function storedSidebarCollapsed() {
+    try { return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'; }
+    catch (_) { return false; }
+  }
+
+  function setSidebarCollapsed(collapsed, persist = true) {
+    if (isCompactNavigation()) {
+      document.body.classList.remove('nav-collapsed');
+      return;
+    }
+    const value = Boolean(collapsed);
+    document.body.classList.toggle('nav-collapsed', value);
+    document.querySelectorAll('.sidebar .nav-item').forEach((item) => {
+      if (value) item.title = item.textContent.trim();
+      else item.removeAttribute('title');
+    });
+    const toggle = $('navCollapseBtn');
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', String(!value));
+      toggle.setAttribute('aria-label', value ? '展开左侧导航' : '收起左侧导航');
+      toggle.title = value ? '展开左侧导航' : '收起左侧导航';
+      toggle.textContent = value ? '›' : '‹';
+    }
+    if (persist) {
+      try { window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, value ? '1' : '0'); } catch (_) {}
+    }
   }
 
   function mirror(sourceId, targetId) {
@@ -106,6 +137,13 @@
     if (toggle) {
       toggle.setAttribute('aria-expanded', String(Boolean(open)));
       toggle.setAttribute('aria-label', open ? '关闭导航' : '打开导航');
+    }
+    const collapseButton = $('navCollapseBtn');
+    if (collapseButton && isCompactNavigation()) {
+      collapseButton.textContent = open ? '×' : '☰';
+      collapseButton.setAttribute('aria-expanded', String(Boolean(open)));
+      collapseButton.setAttribute('aria-label', open ? '关闭导航' : '打开导航');
+      collapseButton.title = open ? '关闭导航' : '打开导航';
     }
     if (open) {
       window.requestAnimationFrame(() => {
@@ -207,6 +245,9 @@
     if ($('exploreTitle')) $('exploreTitle').textContent = route === 'analysis' ? '智能分析目录' : '原始目录';
     if ($('exploreSubtitle')) $('exploreSubtitle').textContent = route === 'analysis' ? '从主题到子方向、文档和证据逐层下钻。' : '确认真实资料结构，原始目录不会被语义分类覆盖。';
     if (route === 'tasks') window.SJFXTasks?.refresh();
+    if (route === 'large-import' || route === 'large-select') window.SJFXLargePackage?.setStage(route === 'large-import' ? 'import' : 'select');
+    if (route === 'packages' || route === 'source') window.SJFXLargePackage?.setStage('normal');
+    if (route === 'large-catalog' || route === 'large-overview' || route === 'large-result') window.SJFXLargeResult?.activate(window.sjfxLargeResultId || '', route === 'large-catalog' ? 'catalog' : 'overview');
     if (route === 'homogeneous') window.SJFXHomogeneous?.activate();
     window.SJFXEngineering?.activate(route);
     if (route === 'packages') {
@@ -246,6 +287,24 @@
       const sidebar = document.querySelector('.sidebar');
       setNavigationOpen(!sidebar?.classList.contains('open'));
     });
+    const collapseButton = $('navCollapseBtn');
+    if (collapseButton) {
+      if (isCompactNavigation()) {
+        collapseButton.textContent = '☰';
+        collapseButton.setAttribute('aria-label', '打开导航');
+        collapseButton.title = '打开导航';
+      } else {
+        setSidebarCollapsed(storedSidebarCollapsed(), false);
+      }
+      collapseButton.addEventListener('click', () => {
+        if (isCompactNavigation()) {
+          const sidebar = document.querySelector('.sidebar');
+          setNavigationOpen(!sidebar?.classList.contains('open'));
+        } else {
+          setSidebarCollapsed(!document.body.classList.contains('nav-collapsed'));
+        }
+      });
+    }
     $('mobileNavBackdrop')?.addEventListener('click', () => setNavigationOpen(false));
     document.querySelector('.main-area')?.addEventListener('click', (event) => {
       const sidebar = document.querySelector('.sidebar');
@@ -256,9 +315,14 @@
       trapNavigationFocus(event);
     });
     window.addEventListener('resize', () => {
-      if (!isCompactNavigation()) setNavigationOpen(false, false);
+      if (!isCompactNavigation()) {
+        setNavigationOpen(false, false);
+        setSidebarCollapsed(storedSidebarCollapsed(), false);
+      } else {
+        document.body.classList.remove('nav-collapsed');
+      }
     }, { passive: true });
-    const resetToken = () => {
+    const resetToken = async () => {
       const auth = window.SJFXAuth;
       if (!auth || typeof auth.ensureToken !== 'function') {
         window.sessionStorage.removeItem('sjfx_api_token');
@@ -266,7 +330,7 @@
         return;
       }
       try {
-        auth.ensureToken({ force: true });
+        await auth.ensureToken({ force: true });
         window.location.reload();
       } catch (_) { /* cancelled: keep the page usable and do not issue anonymous requests */ }
     };

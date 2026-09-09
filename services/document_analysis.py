@@ -9,6 +9,12 @@ from services.evidence import build_file_claims, select_evidence
 from services.scanner import extract_text
 
 
+CHINESE_CONCLUSION_RULE = (
+    " 所有摘要、事实、论点、方法、结论、风险和不确定性必须使用简体中文表达；"
+    "原文专有名词、缩写、CVE、数字和文件路径可以保留原文。"
+)
+
+
 TOPIC_STOPWORDS = {
     "the", "and", "for", "with", "from", "this", "that", "are", "was", "were",
     "have", "has", "into", "using", "paper", "article", "document", "study",
@@ -443,7 +449,7 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
 {{"title":"标题","structure_overview":{{"sections":["章节"],"document_type":"类型"}},"core_summary":"摘要","key_facts":["事实"],"arguments":["论点"],"methodology":["方法"],"conclusions":["候选结论"],"uncertainties":["不确定信息"],"warnings":["预览限制"],"recommended_research_direction":{{"title":"方向","rationale":"理由","questions":["问题"]}}}}
 """.format(path=node_path, metadata=json.dumps(metadata, ensure_ascii=False), text=selected_text)
     result = llm.chat_json(
-        "你是严谨的文献预读助手。只根据代表性内容提炼候选摘要和论点，不得冒充全文校验结论。",
+        "你是严谨的文献预读助手。只根据代表性内容提炼候选摘要和论点，不得冒充全文校验结论。" + CHINESE_CONCLUSION_RULE,
         prompt,
         max_tokens=600,
         long_output=False,
@@ -528,7 +534,7 @@ methodology、conclusions、uncertainties、warnings 必须使用简体中文；
 "conclusions":["候选结论"],"uncertainties":["不确定信息"],"warnings":["预览限制"]}]}""" % prompt_rows
     per_file_tokens = max(160, min(360, int(output_tokens_per_file or 240)))
     result = llm.chat_json(
-        "你是严谨的文献预读助手。一次处理多个文件，每个文件独立返回结果。",
+        "你是严谨的文献预读助手。一次处理多个文件，每个文件独立返回结果。" + CHINESE_CONCLUSION_RULE,
         prompt,
         max_tokens=max(per_file_tokens, min(1600, per_file_tokens * len(rows))),
         # A multi-file object needs its per-file output budget; the ordinary
@@ -680,7 +686,7 @@ def _analyze_structured_document(llm, node_path, unified_document,
         content=selected_text,
     )
     result = llm.chat_json(
-        "你是严谨的结构化漏洞数据分析助手，必须区分记录事实与跨记录归纳。",
+        "你是严谨的结构化漏洞数据分析助手，必须区分记录事实与跨记录归纳。" + CHINESE_CONCLUSION_RULE,
         prompt,
         max_tokens=3200,
         long_output=True,
@@ -791,7 +797,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             text=text,
         )
         result = llm.chat_json(
-            "你是严谨的全文文献分析助手，需要覆盖研究问题、方法、主要论点、结论和局限。",
+            "你是严谨的全文文献分析助手，需要覆盖研究问题、方法、主要论点、结论和局限。" + CHINESE_CONCLUSION_RULE,
             prompt,
             max_tokens=3200,
             long_output=True,
@@ -828,7 +834,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
 正文：
 {text}""".format(path=node_path, index=chunk["index"], total=len(chunks), start=chunk["start"], end=chunk["end"], text=chunk["text"])
         result = llm.chat_json(
-            "你正在进行全文分块阅读。不要猜测其他块内容，只提取当前块的事实和论证。",
+            "你正在进行全文分块阅读。不要猜测其他块内容，只提取当前块的事实和论证。" + CHINESE_CONCLUSION_RULE,
             prompt,
             max_tokens=1800,
             long_output=True,
@@ -880,7 +886,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
     )
     try:
         final_result = llm.chat_json(
-            "你是全文文献综合分析助手。必须综合所有分块，区分作者结论、事实和局限。",
+            "你是全文文献综合分析助手。必须综合所有分块，区分作者结论、事实和局限。" + CHINESE_CONCLUSION_RULE,
             merge_prompt,
             max_tokens=3200,
             long_output=True,

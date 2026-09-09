@@ -7,6 +7,7 @@ claiming safe even if an operator accidentally starts a second Worker.
 
 import errno
 import ctypes
+import copy
 import json
 import logging
 import logging.handlers
@@ -82,6 +83,61 @@ class RemoteJobError(RuntimeError):
     def __init__(self, message, remote_traceback=""):
         super().__init__(message)
         self.remote_traceback = remote_traceback
+
+
+def _is_transient_database_lock(exc):
+    """Return True for SQLite lock contention that is safe to retry.
+
+    The supervised child reports its original traceback through
+    ``RemoteJobError``.  Looking at both messages keeps a short-lived lock
+    from being presented as a permanent file failure, while leaving all other
+    exceptions on the existing failure path.
+    """
+    parts = [str(exc)]
+    remote_traceback = getattr(exc, "remote_traceback", "")
+    if remote_traceback:
+        parts.append(str(remote_traceback))
+    text = "\n".join(parts).casefold()
+    return "database is locked" in text or "database table is locked" in text or "database is busy" in text or "sqlite_busy" in text
+
+
+def _requeue_after_database_lock(job, exc):
+    """Requeue a running job after transient SQLite contention.
+
+    Requeueing is bounded by the normal supervised-attempt limit and uses a
+    few short retries for the queue UPDATE itself.  This preserves the
+    existing checkpoint and prevents a transient lock from poisoning a whole
+    import batch.
+    """
+    attempts = int(job.get("attempt_count") or 1)
+    if attempts >= Config.MAX_JOB_RESUME_ATTEMPTS:
+        return False
+    message = "数据库暂时繁忙，已保存当前检查点并自动重试（第 {} 轮）。".format(attempts + 1)
+    for retry in range(3):
+        try:
+            if storage.requeue_job_slice(job.get("id"), message):
+                logger.warning(
+                    "Requeued job after transient SQLite lock id=%s attempt=%s retry=%s",
+                    job.get("id"), attempts, retry + 1,
+                )
+                try:
+                    if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
+                        storage.update_analysis_progress_status(
+                            job.get("scan_id"), "queued", message, "checkpoint_requeued",
+                        )
+                except Exception:
+                    # The queue row is already safely restored; publishing the
+                    # advisory scan progress can wait for the next worker
+                    # cycle if SQLite is still busy.
+                    logger.warning("Deferred progress publication after lock requeue scan_id=%s", job.get("scan_id"), exc_info=True)
+                return True
+        except Exception as requeue_exc:
+            if not _is_transient_database_lock(requeue_exc):
+                logger.warning("Transient-lock requeue failed id=%s", job.get("id"), exc_info=True)
+                return False
+        time.sleep(0.5 * (retry + 1))
+    logger.warning("Could not requeue transient-lock job id=%s: %s", job.get("id"), exc)
+    return False
 
 
 def _finish_conversation_turn_after_worker_failure(job, status, error=None):
@@ -549,6 +605,93 @@ def _resume_strict_imports():
     return resumed
 
 
+def _resume_preliminary_imports():
+    """Finish durable preliminary stages after a worker restart or missed callback.
+
+    Preliminary file/node jobs and the overview report are separate durable
+    jobs.  If the process is interrupted between their finalization and the
+    state transition, the jobs can all be complete while ``import_tasks`` is
+    still left at an intermediate stage.  Re-run the idempotent queue hooks
+    and advance only when every referenced job is completed.
+    """
+    with storage._connect() as conn:
+        rows = conn.execute(
+            "SELECT scan_id,status,checkpoint,owner_id FROM import_tasks "
+            "WHERE status IN ('preliminary_summarizing','preliminary_nodes','preliminary_overview')"
+        ).fetchall()
+    if not rows:
+        return 0
+    from app import (
+        _queue_idle_deep_backfill,
+        _queue_preliminary_node_summaries,
+        _queue_preliminary_overview,
+    )
+    resumed = 0
+    for row in rows:
+        task = dict(row)
+        scan_id = str(task.get("scan_id") or "")
+        owner_id = str(task.get("owner_id") or "legacy")
+        try:
+            checkpoint = json.loads(task.get("checkpoint") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            checkpoint = {}
+        selected = [str(path) for path in (checkpoint.get("selected_paths") or []) if str(path)]
+        if not scan_id or not selected:
+            continue
+        try:
+            # The queue hooks verify all prerequisite jobs and are safe to call
+            # repeatedly.  This repairs a missed worker callback without
+            # creating duplicate jobs.
+            if task.get("status") == "preliminary_summarizing":
+                file_ids = [str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or []) if str(item)]
+                if not file_ids:
+                    continue
+                with storage._connect() as conn:
+                    states = conn.execute(
+                        "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(",".join("?" for _ in file_ids)),
+                        [scan_id] + file_ids,
+                    ).fetchall()
+                state_map = {str(item["id"]): str(item["status"] or "") for item in states}
+                if any(state_map.get(job_id) != "completed" for job_id in file_ids):
+                    continue
+                _queue_preliminary_node_summaries(scan_id, owner_id)
+
+            current = storage.get_import_task(scan_id) or {}
+            if current.get("status") == "preliminary_nodes":
+                _queue_preliminary_overview(scan_id, owner_id)
+
+            current = storage.get_import_task(scan_id) or {}
+            if current.get("status") not in {"preliminary_nodes", "preliminary_overview"}:
+                continue
+            current_checkpoint = dict(current.get("checkpoint") or {})
+            report_id = str(current_checkpoint.get("preliminary_overview_job_id") or "")
+            if not report_id:
+                continue
+            report = storage.get_job(report_id)
+            if not report or str(report.get("status") or "") != "completed":
+                continue
+            if current.get("status") == "preliminary_nodes":
+                # Preserve the declared state-machine order before moving on
+                # to the low-priority deep-summary stage.
+                storage.transition_import_task(
+                    scan_id,
+                    "preliminary_overview",
+                    checkpoint=current_checkpoint,
+                    reason="文件和节点初步摘要已完成，情报概览已生成。",
+                )
+            storage.transition_import_task(
+                scan_id,
+                "deep_summarizing_files",
+                checkpoint=storage.get_import_task(scan_id).get("checkpoint") or current_checkpoint,
+                reason="初步情报概览已完成，继续后台深度摘要。",
+            )
+            _queue_idle_deep_backfill(scan_id, owner_id)
+            resumed += 1
+        except Exception:
+            logger.warning("恢复初步导入状态机失败 scan_id=%s", scan_id, exc_info=True)
+    return resumed
+
+
 def run_forever():
     ensure_runtime_directories()
     _configure_worker_logging()
@@ -557,12 +700,15 @@ def run_forever():
     recovered = storage.recover_orphaned_jobs_after_lock()
     reconciled_turns = storage.reconcile_conversation_turn_jobs()
     resumed_imports = _resume_strict_imports()
+    resumed_preliminary = _resume_preliminary_imports()
     if recovered:
         logger.warning("Worker startup recovered %s orphaned task(s)", recovered)
     if reconciled_turns:
         logger.warning("Worker startup reconciled %s conversation turn(s)", reconciled_turns)
     if resumed_imports:
         logger.info("Worker startup resumed %s strict import task(s)", resumed_imports)
+    if resumed_preliminary:
+        logger.info("Worker startup reconciled %s preliminary import task(s)", resumed_preliminary)
     try:
         storage.checkpoint_wal(force=True)
     except Exception:
@@ -573,9 +719,18 @@ def run_forever():
     last_recovery = time.monotonic()
     recovery_interval = max(30.0, min(300.0, Config.WORKER_STALE_SECONDS / 3.0))
     last_history_cleanup = 0.0
+    # Entries contain model output only; queued jobs and their state-machine
+    # records remain untouched until each job is claimed normally.
+    preliminary_prefetch_cache = {}
     try:
         while True:
             now = time.monotonic()
+            cache_cutoff = now - 1800.0
+            preliminary_prefetch_cache = {
+                job_id: value
+                for job_id, value in preliminary_prefetch_cache.items()
+                if float(value.get("created_at") or 0) >= cache_cutoff
+            }
             retention_enabled = bool(
                 Config.HISTORY_RETENTION_DAYS or Config.HISTORY_MAX_SCANS
             )
@@ -611,6 +766,7 @@ def run_forever():
                     recovered = storage.recover_stale_jobs(Config.WORKER_STALE_SECONDS)
                     reconciled_turns = storage.reconcile_conversation_turn_jobs()
                     resumed_imports = _resume_strict_imports()
+                    resumed_preliminary = _resume_preliminary_imports()
                     if recovered:
                         logger.warning("Worker recovered %s stale task(s)", recovered)
                     if reconciled_turns:
@@ -619,6 +775,8 @@ def run_forever():
                         )
                     if resumed_imports:
                         logger.info("Worker resumed %s strict import task(s)", resumed_imports)
+                    if resumed_preliminary:
+                        logger.info("Worker reconciled %s preliminary import task(s)", resumed_preliminary)
                 except Exception:
                     logger.warning("周期性失联任务恢复失败，将继续运行", exc_info=True)
                 last_recovery = time.monotonic()
@@ -635,6 +793,14 @@ def run_forever():
             job_id = job["id"]
             try:
                 logger.info("Worker claimed task id=%s type=%s scan_id=%s", job_id, job.get("task_type"), job.get("scan_id"))
+                execution_job = job
+                prefetched = preliminary_prefetch_cache.pop(str(job_id), None)
+                if prefetched:
+                    # This is an in-memory optimization marker. It is never
+                    # written into the persisted job options.
+                    execution_job = copy.deepcopy(job)
+                    execution_job["options"] = dict(job.get("options") or {})
+                    execution_job["options"]["_preliminary_prefetched_summary"] = prefetched
                 resources_ready, resource_reasons = _background_resource_state(job)
                 if not resources_ready:
                     message = "后台补析已暂停：{}；资源恢复后自动重试。".format(
@@ -646,7 +812,16 @@ def run_forever():
                     ):
                         logger.info("Deferred background task id=%s reasons=%s", job_id, resource_reasons)
                         continue
-                result = execute_supervised(job)
+                result = execute_supervised(execution_job)
+                if isinstance(result, dict):
+                    private_prefetch = result.pop("_preliminary_batch_prefetch", None) or {}
+                    created_at = time.time()
+                    for sibling_id, sibling_result in private_prefetch.items():
+                        if sibling_result and str(sibling_id) != str(job_id):
+                            preliminary_prefetch_cache[str(sibling_id)] = {
+                                **dict(sibling_result),
+                                "created_at": created_at,
+                            }
                 if isinstance(result, dict) and result.pop("_defer_slice", False):
                     message = result.pop("_defer_message", "资源不足，任务已延迟。")
                     delay = int(result.pop("_defer_seconds", 60) or 60)
@@ -809,6 +984,13 @@ def run_forever():
                                 )
                             storage.finalize_job(job_id)
                             continue
+                # SQLite uses a single writer even in WAL mode.  Under a
+                # large import the app, worker and supervised child can
+                # briefly overlap writes; preserve the checkpoint and retry
+                # instead of turning that transient contention into a failed
+                # file/job.
+                if _is_transient_database_lock(exc) and _requeue_after_database_lock(job, exc):
+                    continue
                 if isinstance(exc, RemoteJobError) and exc.remote_traceback:
                     logger.error(
                         "Worker task failed id=%s type=%s\n%s",
