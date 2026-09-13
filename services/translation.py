@@ -669,6 +669,10 @@ class TranslationPolicy:
     checkpoint_unit_interval: int = 16
     checkpoint_interval_seconds: float = 30.0
     max_intermediate_checkpoints: int = 32
+    # Keep the historical 1200-character recovery gate for existing callers
+    # (mail/NLLB). Explicit file translation may opt into a lower gate because
+    # its vLLM units are deliberately smaller and independently resumable.
+    segmented_recovery_min_chars: int = 1200
 
     def __post_init__(self):
         self.max_unit_chars = max(128, min(12000, int(self.max_unit_chars or 4800)))
@@ -685,6 +689,9 @@ class TranslationPolicy:
         )
         self.max_intermediate_checkpoints = max(
             1, min(256, int(self.max_intermediate_checkpoints or 32))
+        )
+        self.segmented_recovery_min_chars = max(
+            0, min(12000, int(self.segmented_recovery_min_chars or 1200))
         )
 
 
@@ -1406,7 +1413,13 @@ class TranslationService:
                     if (
                         primary_error.code == "target_contains_untranslated_text"
                         and unit.get("block_kind") != "table"
-                        and len(core) >= max(1200, int(self.policy.max_unit_chars * 0.45))
+                        # vLLM can occasionally echo a short slide/reference
+                        # block. Split such failures immediately so one bad
+                        # block does not terminate the document job.
+                        and len(core) >= max(
+                            self.policy.segmented_recovery_min_chars,
+                            int(self.policy.max_unit_chars * 0.30),
+                        )
                     ):
                         recovered = segmented_recovery()
                     if recovered is not None:

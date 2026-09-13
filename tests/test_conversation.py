@@ -1,4 +1,5 @@
 import unittest
+import json
 
 from services.conversation import (
     CallableEvidenceRetriever,
@@ -11,6 +12,7 @@ from services.conversation import (
     FollowUpResolver,
     IntentRouter,
 )
+from services.conversation_package_context import build_reading_manifest, model_digest
 
 
 def evidence(
@@ -351,6 +353,66 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(result["promotion_request"]["priority"], "interactive")
         self.assertIn("deferred/key-letter.eml", result["promotion_request"]["candidate_paths"])
         self.assertAlmostEqual(result["coverage"]["query_coverage"], 0.12)
+
+    def test_incomplete_all_package_reading_is_visible_as_a_partial_answer(self):
+        retrieval = {
+            "results": [evidence()],
+            "coverage": {
+                "total_files": 2,
+                "candidate_files": 1,
+                "inspected_files": 1,
+                "query_coverage": 1.0,
+                "package_reading_files": 2,
+                "summary_backed_files": 1,
+                "package_reading_coverage": 0.5,
+                "package_reading_complete": False,
+            },
+            "package_context": {
+                "reading_manifest": {
+                    "files_read": 2,
+                    "summary_backed_files": 1,
+                    "files_without_summary": 1,
+                    "summary_coverage": 0.5,
+                    "complete": False,
+                    "source_digest": "digest",
+                },
+            },
+        }
+        engine = self.make_engine(retrieval, model=FakeModel("资料显示计划已获批 [1]。"))
+
+        result = engine.ask(engine.new_session("scan-1"), "计划是否获批？")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["evidence_status"], "partial")
+        self.assertEqual(result["package_reading"]["files_without_summary"], 1)
+        self.assertTrue(any("全包阅读账本" in item for item in result["warnings"]))
+
+
+    def test_digest_reads_every_summary_and_retains_tail_contribution(self):
+        files = [
+            {
+                "path": "reports/{:03d}.txt".format(index),
+                "summary_type": "file",
+                "summary": "常规资料摘要 {}".format(index),
+            }
+            for index in range(18)
+        ]
+        files[-1]["summary"] = "TAILUNIQUE 专属结论"
+        manifest = build_reading_manifest(files)
+        digest = json.loads(model_digest({"file_summaries": files}, max_chars=1800))
+
+        self.assertEqual(manifest["files_read"], 18)
+        self.assertTrue(manifest["complete"])
+        self.assertEqual(digest["all_file_reading"]["source_digest"], manifest["source_digest"])
+        self.assertTrue(any(item["term"] == "tailunique" for item in manifest["semantic_signals"]))
+        self.assertFalse(build_reading_manifest([{"path": "pending.txt", "summary": {}}])["complete"])
+
+        changed = [dict(item) for item in files]
+        changed[-1]["summary"] = "CHANGEDTAIL 另一条结论"
+        self.assertNotEqual(
+            manifest["source_digest"],
+            build_reading_manifest(changed)["source_digest"],
+        )
 
     def test_no_evidence_with_deferred_candidates_refuses_and_requests_promotion(self):
         retrieval = {

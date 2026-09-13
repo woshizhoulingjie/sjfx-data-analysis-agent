@@ -70,3 +70,7 @@ Thumbs.db
 
 # Server-side emergency backups
 backups/
+
+# Server-side snapshots and bounded audit captures; never publish these copies.
+.codex_*
+*.pre-audit-*

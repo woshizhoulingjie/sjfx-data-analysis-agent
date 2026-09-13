@@ -2637,10 +2637,11 @@ function openEvidenceSource(path, location) {
 }
 
 
-async function loadPreliminaryDirectory(scanId = state.scan?.scan_id) {
+async function loadPreliminaryDirectory(scanId = state.scan?.scan_id, isCurrent = () => true) {
   if (!scanId) return null;
   try {
     const data = await api('/api/scan/' + encodeURIComponent(scanId) + '/preliminary-directory');
+    if (!isCurrent()) return null;
     state.preliminaryDirectory = data.directory || null;
     if (state.preliminaryDirectory && $('selectionHint')) {
       const topics = Array.isArray(state.preliminaryDirectory.topics) ? state.preliminaryDirectory.topics : [];
@@ -2652,20 +2653,21 @@ async function loadPreliminaryDirectory(scanId = state.scan?.scan_id) {
 }
 
 
-async function loadFormalDirectory(scanId = state.scan?.scan_id) {
+async function loadFormalDirectory(scanId = state.scan?.scan_id, isCurrent = () => true) {
   if (!scanId) return null;
   try {
     const data = await api('/api/scan/' + encodeURIComponent(scanId) + '/formal-directory');
+    if (!isCurrent()) return null;
     state.formalDirectory = data.directory || null;
     if (state.formalDirectory && $('selectionHint')) {
       const c = state.formalDirectory.coverage || {};
       $('selectionHint').dataset.formalDirectory = JSON.stringify({status: state.formalDirectory.status, coverage: c});
     }
     return state.formalDirectory;
-  } catch (_) { state.formalDirectory = null; return null; }
+  } catch (_) { if (isCurrent()) state.formalDirectory = null; return null; }
 }
 
-async function refreshScan(scanId = state.scan?.scan_id) {
+async function refreshScan(scanId = state.scan?.scan_id, isCurrent = () => true) {
   if (!scanId) {
     return;
   }
@@ -2680,6 +2682,7 @@ async function refreshScan(scanId = state.scan?.scan_id) {
       `/api/scan/${scanId}?compact=1&summary_limit=100`
     );
 
+  if (!isCurrent()) return;
   state.scan =
     data.scan;
   if ($('rootPath') && state.scan) {
@@ -2692,21 +2695,26 @@ async function refreshScan(scanId = state.scan?.scan_id) {
   state.analysis =
     data.analysis;
   state.preliminaryDirectory = state.analysis?.preliminary_directory || null;
-  await loadFormalDirectory(scanId);
-  if (!state.preliminaryDirectory) await loadPreliminaryDirectory(scanId);
+  await loadFormalDirectory(scanId, isCurrent);
+  if (!isCurrent()) return;
+  if (!state.preliminaryDirectory) await loadPreliminaryDirectory(scanId, isCurrent);
+  if (!isCurrent()) return;
   state.processing = data.processing || null;
   loadFileWorkflowFilters();
   try {
     const importState = await api(`/api/import-tasks/${scanId}`);
+    if (!isCurrent()) return;
     state.importTask = importState.import_task || null;
     if (state.importTask) state.processing = { ...(state.processing || {}), import_task: state.importTask, preview_queue: state.importTask.preview_queue || {} };
     if (['candidate_importing', 'candidate_analyzing', 'waiting_for_deep_selection'].includes(String(state.importTask?.status || '').toLowerCase())) {
-      await loadPreliminaryDirectory(scanId);
+      await loadPreliminaryDirectory(scanId, isCurrent);
     }
     renderCandidatePreviewCard();
   } catch (error) {
+    if (!isCurrent()) return;
     state.importTask = null;
   }
+  if (!isCurrent()) return;
   state.fileWorkflowPage = null;
   state.fileWorkflowOffset = 0;
   loadFileWorkflowPage();

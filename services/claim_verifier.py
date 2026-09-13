@@ -55,10 +55,90 @@ def _concepts(value: Any) -> set:
     return output
 
 
+def _attribute_claim(
+    claim_text: str,
+    claim_concepts: set,
+    citations: List[Mapping[str, Any]],
+    scope: "ConversationScope",
+    min_concepts: int = 4,
+    max_sources: int = 6,
+    min_sources: int = 2,
+    min_matched: int = 4,
+    min_coverage: float = 0.22,
+) -> Optional[Dict[str, Any]]:
+    """Attribute an uncited factual claim to the evidence it actually matches.
+
+    A broad package-wide answer is a synthesis over the package reading layer,
+    and the model does not always attach ``[n]`` markers to every sentence.
+    Treating those sentences as unverified facts discarded the whole answer
+    even when the retrieved evidence covered them.  The claim is therefore
+    matched against the retrieved evidence using the same concept-overlap bar
+    the ordinary per-citation check already uses.  Only strong multi-source
+    coverage is accepted; anything weaker stays unsupported and is removed.
+    """
+    if len(claim_concepts) < min_concepts:
+        return None
+    scored: List[Any] = []
+    for position, citation in enumerate(citations, 1):
+        if not _scope_contains(scope, citation):
+            continue
+        evidence_concepts = _concepts(_citation_item(citation).get("text"))
+        if not evidence_concepts:
+            continue
+        overlap = claim_concepts.intersection(evidence_concepts)
+        if len(overlap) < 2:
+            continue
+        scored.append(
+            (len(overlap), int(citation.get("citation_index") or position), overlap)
+        )
+    if len(scored) < max(2, min_sources):
+        return None
+    scored.sort(key=lambda value: -value[0])
+    selected = scored[:max_sources]
+    union: set = set()
+    for _count, _index, overlap in selected:
+        union.update(overlap)
+    if len(union) < min_matched:
+        return None
+    coverage = len(union) / float(len(claim_concepts) or 1)
+    if coverage < min_coverage:
+        return None
+    return {
+        "indexes": [index for _count, index, _overlap in selected],
+        "coverage": coverage,
+        "matched": sorted(union)[:24],
+    }
+
+
+def _strip_list_marker(value: Any) -> str:
+    """Remove the model's own leading list marker(s), e.g. "2. " or "(3) ".
+
+    Markers are presentation, not content: they must not be re-numbered by the
+    guard, and they must never be read as factual numbers by the numeric gate.
+    """
+    text = str(value or "").strip()
+    for _ in range(3):
+        stripped = re.sub(r"^[（(]?\d{1,3}\s*[.、)）]\s*", "", text).strip()
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
 def _claim_body(value: Any) -> str:
     text = re.sub(r"\[\d+\]", "", str(value or ""))
     text = re.sub(r"^(?:部分证据支持|分析判断)[:：]\s*", "", text)
+    # A leading list marker is presentation, not a factual number.
+    text = _strip_list_marker(text)
     return text.strip(" -*#\t")
+
+
+def _is_section_lead_in(text: Any) -> bool:
+    """A short heading ending in a colon is a label, not a factual claim."""
+    body = re.sub(r"\[\d+\]", "", str(text or "")).strip(" -*#\t")
+    if not body or len(body) > 24:
+        return False
+    return body.endswith(("：", ":"))
 
 
 def _identifiers(value: Any) -> set:
@@ -107,7 +187,7 @@ class ClaimVerifier:
             claim = dict(claim)
             text = str(claim.get("text") or "").strip()
             indexes = list(claim.get("citation_indexes") or [])
-            if SECTION_LABEL_RE.match(text):
+            if SECTION_LABEL_RE.match(text) or _is_section_lead_in(text):
                 claim.update({"status": "section_label", "evidence_ids": []})
                 verified_claims.append(claim)
                 continue
@@ -163,6 +243,48 @@ class ClaimVerifier:
                             "concept_coverage": round(concept_ratio, 6),
                         }
                     )
+            has_support = any(
+                item.get("support_status") in {"supported", "partially_supported"}
+                for item in evaluations
+            )
+            if not has_support:
+                # A broad package-wide claim is normally a synthesis over
+                # several sources, which no single citation can support on its
+                # own; the model also sometimes omits markers entirely on a
+                # whole-package summary.  Judge the claim against the combined
+                # coverage of the evidence it names (or, when nothing is
+                # named, of the retrieved evidence it actually matches) so a
+                # covered synthesis is kept instead of being discarded.
+                pool = named if named else citations
+                attribution = _attribute_claim(
+                    check_text, claim_concepts, pool, scope
+                )
+                if attribution:
+                    if not named:
+                        named = [
+                            by_index[index] for index in attribution["indexes"]
+                            if index in by_index
+                        ]
+                        indexes = list(attribution["indexes"])
+                        missing = []
+                        evaluations = [
+                            verify_claim_evidence(check_text, _citation_item(item))
+                            for item in named
+                        ]
+                    evaluations.append({
+                        "support_status": (
+                            "supported"
+                            if attribution["coverage"] >= 0.7
+                            else "partially_supported"
+                        ),
+                        "support_score": round(
+                            min(0.9, 0.6 + attribution["coverage"] / 4.0), 3
+                        ),
+                        "support_reason": "陈述为多来源综合，已由所引证据共同覆盖（自动归因）。",
+                        "support_relation": "aggregate_attribution",
+                        "matched_concepts": attribution["matched"][:8],
+                        "concept_coverage": round(attribution["coverage"], 6),
+                    })
             supported = [
                 item for item in evaluations if item.get("support_status") == "supported"
             ]
@@ -232,6 +354,9 @@ class ClaimVerifier:
             claim.update(
                 {
                     "status": status,
+                    # Keep the attributed indexes on the claim so the ledger and
+                    # the answer card agree about what supports this statement.
+                    "citation_indexes": list(indexes),
                     "evidence_ids": list(
                         dict.fromkeys(
                             str(item.get("evidence_id"))
@@ -423,7 +548,20 @@ class ClaimVerifier:
         return {
             "schema_version": "claim-verification/2.0",
             "status": status,
-            "needs_revision": status not in {"verified", "not_required"},
+            # Only evidence that a claim actually failed justifies another
+            # generation round.  Partial support and an incomplete scope are
+            # caveats the UI already reports; treating them as "needs
+            # revision" rewrote good package-wide summaries into a single
+            # "现有证据不足" sentence.
+            "needs_revision": bool(
+                status not in {"verified", "not_required"}
+                and (
+                    unsupported_count
+                    or invalid_labels
+                    or numeric_failures
+                    or out_of_scope
+                )
+            ),
             "scope_checked": True,
             "citation_labels_checked": True,
             "citation_entailment_checked": True,
@@ -458,7 +596,7 @@ class ClaimVerifier:
         omitted = 0
         for claim in claims:
             status = claim.get("status")
-            text = str(claim.get("text") or "").strip()
+            text = _strip_list_marker(str(claim.get("text") or "").strip())
             if not text or status == "section_label":
                 continue
             if status == "supported":

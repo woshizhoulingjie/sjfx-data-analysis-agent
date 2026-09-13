@@ -220,6 +220,15 @@ class Config:
     VLLM_EMBED_TIMEOUT_SECONDS = max(2, min(60, int(os.getenv("VLLM_EMBED_TIMEOUT_SECONDS", "12"))))
     VLLM_EMBED_MAX_BATCH_SIZE = max(1, min(64, int(os.getenv("VLLM_EMBED_MAX_BATCH_SIZE", "8"))))
     VLLM_EMBED_MAX_CHARS = max(128, min(4000, int(os.getenv("VLLM_EMBED_MAX_CHARS", "1200"))))
+    # The client-side mutex must fail fast so an interactive lane can fall back
+    # to lexical retrieval immediately, while the socket budget above is what
+    # absorbs a busy shared CPU embedding server.  Keeping the two budgets
+    # separate is deliberate: one value previously governed both, so raising it
+    # to survive load also turned the fast fallback into a long block.
+    VLLM_EMBED_SEMAPHORE_TIMEOUT_SECONDS = max(
+        1, min(30, int(os.getenv("VLLM_EMBED_SEMAPHORE_TIMEOUT_SECONDS", "2")))
+    )
+    VLLM_EMBED_RETRIES = max(0, min(5, int(os.getenv("VLLM_EMBED_RETRIES", "2"))))
 
     # The server also provides a local Ollama instance for rollback. Keep its
     # settings intact so LLM_BACKEND=ollama remains a safe fallback.
@@ -230,6 +239,15 @@ class Config:
     # Keep the embedding model on CPU so the vLLM generation model retains the GPU.
     OLLAMA_EMBED_NUM_GPU = max(0, int(os.getenv("OLLAMA_EMBED_NUM_GPU", "0")))
     LLM_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1")))
+    # Directory names are the product's primary output.  On the ordinary
+    # "import -> select -> confirm" path the naming model used to be disabled,
+    # which left every name to a deterministic fallback that could emit raw
+    # English placeholders.  The naming is bounded (a few short calls), so it is
+    # on by default; set SJFX_SEMANTIC_NAMING_ON_USER_IMPORT=0 to restore the
+    # previous faster-but-unreadable behaviour without a code change.
+    SEMANTIC_NAMING_ON_USER_IMPORT = os.getenv(
+        "SJFX_SEMANTIC_NAMING_ON_USER_IMPORT", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     # The available Ollama service is shared by the laboratory. Do not send
     # long document prompts to it unless a dedicated scheduling decision was made.
     ENABLE_SHARED_OLLAMA_EMBEDDINGS = os.getenv("ENABLE_SHARED_OLLAMA_EMBEDDINGS", "0").strip().lower() in {"1", "true", "yes"}
@@ -328,6 +346,11 @@ class Config:
     }
     HOST = os.getenv("HOST", "127.0.0.1")
     PORT = int(os.getenv("PORT", "8000"))
+    # Additional explicit interfaces let VPN and existing SSH tunnels coexist.
+    EXTRA_BIND_HOSTS = tuple(dict.fromkeys(
+        host.strip() for host in os.getenv("SJFX_EXTRA_BIND_HOSTS", "").split(",")
+        if host.strip() and host.strip() != os.getenv("HOST", "127.0.0.1")
+    ))
     API_ACCESS_TOKEN = os.getenv("SJFX_API_ACCESS_TOKEN", "").strip()
     OWNER_ID = re.sub(
         r"[^A-Za-z0-9_.-]+", "-", os.getenv("SJFX_OWNER_ID", "primary").strip()
@@ -336,7 +359,10 @@ class Config:
     DOWNLOAD_TICKET_TTL_SECONDS = max(
         30, min(600, int(os.getenv("DOWNLOAD_TICKET_TTL_SECONDS", "120")))
     )
-    _LOOPBACK_HOST = HOST in {"127.0.0.1", "localhost", "::1"}
+    _LOOPBACK_HOST = all(
+        host in {"127.0.0.1", "localhost", "::1"}
+        for host in (HOST,) + EXTRA_BIND_HOSTS
+    )
     AUTH_REQUIRED = os.getenv(
         "AUTH_REQUIRED", "0" if _LOOPBACK_HOST else "1"
     ).strip().lower() in {"1", "true", "yes", "on"}
@@ -358,7 +384,7 @@ class Config:
         and not AUTH_REQUIRED
     )
     _allowed_roots_raw = os.getenv("SCAN_ALLOWED_ROOTS", "").strip()
-    if not _allowed_roots_raw and HOST not in {"127.0.0.1", "localhost", "::1"}:
+    if not _allowed_roots_raw and not _LOOPBACK_HOST:
         raise RuntimeError("非回环地址部署必须显式设置 SCAN_ALLOWED_ROOTS，拒绝使用宽泛默认扫描范围")
     _allowed_roots = _allowed_roots_raw or str(BASE_DIR.parent)
     SCAN_ALLOWED_ROOTS = tuple(Path(item).expanduser().resolve() for item in _split_path_list(_allowed_roots))
@@ -406,6 +432,9 @@ class Config:
     # Runtime-only coalescing for preliminary file summaries. The queue and
     # import state machine continue to create one task per file.
     PRELIMINARY_SUMMARY_BATCH_SIZE = max(1, min(4, int(os.getenv("PRELIMINARY_SUMMARY_BATCH_SIZE", "4"))))
+    # Ordinary preliminary summaries only; candidate/deep defaults remain unchanged.
+    PRELIMINARY_SUMMARY_OPTIMIZATION_ENABLED = os.getenv("PRELIMINARY_SUMMARY_OPTIMIZATION_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    PRELIMINARY_SUMMARY_INPUT_MAX_CHARS = max(2000, min(6500, int(os.getenv("PRELIMINARY_SUMMARY_INPUT_MAX_CHARS", "6500"))))
     # ZIP64 and streaming writes support a complete 10 GiB handoff without
     # loading the source package into memory.
     MAX_EXPORT_BYTES = content_byte_limit("MAX_EXPORT_BYTES")
@@ -434,6 +463,35 @@ class Config:
         2, min(120, int(os.getenv("SCAN_SLICE_SECONDS", "20")))
     )
     SIDECAR_PAYLOAD_BYTES = int(os.getenv("SIDECAR_PAYLOAD_BYTES", str(256 * 1024)))
+    # Isolated catalog generation budgets; unrelated import policies stay separate.
+    LP_CATALOG_MODEL_NAMING = os.getenv("SJFX_LP_CATALOG_MODEL_NAMING", "1").lower() not in {"0", "false", "off"}
+    LP_CATALOG_REQUESTS = min(1000, _positive_int(os.getenv("SJFX_LP_CATALOG_REQUESTS"), 100))
+    LP_CATALOG_TOTAL_TOKENS = _positive_int(os.getenv("SJFX_LP_CATALOG_TOTAL_TOKENS"), 200000)
+    LP_CATALOG_SECONDS = min(3600, _positive_int(os.getenv("SJFX_LP_CATALOG_SECONDS"), 600))
+    LP_CATALOG_INPUT_TOKENS = min(2500, _positive_int(os.getenv("SJFX_LP_CATALOG_INPUT_TOKENS"), 2500))
+    LP_CATALOG_BATCH_SIZE = min(4, _positive_int(os.getenv("SJFX_LP_CATALOG_BATCH_SIZE"), 4))
+    LP_CATALOG_BATCH_INPUT_TOKENS = min(10000, _positive_int(os.getenv("SJFX_LP_CATALOG_BATCH_INPUT_TOKENS"), 6500))
+    LP_CATALOG_OUTPUT_TOKENS = min(480, _positive_int(os.getenv("SJFX_LP_CATALOG_OUTPUT_TOKENS"), 240))
+    LP_CATALOG_TIMEOUT = min(60, _positive_int(os.getenv("SJFX_LP_CATALOG_TIMEOUT"), 30))
+    # Semantic grouping quality knobs (2026-09-12).  Each defaults to the
+    # improved behaviour and can be disabled without code changes:
+    #   SJFX_LP_CATALOG_CENTER=0           -> legacy absolute-threshold grouping
+    #   SJFX_LP_CATALOG_SIMILARITY=0.94    -> fixed threshold instead of adaptive
+    #   SJFX_LP_CATALOG_GROUP_MAX=0        -> never split oversized groups
+    #   SJFX_LP_CATALOG_NAME_SINGLETONS=1  -> spend model budget on 1-file groups
+    LP_CATALOG_CENTER = os.getenv("SJFX_LP_CATALOG_CENTER", "1").lower() not in {"0", "false", "off"}
+    LP_CATALOG_GARBLE_SPLIT = os.getenv("SJFX_LP_CATALOG_GARBLE_SPLIT", "1").lower() not in {"0", "false", "off"}
+    LP_CATALOG_NAME_SINGLETONS = os.getenv("SJFX_LP_CATALOG_NAME_SINGLETONS", "0").lower() not in {"0", "false", "off"}
+    LP_CATALOG_SINGLETON_MIN_GROUPS = max(1, min(100000, _positive_int(os.getenv("SJFX_LP_CATALOG_SINGLETON_MIN_GROUPS"), 200)))
+    LP_CATALOG_GROUP_MAX = max(0, min(5000, _positive_int(os.getenv("SJFX_LP_CATALOG_GROUP_MAX"), 60)))
+    LP_CATALOG_ADAPTIVE_PERCENTILE = max(5, min(90, _positive_int(os.getenv("SJFX_LP_CATALOG_ADAPTIVE_PERCENTILE"), 40)))
+    try:
+        _lp_similarity = float(os.getenv("SJFX_LP_CATALOG_SIMILARITY", "0") or 0)
+    except (TypeError, ValueError):
+        _lp_similarity = 0.0
+    LP_CATALOG_SIMILARITY = max(0.0, min(0.999, _lp_similarity))
+    LP_PREVIEW_CONCURRENCY = min(4, _positive_int(os.getenv("SJFX_LP_PREVIEW_CONCURRENCY"), 2))
+
     LARGE_PACKAGE_THRESHOLD_BYTES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_BYTES", str(1024 * 1024 * 1024)))
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))
     # Packages at or above the normal large-package threshold use a separate
@@ -602,6 +660,46 @@ class Config:
     MAX_ARCHIVE_MEMBER_PATH_DEPTH = max(
         0, min(256, int(os.getenv("MAX_ARCHIVE_MEMBER_PATH_DEPTH", "32")))
     )
+    # Mail research is enabled for this SJFX deployment. These budgets only
+    # govern services/mail and do not alter the established document pipeline.
+    MAIL_FEATURE_ENABLED = os.getenv("MAIL_FEATURE_ENABLED", "1").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    MAIL_IMPORT_SLICE_MESSAGES = max(1, min(1000, int(os.getenv("MAIL_IMPORT_SLICE_MESSAGES", "50"))))
+    MAIL_IMPORT_SLICE_BYTES = max(1024 * 1024, min(TEN_GIB_BYTES, int(os.getenv("MAIL_IMPORT_SLICE_BYTES", "134217728"))))
+    MAIL_MAX_MESSAGE_BYTES = max(1024 * 1024, min(TEN_GIB_BYTES, int(os.getenv("MAIL_MAX_MESSAGE_BYTES", "52428800"))))
+    MAIL_MAX_NESTED_MESSAGE_DEPTH = max(0, min(16, int(os.getenv("MAIL_MAX_NESTED_MESSAGE_DEPTH", "3"))))
+    MAIL_MAX_MIME_PARTS_PER_MESSAGE = max(1, min(10000, int(os.getenv("MAIL_MAX_MIME_PARTS_PER_MESSAGE", "1000"))))
+    MAIL_MAX_ATTACHMENT_BYTES = max(1024 * 1024, min(TEN_GIB_BYTES, int(os.getenv("MAIL_MAX_ATTACHMENT_BYTES", "536870912"))))
+    MAIL_TEXT_SEGMENT_CHARS = max(256, min(16000, int(os.getenv("MAIL_TEXT_SEGMENT_CHARS", "1800"))))
+    MAIL_TOOL_CONTEXT_MAX_CHARS = max(1000, min(200000, int(os.getenv("MAIL_TOOL_CONTEXT_MAX_CHARS", "24000"))))
+    MAIL_RESEARCH_MAX_TOOL_CALLS = max(1, min(100, int(os.getenv("MAIL_RESEARCH_MAX_TOOL_CALLS", "18"))))
+    MAIL_RESEARCH_MAX_MODEL_CALLS = max(0, min(20, int(os.getenv("MAIL_RESEARCH_MAX_MODEL_CALLS", "7"))))
+    MAIL_RESEARCH_TIMEOUT_SECONDS = max(60, min(3600, int(os.getenv("MAIL_RESEARCH_TIMEOUT_SECONDS", "600"))))
+    MAIL_OCR_MAX_CONCURRENCY = max(1, min(8, int(os.getenv("MAIL_OCR_MAX_CONCURRENCY", "1"))))
+    MAIL_ENABLE_VECTOR_INDEX = os.getenv("MAIL_ENABLE_VECTOR_INDEX", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # Mail-only additions. Disable each independently; no global model settings change.
+    MAIL_ENABLE_AGENT_MINING = os.getenv("MAIL_ENABLE_AGENT_MINING", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_ENABLE_CONVERSATIONS = os.getenv("MAIL_ENABLE_CONVERSATIONS", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_ENABLE_FACT_EXTRACTION = os.getenv("MAIL_ENABLE_FACT_EXTRACTION", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_ENABLE_GRAPH_METRICS = os.getenv("MAIL_ENABLE_GRAPH_METRICS", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_ENABLE_ATTACHMENT_VERSIONS = os.getenv("MAIL_ENABLE_ATTACHMENT_VERSIONS", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_ENABLE_ISOLATED_PARSING = os.getenv("MAIL_ENABLE_ISOLATED_PARSING", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_ENABLE_NESTED_MESSAGES = os.getenv("MAIL_ENABLE_NESTED_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_EMBED_BASE_URL = _local_model_url(os.getenv("MAIL_EMBED_BASE_URL", VLLM_EMBED_BASE_URL))
+    MAIL_EMBED_MODEL = os.getenv("MAIL_EMBED_MODEL", VLLM_EMBED_MODEL)
+    MAIL_EMBED_BATCH = max(1, min(8, int(os.getenv("MAIL_EMBED_BATCH", "4"))))
+    MAIL_EMBED_MAX_CHARS = max(128, min(1180, int(os.getenv("MAIL_EMBED_MAX_CHARS", "1180"))))
+    MAIL_EMBED_INTERVAL_SECONDS = max(0.0, float(os.getenv("MAIL_EMBED_INTERVAL_SECONDS", "2")))
+    MAIL_EMBED_PAUSED = os.getenv("MAIL_EMBED_PAUSED", "0").lower() in {"1", "true", "yes", "on"}
+    MAIL_RRF_K = max(1, int(os.getenv("MAIL_RRF_K", "60")))
+    MAIL_RERANK_ENABLED = os.getenv("MAIL_RERANK_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_RERANK_TOP_N = max(5, min(50, int(os.getenv("MAIL_RERANK_TOP_N", "30"))))
+    MAIL_FACTEXTRACT_SLICE_MESSAGES = max(1, min(20, int(os.getenv("MAIL_FACTEXTRACT_SLICE_MESSAGES", "5"))))
+    MAIL_SUBJECT_CANDIDATE_WINDOW_DAYS = max(1, int(os.getenv("MAIL_SUBJECT_CANDIDATE_WINDOW_DAYS", "90")))
+    MAIL_PARSE_TIMEOUT_SECONDS = max(5, int(os.getenv("MAIL_PARSE_TIMEOUT_SECONDS", "60")))
+    MAIL_PARSE_MEMORY_MB = max(256, int(os.getenv("MAIL_PARSE_MEMORY_MB", "2048")))
+    MAIL_HTML_REMOTE_RESOURCES = os.getenv("MAIL_HTML_REMOTE_RESOURCES", "0").strip().lower() in {"1", "true", "yes", "on"}
     MAX_STRUCTURED_PROFILE_ROWS = max(100, int(os.getenv("MAX_STRUCTURED_PROFILE_ROWS", "100000")))
     MAX_STRUCTURED_PROFILE_BYTES = int(os.getenv("MAX_STRUCTURED_PROFILE_BYTES", str(256 * 1024 * 1024)))
     MAX_ANALYSIS_JOBS = max(1, int(os.getenv("MAX_ANALYSIS_JOBS", "1")))

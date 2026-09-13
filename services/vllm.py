@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 
 from services.ollama import LocalModelClient, LocalModelError
+from services.model_dispatch import serialized_generation
 
 
 class VLLMClient(LocalModelClient):
@@ -68,6 +69,7 @@ class VLLMClient(LocalModelClient):
                 "error": str(exc),
             }
 
+    @serialized_generation
     def chat(self, system_prompt, user_prompt, temperature=0.2, max_tokens=1800,
              retries=2, timeout=None, response_format=None):
         payload = {
@@ -153,13 +155,29 @@ class VLLMClient(LocalModelClient):
 class VLLMEmbeddingClient:
     """Client for a local vLLM pooling/embedding server."""
 
-    def __init__(self, base_url, model, timeout=12, max_batch_size=8, max_chars=1200, api_key=None):
+    def __init__(self, base_url, model, timeout=12, max_batch_size=8, max_chars=1200,
+                 api_key=None, semaphore_timeout=None, retries=None):
         self.base_url = (base_url or "").rstrip("/")
         self.model = str(model or "").strip()
+        # ``timeout`` bounds one HTTP attempt; ``semaphore_timeout`` only bounds
+        # waiting for this client's own mutex so a contended lane still returns
+        # to its lexical fallback quickly.
         self.timeout = max(1, int(timeout))
         self.max_batch_size = max(1, int(max_batch_size))
         self.max_chars = max(64, int(max_chars))
         self.api_key = str(api_key or "").strip()
+        if semaphore_timeout is None or retries is None:
+            try:
+                from config import Config
+                if semaphore_timeout is None:
+                    semaphore_timeout = Config.VLLM_EMBED_SEMAPHORE_TIMEOUT_SECONDS
+                if retries is None:
+                    retries = Config.VLLM_EMBED_RETRIES
+            except Exception:  # standalone use keeps the historical behaviour
+                semaphore_timeout = 2 if semaphore_timeout is None else semaphore_timeout
+                retries = 0 if retries is None else retries
+        self.semaphore_timeout = max(1, int(semaphore_timeout))
+        self.retries = LocalModelClient._retry_limit(retries)
         import threading
         self._semaphore = threading.BoundedSemaphore(1)
 
@@ -191,10 +209,14 @@ class VLLMEmbeddingClient:
         except Exception as exc:
             return {"reachable": False, "model_available": False, "models": [], "error": str(exc)}
 
-    def embed(self, texts):
+    def embed(self, texts, retries=None):
         values = [str(value or "").strip()[:self.max_chars] for value in (texts or [])]
         if not values:
             return []
+        attempts = (
+            LocalModelClient._retry_limit(retries) + 1
+            if retries is not None else self.retries + 1
+        )
         result = []
         for offset in range(0, len(values), self.max_batch_size):
             batch = values[offset:offset + self.max_batch_size]
@@ -209,20 +231,31 @@ class VLLMEmbeddingClient:
                 headers=self._headers(),
                 method="POST",
             )
-            try:
-                acquired = self._semaphore.acquire(timeout=self.timeout)
-                if not acquired:
-                    raise LocalModelError("vLLM Embedding 忙碌，已快速回退词法检索")
+            data = None
+            # A shared single-process CPU embedding server can exceed one
+            # socket budget while other lanes are queued; a bounded retry keeps
+            # a transient stall from discarding the whole semantic stage.
+            for attempt in range(attempts):
                 try:
-                    with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                        data = json.loads(response.read().decode("utf-8"))
-                finally:
-                    self._semaphore.release()
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                raise LocalModelError("vLLM Embedding HTTP {}: {}".format(exc.code, detail[:300])) from exc
-            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-                raise LocalModelError("本机 vLLM Embedding 调用失败：{}".format(exc)) from exc
+                    acquired = self._semaphore.acquire(timeout=self.semaphore_timeout)
+                    if not acquired:
+                        raise LocalModelError("vLLM Embedding 忙碌，已快速回退词法检索")
+                    try:
+                        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                            data = json.loads(response.read().decode("utf-8"))
+                    finally:
+                        self._semaphore.release()
+                    break
+                except urllib.error.HTTPError as exc:
+                    detail = exc.read().decode("utf-8", errors="replace")
+                    message = "vLLM Embedding HTTP {}: {}".format(exc.code, detail[:300])
+                    if not LocalModelClient._retryable_http(exc.code) or attempt + 1 >= attempts:
+                        raise LocalModelError(message) from exc
+                except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+                    message = "本机 vLLM Embedding 调用失败：{}".format(exc)
+                    if attempt + 1 >= attempts:
+                        raise LocalModelError(message) from exc
+                LocalModelClient._backoff(attempt)
             rows = sorted(
                 [row for row in ((data or {}).get("data") or []) if isinstance(row, dict)],
                 key=lambda row: int(row.get("index", 0)),

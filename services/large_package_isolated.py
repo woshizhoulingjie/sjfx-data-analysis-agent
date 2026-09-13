@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import threading
+from contextlib import closing
 import time
 import uuid
 from collections import Counter
@@ -61,6 +62,7 @@ class LargePackageStore:
         self.db_path = str(db_path or (Config.DATA_DIR / "large_package.db"))
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._catalog_cache = {}
         self._init_db()
 
     def _connect(self):
@@ -112,6 +114,28 @@ class LargePackageStore:
             );
             CREATE INDEX IF NOT EXISTS idx_large_user_nodes_package ON user_nodes(package_id, created_at);
             """)
+
+        # Additive migration confined to large_package.db. Existing task/results
+        # remain readable; legacy previews are upgraded only on explicit request.
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+            for name, default in (("topic", ""), ("recognition_status", "legacy"), ("document_role", "")):
+                if name not in columns:
+                    conn.execute("ALTER TABLE files ADD COLUMN " + name + " TEXT NOT NULL DEFAULT '" + default + "'")
+            queue_columns = {row[1] for row in conn.execute("PRAGMA table_info(queue)")}
+            if "priority" not in queue_columns:
+                conn.execute("ALTER TABLE queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_large_queue_priority ON queue(package_id,stage,status,attempts,priority)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_large_files_topic ON files(package_id,topic)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_large_files_recognition ON files(package_id,recognition_status)")
+            conn.commit()
+            from services.large_package_topics import init
+            init(conn)
+            from services.large_package_semantic import init as init_semantic_catalog
+            init_semantic_catalog(conn)
+            from services.large_package_catalog_naming import init as init_naming
+            init_naming(conn)
 
     @staticmethod
     def _row(row):
@@ -195,6 +219,9 @@ class LargePackageStore:
         args = []
         for key, value in values.items():
             columns.append(key + "=?")
+            if key == "counts":
+                current = self.get(package_id) or {}
+                value = {**(current.get("counts") or {}), **value}
             args.append(_json(value) if key == "counts" else value)
         args.append(str(package_id))
         with self._lock, self._connect() as conn:
@@ -202,19 +229,25 @@ class LargePackageStore:
         return self.get(package_id)
 
     def upsert_file(self, package_id, item):
+        self.upsert_files(package_id, [item])
+
+    def upsert_files(self, package_id, items):
         now = time.time()
-        values = (str(package_id), item["path"], item["name"], item.get("extension", ""),
-                  int(item.get("size") or 0), int(item.get("modified_at_ns") or 0),
-                  item.get("sha256"), 1 if item.get("sensitive") else 0,
-                  item.get("file_type") or item.get("extension") or "")
         with self._lock, self._connect() as conn:
-            conn.execute("""INSERT INTO files(package_id,path,name,extension,size,modified_at_ns,sha256,sensitive,file_type,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(package_id,path) DO UPDATE SET
-              name=excluded.name,extension=excluded.extension,size=excluded.size,
-              modified_at_ns=excluded.modified_at_ns,sha256=COALESCE(excluded.sha256,files.sha256),
-              sensitive=excluded.sensitive,file_type=excluded.file_type,updated_at=excluded.updated_at""", values + (now,))
-            conn.execute("INSERT OR IGNORE INTO queue(package_id,path,stage,status,updated_at) VALUES(?,?,?,'queued',?)",
-                         (str(package_id), item["path"], "quick", now))
+            conn.execute("BEGIN IMMEDIATE")
+            for item in items:
+                values = (str(package_id), item["path"], item["name"], item.get("extension", ""),
+                          int(item.get("size") or 0), int(item.get("modified_at_ns") or 0),
+                          item.get("sha256"), 1 if item.get("sensitive") else 0,
+                          item.get("file_type") or item.get("extension") or "", now)
+                conn.execute("""INSERT INTO files(package_id,path,name,extension,size,modified_at_ns,sha256,sensitive,file_type,updated_at)
+                  VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(package_id,path) DO UPDATE SET
+                  name=excluded.name,extension=excluded.extension,size=excluded.size,
+                  modified_at_ns=excluded.modified_at_ns,sensitive=excluded.sensitive,
+                  file_type=excluded.file_type,updated_at=excluded.updated_at""", values)
+                conn.execute("INSERT OR IGNORE INTO queue(package_id,path,stage,status,updated_at) VALUES(?,?,?,'queued',?)",
+                             (str(package_id), item["path"], "quick", now))
+            conn.commit()
 
     def claim(self, stage, limit=1, package_id=None):
         claimed = []
@@ -226,7 +259,7 @@ class LargePackageStore:
             if package_id:
                 sql += " AND package_id=?"
                 args.append(str(package_id))
-            sql += " ORDER BY updated_at LIMIT ?"
+            sql += " ORDER BY attempts,priority,updated_at LIMIT ?" if stage == "recognize" else " ORDER BY updated_at LIMIT ?"
             args.append(int(limit))
             rows = conn.execute(sql, args).fetchall()
             for row in rows:
@@ -243,18 +276,39 @@ class LargePackageStore:
                          (status, error, time.time(), str(package_id), str(path), stage))
 
     def update_file(self, package_id, path, **fields):
-        allowed = {"sha256", "quick_status", "deep_status", "category", "confidence", "local_summary", "deep_summary", "error", "file_type"}
+        allowed = {"sha256", "quick_status", "deep_status", "category", "confidence", "local_summary", "deep_summary", "error", "file_type", "topic", "recognition_status", "document_role"}
         fields = {key: value for key, value in fields.items() if key in allowed}
         if not fields:
             return
-        fields["updated_at"] = time.time()
-        cols, args = [], []
-        for key, value in fields.items():
-            cols.append(key + "=?")
-            args.append(_json(value) if key in {"local_summary", "deep_summary"} else value)
-        args.extend([str(package_id), str(path)])
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            schedule_catalog = False
+            if "local_summary" in fields or "deep_summary" in fields:
+                from services.large_package_catalog import prepare_update
+                previous = conn.execute("SELECT * FROM files WHERE package_id=? AND path=?", (str(package_id), str(path))).fetchone()
+                if not previous:
+                    conn.rollback()
+                    return
+                fields, schedule_catalog = prepare_update(self._row(previous), fields)
+            if "local_summary" in fields:
+                info = (fields["local_summary"] or {}).get("portrait") or {}
+                if info.get("schema"):
+                    from services.large_package_topics import assign
+                    fields["topic"] = assign(conn, str(package_id), str(path), info)
+            fields["updated_at"] = time.time()
+            cols, args = [], []
+            for key, value in fields.items():
+                cols.append(key + "=?")
+                args.append(_json(value) if key in {"local_summary", "deep_summary"} else value)
+            args.extend([str(package_id), str(path)])
             conn.execute("UPDATE files SET " + ",".join(cols) + " WHERE package_id=? AND path=?", args)
+            if schedule_catalog:
+                conn.execute("UPDATE large_catalog_groups SET content_revision=content_revision+1 WHERE package_id=? AND id IN (SELECT group_id FROM large_catalog_members WHERE package_id=? AND path=?)",(str(package_id),str(package_id),str(path)))
+                conn.execute("""INSERT INTO queue(package_id,path,stage,status,updated_at) VALUES(?,?,'catalog','queued',?)
+                  ON CONFLICT(package_id,path,stage) DO UPDATE SET status='queued',attempts=0,leased_at=NULL,error=NULL,updated_at=excluded.updated_at""",
+                             (str(package_id), str(path), time.time()))
+            conn.commit()
+        self._catalog_cache.pop(str(package_id), None)
 
     def counts(self, package_id):
         with self._connect() as conn:
@@ -262,22 +316,63 @@ class LargePackageStore:
             quick = dict(conn.execute("SELECT quick_status,COUNT(*) n FROM files WHERE package_id=? GROUP BY quick_status", (str(package_id),)).fetchall())
             deep = dict(conn.execute("SELECT deep_status,COUNT(*) n FROM files WHERE package_id=? GROUP BY deep_status", (str(package_id),)).fetchall())
             cats = dict(conn.execute("SELECT category,COUNT(*) n FROM files WHERE package_id=? GROUP BY category ORDER BY n DESC", (str(package_id),)).fetchall())
-        return {"total_files": int(total), "quick": quick, "deep": deep, "categories": cats}
+            recognition = dict(conn.execute("SELECT recognition_status,COUNT(*) FROM files WHERE package_id=? GROUP BY recognition_status", (str(package_id),)).fetchall())
+        return {"total_files": int(total), "quick": quick, "deep": deep, "categories": cats, "recognition": recognition}
 
-    def list_files(self, package_id, limit=100, offset=0, query="", category=""):
-        where = ["package_id=?"]
-        args = [str(package_id)]
+    def file_page(self, package_id, limit=100, offset=0, query="", category="", topic="", remaining=False, directory=None, facet_kind="", facet_value="", node_id=""):
+        where, args = ["package_id=?"], [str(package_id)]
         if query:
-            where.append("(path LIKE ? OR name LIKE ? OR local_summary LIKE ?)")
-            like = "%" + str(query) + "%"
-            args.extend([like, like, like])
+            where.append("(path LIKE ? OR name LIKE ? OR local_summary LIKE ? OR path IN (SELECT m.path FROM large_catalog_members m JOIN lp_catalog_labels l ON l.package_id=m.package_id AND l.group_id=m.group_id WHERE m.package_id=? AND (l.name LIKE ? OR l.description LIKE ?)))")
+            args.extend(["%" + str(query) + "%"] * 3 + [str(package_id)] + ["%" + str(query) + "%"] * 2)
         if category:
             where.append("category=?")
             args.append(str(category))
-        args.extend([max(1, min(500, int(limit))), max(0, int(offset))])
+        if node_id:
+            if node_id.startswith("branch:"):
+                from services.large_package_catalog_hierarchy import visible
+                with closing(self._connect()) as c:
+                    branch=next((b for b in visible(c,str(package_id)) if b['node_id']==node_id),None)
+                if not branch:raise ValueError("该上层目录已更新，请刷新目录")
+                children=branch['children']
+                where.append("path IN (SELECT path FROM large_catalog_members WHERE package_id=? AND group_id IN ("+','.join('?' for _ in children)+"))")
+                args.extend([str(package_id)]+children)
+            elif node_id.startswith("preview:"):
+                try:
+                    preview_topic=bytes.fromhex(node_id[8:]).decode('utf8')
+                except (ValueError,UnicodeError):
+                    raise ValueError("目录节点编号无效")
+                where.append("topic=? AND path NOT IN (SELECT path FROM large_catalog_members WHERE package_id=?)")
+                args.extend([preview_topic,str(package_id)])
+            elif node_id.startswith("unread:"):
+                where.append("recognition_status=? AND path NOT IN (SELECT path FROM large_catalog_members WHERE package_id=?)")
+                args.extend([node_id[7:], str(package_id)])
+            else:
+                where.append("path IN (SELECT path FROM large_catalog_members WHERE package_id=? AND group_id=?)")
+                args.extend([str(package_id), str(node_id)])
+        if topic:
+            where.append("topic=?")
+            args.append(str(topic))
+        if remaining:
+            where.append("deep_status != 'completed'")
+        if directory is not None:
+            prefix = str(directory).strip("/") + "/" if directory else ""
+            if prefix:
+                where.append("substr(path,1,?)=?")
+                args.extend([len(prefix), prefix])
+            else:
+                where.append("instr(path,'/')=0")
+        if facet_kind in {"role", "project", "entity", "date"} and facet_value:
+            where.append("path IN (SELECT path FROM portrait_facets WHERE package_id=? AND kind=? AND value=?)")
+            args.extend([str(package_id), facet_kind, facet_value])
+        clause = " AND ".join(where)
+        limit, offset = max(1, min(500, int(limit))), max(0, int(offset))
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM files WHERE " + " AND ".join(where) + " ORDER BY path LIMIT ? OFFSET ?", args).fetchall()
-        return [self._row(row) for row in rows]
+            total = int(conn.execute("SELECT COUNT(*) FROM files WHERE " + clause, args).fetchone()[0])
+            rows = conn.execute("SELECT * FROM files WHERE " + clause + " ORDER BY path LIMIT ? OFFSET ?", args + [limit, offset]).fetchall()
+        return {"files": self._decorate_files(package_id, [self._row(row) for row in rows]), "total": total, "offset": offset, "limit": limit, "has_more": offset + len(rows) < total}
+
+    def list_files(self, package_id, limit=100, offset=0, query="", category="", **filters):
+        return self.file_page(package_id, limit, offset, query, category, **filters)["files"]
 
     def get_file(self, package_id, path):
         """Fetch one manifest row by its exact relative path."""
@@ -286,7 +381,11 @@ class LargePackageStore:
                 "SELECT * FROM files WHERE package_id=? AND path=?",
                 (str(package_id), str(path)),
             ).fetchone()
-        return self._row(row) if row else None
+        return self._decorate_files(package_id, [self._row(row)])[0] if row else None
+
+    def _decorate_files(self, package_id, files):
+        from services.large_package_catalog_view import decorate_files
+        return decorate_files(self, package_id, files)
 
     def create_user_node(self, package_id, name, paths, parent_id=None):
         unique = []
@@ -314,51 +413,93 @@ class LargePackageStore:
         return [self._row(row) for row in rows]
 
     def catalog(self, package_id):
-        """Build compact original-directory and smart-category views.
+        """Bounded directory response and source-supported topic groups.
 
-        This is read-only and belongs exclusively to ``large_package.db``.
-        The response contains directory/category rollups plus small samples,
-        so the UI does not need to load every file in a large package at once.
+        Stream scalar paths; never hydrate every file/portrait. Cache the result
+        briefly so polling does not repeatedly walk a large manifest.
         """
+        now = time.monotonic()
+        cached = self._catalog_cache.get(package_id)
+        if cached and now - cached[0] < 5:
+            return cached[1]
+        directories, root_files = {}, []
+        omitted = False
         with self._connect() as conn:
-            package = conn.execute("SELECT root_path FROM packages WHERE id=?", (str(package_id),)).fetchone()
-            rows = conn.execute(
-                "SELECT path,size,category,confidence,quick_status,deep_status FROM files "
-                "WHERE package_id=? ORDER BY path", (str(package_id),)
-            ).fetchall()
-        if not package:
-            return None
-        directories = {}
-        categories = {}
-        for row in rows:
-            path = str(row["path"] or "")
-            parts = [part for part in Path(path).parts if part not in (".", "")]
-            directory_parts = parts[:-1]
-            prefixes = []
-            for part in directory_parts:
-                prefixes.append(part)
-                directory = "/".join(prefixes)
-                item = directories.setdefault(directory, {"path": directory, "files": 0, "bytes": 0, "sample": []})
-                item["files"] += 1
-                item["bytes"] += int(row["size"] or 0)
-                if len(item["sample"]) < 12 and path not in item["sample"]:
-                    item["sample"].append(path)
-            category = str(row["category"] or "未分类")
-            item = categories.setdefault(category, {"category": category, "files": 0, "bytes": 0, "confidence_total": 0.0, "sample": []})
-            item["files"] += 1
-            item["bytes"] += int(row["size"] or 0)
-            item["confidence_total"] += float(row["confidence"] or 0)
-            if len(item["sample"]) < 12:
-                item["sample"].append({"path": path, "quick_status": row["quick_status"], "deep_status": row["deep_status"]})
-        for item in categories.values():
-            item["confidence"] = round(item.pop("confidence_total") / max(1, item["files"]), 3)
-        return {
-            "root_path": str(package["root_path"]),
-            "files_total": len(rows),
-            "original": {"directories": sorted(directories.values(), key=lambda value: value["path"]),
-                         "root_files": [row["path"] for row in rows if len(Path(str(row["path"] or "")).parts) <= 1][:50]},
-            "smart": {"categories": sorted(categories.values(), key=lambda value: (-value["files"], value["category"]))},
-        }
+            package = conn.execute("SELECT root_path FROM packages WHERE id=?", (package_id,)).fetchone()
+            if not package:
+                return None
+            total = int(conn.execute("SELECT COUNT(*) FROM files WHERE package_id=?", (package_id,)).fetchone()[0])
+            for row in conn.execute("SELECT path,size FROM files WHERE package_id=? ORDER BY path", (package_id,)):
+                path, size = row["path"], row["size"]
+                parts = path.split("/")[:-1]
+                if not parts and len(root_files) < 50:
+                    root_files.append(path)
+                for depth in range(1, min(len(parts), 32) + 1):
+                    prefix = "/".join(parts[:depth])
+                    if prefix not in directories and len(directories) >= 500:
+                        omitted = True
+                        continue
+                    d = directories.setdefault(prefix, {"path": prefix, "files": 0, "bytes": 0, "sample": []})
+                    d["files"] += 1
+                    d["bytes"] += size
+                    if len(d["sample"]) < 3:
+                        d["sample"].append(path)
+                omitted = omitted or len(parts) > 32
+            categories = [dict(row) for row in conn.execute("SELECT category,COUNT(*) files,SUM(size) bytes,AVG(confidence) confidence FROM files WHERE package_id=? GROUP BY category ORDER BY files DESC,category LIMIT 100", (package_id,))]
+            for group in categories:
+                group["sample"] = [dict(row) for row in conn.execute("SELECT path,quick_status,deep_status FROM files WHERE package_id=? AND category=? ORDER BY path LIMIT 3", (package_id, group["category"]))]
+            topic_count, topics = 0, []  # Stable-node query below supplies the paginated themes.
+            recognition = dict(conn.execute("SELECT recognition_status,COUNT(*) FROM files WHERE package_id=? GROUP BY recognition_status", (package_id,)).fetchall())
+            facets = {}
+            for kind in ("role", "project", "entity", "date"):
+                facets[kind] = [dict(row) for row in conn.execute("SELECT value,COUNT(*) files FROM portrait_facets WHERE package_id=? AND kind=? GROUP BY value ORDER BY files DESC,value LIMIT 30", (package_id, kind))]
+            pending_groups = conn.execute("SELECT COUNT(*) FROM large_catalog_groups WHERE package_id=? AND status IN ('queued','retry')", (package_id,)).fetchone()[0]
+            catalog_states = dict(conn.execute("SELECT COALESCE(json_extract(local_summary,'$.portrait.catalog_status'),'legacy'),COUNT(*) FROM files WHERE package_id=? GROUP BY 1", (package_id,)).fetchall())
+            roles = [dict(row) for row in conn.execute("SELECT document_role,COUNT(*) files FROM files WHERE package_id=? AND document_role!='' GROUP BY document_role", (package_id,))]
+        result = {"root_path": package["root_path"], "files_total": total,
+                  "original": {"directories": list(directories.values()), "root_files": root_files, "truncated": omitted, "notice": "目录树最多显示500个节点，完整文件可按路径搜索并翻页" if omitted else ""},
+                  "smart": {"categories": categories, "topics": topics, "topic_total": topic_count, "topics_truncated": topic_count > len(topics), "roles": roles, "facets": facets, "recognition": recognition, "catalog_states": catalog_states, "pending_groups": pending_groups}}
+        from services.large_package_catalog_view import enhance_catalog
+        result = enhance_catalog(self, package_id, result)
+        if len(self._catalog_cache) > 8:
+            self._catalog_cache.clear()
+        self._catalog_cache[package_id] = (now, result)
+        return result
+
+    def enqueue_recognition(self, package_id, path):
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO queue(package_id,path,stage,status,updated_at,priority) VALUES(?,?,'recognize','queued',?,?)", (package_id, path, time.time(), int(hashlib.sha256(path.encode()).hexdigest()[:7],16)))
+
+    def stage_counts(self, package_id, stage):
+        with self._connect() as conn:
+            return dict(conn.execute("SELECT status,COUNT(*) FROM queue WHERE package_id=? AND stage=? GROUP BY status", (package_id, stage)).fetchall())
+
+    def requeue(self, package_id, path, stage):
+        with self._connect() as conn:
+            conn.execute("UPDATE queue SET status='queued',leased_at=NULL,updated_at=? WHERE package_id=? AND path=? AND stage=?", (time.time(), package_id, path, stage))
+
+    def request_recognition(self, package_id):
+        """Explicitly upgrade old previews or continue a deferred recognition slice.
+        Deep results and ordinary tables are never touched.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            item = conn.execute("SELECT status,phase FROM packages WHERE id=?", (package_id,)).fetchone()
+            if not item or item["status"] not in {"waiting_for_selection", "completed"}:
+                raise ValueError("请在当前处理结束后补充内容识别")
+            conn.execute("UPDATE queue SET status='queued',attempts=0,error=NULL,updated_at=? WHERE package_id=? AND stage='catalog' AND error IS NOT NULL", (time.time(), package_id))
+            conn.execute("UPDATE large_catalog_groups SET status='queued',attempts=0,updated_at=? WHERE package_id=? AND status IN ('deferred','retry')", (time.time(), package_id))
+            queued = int(conn.execute("SELECT COUNT(*) FROM queue WHERE package_id=? AND stage='recognize' AND status IN ('queued','retry')", (package_id,)).fetchone()[0])
+            rows = conn.execute("SELECT path FROM files WHERE package_id=? AND sensitive=0 AND recognition_status IN ('legacy','needs_more','needs_ocr','metadata_only','needs_review')", (package_id,))
+            paths = [] if queued else [row[0] for row in rows]
+            for path in paths:
+                conn.execute("INSERT INTO queue(package_id,path,stage,status,updated_at,priority) VALUES(?,?,'recognize','queued',?,?) ON CONFLICT(package_id,path,stage) DO UPDATE SET status='queued',attempts=0,leased_at=NULL,updated_at=excluded.updated_at,priority=excluded.priority", (package_id, path, time.time(), int(hashlib.sha256(path.encode()).hexdigest()[:7],16)))
+            # Keep a completed research brief available while only its navigation
+            # portraits are improved. The worker restores this phase after a slice.
+            if paths or queued:
+                conn.execute("UPDATE packages SET status='queued',phase=?,message='已排队补充内容识别',updated_at=? WHERE id=?", ("recognize_completed" if item["status"] == "completed" else "recognize", time.time(), package_id))
+            conn.commit()
+        return len(paths) + queued
 
     def existing_paths(self, package_id, paths):
         values = [str(path) for path in paths if str(path)]
@@ -375,6 +516,10 @@ class LargePackageStore:
         now = time.time()
         unique = list(dict.fromkeys(str(path) for path in paths if str(path)))
         with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT status FROM packages WHERE id=?", (str(package_id),)).fetchone()
+            if not current or current[0] not in {"waiting_for_selection", "completed"}:
+                raise ValueError("请等待当前处理结束后提交深度解析范围")
             conn.execute("INSERT INTO selections(id,package_id,paths,rule,created_at,updated_at) VALUES(?,?,?,?,?,?)",
                          (selection_id, str(package_id), _json(unique), _json(rule or {}), now, now))
             for path in unique:
@@ -391,6 +536,7 @@ class LargePackageStore:
                              (now, str(package_id), path))
             conn.execute("UPDATE packages SET status='queued',phase='deep_parse',progress=0,message=?,updated_at=? WHERE id=?",
                          ("已收到深度解析选择，共 {} 个文件".format(len(unique)), now, str(package_id)))
+            conn.commit()
         return {"selection_id": selection_id, "paths": unique}
 
     def stale_running_to_retry(self, seconds=900):
@@ -468,20 +614,29 @@ def _pdf_preview(path, limit=12000):
         return {"pages": None, "sample": "", "parser": "unavailable", "notice": "PDF 快速预览失败，已隐藏原始二进制内容：{}".format(str(exc)[:180])}
 
 
-def iter_inventory(root):
+def _closing_entries(entries):
+    try:
+        yield from entries
+    finally:
+        entries.close()
+
+
+def iter_inventory(root, on_error=None):
     root = _under_allowed_root(root)
     stack = [root]
     while stack:
         folder = stack.pop()
         try:
-            entries = sorted(os.scandir(folder), key=lambda entry: entry.name.casefold())
-        except OSError:
+            entries = os.scandir(folder)
+        except OSError as exc:
+            if on_error:on_error(str(folder),str(exc))
             continue
-        for entry in entries:
+        for entry in _closing_entries(entries):
             path = Path(entry.path)
             try:
                 stat = entry.stat(follow_symlinks=False)
-            except OSError:
+            except OSError as exc:
+                if on_error:on_error(str(path),str(exc))
                 continue
             rel = str(path.relative_to(root)).replace("\\", "/")
             if entry.is_dir(follow_symlinks=False):
@@ -513,44 +668,8 @@ def _category(path, text, extension):
 
 
 def quick_preview(root, item, sample_limit=65536):
-    path = Path(root) / item["path"]
-    if item.get("sensitive"):
-        return {"status": "restricted", "title": item["name"], "notice": "敏感文件，仅保留元数据", "sample": ""}, None
-    try:
-        sha256, head, tail = _stream_hash_preview(path, sample_limit)
-        extension = str(item.get("extension") or Path(item["name"]).suffix).lower()
-        metadata = {}
-        if extension == ".pdf":
-            metadata = _pdf_preview(path)
-            text = metadata.get("sample") or ""
-        elif extension in TEXT_EXTENSIONS:
-            text = head.decode("utf-8", errors="replace")
-            if len(tail) and tail != head:
-                text += "\n…\n" + tail.decode("utf-8", errors="replace")
-            text = re.sub(r"\s+", " ", text).strip()
-        else:
-            text = ""
-            metadata = {"notice": "该文件不是纯文本，快速阶段仅保留元数据；深度解析时再提取正文"}
-        keywords = []
-        for token in WORD_RE.findall(text):
-            token = token.lower()
-            if token not in STOPWORDS and token not in keywords:
-                keywords.append(token)
-            if len(keywords) >= 20:
-                break
-        category = _category(item["path"], text, item.get("extension", ""))
-        summary = {
-            "schema_version": "large-local-summary/1.0", "summary_type": "local",
-            "title": Path(item["name"]).stem, "category": category,
-            "keywords": keywords, "sample": text[:4000],
-            "sampled_bytes": min(int(item.get("size") or 0), sample_limit * 2),
-            "size": int(item.get("size") or 0), "size_human": human_size(item.get("size") or 0),
-            "complete": False, "generated_at": utc_now(),
-        }
-        summary.update({key: value for key, value in metadata.items() if value not in (None, "")})
-        return summary, sha256
-    except Exception as exc:
-        return {"status": "failed", "title": item.get("name"), "error": str(exc)[:500]}, None
+    from services.large_package_preview import preview_file
+    return preview_file(root, item)
 
 
 __all__ = ["LargePackageStore", "iter_inventory", "quick_preview", "_under_allowed_root"]

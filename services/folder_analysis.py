@@ -816,6 +816,51 @@ def _attach_model_evidence(
     return summary
 
 
+def _bounded_node_inputs(file_summaries, clusters, catalog, byte_budget=22000):
+    """Reserve model context using UTF-8 bytes, preserving every file identity.
+
+    One token cannot encode less than one source byte. A conservative byte
+    bound avoids tokenizer-estimation overflows and leaves template/output room.
+    """
+    def brief(value, limit):
+        value = str(value or "")
+        if len(value) <= limit:
+            return value
+        prefix = value[:limit]
+        boundary = max(prefix.rfind("。"), prefix.rfind(";"), prefix.rfind("；"), prefix.rfind("\n"))
+        return prefix[:boundary + 1] if boundary >= 0 else "（长摘要请查看文件摘要）"
+    summaries = [{"path":f.get("path"), "title":brief(f.get("title"),120),
+                  "summary":brief(f.get("summary") or f.get("core_summary"),500),
+                  "key_facts":[x for x in f.get("key_facts") or [] if len(str(x))<=220][:2],
+                  "file_conclusions":[x for x in f.get("file_conclusions") or [] if len(str(x))<=400][:2]}
+                 for f in file_summaries]
+    # Rotate across sources before selecting additional evidence from one file.
+    by_source = {}
+    for e in catalog:
+        by_source.setdefault(str(e.get("source_path") or ""), []).append(e)
+    evidence = []
+    for index in range(3):
+        for source,items in by_source.items():
+            if index >= len(items):
+                continue
+            e=items[index]
+            evidence.append({"evidence_id":e.get("evidence_id"),"source_path":source,
+                             "page":e.get("page"),"section":e.get("section"),"text":brief(e.get("text"),650)})
+    compact_clusters=[{"topic":brief(c.get("topic"),100),"file_count":c.get("file_count")} for c in clusters[:12]]
+    def size():
+        return len(json.dumps([summaries,compact_clusters,evidence],ensure_ascii=False).encode("utf-8"))
+    while size()>byte_budget and evidence:
+        evidence.pop()
+    if size()>byte_budget:
+        for f in summaries:
+            f["summary"]=brief(f["summary"],160)
+            f["key_facts"]=f["key_facts"][:1]
+            f["file_conclusions"]=[]
+    if size()>byte_budget:
+        raise ValueError("节点文件摘要超过安全上下文预算，请拆分节点后汇总")
+    return summaries, compact_clusters, evidence
+
+
 def analyze_folder(
     llm,
     context,
@@ -935,6 +980,7 @@ def analyze_folder(
     # 对虚拟节点来说，可以传主题名称。
     # =========================================================
     file_summaries = context.get("file_summaries") or []
+    prompt_summaries, prompt_clusters, prompt_catalog = _bounded_node_inputs(file_summaries, clusters, catalog)
     prompt = """请对分析节点“{path}”做正式节点摘要。节点摘要必须先综合该节点下每个文件已经生成的文件摘要，再用证据目录校验关键结论；不能只根据文件名、文件类型或少量片段猜测。
 
 真实统计：文件 {files} 个，子目录 {dirs} 个，总大小 {size}，类型 {types}。
@@ -976,11 +1022,11 @@ def analyze_folder(
         ),
 
         clusters=json.dumps(
-            clusters,
+            prompt_clusters,
             ensure_ascii=False
         ),
 
-        file_summaries=json.dumps(file_summaries, ensure_ascii=False),
+        file_summaries=json.dumps(prompt_summaries, ensure_ascii=False),
         summary_coverage=json.dumps({
             "generated_file_summaries": context.get("file_summary_count", len(file_summaries)),
             "expected_files": context.get("total_files", 0),
@@ -990,7 +1036,7 @@ def analyze_folder(
             "non_deep_paths": context.get("non_deep_file_summaries") or [],
         }, ensure_ascii=False),
         evidence=json.dumps(
-            catalog,
+            prompt_catalog,
             ensure_ascii=False
         ),
     )

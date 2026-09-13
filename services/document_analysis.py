@@ -729,10 +729,50 @@ def _analyze_structured_document(llm, node_path, unified_document,
     _attach_call_statistics(coverage)
     return summary, coverage, result
 
+def _analyze_tabular_document(llm, node_path, document, context_window_tokens):
+    """Summarize exact table statistics without treating CSV bytes as prose."""
+    text = str(document.get("text") or "")
+    # Each entry is a complete statistical or source-record unit, never cut JSON.
+    pieces, used = [], 0
+    for piece in text.split("\n\n"):
+        if used + len(piece) > 26000:
+            continue
+        pieces.append(piece)
+        used += len(piece) + 2
+    content = "\n\n".join(pieces)
+    prompt = """分析结构化数据文件 {path}。表内统计由程序按声明范围计算，记录示例只供举例。
+请用中文说明主题、总记录数、最重要的实际数字、不同类别的差异和局限。保留原字段名以便核查。
+不得把记录数等同于唯一事件数或人数；不得相加同一事项的明细表与关联表；标识符、日期和坐标不能求和。
+没有完整覆盖时只能描述已读取范围。不要把样本推断成全量频率，不得把统计相关写成因果。
+不同单位的数值不得混合比较，区分直接与间接指标。金额字段带K/M/B时未换算不得求和。
+材料：
+{content}
+输出JSON：{{"title":"简短中文标题","structure_overview":{{"sections":["字段与范围"],"document_type":"结构化数据表"}},"core_summary":"包括具体数字和范围的中文摘要","key_facts":["有数值依据的事实"],"arguments":["谨慎解释"],"methodology":["统计口径"],"conclusions":["有实际价值的结论"],"uncertainties":["局限"],"warnings":[],"recommended_research_direction":{{"title":"方向","rationale":"理由","questions":["问题"]}}}}
+最多6条事实、4条结论，避免重复。""".format(path=node_path, content=content)
+    result = llm.chat_json("你是严谨的结构化数据研究助手。只依据给定统计和原始记录。" + CHINESE_CONCLUSION_RULE,
+                           prompt, max_tokens=1800, long_output=True, strict=True, retries=1,
+                           timeout=180, required_fields=("core_summary",), output_context="结构化表深度分析")
+    summary = _normalise_summary_topics(result["json"], content, node_path)
+    from services.tabular_document import grounded_table_summary
+    summary = grounded_table_summary(summary, document)
+    summary["evidence_chain"] = select_evidence(document.get("evidence") or [], topics=summary.get("topics") or [], max_items=12, per_source=12, max_chars=900)
+    source_coverage = dict(document.get("coverage") or {})
+    coverage = {"parser":"structured-table", "extracted_chars":len(text), "document_chunks":1,
+                "successfully_analyzed_chunks":1, "failed_chunks":[], "local_limit_truncated":not source_coverage.get("complete",False),
+                "structured_record_count":(document.get("parser") or {}).get("record_count"),
+                "structured_records_complete":source_coverage.get("structured_records_complete",False),
+                "model_full_narrative_review":False, "metadata":{"coverage":source_coverage},
+                "warnings":list(document.get("warnings") or []),
+                "model_calls":[_model_call_profile("structured_table_analysis",result,1800,context_window_tokens,1)]}
+    _attach_call_statistics(coverage)
+    return summary, coverage, result
+
 def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
                      unified_document=None, preferred_chunk_chars=42000,
                      context_window_tokens=65536):
     parser_name = str((unified_document or {}).get("parser", {}).get("name") or "").lower()
+    if unified_document and parser_name == "structured-table":
+        return _analyze_tabular_document(llm, node_path, unified_document, context_window_tokens)
     structured_evidence = any(
         isinstance(item, dict) and item.get("label") == "json_record"
         for item in (unified_document or {}).get("evidence") or []

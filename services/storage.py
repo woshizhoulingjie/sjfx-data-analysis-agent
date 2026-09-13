@@ -3009,7 +3009,13 @@ class Storage:
             index_status = item.get("index_status")
             analysis_ready = bool(item.get("analysis_id"))
             import_status = str(item.get("import_status") or "").strip()
-            if import_status in {
+            from services.import_state_machine import STRICT_IMPORT_STATES, processing_state
+            if import_status in STRICT_IMPORT_STATES:
+                control_state = processing_state(import_status)
+                progress["status"] = import_status
+                # The analysis job's old 95% message is not the current import phase.
+                progress["message"] = ""
+            if import_status in STRICT_IMPORT_STATES or import_status in {
                 "created", "scanning", "previewing", "waiting_for_selection",
                 "deep_parsing", "summarizing_files", "building_directory",
                 "paused", "partial", "failed", "completed",
@@ -3244,6 +3250,87 @@ class Storage:
         for sidecar in translation_sidecars:
             self._unlink_translation_sidecar(sidecar)
         return len(rows)
+
+    def _preliminary_stamp(self, conn, job):
+        """Read the exact stored document/version identity without hydrating sidecars."""
+        scan_id = str(job.get("scan_id") or "")
+        path = str((job.get("options") or {}).get("path") or "")
+        scan = conn.execute("SELECT owner_id FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not scan or str(scan["owner_id"]) != str(job.get("owner_id") or "legacy"):
+            return None, None
+        row = conn.execute("SELECT payload FROM unified_documents WHERE scan_id=? AND node_path=?", (scan_id, path)).fetchone()
+        if not row:
+            return None, None
+        raw = row["payload"]
+        payload = json.loads(raw)
+        source, coverage = payload.get("source") or {}, payload.get("coverage") or {}
+        if source.get("sensitive") or coverage.get("content_restricted") or coverage.get("content_unsupported"):
+            return None, None
+        sidecar_stamp = None
+        if payload.get("__sidecar_payload__"):
+            target = (self.sidecar_dir / str(payload.get("file") or "")).resolve()
+            target.relative_to(self.sidecar_dir.resolve())
+            stat = target.stat()
+            sidecar_stamp = [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+        selection = conn.execute("SELECT version,included_paths,excluded_paths FROM scan_selections WHERE scan_id=?", (scan_id,)).fetchone()
+        if selection:
+            if path not in json.loads(selection["included_paths"] or "[]") or path in json.loads(selection["excluded_paths"] or "[]"):
+                return None, None
+        identity = [hashlib.sha256(raw.encode("utf-8")).hexdigest(), sidecar_stamp, dict(selection) if selection else None]
+        stamp = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+        return stamp, raw
+
+    def preliminary_document_snapshot(self, job):
+        with self._connect() as conn:
+            stamp, raw = self._preliminary_stamp(conn, job)
+        if not stamp:
+            return None
+        document = self._load_document_payload(raw)
+        with self._connect() as conn:
+            current, _raw = self._preliminary_stamp(conn, job)
+        if current != stamp:
+            return None
+        return {"stamp": stamp, "document": document}
+
+    def commit_preliminary_result(self, job, ready):
+        """Publish only a claimed file's matching result and completion in one transaction."""
+        from services.preliminary_summary_fast import enabled, ready_matches
+        if not enabled(job) or not ready_matches(job, ready):
+            return "stale"
+        result = ready.get("result") or {}
+        summary = result.get("summary") or {}
+        path = str((job.get("options") or {}).get("path") or "")
+        if (summary.get("node_path") != path or summary.get("analysis_stage") != "preliminary"
+                or not summary.get("preview_only") or summary.get("deep_analysis")
+                or result.get("scan_id") != job.get("scan_id")):
+            return "stale"
+        with self.lock, self._connect(timeout_ms=1000) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job["id"],)).fetchone()
+            if not row:
+                return "missing"
+            if row["cancel_requested"] or row["status"] in {"cancelled", "cancelling"}:
+                return "cancelled"
+            if row["status"] != "running" or row["worker_id"] != job.get("worker_id"):
+                return "not_owned"
+            if (str(row["owner_id"]) != str(job.get("owner_id") or "legacy") or row["scan_id"] != job.get("scan_id")
+                    or json.loads(row["options"] or "{}") != (job.get("options") or {})):
+                return "stale"
+            control = conn.execute("SELECT state,pause_requested FROM package_processing_controls WHERE scan_id=?", (job["scan_id"],)).fetchone()
+            if control and (control["pause_requested"] or control["state"] in {"paused", "cancelled"}):
+                return "cancelled"
+            stamp, _raw = self._preliminary_stamp(conn, job)
+            if not stamp or stamp != ready.get("stamp"):
+                return "stale"
+            # This slot is exclusively preliminary; the deep slot is never written here.
+            conn.execute("INSERT OR REPLACE INTO summaries(scan_id,node_path,summary_type,payload) VALUES (?,?,?,?)",
+                         (job["scan_id"], path, "preliminary_file_summary", json.dumps(summary, ensure_ascii=False)))
+            now = time.time()
+            conn.execute("UPDATE analysis_jobs SET status='completed',stage='completed',progress=100,"
+                         "message='任务已完成',result=?,error=NULL,finished_at=?,heartbeat_at=?,worker_id=NULL,"
+                         "current_stage='已完成',current_file='',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                         (json.dumps(result, ensure_ascii=False), now, now, job["id"]))
+        return "completed"
 
     def get_document(self, scan_id, node_path):
         with self._connect() as conn:
@@ -7645,7 +7732,7 @@ class Storage:
                     "SELECT node_path FROM file_analysis_states WHERE scan_id=? "
                     "AND status='failed' AND retryable=1 AND attempt_count<6 "
                     "AND COALESCE(next_retry_at,0)<=? ORDER BY node_path LIMIT ?",
-                    (scan_id, limit),
+                    (scan_id, now, limit),
                 ).fetchall()
                 paths = [str(row["node_path"]) for row in rows]
                 if not paths:

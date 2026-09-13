@@ -46,3 +46,47 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 
 .v2-file-selection-status{color:#4d687d;font-size:10px;white-space:nowrap;font-variant-numeric:tabular-nums}
 @media(max-width:560px){.v2-file-selection-status{width:100%;padding-bottom:2px}}
+.v2-package-reading{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-top:13px;padding:10px 12px;border:1px solid #c6d7e1;border-left:3px solid #3e8f86;border-radius:6px;background:#f1f8f7}.v2-package-reading>div{display:grid;gap:3px}.v2-package-reading strong{color:#285b59;font-size:10px}.v2-package-reading span{color:#46736e;font-size:9px}.v2-package-reading p{max-width:62%;margin:0;color:#58717a;font-size:9px;line-height:1.6;text-align:right}.v2-package-reading.is-partial{border-left-color:#c08a3f;background:#fff9ef}.v2-package-reading.is-partial strong{color:#805e2e}.v2-package-reading.is-partial span{color:#9a7138}.v2-citation-actions{display:flex;flex-wrap:wrap;gap:3px;margin-top:8px}.v2-citation-actions .text-button{min-height:26px;padding:3px 5px;font-size:9px}.v2-citations>summary{display:flex;align-items:center;gap:7px}.v2-citations>summary::before{content:"";width:7px;height:7px;border-radius:50%;background:#3e8f86;box-shadow:0 0 0 3px #3e8f8614}.v2-citations[open]>summary::before{background:#d68a3a}
+@media(max-width:780px){.v2-package-reading{display:grid;gap:7px}.v2-package-reading p{max-width:none;text-align:left}.v2-citation-actions{gap:2px}.v2-citation-actions .text-button{font-size:10px}}
+
+/* ===== 文件卡片操作区修复（2026-09-12）：按钮不再被挤成竖排 =====
+   卡片是 20px + 1fr 的两列网格，操作区是第三个子元素，
+   必须显式跨整行，否则会落进 20px 宽的第一列。 */
+.v2-file-card-actions{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-start}
+.v2-file-card-actions button{white-space:nowrap;font-size:11px;padding:5px 10px}
+
+/* ===== 资料夹可见面板（2026-09-12）：右下角常驻，可展开/移除/清空/导出 ===== */
+.v2-folder-dock{position:fixed;right:18px;bottom:18px;z-index:900;width:288px;max-width:calc(100vw - 36px);background:#141c2c;border:1px solid #2c3952;border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,.4);color:#d1daed;font-size:12px}
+.v2-folder-dock>header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px}
+.v2-folder-toggle{display:flex;align-items:center;gap:8px;padding:0;border:0;background:transparent;color:inherit;cursor:pointer;font:inherit}
+.v2-folder-toggle strong{color:#e1e9fb;font-size:13px}
+.v2-folder-toggle span{color:#8fa3c0;font-size:11px}
+.v2-folder-toggle span::before{content:"▸ ";color:#6f87ad}
+.v2-folder-toggle[aria-expanded="true"] span::before{content:"▾ "}
+.v2-folder-dock-actions{display:flex;gap:6px}
+.v2-folder-dock-actions button{padding:4px 8px;border:1px solid #3b4a6b;border-radius:5px;background:#172034;color:#a9bde0;font-size:11px;cursor:pointer;white-space:nowrap}
+.v2-folder-dock-actions button:hover{border-color:#5279b8;color:#d7e4ff}
+.v2-folder-dock ul{list-style:none;margin:0;padding:4px 8px 10px;max-height:220px;overflow:auto;border-top:1px solid #2c3952}
+.v2-folder-dock li{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 4px;border-bottom:1px dashed #233049}
+.v2-folder-dock li:last-child{border-bottom:0}
+.v2-folder-dock li span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c3d0eb;font-size:12px}
+.v2-folder-dock li button{flex-shrink:0;width:20px;height:20px;line-height:1;border:1px solid #3b4a6b;border-radius:50%;background:transparent;color:#8fa3c0;cursor:pointer;font-size:12px}
+.v2-folder-dock li button:hover{color:#ff9d9d;border-color:#8a4a4a}
+@media(max-width:720px){.v2-folder-dock{right:10px;bottom:10px;width:240px}}
+
+
+/* Chat data source selector: ordinary package vs isolated large package. */
+.chat-source-bar{display:flex!important;flex-wrap:wrap;align-items:center;gap:8px;margin-left:auto}
+.chat-source-tabs{display:inline-flex;border:1px solid #d5dbe1;border-radius:6px;overflow:hidden;background:#fff}
+.chat-source-tab{padding:6px 12px;border:0;border-right:1px solid #d5dbe1;background:#fff;color:#455667;font-size:11px;cursor:pointer}
+.chat-source-tab:last-child{border-right:0}
+.chat-source-tab.active{background:#41698f;color:#fff}
+.chat-source-bar select{min-width:200px;max-width:280px;padding:6px 8px;border:1px solid #d5dbe1;border-radius:6px;background:#fff;color:#2b3a48;font-size:11px}
+.chat-source-bar select:disabled{background:#f4f6f8;color:#93a1ae}
+.chat-source-state{color:#7b8794;font-size:10px;max-width:240px;line-height:1.5}
+@media(max-width:780px){.chat-source-bar{margin-left:0;width:100%}.chat-source-bar select{max-width:none;flex:1 1 160px}}
+
+/* File translation source selector and multi-file controls */
+.translation-source-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 12px;padding:9px 11px;border:1px solid #dbe1e6;border-radius:6px;background:#f7f8fa}.translation-source-tabs{display:inline-flex;border:1px solid #d5dbe1;border-radius:6px;overflow:hidden;background:#fff}.translation-source-tab{padding:6px 12px;border:0;border-right:1px solid #d5dbe1;background:#fff;color:#455667;font-size:11px;cursor:pointer}.translation-source-tab:last-child{border-right:0}.translation-source-tab.active{background:#41698f;color:#fff}.translation-source-bar select{min-width:220px;max-width:340px;padding:6px 8px;border:1px solid #d5dbe1;border-radius:6px;background:#fff;color:#2b3a48;font-size:11px}.translation-source-bar select:disabled{background:#f4f6f8;color:#93a1ae}.translation-source-state{color:#7b8794;font-size:10px;line-height:1.5;max-width:480px}.translation-source-bar [hidden]{display:none!important}
+.v2-translation-view .v2-translation-selection{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--border,#dbe1e6);font-size:12px}.v2-translation-view .v2-translation-selection label{display:flex;align-items:center;gap:6px;margin:0}.v2-translation-view .v2-translation-row{display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;gap:5px;min-width:0}.v2-translation-view .v2-translation-check{display:flex;justify-content:center;margin:0}.v2-translation-view input[type=checkbox]{width:16px;height:16px;flex:0 0 16px;accent-color:var(--accent,#4169a1)}.v2-translation-view .v2-translation-item{min-width:0}.v2-translation-view .v2-translation-queue{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}.v2-translation-view .v2-translation-queue .v2-inline-state{min-width:0;flex:1 1 220px;overflow-wrap:anywhere}.v2-translation-view #translationDocumentMeta{display:block;overflow-wrap:anywhere;word-break:break-word}
+@media(max-width:780px){.translation-source-bar{align-items:stretch}.translation-source-bar select{max-width:none;flex:1 1 180px}.translation-source-state{flex-basis:100%}}

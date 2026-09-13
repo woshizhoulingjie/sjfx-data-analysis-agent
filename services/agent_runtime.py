@@ -109,6 +109,7 @@ class PydanticAgentRuntime:
         except (TypeError, ValueError):
             requested_max_tokens = 2400
         requested_timeout = kwargs.get("timeout")
+        structured_retry_limit = max(0, min(1, int(kwargs.pop("structured_retry_limit", 1))))
         # Candidate previews are intentionally bounded more tightly than
         # deep analysis. The normal vLLM floor protects long structured
         # generations, while this opt-in lets the preview path degrade to a
@@ -190,6 +191,8 @@ class PydanticAgentRuntime:
         try:
             payload = parse_payload(result)
         except (ValidationError, ValueError, TypeError) as first_exc:
+            if not structured_retry_limit:
+                raise LocalModelError("{} 返回不符合结构化契约：{}".format(output_context, first_exc)) from first_exc
             # Retry once, with a larger budget when the backend explicitly
             # reports length exhaustion; repeating the same budget reproduces
             # the same unterminated-string failure.

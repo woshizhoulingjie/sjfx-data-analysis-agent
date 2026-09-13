@@ -58,6 +58,7 @@ from services.reporting import (
     merge_model_report,
 )
 from services.retrieval import evidence_corpus, retrieve_evidence
+from services import large_package_recall
 from services.scanner import (
     IGNORED_DIRS, IGNORED_FILES, human_size, resolve_under, scan_directory,
     scan_inventory_slice,
@@ -68,6 +69,7 @@ from services.structured_qa import answer_question
 from services.unified_parser import UnifiedDocumentParser
 from services.agent_runtime import PydanticAgentRuntime
 from services.offline_translation import OfflineNLLBProvider
+from services.file_translation import build_file_translation_service
 from services.translation import (
     OllamaTranslationProvider,
     StorageTranslationMemory,
@@ -86,6 +88,7 @@ from services.conversation import (
     ConversationSession,
 )
 from services.conversation_package_context import (
+    build_reading_manifest,
     build_large_context,
     build_standard_context,
     model_digest,
@@ -122,7 +125,9 @@ def _python_runtime_status(version_info=None):
 @asynccontextmanager
 async def _app_lifespan(_application):
     _initialize_runtime_state()
-    yield
+    from services.selection_supplement import publication_watch
+    async with publication_watch(storage):
+        yield
 
 
 app = SJFXFastAPI(
@@ -273,6 +278,22 @@ translation_service = TranslationService(
 # native-backend contention on a shared server.
 _translation_execution_lock = threading.RLock()
 
+# Explicit file jobs share the production vLLM admission gate, not the mail/NLLB provider.
+file_translation_transport = (
+    llm_transport if isinstance(llm_transport, VLLMClient) else VLLMClient(
+        Config.VLLM_BASE_URL, Config.VLLM_MODEL,
+        timeout=Config.VLLM_REQUEST_TIMEOUT, max_concurrency=1, api_key=Config.VLLM_API_KEY,
+    )
+)
+file_translation_service = build_file_translation_service(
+    file_translation_transport, StorageTranslationMemory(storage),
+    max_unit_chars=Config.TRANSLATION_MAX_UNIT_CHARS,
+    max_attempts=Config.TRANSLATION_MAX_ATTEMPTS,
+    timeout_seconds=Config.TRANSLATION_TIMEOUT_SECONDS,
+)
+
+
+
 
 def _translate_document_serialized(document, **kwargs):
     with _translation_execution_lock:
@@ -340,6 +361,16 @@ def _initialize_runtime_state():
     )
     runtime_storage.register_existing_outputs(
         Config.OUTPUT_DIR, _configured_owner_id
+    )
+    from services.mail.bootstrap import register_mail_module
+    register_mail_module(
+        app,
+        runtime_storage,
+        parser=parser,
+        translation_service=translation_service,
+        owner_resolver=_request_owner_id,
+        job_factory=runtime_storage.create_or_get_typed_job,
+        model=llm if llm_generation_enabled else None,
     )
     _configure_file_logging()
 
@@ -1341,6 +1372,7 @@ def _combined_export_context(scan_id, scan_result, analysis, payload):
     }]
     if not isinstance(selections, list) or not selections:
         raise ValueError("请至少选择一个主题、目录、文档或证据")
+    published_paths, deep_published = _published_deep_scope(scan_id)
     member_paths = set()
     selection_metadata = []
     summaries = []
@@ -1356,7 +1388,7 @@ def _combined_export_context(scan_id, scan_result, analysis, payload):
         if node_id:
             node = _find_analysis_node(scan_id, node_id)
             paths = list(node.get("member_paths") or [])
-            summary = storage.get_summary(scan_id, "node:{}".format(node_id), "folder") or _virtual_node_summary(scan_id, node)
+            summary = (storage.get_summary(scan_id, "node:{}".format(node_id), staged_summary_type("deep", "node")) if deep_published else None) or storage.get_summary(scan_id, "node:{}".format(node_id), "folder") or _virtual_node_summary(scan_id, node)
             name = node.get("name") or name
         elif kind == "evidence":
             source_path = raw.get("source_path") or raw.get("path")
@@ -1370,6 +1402,13 @@ def _combined_export_context(scan_id, scan_result, analysis, payload):
             paths = _requested_member_paths(scan_result, raw.get("path", "."))
             summary_type = "folder" if kind == "directory" else "file"
             summary = storage.get_summary(scan_id, raw.get("path", "."), summary_type) or {}
+            if deep_published and kind == "file":
+                summary = storage.get_summary(scan_id, raw.get("path", "."), staged_summary_type("deep", "file")) or summary
+            elif deep_published and kind == "directory" and set(paths) == set(published_paths):
+                report = storage.get_summary(scan_id, ".", "deep_report") or {}
+                summary = {"title":report.get("title"), "summary":" ".join(str(x) for x in (report.get("key_findings") or [])[:8]),
+                           "evidence_chain":(report.get("recommended_research_direction") or {}).get("evidence_chain") or [],
+                           "report_scope":report.get("report_scope"), "summary_stage":"deep"}
         member_paths.update(paths)
         evidence_only = evidence_only and kind == "evidence"
         selection_metadata.append({
@@ -1646,7 +1685,25 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         summaries = scoped
         analysis["selected_scope_paths"] = sorted(selected_paths)
         analysis["selected_scope_only"] = True
+    if summary_stage in {"preliminary", "deep"}:
+        names = {str(item.get("path") or ""):str((item.get("payload") or {}).get("title") or "")
+                 for item in summaries if item.get("type") == staged_summary_type(summary_stage,"node")}
+        tree = analysis.get("analysis_tree") or {}
+        changed = False
+        for node in _walk_analysis_nodes(tree):
+            title = names.get("node:"+str(node.get("node_id") or ""))
+            if title and ("待智能命名" in str(node.get("name") or "") or re.match(r"^主题\d+",str(node.get("name") or ""))):
+                node["name"] = title[:120]
+                changed = True
+        if changed:
+            storage.save_analysis(scan_id, analysis)
     report_data = build_local_report(scan_result, summaries, analysis)
+    if summary_stage in {"preliminary", "deep"}:
+        stage_files = [item.get("payload") or {} for item in summaries if item.get("type") == staged_summary_type(summary_stage,"file")]
+        stage_nodes = [item.get("payload") or {} for item in summaries if item.get("type") == staged_summary_type(summary_stage,"node")]
+        report_data["summary_quality"] = {"stage":summary_stage,"file_summaries":len(stage_files),"node_summaries":len(stage_nodes),
+            "degraded_file_summaries":sum(bool((s.get("parser_info") or {}).get("degraded")) for s in stage_files),
+            "degraded_node_summaries":sum(bool((s.get("parser_info") or {}).get("degraded")) for s in stage_nodes)}
     if summary_stage == "parsed":
         report_data["summary_stage"] = "parsed"
         model_name, model_usage, warning = None, {}, "解析版概览仅使用已解析内容与证据，不调用摘要模型。"
@@ -1660,7 +1717,28 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         inventory = _inventory_by_path(scan_result)
         selected = sorted(selected_paths)
         selected_bytes = sum(int((inventory.get(path) or {}).get("size") or 0) for path in selected)
-        parsed_count = sum(1 for path in selected if storage.get_document(scan_id, path))
+        scoped_documents = {path: storage.get_document(scan_id, path) for path in selected}
+        document_count = sum(bool(document) for document in scoped_documents.values())
+        parsed_count = sum(
+            bool(document) and bool((document.get("coverage") or {}).get("complete", False))
+            and not (document.get("coverage") or {}).get("content_restricted")
+            and not (document.get("coverage") or {}).get("content_unsupported")
+            for document in scoped_documents.values()
+        )
+        partial_parse_count = document_count - parsed_count
+        table_documents = {path:document for path,document in scoped_documents.items()
+                           if (document or {}).get("parser", {}).get("name") == "structured-table"}
+        if table_documents:
+            from services.tabular_document import grounded_group_summary
+            statistics = grounded_group_summary({}, table_documents)
+            report_data["structured_table_findings"] = statistics
+            from services.tabular_document import table_research_direction
+            direction = table_research_direction(table_documents)
+            if direction:
+                report_data["recommended_research_direction"] = direction
+            facts = list(statistics.get("key_facts") or [])
+            report_data["key_findings"] = facts[:5] + list(statistics.get("conclusions") or []) + facts[5:] + [x for x in (report_data.get("key_findings") or []) if "抽样/首轮概览" not in str(x)]
+            report_data.setdefault("limitations", []).extend(statistics.get("uncertainties") or [])
         stage_type = (
             staged_summary_type(summary_stage, "file")
             if summary_stage in {"preliminary", "deep"} else None
@@ -1674,7 +1752,13 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
             "preliminary": "初步摘要版",
             "deep": "深度证据版",
         }.get(summary_stage, "选中范围版")
-        stage_deep_count = summary_count if summary_stage == "deep" else 0
+        stage_deep_count = sum(
+            bool(summary.get("deep_analysis"))
+            and not bool((summary.get("parser_info") or {}).get("degraded"))
+            and bool((scoped_documents.get(path) or {}).get("coverage", {}).get("complete", False))
+            for path in selected
+            for summary in [storage.get_summary(scan_id, path, stage_type) or {}]
+        ) if summary_stage == "deep" else 0
         report_data["summary_stage"] = summary_stage or "selected"
         report_data["report_scope"] = {
             "kind": "selected_files",
@@ -1696,8 +1780,9 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
             "inventory_files": len(selected),
             "scanned_files": len(selected),
             "parsed_files": parsed_count,
-            "document_records": parsed_count,
-            "sampled_files": parsed_count,
+            "document_records": document_count,
+            "partial_parse_files": partial_parse_count,
+            "sampled_files": document_count,
             "deep_analyzed_files": stage_deep_count,
             "pending_files": max(0, len(selected) - (stage_deep_count or parsed_count)),
             "parsed_file_ratio": round(parsed_count / float(len(selected) or 1), 6),
@@ -1718,6 +1803,13 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
             "coverage_ratio": round(stage_deep_count / float(len(selected) or 1), 6),
         }
         coverage["pipeline_coverage"] = pipeline
+        if table_documents:
+            coverage["coverage_level_label"] = "结构化全表统计与文档摘要"
+            coverage["deep_analysis_label"] = "深度统计/文档摘要"
+            coverage["table_statistics_files"] = len(table_documents)
+            coverage["model_full_narrative_review"] = False
+            coverage["limitations"] = [str(item) for item in (coverage.get("limitations") or [])
+                if "抽样/首轮概览" not in str(item)] + ["表格已按声明范围完成统计；模型阅读统计和记录示例，未逐条语义阅读全部原始叙述。"]
         report_data["coverage"] = coverage
         report_data["basic_information"] = [
             item for item in (report_data.get("basic_information") or [])
@@ -1732,12 +1824,15 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         ]
         report_data["limitations"] = [
             item for item in (report_data.get("limitations") or [])
-            if "尚未完成正文解析" not in str(item)
-            and not (summary_stage == "deep" and "抽样/首轮概览" in str(item))
+            if not (summary_stage == "deep" and stage_deep_count == len(selected) and "抽样/首轮概览" in str(item))
         ]
         report_data["limitations"].insert(
             0, "本报告只对已选择范围作出结论；未选择文件保留在清单中，不参与本轮结论。"
         )
+        if partial_parse_count:
+            report_data["limitations"].append("选中范围有 {} 个文件仅部分解析或仅有元数据，未计入正文完整覆盖。".format(partial_parse_count))
+        if summary_stage == "deep" and stage_deep_count < summary_count:
+            report_data["limitations"].append("{} 份深度摘要存在降级或源内容不完整，未计入完整深度分析。".format(summary_count - stage_deep_count))
         value_judgment = dict(report_data.get("value_judgment") or {})
         value_judgment["limitations"] = list(report_data["limitations"])
         report_data["value_judgment"] = value_judgment
@@ -2653,7 +2748,9 @@ def _mark_deep_update_available(scan_id):
             source = ""
         if source in {"idle_deep_model_summary", "deep_node_rebuild"}:
             return False
-    if str(task.get("status") or "") in {"deep_summarizing_files", "deep_summarizing_nodes", "deep_overview_updating"}:
+    # A queued/running report owns deep_overview_updating. A concurrent
+    # reconciliation must not roll it back before its completion callback.
+    if str(task.get("status") or "") in {"deep_summarizing_files", "deep_summarizing_nodes"}:
         storage.transition_import_task(
             scan_id, "deep_update_available", checkpoint=checkpoint,
 
@@ -2767,6 +2864,11 @@ def _run_claimed_summary_job(job):
     global llm
     original_model = llm
     options = job.get("options") or {}
+    if (llm_generation_enabled and Config.PRELIMINARY_SUMMARY_OPTIMIZATION_ENABLED
+            and options.get("workflow_source") == "preliminary_model_summary"):
+        from services.preliminary_summary_fast import enabled as preliminary_fast_enabled, generate_ready_results
+        if preliminary_fast_enabled(job):
+            return generate_ready_results(llm, storage, job, _local_document_fallback)
     if options.get("workflow_source") in {"idle_deep_model_summary", "deep_node_rebuild"}:
         from services.import_checkpoint import CheckpointedModel
         import hashlib
@@ -3087,6 +3189,15 @@ def _execute_summary_job(job):
         is_preliminary_node = workflow_source == "preliminary_node_summary"
         context["analysis_level"] = "deep" if is_deep_node else "preview"
         generated, result, errors = analyze_folder(llm, context, node.get("name") or "node:{}".format(node_id))
+        member_documents = {path: storage.get_document(scan_id, path) for path in context.get("member_paths") or []}
+        table_members = {path:d for path,d in member_documents.items() if (d or {}).get("parser", {}).get("name") == "structured-table"}
+        if table_members:
+            from services.tabular_document import grounded_group_summary
+            generated = grounded_group_summary(generated, table_members)
+            generated["non_table_member_paths"] = [path for path in member_documents if path not in table_members]
+            if generated["non_table_member_paths"]:
+                generated["core_summary"] += " 另有 {} 个非表格资料，未计入上述表格数量。".format(len(generated["non_table_member_paths"]))
+                generated["summary"] = generated["core_summary"]
         generated.update({
             "node_path": "node:{}".format(node_id), "summary_type": "folder", "schema_version": 4,
             # Evidence is scoped to the model subset, while the displayed
@@ -3414,11 +3525,18 @@ def _run_claimed_analysis_job(job):
     analysis = analyze_package(
         scan_id, scan_result, storage, parser, progress,
         embedding_client=_package_embedding_client,
-        # A user-selected import is a fast, bounded parse pass. Directory
-        # labels use the deterministic fallback here; model summaries remain
-        # queued separately after parsing, so this path is not held by a
-        # semantic naming request.
-        llm=(llm if llm_generation_enabled and not selected_file_parse else None),
+        # A user-selected import is a fast, bounded parse pass, so parsing must
+        # never be held by a naming request.  The naming itself is nevertheless
+        # bounded (one short call for all clusters, one for the topic nodes, one
+        # for the subtopics) and a readable directory is the product's core
+        # output, so it is enabled by default and stays switchable through
+        # SJFX_SEMANTIC_NAMING_ON_USER_IMPORT.
+        llm=(
+            llm
+            if llm_generation_enabled
+            and (not selected_file_parse or Config.SEMANTIC_NAMING_ON_USER_IMPORT)
+            else None
+        ),
         large_options=_package_large_options(),
         target_paths=options.get("target_paths"),
         cancel_check=lambda: storage.is_job_cancel_requested(job_id),
@@ -3843,6 +3961,207 @@ def _translation_inventory_node(scan_result, node_path):
     )
     resolve_under(scan_result["root"], source_path)
     return file_node
+
+
+def _is_large_translation_source(scan_id):
+    """Return whether *scan_id* names an isolated large package."""
+    return str(scan_id or "").startswith("lp-")
+
+
+def _large_package_owner_id(owner_id=None):
+    return str(owner_id or _request_owner_id() or "legacy")
+
+
+def _large_translation_target(package_id, node_path, owner_id=None):
+    """Resolve a large-package translation target from its immutable manifest.
+
+    The manifest is the authorization boundary.  ``resolve_under`` is still
+    applied before opening bytes so a stale or malicious path can never escape
+    the package root, even if the source directory changes after inventory.
+    """
+    package = large_package_store.get(
+        str(package_id), owner_id=_large_package_owner_id(owner_id)
+    )
+    if not package:
+        raise ValueError("大数据包任务不存在、已失效或不属于当前访问用户")
+    path = str(node_path or "").replace("\\", "/").strip()
+    if not path:
+        raise ValueError("缺少文件路径")
+    valid = set(large_package_store.existing_paths(str(package_id), [path]))
+    if path not in valid:
+        raise ValueError("文件不属于当前大数据包")
+    resolved = resolve_under(package["root_path"], path)
+    if not resolved.is_file():
+        raise ValueError("文件当前不可读，请刷新大数据包清单")
+    row = large_package_store.get_file(str(package_id), path)
+    if not row:
+        raise ValueError("文件不属于当前大数据包")
+    return package, row, path, resolved
+
+
+def _large_translation_preview_document(package_id, node_path, owner_id=None):
+    """Build a bounded document view from an isolated manifest row.
+
+    A GET never performs a deep parse.  It uses the durable quick sample until
+    the user explicitly starts translation, at which point the Worker promotes
+    the selected file to a full parser document.
+    """
+    package, row, path, _resolved = _large_translation_target(
+        package_id, node_path, owner_id=owner_id
+    )
+    stored = storage.get_document(str(package_id), path)
+    if stored:
+        return stored, package, row
+    local = row.get("local_summary") if isinstance(row.get("local_summary"), dict) else {}
+    sample = str(
+        local.get("sample") or local.get("text_preview") or local.get("text") or ""
+    )
+    language = local.get("language") if isinstance(local.get("language"), dict) else {}
+    title = str(local.get("title") or row.get("name") or Path(path).name)
+    document = {
+        "schema_version": "large-translation-preview/1.0",
+        "source": {"path": path, "name": row.get("name") or Path(path).name,
+                   "physical_path": path, "extension": row.get("extension") or ""},
+        "text": sample,
+        "structure": {"title": title, "headings": list(local.get("headings") or [])[:24]},
+        "coverage": {"complete": False, "preview_only": True,
+                     "translation_source_level": "preview"},
+        "parser": {"name": "large-package-summary", "mode": "bounded_preview",
+                   "degraded": True},
+        "warnings": ([str(local.get("notice"))] if local.get("notice") else []) + [
+            "当前为大数据包导入阶段的受限样本；启动翻译后会按需解析全文。"
+        ],
+        "language": language,
+        "evidence": [],
+    }
+    return document, package, row
+
+
+def _large_translation_document(package_id, node_path, source_level="preview", owner_id=None):
+    document, _package, _row = _large_translation_preview_document(
+        package_id, node_path, owner_id=owner_id
+    )
+    if source_level == "full" and str(document.get("parser", {}).get("name")) == "large-package-summary":
+        raise ValueError("文件尚未完成全文解析，请重新提交翻译")
+    return document
+
+
+def _promote_large_for_translation(package_id, node_path, job_id, owner_id=None):
+    package, row, path, resolved = _large_translation_target(
+        package_id, node_path, owner_id=owner_id
+    )
+    existing = storage.get_document(str(package_id), path)
+    if existing and ((existing.get("coverage") or {}).get("semantic_complete")
+                     or (existing.get("coverage") or {}).get("complete")):
+        return existing
+    _ensure_job_active(job_id)
+    document = parser.parse(resolved, relative_path=path, mode="accurate")
+    if not isinstance(document, dict) or (
+        not str(document.get("text") or "").strip() and not document.get("evidence")
+    ):
+        raise ValueError("未能从文件获得可翻译正文")
+    source = document.setdefault("source", {})
+    source.setdefault("path", path)
+    source.setdefault("physical_path", path)
+    source.setdefault("name", row.get("name") or Path(path).name)
+    coverage = document.setdefault("coverage", {})
+    coverage["semantic_complete"] = True
+    coverage["translation_source_level"] = "full"
+    storage.save_document(str(package_id), path, document)
+    storage.set_file_state(
+        str(package_id), path,
+        checkpoint_fingerprint(row, parser, "accurate", document),
+        "completed", document=document,
+    )
+    storage.replace_document_evidence_index(
+        str(package_id), path, evidence_corpus({path: document})
+    )
+    return document
+
+
+def _large_translation_item(package_id, row, state=None):
+    state = dict(state or {})
+    path = str(row.get("path") or "")
+    local = row.get("local_summary") if isinstance(row.get("local_summary"), dict) else {}
+    language = str(state.get("source_language") or "")
+    if not language:
+        raw_language = local.get("language")
+        if isinstance(raw_language, dict):
+            language = str(raw_language.get("code") or raw_language.get("language") or "")
+        else:
+            language = str(raw_language or "")
+    language = language or "unknown"
+    status = str(state.get("status") or "not_started")
+    sample = str(local.get("sample") or local.get("text_preview") or "")
+    source_availability = "document" if storage.get_document(package_id, path) else (
+        "preview" if sample else "metadata"
+    )
+    original_title = str(state.get("original_title") or local.get("title") or row.get("name") or Path(path).name)
+    return {
+        **state,
+        "path": path, "status": status, "source_language": language,
+        "source_availability": source_availability,
+        "preview_status": row.get("quick_status"),
+        "titles": {"original": original_title, "translated": state.get("translated_title")},
+    }
+
+
+def _large_translation_page(package_id, offset=0, limit=100, query="", statuses=None, language="all"):
+    """Return a bounded translation work list backed by large_package.db."""
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(500, int(limit or 100)))
+    query = str(query or "").strip().casefold()
+    wanted = {str(value).strip() for value in (statuses or []) if str(value).strip()}
+    wanted = {"not_started" if value == "pending" else value for value in wanted}
+    language = str(language or "all").strip().lower()
+    package = _large_package_owned(package_id)
+    matches = []
+    status_counts, language_counts = {}, {}
+    scan_offset = 0
+    while True:
+        page = large_package_store.file_page(package_id, limit=500, offset=scan_offset)
+        rows = page.get("files") or []
+        if not rows:
+            break
+        for row in rows:
+            path = str(row.get("path") or "")
+            state = storage.get_translation(package_id, path, hydrate=False) or {}
+            item = _large_translation_item(package_id, row, state)
+            item_status = str(item.get("status") or "not_started")
+            item_language = str(item.get("source_language") or "unknown").lower()
+            status_counts[item_status] = status_counts.get(item_status, 0) + 1
+            language_counts[item_language] = language_counts.get(item_language, 0) + 1
+            if wanted and item_status not in wanted:
+                continue
+            if language not in {"", "all"}:
+                if language == "foreign":
+                    if item_language in {"zh", "zh-cn", "zh-hans"}:
+                        continue
+                elif item_language != language:
+                    continue
+            if query:
+                haystack = " ".join((path, str(row.get("name") or ""),
+                                      str((item.get("titles") or {}).get("original") or ""),
+                                      str((item.get("titles") or {}).get("translated") or ""))).casefold()
+                if query not in haystack:
+                    continue
+            matches.append(item)
+        scan_offset += len(rows)
+        if scan_offset >= int(page.get("total") or 0):
+            break
+    total = len(matches)
+    items = matches[offset:offset + limit]
+    next_offset = offset + len(items)
+    return {
+        "items": items, "offset": offset, "limit": limit, "total": total,
+        "next_offset": next_offset if next_offset < total else None,
+        "has_more": next_offset < total,
+        "status": next(iter(wanted)) if len(wanted) == 1 else None,
+        "statuses": sorted(wanted), "language": language, "query": query,
+        "unfiltered_total": sum(status_counts.values()),
+        "status_counts": status_counts, "language_counts": language_counts,
+        "package_id": package.get("id"),
+    }
 
 
 def _translation_document(scan_id, node_path, source_level):
@@ -4321,8 +4640,13 @@ def _prepare_import_translations(scan_id, job_id, documents, policy, priority_pa
     return result_summary
 
 
-def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_units=None):
-    document = _translation_document(scan_id, node_path, source_level)
+def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_units=None,
+                            translation_backend=None, owner_id=None):
+    document = (
+        _large_translation_document(scan_id, node_path, source_level=source_level, owner_id=owner_id)
+        if _is_large_translation_source(scan_id)
+        else _translation_document(scan_id, node_path, source_level)
+    )
     if not document:
         raise ValueError("文件尚无可翻译内容：{}".format(node_path))
     previous = storage.get_translation(scan_id, node_path, hydrate=True)
@@ -4330,6 +4654,8 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
 
     def checkpoint(state):
         state["source_level"] = source_level
+        if translation_backend == "vllm":
+            state["translation_mode"] = "vllm"
         state["full_translation"] = bool(
             source_level == "full" and state.get("status") in {"completed", "not_required"}
         )
@@ -4345,7 +4671,9 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
                 current_stage="文档翻译", current_file=node_path, heartbeat=True,
             )
 
-    result = _translate_document_serialized(
+    translate = (file_translation_service.translate_document
+                 if translation_backend == "vllm" else _translate_document_serialized)
+    result = translate(
         document,
         resume_state=previous,
         max_units=max_units,
@@ -4353,6 +4681,8 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
         cancel_check=(lambda: storage.is_job_cancel_requested(job_id)) if job_id else None,
     )
     result["source_level"] = source_level
+    if translation_backend == "vllm":
+        result["translation_mode"] = "vllm"
     result["full_translation"] = bool(
         source_level == "full" and result.get("status") in {"completed", "not_required"}
     )
@@ -4511,11 +4841,150 @@ def _run_claimed_homogeneous_analysis_job(job):
     }
 
 
+def _schedule_vllm_translation_retry(job, scan_id, options, paths, owner_id):
+    """Queue another verified pass for pending or quality-failed units."""
+    retry_round = max(0, int(options.get("vllm_retry_round") or 0))
+    if retry_round >= 64 or not paths:
+        return None
+    retry_options = dict(options)
+    retry_options.update({
+        "target_paths": list(dict.fromkeys(str(path) for path in paths if str(path))),
+        "selected_only": True, "phase": "deep_backfill", "cursor": 0,
+        "vllm_retry_round": retry_round + 1, "translation_backend": "vllm",
+    })
+    continuation_job_id, _created = storage.create_or_get_typed_job(
+        scan_id, "translate_package", options=retry_options, owner_id=owner_id,
+    )
+    return continuation_job_id
+
+
+def _run_claimed_large_translation_job(job):
+    """Translate explicitly selected files from an isolated large package."""
+    job_id = job["id"]
+    package_id = str(job.get("scan_id") or "")
+    options = dict(job.get("options") or {})
+    backend = options.get("translation_backend")
+    model_options = {"translation_backend": "vllm", "max_units": 8} if backend == "vllm" else {}
+    phase = str(options.get("phase") or "deep_backfill")
+    selected_only = bool(options.get("selected_only"))
+    paths = list(dict.fromkeys(str(path).replace("\\", "/").strip()
+                               for path in (options.get("target_paths") or []) if str(path).strip()))
+    owner_id = job.get("owner_id") or "legacy"
+    if job.get("task_type") == "translate_document":
+        node_path = str(options.get("path") or "").replace("\\", "/").strip()
+        _large_translation_target(package_id, node_path, owner_id=owner_id)
+        state = storage.get_file_state(package_id, node_path) or {}
+        state_status = state.get("status")
+        if bool(options.get("require_full", True)) and state_status != "completed":
+            _promote_large_for_translation(package_id, node_path, job_id, owner_id=owner_id)
+            state_status = "completed"
+        source_level = "full" if state_status == "completed" else "preview"
+        storage.update_job(
+            job_id, progress=5, stage="translating", message="正在准备大数据包文件翻译",
+            current_stage="大数据包文件翻译", current_file=node_path, heartbeat=True,
+        )
+        result = _translate_one_document(package_id, node_path, source_level,
+                                         job_id=job_id, owner_id=owner_id, **model_options)
+        _ensure_job_active(job_id)
+        progress = result.get("progress") or {}
+        if backend == "vllm" and progress.get("pending_units") and not progress.get("failed_units"):
+            return {"_requeue_slice": True, "_requeue_message": "大数据包文件译文已保存，继续翻译剩余段落。"}
+        if backend == "vllm" and (progress.get("pending_units") or progress.get("failed_units")):
+            continuation_job_id = _schedule_vllm_translation_retry(
+                job, package_id, options, [node_path], owner_id,
+            )
+            if continuation_job_id:
+                return {"scan_id": package_id, "package_type": "large", "path": node_path,
+                        "translation_status": result.get("status"),
+                        "source_level": result.get("source_level"),
+                        "full_translation": result.get("full_translation"),
+                        "continuation_job_id": continuation_job_id}
+        return {"scan_id": package_id, "package_type": "large", "path": node_path,
+                "translation_status": result.get("status"),
+                "source_level": result.get("source_level"),
+                "full_translation": result.get("full_translation")}
+    if not selected_only or not paths:
+        raise ValueError("大数据包翻译必须明确选择文件")
+    if phase != "deep_backfill":
+        raise ValueError("大数据包仅支持翻译已选择的文件")
+    if len(paths) > 500:
+        raise ValueError("单次最多选择 500 个文件")
+    owner_id = job.get("owner_id") or "legacy"
+    for path in paths:
+        _large_translation_target(package_id, path, owner_id=owner_id)
+    cursor = max(0, int(options.get("cursor") or 0))
+    batch_size = Config.TRANSLATION_PACKAGE_BATCH_FILES
+    current = paths[cursor:cursor + batch_size]
+    storage.update_job(
+        job_id, progress=2, stage="translating_package",
+        message="正在翻译大数据包中已选择的文件：{} 份".format(len(current)),
+        current_stage="大数据包文件翻译", heartbeat=True,
+    )
+    completed, failed = 0, []
+    for index, node_path in enumerate(current, 1):
+        _ensure_job_active(job_id)
+        try:
+            state = storage.get_file_state(package_id, node_path) or {}
+            state_status = state.get("status")
+            require_full = bool(options.get("require_full", True))
+            if require_full and state_status != "completed":
+                _promote_large_for_translation(package_id, node_path, job_id, owner_id=owner_id)
+                state_status = "completed"
+            source_level = "full" if state_status == "completed" else "preview"
+            result = _translate_one_document(package_id, node_path, source_level,
+                                             job_id=job_id, owner_id=owner_id, **model_options)
+            _ensure_job_active(job_id)
+            progress = result.get("progress") or {}
+            if backend == "vllm" and progress.get("pending_units") and not progress.get("failed_units"):
+                return {"_requeue_slice": True, "_requeue_message": "大数据包译文检查点已保存，继续翻译剩余段落。"}
+            if backend == "vllm" and (progress.get("pending_units") or progress.get("failed_units")):
+                failed.append({"path": node_path, "status": result.get("status"),
+                               "errors": result.get("errors") or [], "retryable": True})
+                continue
+            if result.get("status") in {"completed", "not_required"}:
+                completed += 1
+            else:
+                failed.append({"path": node_path, "status": result.get("status"),
+                               "errors": result.get("errors") or []})
+        except Exception as exc:
+            failed.append({"path": node_path, "status": "failed", "error": str(exc)[:500]})
+        storage.update_job(
+            job_id, progress=min(94, 4 + int(90 * index / max(1, len(current)))),
+            stage="translating_package", current_stage="大数据包文件翻译",
+            current_file=node_path,
+            message="大数据包翻译：{}/{} {}".format(index, len(current), node_path),
+            heartbeat=True,
+        )
+    next_cursor = cursor + len(current)
+    continuation_job_id = None
+    if backend == "vllm" and failed:
+        continuation_job_id = _schedule_vllm_translation_retry(
+            job, package_id, options, [item.get("path") for item in failed], owner_id,
+        )
+    if next_cursor < len(paths):
+        continuation_job_id, _created = storage.create_or_get_typed_job(
+            package_id, "translate_package", options={**options, "cursor": next_cursor},
+            owner_id=owner_id,
+        )
+    return {
+        "scan_id": package_id, "package_type": "large", "phase": phase,
+        "processed_files": len(current), "completed_files": completed,
+        "failed_files": len(failed), "failures": failed[:50],
+        "next_cursor": next_cursor if continuation_job_id else None,
+        "continuation_job_id": continuation_job_id,
+    }
+
+
 def _run_claimed_translation_job(job):
     """Run interactive or package-wide local translation with durable slices."""
     job_id = job["id"]
     scan_id = job["scan_id"]
     options = dict(job.get("options") or {})
+    translation_backend = options.get("translation_backend")
+    model_options = ({"translation_backend": "vllm", "max_units": 8}
+                     if translation_backend == "vllm" else {})
+    if _is_large_translation_source(scan_id):
+        return _run_claimed_large_translation_job(job)
     scan_result = require_scan(scan_id)
     if job.get("task_type") == "translate_document":
         node_path = str(options.get("path") or "")
@@ -4529,7 +4998,21 @@ def _run_claimed_translation_job(job):
             job_id, progress=5, stage="translating", message="正在准备文档翻译",
             current_stage="文档翻译", current_file=node_path, heartbeat=True,
         )
-        result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id)
+        result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id, **model_options)
+        _ensure_job_active(job_id)
+        progress = result.get("progress") or {}
+        if translation_backend == "vllm" and progress.get("pending_units") and not progress.get("failed_units"):
+            return {"_requeue_slice": True, "_requeue_message": "文件译文已保存，继续翻译剩余段落。"}
+        if translation_backend == "vllm" and (progress.get("pending_units") or progress.get("failed_units")):
+            continuation_job_id = _schedule_vllm_translation_retry(
+                job, scan_id, options, [node_path], job.get("owner_id") or "legacy",
+            )
+            if continuation_job_id:
+                return {"scan_id": scan_id, "path": node_path,
+                        "translation_status": result.get("status"),
+                        "source_level": result.get("source_level"),
+                        "full_translation": result.get("full_translation"),
+                        "continuation_job_id": continuation_job_id}
         return {
             "scan_id": scan_id, "path": node_path, "translation_status": result.get("status"),
             "source_level": result.get("source_level"), "full_translation": result.get("full_translation"),
@@ -4565,7 +5048,15 @@ def _run_claimed_translation_job(job):
                 _promote_for_translation(scan_id, scan_result, node_path, job_id)
                 state = "completed"
             source_level = "full" if state == "completed" else "preview"
-            result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id)
+            result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id, **model_options)
+            _ensure_job_active(job_id)
+            progress = result.get("progress") or {}
+            if translation_backend == "vllm" and progress.get("pending_units") and not progress.get("failed_units"):
+                return {"_requeue_slice": True, "_requeue_message": "译文检查点已保存，继续处理所选文件。"}
+            if translation_backend == "vllm" and (progress.get("pending_units") or progress.get("failed_units")):
+                failed.append({"path": node_path, "status": result.get("status"),
+                               "errors": result.get("errors") or [], "retryable": True})
+                continue
             if result.get("status") in {"completed", "not_required"}:
                 completed += 1
             else:
@@ -4580,14 +5071,26 @@ def _run_claimed_translation_job(job):
             current_stage="数据包翻译", current_file=node_path, heartbeat=True,
         )
 
+    if translation_backend == "vllm":
+        _ensure_job_active(job_id)
     next_cursor = cursor + len(current)
     continuation_job_id = None
-    if not selected_only and phase == "deep_backfill" and len(current) < len(paths):
+    if translation_backend == "vllm" and failed:
+        continuation_job_id = _schedule_vllm_translation_retry(
+            job, scan_id, options, [item.get("path") for item in failed],
+            job.get("owner_id") or "legacy",
+        )
+    if selected_only and next_cursor < len(paths):
+        continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
+            scan_id, "translate_package", options={**options, "cursor": next_cursor},
+            owner_id=job.get("owner_id") or "legacy",
+        )
+    elif not selected_only and phase == "deep_backfill" and len(current) < len(paths):
         continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
             scan_id, "translate_package",
             # The remaining-candidate set shrinks after every successful
             # promotion, so each continuation starts at its new first item.
-            options={"phase": phase, "cursor": 0, "slice": slice_no + 1},
+            options={**options, "phase": phase, "cursor": 0, "slice": slice_no + 1},
             owner_id=job.get("owner_id") or "legacy",
         )
         next_cursor = 0
@@ -4599,20 +5102,20 @@ def _run_claimed_translation_job(job):
         if remaining:
             continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
                 scan_id, "translate_package",
-                options={"phase": phase, "cursor": 0, "slice": slice_no + 1},
+                options={**options, "phase": phase, "cursor": 0, "slice": slice_no + 1},
                 owner_id=job.get("owner_id") or "legacy",
             )
             next_cursor = 0
     elif not selected_only and next_cursor < len(paths):
         continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
             scan_id, "translate_package",
-            options={"phase": phase, "cursor": next_cursor},
+            options={**options, "phase": phase, "cursor": next_cursor},
             owner_id=job.get("owner_id") or "legacy",
         )
     elif not selected_only and large and phase == "preview_and_priority" and options.get("schedule_deep_backfill", True):
         continuation_job_id, _continuation_created = storage.create_or_get_typed_job(
             scan_id, "translate_package",
-            options={"phase": "deep_backfill", "cursor": 0, "slice": 0},
+            options={**options, "phase": "deep_backfill", "cursor": 0, "slice": 0},
             owner_id=job.get("owner_id") or "legacy",
         )
     if phase == "deep_backfill" and current:
@@ -5643,6 +6146,44 @@ def confirm_scan_selection(scan_id):
     except ValueError as exc:
         return api_error(str(exc), 400)
 
+@app.route("/api/scan/<scan_id>/directory-supplement", methods=["GET", "POST"])
+def directory_supplement(scan_id):
+    """An opt-in directory picker; the legacy selection flow stays unchanged."""
+    from services.selection_supplement import SupplementError, browse, status, submit
+    try:
+        owner_id = _request_owner_id() or Config.OWNER_ID
+        if request.method == "POST":
+            payload = request.get_json(silent=True) or {}
+            if not isinstance(payload, dict):
+                return api_error("请求必须是对象", 400)
+            result = submit(storage, scan_id, owner_id, payload)
+            return jsonify({"ok": True, **result}), 202 if result.get("accepted") else 200
+        if request.args.get("status_only") == "1":
+            return jsonify({"ok": True, **status(storage, scan_id, owner_id)})
+        result = browse(storage, scan_id, owner_id,
+                        request.args.get("parent", "."), request.args.get("offset", 0))
+        return jsonify({"ok": True, **result})
+    except SupplementError as exc:
+        return api_error(str(exc), exc.status)
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+
+@app.route("/api/scan/<scan_id>/directory-supplement/preview", methods=["POST"])
+def preview_directory_supplement(scan_id):
+    from services.selection_supplement import SupplementError, preview
+    try:
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return api_error("请求必须是对象", 400)
+        result = preview(storage, scan_id, _request_owner_id() or Config.OWNER_ID, payload)
+        return jsonify({"ok": True, **result})
+    except SupplementError as exc:
+        return api_error(str(exc), exc.status)
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
+
+
 @app.route("/api/scan/<scan_id>/selection/supplement", methods=["POST"])
 def supplement_scan_selection(scan_id):
     """Add files to a confirmed scope without rerunning completed work."""
@@ -6482,6 +7023,8 @@ def get_document(scan_id):
         return response
 
     try:
+        if str(scan_id).startswith("lp-"):
+            return _large_package_document(scan_id)
         scan = require_scan(scan_id)
         node_path = str(request.args.get("path", "") or "").strip()
         if not node_path:
@@ -6816,49 +7359,53 @@ def _conversation_retrieve(retrieval_request):
         scoped_files = [item for item in (package_context.get("file_summaries") or []) if scope.contains_source(item.get("path"))]
         package_context = dict(package_context)
         package_context["file_summaries"] = scoped_files
+        package_context["reading_manifest"] = build_reading_manifest(scoped_files)
         package_context["coverage"] = dict(package_context.get("coverage") or {})
         package_context["coverage"]["scope"] = scope.kind
         package_context["coverage"]["scope_files"] = len(scoped_files)
+    reading_manifest = dict((package_context or {}).get("reading_manifest") or {})
     if str(retrieval_request.scan_id).startswith("lp-"):
         # The isolated large-package store has no ordinary evidence_index.  Use
         # its persisted quick/deep summaries as a read-only evidence corpus.
         files = (package_context or {}).get("file_summaries") or []
-        raw_tokens = re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9_./-]+", str(query or "").casefold())
-        query_tokens = []
-        for token in raw_tokens:
-            if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 6:
-                query_tokens.extend(token[index:index + 2] for index in range(0, len(token) - 1, 2))
-            else:
-                query_tokens.append(token)
-        indexed = []
-        for file in files:
-            text = str(file.get("summary") or "")
-            haystack = "{} {}".format(file.get("path") or "", text).casefold()
-            if query_tokens and not all(token in haystack for token in query_tokens):
-                if not any(token in haystack for token in query_tokens):
-                    continue
-            indexed.append({
-                "evidence_id": "large:{}:{}".format(retrieval_request.scan_id, file.get("path")),
-                "source_path": file.get("path"),
-                "text": text,
-                "original_text": text,
-                "location": {"source": "file_summary"},
-                "evidence_role": "文件摘要",
-                "archive_source_path": file.get("path"),
-            })
-        if retrieval_request.intent in {"summary", "analysis", "comparison", "timeline", "relationship", "contradiction", "risk", "multi_task"} and not indexed:
-            indexed = [{
-                "evidence_id": "large:{}:{}".format(retrieval_request.scan_id, file.get("path")),
-                "source_path": file.get("path"), "text": file.get("summary") or "",
-                "original_text": file.get("summary") or "", "location": {"source": "file_summary"},
-                "evidence_role": "文件摘要", "archive_source_path": file.get("path"),
-            } for file in files]
-        result = retrieve_evidence({}, query, top_k=retrieval_request.top_k, indexed_chunks=indexed)
+        # High-recall hybrid retrieval over the persisted summaries; the shared
+        # conversation layer then decides how much of it the page shows and how
+        # much of it the model receives.  See services/large_package_recall.py.
+        result = large_package_recall.collect_evidence(
+            retrieval_request, query, files,
+            store=large_package_store,
+            retrieve_evidence=retrieve_evidence,
+            logger=logger,
+            relaxed=retrieval_request.intent in large_package_recall.BROAD_INTENTS,
+        )
+        source_package = {
+            "id": str(retrieval_request.scan_id), "type": "large",
+            "name": str(((package_context or {}).get("package_info") or {}).get("name") or retrieval_request.scan_id),
+        }
+        for evidence in result.get("results") or []:
+            evidence["source_package"] = dict(source_package)
+            evidence["evidence_level"] = "file"
+        result["warnings"] = list(result.get("warnings") or []) + [
+            "大数据包问答依据已保存的文件摘要；引用定位到文件，不代表已读取全文或核验原文段落。"
+        ]
+        result["index_mode"] = "large-package-summary"
+        result["retrieval_mode"] = "large_hybrid"
         result["package_context"] = package_context
         all_paths = [str(item.get("path")) for item in files if item.get("path")]
         result["candidate_paths"] = all_paths
         result["related_file_paths"] = all_paths if retrieval_request.intent in {"summary", "analysis", "multi_task"} else [str(item.get("source_path")) for item in result.get("results") or [] if item.get("source_path")]
-        result["coverage"] = {**(result.get("coverage") or {}), "scope": "package", "total_files": len(files), "candidate_files": len(files), "inspected_files": len(result.get("results") or []), "query_coverage": 1.0 if files else 0.0, "coverage_basis": "package_summary"}
+        result["coverage"] = {
+            **(result.get("coverage") or {}),
+            "scope": scope.kind, "total_files": len(files),
+            "candidate_files": len(files),
+            "inspected_files": len(result.get("results") or []),
+            "query_coverage": 1.0 if files else 0.0,
+            "coverage_basis": "package_summary",
+            "package_reading_files": reading_manifest.get("files_read"),
+            "summary_backed_files": reading_manifest.get("summary_backed_files"),
+            "package_reading_coverage": reading_manifest.get("summary_coverage"),
+            "package_reading_complete": reading_manifest.get("complete"),
+        }
         return result
     if scope.kind in {"topic", "entity", "file_type"}:
         query = "{} {}".format(scope.value, query)
@@ -6886,6 +7433,31 @@ def _conversation_retrieve(retrieval_request):
         indexed, projection_fallback = _conversation_projection_fallback(
             retrieval_request
         )
+    if not indexed:
+        # Zero FTS hits do not mean the package lacks relevant material: a
+        # Chinese question over an English corpus (or any cross-lingual or
+        # paraphrased query) legitimately produces no keyword matches even
+        # when every file was parsed and indexed, whatever the intent is.
+        # The persisted per-file summaries are the curated "package reading"
+        # corpus; ranking them against the query keeps answers grounded for
+        # every intent, and retrieve_evidence's score>0 filter still reports
+        # honest "insufficient evidence" for genuinely unrelated questions.
+        summary_files = (package_context or {}).get("file_summaries") or []
+        indexed = [
+            {
+                "evidence_id": "summary:{}:{}".format(
+                    retrieval_request.scan_id, file.get("path")
+                ),
+                "source_path": file.get("path"),
+                "text": str(file.get("summary") or ""),
+                "original_text": str(file.get("summary") or ""),
+                "location": {"source": "file_summary"},
+                "evidence_role": "文件摘要",
+                "archive_source_path": file.get("path"),
+            }
+            for file in summary_files
+            if str(file.get("summary") or "").strip()
+        ]
     if scope.kind == "file_type" and (scope.constraints or {}).get("dimension") == "format":
         expected = str(scope.value or "").lower().strip()
         if expected and not expected.startswith(".") and expected != "[无扩展名]":
@@ -7074,6 +7646,10 @@ def _conversation_retrieve(retrieval_request):
         "scope_inspection_coverage": scope_inspection_coverage,
         "coverage_basis": "scope_inspection" if broad_scope else "candidate_depth",
         "query_coverage": query_coverage,
+        "package_reading_files": reading_manifest.get("files_read"),
+        "summary_backed_files": reading_manifest.get("summary_backed_files"),
+        "package_reading_coverage": reading_manifest.get("summary_coverage"),
+        "package_reading_complete": reading_manifest.get("complete"),
         "deferred_candidates": deferred[:100],
         "projection_fallback": projection_fallback,
     }
@@ -7142,8 +7718,9 @@ def _conversation_index_status(scan_id):
         status = str(package.get("status") or "queued")
         total = int(counts.get("total_files") or 0)
         quick = counts.get("quick") or {}
-        ready = status in {"waiting_for_selection", "completed"} and total > 0 and not int(quick.get("queued", 0) or 0) and not int(quick.get("running", 0) or 0)
-        return {"usable": bool(ready), "ready": bool(status == "completed"), "status": status, "code": "ready" if ready else "index_unavailable", "total_files": total, "indexed_files": int(quick.get("completed", 0) or 0), "failed_files": int(quick.get("failed", 0) or 0), "package_type": "large"}
+        indexed = int(quick.get("completed", 0) or 0)
+        ready = total > 0 and indexed == total
+        return {"usable": indexed > 0, "ready": ready, "status": status, "code": "ready" if ready else "partial" if indexed else "index_unavailable", "total_files": total, "indexed_files": indexed, "failed_files": int(quick.get("failed", 0) or 0), "package_type": "large"}
     documents = storage.count_documents(scan_id)
     evidence = storage.count_evidence_index(scan_id)
     preview_counts = storage.file_preview_counts(scan_id)
@@ -7301,7 +7878,16 @@ def _run_claimed_conversation_turn_job(job):
     ]
     session = ConversationSession.from_dict(stored)
     scope = ConversationScope.from_dict(turn.get("scope") or session.scope.as_dict())
-    scan_result = require_scan(turn["scan_id"])
+    # This worker runs outside any request context, so the request-scoped owner
+    # helper cannot see the package owner.  Resolve an isolated large package
+    # with the job's own owner id, and leave the ordinary scan path untouched.
+    turn_owner_id = str(job.get("owner_id") or turn.get("owner_id") or "") or "legacy"
+    if str(turn["scan_id"]).startswith("lp-"):
+        if not large_package_store.get(turn["scan_id"], owner_id=turn_owner_id):
+            raise ValueError("大数据包不存在、已失效或不属于当前用户")
+        inventory_paths = _large_package_inventory_paths(turn["scan_id"])
+    else:
+        inventory_paths = list(_inventory_by_path(require_scan(turn["scan_id"])))
     turn["job_id"] = job["id"]
     storage.update_conversation_turn(turn_id, job_id=job["id"])
     result = AnalysisTurnRuntime(
@@ -7312,7 +7898,7 @@ def _run_claimed_conversation_turn_job(job):
         max_revision_attempts=Config.CONVERSATION_MAX_REVISION_ATTEMPTS,
         cancel_check=lambda: _ensure_job_active(job["id"]),
     ).execute(
-        turn, session, scope, inventory_paths=list(_inventory_by_path(scan_result)),
+        turn, session, scope, inventory_paths=inventory_paths,
     )
     _ensure_job_active(job["id"])
     return result
@@ -7703,7 +8289,7 @@ def refresh_deep_results(scan_id):
             completed = [path for path in selected_paths if _is_persisted_deep_file_summary(storage.get_summary(scan_id, path, staged_summary_type("deep", "file")) or {})]
             if len(completed) != len(selected_paths) or active_jobs:
                 return api_error("深度摘要尚未全部完成，暂不能更新正式结果", 409, {"selected_files": len(selected_paths), "completed_files": len(completed), "active_deep_jobs": active_jobs})
-            if task_status != "deep_update_available":
+            if task_status not in {"deep_update_available", "completed", "partial"}:
                 return api_error("请等待当前阶段完成后再更新。", 409, {"task_status": task_status})
             storage.transition_import_task(
                 scan_id, "deep_overview_updating", checkpoint=checkpoint,
@@ -8113,6 +8699,8 @@ def create_conversation_turn(session_id):
 def rebuild_search_index(scan_id):
     try:
         _conversation_package_record(scan_id, request.args)
+        if str(scan_id).startswith("lp-"):
+            return api_error("大数据包使用独立文件摘要，不支持普通数据包的索引重建；请在大包导入页查看处理进度。", 400)
         options = {
             "workflow_source": "index_rebuild",
             "scope_label": "重建轻量预览与对话证据索引",
@@ -8305,6 +8893,107 @@ def conversation_message(session_id):
     return create_conversation_turn(session_id)
 
 
+def _large_document_translation(package_id):
+    """GET/POST document translation contract for an isolated large package."""
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            raise ValueError("请求必须是对象")
+        if not Config.ENABLE_TRANSLATION or not Config.ENABLE_VLLM:
+            return api_error("系统 vLLM 文件翻译未启用", 503)
+        _package, _row, path, _resolved = _large_translation_target(package_id, payload.get("path"))
+        job_id, _created = storage.create_or_get_typed_job(
+            package_id, "translate_document",
+            options={"path": path, "require_full": bool(payload.get("require_full", True)),
+                     "translation_backend": "vllm", "package_type": "large"},
+            owner_id=_request_owner_id() or "legacy",
+        )
+        return jsonify({"ok": True, "job_id": job_id, "path": path,
+                        "package_type": "large"}), 202
+
+    path = str(request.args.get("path", "") or "").replace("\\", "/").strip()
+    document, package, row = _large_translation_preview_document(package_id, path)
+    state = storage.get_translation(package_id, path, hydrate=True)
+    view = str(request.args.get("view", "translated") or "translated").lower()
+    if view not in {"original", "translated", "bilingual"}:
+        raise ValueError("view 仅支持 original、translated、bilingual")
+    offset = max(0, int(request.args.get("offset", 0) or 0))
+    limit = max(200, min(20000, int(request.args.get("limit", 8000) or 8000)))
+    original = str((state or {}).get("original_text") if state else document.get("text") or "")
+    translated_value = (state or {}).get("translated_text") if state else None
+    translated = str(translated_value) if translated_value is not None else None
+
+    def page(text):
+        if text is None:
+            return None
+        return {"text": text[offset:offset + limit], "offset": offset, "limit": limit,
+                "total_characters": len(text), "has_more": offset + limit < len(text)}
+
+    local = row.get("local_summary") if isinstance(row.get("local_summary"), dict) else {}
+    raw_language = local.get("language")
+    local_language = (raw_language.get("code") if isinstance(raw_language, dict) else raw_language) or "unknown"
+    response = {
+        "ok": True, "package_type": "large", "package_id": package.get("id"), "path": path,
+        "view": view, "status": (state or {}).get("status") or "not_started",
+        "source_level": (state or {}).get("source_level"),
+        "source_availability": "document" if storage.get_document(package_id, path) else ("preview" if document.get("text") else "metadata"),
+        "content_available": bool(document), "full_translation": bool((state or {}).get("full_translation")),
+        "source_language": (state or {}).get("source_language") or local_language,
+        "target_language": (state or {}).get("target_language") or "zh-CN",
+        "translation_mode": (state or {}).get("translation_mode") or "fast",
+        "performance": (state or {}).get("performance") or {}, "provider_id": (state or {}).get("provider_id"),
+        "titles": {"original": (state or {}).get("original_title") or ((document.get("structure") or {}).get("title")),
+                   "translated": (state or {}).get("translated_title")},
+        "progress": (state or {}).get("progress"), "errors": (state or {}).get("errors") or [],
+        "warnings": (state or {}).get("warnings") or document.get("warnings") or [],
+    }
+    if view in {"original", "bilingual"}:
+        response["original"] = page(original)
+    if view in {"translated", "bilingual"}:
+        response["translated"] = page(translated)
+    if not state and document:
+        response["plan"] = build_translation_plan(
+            storage.project_document(document, text_limit=Config.LARGE_PACKAGE_OVERVIEW_CHARS_PER_FILE),
+            max_unit_chars=Config.TRANSLATION_MAX_UNIT_CHARS,
+            coalesce_paragraphs=Config.TRANSLATION_COALESCE_PARAGRAPHS,
+        )
+    return jsonify(response)
+
+
+def _translate_large_package_request(package_id):
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        raise ValueError("请求必须是对象")
+    if not Config.ENABLE_TRANSLATION or not Config.ENABLE_VLLM:
+        return api_error("系统 vLLM 文件翻译未启用", 503)
+    phase = str(payload.get("phase") or "deep_backfill")
+    if phase != "deep_backfill":
+        raise ValueError("大数据包仅支持翻译已选择的文件")
+    requested_paths = payload.get("target_paths", payload.get("paths"))
+    if not isinstance(requested_paths, list):
+        raise ValueError("大数据包翻译必须提供 target_paths 文件路径数组")
+    selected_paths = list(dict.fromkeys(
+        str(path).replace("\\", "/").strip() for path in requested_paths if str(path).strip()
+    ))
+    if not selected_paths:
+        raise ValueError("至少选择一个需要翻译的文件")
+    if len(selected_paths) > 500:
+        raise ValueError("单次最多选择 500 个文件")
+    for path in selected_paths:
+        _large_translation_target(package_id, path)
+    options = {
+        "phase": phase, "cursor": 0, "translation_backend": "vllm",
+        "package_type": "large", "target_paths": selected_paths,
+        "selected_only": True, "require_full": bool(payload.get("require_full", True)),
+    }
+    job_id, _created = storage.create_or_get_typed_job(
+        package_id, "translate_package", options=options,
+        owner_id=_request_owner_id() or "legacy",
+    )
+    return jsonify({"ok": True, "job_id": job_id, "package_type": "large",
+                    "phase": phase, "selected_files": len(selected_paths)}), 202
+
+
 @app.route("/api/translations/<scan_id>")
 def list_translations(scan_id):
     """List one bounded, searchable page of translation work.
@@ -8315,7 +9004,6 @@ def list_translations(scan_id):
     translated subset.
     """
     try:
-        require_scan(scan_id)
         limit = max(1, min(500, int(request.args.get("limit", 100) or 100)))
         offset = max(0, min(10_000_000, int(request.args.get("offset", 0) or 0)))
         query = str(
@@ -8323,7 +9011,6 @@ def list_translations(scan_id):
         ).strip()
         if len(query) > 500:
             raise ValueError("query 不能超过 500 个字符")
-
         # Support both the documented comma-separated form and repeated
         # ``status`` query parameters when the underlying request adapter has
         # a MultiDict-compatible ``getlist`` method.
@@ -8341,6 +9028,13 @@ def list_translations(scan_id):
                     status_values.append(value)
         statuses = list(dict.fromkeys(status_values))
         language = str(request.args.get("language", "all") or "all").strip().lower()
+        if _is_large_translation_source(scan_id):
+            page = _large_translation_page(
+                scan_id, offset=offset, limit=limit, query=query,
+                statuses=statuses, language=language,
+            )
+            return jsonify({"ok": True, "counts": storage.translation_counts(scan_id), **page,
+                            "previous_offset": max(0, offset - limit) if offset else None})
         page = storage.list_translation_page(
             scan_id,
             offset=offset,
@@ -8365,9 +9059,15 @@ def list_translations(scan_id):
 @app.route("/api/translation/<scan_id>", methods=["GET", "POST"])
 def document_translation(scan_id):
     try:
+        if _is_large_translation_source(scan_id):
+            return _large_document_translation(scan_id)
         scan_result = require_scan(scan_id)
         if request.method == "POST":
             payload = request.get_json(silent=True) or {}
+            if not isinstance(payload, dict):
+                raise ValueError("请求必须是对象")
+            if not Config.ENABLE_TRANSLATION or not Config.ENABLE_VLLM:
+                return api_error("系统 vLLM 文件翻译未启用", 503)
             node_path = str(payload.get("path") or "")
             _translation_inventory_node(scan_result, node_path)
             job_id, _created = storage.create_or_get_typed_job(
@@ -8375,6 +9075,7 @@ def document_translation(scan_id):
                 options={
                     "path": node_path,
                     "require_full": bool(payload.get("require_full", True)),
+                    "translation_backend": "vllm",
                 },
                 owner_id=_request_owner_id() or "legacy",
             )
@@ -8435,6 +9136,7 @@ def document_translation(scan_id):
                 "quality" if Config.TRANSLATION_REVIEW_COMPLEX_UNITS else "fast"
             ),
             "performance": (state or {}).get("performance") or {},
+            "provider_id": (state or {}).get("provider_id"),
             "titles": {
                 "original": (state or {}).get("original_title") or ((document or {}).get("structure") or {}).get("title"),
                 "translated": (state or {}).get("translated_title"),
@@ -8463,16 +9165,24 @@ def document_translation(scan_id):
 @app.route("/api/translate-package/<scan_id>", methods=["POST"])
 def translate_package(scan_id):
     try:
+        if _is_large_translation_source(scan_id):
+            return _translate_large_package_request(scan_id)
         scan_result = require_scan(scan_id)
         payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            raise ValueError("请求必须是对象")
         phase = str(payload.get("phase") or "preview_and_priority")
         if phase not in {"preview_and_priority", "deep_backfill"}:
             raise ValueError("不支持的翻译阶段")
         requested_paths = payload.get("target_paths", payload.get("paths"))
-        options = {"phase": phase, "cursor": 0}
+        if not Config.ENABLE_TRANSLATION or not Config.ENABLE_VLLM:
+            return api_error("系统 vLLM 文件翻译未启用", 503)
+        options = {"phase": phase, "cursor": 0, "translation_backend": "vllm"}
         if requested_paths is not None:
             if not isinstance(requested_paths, list):
                 raise ValueError("target_paths 必须是文件路径数组")
+            if any(not isinstance(path, str) for path in requested_paths):
+                raise ValueError("每个文件路径必须是字符串")
             selected_paths = list(dict.fromkeys(
                 str(path).strip() for path in requested_paths if str(path).strip()
             ))
@@ -8805,6 +9515,13 @@ def search_files():
         query = re.sub(r"\s+", " ", str(payload.get("query") or "")).strip()
         if not query or len(query) > 8000:
             raise ValueError("搜索内容不能为空且不能超过 8000 个字符")
+        if str(scan_id).startswith("lp-"):
+            try:
+                page = max(1, int(payload.get("page", 1)))
+                page_size = max(1, min(100, int(payload.get("page_size", 50))))
+            except (TypeError, ValueError):
+                raise ValueError("分页参数无效")
+            return jsonify(_large_package_file_search(scan_id, query, page, page_size))
         scan_result = require_scan(scan_id)
 
         try:
@@ -9507,7 +10224,7 @@ def summarize():
             document_parser = (unified_document or {}).get("parser") or {}
             document_coverage = (unified_document or {}).get("coverage") or {}
             source_extension = Path(node_path).suffix.lower()
-            structured_source_needs_upgrade = source_extension in {".json", ".jsonl", ".csv", ".tsv", ".xlsx", ".xls", ".xlsm", ".ods"} and document_parser.get("name") != "structured-json"
+            structured_source_needs_upgrade = source_extension in {".json", ".jsonl", ".csv", ".tsv", ".xlsx", ".xls", ".xlsm", ".ods"} and document_parser.get("name") not in {"structured-json", "structured-table"}
             needs_deep_parse = structured_source_needs_upgrade or (is_large_package and document_parser.get("name") != "structured-json" and (
                 document_parser.get("mode") == "fast"
                 or document_parser.get("fast_preview")
@@ -9660,6 +10377,31 @@ def export():
         }), 202
     except ValueError as exc:
         return api_error(str(exc), 400)
+
+
+@app.route("/api/file-summaries/<scan_id>")
+def file_summaries_map(scan_id):
+    """Bounded path -> summary map for chat file cards and folder panels."""
+    try:
+        limit = max(1, min(2000, int(request.args.get("limit", 500) or 500)))
+        if str(scan_id).startswith("lp-"):
+            return jsonify({"ok": True, "summaries": _large_package_summary_map(scan_id, limit)})
+        require_scan(scan_id)
+        rows = storage.list_summaries(scan_id) or []
+        summaries = {}
+        for row in rows:
+            node_path = str((row or {}).get("path") or "")
+            payload = (row or {}).get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            text = str(payload.get("summary") or "").strip()
+            if node_path and text and node_path not in summaries:
+                summaries[node_path] = text[:320]
+            if len(summaries) >= limit:
+                break
+        return jsonify({"ok": True, "summaries": summaries})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
 
 
 @app.route("/api/download-ticket", methods=["POST"])
@@ -10244,6 +10986,288 @@ def _large_package_owned(package_id):
     return item
 
 
+def _large_package_summary_map(package_id, limit=500):
+    """Bounded path -> summary map for an isolated large package.
+
+    The isolated store keeps quick/deep summaries per file and has no ordinary
+    scan tables, so the chat file cards read exactly the two columns the
+    conversation context already consumes.
+    """
+    package = large_package_store.get(package_id, owner_id=_request_owner_id() or "legacy")
+    if not package:
+        raise ValueError("大数据包不存在、已失效或不属于当前用户")
+    summaries = {}
+    offset = 0
+    while len(summaries) < limit:
+        page = large_package_store.list_files(package_id, limit=500, offset=offset)
+        if not page:
+            break
+        for row in page:
+            path = str((row or {}).get("path") or "").strip()
+            if not path or path in summaries:
+                continue
+            local = (row or {}).get("local_summary") or {}
+            deep = (row or {}).get("deep_summary") or {}
+            chosen = deep if isinstance(deep, dict) and deep.get("summary_type") not in (None, "model_pending") else local
+            text = ""
+            if isinstance(chosen, dict):
+                text = str(chosen.get("summary") or chosen.get("sample") or "").strip()
+                if not text:
+                    keywords = chosen.get("keywords") or []
+                    if isinstance(keywords, (list, tuple)):
+                        text = "；".join(str(item) for item in keywords[:12])
+            if text:
+                summaries[path] = text[:320]
+            if len(summaries) >= limit:
+                break
+        offset += len(page)
+        if len(page) < 500:
+            break
+    return summaries
+
+
+def _large_package_query_tokens(query):
+    """Reuse the isolated-package tokenisation already used by retrieval."""
+    tokens = []
+    for token in re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9_./-]+", str(query or "").casefold()):
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 6:
+            tokens.extend(token[index:index + 2] for index in range(0, len(token) - 1, 2))
+        else:
+            tokens.append(token)
+    return tokens
+
+
+def _large_package_file_search(package_id, query, page, page_size):
+    """File discovery for an isolated large package.
+
+    The isolated store has no full-text index, so this mirrors the ordinary
+    ``/api/search/files`` response contract using the persisted quick/deep
+    summaries as the corpus. Evidence stays at file level and says so.
+    """
+    package = large_package_store.get(package_id, owner_id=_request_owner_id() or "legacy")
+    if not package:
+        raise ValueError("大数据包不存在、已失效或不属于当前用户")
+    tokens = _large_package_query_tokens(query)
+    matched = []
+    offset = 0
+    while True:
+        rows = large_package_store.list_files(package_id, limit=500, offset=offset)
+        if not rows:
+            break
+        for row in rows:
+            path = str((row or {}).get("path") or "").strip()
+            if not path:
+                continue
+            name = str((row or {}).get("name") or Path(path).name or path)
+            local = (row or {}).get("local_summary") or {}
+            deep = (row or {}).get("deep_summary") or {}
+            deep_ready = isinstance(deep, dict) and deep.get("summary_type") not in (None, "model_pending")
+            chosen = deep if deep_ready else local
+            summary = ""
+            if isinstance(chosen, dict):
+                summary = str(chosen.get("summary") or chosen.get("sample") or "").strip()
+            haystack = "{} {} {}".format(path, name, summary).casefold()
+            hits = sum(1 for token in tokens if token in haystack) if tokens else 0
+            if not hits:
+                continue
+            score = round(hits / float(len(tokens) or 1), 6)
+            evidence = []
+            if summary:
+                evidence.append({
+                    "evidence_id": "large:{}:{}".format(package_id, path),
+                    "source_path": path,
+                    "archive_source_path": path,
+                    "text": summary[:520],
+                    "original_text": summary[:520],
+                    "location": {"source": "deep_summary" if deep_ready else "file_summary"},
+                    "evidence_role": "文件摘要",
+                    "preview_only": not deep_ready,
+                    "retrieval_score": score,
+                })
+            matched.append({
+                "path": path,
+                "physical_path": path,
+                "name": name,
+                "extension": (row or {}).get("extension"),
+                "size": (row or {}).get("size"),
+                "match_count": hits,
+                "best_score": score,
+                "snippets": [summary[:520]] if summary else [],
+                "pages": [],
+                "sections": [],
+                "evidence": evidence,
+                "status": "completed" if deep_ready else "indexed",
+                "analysis_level": "deep" if deep_ready else "preview",
+                "retryable": None,
+                "error": None,
+                "file_set_match": True,
+            })
+        offset += len(rows)
+        if len(rows) < 500:
+            break
+    matched.sort(key=lambda item: (-float(item.get("best_score") or 0), item.get("path") or ""))
+    matched_count = len(matched)
+    start = (page - 1) * page_size
+    page_items = matched[start:start + page_size]
+    try:
+        scope_file_count = int((large_package_store.counts(package_id) or {}).get("total_files") or 0)
+    except Exception:
+        scope_file_count = 0
+    conclusion = "检索“{}”共找到 {} 个相关文件（依据文件摘要，定位到文件）。".format(query[:120], matched_count)
+    if not matched_count:
+        conclusion = "当前大数据包中暂未找到包含“{}”的文件。".format(query[:120])
+    return {
+        "ok": True,
+        "query": query,
+        "scope": ".",
+        "node_id": None,
+        "node_name": None,
+        "conclusion": conclusion,
+        "answer": {
+            "query": query,
+            "conclusion": conclusion,
+            "matched_file_count": matched_count,
+            "scope_file_count": scope_file_count,
+            "evidence_count": matched_count,
+            "top_files": [
+                {"path": item["path"], "name": item["name"], "match_count": item["match_count"], "best_score": item["best_score"]}
+                for item in matched[:5]
+            ],
+            "evidence": [evidence for item in matched[:5] for evidence in item.get("evidence", [])[:1]],
+        },
+        "matched_file_count": matched_count,
+        "displayed_file_count": len(page_items),
+        "evidence_count": matched_count,
+        "matched_files": page_items,
+        "page": page,
+        "page_size": page_size,
+        "has_more": start + page_size < matched_count,
+        "next_page": page + 1 if start + page_size < matched_count else None,
+        "file_set_complete": False,
+        "evidence_window_truncated": False,
+        "index_mode": "large-package-summary",
+        "coverage": {
+            "complete": False,
+            "indexed_evidence": matched_count,
+            "candidate_evidence": matched_count,
+            "scope_file_count": scope_file_count,
+            "deep_matched_file_count": sum(1 for item in matched if item.get("analysis_level") == "deep"),
+            "index_state": {},
+        },
+        "warnings": ["大数据包问答依据已持久化的文件摘要，证据定位到文件而非段落。"],
+    }
+
+
+def _large_package_document(package_id):
+    """Render the ordinary document contract from an isolated large package.
+
+    The isolated store keeps a bounded quick preview plus optional deep
+    summaries. This adapter exposes those persisted artifacts so the chat
+    reader shows an ordinary-shaped document card, and it labels the sampling
+    boundary instead of pretending the text is a full parse.
+    """
+    package = large_package_store.get(package_id, owner_id=_request_owner_id() or "legacy")
+    if not package:
+        raise ValueError("大数据包不存在、已失效或不属于当前用户")
+    node_path = str(request.args.get("path", "") or "").replace("\\", "/").strip()
+    if not node_path:
+        raise ValueError("缺少文件路径")
+    row = large_package_store.get_file(package_id, node_path)
+    if not row:
+        raise ValueError("文件不属于当前大数据包")
+    local = row.get("local_summary") if isinstance(row.get("local_summary"), dict) else {}
+    deep = row.get("deep_summary") if isinstance(row.get("deep_summary"), dict) else {}
+    deep_ready = deep.get("summary_type") not in (None, "model_pending")
+    deep_text = str(deep.get("summary") or "").strip() if deep_ready else ""
+    sample = str(local.get("sample") or "").strip()
+    text = deep_text or sample
+    headings = list((local.get("portrait") or {}).get("headings") or [])[:24]
+    warnings = []
+    notice = str(local.get("notice") or "").strip()
+    if notice:
+        warnings.append(notice)
+    if not deep_ready:
+        warnings.append("当前文件尚未生成深度摘要；正文为导入阶段的受限样本，未经全文解析。")
+    evidence = []
+    if text:
+        for index, start in enumerate(range(0, len(text), 1800)):
+            piece = text[start:start + 1800].strip()
+            if not piece:
+                continue
+            evidence.append({
+                "evidence_id": "large:{}:{}:{}".format(package_id, node_path, index),
+                "source_path": node_path,
+                "archive_source_path": node_path,
+                "text": piece,
+                "original_text": piece,
+                "location": {"source": "deep_summary" if deep_ready else "file_summary"},
+                "evidence_role": "文件摘要",
+                "preview_only": not deep_ready,
+            })
+            if len(evidence) >= 12:
+                break
+    coverage = dict(local.get("coverage") or {}) if isinstance(local.get("coverage"), dict) else {}
+    coverage.update({
+        "complete": False,
+        "parse_complete": False,
+        "semantic_complete": bool(deep_ready and deep_text),
+        "preview_only": not bool(deep_ready and deep_text),
+    })
+    title = str(local.get("title") or row.get("name") or Path(node_path).name)
+    return jsonify({"ok": True, "document": {
+        "schema_version": "large-document/1.0",
+        "source": {"path": node_path, "name": row.get("name") or Path(node_path).name, "physical_path": node_path},
+        "source_reference": {
+            "logical_path": node_path,
+            "physical_path": node_path,
+            "container_path": None,
+            "logical_member": None,
+            "location": {},
+        },
+        "analysis_level": "deep" if deep_text else "preview",
+        "focus": {"page": None, "paragraph_index": None, "block_index": None, "char_start": None, "char_end": None, "section": None},
+        "parser": {
+            "name": "large-package-summary",
+            "mode": "deep_summary" if deep_text else "bounded_preview",
+            "degraded": not bool(deep_text),
+        },
+        "structure": {"title": title, "headings": headings},
+        "coverage": coverage,
+        "data_profile": None,
+        "data_profiles": [],
+        "warnings": warnings,
+        "text_preview": text[:5000],
+        "text_content": text if str(request.args.get("full") or "").lower() in {"1", "true", "yes"} else None,
+        "text_char_count": len(text),
+        "evidence": evidence,
+        "evidence_count": len(evidence),
+    }})
+
+def _large_package_inventory_paths(package_id, limit=100000):
+    """Complete manifest path list for an isolated large package.
+
+    The isolated store keeps no ordinary inventory table, so its durable file
+    manifest is the equivalent complete file set for a conversation turn.
+    """
+    paths = []
+    offset = 0
+    while len(paths) < limit:
+        page = large_package_store.list_files(package_id, limit=500, offset=offset)
+        if not page:
+            break
+        for row in page:
+            path = str((row or {}).get("path") or "").strip()
+            if path:
+                paths.append(path)
+        offset += len(page)
+        if len(page) < 500:
+            break
+    return paths
+
+
+
+
+
 @app.route("/api/large-packages/history")
 def list_large_package_history():
     try:
@@ -10276,13 +11300,18 @@ def list_large_package_files(package_id):
             offset = max(0, int(request.args.get("offset", 0)))
         except (TypeError, ValueError):
             limit, offset = 100, 0
-        rows = large_package_store.list_files(
+        page = large_package_store.file_page(
             package_id, limit=limit, offset=offset,
             query=str(request.args.get("q") or "").strip(),
             category=str(request.args.get("category") or "").strip(),
+            topic=str(request.args.get("topic") or "").strip(),
+            remaining=str(request.args.get("remaining") or "") == "1",
+            directory=request.args.get("directory"),
+            facet_kind=str(request.args.get("facet_kind") or ""),
+            facet_value=str(request.args.get("facet_value") or ""),
+            node_id=str(request.args.get("node_id") or ""),
         )
-        return jsonify({"ok": True, "files": rows, "counts": large_package_store.counts(package_id),
-                        "offset": offset, "limit": limit})
+        return jsonify({"ok": True, **page, "counts": large_package_store.counts(package_id)})
     except ValueError as exc:
         return api_error(str(exc), 404)
 
@@ -10328,6 +11357,49 @@ def large_package_catalog(package_id):
         return jsonify({"ok": True, "catalog": catalog})
     except ValueError as exc:
         return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/catalog/improve", methods=["POST"])
+def improve_large_package_catalog(package_id):
+    try:
+        item = _large_package_owned(package_id)
+        if item['status'] not in {'waiting_for_selection','completed'}:
+            return api_error("请等待当前处理完成后完善目录", 409)
+        from services.large_package_catalog_naming import ensure_round, queue_groups, state
+        payload = request.get_json(silent=True) or {}
+        request_key = str(payload.get('request_key') or '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9_-]{8,100}', request_key):
+            return api_error("缺少有效的命名请求编号", 400)
+        queue_groups(large_package_store, package_id)
+        ensure_round(large_package_store, package_id, request_key)
+        return jsonify({"ok": True, "naming": state(large_package_store, package_id)}), 202
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/catalog/nodes/<node_id>/name", methods=["POST"])
+def rename_large_package_catalog_node(package_id,node_id):
+    try:
+        _large_package_owned(package_id)
+        from services.large_package_catalog_naming import rename_node
+        payload=request.get_json(silent=True) or {}
+        node=rename_node(large_package_store,package_id,node_id,payload.get('name'),payload.get('description',''),payload.get('restore_version'))
+        return jsonify({'ok':True,'node':node})
+    except (ValueError,TypeError) as exc:
+        return api_error(str(exc),400)
+
+
+@app.route("/api/large-packages/<package_id>/catalog/nodes")
+def large_package_catalog_nodes(package_id):
+    try:
+        _large_package_owned(package_id)
+        from services.large_package_catalog_view import enhance_catalog
+        limit=max(1,min(200,int(request.args.get('limit',100))))
+        offset=max(0,int(request.args.get('offset',0)))
+        result=enhance_catalog(large_package_store,package_id,{'smart':{}},limit,offset,str(request.args.get('q') or '')[:200])
+        return jsonify({'ok':True,**result['smart']})
+    except (ValueError,TypeError) as exc:
+        return api_error(str(exc),400)
 
 
 @app.route("/api/large-packages/<package_id>/select", methods=["POST"])
@@ -10390,6 +11462,16 @@ def retry_large_package_failed(package_id):
         return api_error(str(exc), 404)
 
 
+@app.route("/api/large-packages/<package_id>/recognize", methods=["POST"])
+def recognize_large_package(package_id):
+    try:
+        _large_package_owned(package_id)
+        count = large_package_store.request_recognition(package_id)
+        return jsonify({"ok": True, "queued_files": count}), 202 if count else 200
+    except ValueError as exc:
+        return api_error(str(exc), 409)
+
+
 @app.route("/api/large-packages/<package_id>/pause", methods=["POST"])
 def pause_large_package(package_id):
     try:
@@ -10425,4 +11507,25 @@ def cancel_large_package(package_id):
 if __name__ == "__main__":
     import uvicorn
     logger.info("数据分析 Agent 启动 http://%s:%s backend=%s model=%s", Config.HOST, Config.PORT, ACTIVE_LLM_BACKEND, llm.model)
-    uvicorn.run(app, host=Config.HOST, port=Config.PORT, log_level="info")
+    if not Config.EXTRA_BIND_HOSTS:
+        uvicorn.run(app, host=Config.HOST, port=Config.PORT, log_level="info")
+    else:
+        import socket
+        sockets = []
+        try:
+            for host in (Config.HOST,) + Config.EXTRA_BIND_HOSTS:
+                family = socket.AF_INET6 if ":" in host else socket.AF_INET
+                listener = socket.socket(family, socket.SOCK_STREAM)
+                sockets.append(listener)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind((host, Config.PORT))
+                listener.listen(2048)
+                listener.setblocking(False)
+                logger.info("网页访问入口 http://%s:%s", host, Config.PORT)
+            server = uvicorn.Server(uvicorn.Config(
+                app, host=Config.HOST, port=Config.PORT, log_level="info"
+            ))
+            server.run(sockets=sockets)
+        finally:
+            for listener in sockets:
+                listener.close()

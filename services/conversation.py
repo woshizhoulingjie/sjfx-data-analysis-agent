@@ -32,7 +32,7 @@ from services.evidence import evidence_quality
 from config import Config
 
 
-SCHEMA_VERSION = "conversation-answer/1.0"
+SCHEMA_VERSION = "conversation-answer/1.1"
 SESSION_SCHEMA_VERSION = "conversation-session/1.0"
 SCOPE_KINDS = ("package", "directory", "topic", "entity", "time", "file_type", "files")
 
@@ -230,13 +230,22 @@ class ContextWindowPolicy:
     max_summary_chars: int = 2400
     max_prompt_evidence: int = 16
     max_evidence_chars: int = 1800
+    # The page shows every retrieved result (bounded only to protect the API
+    # and the browser); the model receives a dynamically selected subset that
+    # fits an explicit context budget instead of a fixed number of hits.
+    max_display_evidence: int = 50
+    max_model_evidence_chars: int = 16000
+    max_model_evidence_per_file: int = 2
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_recent_messages", max(2, int(self.max_recent_messages)))
         object.__setattr__(self, "max_recent_chars", max(800, int(self.max_recent_chars)))
         object.__setattr__(self, "max_summary_chars", max(400, int(self.max_summary_chars)))
-        object.__setattr__(self, "max_prompt_evidence", max(1, min(20, int(self.max_prompt_evidence))))
+        object.__setattr__(self, "max_prompt_evidence", max(1, min(50, int(self.max_prompt_evidence))))
         object.__setattr__(self, "max_evidence_chars", max(200, min(4000, int(self.max_evidence_chars))))
+        object.__setattr__(self, "max_display_evidence", max(1, min(200, int(self.max_display_evidence))))
+        object.__setattr__(self, "max_model_evidence_chars", max(2000, min(120000, int(self.max_model_evidence_chars))))
+        object.__setattr__(self, "max_model_evidence_per_file", max(1, min(10, int(self.max_model_evidence_per_file))))
 
 
 @dataclass
@@ -629,6 +638,10 @@ class CoverageSnapshot:
     deep_candidate_files: Optional[int] = None
     candidate_deep_coverage: Optional[float] = None
     scope_inspection_coverage: Optional[float] = None
+    package_reading_files: Optional[int] = None
+    summary_backed_files: Optional[int] = None
+    package_reading_coverage: Optional[float] = None
+    package_reading_complete: Optional[bool] = None
     coverage_basis: Optional[str] = None
     query_coverage: Optional[float] = None
     deferred_candidates: Tuple[str, ...] = field(default_factory=tuple)
@@ -660,6 +673,8 @@ class CoverageSnapshot:
         candidate_files = integer("candidate_files")
         inspected_files = integer("inspected_files", "retrieved_files")
         deep_candidate_files = integer("deep_candidate_files")
+        package_reading_files = integer("package_reading_files", "files_read")
+        summary_backed_files = integer("summary_backed_files")
 
         def ratio_value(*keys: str) -> Optional[float]:
             for key in keys:
@@ -674,6 +689,12 @@ class CoverageSnapshot:
 
         candidate_deep_coverage = ratio_value("candidate_deep_coverage")
         scope_inspection_coverage = ratio_value("scope_inspection_coverage")
+        package_reading_coverage = ratio_value("package_reading_coverage", "summary_coverage")
+        package_reading_complete = (
+            bool(merged.get("package_reading_complete"))
+            if merged.get("package_reading_complete") is not None
+            else (bool(merged.get("complete")) if "complete" in merged else None)
+        )
         ratio = merged.get("query_coverage", merged.get("coverage_ratio"))
         try:
             ratio = min(1.0, max(0.0, float(ratio))) if ratio is not None else None
@@ -693,7 +714,8 @@ class CoverageSnapshot:
             ratio = 1.0
         known = any(value is not None for value in (
             total, scope_files, searchable, deep, candidate_files,
-            inspected_files, deep_candidate_files, ratio,
+            inspected_files, deep_candidate_files, package_reading_files,
+            summary_backed_files, package_reading_coverage, ratio,
         )) or "complete" in merged
         return cls(
             known=known,
@@ -706,6 +728,10 @@ class CoverageSnapshot:
             deep_candidate_files=deep_candidate_files,
             candidate_deep_coverage=candidate_deep_coverage,
             scope_inspection_coverage=scope_inspection_coverage,
+            package_reading_files=package_reading_files,
+            summary_backed_files=summary_backed_files,
+            package_reading_coverage=package_reading_coverage,
+            package_reading_complete=package_reading_complete,
             coverage_basis=str(merged.get("coverage_basis") or "") or None,
             query_coverage=ratio,
             deferred_candidates=_unique_strings(candidates, limit=100),
@@ -723,6 +749,10 @@ class CoverageSnapshot:
             "deep_candidate_files": self.deep_candidate_files,
             "candidate_deep_coverage": self.candidate_deep_coverage,
             "scope_inspection_coverage": self.scope_inspection_coverage,
+            "package_reading_files": self.package_reading_files,
+            "summary_backed_files": self.summary_backed_files,
+            "package_reading_coverage": self.package_reading_coverage,
+            "package_reading_complete": self.package_reading_complete,
             "coverage_basis": self.coverage_basis,
             "query_coverage": self.query_coverage,
             "deferred_candidates": list(self.deferred_candidates),
@@ -854,8 +884,19 @@ def _citation(item: Mapping[str, Any], index: int, structured: bool = False) -> 
         "target_language": item.get("target_language") or ("zh-CN" if translated else None),
         "translation_status": item.get("translation_status") or ("available" if translated else "not_requested"),
         "retrieval_score": item.get("retrieval_score") or item.get("score"),
+        # Retrieval provenance travels with the citation so the page can show
+        # why a hit was kept instead of only where it came from.
+        "match_type": item.get("match_type"),
+        "matched_keywords": [str(value) for value in (item.get("matched_keywords") or [])][:12],
+        "match_reason": item.get("match_reason") or item.get("semantic_reason"),
         "evidence_role": item.get("evidence_role") or ("structured_statistic" if structured else "direct_source"),
         "quality": dict(quality),
+        **({
+            "source_package": dict(item["source_package"]),
+            "evidence_level": "file",
+            "location": {"source": "file_summary"},
+        } if isinstance(item.get("source_package"), Mapping)
+        and item["source_package"].get("type") == "large" else {}),
     }
 
 
@@ -878,6 +919,63 @@ def _normalise_citations(items: Iterable[Mapping[str, Any]], limit: int, structu
     return output
 
 
+def _select_model_citations(
+    citations: Sequence[Mapping[str, Any]],
+    policy: "ContextWindowPolicy",
+) -> List[Mapping[str, Any]]:
+    """Choose the evidence that actually enters the model prompt.
+
+    Selection follows the retrieval order (already relevance ranked) and stops
+    at the evidence character budget rather than at a fixed hit count, while
+    spreading the selection across files so a single document cannot fill the
+    window.  Citation labels are preserved: the model and the page must agree
+    on what ``[7]`` refers to.
+    """
+    ordered = [item for item in citations if isinstance(item, Mapping)]
+    if not ordered:
+        return []
+    target = min(int(policy.max_prompt_evidence), len(ordered))
+    budget = int(policy.max_model_evidence_chars)
+    per_file_limit = int(policy.max_model_evidence_per_file)
+
+    chosen: List[int] = []
+    chosen_indexes = set()
+    per_file: Dict[str, int] = {}
+    used_chars = 0
+    for item in ordered:
+        if len(chosen) >= target:
+            break
+        index = int(item.get("citation_index") or 0)
+        path = str(item.get("source_path") or "")
+        if per_file.get(path, 0) >= per_file_limit:
+            continue
+        length = len(str(item.get("original_text") or ""))
+        if chosen and used_chars + length > budget:
+            break
+        per_file[path] = per_file.get(path, 0) + 1
+        used_chars += length
+        chosen.append(index)
+        chosen_indexes.add(index)
+    # A corpus dominated by one or two files must still reach the model with a
+    # usable evidence set, so top up in relevance order with the per-file
+    # spread relaxed.  The character budget is never exceeded.
+    minimum = min(6, target)
+    if len(chosen) < minimum:
+        for item in ordered:
+            if len(chosen) >= target:
+                break
+            index = int(item.get("citation_index") or 0)
+            if index in chosen_indexes:
+                continue
+            length = len(str(item.get("original_text") or ""))
+            if chosen and used_chars + length > budget:
+                break
+            used_chars += length
+            chosen.append(index)
+            chosen_indexes.add(index)
+    return [item for item in ordered if int(item.get("citation_index") or 0) in chosen_indexes]
+
+
 def _sanitize_citation_labels(answer: str, citation_count: int) -> str:
     def replace(match: re.Match[str]) -> str:
         number = int(match.group(1))
@@ -898,6 +996,8 @@ class ConversationEngine:
         "区分资料直接说明、模型分析判断和一般建议，不得伪造人物关系、数字、日期或文件内容。"
         "回答要像耐心、懂行的人在和用户交流：先自然地回应问题，再在需要时补充依据；"
         "避免模板化开场、机械复述问题、连续堆砌小标题和暴露检索/编排/模型内部流程。"
+        "正文先用一小段直接回答，再用少量短段解释关键脉络、例外和必要推断；事实引用贴在对应句末。"
+        "除非用户明确要清单，不要按文件逐份流水账，也不要把证据卡中已经展示的原文重复堆进正文。"
         "资料不足时直接说明缺口，并告诉用户下一步能查什么；不要为了显得完整而编造结论。"
     )
 
@@ -919,7 +1019,7 @@ class ConversationEngine:
         intent_router: Optional[IntentRouter] = None,
         follow_up_resolver: Optional[FollowUpResolver] = None,
         context_policy: Optional[ContextWindowPolicy] = None,
-        top_k: int = 16,
+        top_k: int = 50,
         coverage_threshold: float = 0.45,
         max_translation_citations: int = 4,
     ):
@@ -1159,7 +1259,14 @@ class ConversationEngine:
         coverage: CoverageSnapshot,
         promotion: Optional[PromotionRequest],
         warnings: Optional[Sequence[str]] = None,
+        model_citations: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        display_citations = [item for item in citations]
+        evidence_for_model = (
+            [item for item in model_citations]
+            if model_citations is not None
+            else display_citations
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "session_id": session.session_id,
@@ -1170,9 +1277,16 @@ class ConversationEngine:
             "intent": decision.as_dict(),
             "scope": scope.as_dict(),
             "answer": answer,
-            "citations": list(citations),
-            "original_available": bool(citations),
-            "translation_available": any(item.get("translated_text") for item in citations),
+            # ``citations`` stays the page-facing list so existing consumers
+            # keep working; the explicit fields make the retrieval/model split
+            # auditable (the model only ever sees ``model_citations``).
+            "citations": display_citations,
+            "display_citations": display_citations,
+            "model_citations": evidence_for_model,
+            "retrieval_count": len(display_citations),
+            "model_evidence_count": len(evidence_for_model),
+            "original_available": bool(display_citations),
+            "translation_available": any(item.get("translated_text") for item in display_citations),
             "coverage": coverage.as_dict(),
             "promotion_request": promotion.as_dict() if promotion else None,
             "warnings": list(dict.fromkeys(str(item) for item in (warnings or []) if item)),
@@ -1259,7 +1373,8 @@ class ConversationEngine:
             resolution = FollowUpResolution(resolution.original_question, file_query, resolution.is_follow_up, resolution.antecedent)
         retrieval = (dict(retrieval_override) if isinstance(retrieval_override, Mapping)
                      else self._retrieve(session, resolution.resolved_query, scope, decision.name))
-        citations = _normalise_citations(self._retrieval_items(retrieval), limit=self.context_policy.max_prompt_evidence)
+        citations = _normalise_citations(self._retrieval_items(retrieval), limit=self.context_policy.max_display_evidence)
+        model_citations = _select_model_citations(citations, self.context_policy)
         coverage = CoverageSnapshot.from_values(
             retrieval.get('coverage') if isinstance(retrieval.get('coverage'), Mapping) else None,
             retrieval, coverage_override,
@@ -1274,6 +1389,7 @@ class ConversationEngine:
         turn = self._base_turn(
             session, resolution, decision, scope, answer, citations, status='answered',
             evidence_status='not_required', coverage=coverage, promotion=None, warnings=list(retrieval.get('warnings') or []),
+            model_citations=model_citations,
         )
         turn['file_search'] = True
         turn['related_file_paths'] = related[:5000]
@@ -1298,12 +1414,19 @@ class ConversationEngine:
         )
         citations = _normalise_citations(
             self._retrieval_items(retrieval),
-            limit=self.context_policy.max_prompt_evidence,
+            limit=self.context_policy.max_display_evidence,
         )
+        model_citations = _select_model_citations(citations, self.context_policy)
         coverage = CoverageSnapshot.from_values(
             retrieval.get("coverage") if isinstance(retrieval.get("coverage"), Mapping) else None,
             retrieval,
             coverage_override,
+        )
+        package_context = dict(retrieval.get("package_context") or {})
+        reading_manifest = dict(package_context.get("reading_manifest") or {})
+        reading_incomplete = bool(
+            reading_manifest.get("files_read")
+            and not reading_manifest.get("complete")
         )
         # Keep an auditable manifest of what actually entered this model turn.
         # The UI can distinguish candidate files from evidence truly supplied to
@@ -1311,7 +1434,7 @@ class ConversationEngine:
         # complete answer.
         selected_paths = []
         selected_chars = 0
-        for item in citations:
+        for item in model_citations:
             path = str(item.get("source_path") or "").strip()
             if path and path not in selected_paths:
                 selected_paths.append(path)
@@ -1320,16 +1443,34 @@ class ConversationEngine:
             "candidate_files": len(retrieval.get("candidate_paths") or retrieval.get("paths") or []),
             "selected_files": len(selected_paths),
             "selected_paths": selected_paths[:100],
-            "selected_evidence": len(citations),
+            "selected_evidence": len(model_citations),
+            "display_evidence": len(citations),
             "selected_characters": selected_chars,
             "evidence_limit": self.context_policy.max_prompt_evidence,
+            "display_limit": self.context_policy.max_display_evidence,
             "evidence_char_limit": self.context_policy.max_evidence_chars,
+            "model_evidence_char_budget": self.context_policy.max_model_evidence_chars,
             "deferred_files": list((retrieval.get("deferred_paths") or retrieval.get("promotion_candidates") or []))[:100],
+            "package_reading": {
+                "files_read": reading_manifest.get("files_read"),
+                "summary_backed_files": reading_manifest.get("summary_backed_files"),
+                "files_without_summary": reading_manifest.get("files_without_summary"),
+                "summary_coverage": reading_manifest.get("summary_coverage"),
+                "complete": reading_manifest.get("complete"),
+                "source_digest": reading_manifest.get("source_digest"),
+            },
         }
         promotion = self._promotion(
-            resolution.resolved_query, scope, coverage, len(citations), retrieval=retrieval
+            resolution.resolved_query, scope, coverage, len(model_citations), retrieval=retrieval
         )
         warnings = list(retrieval.get("warnings") or [])
+        if reading_incomplete:
+            warnings.append(
+                "全包阅读账本已纳入 {} 份文件，其中 {} 份尚无可用摘要；本轮不能称为完整全包结论。".format(
+                    reading_manifest.get("files_read") or 0,
+                    reading_manifest.get("files_without_summary") or 0,
+                )
+            )
         if not citations:
             if decision.name == "analysis":
                 answer, advisory_warnings = self._advisory_answer(
@@ -1381,16 +1522,18 @@ class ConversationEngine:
                 )
             if decision.name == "multi_task":
                 answer, model_warnings = self._grounded_answer(
-                    decision.name, resolution.resolved_query, context, citations,
+                    decision.name, resolution.resolved_query, context, model_citations,
                     package_context=retrieval.get("package_context"),
+                    evidence_total=len(citations),
                 )
                 warnings.extend(model_warnings)
             else:
                 answer = translation_answer
         else:
             answer, model_warnings = self._grounded_answer(
-                decision.name, resolution.resolved_query, context, citations,
+                decision.name, resolution.resolved_query, context, model_citations,
                 package_context=retrieval.get("package_context"),
+                evidence_total=len(citations),
             )
             warnings.extend(model_warnings)
 
@@ -1405,8 +1548,8 @@ class ConversationEngine:
                     "\n".join(translated_blocks), answer
                 )
 
-        status = "partial" if promotion else "answered"
-        evidence_status = "partial" if promotion else "supported"
+        status = "partial" if promotion or reading_incomplete else "answered"
+        evidence_status = "partial" if promotion or reading_incomplete else "supported"
         turn = self._base_turn(
             session, resolution, decision, scope, answer, citations,
             status=status,
@@ -1414,8 +1557,10 @@ class ConversationEngine:
             coverage=coverage,
             promotion=promotion,
             warnings=warnings,
+            model_citations=model_citations,
         )
         turn["input_manifest"] = input_manifest
+        turn["package_reading"] = input_manifest["package_reading"]
         related_paths = [str(path) for path in (retrieval.get("related_file_paths") or []) if path]
         # Broad answers must expose the complete selected scope even when the bounded
         # evidence window was assembled from a repair pass.
@@ -1522,6 +1667,7 @@ class ConversationEngine:
         context: str,
         citations: Sequence[Mapping[str, Any]],
         package_context: Optional[Mapping[str, Any]] = None,
+        evidence_total: Optional[int] = None,
     ) -> Tuple[str, List[str]]:
         evidence_payload = [
             {
@@ -1540,10 +1686,14 @@ class ConversationEngine:
                 from services.conversation_package_context import model_digest
                 package_digest = model_digest(package_context)
             except Exception:
-                package_digest = json.dumps(dict(package_context), ensure_ascii=False)[:30000]
+                package_digest = json.dumps({
+                    "coverage": package_context.get("coverage") or {},
+                    "all_file_reading": package_context.get("reading_manifest") or {},
+                    "instruction": "全包阅读层摘要生成失败；不得把未显示的资料当作已阅读。",
+                }, ensure_ascii=False)
         user_prompt = (
             "任务类型：{intent}\n任务要求：{instruction}\n会话上下文：\n{context}\n\n"
-            "当前整个数据包上下文（摘要、解析状态和覆盖信息）：\n{package_context}\n\n"
+            "全包阅读层（逐份摘要归并、解析状态和覆盖信息）：\n{package_context}\n\n"
             "当前问题：{query}\n\n本轮实际输入范围：{manifest}\n\n编号证据（仅这些内容可作为事实依据）：\n{evidence}"
         ).format(
             intent=intent,
@@ -1554,7 +1704,8 @@ class ConversationEngine:
             manifest=json.dumps({
                 "selected_files": len({str(item.get("source_path") or "") for item in citations}),
                 "selected_evidence": len(citations),
-                "note": "未列出的文件不得被假定为已分析",
+                "evidence_available": int(evidence_total or len(citations)),
+                "note": "全包阅读层用于理解整体脉络；具体事实只能由下方编号原文证据支撑。",
             }, ensure_ascii=False),
             evidence=json.dumps(evidence_payload, ensure_ascii=False, indent=2),
         )
@@ -1577,7 +1728,8 @@ class ConversationEngine:
                 text = item.get("translated_text") or item["original_text"]
                 lines.append("- {} {}".format(_clean_text(text, 300), item["citation_label"]))
             answer = "\n".join(lines)
-        return _sanitize_citation_labels(answer, len(citations)), warnings
+        label_space = max(len(citations), int(evidence_total or 0))
+        return _sanitize_citation_labels(answer, label_space), warnings
 
     def _answer_structured(
         self,

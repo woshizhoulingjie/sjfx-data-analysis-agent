@@ -70,10 +70,17 @@ def _canonical_name(value):
 
 def _schema_signature(profile):
     columns = profile.get("columns") or {}
-    return tuple(sorted(
-        (_canonical_name(name), str(column.get("inferred_type") or "unknown").casefold())
-        for name, column in columns.items()
-    ))
+    def data_type(column):
+        kind = str(column.get("inferred_type") or "unknown").casefold()
+        # Missing values are not a different source schema. Recover the sole
+        # observed non-missing type when missing cells were the majority.
+        if kind == "missing":
+            observed = {str(k).casefold() for k,v in (column.get("type_counts") or {}).items()
+                        if k != "missing" and int(v or 0)>0}
+            if len(observed) == 1:
+                return next(iter(observed))
+        return kind
+    return tuple(sorted((_canonical_name(name), data_type(column)) for name,column in columns.items()))
 
 
 def _field_score(question, column_name):
@@ -346,6 +353,14 @@ def _select_field(question, candidates):
 
 
 def _select_compatible_group(column_name, candidates):
+    signatures = [dict(_schema_signature(item["profile"])) for item in candidates]
+    if signatures and all(set(s) == set(signatures[0]) for s in signatures):
+        # A wholly empty non-target column contributes no conflicting type.
+        # Target numeric compatibility is independently enforced before here.
+        compatible = all(len({s[name] for s in signatures if s[name] not in {"missing", "unknown"}}) <= 1
+                         for name in signatures[0])
+        if compatible:
+            return candidates
     groups = {}
     for candidate in candidates:
         signature = _schema_signature(candidate["profile"])

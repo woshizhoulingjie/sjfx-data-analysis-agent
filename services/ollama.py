@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 
+from services.model_dispatch import serialized_generation
 from services.model_output import ModelOutputError, extract_json_value, validate_json_object
 
 
@@ -113,6 +114,7 @@ class OllamaClient(LocalModelClient):
         except Exception as exc:
             return {"reachable": False, "model_available": False, "models": [], "error": str(exc)}
 
+    @serialized_generation
     def _request(self, payload, retries=2, timeout=None):
         """Call native Ollama chat with thinking disabled.
 
@@ -181,6 +183,7 @@ class OllamaClient(LocalModelClient):
             },
         }
 
+    @serialized_generation
     def _stream_request(self, payload, timeout=None, retries=2):
         # The compatibility endpoint ignores `think: false` for the shared
         # Qwen model. Use Ollama's native endpoint, where the switch is honored.

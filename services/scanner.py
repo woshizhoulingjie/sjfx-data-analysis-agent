@@ -748,9 +748,9 @@ def extract_text(path, max_chars=60000):
                 parser = "openpyxl"
             except ImportError:
                 warnings.append("未安装 openpyxl，当前只能读取文件元数据")
-        elif ext in {".doc", ".xls", ".ppt"}:
-            metadata["capability"] = "out_of_scope_legacy_office"
-            warnings.append("旧版 Office 格式当前仅登记元数据；正文解析需要 LibreOffice/专用转换器")
+        elif ext in {".doc", ".xls", ".ppt", ".rtf"}:
+            from services.legacy_office import extract_legacy
+            return extract_legacy(path, max_chars=max_chars)
         else:
             warnings.append("该文件类型尚未配置正文解析器")
     except Exception as exc:

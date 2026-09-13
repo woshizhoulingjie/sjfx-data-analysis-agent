@@ -44,7 +44,7 @@ OUT_OF_SCOPE_MEDIA_EXTENSIONS = {
 }
 DEEP_PARSE_EXTENSIONS = (
     TEXT_EXTENSIONS | OFFICE_EXTENSIONS | ARCHIVE_EXTENSIONS | IMAGE_EXTENSIONS
-    | {".pdf", ".doc", ".ppt", ".xls", ".eml", ".msg", ".mbox", ".pst"}
+    | {".pdf", ".doc", ".ppt", ".xls", ".rtf", ".eml", ".msg", ".mbox", ".pst"}
 )
 LOW_VALUE_NAMES = {
     "thumbs.db", "desktop.ini", ".ds_store", "npm-debug.log", "yarn-error.log",
@@ -693,6 +693,22 @@ def preview_file(root, file_node, per_file_bytes=96 * 1024, budget=None,
                     total_bytes=per_file_bytes,
                 )
                 text = text[: max(1000, int(per_file_bytes))]
+            elif extension in {".doc", ".ppt", ".xls", ".rtf"}:
+                from services.legacy_office import extract_legacy
+                # This older preview API has a strict aggregate byte contract.
+                # Only parse a whole OLE container if it fits that contract.
+                allowance = min(size, int(per_file_bytes))
+                granted = budget.claim(allowance) if budget is not None else allowance
+                if size > granted:
+                    status = "deferred"
+                    warning.append("旧格式容器超过本轮预览读取预算，保留为深度解析候选")
+                else:
+                    extracted = extract_legacy(path, max_chars=max(1000,int(per_file_bytes)), preview=True)
+                    text = extracted.get("text") or ""
+                    warning.extend(extracted.get("warnings") or [])
+                    sampled_bytes = size
+                    status = "previewed" if text else "deferred"
+                    preview_windows = [{"label":"legacy_text", "byte_start":None, "byte_end":None, "text":text, "encoding":"utf-8"}] if text else []
             elif extension in TEXT_EXTENSIONS or extension in {".eml", ".mbox"}:
                 blob, sampled_ranges, limited, window_blobs = _sample_windows(
                     path, per_file_bytes, budget=budget

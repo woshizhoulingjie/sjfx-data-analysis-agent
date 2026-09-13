@@ -88,3 +88,5 @@
   .file-workflow-row { grid-template-columns: minmax(0, 1fr); }
   .file-workflow-status { width: max-content; }
 }
+
+.lp-content-branch{margin:8px 0}.lp-content-branch>.lp-node{font-weight:700}.lp-content-children{margin:0 0 8px 14px;padding-left:10px;border-left:1px solid var(--line,#34445c)}.lp-scope-description{margin:8px 0;color:inherit;line-height:1.65}

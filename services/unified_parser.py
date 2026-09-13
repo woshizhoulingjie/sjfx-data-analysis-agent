@@ -88,7 +88,7 @@ def _scratch_is_leased(child):
         return True
 
 SUPPORTED_EXTENSIONS = {
-    ".pdf", ".docx", ".pptx", ".xlsx", ".xlsm",
+    ".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".doc", ".ppt", ".xls", ".rtf",
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
     ".xml", ".html", ".htm", ".log", ".yaml", ".yml",
@@ -821,7 +821,12 @@ class UnifiedDocumentParser:
                 "extracted_characters": 0,
                 "stored_characters": 0,
                 "embedded_ocr_characters": 0,
+                # ``complete`` tracks body text only.  Whether embedded images,
+                # objects and comments were OCR'd is a separate capability axis
+                # recorded in ``embedded_objects_covered``; conflating the two
+                # turned a documented parser limitation into a parse failure.
                 "complete": True,
+                "embedded_objects_covered": True,
                 "truncated_by_limit": False,
                 "limited_by_fast_mode": False,
                 "coverage_ratio": 1.0,
@@ -856,6 +861,12 @@ class UnifiedDocumentParser:
             })
             base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
             return base
+
+        if ext in {".csv", ".tsv"}:
+            profile = profile_path(path)
+            if profile and profile.get("row_count"):
+                from services.tabular_document import project_table
+                return project_table(path, base, profile)
 
         # OOXML files are ZIP containers even though users perceive them as
         # documents. Validate their complete member inventory before any
@@ -1021,7 +1032,7 @@ class UnifiedDocumentParser:
         """
         simple = {
             ".txt", ".md", ".markdown", ".html", ".htm", ".csv", ".tsv",
-            ".json", ".jsonl", ".xml", ".docx", ".pptx", ".xlsx", ".xlsm",
+            ".json", ".jsonl", ".xml", ".docx", ".pptx", ".xlsx", ".xlsm", ".doc", ".ppt", ".xls", ".rtf",
         }
         if ext in simple:
             return "fast"
@@ -1726,7 +1737,10 @@ class UnifiedDocumentParser:
             self._rapidocr_office_images(path, base)
         elif ext in {".docx", ".pptx", ".xlsx", ".xlsm"}:
             base["warnings"].append("快速模式已跳过 Office 内嵌图片 OCR；可切换高精度解析。")
-            base["coverage"]["complete"] = False
+            # The body text was extracted in full; only the optional embedded
+            # image OCR was skipped.  That is a known capability boundary, not
+            # "正文未完整覆盖", so ``complete`` must stay True here.
+            base["coverage"]["embedded_objects_covered"] = False
             base["coverage"]["limited_by_fast_mode"] = True
             base["coverage"]["coverage_ratio"] = None
             base["coverage"]["coverage_ratio_reason"] = "快速模式跳过 Office 内嵌图片 OCR，无法从正文字符数估算完整覆盖率。"
@@ -1744,7 +1758,15 @@ class UnifiedDocumentParser:
             except Exception as exc:
                 base["warnings"].append("快速模式扫描 PDF 预览 OCR 失败：{}".format(exc))
         base["parser"]["degraded"] = False
-        base["parser"]["fast_preview"] = bool(base["coverage"].get("limited_by_fast_mode"))
+        # ``fast_preview`` keeps its historical meaning of "a fast route left
+        # something upgradeable behind".  It must still cover receivers whose
+        # body text is complete but whose embedded images/objects were not OCR'd
+        # (legacy OLE formats always, Office files when fast OCR is disabled),
+        # otherwise the deep-parse upgrade hint would silently disappear.
+        base["parser"]["fast_preview"] = bool(
+            base["coverage"].get("limited_by_fast_mode")
+            or not base["coverage"].get("embedded_objects_covered", True)
+        )
 
     @staticmethod
     def _office_image_contexts(archive, ext, names, read_member):
@@ -2057,6 +2079,28 @@ class UnifiedDocumentParser:
             "remote_services_enabled": False,
         }
         metadata = extracted.get("metadata", {})
+        if path.suffix.lower() in {".doc", ".ppt", ".xls", ".rtf"}:
+            if not base["text"].strip():
+                raise DocumentParseError("；".join(extracted.get("warnings") or ["旧格式文件未获得可读正文"]))
+            base["parser"]["legacy_format"] = True
+            base["parser"]["native_metadata"] = metadata
+            # Two independent facts, deliberately no longer OR-ed together:
+            #  * ``content_complete`` — was the body text truncated by a budget?
+            #    Only this may drive ``complete`` / the parse-failure bucket.
+            #  * ``embedded_objects_ocr`` — the native legacy readers never OCR
+            #    embedded images/objects/comments.  That is a documented,
+            #    permanent capability boundary for .doc/.ppt/.xls/.rtf, so it is
+            #    reported as reduced embedded-object coverage instead of turning
+            #    every successfully extracted legacy file into a failure.
+            base["coverage"]["embedded_objects_covered"] = bool(
+                metadata.get("embedded_objects_ocr", True)
+            )
+            if metadata.get("content_complete") is False:
+                base["coverage"]["complete"] = False
+                base["coverage"]["truncated_by_limit"] = True
+            if not base["coverage"]["embedded_objects_covered"]:
+                base["coverage"]["coverage_ratio"] = None
+                base["coverage"]["coverage_ratio_reason"] = "旧格式文本提取未承诺图片/嵌入对象或预算外内容的完整覆盖"
         base["structure"].update({
             "page_count": metadata.get("page_count") or metadata.get("slide_count"),
             "table_count": metadata.get("table_count", 0),

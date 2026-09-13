@@ -51,6 +51,9 @@ def _date(value):
     if isinstance(value, datetime):
         return value.isoformat()
     text = str(value or "").strip()
+    # Reject ordinary prose/numbers before attempting five datetime parsers per cell.
+    if not re.match(r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:$|[ T])", text):
+        return None
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
         try:
             return datetime.strptime(text[:19], fmt).isoformat()

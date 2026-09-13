@@ -117,6 +117,13 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('data-regenerate-message', self.script)
         self.assertIn('analysisQualityMarkup', self.script)
         self.assertIn('turn.quality_metrics', self.script)
+        self.assertIn('packageReadingMarkup', self.script)
+        self.assertIn('data-citation-read', self.script)
+        self.assertIn('data-citation-collect', self.script)
+        self.assertIn('data-citation-node', self.script)
+        self.assertIn('data-citation-read', self.script)
+        self.assertIn('.v2-package-reading', self.style)
+        self.assertIn('.v2-citation-actions', self.style)
         for metric in (
             '范围文件', '候选文件', '实际检查', '未检查', '深析完成',
             '分析批次', '范围检查率', '候选深析率', '覆盖率', '引用',

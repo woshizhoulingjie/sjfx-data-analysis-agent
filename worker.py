@@ -241,6 +241,10 @@ def _write_lock_metadata(handle):
 
 
 def execute(job):
+    task_type = job.get("task_type")
+    if task_type in {"mail_import", "mail_extract", "mail_ocr", "mail_research", "mail_export", "mail_embed", "mail_factextract"}:
+        from services.mail.jobs import run_claimed_mail_job
+        return run_claimed_mail_job(job)
     # Import the web/application module only when a real job is claimed. A
     # broken optional parser/model dependency can no longer prevent the Worker
     # from starting or recovering its SQLite queue.
@@ -333,6 +337,13 @@ def _task_runtime_limit(job):
         "export_package": Config.JOB_EXPORT_TIMEOUT_SECONDS,
         "translate_document": Config.JOB_TRANSLATION_TIMEOUT_SECONDS,
         "translate_package": Config.JOB_TRANSLATION_PACKAGE_TIMEOUT_SECONDS,
+        "mail_import": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
+        "mail_extract": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
+        "mail_ocr": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
+        "mail_research": Config.MAIL_RESEARCH_TIMEOUT_SECONDS,
+        "mail_export": Config.JOB_EXPORT_TIMEOUT_SECONDS,
+        "mail_embed": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
+        "mail_factextract": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
     }
     limit = limits.get(job.get("task_type"), Config.JOB_DEFAULT_TIMEOUT_SECONDS)
     if job.get("task_type") == "generate_summary":
@@ -406,6 +417,66 @@ def _stop_process(process):
         if not killed_group:
             process.kill()
         process.join(timeout=2)
+
+
+def _commit_preliminary_ready(job, ready):
+    started = time.monotonic()
+    outcome = storage.commit_preliminary_result(job, ready)
+    if outcome == "cancelled":
+        raise JobCancelled("初步摘要任务已取消或暂停")
+    if outcome in {"missing", "not_owned"}:
+        return {"_preliminary_skip": True}
+    if outcome != "completed":
+        return None
+    result = dict(ready["result"])
+    result["_preliminary_committed"] = True
+    logger.info("Preliminary ready committed id=%s elapsed_ms=%.2f", job["id"], (time.monotonic() - started) * 1000)
+    return result
+
+
+def execute_with_preliminary_cache(job, cache):
+    prefetched = cache.pop(str(job["id"]), None)
+    fast_candidate = (Config.PRELIMINARY_SUMMARY_OPTIMIZATION_ENABLED
+                      and (job.get("options") or {}).get("workflow_source") == "preliminary_model_summary")
+    if fast_candidate:
+        from services.preliminary_summary_fast import enabled, ready_matches
+    if fast_candidate and enabled(job) and prefetched and ready_matches(job, prefetched):
+        try:
+            result = _commit_preliminary_ready(job, prefetched)
+        except Exception:
+            cache[str(job["id"])] = prefetched
+            raise
+        if result is not None:
+            return result
+    execution_job = job
+    # Preserve the old optimization path when the feature flag is off.
+    if prefetched and "configuration" not in prefetched:
+        execution_job = copy.deepcopy(job)
+        execution_job["options"] = dict(job.get("options") or {})
+        execution_job["options"]["_preliminary_prefetched_summary"] = prefetched
+    result = execute_supervised(execution_job)
+    if isinstance(result, dict) and "_preliminary_ready_results" in result:
+        prepared = result.pop("_preliminary_ready_results")
+        for sibling_id, ready in prepared.items():
+            if sibling_id != str(job["id"]):
+                cache[str(sibling_id)] = ready
+        lead = prepared.get(str(job["id"]))
+        if lead:
+            try:
+                committed = _commit_preliminary_ready(job, lead)
+            except Exception:
+                cache[str(job["id"])] = lead
+                raise
+            if committed is not None:
+                return committed
+        if storage.is_job_cancel_requested(job["id"]):
+            raise JobCancelled("初步摘要任务已取消")
+        return {"_requeue_slice": True, "_requeue_message": "文件或选择版本变化，初步摘要按当前版本重新处理。"}
+    if isinstance(result, dict):
+        for sibling_id, sibling_result in (result.pop("_preliminary_batch_prefetch", None) or {}).items():
+            if sibling_result and str(sibling_id) != str(job["id"]):
+                cache[str(sibling_id)] = {**dict(sibling_result), "created_at": time.time()}
+    return result
 
 
 def execute_supervised(job):
@@ -725,7 +796,7 @@ def run_forever():
     try:
         while True:
             now = time.monotonic()
-            cache_cutoff = now - 1800.0
+            cache_cutoff = time.time() - 1800.0
             preliminary_prefetch_cache = {
                 job_id: value
                 for job_id, value in preliminary_prefetch_cache.items()
@@ -793,14 +864,6 @@ def run_forever():
             job_id = job["id"]
             try:
                 logger.info("Worker claimed task id=%s type=%s scan_id=%s", job_id, job.get("task_type"), job.get("scan_id"))
-                execution_job = job
-                prefetched = preliminary_prefetch_cache.pop(str(job_id), None)
-                if prefetched:
-                    # This is an in-memory optimization marker. It is never
-                    # written into the persisted job options.
-                    execution_job = copy.deepcopy(job)
-                    execution_job["options"] = dict(job.get("options") or {})
-                    execution_job["options"]["_preliminary_prefetched_summary"] = prefetched
                 resources_ready, resource_reasons = _background_resource_state(job)
                 if not resources_ready:
                     message = "后台补析已暂停：{}；资源恢复后自动重试。".format(
@@ -812,16 +875,9 @@ def run_forever():
                     ):
                         logger.info("Deferred background task id=%s reasons=%s", job_id, resource_reasons)
                         continue
-                result = execute_supervised(execution_job)
-                if isinstance(result, dict):
-                    private_prefetch = result.pop("_preliminary_batch_prefetch", None) or {}
-                    created_at = time.time()
-                    for sibling_id, sibling_result in private_prefetch.items():
-                        if sibling_result and str(sibling_id) != str(job_id):
-                            preliminary_prefetch_cache[str(sibling_id)] = {
-                                **dict(sibling_result),
-                                "created_at": created_at,
-                            }
+                result = execute_with_preliminary_cache(job, preliminary_prefetch_cache)
+                if isinstance(result, dict) and result.pop("_preliminary_skip", False):
+                    continue
                 if isinstance(result, dict) and result.pop("_defer_slice", False):
                     message = result.pop("_defer_message", "资源不足，任务已延迟。")
                     delay = int(result.pop("_defer_seconds", 60) or 60)
@@ -835,7 +891,8 @@ def run_forever():
                     if storage.requeue_job_slice(job_id, message):
                         logger.info("Worker yielded checkpointed slice id=%s", job_id)
                         continue
-                storage.finalize_job(job_id, result=result)
+                if not (isinstance(result, dict) and result.pop("_preliminary_committed", False)):
+                    storage.finalize_job(job_id, result=result)
                 if job.get("task_type") == "generate_report":
                     try:
                         source = str((job.get("options") or {}).get("workflow_source") or "")
@@ -848,11 +905,20 @@ def run_forever():
                         elif source == "deep_results_report":
                             task_state = storage.get_import_task(job.get("scan_id")) or {}
                             if task_state.get("status") == "deep_overview_updating":
-                                resume = (job.get("options") or {}).get("resume_state") or "deep_update_available"
-                                storage.transition_import_task(job.get("scan_id"), resume)
-                                from app import _queue_idle_deep_backfill, _mark_deep_update_available
-                                _queue_idle_deep_backfill(job.get("scan_id"), job.get("owner_id"))
-                                _mark_deep_update_available(job.get("scan_id"))
+                                from services.import_state_machine import deep_report_outcome
+                                report = ((result or {}).get("overview") or {}).get("report") or {}
+                                outcome = deep_report_outcome(task_state, report)
+                                if outcome:
+                                    storage.transition_import_task(job.get("scan_id"), outcome,
+                                        reason="当前选中范围正式概览已生成。" if outcome == "completed" else "正式概览已生成，存在内容或模型质量待复核项。")
+                                    storage.set_package_processing_state(job.get("scan_id"), outcome, "正式概览已生成，可查看和下载。")
+                                    storage.update_analysis_progress_status(job.get("scan_id"), outcome, "正式概览已生成，可查看和下载。", outcome)
+                                else:
+                                    resume = (job.get("options") or {}).get("resume_state") or "deep_update_available"
+                                    storage.transition_import_task(job.get("scan_id"), resume)
+                                    from app import _queue_idle_deep_backfill, _mark_deep_update_available
+                                    _queue_idle_deep_backfill(job.get("scan_id"), job.get("owner_id"))
+                                    _mark_deep_update_available(job.get("scan_id"))
                     except Exception:
                         logger.warning("初步概览完成后启动深度摘要失败 scan_id=%s", job.get("scan_id"), exc_info=True)
                 # A resumed foreground batch can have all of its file

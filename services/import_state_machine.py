@@ -67,7 +67,7 @@ ALLOWED_TRANSITIONS: Dict[str, FrozenSet[str]] = {
     PAUSED: frozenset({PARSING_SELECTED, PRELIMINARY_FILES, PRELIMINARY_NODES,
                        PRELIMINARY_OVERVIEW, DEEP_FILES, DEEP_NODES, DEEP_UPDATE_AVAILABLE,
                        DEEP_OVERVIEW, CANCELLED}),
-    COMPLETED: frozenset({PARSING_SELECTED}),
+    COMPLETED: frozenset({PARSING_SELECTED, DEEP_OVERVIEW}),
     PARTIAL: frozenset({PARSING_SELECTED, DEEP_FILES, DEEP_NODES, DEEP_OVERVIEW, COMPLETED}),
     FAILED: frozenset({PARSING_SELECTED, PRELIMINARY_FILES, DEEP_FILES, CANCELLED}),
     CANCELLED: frozenset(),
@@ -122,3 +122,24 @@ def processing_state(stage: str) -> str:
         CANCELLED: "cancelled",
     }
     return mapping.get(str(stage or ""), "running")
+
+
+def deep_report_outcome(task, report):
+    """A published current-scope report closes the selected import honestly."""
+    checkpoint = task.get("checkpoint") or {}
+    selected = set(checkpoint.get("selected_paths") or [])
+    scope = report.get("report_scope") or {}
+    if not selected or selected != set(scope.get("selected_paths") or []):
+        return None
+    if int(checkpoint.get("selection_version") or 0) != int(scope.get("selection_version") or 0):
+        return None
+    pipeline = (report.get("coverage") or {}).get("pipeline_coverage") or {}
+    quality = report.get("summary_quality") or {}
+    complete = bool((pipeline.get("content_parse") or {}).get("complete")
+                    and (pipeline.get("deep_analysis") or {}).get("complete")
+                    and quality.get("stage") == "deep"
+                    and quality.get("file_summaries") == len(selected)
+                    and not quality.get("degraded_file_summaries")
+                    and not quality.get("degraded_node_summaries")
+                    and (report.get("model_analysis") or {}).get("status") == "completed")
+    return COMPLETED if complete else PARTIAL

@@ -848,7 +848,7 @@ def create_report_docx(report, scan, output_path):
             [
                 ["目录清点", coverage.get("scanned_files", 0), coverage.get("inventory_files", 0), "完整" if (coverage.get("inventory_coverage") or {}).get("complete") else "存在限制"],
                 ["内容解析", coverage.get("parsed_files", 0), coverage.get("inventory_files", 0), "{:.1%}".format(float(coverage.get("content_parse_ratio") or 0))],
-                ["全文深度分析", coverage.get("deep_analyzed_files", 0), coverage.get("inventory_files", 0), "{:.1%}".format(float(coverage.get("deep_analysis_ratio") or 0))],
+                [coverage.get("deep_analysis_label") or "全文深度分析", coverage.get("deep_analyzed_files", 0), coverage.get("inventory_files", 0), "{:.1%}".format(float(coverage.get("deep_analysis_ratio") or 0))],
                 ["失败/待处理", coverage.get("failed_files", 0), coverage.get("pending_files", 0), coverage.get("status", "待分析")],
             ],
         )

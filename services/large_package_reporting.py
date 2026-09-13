@@ -8,10 +8,11 @@ import re
 import threading
 import uuid
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA = "large-package-report/2.0"
+SCHEMA = "large-package-report/2.3"
 _lock = threading.RLock()
 
 
@@ -78,7 +79,7 @@ def _direction(category, data):
             data["files"], data["text_files"], data["models"], "预览关键词包括 {}。".format("、".join(keywords)) if keywords else ""),
         "research_questions": questions, "methods": methods,
         "representative_documents": [item["source_path"] for item in examples],
-        "evidence_chain": examples, "basis": "已保存的文件分类与有限内容预览",
+        "evidence_chain": examples, "basis": "内容语义目录、已保存深度摘要与可追溯的内容片段",
         "limitations": ["本项是基于现有内容的研究建议，需结合代表文件全文核验。"],
         "score": data["models"] * 10 + data["text_files"],
     }
@@ -92,10 +93,10 @@ def build_report(store, item):
     """
     package_id = item["id"]
     directory = report_directory(store, package_id)
-    with _lock, store._connect() as conn:
+    with _lock, closing(store._connect()) as conn:
         conn.execute("BEGIN")
         revision = conn.execute("SELECT COUNT(*),MAX(updated_at) FROM files WHERE package_id=?", (package_id,)).fetchone()
-        cache_key = hashlib.sha256(json.dumps([SCHEMA, package_id, item.get("updated_at"), list(revision)]).encode()).hexdigest()[:20]
+        cache_key = hashlib.sha256(json.dumps([SCHEMA, package_id, item.get("updated_at"), list(revision), list(conn.execute("SELECT COUNT(*),MAX(updated) FROM lp_catalog_labels WHERE package_id=?",(package_id,)).fetchone())]).encode()).hexdigest()[:20]
         cached = directory / "overview.json"
         try:
             report = json.loads(cached.read_text(encoding="utf-8"))
@@ -104,13 +105,20 @@ def build_report(store, item):
         except (ValueError, OSError):
             pass
         coverage = Counter()
+        recognition = Counter()
+        topic_counts = Counter()
         groups = {}
         formats = Counter()
         failures, deep_files = [], []
         modified_min, modified_max, total_bytes = None, None, 0
-        for row in conn.execute("SELECT * FROM files WHERE package_id=? ORDER BY path", (package_id,)):
+        for raw in conn.execute("SELECT f.*,l.name catalog_model_name FROM files f LEFT JOIN large_catalog_members m ON m.package_id=f.package_id AND m.path=f.path LEFT JOIN lp_catalog_labels l ON l.package_id=m.package_id AND l.group_id=m.group_id WHERE f.package_id=? ORDER BY f.path", (package_id,)):
+            row=dict(raw)
+            row['topic']=row.get('catalog_model_name') or row['topic']
             local, deep = _json(row["local_summary"]), _json(row["deep_summary"])
             coverage["inventory_files"] += 1
+            recognition[row["recognition_status"]] += 1
+            if row["topic"]:
+                topic_counts[row["topic"]] += 1
             total_bytes += int(row["size"] or 0)
             formats[row["extension"] or "无扩展名"] += 1
             modified = int(row["modified_at_ns"] or 0)
@@ -121,7 +129,8 @@ def build_report(store, item):
             failed = row["quick_status"] == "failed" or row["deep_status"] == "failed" or deep.get("summary_type") == "local_deep_failed"
             deep_ok = row["deep_status"] == "completed" and deep.get("summary_type") != "local_deep_failed"
             model = deep_ok and deep.get("summary_type") == "model"
-            text = "" if row["sensitive"] else _text(deep.get("text_preview") or local.get("sample"), 450)
+            summary_text = _text(deep.get("summary"), 900) if deep_ok and not row["sensitive"] else ""
+            text = "" if row["sensitive"] else summary_text or _text(deep.get("text_preview") or local.get("sample"), 450)
             coverage["quick_completed"] += quick_ok
             coverage["local_summaries"] += bool(local) and quick_ok
             coverage["metadata_summaries"] += bool(local) and quick_ok and not bool(_text(local.get("sample")))
@@ -148,7 +157,7 @@ def build_report(store, item):
             # Fixed-size sample per category, with completed deep results preferred.
             if text and not failed:
                 evidence = {"source_path": row["path"], "source_sha256": row["sha256"], "text": text,
-                            "scope": "深度解析正文预览" if deep_ok else "快速解析有限预览", "deep": deep_ok}
+                            "scope": "深度摘要" if summary_text else "深度解析正文预览" if deep_ok else "快速解析有限预览", "deep": deep_ok, "topic": row["topic"]}
                 if len(group["examples"]) < 3:
                     group["examples"].append(evidence)
                 elif deep_ok:
@@ -160,7 +169,34 @@ def build_report(store, item):
                 if word and (word in group["keywords"] or len(group["keywords"]) < 200):
                     group["keywords"][word] += 1
         categories = {key: value["files"] for key, value in sorted(groups.items(), key=lambda pair: (-pair[1]["files"], pair[0]))}
+        topic_summaries = []
+        for category, data in groups.items():
+            summaries = [example for example in data["examples"] if example.get("scope") == "深度摘要"]
+            if summaries:
+                topic_summaries.append({"category": category, "files": data["files"], "summarized_files": data["models"], "sources": summaries})
+        topic_summaries.sort(key=lambda x: (-x["summarized_files"], x["category"]))
+        topic_summaries = topic_summaries[:20]
         candidates = sorted(filter(None, (_direction(key, value) for key, value in groups.items())), key=lambda x: (-x["score"], x["title"]))[:5]
+        # Quick parsing can classify a package even when no category has a
+        # readable excerpt. Keep the overview useful in that case by exposing
+        # a clearly preliminary, evidence-limited direction from the dominant
+        # category/topic counts. Deep summaries will replace it automatically.
+        if not candidates and groups:
+            category, data = max(groups.items(), key=lambda pair: (pair[1]["files"], pair[0]))
+            generic = {"未分类", "无法识别内容", "资料类别", "其他"}
+            topic = next((str(name) for name, count in topic_counts.most_common() if str(name).strip() and str(name).strip() not in generic), "")
+            label = topic or (str(category).strip() if str(category).strip() not in generic else "资料内容")
+            candidates = [{
+                "title": "围绕“{}”资料的主题与证据核验".format(label),
+                "category": category, "priority": "初步研判", "confidence": round(data["confidence"] / max(1, data["files"]), 3),
+                "confidence_note": "该方向只依据快速解析的分类和主题统计，完成深度摘要后自动更新。",
+                "rationale": "快速解析显示“{}”相关资料占当前范围较大比例，建议先核验其主题边界、关键事实和资料之间的一致性。".format(label),
+                "research_questions": ["“{}”资料主要涉及哪些主题和可验证事实？".format(label), "哪些判断需要深度摘要进一步核验？"],
+                "methods": ["按主题和文件来源分组比对", "对代表文件进行深度摘要并回溯原文证据"],
+                "representative_documents": [item["source_path"] for item in data["examples"]],
+                "evidence_chain": data["examples"], "basis": "快速解析分类与主题统计", "limitations": ["尚未结合用户选定文件的深度摘要"],
+                "score": data["files"],
+            }]
         total = coverage["inventory_files"]
         coverage["quick_ratio"] = round(coverage["quick_completed"] / max(1, total), 4)
         coverage["deep_ratio"] = round(coverage["deep_completed"] / max(1, total), 4)
@@ -171,7 +207,7 @@ def build_report(store, item):
             coverage.setdefault(key, 0)
         limits = [
             "全量统计只描述已盘点文件；快速解析为有限内容预览，不能视为全文分析。",
-            "研究方向由已保存的分类和内容预览归纳，不额外调用模型；建议需结合原文核验。",
+            "概览随语义目录和已保存深度摘要更新，不额外调用生成式模型；未选文件仍只依据有限内容预览。",
             "深度解析与模型摘要只覆盖用户选定范围，模型摘要覆盖率为 {:.1%}。".format(coverage["model_ratio"]),
             "本地摘要中有 {} 个仅含元数据，{} 个敏感文件未展示正文。".format(coverage["metadata_summaries"], coverage["sensitive_files"]),
         ]
@@ -183,6 +219,9 @@ def build_report(store, item):
             limits.append("有 {} 个文件解析失败；页面和报告最多展示前 50 条失败记录。".format(coverage["failed_files"]))
         if coverage["unsupported_files"]:
             limits.append("有 {} 个非敏感文件尚未提取到可读正文，可能需要 OCR、格式支持或人工复核。".format(coverage["unsupported_files"]))
+        package_status = str(item.get("status") or "")
+        if package_status == "paused":
+            limits.insert(0, "数据包已暂停；本概览基于已完成的深度摘要与本地摘要生成，继续深度摘要后概览会随之更新。")
         findings = [
             "已盘点 {} 个文件，总大小 {}，形成 {} 个智能分类。".format(total, _size(total_bytes), len(categories)),
             "已完成 {} 个本地摘要，其中 {} 个仅含元数据。".format(coverage["local_summaries"], coverage["metadata_summaries"]),
@@ -190,23 +229,34 @@ def build_report(store, item):
         ]
         if categories:
             findings.append("主要分类为 " + "、".join("{}（{} 个）".format(key, value) for key, value in list(categories.items())[:5]) + "。")
+        for topic in topic_summaries[:5]:
+            source = topic["sources"][0]
+            findings.append("【{}】已选文件摘要：{}（来源：{}）".format(topic["category"], _text(source["text"], 280), source["source_path"]))
         basic = ["数据包目录：" + item["root_path"], findings[0], "文件格式：" + "、".join("{} {} 个".format(key, value) for key, value in formats.most_common(10))]
         if modified_min:
             dates = [datetime.fromtimestamp(value / 1e9, timezone.utc).strftime("%Y-%m-%d") for value in (modified_min, modified_max)]
             basic.append("文件修改时间范围：{} 至 {}（不等同于内容事件时间）".format(*dates))
-        brief_ready = str(item.get("status") or "") == "completed" and coverage["deep_selected"] > 0 and coverage["deep_completed"] > 0
+        # 暂停状态同样出简报：用户暂停深度摘要后仍希望得到基于已完成部分的
+        # 情报概览；只要选定范围内有已完成的深度摘要就生成，并在限制里注明
+        # 这是部分快照。恢复深度摘要后 updated_at 变化会自然使缓存失效重建。
+        brief_ready = package_status in {"completed", "paused"} and coverage["deep_selected"] > 0 and coverage["deep_completed"] > 0
+        preliminary_direction = bool(candidates) and not brief_ready
         report = {
             "schema_version": SCHEMA, "revision": cache_key, "package_id": package_id,
             "generated_at": datetime.now(timezone.utc).isoformat(), "status": item.get("status"), "phase": item.get("phase"),
             "root_path": item["root_path"], "coverage": dict(coverage), "categories": categories,
+            "recognition": dict(recognition), "content_topics": dict(topic_counts.most_common(200)), "topics_total": len(topic_counts),
             "total_bytes": total_bytes, "total_size_human": _size(total_bytes), "formats": dict(formats),
-            "deep_files": deep_files, "failures": failures,
+            "deep_files": deep_files, "failures": failures, "topic_summaries": topic_summaries,
             "research_brief": {
-                "title": "大数据包情况概览", "available": brief_ready, "ready": brief_ready, "generation_mode": "local_evidence_brief",
+                "title": "大数据包情况概览", "available": bool(candidates), "ready": brief_ready,
+                "preliminary": preliminary_direction,
+                "generation_mode": "local_evidence_preliminary" if preliminary_direction else "local_evidence_brief",
                 "basic_information": basic, "key_findings": findings,
-                "recommended_research_direction": candidates[0] if brief_ready and candidates else {},
-                "direction_candidates": candidates[1:] if brief_ready else [], "limitations": limits,
-                "empty_direction_reason": "深度摘要完成后生成推荐研究方向。" if not brief_ready else ("暂未提取到足够的可读内容，请先对代表文件进行深度解析。" if not candidates else ""),
+                "recommended_research_direction": candidates[0] if candidates else {},
+                "direction_candidates": candidates[1:] if candidates else [], "limitations": limits,
+                "empty_direction_reason": ("当前为基于快速解析的初步研究方向；深度摘要完成后将自动更新。" if preliminary_direction else
+                                            ("暂未提取到足够的可读内容，请先对代表文件进行深度解析。" if not candidates else "")),
             },
             "download_formats": ["docx", "json"],
         }
@@ -218,8 +268,9 @@ def export_report(store, item, file_format="docx"):
     if file_format not in {"docx", "json"}:
         raise ValueError("仅支持 Word 或 JSON 概览下载")
     report = build_report(store, item)
-    if not (report.get("research_brief") or {}).get("ready"):
-        raise ValueError("深度摘要尚未完成，暂不能下载大数据包研究简报")
+    brief = report.get("research_brief") or {}
+    if not brief.get("available"):
+        raise ValueError("当前尚未形成可下载的大数据包研究简报")
     directory = report_directory(store, item["id"])
     target = directory / ("large-package-overview-" + report["revision"] + "." + file_format)
     with _lock:

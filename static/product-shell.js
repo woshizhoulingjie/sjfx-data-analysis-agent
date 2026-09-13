@@ -308,7 +308,7 @@
     $('mobileNavBackdrop')?.addEventListener('click', () => setNavigationOpen(false));
     document.querySelector('.main-area')?.addEventListener('click', (event) => {
       const sidebar = document.querySelector('.sidebar');
-      if (sidebar?.classList.contains('open') && !event.target.closest('#mobileMenuBtn')) setNavigationOpen(false);
+      if (sidebar?.classList.contains('open') && !event.target.closest('#mobileMenuBtn, #navCollapseBtn')) setNavigationOpen(false);
     });
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') setNavigationOpen(false);

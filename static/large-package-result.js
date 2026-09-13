@@ -3,15 +3,21 @@
   const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const api = () => window.sjfxApi;
   let packageId = '';
+  let extraCatalogNodes = [];
   let files = [];
+  const selectedForSummary = new Set();
   let currentStage = 'overview';
   let latestStatus = {};
+  let liveTimer = null;
+  let retryTimer = null;
 
   function setText(id, value) { const el = $(id); if (el) el.textContent = value == null ? '' : value; }
   function setStage(stage) {
+    ensureExplorer();
     currentStage = stage || 'overview';
+    document.querySelector('.large-result-view')?.setAttribute('data-large-mode', currentStage);
     const titles = {
-      catalog: ['大数据包目录', '原始目录、智能目录和节点摘要按范围查看。'],
+      catalog: ['大数据包目录', '选择目录或主题，查看关联文件与摘要。'],
       overview: ['大数据包情报概览', '深度摘要完成后生成研究简报、推荐方向和下载报告。'],
     };
     const heading = titles[currentStage] || titles.overview;
@@ -28,36 +34,427 @@
     if (catalog) catalog.disabled = currentStage === 'catalog';
     const overview = $('largeResultToOverview');
     if (overview) overview.disabled = currentStage === 'overview';
+    renderSelection();
   }
+  // Browsing state belongs only to this isolated large-package module.
+  const newBrowseState = () => ({ node: { type: 'all', value: '', label: '整个数据包' }, query: '', draft: '', category: '', offset: 0, expanded: new Set(['topics']), scroll: 0, listScroll: 0, file: null });
+  let browseMode = 'physical';
+  let browseStates = { physical: newBrowseState(), smart: newBrowseState() };
+  let latestCatalog = null;
+  let catalogFingerprint = '';
+  let fileFingerprint = '';
+  let detailFingerprint = '';
+  let fileRequestId = 0;
+  let loadRequestId = 0;
+  let activationId = 0;
+  let nodeInfo = new Map();
+  const browse = () => browseStates[browseMode];
+  const nodeKey = (type, value) => JSON.stringify([type, value || '']);
+  const scopeLabels = { all: '全部资料', directory: '原始目录', topic: '内容主题', group: '内容主题', category: '资料类别', role: '文档用途', project: '项目 / 编号', entity: '参与者', date: '样本时间' };
+  const folderIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3Z"/></svg>';
+  const topicIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m12 3 2.8 6.2L21 12l-6.2 2.8L12 21l-2.8-6.2L3 12l6.2-2.8Z"/></svg>';
+
+  function ensureExplorer() {
+    if ($('largeResultExplorer')) return;
+    const view = document.querySelector('.large-result-view');
+    const nav = view?.querySelector('.large-result-catalog-grid');
+    const detail = view?.querySelector('.large-result-files-card');
+    if (!nav || !detail) return;
+    const original = $('largeResultOriginalCatalog')?.closest('section');
+    const smart = $('largeResultSmartCatalog')?.closest('section');
+    if (!original || !smart) return;
+    const workspace = document.createElement('div');
+    workspace.id = 'largeResultExplorer';
+    workspace.className = 'large-explorer large-result-section';
+    workspace.dataset.largeSection = 'catalog';
+    nav.before(workspace);
+    workspace.append(nav, detail);
+    nav.classList.add('large-explorer-nav');
+    detail.classList.add('large-explorer-detail');
+    original.id = 'largeResultPhysicalPane';
+    smart.id = 'largeResultSmartPane';
+    original.setAttribute('role', 'tabpanel');
+    smart.setAttribute('role', 'tabpanel');
+    original.setAttribute('aria-labelledby', 'largeResultPhysicalTab');
+    smart.setAttribute('aria-labelledby', 'largeResultSmartTab');
+    const heading = document.createElement('div');
+    heading.className = 'lp-nav-heading';
+    heading.innerHTML = '<span class="section-kicker">NAVIGATE</span><h2>资料目录</h2><div class="lp-mode-tabs" role="tablist" aria-label="大数据包目录模式"><button id="largeResultPhysicalTab" type="button" role="tab" aria-controls="largeResultPhysicalPane" data-lp-mode="physical">原始目录</button><button id="largeResultSmartTab" type="button" role="tab" aria-controls="largeResultSmartPane" data-lp-mode="smart">智能目录</button></div>';
+    nav.prepend(heading);
+    const title = detail.querySelector('.surface-heading h2');
+    if (title) title.textContent = '节点详情';
+    const hint = detail.querySelector('.surface-heading small');
+    if (hint) hint.textContent = '查看当前范围内的文件与已有摘要';
+    const scope = $('largeResultNodeSummary');
+    if (scope) { scope.classList.add('lp-scope'); scope.setAttribute('aria-live', 'polite'); }
+    const filters = detail.querySelector('.large-result-filters');
+    if (filters) {
+      filters.id = 'largeResultFilterBar';
+      $('largeResultSearch')?.setAttribute('aria-label', '搜索当前范围内的文件');
+      $('largeResultSearch')?.setAttribute('placeholder', '在当前范围搜索文件或摘要');
+      $('largeResultCategory')?.setAttribute('aria-label', '按资料类别筛选');
+      const clear = document.createElement('button');
+      clear.id = 'largeResultClearSearch'; clear.type = 'button'; clear.className = 'ghost'; clear.textContent = '清空筛选';
+      filters.append(clear);
+    }
+    const list = document.createElement('div');
+    list.id = 'largeResultListView'; list.className = 'lp-list-view';
+    if (filters) detail.insertBefore(list, filters); else detail.append(list);
+    if (filters) list.append(filters);
+    if ($('largeResultFiles')) list.append($('largeResultFiles'));
+    const pager = $('largeResultPager') || document.createElement('div');
+    pager.id = 'largeResultPager'; pager.className = 'lp-pager';
+    list.append(pager);
+    const fileDetail = document.createElement('div');
+    fileDetail.id = 'largeResultFileDetail'; fileDetail.className = 'lp-file-detail'; fileDetail.hidden = true;
+    detail.append(fileDetail);
+    for (const id of ['largeResultOriginalCatalog', 'largeResultSmartCatalog']) {
+      $(id)?.addEventListener('scroll', () => { browseStates[id === 'largeResultOriginalCatalog' ? 'physical' : 'smart'].scroll = $(id).scrollTop; }, { passive: true });
+    }
+    $('largeResultFiles')?.addEventListener('scroll', () => { browse().listScroll = $('largeResultFiles').scrollTop; }, { passive: true });
+    syncBrowseUI();
+  }
+
+  function syncBrowseUI() {
+    const state = browse();
+    for (const mode of ['physical', 'smart']) {
+      const tab = $(mode === 'physical' ? 'largeResultPhysicalTab' : 'largeResultSmartTab');
+      const pane = $(mode === 'physical' ? 'largeResultPhysicalPane' : 'largeResultSmartPane');
+      if (tab) { tab.setAttribute('aria-selected', String(mode === browseMode)); tab.tabIndex = mode === browseMode ? 0 : -1; }
+      if (pane) pane.hidden = mode !== browseMode;
+    }
+    if ($('largeResultSearch')) $('largeResultSearch').value = state.draft;
+    if ($('largeResultCategory')) $('largeResultCategory').value = state.category;
+    $('largeResultExplorer')?.setAttribute('data-directory-mode', browseMode);
+    markSelectedNode();
+  }
+
+  function markSelectedNode() {
+    const state = browse();
+    document.querySelectorAll('#largeResultExplorer [data-lp-node]').forEach(el => {
+      const selected = el.dataset.lpType === state.node.type && el.dataset.lpValue === state.node.value;
+      el.classList.toggle('is-selected', selected);
+      if (selected) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
+    });
+  }
+
+  function nodeButton(type, value, label, count, info = {}) {
+    nodeInfo.set(nodeKey(type, value), { ...info, type, value, label, count });
+    return `<button type="button" class="lp-node" data-lp-node="1" data-lp-type="${esc(type)}" data-lp-value="${esc(value)}" title="${esc(type === 'group' ? label : value || label)}">${type === 'directory' || type === 'all' ? folderIcon : topicIcon}<span>${esc(label)}</span>${count == null ? '' : `<small>${Number(count) || 0}</small>`}</button>`;
+  }
+
+  function originalNavigation(catalog) {
+    const root = { children: new Map() };
+    for (const item of catalog.original?.directories || []) {
+      let parent = root;
+      const parts = String(item.path || '').split('/').filter(Boolean);
+      parts.forEach((part, index) => {
+        const path = parts.slice(0, index + 1).join('/');
+        if (!parent.children.has(part)) parent.children.set(part, { path, label: part, children: new Map() });
+        parent = parent.children.get(part);
+      });
+      if (parts.length) parent.info = item;
+    }
+    const rows = (branch) => [...branch.children.values()].map(item => {
+      const key = 'dir:' + item.path;
+      const open = browseStates.physical.expanded.has(key);
+      const expand = item.children.size ? `<button type="button" class="lp-expand" data-lp-expand="${esc(key)}" aria-expanded="${open}" aria-label="${open ? '收起' : '展开'} ${esc(item.label)}"><span aria-hidden="true">›</span></button>` : '<span class="lp-expand-space"></span>';
+      return `<li><div class="lp-nav-row">${expand}${nodeButton('directory', item.path, item.label, item.info?.files, item.info)}</div>${item.children.size ? `<ul class="lp-children" ${open ? '' : 'hidden'}>${rows(item)}</ul>` : ''}</li>`;
+    }).join('');
+    return `<div class="lp-all-node">${nodeButton('all', '', '整个数据包', catalog.files_total)}</div>${catalog.original?.root_files?.length ? `<div class="lp-root-files">${nodeButton('directory', '', '根目录文件', null, { sample: catalog.original.root_files })}</div>` : ''}<ul class="lp-tree">${rows(root)}</ul>${catalog.original?.truncated ? `<p class="lp-limit-note">${esc(catalog.original.notice || '目录显示数量已达上限，完整文件可搜索并翻页查看。')}</p>` : ''}`;
+  }
+
+  function smartNavigation(catalog) {
+    const smart = catalog.smart || {};
+    const labels = { pending: '待语义分组', grouped: '待主题命名', classified: '已按语义归类', deferred: '主题待确认', no_content: '待提取内容', legacy: '旧版目录', identified: '已识别主题', needs_more: '待补充采样', needs_ocr: '待 OCR', needs_review: '待核查', metadata_only: '仅元数据', restricted: '受限文件', unsupported: '暂不支持' };
+    const group = (key, title, content, count) => `<section class="lp-nav-group"><button type="button" class="lp-group-toggle" data-lp-group="${esc(key)}" aria-expanded="${browseStates.smart.expanded.has(key)}"><span class="lp-group-arrow" aria-hidden="true">›</span><span>${esc(title)}</span>${count == null ? '' : `<small>${count}</small>`}</button><div class="lp-group-content" ${browseStates.smart.expanded.has(key) ? '' : 'hidden'}>${content}</div></section>`;
+    const byId=new Map((smart.topics || []).map(item=>[item.node_id,item]));
+    const nested=new Set();
+    const branches=(smart.branches || []).map(branch=>{
+      const children=(branch.children || []).map(id=>byId.get(id)).filter(Boolean);
+      if (children.length<2)return '';
+      children.forEach(child=>nested.add(child.node_id));
+      const count=children.reduce((sum,child)=>sum+child.files,0);
+      const parent=nodeButton('group',branch.node_id,branch.name,count,{description:'根据子目录的共同内容组织，点击可查看所有成员。'});
+      const body=children.map(child=>nodeButton('group',child.node_id,child.topic,child.files,child)).join('');
+      return '<div class="lp-content-branch">'+parent+'<div class="lp-content-children">'+body+'</div></div>';
+    }).join('');
+    const topics = branches+(smart.topics || []).filter(item=>!nested.has(item.node_id)).map(item => nodeButton(item.node_id ? 'group' : 'topic', item.node_id || item.topic, item.topic, item.files, item)).join('');
+    const categories = (smart.categories || []).map(item => nodeButton('category', item.category, item.category || '未分类', item.files, item)).join('');
+    const facets = Object.entries(smart.facets || {}).filter(([kind]) => ['role', 'project', 'entity', 'date'].includes(kind)).map(([kind, items]) => group('facet:' + kind, scopeLabels[kind] + '线索', (items || []).map(item => nodeButton(kind, item.value, item.value, item.files, item)).join(''), items.length)).join('');
+    const naming = smart.naming || {};
+    const inventoryNotice = catalog.inventory?.inventory_error_count ? '<p class="lp-scope-notice">盘点有 ' + catalog.inventory.inventory_error_count + ' 处无法读取，当前目录仅覆盖已发现文件。</p>' : '';
+    const namingInfo = inventoryNotice + '<p class="lp-empty-note">内容预览 ' + (smart.content_files || 0) + ' 个文件；已命名 ' + (naming.named_nodes || 0) + ' 个主题，覆盖 ' + (naming.named_files || 0) + ' 个文件。' + (naming.active ? ' 正在完善。' : ' 其余主题保留可读的内容名称（单文件分组直接采用文件线索命名）。') + '</p><button type="button" data-lp-improve ' + (naming.active ? 'disabled' : '') + '>完善目录名称</button>';
+    const states = Object.entries(smart.catalog_states || smart.recognition || {}).map(([key, value]) => `<span>${esc(labels[key] || key)} <b>${Number(value) || 0}</b></span>`).join('');
+    return `<div class="lp-all-node">${nodeButton('all', '', '整个数据包', catalog.files_total)}</div>${namingInfo}${group('topics', '内容主题', (topics || '<p class="lp-empty-note">正在整理主题，已盘点文件可从原始目录查看。</p>') + (smart.topics_truncated ? '<button type="button" data-lp-more>查看更多内容主题</button>' : ''), smart.topic_total || 0)}${group('categories', '资料类别', categories, (smart.categories || []).length)}${facets}${group('states', '目录整理状态', `<div class="lp-catalog-states">${states || '等待内容识别。'}</div><p class="lp-empty-note">目录随内容识别与深度摘要更新。</p>`)} `;
+  }
+
   function renderCatalog(catalog) {
     if (!catalog) return;
+    ensureExplorer();
+    if (extraCatalogNodes.length) {
+      const found = new Map((catalog.smart?.topics || []).map(n => [n.node_id || n.topic, n]));
+      extraCatalogNodes.forEach(n => { if (!found.has(n.node_id || n.topic)) found.set(n.node_id || n.topic,n); });
+      catalog = {...catalog,smart:{...catalog.smart,topics:[...found.values()],topics_truncated:found.size < catalog.smart.topic_total}};
+    }
+    latestCatalog = catalog;
     setText('largeResultRootPath', catalog.root_path || '');
-    setText('largeResultDirectoryStats', `${catalog.files_total || 0} 个文件 · ${(catalog.original?.directories || []).length} 个目录`);
-    const dirs = (catalog.original?.directories || []).map((item) => `<details class="large-result-node" data-large-node-type="directory" data-large-node-value="${esc(item.path || '')}"><summary><b>${esc(item.path || '根目录')}</b><span>${item.files || 0} 个文件</span></summary><small>${(item.sample || []).map(esc).join(' · ')}</small></details>`);
-    if (catalog.original?.root_files?.length) dirs.unshift(`<div class="large-result-root"><b>根目录文件</b><small>${catalog.original.root_files.map(esc).join(' · ')}</small></div>`);
-    $('largeResultOriginalCatalog').innerHTML = dirs.join('') || '<div class="large-empty">暂无原始目录记录。</div>';
-    const categories = catalog.smart?.categories || [];
-    setText('largeResultSmartStats', `${categories.length} 个分类`);
-    $('largeResultSmartCatalog').innerHTML = categories.map((item) => `<details class="large-result-node" data-large-node-type="category" data-large-node-value="${esc(item.category || '')}"><summary><b>${esc(item.category || '未分类')}</b><span>${item.files || 0} 个文件 · ${Math.round(Number(item.confidence || 0) * 100)}%</span></summary><small>${(item.sample || []).map((file) => esc(file.path)).join(' · ')}</small></details>`).join('') || '<div class="large-empty">暂无智能分类。</div>';
+    setText('largeResultDirectoryStats', `${catalog.files_total || 0} 个文件 · ${(catalog.original?.directories || []).length} 个目录${catalog.original?.truncated ? '（部分显示）' : ''}`);
+    setText('largeResultSmartStats', `${catalog.smart?.topic_total || 0} 个主题 · ${(catalog.smart?.categories || []).length} 个类别`);
+    const fingerprint = JSON.stringify(catalog);
+    if (fingerprint !== catalogFingerprint) {
+      catalogFingerprint = fingerprint;
+      nodeInfo = new Map();
+      const active = document.activeElement;
+      const focused = active?.dataset.lpNode ? { type: active.dataset.lpType, value: active.dataset.lpValue } : null;
+      const focusedToggle = active?.dataset.lpExpand || active?.dataset.lpGroup;
+      $('largeResultOriginalCatalog').innerHTML = originalNavigation(catalog);
+      $('largeResultSmartCatalog').innerHTML = smartNavigation(catalog);
+      const smartState = browseStates.smart;
+      if (smartState.node.type === 'topic' && !nodeInfo.has(nodeKey('topic', smartState.node.value)) && !catalog.smart?.topics_truncated) {
+        smartState.node = { type: 'all', value: '', label: '整个数据包' };
+        smartState.offset = 0;
+        smartState.notice = '原主题已重新整理，当前显示整个数据包。';
+      }
+      markSelectedNode();
+      $('largeResultOriginalCatalog').scrollTop = browseStates.physical.scroll;
+      $('largeResultSmartCatalog').scrollTop = browseStates.smart.scroll;
+      if (focused) [...document.querySelectorAll('#largeResultExplorer [data-lp-node]')].find(el => el.dataset.lpType === focused.type && el.dataset.lpValue === focused.value)?.focus({ preventScroll: true });
+      else if (focusedToggle) [...document.querySelectorAll('#largeResultExplorer [data-lp-expand], #largeResultExplorer [data-lp-group]')].find(el => (el.dataset.lpExpand || el.dataset.lpGroup) === focusedToggle)?.focus({ preventScroll: true });
+    }
+    renderScope();
+  }
+
+  function renderScope(total) {
+    const state = browse();
+    if (total != null) state.total = total;
+    const info = nodeInfo.get(nodeKey(state.node.type, state.node.value)) || state.node;
+    const label = info.label || state.node.label;
+    const namingText = {model:'依据代表内容由模型命名',extractive:'原文内容名称，尚可完善',stale:'内容已更新，名称待复核',manual:'已人工确认',unread:'内容识别尚未完成'}[info.naming_status] || '';
+    const basis = [info.description || info.basis, namingText, info.needs_review ? '组内内容需要进一步复核' : ''].filter(Boolean).join(' · ') || (state.node.type === 'directory' ? '文件按原始路径归属，包含该目录下的子目录文件。' : '');
+    const samples = (info.sample || []).map(item => typeof item === 'string' ? `<li>${esc(item)}</li>` : `<li><b>${esc(item.path)}</b>${item.basis ? `<p>${esc(item.basis)}</p>` : ''}${(item.evidence || []).map(e => `<p><span>${esc(e.location)}</span>：${esc(e.text)}</p>`).join('')}</li>`).join('');
+    const details = basis || samples ? `<details class="lp-scope-evidence"><summary>节点信息与代表文件</summary>${basis ? `<p>${esc(basis)}</p>` : ''}${samples ? `<ul>${samples}</ul>` : ''}</details>` : '';
+    const content = `<div class="lp-scope-top"><div><span class="lp-scope-kind">${esc(scopeLabels[state.node.type] || '当前范围')}</span><h3 title="${esc(state.node.value || label)}">${esc(label)}</h3></div><button id="largeResultClearScope" type="button" class="ghost">查看全包</button></div>${state.node.value && state.node.type === 'directory' ? `<p class="lp-scope-path">${esc(state.node.value)}</p>` : ''}${info.description ? `<p class="lp-scope-description">${esc(info.description)}</p>` : ''}<p class="lp-scope-count">${state.total == null ? '正在读取文件…' : `当前范围匹配 ${state.total} 个文件`}${state.query || state.category ? ' · 已应用筛选' : ''}</p>${state.notice ? `<p class="lp-scope-notice">${esc(state.notice)}</p>` : ''}${details}${state.node.type === 'group' && !state.node.value.startsWith('preview:') && !state.node.value.startsWith('branch:') ? '<button type="button" data-lp-rename>确认或修改名称</button>' : ''}`;
+    const host = $('largeResultNodeSummary');
+    if (host && host._lpMarkup !== content) {
+      const wasOpen = host.querySelector('details')?.open;
+      host.innerHTML = content; host._lpMarkup = content;
+      if (wasOpen && host.querySelector('details')) host.querySelector('details').open = true;
+    }
+  }
+
+  function summaryData(item) {
+    const deep = item.deep_summary || {}, local = item.local_summary || {};
+    return { deep, local, type: deep.summary_type === 'model' ? '模型摘要' : (deep.summary_type ? '深度本地摘要' : '本地摘要'), text: deep.summary || local.sample || local.notice || item.error || '暂无摘要' };
+  }
+  function fileStatus(item) {
+    if (item.deep_status === 'completed') return '已深度解析';
+    if (item.deep_status === 'running' || item.deep_status === 'queued') return '深度解析中';
+    if (item.deep_status === 'failed') return '深度解析失败';
+    if (item.quick_status === 'failed') return '快速解析失败';
+    return item.quick_status === 'completed' ? '已有本地摘要' : '已盘点';
   }
   function renderFiles(rows) {
     files = rows || [];
     const box = $('largeResultFiles');
     if (!box) return;
-    box.innerHTML = files.map((item) => {
-      const deep = item.deep_summary || {};
-      const local = item.local_summary || {};
-      const type = deep.summary_type === 'model' ? '模型摘要' : (deep.summary_type ? '深度本地摘要' : '本地摘要');
-      const summary = deep.summary || local.sample || local.notice || item.error || '暂无摘要';
-      return `<article class="large-result-file"><div><b>${esc(item.path)}</b><small>${esc(item.category || '未分类')} · 置信度 ${Math.round(Number(item.confidence || 0) * 100)}% · ${esc(type)}</small><p>${esc(summary)}</p></div><span class="large-result-file-status ${item.deep_status === 'completed' ? 'is-deep' : ''}">${item.deep_status === 'completed' ? '已深度解析' : '已盘点'}</span></article>`;
-    }).join('') || '<div class="large-empty">暂无匹配文件。</div>';
-    setText('largeResultFileStats', `当前显示 ${files.length} 个文件`);
+    const fingerprint = JSON.stringify([files, Array.from(selectedForSummary), latestStatus.status, currentStage]);
+    if (fingerprint !== fileFingerprint) {
+      fileFingerprint = fingerprint;
+      const focusedPath = document.activeElement?.dataset.lpFile;
+      const scroll = browse().listScroll;
+      box.innerHTML = files.map(item => {
+        const summary = summaryData(item);
+        const parts = String(item.path || '').split('/');
+        return `<article class="lp-file-row" style="display:flex;align-items:flex-start">${currentStage === 'catalog' ? `<input style="flex:0 0 auto;width:18px;margin:18px 0 0 14px" type="checkbox" data-catalog-select="${esc(item.path)}" aria-label="选择 ${esc(item.path)} 进入深度摘要" ${selectedForSummary.has(item.path) ? 'checked' : ''} ${!['completed','waiting_for_selection'].includes(latestStatus.status) || ['queued','running'].includes(item.deep_status) ? 'disabled' : ''}>` : ''}<button class="lp-file-open" type="button" data-lp-file="${esc(item.path)}"><span class="lp-file-name">${esc(parts.pop())}</span><span class="lp-file-path">${esc(item.path)}</span><span class="lp-file-tags">${esc(item.catalog_name || item.category || '未分类')} · ${esc(summary.type)} · ${esc(fileStatus(item))}</span><span class="lp-file-preview">${esc(summary.text)}</span><span class="lp-file-action">查看详情 <span aria-hidden="true">→</span></span></button></article>`;
+      }).join('') || '<div class="large-empty">当前范围没有匹配文件，可清空筛选或查看全包。</div>';
+      box.scrollTop = scroll;
+      if (focusedPath) [...box.querySelectorAll('[data-lp-file]')].find(el => el.dataset.lpFile === focusedPath)?.focus({ preventScroll: true });
+    }
+    const state = browse();
+    if (state.file) {
+      const updated = files.find(item => item.path === state.file.path);
+      if (updated) state.file = updated;
+    }
+    renderFileDetail();
+    renderSelection();
   }
+
+  function renderSelection() {
+    let bar = $('largeCatalogSelection');
+    if (!bar && $('largeResultFiles')) {
+      bar = document.createElement('div'); bar.id = 'largeCatalogSelection'; bar.className = 'button-row';
+      $('largeResultFiles').before(bar);
+      bar.innerHTML = '<button type="button" id="largeCatalogSelectPage">选择本页</button><button type="button" id="largeCatalogClear">清空选择</button><span id="largeCatalogSelectedCount"></span><button type="button" id="largeCatalogStartDeep">开始深度摘要</button>';
+      $('largeCatalogSelectPage').onclick = () => { files.filter(x => !['queued','running'].includes(x.deep_status)).forEach(x => selectedForSummary.add(x.path)); renderFiles(files); };
+      $('largeCatalogClear').onclick = () => { selectedForSummary.clear(); renderFiles(files); };
+      $('largeCatalogStartDeep').onclick = async () => {
+        if (!selectedForSummary.size) return;
+        const button = $('largeCatalogStartDeep'); button.disabled = true;
+        try {
+          const targetId = packageId;
+          await api()(`/api/large-packages/${encodeURIComponent(targetId)}/select`, {method:'POST', body:JSON.stringify({paths:Array.from(selectedForSummary),rule:{kind:'semantic_catalog_selection'}})});
+          if (targetId !== packageId) return;
+          selectedForSummary.clear();
+          setText('largeResultStatus', '已提交选中文件；深度摘要完成后将更新目录和概览。');
+          await load();
+        } catch (error) { setText('largeResultStatus', error.message || '提交深度摘要失败'); }
+        finally { renderSelection(); }
+      };
+    }
+    if (!bar) return;
+    bar.hidden = currentStage !== 'catalog';
+    const ready = ['completed','waiting_for_selection'].includes(latestStatus.status);
+    $('largeCatalogSelectPage').disabled = !ready;
+    $('largeCatalogStartDeep').disabled = !ready || selectedForSummary.size === 0;
+    setText('largeCatalogSelectedCount', `已选择 ${selectedForSummary.size} 个文件`);
+  }
+  function renderFileDetail() {
+    const item = browse().file;
+    const host = $('largeResultFileDetail');
+    if (!host) return;
+    host.hidden = !item;
+    if ($('largeResultListView')) $('largeResultListView').hidden = Boolean(item);
+    if (!item) { detailFingerprint = ''; return; }
+    const fingerprint = JSON.stringify(item);
+    if (fingerprint === detailFingerprint) return;
+    detailFingerprint = fingerprint;
+    const sameFile = host.dataset.filePath === item.path;
+    const detailKey = el => el.classList.contains('large-portrait') ? 'portrait' : el.querySelector('summary')?.textContent;
+    const openDetails = new Set(sameFile ? [...host.querySelectorAll('details')].filter(el => el.open).map(detailKey) : []);
+    const scroll = sameFile ? host.scrollTop : 0;
+    host.dataset.filePath = item.path;
+    const { deep, local, type, text } = summaryData(item);
+    const basis = local.portrait?.catalog_version ? (local.portrait.catalog_source === 'deep_summary' ? '目录依据：深度摘要' : '目录依据：文件内容') : `置信度 ${Math.round(Number(item.confidence || 0) * 100)}%`;
+    host.innerHTML = `<button id="largeResultBackToFiles" type="button" class="ghost lp-back">← 返回文件列表</button><div class="lp-file-detail-heading"><span class="lp-scope-kind">文件详情</span><h3>${esc(String(item.path || '').split('/').pop())}</h3><p>${esc(item.path)}</p><div class="lp-detail-tags"><span>${esc(item.category || '未分类')}</span><span>${esc(fileStatus(item))}</span><span>${esc(basis)}</span></div></div><section class="lp-summary-block"><h4>${esc(type)}</h4><p>${esc(text)}</p></section>${deep.summary && (local.sample || local.notice) ? `<details class="lp-summary-extra"><summary>本地摘要</summary><p>${esc(local.sample || local.notice)}</p></details>` : ''}${window.SJFXLargePortrait?.portrait(local.portrait) || ''}${deep.text_preview ? `<details class="lp-summary-extra"><summary>已有正文预览</summary><p>${esc(deep.text_preview)}</p></details>` : ''}${item.error ? `<p class="lp-file-error">${esc(item.error)}</p>` : ''}`;
+    host.querySelectorAll('details').forEach(el => { if (openDetails.has(detailKey(el))) el.open = true; });
+    host.scrollTop = scroll;
+  }
+
   async function loadFiles() {
-    const query = $('largeResultSearch')?.value || '';
-    const category = $('largeResultCategory')?.value || '';
-    const data = await api()(`/api/large-packages/${encodeURIComponent(packageId)}/files?limit=200&q=${encodeURIComponent(query)}&category=${encodeURIComponent(category)}`);
-    renderFiles(data.files || []);
+    if (!packageId) return;
+    const requestId = ++fileRequestId;
+    const id = packageId, mode = browseMode, stage = currentStage, state = browse();
+    const node = state.node;
+    const params = new URLSearchParams({ limit: '100', offset: String(state.offset), q: state.query, category: node.type === 'category' ? node.value : state.category, topic: node.type === 'topic' ? node.value : '' });
+    if (node.type === 'directory') params.set('directory', node.value);
+    if (node.type === 'group') params.set('node_id', node.value);
+    if (['role', 'project', 'entity', 'date'].includes(node.type)) { params.set('facet_kind', node.type); params.set('facet_value', node.value); }
+    const isCurrent = () => requestId === fileRequestId && id === packageId && mode === browseMode && stage === currentStage && state === browse();
+    $('largeResultListView')?.setAttribute('aria-busy', 'true');
+    try {
+      const data = await api()(`/api/large-packages/${encodeURIComponent(id)}/files?${params}`);
+      if (!isCurrent()) return;
+      const total = Number(data.total || 0);
+      if (state.offset >= total && state.offset > 0) { state.offset = total ? Math.floor((total - 1) / 100) * 100 : 0; return await loadFiles(); }
+      renderFiles(data.files || []);
+      setText('largeResultFileStats', `匹配 ${total} 个 · 本页 ${files.length} 个`);
+      renderScope(total);
+      const pager = $('largeResultPager');
+      if (pager) {
+        const markup = window.SJFXLargePortrait.pager('largeResultPage', state.offset, 100, total);
+        if (pager.dataset.markup !== markup) { pager.innerHTML = markup; pager.dataset.markup = markup; }
+      }
+    } catch (error) {
+      if (isCurrent()) { setText('largeResultFileStats', '读取失败，请重试'); state.notice = error.message || '文件摘要读取失败'; renderScope(); }
+    } finally {
+      if (isCurrent()) $('largeResultListView')?.setAttribute('aria-busy', 'false');
+    }
+  }
+
+  function prepareFileNavigation() {
+    fileRequestId++; files = []; fileFingerprint = '';
+    if ($('largeResultFiles')) $('largeResultFiles').innerHTML = '<div class="large-empty">正在读取文件…</div>';
+    setText('largeResultFileStats', '正在读取文件…');
+    $('largeResultPager')?.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    if ($('largeResultPager')) delete $('largeResultPager').dataset.markup;
+  }
+
+  function switchBrowseMode(mode) {
+    if (!['physical', 'smart'].includes(mode) || mode === browseMode) return;
+    browse().draft = $('largeResultSearch')?.value || '';
+    browseMode = mode;
+    fileRequestId++; fileFingerprint = ''; detailFingerprint = '';
+    syncBrowseUI(); renderScope(); renderFileDetail();
+    prepareFileNavigation(); loadFiles();
+  }
+
+  function selectBrowseNode(type, value) {
+    const state = browse();
+    const info = nodeInfo.get(nodeKey(type, value));
+    state.node = { type, value, label: info?.label || value || '整个数据包' };
+    state.query = ''; state.draft = ''; state.category = type === 'category' ? value : ''; state.offset = 0; state.total = null; state.file = null; state.notice = ''; state.listScroll = 0;
+    fileRequestId++; fileFingerprint = ''; detailFingerprint = '';
+    syncBrowseUI(); renderScope(); renderFileDetail();
+    prepareFileNavigation(); loadFiles();
+  }
+
+  function resetBrowser() {
+    selectedForSummary.clear();
+    browseMode = 'physical'; browseStates = { physical: newBrowseState(), smart: newBrowseState() };
+    latestCatalog = null; files = []; nodeInfo = new Map();
+    catalogFingerprint = ''; fileFingerprint = ''; detailFingerprint = '';
+    fileRequestId++; loadRequestId++; clearTimeout(liveTimer); clearInterval(retryTimer);
+    for (const id of ['largeResultOriginalCatalog', 'largeResultSmartCatalog', 'largeResultFiles']) if ($(id)) $(id).innerHTML = '<div class="large-empty">正在读取数据包…</div>';
+    if ($('largeResultPager')) $('largeResultPager').innerHTML = '';
+    if ($('largeResultCategory')) $('largeResultCategory').innerHTML = '<option value="">全部分类</option>';
+    setText('largeResultFileStats', '正在读取文件…');
+    syncBrowseUI(); renderScope(); renderFileDetail();
+  }
+
+  function bindExplorer() {
+    ensureExplorer();
+    $('largeResultSearch')?.addEventListener('input', () => { browse().draft = $('largeResultSearch').value; });
+    const search = () => {
+      const state = browse();
+      state.query = $('largeResultSearch')?.value.trim() || ''; state.draft = $('largeResultSearch')?.value || ''; state.category = $('largeResultCategory')?.value || ''; state.offset = 0; state.listScroll = 0; state.notice = ''; state.total = null; state.file = null;
+      if (state.node.type === 'category' && state.node.value !== state.category) state.node = { type: 'all', value: '', label: '整个数据包' };
+      markSelectedNode(); renderScope(); renderFileDetail(); prepareFileNavigation(); loadFiles();
+    };
+    $('largeResultSearchBtn')?.addEventListener('click', search);
+    $('largeResultSearch')?.addEventListener('keydown', event => { if (event.key === 'Enter') search(); });
+    $('largeResultCategory')?.addEventListener('change', search);
+    $('largeResultClearSearch')?.addEventListener('click', () => { if ($('largeResultSearch')) $('largeResultSearch').value = ''; if ($('largeResultCategory')) $('largeResultCategory').value = browse().node.type === 'category' ? browse().node.value : ''; search(); });
+    $('largeResultExplorer')?.addEventListener('keydown', event => {
+      if (!event.target.closest('[role="tab"]')) return;
+      if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const mode = event.key === 'Home' ? 'physical' : event.key === 'End' ? 'smart' : browseMode === 'physical' ? 'smart' : 'physical';
+        switchBrowseMode(mode); $(mode === 'physical' ? 'largeResultPhysicalTab' : 'largeResultSmartTab')?.focus();
+      }
+    });
+    $('largeResultExplorer')?.addEventListener('click', event => {
+      const mode = event.target.closest('[data-lp-mode]');
+      if (mode) { switchBrowseMode(mode.dataset.lpMode); return; }
+      const expand = event.target.closest('[data-lp-expand]');
+      if (expand) {
+        const state = browse(), key = expand.dataset.lpExpand, open = !state.expanded.has(key);
+        if (open) state.expanded.add(key); else state.expanded.delete(key);
+        expand.setAttribute('aria-expanded', String(open));
+        expand.setAttribute('aria-label', `${open ? '收起' : '展开'} ${expand.parentElement.querySelector('.lp-node')?.textContent || '目录'}`);
+        const children = expand.parentElement.nextElementSibling;
+        if (children) children.hidden = !open;
+        return;
+      }
+      const group = event.target.closest('[data-lp-group]');
+      if (group) {
+        const key = group.dataset.lpGroup, open = !browse().expanded.has(key);
+        if (open) browse().expanded.add(key); else browse().expanded.delete(key);
+        group.setAttribute('aria-expanded', String(open)); group.nextElementSibling.hidden = !open; return;
+      }
+      const node = event.target.closest('[data-lp-node]');
+      if (node) { selectBrowseNode(node.dataset.lpType, node.dataset.lpValue); return; }
+      if (event.target.closest('#largeResultClearScope')) { selectBrowseNode('all', ''); return; }
+      const file = event.target.closest('[data-lp-file]');
+      if (file) { browse().file = files.find(item => item.path === file.dataset.lpFile) || null; detailFingerprint = ''; renderFileDetail(); $('largeResultBackToFiles')?.focus({ preventScroll: true }); return; }
+      if (event.target.closest('#largeResultBackToFiles')) {
+        const path = browse().file?.path; browse().file = null; renderFileDetail();
+        if ($('largeResultFiles')) $('largeResultFiles').scrollTop = browse().listScroll;
+        [...document.querySelectorAll('#largeResultFiles [data-lp-file]')].find(el => el.dataset.lpFile === path)?.focus({ preventScroll: true }); return;
+      }
+      const page = event.target.closest('#largeResultPagePrev, #largeResultPageNext');
+      if (page && !page.disabled) { browse().offset = Math.max(0, browse().offset + (page.id.endsWith('Next') ? 100 : -100)); browse().listScroll = 0; prepareFileNavigation(); loadFiles(); }
+    });
   }
 
   function renderResearchBrief(report) {
@@ -72,8 +469,9 @@
     const findings = $('largeResultFindings');
     if (findings) findings.innerHTML = `<h4>关键发现</h4>${list(brief.key_findings, '当前没有形成稳定发现')}`;
     const directionHost = $('largeResultDirection');
+    const preliminary = Boolean(brief.preliminary || (brief.available && !brief.ready));
     if (directionHost) directionHost.innerHTML = direction.title
-      ? `<h4>${esc(direction.title)}</h4><p>${esc(direction.rationale || '该方向仍需结合代表性资料继续验证。')}</p>${list(direction.research_questions, '暂无建议问题')}`
+      ? `<h4>${esc(direction.title)}</h4>${preliminary ? '<p class="lp-brief-stage">初步研究方向：完成深度摘要后将自动更新。</p>' : ''}<p>${esc(direction.rationale || '该方向仍需结合代表性资料继续验证。')}</p>${list(direction.research_questions, '暂无建议问题')}`
       : `<p>${esc(brief.empty_direction_reason || '当前尚未形成首选研究方向。')}</p>`;
     const details = $('largeResultResearchDetails');
     if (details) {
@@ -83,12 +481,12 @@
     }
     const limitations = $('largeResultLimitations');
     if (limitations) limitations.innerHTML = list(brief.limitations, '当前未记录额外限制');
-    const ready = Boolean(brief.ready || brief.available);
+    const ready = Boolean(brief.available || brief.ready);
     ['largeResultDownloadDocx', 'largeResultDownloadJson'].forEach((id) => {
       const button = $(id);
       if (button) button.disabled = !ready;
     });
-    setText('largeResultDownloadStatus', ready ? '研究简报已生成，可下载概览文件。' : (brief.empty_direction_reason || '深度摘要完成后生成研究简报。'));
+    setText('largeResultDownloadStatus', ready ? (preliminary ? '初步研究简报已生成，可下载；完成深度摘要后将自动更新。' : '研究简报已生成，可下载概览文件。') : (brief.empty_direction_reason || '快速解析形成研究方向后即可下载简报。'));
   }
 
   function renderControls(item) {
@@ -99,17 +497,24 @@
     ['largeResultPauseBtn', 'largePackagePauseBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !active; });
     ['largeResultResumeBtn', 'largePackageResumeBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !paused; });
     ['largeResultCancelBtn', 'largePackageCancelBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !active; });
+    // 暂停后双入口：继续深度摘要（上方"继续处理"）+ 生成情报概览（基于已完成部分）。
+    const deepCompleted = Number(latestStatus?.counts?.deep?.completed || 0);
+    const briefButton = $('largeResultBuildBrief');
+    if (briefButton) briefButton.hidden = !(paused && deepCompleted > 0);
   }
 
   async function control(action) {
     if (!packageId) return;
     if (action === 'cancel' && !window.confirm('停止后会保留已完成结果，但未完成文件不会继续处理。确定停止这个数据包吗？')) return;
     const endpoint = action === 'pause' ? 'pause' : action === 'resume' ? 'resume' : 'cancel';
-    const response = await api()(`/api/large-packages/${encodeURIComponent(packageId)}/${endpoint}`, { method: 'POST' });
+    const targetId = packageId;
+    const response = await api()(`/api/large-packages/${encodeURIComponent(targetId)}/${endpoint}`, { method: 'POST' });
+    if (targetId !== packageId) return;
     const item = response.large_package || {};
     renderControls(item);
     setText('largeResultStatus', `${item.message || '状态已更新'} · ${item.phase || '—'} · ${item.progress || 0}%`);
     if (endpoint === 'cancel') setText('largeResultDownloadStatus', '任务已停止，已完成结果仍然保留。');
+    await load();
   }
 
   async function downloadReport(format) {
@@ -137,14 +542,37 @@
 
   async function load() {
     if (!packageId) return;
-    const status = await api()(`/api/large-packages/${encodeURIComponent(packageId)}`);
+    const requestId = ++loadRequestId, id = packageId, stage = currentStage;
+    const isCurrent = () => requestId === loadRequestId && id === packageId && stage === currentStage;
+    clearTimeout(liveTimer);
+    const status = await api()(`/api/large-packages/${encodeURIComponent(id)}`);
+    if (!isCurrent()) return;
     const item = status.large_package || {};
     renderControls(item);
+    let recognize = $('largeResultRecognize');
+    if (!recognize && $('largeResultRefreshBtn')) {
+      recognize = document.createElement('button'); recognize.id = 'largeResultRecognize'; recognize.type = 'button'; recognize.textContent = '补充内容识别';
+      $('largeResultRefreshBtn').after(recognize);
+      recognize.onclick = async () => {
+        recognize.disabled = true;
+        try {
+          const targetId = packageId;
+          const result = await api()(`/api/large-packages/${encodeURIComponent(targetId)}/recognize`, {method:'POST'});
+          if (targetId !== packageId) return;
+          setText('largeResultStatus', `已排队 ${result.queued_files || 0} 个文件；每轮追加识别有时间预算，目录将继续更新。`);
+          clearTimeout(liveTimer); liveTimer = setTimeout(() => load().catch(error => setText('largeResultStatus',error.message)), 1500);
+        } catch (error) { setText('largeResultStatus', error.message); }
+        finally { recognize.disabled = false; }
+      };
+    }
+    if (recognize) recognize.disabled = !['completed', 'waiting_for_selection'].includes(item.status);
     setText('largeResultStatus', `${item.message || '大数据包成果'} · ${item.phase || '—'} · ${item.progress || 0}%`);
     setText('largeResultPackageId', packageId);
-    const reportPayload = await api()(`/api/large-packages/${encodeURIComponent(packageId)}/report`);
+    const c = item.counts || {};
+    const reportPayload = currentStage === 'catalog' ? {report:{coverage:{inventory_files:c.total_files,quick_completed:c.quick?.completed,deep_completed:c.deep?.completed},categories:c.categories || {}}} : await api()(`/api/large-packages/${encodeURIComponent(packageId)}/report`);
+    if (!isCurrent()) return;
     const report = reportPayload.report || {};
-    renderResearchBrief(report);
+    if (stage === 'overview') renderResearchBrief(report);
     const coverage = report.coverage || {};
     setText('largeResultInventory', coverage.inventory_files || 0);
     setText('largeResultQuick', coverage.quick_completed || 0);
@@ -164,65 +592,118 @@
     if (retry) retry.hidden = !failures.length || !['completed', 'waiting_for_selection'].includes(item.status);
     const select = $('largeResultCategory');
     if (select) {
-      select.innerHTML = '<option value="">全部分类</option>';
-      Object.keys(categories).forEach((category) => select.add(new Option(`${category} (${categories[category]})`, category)));
+      const selectedCategory = browse().category;
+      const categoryNames = Object.keys(categories);
+      if (selectedCategory && !categoryNames.includes(selectedCategory)) categoryNames.push(selectedCategory);
+      const options = '<option value="">全部分类</option>' + categoryNames.map(category => `<option value="${esc(category)}">${esc(category)}${categories[category] == null ? '' : ` (${categories[category]})`}</option>`).join('');
+      if (select.dataset.options !== options) { select.innerHTML = options; select.dataset.options = options; }
+      select.value = selectedCategory;
     }
-    renderCatalog((await api()(`/api/large-packages/${encodeURIComponent(packageId)}/catalog`)).catalog);
-    await loadFiles();
+    const catalog = (await api()(`/api/large-packages/${encodeURIComponent(id)}/catalog`)).catalog;
+    if (!isCurrent()) return;
+    renderCatalog(catalog);
+    const directoryPending = (catalog?.smart?.naming?.active ? 1 : 0) + Number(catalog?.smart?.catalog_states?.pending || 0) + Number(catalog?.smart?.catalog_states?.grouped || 0) + Number(catalog?.smart?.pending_groups || 0);
+    if (stage === 'catalog') await loadFiles();
+    if (!isCurrent()) return;
+    clearTimeout(liveTimer);
+    if (['queued','running'].includes(item.status) || (directoryPending > 0 && ['completed','waiting_for_selection'].includes(item.status))) {
+      liveTimer = setTimeout(() => { load().catch(error => { if (id === packageId && stage === currentStage) setText('largeResultStatus', error.message); }); }, 5000);
+    }
   }
 
   async function retryFailed() {
     if (!packageId) return;
-    const response = await api()(`/api/large-packages/${encodeURIComponent(packageId)}/retry-failed`, { method: 'POST' });
+    const targetId = packageId;
+    const response = await api()(`/api/large-packages/${encodeURIComponent(targetId)}/retry-failed`, { method: 'POST' });
+    if (targetId !== packageId) return;
     setText('largeResultDownloadStatus', response.retry_files ? `已重新排队 ${response.retry_files} 个失败文件，正在处理。` : '当前没有可重试的失败文件。');
+    clearInterval(retryTimer);
     if (response.retry_files) {
-      const timer = window.setInterval(async () => {
+      retryTimer = window.setInterval(async () => {
+        if (targetId !== packageId) { window.clearInterval(retryTimer); return; }
         try {
-          const status = await api()(`/api/large-packages/${encodeURIComponent(packageId)}`);
+          const status = await api()(`/api/large-packages/${encodeURIComponent(targetId)}`);
+          if (targetId !== packageId) return;
           await load();
-          if (['waiting_for_selection', 'completed', 'failed', 'cancelled'].includes(status.large_package?.status)) window.clearInterval(timer);
-        } catch (_) { window.clearInterval(timer); }
+          if (['waiting_for_selection', 'completed', 'failed', 'cancelled'].includes(status.large_package?.status)) window.clearInterval(retryTimer);
+        } catch (_) { window.clearInterval(retryTimer); }
       }, 2000);
     }
   }
   async function activate(id, stage = currentStage) {
-    packageId = String(id || packageId || '');
-    if (!packageId) {
+    const requestId = ++activationId;
+    let nextId = String(id || packageId || '');
+    if (!nextId) {
       try {
         const history = await api()('/api/large-packages/history?limit=1');
+        if (requestId !== activationId) return;
         const latest = (history.items || [])[0];
-        packageId = String(latest?.large_package_id || latest?.scan_id || '');
+        nextId = String(latest?.large_package_id || latest?.scan_id || '');
       } catch (error) {
-        setText('largeResultStatus', error.message || '大数据包历史读取失败');
+        if (requestId === activationId) setText('largeResultStatus', error.message || '大数据包历史读取失败');
+        return;
       }
     }
+    ensureExplorer();
+    if (nextId !== packageId) { packageId = nextId; extraCatalogNodes = []; resetBrowser(); }
+    setStage(stage);
     if (!packageId) {
       setText('largeResultStatus', '暂无大数据包成果，请先创建一个大数据包任务');
-      if (window.SJFXShell && !['large-catalog', 'large-overview', 'large-result'].includes(document.body.dataset.route)) window.SJFXShell.activate('large-overview');
       return;
     }
     window.sjfxLargeResultId = packageId;
-    setStage(stage);
-    if (window.SJFXShell && !['large-catalog', 'large-overview', 'large-result'].includes(document.body.dataset.route)) window.SJFXShell.activate('large-overview');
-    else document.querySelectorAll('.app-view').forEach((el) => el.classList.toggle('active', el.dataset.view === 'large-result'));
-    try { await load(); } catch (error) { setText('largeResultStatus', error.message || '大数据包成果读取失败'); }
+    if (window.SJFXShell && !['large-catalog', 'large-overview', 'large-result'].includes(document.body.dataset.route)) {
+      window.SJFXShell.activate(currentStage === 'catalog' ? 'large-catalog' : 'large-overview'); return;
+    }
+    document.querySelectorAll('.app-view').forEach(el => el.classList.toggle('active', el.dataset.view === 'large-result'));
+    try { await load(); } catch (error) { if (requestId === activationId) setText('largeResultStatus', error.message || '大数据包成果读取失败'); }
   }
   window.SJFXLargeResult = { activate };
+  window.addEventListener('sjfx-shell-state', event => {
+    if (!['large-catalog', 'large-overview', 'large-result'].includes(event.detail?.route)) {
+      clearTimeout(liveTimer); clearInterval(retryTimer); loadRequestId++; fileRequestId++; activationId++;
+    }
+  });
+  document.addEventListener('click', async event => {
+    const more = event.target.closest?.('[data-lp-more]');
+    if (more && packageId) {
+      more.disabled=true;const id=packageId;
+      try {
+        const offset=(latestCatalog?.smart?.topics || []).length;
+        const result=await api()('/api/large-packages/'+encodeURIComponent(id)+'/catalog/nodes?offset='+offset+'&limit=200');
+        if (id===packageId) { extraCatalogNodes.push(...result.topics);renderCatalog(latestCatalog); }
+      } catch(error) { setText('largeResultStatus',error.message);more.disabled=false; }
+      return;
+    }
+    const rename=event.target.closest?.('[data-lp-rename]');
+    if (rename && packageId) {
+      const node=browse().node;const info=nodeInfo.get(nodeKey(node.type,node.value)) || node;
+      const name=window.prompt('输入根据内容确认的目录名称。保存后自动更新将保留此名称。',info.label || node.label);
+      if (name==null)return;
+      try { await api()('/api/large-packages/'+encodeURIComponent(packageId)+'/catalog/nodes/'+encodeURIComponent(node.value)+'/name',{method:'POST',body:JSON.stringify({name})});extraCatalogNodes=[];await load(); }
+      catch(error) {setText('largeResultStatus',error.message);}
+      return;
+    }
+    const improve = event.target.closest?.('[data-lp-improve]');
+    if (!improve || !packageId) return;
+    improve.disabled = true;
+    const id = packageId;
+    const request_key = improve.dataset.requestKey || ('name-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+    improve.dataset.requestKey = request_key;
+    try {
+      await api()('/api/large-packages/' + encodeURIComponent(id) + '/catalog/improve', {method:'POST',body:JSON.stringify({request_key})});
+      if (id === packageId) await load();
+    } catch (error) { setText('largeResultStatus',error.message); improve.disabled=false; }
+  });
+  document.addEventListener('change', event => {
+    const input = event.target.closest?.('[data-catalog-select]');
+    if (!input) return;
+    if (input.checked) selectedForSummary.add(input.dataset.catalogSelect); else selectedForSummary.delete(input.dataset.catalogSelect);
+    renderSelection();
+  });
   document.addEventListener('DOMContentLoaded', () => {
+    bindExplorer();
     $('largeResultRefreshBtn')?.addEventListener('click', () => activate(packageId));
-    $('largeResultSearchBtn')?.addEventListener('click', loadFiles);
-    $('largeResultSearch')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') loadFiles(); });
-    $('largeResultCategory')?.addEventListener('change', loadFiles);
-    document.querySelector('.large-result-view')?.addEventListener('click', (event) => {
-      const node = event.target.closest('[data-large-node-type]');
-      if (!node || !event.target.closest('summary')) return;
-      const type = node.dataset.largeNodeType || '';
-      const value = node.dataset.largeNodeValue || '';
-      if ($('largeResultSearch')) $('largeResultSearch').value = type === 'directory' ? value : '';
-      if ($('largeResultCategory')) $('largeResultCategory').value = type === 'category' ? value : '';
-      setText('largeResultNodeSummary', `${type === 'category' ? '智能目录分类' : '原始目录'}：${value || '根目录'} · 正在读取该节点的文件摘要`);
-      loadFiles().then(() => setText('largeResultNodeSummary', `${type === 'category' ? '智能目录分类' : '原始目录'}：${value || '根目录'} · 已显示该节点的文件摘要`)).catch((error) => setText('largeResultNodeSummary', error.message || '节点摘要读取失败'));
-    });
     $('largeResultToImport')?.addEventListener('click', () => window.SJFXShell?.activate('large-import'));
     $('largeResultToSelect')?.addEventListener('click', () => {
       if (window.openLargePackageHistory && packageId) window.openLargePackageHistory(packageId, 'select');
@@ -231,6 +712,17 @@
     $('largeResultSwitchPackage')?.addEventListener('click', () => window.SJFXDataSources?.open('large') || window.SJFXShell?.activate('packages'));
     $('largeResultPauseBtn')?.addEventListener('click', async () => { try { await control('pause'); } catch (error) { setText('largeResultStatus', error.message || '暂停失败'); } });
     $('largeResultResumeBtn')?.addEventListener('click', async () => { try { await control('resume'); } catch (error) { setText('largeResultStatus', error.message || '继续失败'); } });
+    $('largeResultBuildBrief')?.addEventListener('click', async () => {
+      if (!packageId) return;
+      const button = $('largeResultBuildBrief');
+      if (button) { button.disabled = true; button.textContent = '正在生成…'; }
+      try {
+        await api()(`/api/large-packages/${encodeURIComponent(packageId)}/report`);
+        await activate(packageId, 'overview');
+        if (window.toast) window.toast('情报概览已生成（基于已完成的深度摘要）');
+      } catch (error) { setText('largeResultStatus', error.message || '情报概览生成失败'); }
+      finally { if (button) { button.disabled = false; button.textContent = '生成情报概览'; } }
+    });
     $('largeResultCancelBtn')?.addEventListener('click', async () => { try { await control('cancel'); } catch (error) { setText('largeResultStatus', error.message || '停止失败'); } });
     $('largeResultToCatalog')?.addEventListener('click', () => window.SJFXShell?.activate('large-catalog'));
     $('largeResultToOverview')?.addEventListener('click', () => window.SJFXShell?.activate('large-overview'));

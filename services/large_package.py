@@ -63,7 +63,9 @@ def build_policy(scan, options=None):
     )
     preview_zip_members = max(1, min(1000, int(options.get("preview_zip_members") or 80)))
     preview_zip_member_bytes = max(256, min(64 * 1024, int(options.get("preview_zip_member_bytes") or 8192)))
-    threshold_enabled = total_size >= threshold_bytes or file_count >= threshold_files
+    threshold_enabled = bool(options.get("auto_threshold", True)) and (
+        total_size >= threshold_bytes or file_count >= threshold_files
+    )
     enabled = bool(options.get("force_enabled")) or threshold_enabled
     large_directory_mode = enabled and bool(options.get("large_directory_mode", True))
     directory_model_limit = max(12, min(500, int(

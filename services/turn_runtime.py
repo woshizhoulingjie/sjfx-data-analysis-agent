@@ -664,6 +664,15 @@ class AnalysisTurnRuntime:
             quality_metrics = dict(verification.get("quality_metrics") or {})
             quality_metrics["revision_attempts"] = revision_attempts
             quality_metrics["professional_tool_count"] = len(tool_results)
+            package_reading = dict(turn_result.get("package_reading") or {})
+            if package_reading:
+                quality_metrics.update({
+                    "package_reading_files": package_reading.get("files_read"),
+                    "summary_backed_files": package_reading.get("summary_backed_files"),
+                    "files_without_summary": package_reading.get("files_without_summary"),
+                    "package_reading_coverage": package_reading.get("summary_coverage"),
+                    "package_reading_complete": package_reading.get("complete"),
+                })
             turn_result["quality_metrics"] = quality_metrics
             turn_result["citation_verification_status"] = verification.get("status")
             turn_result["scope_completeness"] = (

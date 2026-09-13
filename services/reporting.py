@@ -709,7 +709,10 @@ def build_local_report(scan, summaries, analysis=None):
     findings = [
         "包内精确去重发现 {} 个重复组，除每组保留 1 个规范副本外，可合并重复文件 {} 个。".format(stats.get("exact_duplicate_groups", 0), stats.get("exact_duplicate_files", 0)),
         "高相似度检测形成 {} 个相似文档簇；内容主题聚合形成 {} 个主题簇。".format(stats.get("similar_document_clusters", 0), stats.get("topic_clusters", 0)),
-        "统一解析成功登记 {} 个文件，生成 {} 条可回查证据；{} 个文件解析失败。".format(stats.get("parsed_files", 0), stats.get("evidence_items", 0), stats.get("failed_files", 0)),
+        # ``failed_files`` is a subset of ``parsed_files`` (a file can be
+        # registered with an incomplete body), so the wording must not read as
+        # two disjoint totals.
+        "统一解析登记 {} 个文件，生成 {} 条可回查证据；其中 {} 个文件正文未完整覆盖（详见《解析覆盖率清单》）。".format(stats.get("parsed_files", 0), stats.get("evidence_items", 0), stats.get("failed_files", 0)),
         "本地混合检索已建立 {} 个证据块；{} 个 Office 文件启用了内嵌图片 OCR。".format(stats.get("retrieval_evidence_chunks", 0), stats.get("office_embedded_image_ocr_files", 0)),
     ]
     if coverage.get("limitations"):
@@ -723,15 +726,52 @@ def build_local_report(scan, summaries, analysis=None):
         findings.append("扫描阶段有 {} 个路径读取失败，需要补充权限后重新分析。".format(len(scan["errors"])))
     if stats.get("truncated_text_files", 0):
         findings.append("有 {} 个文件达到正文保存上限；相关摘要必须结合《解析覆盖率清单》复核，不得表述为全文完整覆盖。".format(stats["truncated_text_files"]))
+    # ``fast_preview_paths`` mixes two unrelated limitations.  A scanned PDF
+    # really was only OCR'd on a few pages; an Office file simply skipped the
+    # optional embedded-image OCR while its body text was read in full.  Report
+    # them separately so a .docx is never described as a 扫描型 PDF.
     fast_preview_paths = stats.get("fast_preview_paths", [])
-    if fast_preview_paths:
-        shown = "、".join(fast_preview_paths[:8])
-        suffix = " 等" if len(fast_preview_paths) > 8 else ""
+    scanned_pdf_previews = [
+        path for path in fast_preview_paths
+        if str(path).lower().endswith(".pdf")
+    ]
+    office_image_skipped = [
+        path for path in fast_preview_paths
+        if not str(path).lower().endswith(".pdf")
+    ]
+    if scanned_pdf_previews:
+        shown = "、".join(scanned_pdf_previews[:8])
+        suffix = " 等" if len(scanned_pdf_previews) > 8 else ""
         findings.append("快速模式仅预览 OCR 了 {} 个扫描型 PDF 的前几页：{}{}；这些文件不得视为全文分析。".format(
-            len(fast_preview_paths), shown, suffix
+            len(scanned_pdf_previews), shown, suffix
         ))
+    if office_image_skipped:
+        findings.append(
+            "有 {} 个 Office 文件（如 .docx/.pptx/.xlsx）正文已完整提取，但快速模式跳过了内嵌图片 OCR；"
+            "需要图片文字时请对这些文件切换高精度解析。".format(len(office_image_skipped))
+        )
     if classification_source != "adaptive_analysis_tree":
         findings.append("自适应内容分类未完成，报告已降级为单一扫描清单类别；未按目录或文件逐项展开，避免产生误导性海量类别。")
+    # Degradation must be visible: without this the semantic path could fail
+    # silently and the directory would be read as if it were model-named.
+    # Cluster degradation and naming degradation are separate facts and must be
+    # described separately, otherwise a successful clustering run with a
+    # degraded label would be reported as a failed clustering run.
+    semantic_error = stats.get("semantic_cluster_error")
+    semantic_clusters = int(stats.get("semantic_topic_clusters") or 0)
+    if semantic_error and semantic_clusters == 0:
+        findings.append(
+            "文档级语义聚类未完成（{}），本次目录由词法主题兜底生成，主题命名与分组粒度会明显下降；"
+            "建议修复后重新分析或人工复核目录。".format(str(semantic_error)[:200])
+        )
+    elif semantic_error:
+        findings.append(
+            "文档级语义聚类已完成（{} 个主题簇），但主题命名降级（{}）；"
+            "分组结构可信，名称建议人工复核或触发“完善目录名称”。".format(
+                semantic_clusters, str(semantic_error)[:200])
+        )
+    elif semantic_clusters == 0 and int(stats.get("parsed_files") or 0) > 1:
+        findings.append("本次未产生语义主题簇，目录按词法主题生成，分组精度低于语义模式，请人工复核。")
 
     direction_candidates = _direction_candidates(scan, analysis)
     direction = direction_candidates[0] if direction_candidates else _research_direction(scan, summaries, analysis)

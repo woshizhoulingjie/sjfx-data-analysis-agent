@@ -8,6 +8,8 @@
   'use strict';
 
   const CURRENT_SCAN_KEY = 'sjfx_current_scan_id_v1';
+  const CHAT_SOURCE_KEY = 'sjfx_chat_source_v1';
+  const TRANSLATION_SOURCE_KEY = 'sjfx_translation_source_v1';
   const LAST_DOCUMENT_KEY = 'sjfx_last_document_path_v2';
   const LAST_DOCUMENT_SCAN_KEY = 'sjfx_last_document_scan_id_v1';
   const PAGE_SIZE = 6000;
@@ -37,7 +39,10 @@
     translationOffset: 0, translationPage: null, translationLoading: false,
     translationListOffset: 0, translationListPage: null, translationListLoading: false,
     translationRequestSeq: 0, translationListRequestSeq: 0, translationSearchTimer: 0,
-    conversationListRequestSeq: 0,
+    translationSelectedPaths: new Set(), translationSubmitting: false, translationActiveJob: '',
+    conversationListRequestSeq: 0, conversationRequestSeq: 0, conversationContextVersion: 0, chatSourceVersion: 0,
+    chatSourceKind: 'standard', chatSourceId: '', chatSourceList: [], chatSourceRequestSeq: 0,
+    translationSourceKind: 'standard', translationSourceId: '', translationSourceList: [], translationSourceRequestSeq: 0,
     watchers: new Map(), scopeConstraints: {}, fileFolder: new Set()
   };
 
@@ -343,7 +348,7 @@
     const exact = overview.duplicates && overview.duplicates.exact_groups || {};
     const near = overview.duplicates && overview.duplicates.near_duplicate_groups || {};
     const exactItems = itemsOf(exact), nearItems = itemsOf(near);
-    host.innerHTML = `<div class="v2-split-facts"><div><b class="v2-fact-count">${integer(exact.duplicate_file_count)}</b><span>精确重复副本</span><div class="v2-fact-list">${exactItems.slice(0, 4).map(duplicateGroup).join('') || '<small class="muted">无精确重复组</small>'}</div></div><div><b class="v2-fact-count">${integer(near.duplicate_file_count)}</b><span>近似重复副本</span><div class="v2-fact-list">${nearItems.slice(0, 4).map(duplicateGroup).join('') || '<small class="muted">无近似重复组</small>'}</div></div></div>${disclosure(exact, '精确重复组')}${disclosure(near, '近似重复组')}`;
+    host.innerHTML = `<div class="v2-split-facts"><div><b class="v2-fact-count">${integer(exact.duplicate_file_count)}</b><span>精确重复副本</span><div class="v2-fact-list">${exactItems.slice(0, 4).map(duplicateGroup).join('') || '<small class="muted">无精确重复组</small>'}</div></div><div><b class="v2-fact-count">${integer(near.duplicate_file_count)}</b><span>高相似候选文件</span><div class="v2-fact-list">${nearItems.slice(0, 4).map(duplicateGroup).join('') || '<small class="muted">无高相似候选组</small>'}</div></div></div>${disclosure(exact, '精确重复组')}${disclosure(near, '近似重复组')}`;
   }
 
   function renderOutliers(overview) {
@@ -515,7 +520,9 @@
   function renderScopeFields() {
     const host = $('conversationScopeFields');
     if (!host) return;
-    const kind = $('conversationScopeKind').value;
+    const select = $('conversationScopeKind');
+    if (select) syncScopeOptions(select);
+    const kind = select ? select.value : 'package';
     if (kind === 'package') {
       host.innerHTML = '<p class="help-text">问题将在当前数据包的全部可检索资料中查找证据。</p>';
     } else if (kind === 'time') {
@@ -661,7 +668,7 @@
   }
 
   function ensureGeneralSession() {
-    if (state.scanId || state.conversation) return;
+    if (state.chatSourceKind === 'large' || chatScanId() || state.conversation) return;
     state.conversation = {
       session_id: `general-${Date.now()}`,
       scan_id: '',
@@ -669,6 +676,206 @@
       scope: { kind: 'general' },
       messages: state.generalChatMessages.slice()
     };
+  }
+
+  /* Chat data source -------------------------------------------------------
+   * The chat page owns its own package selection.  An isolated large package
+   * lives in a separate store, so choosing one must never rewrite the global
+   * current-scan key that the translation, directory, overview and export
+   * views depend on.  ``chatScanId`` therefore resolves the chat package
+   * independently and falls back to the ordinary workspace in standard mode.
+   */
+  const SCOPE_OPTIONS = [
+    ['package', '整个数据包'], ['topic', '主题'], ['directory', '目录'],
+    ['entity', '人物或机构'], ['time', '时间范围'], ['file_type', '文件类型'],
+    ['files', '指定文件']
+  ];
+  const LARGE_SCOPE_OPTIONS = [['package', '整个数据包'], ['files', '指定文件']];
+
+  function chatScanId() {
+    return state.chatSourceKind === 'large' ? state.chatSourceId : state.scanId;
+  }
+
+  function isLargeChatSource() {
+    return state.chatSourceKind === 'large';
+  }
+
+  function chatSourcePayload() {
+    return isLargeChatSource() ? { package_type: 'large' } : {};
+  }
+
+  function beginConversationTransition() {
+    state.conversationContextVersion += 1;
+    state.conversationRequestSeq += 1;
+    state.conversationSending = false;
+    state.generalChatSending = false;
+    state.conversationPending = null;
+    for (const key of state.watchers.keys()) {
+      if (key.startsWith('analysis-turn-') || key.startsWith('conversation-')) state.watchers.delete(key);
+    }
+    return state.conversationRequestSeq;
+  }
+
+  function chatSourceStatusLabel(item) {
+    return String((item && item.status) || '').trim() || '未知状态';
+  }
+
+  function persistChatSource() {
+    try {
+      window.localStorage.setItem(CHAT_SOURCE_KEY, JSON.stringify({
+        kind: state.chatSourceKind, id: state.chatSourceId
+      }));
+    } catch (_error) { /* browser storage is optional */ }
+  }
+
+  function restoreChatSource() {
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(CHAT_SOURCE_KEY) || '{}');
+      if (stored && stored.kind === 'large' && String(stored.id || '').startsWith('lp-')) {
+        state.chatSourceKind = 'large';
+        state.chatSourceId = String(stored.id);
+        return;
+      }
+    } catch (_error) { /* fall back to the ordinary package */ }
+    state.chatSourceKind = 'standard';
+    state.chatSourceId = '';
+  }
+
+  function syncScopeOptions(select) {
+    if (!select) return;
+    const signature = isLargeChatSource() ? 'large' : 'standard';
+    if (select.dataset.scopeSignature === signature) return;
+    if (signature === 'standard' && !select.dataset.scopeSignature) {
+      // The standard option list is rendered by the template; leave it alone.
+      select.dataset.scopeSignature = signature;
+      return;
+    }
+    const options = signature === 'large' ? LARGE_SCOPE_OPTIONS : SCOPE_OPTIONS;
+    const previous = select.value;
+    select.innerHTML = options
+      .map(([value, label]) => `<option value="${value}">${label}</option>`)
+      .join('');
+    select.dataset.scopeSignature = signature;
+    select.value = options.some(([value]) => value === previous) ? previous : 'package';
+  }
+
+  function renderChatSourceBar() {
+    const bar = $('chatSourceBar');
+    if (!bar) return;
+    bar.querySelectorAll('[data-chat-source-kind]').forEach((button) => {
+      const active = button.dataset.chatSourceKind === state.chatSourceKind;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    const select = $('chatSourceSelect');
+    if (select) {
+      const desired = state.chatSourceKind === 'large' ? state.chatSourceId : state.scanId;
+      const matched = state.chatSourceList.some((item) => String(item.scan_id) === String(desired));
+      select.innerHTML = ['<option value="">选择数据包…</option>']
+        .concat(state.chatSourceList.map((item) => {
+          const label = `${item.name || item.scan_id} · ${chatSourceStatusLabel(item)}`;
+          const disabled = item.usable === false ? ' disabled' : '';
+          return `<option value="${escapeHtml(item.scan_id)}"${disabled}>${escapeHtml(label)}</option>`;
+        }))
+        .join('');
+      select.value = matched ? String(desired) : '';
+      select.disabled = !state.chatSourceList.length;
+    }
+    const hint = $('chatSourceState');
+    if (hint) {
+      hint.textContent = state.chatSourceKind === 'large'
+        ? '大包问答依据文件摘要，证据定位到文件'
+        : '普通数据包沿用数据包页当前选择';
+    }
+    syncScopeOptions($('conversationScopeKind'));
+  }
+
+  async function loadChatSources() {
+    const requestSeq = ++state.chatSourceRequestSeq;
+    const kind = state.chatSourceKind;
+    const endpoint = kind === 'large' ? '/api/large-packages/history' : '/api/data-sources';
+    try {
+      const response = await api(`${endpoint}?limit=50&offset=0`);
+      if (state.chatSourceRequestSeq !== requestSeq || state.chatSourceKind !== kind) return;
+      state.chatSourceList = (response.items || []).map((item) => ({
+        scan_id: String(item.scan_id || item.id || ''),
+        name: String(item.name || item.root || item.scan_id || ''),
+        status: item.status || '',
+        usable: item.usable === undefined ? true : Boolean(item.usable),
+      })).filter((item) => item.scan_id);
+    } catch (error) {
+      if (state.chatSourceRequestSeq !== requestSeq) return;
+      state.chatSourceList = [];
+      const hint = $('chatSourceState');
+      if (hint) hint.textContent = error.message || '数据包列表读取失败';
+    }
+    renderChatSourceBar();
+  }
+
+  async function setChatSource(kind, id) {
+    const nextKind = kind === 'large' ? 'large' : 'standard';
+    if (nextKind === 'standard' && id && id !== state.scanId) {
+      // Picking an ordinary package keeps the single global workspace in step,
+      // exactly like the data-package page does.
+      try {
+        await api('/api/data-sources/select', { method: 'POST', body: JSON.stringify({ scan_id: id }) });
+      } catch (error) {
+        notify(error.message || '切换数据包失败', true);
+        return;
+      }
+      state.chatSourceKind = 'standard';
+      state.chatSourceId = '';
+      persistChatSource();
+      resetForScan(id);
+      loadChatSources();
+      return;
+    }
+    const nextId = nextKind === 'large' ? String(id || '') : '';
+    if (nextKind === state.chatSourceKind && nextId === state.chatSourceId) return;
+    state.chatSourceKind = nextKind;
+    state.chatSourceId = nextId;
+    state.chatSourceVersion += 1;
+    beginConversationTransition();
+    state.conversationListRequestSeq += 1;
+    persistChatSource();
+    // Every chat artifact belonged to the previous package and must go.
+    state.conversation = null;
+    state.conversationPending = null;
+    state.conversationLoading = false;
+    state.searchIndex = null;
+    state.conversationList = [];
+    state.turns.clear();
+    state.fileSummaries = null;
+    state.fileSummariesScanId = '';
+    state.scopeConstraints = {};
+    if ($('conversationScopeKind')) { $('conversationScopeKind').value = 'package'; }
+    renderChatSourceBar();
+    renderScopeFields();
+    renderConversation();
+    renderConversationList();
+    notify(nextKind === 'large' ? '已切换到大数据库，证据定位到文件' : '已切换到普通数据包');
+    if (chatScanId()) loadConversationList();
+  }
+
+  function bindChatSource() {
+    const bar = $('chatSourceBar');
+    if (!bar) return;
+    bar.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-chat-source-kind]');
+      if (!button) return;
+      const kind = button.dataset.chatSourceKind;
+      if (kind === state.chatSourceKind) return;
+      setChatSource(kind, '');
+      loadChatSources();
+    });
+    const select = $('chatSourceSelect');
+    if (select) {
+      select.addEventListener('change', (event) => {
+        const id = String(event.target.value || '');
+        if (!id) return;
+        setChatSource(state.chatSourceKind, id);
+      });
+    }
   }
 
   function renderConversationList() {
@@ -682,25 +889,57 @@
   }
 
   async function loadConversationList() {
-    if (!state.scanId) return;
-    const requestedScanId = state.scanId;
+    if (!chatScanId()) return;
+    const requestedScanId = chatScanId();
     const requestSeq = ++state.conversationListRequestSeq;
     try {
       const response = await api(`/api/conversations/${encodeURIComponent(requestedScanId)}`);
-      if (state.scanId !== requestedScanId || state.conversationListRequestSeq !== requestSeq) return;
+      if (chatScanId() !== requestedScanId || state.conversationListRequestSeq !== requestSeq) return;
       state.conversationList = response.items || [];
       renderConversationList();
     } catch (error) {
-      if (state.scanId === requestedScanId && state.conversationListRequestSeq === requestSeq) $('conversationList').innerHTML = `<span class="help-text">${escapeHtml(error.message)}</span>`;
+      if (chatScanId() === requestedScanId && state.conversationListRequestSeq === requestSeq) $('conversationList').innerHTML = `<span class="help-text">${escapeHtml(error.message)}</span>`;
     }
   }
 
   function citationMarkup(citation) {
-    const location = citation.location && Object.keys(citation.location).length
+    const legacyPackageId = (String(citation.evidence_id || '').match(/^large:(lp-[^:]+):/) || [])[1];
+    const sourcePackage = citation.source_package || (legacyPackageId ? {
+      id: legacyPackageId,
+      name: (state.chatSourceList.find((item) => item.scan_id === legacyPackageId) || {}).name,
+      type: 'large'
+    } : null);
+    const fileEvidence = citation.evidence_level === 'file' || Boolean(sourcePackage && sourcePackage.type === 'large');
+    const packageLabel = sourcePackage ? `<small>大数据包：${escapeHtml(sourcePackage.name || sourcePackage.id)} · ${escapeHtml(sourcePackage.id)}</small>` : '';
+    const location = fileEvidence ? '文件级证据 · 已保存摘要，非全文原文' : citation.location && Object.keys(citation.location).length
       ? Object.entries(citation.location).map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join('-') : value}`).join(' · ') : '原文片段';
-    const original = citation.original_text ? `<p><b>原文：</b>${escapeHtml(citation.original_text)}</p>` : '';
+    const original = citation.original_text ? `<p><b>${fileEvidence ? '文件摘要' : '原文'}：</b>${escapeHtml(citation.original_text)}</p>` : '';
     const translated = citation.translated_text ? `<p><b>中文：</b>${escapeHtml(citation.translated_text)}</p>` : '';
-    return `<div class="v2-citation"><strong>${escapeHtml(citation.citation_label || '')} ${escapeHtml(citation.source_path || '未知来源')}</strong><small>${escapeHtml(location)} · ${escapeHtml(citation.evidence_role || '直接证据')}</small>${translated}${original}<button type="button" class="text-button" data-citation-translation="${escapeHtml(citation.source_path || '')}">在翻译页打开</button></div>`;
+    const scoreValue = Number(citation.retrieval_score);
+    const scoreLabel = Number.isFinite(scoreValue) ? `相关度 ${scoreValue.toFixed(2)}` : '';
+    const matchedKeywords = Array.isArray(citation.matched_keywords) ? citation.matched_keywords.filter(Boolean) : [];
+    const matchLabel = citation.match_reason
+      ? String(citation.match_reason)
+      : (matchedKeywords.length ? `命中关键词：${matchedKeywords.slice(0, 5).join('、')}` : '');
+    const provenance = [scoreLabel, matchLabel].filter(Boolean).join(' · ');
+    const provenanceLine = provenance ? `<small class="v2-citation-provenance">${escapeHtml(provenance)}</small>` : '';
+    const path = String(citation.source_path || '');
+    const actions = path ? `<div class="v2-citation-actions"><button type="button" class="text-button" data-citation-read="${escapeHtml(path)}">阅读原文</button><button type="button" class="text-button" data-citation-collect="${escapeHtml(path)}">收入资料夹</button><button type="button" class="text-button" data-citation-node="${escapeHtml(path)}">归入节点</button><button type="button" class="text-button" data-citation-translation="${escapeHtml(path)}">查看译文</button></div>` : '';
+    return `<article class="v2-citation">${packageLabel}<strong>${escapeHtml(citation.citation_label || '')} ${escapeHtml(path || '未知来源')}</strong><small>${escapeHtml(location)} · ${escapeHtml(citation.evidence_role || '直接证据')}</small>${provenanceLine}${translated}${original}${actions}</article>`;
+  }
+
+  function packageReadingMarkup(turn) {
+    const reading = turn && (turn.package_reading || turn.input_manifest && turn.input_manifest.package_reading);
+    if (!reading || reading.files_read == null) return '';
+    const filesRead = integer(reading.files_read);
+    const summaryFiles = integer(reading.summary_backed_files);
+    const missing = numeric(reading.files_without_summary);
+    const coverage = reading.summary_coverage == null ? '' : ` · 摘要覆盖 ${Math.round(numeric(reading.summary_coverage) * 100)}%`;
+    const status = reading.complete ? '完整阅读层' : '待补全阅读层';
+    const detail = reading.complete
+      ? `已逐份纳入 ${filesRead} 个文件的已持久化摘要${coverage}`
+      : `已纳入 ${summaryFiles}/${filesRead} 份可用摘要${coverage}，仍有 ${integer(missing)} 份等待补全`;
+    return `<section class="v2-package-reading ${reading.complete ? 'is-complete' : 'is-partial'}" aria-label="全包阅读范围"><div><strong>全包阅读</strong><span>${escapeHtml(status)}</span></div><p>${escapeHtml(detail)}</p></section>`;
   }
 
   function analysisTurnStatusLabel(status) {
@@ -754,6 +993,9 @@
     const candidateDepth = candidateDepthValue == null ? null : numeric(candidateDepthValue);
     const scopeCoverageValue = metrics.inspection_coverage == null ? metrics.scope_inspection_coverage : metrics.inspection_coverage;
     const scopeCoverage = scopeCoverageValue == null ? null : numeric(scopeCoverageValue);
+    const packageReadingFiles = metrics.package_reading_files == null ? null : numeric(metrics.package_reading_files);
+    const summaryBackedFiles = metrics.summary_backed_files == null ? null : numeric(metrics.summary_backed_files);
+    const packageReadingCoverage = metrics.package_reading_coverage == null ? null : numeric(metrics.package_reading_coverage);
     const values = [
       ['范围文件', integer(scopeFiles)],
       ['候选文件', integer(metrics.candidate_files)],
@@ -771,6 +1013,8 @@
     if (scopeCoverage != null) values.splice(5, 0, ['范围检查率', `${Math.round(scopeCoverage * 100)}%`]);
     if (candidateDepth != null) values.splice(6, 0, ['候选深析率', `${Math.round(candidateDepth * 100)}%`]);
     if (coverage != null && scopeCoverage == null && candidateDepth == null) values.splice(5, 0, ['覆盖率', `${Math.round(coverage * 100)}%`]);
+    if (packageReadingFiles != null) values.splice(1, 0, ['全包摘要', `${integer(summaryBackedFiles)}/${integer(packageReadingFiles)}`]);
+    if (packageReadingCoverage != null) values.splice(2, 0, ['摘要覆盖', `${Math.round(packageReadingCoverage * 100)}%`]);
     const status = { verified: '引用核验通过', partial: '引用部分通过', insufficient_evidence: '证据不足', not_required: '无需引用核验' }[metrics.verification_status] || metrics.verification_status || '待核验';
     const task = taskStatusLabel(turn && turn.task_status);
     return `<section class="v2-quality" aria-label="分析质量"><header><strong>分析质量</strong><span>${escapeHtml(task ? `${task} · ${status}` : status)}</span></header><div>${values.map(([label, value]) => `<dl><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></dl>`).join('')}</div></section>`;
@@ -815,7 +1059,14 @@
     const intent = message.intent || turn && turn.intent && turn.intent.name;
     let evidence = '';
     if (turn && Array.isArray(turn.citations) && turn.citations.length) {
-      evidence = `<details class="v2-citations"><summary>查看 ${integer(turn.citations.length)} 条引用证据</summary>${turn.citations.map(citationMarkup).join('')}</details>`;
+      // The page lists every retrieved result; the model only receives the
+      // dynamically selected core evidence, so both counts are surfaced.
+      const retrievedCount = Number.isFinite(Number(turn.retrieval_count)) ? Number(turn.retrieval_count) : turn.citations.length;
+      const modelCount = Number.isFinite(Number(turn.model_evidence_count)) ? Number(turn.model_evidence_count) : null;
+      const evidenceCounts = modelCount == null
+        ? `检索到 ${integer(retrievedCount)} 条证据`
+        : `检索到 ${integer(retrievedCount)} 条证据 · 本轮模型采用 ${integer(modelCount)} 条核心证据`;
+      evidence = `${packageReadingMarkup(turn)}<details class="v2-citations"><summary>证据轨迹 · ${evidenceCounts}</summary>${turn.citations.map(citationMarkup).join('')}</details>`;
     } else if (message.evidence_ids && message.evidence_ids.length) {
       evidence = `<details class="v2-citations"><summary>查看证据标识</summary><div class="v2-citation"><small>${escapeHtml(message.evidence_ids.join('、'))}</small></div></details>`;
     }
@@ -825,14 +1076,15 @@
     const fileResults = turn && Array.isArray(turn.file_results) ? turn.file_results : [];
     const completePackageFiles = Boolean(turn && Array.isArray(turn.related_file_paths) && turn.related_file_paths.length);
     const renderedFileResults = completePackageFiles ? fileResults : fileResults.slice(0, 20);
-    const fileCards = fileResults.length ? `<section class="v2-file-results"><header><div><strong>相关文件</strong><span>${integer(turn.file_results_total || fileResults.length)} 个命中文件${turn.file_results_coverage ? ` · ${escapeHtml(turn.file_results_coverage)}` : ''}</span></div><div class="v2-file-bulk-actions"><span class="v2-file-selection-status" data-file-selection-count>未选择文件</span><button type="button" data-select-all-files>全选</button><button type="button" data-create-node-selected disabled>选中后创建节点</button><button type="button" data-export-file-folder>导出资料夹</button></div></header>${renderedFileResults.map((item) => {
+    const fileCountLabel = simpleFileSearch ? '个命中文件' : '个范围文件';
+    const fileCards = fileResults.length ? `<section class="v2-file-results"><header><div><strong>相关文件</strong><span>${integer(turn.file_results_total || fileResults.length)} ${fileCountLabel}${turn.file_results_coverage ? ` · ${escapeHtml(turn.file_results_coverage)}` : ''}</span></div><div class="v2-file-bulk-actions"><span class="v2-file-selection-status" data-file-selection-count>未选择文件</span><button type="button" data-select-all-files>全选</button><button type="button" data-create-node-selected disabled>选中后创建节点</button><button type="button" data-export-file-folder>导出资料夹</button></div></header>${renderedFileResults.map((item) => {
       const path = item.node_path || item.path || item.source_path || '';
       const snippets = Array.isArray(item.snippets) ? item.snippets.filter(Boolean) : [];
       const preview = item.preview || {};
       const previewText = preview.text || snippets.join(' … ');
       const pages = Array.isArray(item.pages) && item.pages.length ? ` · 页 ${item.pages.slice(0, 3).join(', ')}` : '';
       const status = item.analysis_level || item.status || '';
-      return `<article class="v2-file-card"><label class="v2-file-select"><input type="checkbox" data-file-select="${escapeHtml(path)}"><span class="sr-only">选择 ${escapeHtml(basename(path))}</span></label><div><strong title="${escapeHtml(path)}">${escapeHtml(basename(path))}</strong><small>${escapeHtml(path)} · ${escapeHtml(item.extension || '未知类型')} · ${escapeHtml(formatBytes(item.size || 0))}${pages}${status ? ` · ${escapeHtml(status)}` : ''}</small>${previewText ? `<p>${escapeHtml(truncate(previewText, 260))}</p>` : ''}</div><div class="v2-file-card-actions"><button type="button" data-file-open="${escapeHtml(path)}">阅读原文</button><button type="button" data-file-download="${escapeHtml(path)}">下载原文件</button><button type="button" data-file-deep-summary="${escapeHtml(path)}">深度摘要</button><button type="button" data-file-collect="${escapeHtml(path)}">加入资料夹</button><button type="button" data-file-node="${escapeHtml(path)}">归入新节点</button></div></article>`;
+      return `<article class="v2-file-card"><label class="v2-file-select"><input type="checkbox" data-file-select="${escapeHtml(path)}"><span class="sr-only">选择 ${escapeHtml(basename(path))}</span></label><div><strong title="${escapeHtml(path)}">${escapeHtml(basename(path))}</strong><small>${escapeHtml(path)} · ${escapeHtml(item.extension || '未知类型')}${item.size != null ? ` · ${escapeHtml(formatBytes(item.size))}` : ''}${pages}${status ? ` · ${escapeHtml(status)}` : ''}</small>${previewText ? `<p>${escapeHtml(truncate(previewText, 260))}</p>` : ''}</div><div class="v2-file-card-actions"><button type="button" data-file-open="${escapeHtml(path)}">阅读原文</button><button type="button" data-file-deep-summary="${escapeHtml(path)}">深度摘要</button><button type="button" data-file-collect="${escapeHtml(path)}">加入资料夹</button><button type="button" data-file-node="${escapeHtml(path)}">归入新节点</button></div></article>`;
     }).join('')}</section>` : '';
     const meta = role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intentLabel(intent))}</span>${task ? `<span>${escapeHtml(task)}</span>` : ''}${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${evidenceStatus && evidenceStatus !== 'not_required' ? `<span>证据：${escapeHtml(evidenceStatus)}</span>` : ''}</div>` : '';
     const content = role === 'assistant' ? safeMarkdown(assistantDisplayText(message.content)) : `<p>${escapeHtml(message.content || '')}</p>`;
@@ -844,7 +1096,7 @@
       ? `<section class="v2-turn-warnings"><strong>范围与核验限制</strong><ul>${turn.warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></section>`
       : '';
     const manifest = role === 'assistant' && turn && turn.input_manifest && !simpleFileSearch
-      ? `<details class="v2-input-manifest"><summary>查看本次实际分析范围</summary><div>实际纳入 ${integer(turn.input_manifest.selected_files || 0)} 个文件、${integer(turn.input_manifest.selected_evidence || 0)} 个内容片段，共约 ${integer(turn.input_manifest.selected_characters || 0)} 字。${turn.input_manifest.deferred_files && turn.input_manifest.deferred_files.length ? `仍有 ${integer(turn.input_manifest.deferred_files.length)} 个候选文件未纳入本轮。` : ''}</div></details>`
+      ? `<details class="v2-input-manifest"><summary>查看本次实际分析范围</summary><div>实际纳入 ${integer(turn.input_manifest.selected_files || 0)} 个文件、${integer(turn.input_manifest.selected_evidence || 0)} 个内容片段，共约 ${integer(turn.input_manifest.selected_characters || 0)} 字。${turn.input_manifest.package_reading && turn.input_manifest.package_reading.files_read != null ? ` 全包阅读层已处理 ${integer(turn.input_manifest.package_reading.summary_backed_files || 0)}/${integer(turn.input_manifest.package_reading.files_read)} 份摘要。` : ''}${turn.input_manifest.deferred_files && turn.input_manifest.deferred_files.length ? `仍有 ${integer(turn.input_manifest.deferred_files.length)} 个候选文件未纳入本轮。` : ''}</div></details>`
       : '';
     const steps = !simpleFileSearch && turn && Array.isArray(turn.steps) && turn.steps.length ? `<details class="v2-analysis-steps"><summary>查看分析步骤</summary>${turn.steps.map((step) => `<div class="v2-analysis-step ${escapeHtml(step.status || 'pending')}"><span>${escapeHtml(step.action || step.tool || '')}</span><b>${escapeHtml(analysisTurnStatusLabel(step.status))}</b></div>`).join('')}</details>` : '';
     const continueDeep = turn && turn.status === 'completed' && turn.promotion_limit_reached
@@ -856,7 +1108,7 @@
 
   function renderConversation() {
     const session = state.conversation;
-    const generalMode = Boolean(session && !state.scanId);
+    const generalMode = Boolean(session && !chatScanId());
     const indexBlocked = Boolean(
       session && state.searchIndex && state.searchIndex.usable === false
     );
@@ -897,7 +1149,7 @@
       ));
     $('conversationQuestion').disabled = !session || state.conversationSending || state.generalChatSending || state.conversationLoading || (!generalMode && indexBlocked);
     $('conversationSendBtn').disabled = !session || state.conversationSending || state.generalChatSending || state.conversationLoading || (!generalMode && indexBlocked);
-    $('conversationNewBtn').disabled = false;
+    $('conversationNewBtn').disabled = isLargeChatSource() && !chatScanId();
     $('conversationComposerHint').textContent = indexBlocked
       ? '当前没有可检索文本；请等待基础解析或重建索引'
       : indexPartial
@@ -908,7 +1160,11 @@
       $('conversationDeepeningState').className = 'v2-job-state';
       $('conversationDeepeningState').textContent = '';
     }
-    if (indexBlocked) {
+    if (isLargeChatSource() && state.searchIndex) {
+      const host = $('conversationDeepeningState');
+      host.className = `v2-job-state ${indexBlocked ? 'is-error' : 'is-complete'}`;
+      host.textContent = `大数据包文件摘要：${integer(state.searchIndex.indexed_files)}/${integer(state.searchIndex.total_files)} 份可用${indexBlocked ? ' · 请等待大包基础摘要完成' : ' · 证据定位到文件'}`;
+    } else if (indexBlocked) {
       const host = $('conversationDeepeningState');
       host.className = 'v2-job-state is-error';
       host.innerHTML = `当前没有可检索文本 · ${integer(state.searchIndex.documents)} 份已保存文档 <button type="button" data-rebuild-search-index>重建索引</button>`;
@@ -925,8 +1181,11 @@
     const session = state.conversation;
     const page = session && session.message_page;
     if (!session || !page || !page.before_sequence) return;
+    const sourceVersion = state.chatSourceVersion;
+    const contextVersion = state.conversationContextVersion;
     try {
-      const response = await api(`/api/conversation/${encodeURIComponent(session.session_id)}?scan_id=${encodeURIComponent(state.scanId)}&message_limit=100&before_sequence=${encodeURIComponent(page.before_sequence)}`);
+      const response = await api(`/api/conversation/${encodeURIComponent(session.session_id)}?scan_id=${encodeURIComponent(chatScanId())}&message_limit=100&before_sequence=${encodeURIComponent(page.before_sequence)}`);
+      if (sourceVersion !== state.chatSourceVersion || contextVersion !== state.conversationContextVersion || state.conversation !== session) return;
       const older = response.session || {};
       const currentMessages = Array.isArray(session.messages) ? session.messages : [];
       const olderMessages = Array.isArray(older.messages) ? older.messages : [];
@@ -936,7 +1195,9 @@
   }
 
   async function createConversation() {
-    if (!state.scanId) {
+    if (isLargeChatSource() && !chatScanId()) { notify('请先选择大数据包', true); return; }
+    if (!chatScanId()) {
+      beginConversationTransition();
       state.generalChatMessages = [];
       state.conversation = null;
       ensureGeneralSession();
@@ -948,11 +1209,13 @@
     let scope;
     try { scope = conversationScope(); } catch (error) { notify(error.message, true); return; }
     const button = $('conversationNewBtn');
+    const requestSeq = beginConversationTransition();
     button.disabled = true;
     try {
       const response = await api('/api/conversations', {
-        method: 'POST', body: JSON.stringify({ scan_id: state.scanId, scope, title: `对话 · ${new Date().toLocaleString('zh-CN', { hour12: false })}` })
+        method: 'POST', body: JSON.stringify({ scan_id: chatScanId(), ...chatSourcePayload(), scope, title: `对话 · ${new Date().toLocaleString('zh-CN', { hour12: false })}` })
       });
+      if (requestSeq !== state.conversationRequestSeq) return;
       state.conversation = response.session;
       state.searchIndex = response.search_index || null;
       state.turns.clear();
@@ -961,20 +1224,23 @@
       $('conversationQuestion').focus();
     } catch (error) {
       notify(error.message || '新建会话失败', true);
-    } finally { button.disabled = !state.scanId; }
+    } finally { if (requestSeq === state.conversationRequestSeq) button.disabled = isLargeChatSource() && !chatScanId(); }
   }
 
   async function openConversation(sessionId) {
-    if (!state.scanId || !sessionId) return;
+    if (!chatScanId() || !sessionId) return;
+    const requestSeq = beginConversationTransition();
     state.conversationLoading = true;
     renderConversation();
     try {
-      const response = await api(`/api/conversation/${encodeURIComponent(sessionId)}?scan_id=${encodeURIComponent(state.scanId)}`);
+      const response = await api(`/api/conversation/${encodeURIComponent(sessionId)}?scan_id=${encodeURIComponent(chatScanId())}`);
+      if (requestSeq !== state.conversationRequestSeq) return;
       state.conversation = response.session;
       state.searchIndex = response.search_index || null;
       state.turns.clear();
       registerAnalysisTurns(response.turns || []);
       for (const historicalTurn of (response.turns || [])) {
+        if (requestSeq !== state.conversationRequestSeq) return;
         const storedResult = historicalTurn.result && typeof historicalTurn.result === 'object' ? historicalTurn.result : {};
         if (Array.isArray(storedResult.related_file_paths) && storedResult.related_file_paths.length) {
           await attachFileResults(historicalTurn.question, historicalTurn);
@@ -987,9 +1253,10 @@
         }
       }
       renderConversation();
+      if (requestSeq !== state.conversationRequestSeq) return;
       (response.turns || []).filter((turn) => ['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status)).forEach((turn) => watchAnalysisTurn(turn.id));
     } catch (error) { notify(error.message || '无法打开会话', true); }
-    finally { state.conversationLoading = false; renderConversation(); }
+    finally { if (requestSeq === state.conversationRequestSeq) { state.conversationLoading = false; renderConversation(); } }
   }
 
   function jobStatusLabel(job) {
@@ -1053,7 +1320,15 @@
     if (!turnId) return;
     const key = `analysis-turn-${turnId}`;
     const token = `${Date.now()}-${Math.random()}`;
-    const requestedScanId = state.scanId;
+    const requestedScanId = chatScanId();
+    const sourceVersion = state.chatSourceVersion;
+    const contextVersion = state.conversationContextVersion;
+    const requestedSessionId = state.conversation && state.conversation.session_id;
+    const isCurrent = () => sourceVersion === state.chatSourceVersion
+      && contextVersion === state.conversationContextVersion
+      && chatScanId() === requestedScanId
+      && state.conversation && state.conversation.session_id === requestedSessionId
+      && state.watchers.get(key) === token;
     let afterEventId = 0;
     let needsSnapshot = true;
     state.watchers.set(key, token);
@@ -1065,7 +1340,7 @@
           // snapshot is fetched only after a change so long analyses do not
           // repeatedly transfer the same evidence and conversation payload.
           const eventResponse = await api(`/api/turns/${encodeURIComponent(turnId)}/events?after=${afterEventId}`);
-          if (state.scanId !== requestedScanId || state.watchers.get(key) !== token) return;
+          if (!isCurrent()) return;
           const events = Array.isArray(eventResponse.items) ? eventResponse.items : [];
           afterEventId = numeric(eventResponse.next_after == null ? afterEventId : eventResponse.next_after);
           if (events.length) {
@@ -1076,9 +1351,9 @@
           }
           if (needsSnapshot || events.length) {
             const response = await api(`/api/turns/${encodeURIComponent(turnId)}`);
-            if (state.scanId !== requestedScanId || state.watchers.get(key) !== token) return;
+            if (!isCurrent()) return;
             const turn = response.turn || {};
-            if (response.session) state.conversation = response.session;
+            if (response.session && response.session.session_id === requestedSessionId) state.conversation = response.session;
             registerAnalysisTurn(turn, response.steps || []);
             const progress = Math.round(numeric(turn.progress));
             if (['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status)) {
@@ -1100,7 +1375,7 @@
             }
           }
         } catch (error) {
-          if (state.scanId !== requestedScanId || state.watchers.get(key) !== token) return;
+          if (!isCurrent()) return;
           host.className = 'v2-job-state is-error';
           host.textContent = `分析状态暂时无法读取：${error.message}`;
           needsSnapshot = true;
@@ -1148,15 +1423,15 @@
   }
 
   async function rebuildConversationSearchIndex() {
-    if (!state.scanId) return;
+    if (!chatScanId() || isLargeChatSource()) return;
     try {
-      const response = await api(`/api/scans/${encodeURIComponent(state.scanId)}/rebuild-search-index`, {
+      const response = await api(`/api/scans/${encodeURIComponent(chatScanId())}/rebuild-search-index`, {
         method: 'POST', body: '{}'
       });
       const host = $('conversationDeepeningState');
       host.className = 'v2-job-state is-running';
       host.textContent = response.created ? '索引重建任务已进入队列' : '索引重建任务正在运行';
-      watchJob(response.job_id, `search-index-${state.scanId}`, (job) => {
+      watchJob(response.job_id, `search-index-${chatScanId()}`, (job) => {
         const progress = job.progress == null ? '' : ` · ${Math.round(numeric(job.progress))}%`;
         if (job.status === 'completed') {
           host.className = 'v2-job-state is-complete';
@@ -1185,11 +1460,11 @@
   }
 
   async function downloadOriginalFile(path) {
-    if (!state.scanId || !path) return;
+    if (!chatScanId() || !path) return;
     try {
-      const endpoint = String(state.scanId).startsWith('lp-')
-        ? `/api/large-packages/${encodeURIComponent(state.scanId)}/file?path=${encodeURIComponent(path)}&download=1`
-        : `/api/document/${encodeURIComponent(state.scanId)}/raw?path=${encodeURIComponent(path)}&download=1`;
+      const endpoint = String(chatScanId()).startsWith('lp-')
+        ? `/api/large-packages/${encodeURIComponent(chatScanId())}/file?path=${encodeURIComponent(path)}&download=1`
+        : `/api/document/${encodeURIComponent(chatScanId())}/raw?path=${encodeURIComponent(path)}&download=1`;
       const response = await window.SJFXAuth.request(
         endpoint,
         { headers: { Accept: '*/*' } },
@@ -1207,20 +1482,41 @@
     } catch (error) { notify(error.message || '原文件下载失败', true); }
   }
 
+  function buildReaderWindowHtml(name, path, fileUrl, bodyHtml) {
+    // 阅读窗口自带"下载原文件"，下载入口已并入阅读，不再单列按钮。
+    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(name)} · 原文阅读</title><style>
+      :root{color-scheme:dark}
+      body{margin:0;background:#0d1420;color:#d1daed;font:14px/1.7 "Microsoft YaHei",system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
+      header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:#141c2c;border-bottom:1px solid #2c3952;flex-shrink:0}
+      header strong{font-size:14px;color:#e1e9fb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      header small{color:#7d8fac;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+      header a.dl{flex-shrink:0;padding:6px 14px;border:1px solid #4169a1;border-radius:6px;background:#4169a1;color:#fff;text-decoration:none;font-size:12px}
+      header a.dl:hover{background:#5279b8}
+      main{flex:1;overflow:auto;padding:18px 22px;min-height:0}
+      main.frameless{padding:0;display:flex}
+      pre{white-space:pre-wrap;word-break:break-word;margin:0;font:13px/1.8 "Consolas","Microsoft YaHei",monospace;color:#c9d6ea}
+      object,iframe,img{width:100%;height:100%;border:0;flex:1}
+      img{object-fit:contain;height:auto}
+      .hint{color:#91a3c1;padding:30px;text-align:center}
+    </style></head><body><header><strong>${escapeHtml(name)}</strong><small>${escapeHtml(path)}</small><a class="dl" href="${fileUrl}" download="${escapeHtml(name)}">下载原文件</a></header>${bodyHtml}</body></html>`;
+  }
+
+  function openReaderWindow(html) {
+    const htmlUrl = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+    const win = window.open(htmlUrl, '_blank');
+    if (!win) { URL.revokeObjectURL(htmlUrl); notify('浏览器拦截了新窗口，请允许弹出窗口后重试', true); return null; }
+    // 阅读窗口加载完成后 HTML blob 即可回收；raw 文件 blob 由窗口内的下载按钮继续持有。
+    setTimeout(() => URL.revokeObjectURL(htmlUrl), 60000);
+    return win;
+  }
+
   async function openOriginalFile(path) {
-    if (!state.scanId || !path) return;
-    const modal = $('fileReaderModal');
-    if (!modal) return;
-    modal.hidden = false;
-    $('fileReaderTitle').textContent = basename(path);
-    $('fileReaderMeta').textContent = path;
-    $('fileReaderState').textContent = '正在读取完整原文…';
-    $('fileReaderContent').textContent = '';
-    modal.dataset.path = path;
+    if (!chatScanId() || !path) return;
+    notify('正在打开原文…');
     try {
-      const endpoint = String(state.scanId).startsWith('lp-')
-        ? `/api/large-packages/${encodeURIComponent(state.scanId)}/file?path=${encodeURIComponent(path)}`
-        : `/api/document/${encodeURIComponent(state.scanId)}/raw?path=${encodeURIComponent(path)}`;
+      const endpoint = String(chatScanId()).startsWith('lp-')
+        ? `/api/large-packages/${encodeURIComponent(chatScanId())}/file?path=${encodeURIComponent(path)}`
+        : `/api/document/${encodeURIComponent(chatScanId())}/raw?path=${encodeURIComponent(path)}`;
       const response = await window.SJFXAuth.request(
         endpoint,
         { headers: { Accept: '*/*' } },
@@ -1228,23 +1524,24 @@
       if (!response.ok) throw new Error('原文件读取失败');
       const type = String(response.headers.get('content-type') || '').toLowerCase();
       const blob = await response.blob();
-      const host = $('fileReaderContent');
-      if (type.startsWith('text/') || type.includes('json') || type.includes('xml') || type.includes('csv')) {
-        host.textContent = await blob.text();
-        $('fileReaderState').textContent = `已加载完整原文件，共 ${host.textContent.length.toLocaleString()} 个字符。`;
-      } else if (type.includes('pdf') || type.startsWith('image/')) {
-        const url = URL.createObjectURL(blob);
-        const safeName = escapeHtml(basename(path));
-        // 使用 object 让浏览器原生文件查看器接管 PDF/图片，避免 iframe 被安全策略拦截。
-        host.innerHTML = `<object data="${url}" type="${escapeHtml(type)}" aria-label="${safeName}" style="width:100%;height:100%;display:block"><div class="file-reader-fallback">浏览器未能在页面内嵌显示此文件。<a href="${url}" target="_blank" rel="noopener">在新窗口打开原文</a></div></object>`;
-        $('fileReaderState').textContent = '已加载原文件；浏览器正在显示完整内容。';
-        modal.dataset.objectUrl = url;
+      const name = basename(path);
+      const fileUrl = URL.createObjectURL(blob);
+      if (type.includes('pdf')) {
+        // 原生 PDF 查看器自带下载/打印；外层套工具栏让"下载原文件"始终可见。
+        openReaderWindow(buildReaderWindowHtml(name, path, fileUrl,
+          `<main class="frameless"><object data="${fileUrl}" type="application/pdf" aria-label="${escapeHtml(name)}"><div class="hint">浏览器未能内嵌显示此 PDF，请使用右上角"下载原文件"。</div></object></main>`));
+      } else if (type.startsWith('image/')) {
+        openReaderWindow(buildReaderWindowHtml(name, path, fileUrl,
+          `<main class="frameless"><img src="${fileUrl}" alt="${escapeHtml(name)}"></main>`));
+      } else if (type.startsWith('text/') || type.includes('json') || type.includes('xml') || type.includes('csv')) {
+        const text = await blob.text();
+        openReaderWindow(buildReaderWindowHtml(name, path, fileUrl, `<main><pre>${escapeHtml(text)}</pre></main>`));
       } else {
-        host.textContent = '此格式无法在浏览器内直接展示完整内容，请点击“下载原文件”查看真实文件。';
-        $('fileReaderState').textContent = `原文件类型：${type || '未知'}；已保留下载原文件入口。`;
+        openReaderWindow(buildReaderWindowHtml(name, path, fileUrl,
+          `<main><div class="hint">此格式（${escapeHtml(type || '未知')}）无法在浏览器内直接展示，请使用右上角"下载原文件"查看。</div></main>`));
       }
     } catch (error) {
-      $('fileReaderState').textContent = error.message || '原文读取失败';
+      notify(error.message || '原文读取失败', true);
     }
   }
 
@@ -1257,13 +1554,20 @@
   }
 
   async function queueFileDeepSummary(path, button) {
-    if (!state.scanId || !path) return;
+    if (!chatScanId() || !path) return;
     const original = button && button.textContent;
     if (button) { button.disabled = true; button.textContent = '已提交…'; }
     try {
-      const result = await api('/api/summary', {
-        method: 'POST', body: JSON.stringify({ scan_id: state.scanId, path, kind: 'file', force: true }),
-      });
+      const largeSource = isLargeChatSource();
+      const result = await api(
+        largeSource ? `/api/large-packages/${encodeURIComponent(chatScanId())}/select` : '/api/summary',
+        {
+          method: 'POST',
+          body: JSON.stringify(largeSource
+            ? { paths: [path] }
+            : { scan_id: chatScanId(), path, kind: 'file', force: true }),
+        }
+      );
       notify(result.accepted ? '文件已提交模型深度摘要' : '文件深度摘要已完成');
       if (result.job_id) watchJob(result.job_id, `file-summary-${path}`);
       if (button) button.textContent = result.job_id ? '分析中' : '已完成';
@@ -1273,29 +1577,112 @@
     }
   }
 
+  function ensureFolderDock() {
+    let dock = document.getElementById('v2FolderDock');
+    if (dock) return dock;
+    dock = document.createElement('section');
+    dock.id = 'v2FolderDock';
+    dock.className = 'v2-folder-dock';
+    dock.hidden = true;
+    dock.innerHTML = `<header><button type="button" class="v2-folder-toggle" data-folder-toggle aria-expanded="false"><strong>资料夹</strong><span data-folder-count>0 个文件</span></button><div class="v2-folder-dock-actions"><button type="button" data-folder-export>导出资料夹</button><button type="button" data-folder-clear>清空</button></div></header><ul data-folder-list hidden></ul>`;
+    dock.addEventListener('click', (event) => {
+      if (event.target.closest('[data-folder-toggle]')) {
+        const list = dock.querySelector('[data-folder-list]');
+        list.hidden = !list.hidden;
+        dock.querySelector('[data-folder-toggle]').setAttribute('aria-expanded', String(!list.hidden));
+        return;
+      }
+      const remove = event.target.closest('[data-folder-remove]');
+      if (remove) {
+        state.fileFolder.delete(remove.dataset.folderRemove || '');
+        try { sessionStorage.setItem('sjfx_file_folder_v1', JSON.stringify([...state.fileFolder])); } catch (_) {}
+        renderFolderDock();
+        return;
+      }
+      if (event.target.closest('[data-folder-clear]')) {
+        state.fileFolder.clear();
+        try { sessionStorage.setItem('sjfx_file_folder_v1', '[]'); } catch (_) {}
+        renderFolderDock();
+        notify('资料夹已清空');
+        return;
+      }
+      if (event.target.closest('[data-folder-export]')) { exportCollectedFolder(); return; }
+    });
+    document.body.appendChild(dock);
+    return dock;
+  }
+
+  function renderFolderDock() {
+    state.fileFolder = state.fileFolder || new Set();
+    const dock = ensureFolderDock();
+    const count = state.fileFolder.size;
+    dock.hidden = count === 0;
+    dock.querySelector('[data-folder-count]').textContent = `${count} 个文件`;
+    dock.querySelector('[data-folder-list]').innerHTML = [...state.fileFolder]
+      .map((path) => `<li><span title="${escapeHtml(path)}">${escapeHtml(basename(path))}</span><button type="button" data-folder-remove="${escapeHtml(path)}" aria-label="从资料夹移除 ${escapeHtml(basename(path))}">×</button></li>`)
+      .join('');
+    // 卡片上的"加入资料夹"按钮与资料夹内容保持一致（例如清空后恢复可点击）。
+    document.querySelectorAll('[data-file-collect],[data-citation-collect]').forEach((button) => {
+      const path = button.dataset.fileCollect || button.dataset.citationCollect || '';
+      if (path && !state.fileFolder.has(path) && button.disabled) {
+        button.disabled = false;
+        button.textContent = button.hasAttribute('data-citation-collect') ? '收入资料夹' : '加入资料夹';
+      }
+    });
+  }
+
   function collectFileForFolder(path, button) {
     if (!path) return;
     state.fileFolder = state.fileFolder || new Set();
     state.fileFolder.add(path);
     try { sessionStorage.setItem('sjfx_file_folder_v1', JSON.stringify([...state.fileFolder])); } catch (_) {}
     if (button) { button.textContent = '已加入资料夹'; button.disabled = true; }
-    notify(`已加入资料夹，共 ${state.fileFolder.size} 个文件`);
+    renderFolderDock();
+    notify(`已加入资料夹，共 ${state.fileFolder.size} 个文件；面板在页面右下角`);
+  }
+
+  async function downloadOutputFile(filename, message) {
+    if (!filename) return;
+    try {
+      const ticket = await api('/api/download-ticket', {
+        method: 'POST', body: JSON.stringify({ filename }),
+      });
+      const anchor = document.createElement('a');
+      anchor.href = ticket.download_url;
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      notify(message || '文件已开始下载');
+    } catch (error) { notify(error.message || '下载失败', true); }
   }
 
   async function exportCollectedFolder() {
     state.fileFolder = state.fileFolder || new Set();
-    if (!state.fileFolder.size || !state.scanId) { notify('资料夹还是空的，请先加入文件', true); return; }
+    if (!state.fileFolder.size || !chatScanId()) { notify('资料夹还是空的，请先加入文件', true); return; }
+    // The ordinary export pipeline reads ordinary scan tables only.
+    if (isLargeChatSource()) { notify('大数据包暂不支持资料夹打包导出，请使用大包报告的下载入口。', true); return; }
     try {
       const response = await api('/api/export', {
         method: 'POST',
         body: JSON.stringify({
-          scan_id: state.scanId,
+          scan_id: chatScanId(),
           task_topic: '搜索结果资料夹',
           selections: [...state.fileFolder].map((path) => ({ path, kind: 'file', name: basename(path) })),
         }),
       });
-      notify('资料夹已提交生成，完成后可下载');
-      if (response.job_id) watchJob(response.job_id, 'file-folder-export');
+      notify('资料夹打包中，完成后自动下载');
+      if (response.job_id) {
+        watchJob(response.job_id, 'file-folder-export', (job) => {
+          if (job.status === 'completed') {
+            const result = job.result && typeof job.result === 'object' ? job.result : {};
+            if (result.file_name) downloadOutputFile(result.file_name, '资料夹打包完成，已开始下载');
+            else notify('资料夹打包完成');
+          } else if (job.status === 'failed') {
+            notify(job.error || '资料夹打包失败', true);
+          }
+        });
+      }
     } catch (error) { notify(error.message || '资料夹生成失败', true); }
   }
 
@@ -1322,15 +1709,15 @@
 
   async function createNodeFromFiles(paths, button) {
     const selected = [...new Set((paths || []).filter(Boolean))];
-    if (!state.scanId || !selected.length) { notify('请先选择要整理的文件', true); return; }
+    if (!chatScanId() || !selected.length) { notify('请先选择要整理的文件', true); return; }
     const name = await askNodeName(selected);
     if (!name) return;
     if (button) { button.disabled = true; button.textContent = '创建中…'; }
     try {
-      const endpoint = String(state.scanId).startsWith('lp-')
-        ? `/api/large-packages/${encodeURIComponent(state.scanId)}/nodes`
-        : `/api/tree-edits/${encodeURIComponent(state.scanId)}`;
-      const body = String(state.scanId).startsWith('lp-')
+      const endpoint = String(chatScanId()).startsWith('lp-')
+        ? `/api/large-packages/${encodeURIComponent(chatScanId())}/nodes`
+        : `/api/tree-edits/${encodeURIComponent(chatScanId())}`;
+      const body = String(chatScanId()).startsWith('lp-')
         ? { name, paths: selected }
         : { operation: 'create', payload: { name, paths: selected } };
       const response = await api(endpoint, { method: 'POST', body: JSON.stringify(body) });
@@ -1350,6 +1737,7 @@
     const label = selected.length ? `已选择 ${selected.length} 个文件` : '未选择文件';
     document.querySelectorAll('[data-create-node-selected]').forEach((button) => {
       button.disabled = selected.length === 0;
+      button.textContent = selected.length ? `把 ${selected.length} 个文件并成新节点` : '选中后创建节点';
       button.setAttribute('aria-label', selected.length ? `用已选择的 ${selected.length} 个文件创建节点` : '请先选择文件');
     });
     document.querySelectorAll('[data-file-selection-count]').forEach((item) => { item.textContent = label; });
@@ -1359,8 +1747,28 @@
     return createNodeFromFiles([path], button);
   }
 
+  async function loadFileSummaries() {
+    if (!chatScanId()) return {};
+    const requestedScanId = chatScanId();
+    const sourceVersion = state.chatSourceVersion;
+    if (state.fileSummaries && state.fileSummariesScanId === chatScanId()) return state.fileSummaries;
+    try {
+      const result = await api(`/api/file-summaries/${encodeURIComponent(requestedScanId)}`);
+      if (sourceVersion !== state.chatSourceVersion || chatScanId() !== requestedScanId) return {};
+      state.fileSummaries = result.summaries || {};
+      state.fileSummariesScanId = requestedScanId;
+    } catch (_) {
+      if (sourceVersion === state.chatSourceVersion && chatScanId() === requestedScanId) {
+        state.fileSummaries = state.fileSummaries || {};
+      }
+    }
+    return state.fileSummaries;
+  }
+
   async function attachFileResults(question, turn) {
-    if (!state.scanId || !turn || !turn.assistant_message_id) return;
+    if (!chatScanId() || !turn || !turn.assistant_message_id) return;
+    const sourceVersion = state.chatSourceVersion;
+    const contextVersion = state.conversationContextVersion;
     const stored = state.turns.get(turn.assistant_message_id);
     const resultPayload = turn.result && typeof turn.result === 'object' ? turn.result : {};
     const relatedPaths = Array.isArray(resultPayload.related_file_paths)
@@ -1369,13 +1777,20 @@
     if (relatedPaths.length && stored) {
       // The backend resolves the complete related-file set.  Keep this list
       // independent from the bounded evidence window shown to the model.
+      const summaries = await loadFileSummaries();
+      if (sourceVersion !== state.chatSourceVersion || contextVersion !== state.conversationContextVersion) return;
       stored.related_file_paths = relatedPaths;
       stored.file_results = relatedPaths.map((path) => ({
-        path, node_path: path, name: basename(path), analysis_level: '已归集',
+        path, node_path: path, name: basename(path),
+        extension: path.includes('.') ? path.slice(path.lastIndexOf('.')).toLowerCase() : '',
+        preview: { text: summaries[path] || '' },
+        analysis_level: '已归集',
       }));
       stored.file_results_total = relatedPaths.length;
       stored.file_results_coverage = null;
-      stored.file_search = true;
+      const intent = stored.intent && typeof stored.intent === 'object' ? stored.intent.name : stored.intent;
+      stored.file_search = intent === 'file_search';
+      renderConversation();
       return;
     }
     const text = String(question || '').trim();
@@ -1386,9 +1801,10 @@
     try {
       const result = await api('/api/search/files', {
         method: 'POST',
-        body: JSON.stringify({ scan_id: state.scanId, query, page: 1, page_size: 50 })
+        body: JSON.stringify({ scan_id: chatScanId(), query, page: 1, page_size: 50 })
       });
       const target = state.turns.get(turn.assistant_message_id);
+      if (sourceVersion !== state.chatSourceVersion || contextVersion !== state.conversationContextVersion) return;
       if (target) {
         target.file_results = result.matched_files || [];
         target.file_results_total = result.matched_file_count || target.file_results.length;
@@ -1402,10 +1818,16 @@
   }
 
   async function sendQuestion(questionOverride) {
-    if (!state.conversation || state.conversationSending) return;
+    if (!state.conversation || state.conversationSending || state.generalChatSending || (isLargeChatSource() && !chatScanId())) return;
+    const sourceVersion = state.chatSourceVersion;
+    const contextVersion = state.conversationContextVersion;
+    const sessionId = state.conversation.session_id;
+    const isCurrent = () => sourceVersion === state.chatSourceVersion
+      && contextVersion === state.conversationContextVersion
+      && state.conversation && state.conversation.session_id === sessionId;
     const question = String(questionOverride || $('conversationQuestion').value || '').trim();
     if (!question) { notify('请输入问题', true); return; }
-    const generalMode = !state.scanId;
+    const generalMode = !chatScanId();
     let turnScope;
     if (!generalMode) {
       try { turnScope = conversationScope(); } catch (error) { notify(error.message, true); return; }
@@ -1420,6 +1842,7 @@
       renderConversation();
       try {
         const response = await api('/api/general-chat', { method: 'POST', body: JSON.stringify({ question, messages: history }) });
+        if (!isCurrent()) return;
         const stamp = Date.now();
         state.conversation.messages = state.conversation.messages.filter((message) => message.message_id !== optimistic.message_id).concat([
           { message_id: `general-${stamp}-user`, role: 'user', content: question },
@@ -1428,15 +1851,18 @@
         state.generalChatMessages = state.conversation.messages.slice();
         renderConversation();
       } catch (error) {
+        if (!isCurrent()) return;
         state.conversation.messages = state.conversation.messages.filter((message) => message.message_id !== optimistic.message_id);
         state.generalChatMessages = state.conversation.messages.slice();
         renderConversation();
         $('conversationQuestion').value = question;
         notify(error.message || '发送失败', true);
       } finally {
-        state.generalChatSending = false;
-        renderConversation();
-        $('conversationQuestion').focus();
+        if (isCurrent()) {
+          state.generalChatSending = false;
+          renderConversation();
+          $('conversationQuestion').focus();
+        }
       }
       return;
     }
@@ -1457,21 +1883,25 @@
     try {
       const response = await api(`/api/conversation/${encodeURIComponent(state.conversation.session_id)}/turns`, {
         method: 'POST', body: JSON.stringify({
-          scan_id: state.scanId, question, scope: turnScope,
+          scan_id: chatScanId(), ...chatSourcePayload(), question, scope: turnScope,
           persist_scope: $('conversationPersistScope').checked,
           idempotency_key: idempotencyKey
         })
       });
+      if (!isCurrent()) return;
       state.conversation = response.session;
       state.conversationPending = null;
       registerAnalysisTurn(response.turn, []);
       await attachFileResults(question, response.turn);
+      if (!isCurrent()) return;
       renderConversation();
       await loadConversationList();
+      if (!isCurrent()) return;
       $('conversationDeepeningState').className = 'v2-job-state is-running';
       $('conversationDeepeningState').textContent = '分析任务已进入队列';
       if (response.turn && response.turn.id) watchAnalysisTurn(response.turn.id);
     } catch (error) {
+      if (!isCurrent()) return;
       state.conversation.messages = state.conversation.messages.filter((message) => message.message_id !== optimistic.message_id);
       if (error.code === 'search_index_rebuild_required' && error.payload) {
         state.searchIndex = error.payload.search_index || state.searchIndex;
@@ -1484,9 +1914,11 @@
       if (error && error.status >= 400 && error.status < 500) state.conversationPending = null;
       notify(error.message || '发送失败', true);
     } finally {
-      state.conversationSending = false;
-      renderConversation();
-      $('conversationQuestion').focus();
+      if (isCurrent()) {
+        state.conversationSending = false;
+        renderConversation();
+        $('conversationQuestion').focus();
+      }
     }
   }
 
@@ -1579,7 +2011,144 @@
     host.innerHTML = values.map(([label, value]) => `<div class="v2-translation-stat"><span>${escapeHtml(label)}</span><b>${integer(value)}</b></div>`).join('');
   }
 
+
+  /* Translation data source --------------------------------------------------
+   * This selector is deliberately independent from the global scan id.  A
+   * large package is stored in large_package.db and must never replace the
+   * ordinary package used by analysis, chat, import or email translation.
+   */
+  function translationScanId() {
+    return state.translationSourceKind === 'large' ? state.translationSourceId : (state.translationSourceId || state.scanId);
+  }
+
+  function isLargeTranslationSource() {
+    return String(translationScanId() || '').startsWith('lp-');
+  }
+
+  function persistTranslationSource() {
+    try {
+      window.localStorage.setItem(TRANSLATION_SOURCE_KEY, JSON.stringify({
+        kind: state.translationSourceKind, id: state.translationSourceId
+      }));
+    } catch (_) { /* optional browser storage */ }
+  }
+
+  function restoreTranslationSource() {
+    let stored = {};
+    try {
+      stored = JSON.parse(window.localStorage.getItem(TRANSLATION_SOURCE_KEY) || '{}');
+      if (stored && stored.kind === 'large' && String(stored.id || '').startsWith('lp-')) {
+        state.translationSourceKind = 'large';
+        state.translationSourceId = String(stored.id);
+        return;
+      }
+    } catch (_) { /* use standard source */ }
+    if (stored && stored.kind === 'standard' && stored.id && !String(stored.id).startsWith('lp-')) {
+      state.translationSourceKind = 'standard';
+      state.translationSourceId = String(stored.id);
+      return;
+    }
+    state.translationSourceKind = 'standard';
+    state.translationSourceId = '';
+  }
+
+  function translationSourceLabel(item) {
+    return String((item && (item.name || item.root || item.scan_id || item.id)) || '未命名数据包');
+  }
+
+  function renderTranslationSourceBar() {
+    const bar = $('translationSourceBar');
+    if (!bar) return;
+    bar.querySelectorAll('[data-translation-source-kind]').forEach((button) => {
+      const active = button.dataset.translationSourceKind === state.translationSourceKind;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    const select = $('translationSourceSelect');
+    if (select) {
+      const desired = state.translationSourceKind === 'large' ? state.translationSourceId : (state.translationSourceId || state.scanId);
+      select.innerHTML = ['<option value="">选择数据包…</option>']
+        .concat(state.translationSourceList.map((item) => {
+          const id = String(item.scan_id || item.id || '');
+          const status = item.status ? ` · ${item.status}` : '';
+          return `<option value="${escapeHtml(id)}"${item.usable === false ? ' disabled' : ''}>${escapeHtml(translationSourceLabel(item) + status)}</option>`;
+        })).join('');
+      select.value = state.translationSourceList.some((item) => String(item.scan_id || item.id || '') === String(desired)) ? String(desired) : '';
+      select.disabled = !state.translationSourceList.length;
+    }
+    const hint = $('translationSourceState');
+    if (hint) hint.textContent = state.translationSourceKind === 'large'
+      ? '大数据包只翻译明确勾选的文件；不会影响普通数据包和邮件翻译。'
+      : '普通数据包沿用当前数据包；可跨页勾选多个文件。';
+    const large = isLargeTranslationSource();
+    ['translatePriorityBtn', 'translateBackfillBtn'].forEach((id) => {
+      if ($(id)) $(id).hidden = large;
+    });
+  }
+
+  async function loadTranslationSources() {
+    const requestSeq = ++state.translationSourceRequestSeq;
+    const kind = state.translationSourceKind;
+    const endpoint = kind === 'large' ? '/api/large-packages/history' : '/api/data-sources';
+    try {
+      const response = await api(`${endpoint}?limit=50&offset=0`);
+      if (state.translationSourceRequestSeq !== requestSeq || state.translationSourceKind !== kind) return;
+      state.translationSourceList = (response.items || []).map((item) => ({
+        scan_id: String(item.scan_id || item.id || ''), name: translationSourceLabel(item),
+        status: item.status || '', usable: item.usable === undefined ? true : Boolean(item.usable)
+      })).filter((item) => item.scan_id);
+    } catch (error) {
+      if (state.translationSourceRequestSeq !== requestSeq) return;
+      state.translationSourceList = [];
+      const hint = $('translationSourceState');
+      if (hint) hint.textContent = error.message || '数据包列表读取失败';
+    }
+    renderTranslationSourceBar();
+  }
+
+  async function setTranslationSource(kind, id) {
+    const nextKind = kind === 'large' ? 'large' : 'standard';
+    const nextId = String(id || (nextKind === 'standard' ? state.scanId : '') || '');
+    if (nextKind === 'large' && !nextId) return;
+    if (nextKind === 'standard' && !nextId) return;
+    if (nextKind === state.translationSourceKind && nextId === state.translationSourceId) return;
+    state.translationSourceKind = nextKind;
+    state.translationSourceId = nextId;
+    persistTranslationSource();
+    state.translationSourceRequestSeq += 1;
+    resetTranslationView(translationScanId());
+    renderTranslationSourceBar();
+    notify(nextKind === 'large' ? '已切换到大数据包翻译' : '已切换到普通数据包翻译');
+    if (translationScanId()) loadTranslationList();
+  }
+
+  function bindTranslationSource() {
+    const bar = $('translationSourceBar');
+    if (!bar) return;
+    bar.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-translation-source-kind]');
+      if (button) {
+        state.translationSourceKind = button.dataset.translationSourceKind === 'large' ? 'large' : 'standard';
+        state.translationSourceId = state.translationSourceKind === 'large' ? '' : '';
+        persistTranslationSource();
+        state.translationSourceRequestSeq += 1;
+        resetTranslationView(translationScanId());
+        renderTranslationSourceBar();
+        loadTranslationSources();
+        if (translationScanId()) loadTranslationList();
+      }
+    });
+    $('translationSourceSelect')?.addEventListener('change', (event) => {
+      const id = event.currentTarget.value;
+      if (id) setTranslationSource(state.translationSourceKind, id);
+    });
+  }
+
   function resetTranslationView(scanId) {
+    state.translationSelectedPaths.clear();
+    state.translationSubmitting = false;
+    state.translationActiveJob = '';
+    if ($('translationQueueState')) $('translationQueueState').textContent = '';
     state.translationOffset = 0;
     state.translationPage = null;
     state.translationLoading = false;
@@ -1613,6 +2182,28 @@
     if ($('translationListPageInfo')) $('translationListPageInfo').textContent = '—';
     ['translationListPrevBtn', 'translationListNextBtn'].forEach((id) => { if ($(id)) $(id).disabled = true; });
     renderTranslationSummary();
+    renderTranslationSelection();
+  }
+
+  function renderTranslationSelection() {
+    const selected = state.translationSelectedPaths;
+    const visible = (state.translationItems || []).map((item) => item.path);
+    const selectedVisible = visible.filter((path) => selected.has(path)).length;
+    const busy = state.translationSubmitting || Boolean(state.translationActiveJob);
+    const checkbox = $('translationSelectPage');
+    if (checkbox) {
+      checkbox.checked = visible.length > 0 && selectedVisible === visible.length;
+      checkbox.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+      checkbox.disabled = !translationScanId() || !visible.length || state.translationListLoading;
+    }
+    if ($('translationSelectedCount')) $('translationSelectedCount').textContent = `已选 ${integer(selected.size)} 份`;
+    if ($('translationClearSelection')) $('translationClearSelection').disabled = !selected.size;
+    if ($('translateSelectedBtn')) $('translateSelectedBtn').disabled = !translationScanId() || !selected.size || busy;
+    if ($('translationCancelBtn')) $('translationCancelBtn').disabled = !state.translationActiveJob;
+    ['translatePriorityBtn', 'translateBackfillBtn'].forEach((id) => { if ($(id)) $(id).disabled = !translationScanId() || busy; });
+    const page = state.translationPage || {};
+    const ready = String(page.provider_id || '').startsWith('vllm:') && page.full_translation && page.status === 'completed';
+    if ($('translateDocumentBtn')) $('translateDocumentBtn').disabled = !translationScanId() || !state.translationPath || busy || ready;
   }
 
   function renderTranslationListPager() {
@@ -1636,6 +2227,7 @@
     const items = state.translationItems || [];
     renderTranslationFilterControls();
     renderTranslationListPager();
+    renderTranslationSelection();
     if ($('translationListSummary')) {
       const controls = translationListControls();
       const total = numeric(page.total);
@@ -1660,14 +2252,14 @@
       const completed = numeric(progress.completed_units);
       const progressText = total ? ` · ${integer(completed)}/${integer(total)} 段` : '';
       const availability = item.source_availability === 'metadata' ? ' · 待解析' : item.source_availability === 'preview' ? ' · 预览可读' : '';
-      return `<button type="button" class="v2-translation-item${state.translationPath === item.path ? ' active' : ''}" data-translation-path="${escapeHtml(item.path)}"><strong>${escapeHtml(item.titles && (item.titles.translated || item.titles.original) || basename(item.path))}</strong><span>${escapeHtml(item.path)} · ${escapeHtml(translationLanguageLabel(item.source_language))} · ${escapeHtml(translationStatusLabel(item.status))}${escapeHtml(progressText)}${escapeHtml(availability)}</span></button>`;
+      return `<div class="v2-translation-row"><label class="v2-translation-check"><input type="checkbox" data-translation-select="${escapeHtml(item.path)}" aria-label="选择 ${escapeHtml(item.path)}"${state.translationSelectedPaths.has(item.path) ? ' checked' : ''}></label><button type="button" class="v2-translation-item${state.translationPath === item.path ? ' active' : ''}" data-translation-path="${escapeHtml(item.path)}"><strong>${escapeHtml(item.titles && (item.titles.translated || item.titles.original) || basename(item.path))}</strong><span>${escapeHtml(item.path)} · ${escapeHtml(translationLanguageLabel(item.source_language))} · ${escapeHtml(translationStatusLabel(item.status))}${escapeHtml(progressText)}${escapeHtml(availability)}</span></button></div>`;
     }).join('');
   }
 
   async function loadTranslationList(options) {
-    if (!state.scanId) return;
+    if (!translationScanId()) return;
     options = options || {};
-    const requestedScanId = state.scanId;
+    const requestedScanId = translationScanId();
     const requestSeq = ++state.translationListRequestSeq;
     state.translationListOffset = Math.max(0, numeric(options.offset == null ? state.translationListOffset : options.offset));
     state.translationListLoading = true;
@@ -1679,7 +2271,7 @@
         status: controls.status, language: controls.language, q: controls.query
       });
       const response = await api(`/api/translations/${encodeURIComponent(requestedScanId)}?${query.toString()}`);
-      if (state.scanId !== requestedScanId || state.translationListRequestSeq !== requestSeq) return;
+      if (translationScanId() !== requestedScanId || state.translationListRequestSeq !== requestSeq) return;
       if (!response.items?.length && numeric(response.total) && numeric(response.offset) >= numeric(response.total)) {
         const lastOffset = Math.floor((numeric(response.total) - 1) / TRANSLATION_LIST_PAGE_SIZE) * TRANSLATION_LIST_PAGE_SIZE;
         if (lastOffset !== state.translationListOffset) return loadTranslationList({ offset: lastOffset });
@@ -1692,7 +2284,7 @@
       renderTranslationList();
       if ($('translationOpenBtn')) $('translationOpenBtn').disabled = false;
     } catch (error) {
-      if (state.scanId === requestedScanId && state.translationListRequestSeq === requestSeq) {
+      if (translationScanId() === requestedScanId && state.translationListRequestSeq === requestSeq) {
         $('translationList').innerHTML = `<span class="help-text">${escapeHtml(error.message)}</span>`;
         if ($('translationListSummary')) $('translationListSummary').textContent = '无法读取翻译资料';
         if ($('translationOpenBtn')) $('translationOpenBtn').disabled = false;
@@ -1701,6 +2293,7 @@
       if (state.translationListRequestSeq === requestSeq) {
         state.translationListLoading = false;
         renderTranslationListPager();
+        renderTranslationSelection();
       }
     }
   }
@@ -1716,7 +2309,7 @@
     state.translationPage = page;
     const title = page.titles && (page.titles.translated || page.titles.original) || basename(page.path);
     $('translationDocumentTitle').textContent = title || page.path;
-    const modeLabel = page.translation_mode === 'quality' ? '精细复核模式' : '快速翻译模式';
+    const modeLabel = String(page.provider_id || '').startsWith('vllm:') ? `vLLM · ${String(page.provider_id).slice(5)}` : page.translation_mode === 'quality' ? '精细复核模式' : '已有工作译文';
     $('translationDocumentMeta').textContent = `${page.path} · ${translationStatusLabel(page.status)} · ${page.source_language || '语言待识别'} → ${page.target_language || 'zh-CN'} · ${modeLabel}`;
     const progress = page.progress || {};
     const details = [];
@@ -1754,14 +2347,13 @@
     $('translationPageInfo').textContent = bounds.total ? `${integer(bounds.offset + 1)}–${integer(bounds.end)} / ${integer(bounds.total)} 字符` : '暂无正文';
     $('translationPrevBtn').disabled = bounds.offset <= 0;
     $('translationNextBtn').disabled = !bounds.hasMore;
-    $('translateDocumentBtn').disabled = !state.scanId || !state.translationPath || page.status === 'completed' && page.full_translation;
     renderTranslationList();
   }
 
   async function loadTranslation(path, offset) {
     path = String(path || '').trim();
-    if (!state.scanId || !path || state.translationLoading) return;
-    const requestedScanId = state.scanId;
+    if (!translationScanId() || !path || state.translationLoading) return;
+    const requestedScanId = translationScanId();
     const requestSeq = ++state.translationRequestSeq;
     state.translationLoading = true;
     state.translationPath = path;
@@ -1774,24 +2366,24 @@
     try {
       const query = new URLSearchParams({ path, view: state.translationView, offset: String(state.translationOffset), limit: String(PAGE_SIZE) });
       const response = await api(`/api/translation/${encodeURIComponent(requestedScanId)}?${query.toString()}`);
-      if (state.scanId === requestedScanId && state.translationRequestSeq === requestSeq) renderTranslationDocument(response);
+      if (translationScanId() === requestedScanId && state.translationRequestSeq === requestSeq) renderTranslationDocument(response);
     } catch (error) {
-      if (state.scanId === requestedScanId && state.translationRequestSeq === requestSeq) {
+      if (translationScanId() === requestedScanId && state.translationRequestSeq === requestSeq) {
         $('translationDocumentState').textContent = error.message || '无法打开文档';
         $('translationDocumentState').className = 'v2-inline-state is-error';
         $('translationDocumentContent').innerHTML = emptyMarkup('文档未能打开', error.message || '请检查文件路径和解析状态。');
-        $('translateDocumentBtn').disabled = !state.scanId || !state.translationPath;
+        $('translateDocumentBtn').disabled = !translationScanId() || !state.translationPath;
       }
     } finally {
       if (state.translationRequestSeq === requestSeq) {
         state.translationLoading = false;
-        $('translationOpenBtn').disabled = !state.scanId;
+        $('translationOpenBtn').disabled = !translationScanId();
       }
     }
   }
 
   function translationJobState(job, label) {
-    const host = $('translationDocumentState');
+    const host = $('translationQueueState');
     if (job.status === 'completed') {
       host.textContent = `${label}已完成，正在刷新译文…`;
       host.className = 'v2-inline-state is-ready';
@@ -1810,38 +2402,113 @@
     }
   }
 
+  async function watchTranslationJob(jobId, label) {
+    const scanId = translationScanId();
+    let current = jobId;
+    let failures = 0;
+    let completed = 0;
+    let lastRefresh = 0;
+    try {
+      while (current && translationScanId() === scanId) {
+        state.translationActiveJob = current;
+        renderTranslationSelection();
+        const job = await watchJob(current, 'translation-files', (item) => {
+          translationJobState(item, label);
+          if (Date.now() - lastRefresh > 6000 && !['completed', 'failed', 'cancelled'].includes(item.status)) {
+            lastRefresh = Date.now();
+            loadTranslationList();
+            if (state.translationPath) loadTranslation(state.translationPath, state.translationOffset);
+          }
+        });
+        if (translationScanId() !== scanId || !job || job.status !== 'completed') break;
+        const result = job.result || {};
+        completed += numeric(result.completed_files);
+        failures += numeric(result.failed_files) || (['failed', 'partial'].includes(result.translation_status) ? 1 : 0);
+        current = result.continuation_job_id || '';
+        if (!current) {
+          const host = $('translationQueueState');
+          host.textContent = failures ? `${label}已结束：${integer(completed)} 份成功，${integer(failures)} 份未完成，可查看文件错误后重试。` : `${label}已完成。`;
+          host.className = 'v2-inline-state' + (failures ? ' is-error' : ' is-ready');
+        }
+      }
+    } finally {
+      if (translationScanId() === scanId) {
+        state.translationActiveJob = '';
+        state.translationSubmitting = false;
+        renderTranslationSelection();
+        loadTranslationList();
+        if (state.translationPath) loadTranslation(state.translationPath, state.translationOffset);
+      }
+    }
+  }
+
+  async function translateSelected() {
+    const scanId = translationScanId();
+    const paths = Array.from(state.translationSelectedPaths);
+    if (!scanId || !paths.length || state.translationSubmitting || state.translationActiveJob) return;
+    state.translationSubmitting = true;
+    renderTranslationSelection();
+    try {
+      const response = await api(`/api/translate-package/${encodeURIComponent(scanId)}`, {
+        method: 'POST', body: JSON.stringify({ phase: 'deep_backfill', target_paths: paths, require_full: true })
+      });
+      if (translationScanId() !== scanId) return;
+      if (!state.translationPath) loadTranslation(paths[0], 0);
+      watchTranslationJob(response.job_id, `所选 ${integer(paths.length)} 份文件翻译`);
+    } catch (error) {
+      if (translationScanId() === scanId) {
+        state.translationSubmitting = false;
+        renderTranslationSelection();
+        notify(error.message || '无法提交所选文件翻译', true);
+      }
+    }
+  }
+
   async function translateDocument() {
     const path = state.translationPath || ($('translationPath').value || '').trim();
-    if (!state.scanId || !path) { notify('请先打开一个文件', true); return; }
-    const button = $('translateDocumentBtn');
-    button.disabled = true;
+    if (!translationScanId() || !path) { notify('请先打开一个文件', true); return; }
+    if (state.translationSubmitting || state.translationActiveJob) return;
+    const scanId = translationScanId();
+    state.translationSubmitting = true;
+    renderTranslationSelection();
     try {
-      const response = await api(`/api/translation/${encodeURIComponent(state.scanId)}`, {
+      const response = await api(`/api/translation/${encodeURIComponent(translationScanId())}`, {
         method: 'POST', body: JSON.stringify({ path, require_full: true })
       });
-      $('translationDocumentState').textContent = '当前文件已加入全文翻译队列。';
-      watchJob(response.job_id, 'translation-document', (job) => translationJobState(job, '当前文件全文翻译'));
+      if (translationScanId() !== scanId) return;
+      $('translationQueueState').textContent = '当前文件已加入 vLLM 翻译队列。';
+      watchTranslationJob(response.job_id, '当前文件全文翻译');
     } catch (error) {
       notify(error.message || '无法提交翻译', true);
-      button.disabled = false;
+      if (translationScanId() === scanId) {
+        state.translationSubmitting = false;
+        renderTranslationSelection();
+      }
     }
   }
 
   async function translatePackage(phase) {
-    if (!state.scanId) return;
-    const button = phase === 'deep_backfill' ? $('translateBackfillBtn') : $('translatePriorityBtn');
-    button.disabled = true;
+    if (!translationScanId()) return;
+    if (state.translationSubmitting || state.translationActiveJob) return;
+    const scanId = translationScanId();
+    state.translationSubmitting = true;
+    renderTranslationSelection();
     try {
-      const response = await api(`/api/translate-package/${encodeURIComponent(state.scanId)}`, {
+      const response = await api(`/api/translate-package/${encodeURIComponent(translationScanId())}`, {
         method: 'POST', body: JSON.stringify({ phase })
       });
       const label = phase === 'deep_backfill' ? '全部外文全文补齐' : '预览与重点文件翻译';
-      $('translationDocumentState').textContent = `${label}已加入后台队列。`;
-      watchJob(response.job_id, `translation-package-${phase}`, (job) => translationJobState(job, label));
+      if (translationScanId() !== scanId) return;
+      $('translationQueueState').textContent = `${label}已加入后台队列。`;
+      watchTranslationJob(response.job_id, label);
       notify(`${label}已提交`);
     } catch (error) {
       notify(error.message || '无法提交数据包翻译', true);
-    } finally { button.disabled = !state.scanId; }
+      if (translationScanId() === scanId) {
+        state.translationSubmitting = false;
+        renderTranslationSelection();
+      }
+    }
   }
 
   function resetForScan(scanId) {
@@ -1873,20 +2540,30 @@
     state.researchBrief = null;
     state.reportArtifact = null;
     state.selectedScope = null;
-    state.conversation = null;
-    state.conversationLoading = false;
-    if (!scanId) ensureGeneralSession();
-    state.conversationPending = null;
-    state.searchIndex = null;
-    state.conversationList = [];
-    state.turns.clear();
-    state.translationItems = [];
-    state.translationCounts = {};
-    state.translationPath = '';
-    state.translationPage = null;
+    // A chat session bound to an isolated large package is independent of the
+    // global workspace, so switching ordinary packages must not discard it.
+    const keepChatSource = Boolean(state.chatSourceId);
+    if (!keepChatSource) {
+      state.chatSourceVersion += 1;
+      beginConversationTransition();
+      state.conversation = null;
+      state.conversationLoading = false;
+      if (!scanId) ensureGeneralSession();
+      state.searchIndex = null;
+      state.conversationList = [];
+      state.turns.clear();
+    }
+    const preserveIndependentTranslation = Boolean(translationScanId() && translationScanId() !== scanId);
+    if (!preserveIndependentTranslation) {
+      state.translationItems = [];
+      state.translationCounts = {};
+      state.translationPath = '';
+      state.translationPage = null;
+    }
     state.scopeConstraints = {};
-    state.watchers.clear();
-    if ($('conversationScopeKind')) { $('conversationScopeKind').value = 'package'; renderScopeFields(); }
+    if (!preserveIndependentTranslation) state.watchers.clear();
+    if (!keepChatSource && $('conversationScopeKind')) { $('conversationScopeKind').value = 'package'; renderScopeFields(); }
+    renderChatSourceBar();
     const enabled = Boolean(scanId);
     ['packageOverviewRefreshBtn', 'packageOverviewAskAllBtn', 'translatePriorityBtn', 'translateBackfillBtn', 'translationOpenBtn'].forEach((id) => { if ($(id)) $(id).disabled = !enabled; });
     if ($('conversationNewBtn')) $('conversationNewBtn').disabled = false;
@@ -1911,13 +2588,18 @@
     syncScan();
     if (route === 'overview') loadOverview(false);
     if (route === 'chat') {
+      loadChatSources();
       loadConversationList();
-      if (state.scanId && !state.overview) loadOverview(false);
+      // An isolated large package has no ordinary package overview; asking
+      // for one would only surface a 404 inside the chat view.
+      if (!isLargeChatSource() && state.scanId && !state.overview) loadOverview(false);
     }
     if (route === 'translation') {
+      loadTranslationSources();
       loadTranslationList();
       const rememberedScan = window.sessionStorage.getItem(LAST_DOCUMENT_SCAN_KEY) || '';
-      const remembered = state.translationPath || (rememberedScan === state.scanId ? window.sessionStorage.getItem(LAST_DOCUMENT_KEY) || '' : '');
+      const sourceId = translationScanId();
+      const remembered = state.translationPath || (rememberedScan === sourceId ? window.sessionStorage.getItem(LAST_DOCUMENT_KEY) || '' : '');
       if (remembered) {
         $('translationPath').value = remembered;
         if (!state.translationPath) loadTranslation(remembered, 0);
@@ -1927,7 +2609,17 @@
 
   function bind() {
     renderScopeFields();
+    renderFolderDock();
+    $('conversationMessages').addEventListener('change', (event) => {
+      if (event.target.matches('[data-file-select]')) updateFileSelectionActions();
+    });
+    restoreTranslationSource();
     resetForScan((window.localStorage.getItem(CURRENT_SCAN_KEY) || '').trim());
+    restoreChatSource();
+    bindChatSource();
+    bindTranslationSource();
+    renderTranslationSourceBar();
+    loadChatSources();
     $('packageOverviewRefreshBtn').addEventListener('click', () => loadOverview(true));
     $('packageOverviewAskAllBtn').addEventListener('click', () => carryScopeToConversation({ kind: 'package', label: '整个数据包', source_paths: [] }));
     $('packageOverviewAskBtn').addEventListener('click', () => carryScopeToConversation(state.selectedScope));
@@ -1967,12 +2659,18 @@
       }
       const fileOpen = event.target.closest('[data-file-open]');
       if (fileOpen) { openOriginalFile(fileOpen.dataset.fileOpen || ''); return; }
+      const citationRead = event.target.closest('[data-citation-read]');
+      if (citationRead) { openOriginalFile(citationRead.dataset.citationRead || ''); return; }
       const fileDownload = event.target.closest('[data-file-download]');
       if (fileDownload) { downloadOriginalFile(fileDownload.dataset.fileDownload || ''); return; }
       const collectFile = event.target.closest('[data-file-collect]');
       if (collectFile) { collectFileForFolder(collectFile.dataset.fileCollect || '', collectFile); return; }
+      const citationCollect = event.target.closest('[data-citation-collect]');
+      if (citationCollect) { collectFileForFolder(citationCollect.dataset.citationCollect || '', citationCollect); return; }
       const nodeFile = event.target.closest('[data-file-node]');
       if (nodeFile) { createNodeFromFile(nodeFile.dataset.fileNode || '', nodeFile); return; }
+      const citationNode = event.target.closest('[data-citation-node]');
+      if (citationNode) { createNodeFromFile(citationNode.dataset.citationNode || '', citationNode); return; }
       if (event.target.closest('[data-file-select]')) { updateFileSelectionActions(); return; }
       if (event.target.closest('[data-select-all-files]')) {
         const boxes = [...event.currentTarget.querySelectorAll('[data-file-select]')];
@@ -1995,15 +2693,23 @@
       const prioritize = event.target.closest('[data-evidence-prioritize]');
       if (prioritize) {
         const path = prioritize.dataset.evidencePrioritize || '';
-        if (!path || !state.scanId) return;
+        if (!path || !chatScanId()) return;
         prioritize.disabled = true;
         const originalLabel = prioritize.textContent;
         prioritize.textContent = '已提交…';
         try {
-          const result = await api(`/api/package-processing/${encodeURIComponent(state.scanId)}/resume`, {
-            method: 'POST',
-            body: JSON.stringify({ mode: 'selection', target_paths: [path], continue_full: false })
-          });
+          const largeSource = isLargeChatSource();
+          const result = await api(
+            largeSource
+              ? `/api/large-packages/${encodeURIComponent(chatScanId())}/select`
+              : `/api/package-processing/${encodeURIComponent(chatScanId())}/resume`,
+            {
+              method: 'POST',
+              body: JSON.stringify(largeSource
+                ? { paths: [path] }
+                : { mode: 'selection', target_paths: [path], continue_full: false })
+            }
+          );
           notify(result.message || (result.accepted ? '已加入深度分析队列' : '文件已在分析队列中'));
           prioritize.textContent = result.accepted ? '已加入队列' : '已处理';
         } catch (error) {
@@ -2064,6 +2770,42 @@
     $('translationList').addEventListener('click', (event) => {
       const button = event.target.closest('[data-translation-path]');
       if (button) loadTranslation(button.dataset.translationPath, 0);
+    });
+    $('translationList').addEventListener('change', (event) => {
+      const checkbox = event.target.closest('[data-translation-select]');
+      if (!checkbox) return;
+      const path = checkbox.dataset.translationSelect;
+      if (checkbox.checked && state.translationSelectedPaths.size >= 500 && !state.translationSelectedPaths.has(path)) {
+        checkbox.checked = false;
+        notify('单次最多选择 500 个文件', true);
+        return;
+      }
+      if (checkbox.checked) state.translationSelectedPaths.add(path);
+      else state.translationSelectedPaths.delete(path);
+      renderTranslationSelection();
+    });
+    $('translationSelectPage')?.addEventListener('change', (event) => {
+      const paths = state.translationItems.map((item) => item.path);
+      if (event.target.checked && new Set([...state.translationSelectedPaths, ...paths]).size > 500) {
+        notify('单次最多选择 500 个文件', true);
+        renderTranslationSelection();
+        return;
+      }
+      paths.forEach((path) => event.target.checked ? state.translationSelectedPaths.add(path) : state.translationSelectedPaths.delete(path));
+      renderTranslationList();
+    });
+    $('translationClearSelection')?.addEventListener('click', () => {
+      state.translationSelectedPaths.clear();
+      renderTranslationList();
+    });
+    $('translateSelectedBtn')?.addEventListener('click', translateSelected);
+    $('translationCancelBtn')?.addEventListener('click', async () => {
+      const jobId = state.translationActiveJob;
+      if (!jobId) return;
+      try {
+        await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST', body: '{}' });
+        $('translationQueueState').textContent = '正在取消，已完成的译文会保留。';
+      } catch (error) { notify(error.message || '无法取消翻译', true); }
     });
     $('translationListPrevBtn').addEventListener('click', () => {
       const pageOffset = numeric(state.translationListPage && state.translationListPage.offset);

@@ -229,8 +229,8 @@
     $('workspaceRailName').textContent = workspaceName || '尚未导入数据包';
 
     const inventory = processingMetric('全量盘点文件') || metricText('递归文件') || '—';
-    const searchable = processingMetric('基础可搜索') || '';
-    const deep = processingMetric('深析完成率') || '';
+    const searchable = processingMetric('证据索引进度') || processingMetric('基础可搜索') || '';
+    const deep = processingMetric('深度解析进度') || processingMetric('深析完成率') || '';
     const pendingMatch = document.querySelector('.package-processing-panel')?.textContent.match(/可立即处理\s*([\d,]+)/);
     const pending = pendingMatch ? pendingMatch[1] : '—';
     $('railInventory').textContent = inventory;
@@ -246,7 +246,7 @@
     const meta = $('workspaceRailMeta');
     const progress = $('progressText')?.textContent.trim();
     if (meta) {
-      meta.textContent = progress && !/导入后将按所选模式/.test(progress)
+      meta.textContent = state === 'completed' ? '选中范围的解析、摘要和正式概览已完成，可查看证据或下载报告。' : progress && !/导入后将按所选模式/.test(progress)
         ? progress.replace(/\s+/g, ' ').slice(0, 120)
         : (workspaceName === '尚未导入数据包' ? '导入后，这里会持续显示盘点、索引与深度分析进度' : '数据包已连接，选择左侧模块继续工作');
     }

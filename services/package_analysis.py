@@ -394,9 +394,40 @@ CHINESE_DOMAIN_TERMS = (
     "侧信道攻击", "远程证明", "身份认证", "访问控制", "隐私保护", "密码技术",
     "供应链安全", "数据泄露", "安全事件", "应急响应", "安全评估", "风险分析",
 )
+# Topic-word filter.  This used to hold just seven English words, so ordinary
+# function words and document boilerplate became "topics" — a real package
+# produced subtopic names such as 专题（WERE）研究资料 and 专题（HTTPS）研究资料.
+# Only non-content words belong here: articles, pronouns, prepositions,
+# auxiliaries, generic academic boilerplate and URL/repository noise.  Topic
+# words (energy, solar, battery, water, ...) must never be listed.
 STOPWORDS = {
-    "the", "and", "for", "with", "from", "this", "that", "研究", "分析", "报告",
-    "文档", "文件", "资料", "进行", "一种", "基于", "相关", "情况", "数据", "方法",
+    # Chinese generic words
+    "研究", "分析", "报告", "文档", "文件", "资料", "进行", "一种", "基于",
+    "相关", "情况", "数据", "方法", "内容", "主要", "本文", "我们", "结果",
+    "摘要", "目录", "目录页", "章节", "附录", "参考", "参考文献", "图表",
+    # English function words
+    "a", "about", "above", "after", "again", "against", "all", "also", "am",
+    "an", "and", "any", "are", "as", "at", "be", "because", "been", "before",
+    "being", "below", "between", "both", "but", "by", "can", "cannot", "could",
+    "did", "do", "does", "doing", "done", "down", "during", "each", "few",
+    "for", "from", "further", "had", "has", "have", "having", "he", "her",
+    "here", "hers", "him", "his", "how", "however", "i", "if", "in", "into",
+    "is", "it", "its", "itself", "just", "may", "me", "might", "more", "most",
+    "must", "my", "no", "nor", "not", "now", "of", "off", "on", "once", "one",
+    "only", "or", "other", "our", "out", "over", "own", "same", "she",
+    "should", "so", "some", "such", "than", "that", "the", "their", "them",
+    "then", "there", "these", "they", "this", "those", "through", "to", "too",
+    "under", "until", "up", "us", "very", "was", "we", "were", "what", "when",
+    "where", "which", "while", "who", "whom", "why", "will", "with", "within",
+    "without", "would", "you", "your",
+    # English document boilerplate / repository noise (never a topic)
+    "abstract", "acknowledg", "acknowledgement", "acknowledgments", "appendix",
+    "copyright", "disclaimer", "doc", "doi", "draft", "edu", "et", "etc",
+    "figure", "figures", "gov", "http", "https", "introduction", "journal",
+    "llc", "note", "notes", "org", "page", "pages", "paper", "pdf", "press",
+    "publication", "publications", "publisher", "references", "reserved",
+    "retrieved", "rights", "section", "sections", "see", "table", "tables",
+    "title", "university", "vol", "volume", "www",
 }
 
 try:
@@ -1883,25 +1914,67 @@ def _evidence_diversity_metrics(items):
     }
 
 
+_SECURITY_TOPIC_TERMS = {
+    "vulnerability": "漏洞", "exploit": "漏洞利用", "attack": "攻击技术",
+    "malware": "恶意软件", "threat": "威胁情报", "detection": "威胁检测",
+    "privacy": "隐私保护", "network": "网络安全", "firmware": "固件安全",
+    "authentication": "身份认证", "memory": "内存安全", "cloud": "云安全",
+    "cve": "漏洞情报", "intrusion": "入侵检测", "encryption": "加密技术",
+    "cryptography": "密码技术", "iot": "物联网安全", "android": "移动端安全",
+    "vehicle": "车联网安全", "automotive": "车联网安全", "can": "车载CAN安全",
+    "sidechannel": "侧信道安全", "side-channel": "侧信道安全",
+    "enclave": "可信执行环境", "tee": "可信执行环境", "sgx": "SGX安全",
+    "protocol": "协议安全", "adversarial": "对抗安全", "blockchain": "区块链安全",
+    "amd": "AMD机密计算", "sev-snp": "SEV-SNP安全", "stackwarp": "栈安全",
+    "pointer": "指针安全", "computing": "机密计算", "confidential": "机密执行环境",
+    "trusted": "可信计算", "attestation": "可信证明", "gpu": "GPU安全",
+}
+
+# Non-security domains.  Real packages are mostly not about security, so the
+# table above alone produced raw-English subtopic names.  These entries widen
+# the localisation coverage; anything still unknown returns None and the caller
+# simply skips that candidate rather than inventing a placeholder name.
+_GENERAL_TOPIC_TERMS = {
+    "energy": "能源", "solar": "光伏", "photovoltaic": "光伏", "photovoltaics": "光伏",
+    "wind": "风电", "battery": "电池", "batteries": "电池", "storage": "储能",
+    "grid": "电网", "nuclear": "核能", "reactor": "反应堆", "carbon": "碳管理",
+    "emission": "排放", "emissions": "排放", "climate": "气候", "water": "水资源",
+    "soil": "土壤", "land": "土地", "agriculture": "农业", "forest": "林业",
+    "ocean": "海洋", "weather": "气象", "hurricane": "飓风", "flood": "洪水",
+    "hydrology": "水文", "groundwater": "地下水", "geology": "地质",
+    "seismic": "地震", "material": "材料", "materials": "材料",
+    "chemistry": "化学", "catalyst": "催化", "polymer": "高分子",
+    "physics": "物理", "biology": "生物", "gene": "基因", "genome": "基因组",
+    "protein": "蛋白质", "cell": "细胞", "cells": "细胞", "health": "健康",
+    "medical": "医疗", "drug": "药物", "clinical": "临床", "law": "法律",
+    "legal": "法律", "court": "司法", "regulation": "监管", "regulatory": "监管",
+    "policy": "政策", "finance": "金融", "financial": "金融", "market": "市场",
+    "economic": "经济", "education": "教育", "history": "历史", "risk": "风险评估",
+    "hazard": "灾害风险", "assessment": "评估", "model": "建模",
+    "modeling": "建模", "simulation": "仿真", "dataset": "数据集",
+    "monitoring": "监测", "performance": "性能", "manufacturing": "制造工艺",
+    "sensor": "传感器", "semiconductor": "半导体", "silicon": "硅基器件",
+}
+
+
 def _localized_subtopic_term(term):
+    """Localise one subtopic term, or return None when it cannot be localised.
+
+    Returning None (instead of a placeholder such as ``专题（WERE）``) lets the
+    caller drop that candidate; unlocalisable terms are function words,
+    repository noise or out-of-table vocabulary, none of which deserve a
+    directory name.
+    """
     value = str(term or "").strip()
     if re.search(r"[\u4e00-\u9fff]", value):
         return value
-    return {
-        "vulnerability": "漏洞", "exploit": "漏洞利用", "attack": "攻击技术",
-        "malware": "恶意软件", "threat": "威胁情报", "detection": "威胁检测",
-        "privacy": "隐私保护", "network": "网络安全", "firmware": "固件安全",
-        "authentication": "身份认证", "memory": "内存安全", "cloud": "云安全",
-        "cve": "漏洞情报", "intrusion": "入侵检测", "encryption": "加密技术",
-        "cryptography": "密码技术", "iot": "物联网安全", "android": "移动端安全",
-        "vehicle": "车联网安全", "automotive": "车联网安全", "can": "车载CAN安全",
-        "sidechannel": "侧信道安全", "side-channel": "侧信道安全",
-        "enclave": "可信执行环境", "tee": "可信执行环境", "sgx": "SGX安全",
-        "protocol": "协议安全", "adversarial": "对抗安全", "blockchain": "区块链安全",
-        "amd": "AMD机密计算", "sev-snp": "SEV-SNP安全", "stackwarp": "栈安全",
-        "pointer": "指针安全", "computing": "机密计算", "confidential": "机密计算",
-        "trusted": "可信计算", "attestation": "可信证明", "gpu": "GPU安全",
-    }.get(value.lower(), "专题（{}）".format(value[:12].upper() or "待命名"))
+    key = value.lower()
+    if not key or key in STOPWORDS or len(key) < 3:
+        return None
+    for table in (_SECURITY_TOPIC_TERMS, _GENERAL_TOPIC_TERMS):
+        if key in table:
+            return table[key]
+    return None
 
 
 def _subtopic_partitions(topic_name, member_paths, documents):
@@ -1939,8 +2012,13 @@ def _subtopic_partitions(topic_name, member_paths, documents):
         ]
         if len(paths) < 2:
             continue
+        label = _localized_subtopic_term(term)
+        if not label:
+            # Not a localisable topic word (function word, URL/repository noise
+            # or unknown vocabulary); skip it instead of naming a node after it.
+            continue
         partitions.append({
-            "name": "{}研究资料".format(_localized_subtopic_term(term)),
+            "name": "{}研究资料".format(label),
             "paths": paths,
             "topics": [term],
         })
@@ -2977,6 +3055,38 @@ def _cosine_vector(left, right):
     return numerator / (left_norm * right_norm)
 
 
+def _centered_vectors(vectors):
+    """Remove the corpus-common component, then unit-normalise.
+
+    Mean-pooled sentence embeddings are strongly anisotropic: on real corpora
+    almost every pair of same-language documents scores above 0.85 cosine and
+    the whole discriminative range collapses into a few hundredths.  Measured on
+    a real 26-document package the pairwise range was 0.867--0.940 (std 0.013),
+    so *any* absolute similarity threshold merged every document into a single
+    cluster.  Subtracting the corpus mean ("all-but-the-top-1") widened the same
+    range to -0.315--0.269 (std 0.108) and restored topic structure.
+
+    The transform is deterministic, needs no extra model call, and is applied
+    only at clustering time, so cached raw vectors stay valid.
+    """
+    if not vectors:
+        return []
+    dimension = len(vectors[0])
+    centroid = [
+        sum(float(vector[index]) for vector in vectors) / float(len(vectors))
+        for index in range(dimension)
+    ]
+    centered = []
+    for vector in vectors:
+        values = [float(vector[index]) - centroid[index] for index in range(dimension)]
+        norm = math.sqrt(sum(value * value for value in values))
+        # A document identical to the corpus mean carries no topic signal and
+        # would divide by zero; keep it as a zero vector so it simply joins the
+        # nearest centroid instead of crashing the run.
+        centered.append([value / norm for value in values] if norm > 1e-12 else [0.0] * dimension)
+    return centered
+
+
 def _semantic_document_clusters(
     documents,
     embedding_client,
@@ -3052,6 +3162,13 @@ def _semantic_document_clusters(
     if batch_progress and not missing_paths:
         batch_progress(len(paths), len(paths))
     vectors = [vectors_by_path[path] for path in paths]
+    # Grouping happens in the corpus-centred space; the raw vectors are kept for
+    # the reported similarity values.  A dimension mismatch (mixed embedding
+    # models in one cache) falls back to the raw vectors instead of failing.
+    try:
+        cluster_vectors = _centered_vectors(vectors)
+    except Exception:
+        cluster_vectors = vectors
 
     if len(paths) == 1:
         return [{
@@ -3067,11 +3184,18 @@ def _semantic_document_clusters(
 
     count = len(paths)
 
-    if count > 500:
-        # Average-link clustering is intentionally bounded to small corpora.
-        # MiniBatchKMeans gives predictable memory/time behaviour for thousands
-        # of small files and never allocates an n*n similarity matrix.
-        cluster_count = max(8, min(96, int(round(math.sqrt(count)))))
+    # Clustering strategy.  "centroid" (default) clusters in the corpus-centred
+    # vector space with a document-count-derived k; "legacy" keeps the
+    # historical absolute-cosine-threshold average-link path available for
+    # rollback without a code revert.  The legacy path is not the default
+    # because its threshold cannot transfer between embedding models and on a
+    # real package it merged every document into one cluster.
+    clustering_strategy = str(
+        os.getenv("SJFX_SEMANTIC_CLUSTERING", "centroid")
+    ).strip().lower()
+
+    if clustering_strategy != "legacy":
+        cluster_count = max(1, min(96, int(round(math.sqrt(count)))))
         try:
             from sklearn.cluster import MiniBatchKMeans
             model = MiniBatchKMeans(
@@ -3081,13 +3205,13 @@ def _semantic_document_clusters(
                 n_init=3,
                 max_iter=120,
             )
-            labels = model.fit_predict(vectors).tolist()
+            labels = model.fit_predict(cluster_vectors).tolist()
             centers = model.cluster_centers_.tolist()
             algorithm = "MiniBatchKMeans"
         except Exception:
             # Deterministic bounded fallback for minimal/offline deployments.
             labels = []
-            for vector in vectors:
+            for vector in cluster_vectors:
                 signature = "".join("1" if float(value) >= 0 else "0" for value in vector[:16])
                 labels.append(int(signature or "0", 2) % cluster_count)
             centers = None
@@ -3101,29 +3225,40 @@ def _semantic_document_clusters(
             if centers is not None:
                 center = centers[label]
                 ranked = sorted(
-                    ((_cosine_vector(vectors[index], center), paths[index]) for index in member_indices),
+                    ((_cosine_vector(cluster_vectors[index], center), paths[index]) for index in member_indices),
                     key=lambda item: (-item[0], item[1]),
                 )
                 representatives = [path for _score, path in ranked[:3]]
-                mean_similarity = round(sum(score for score, _path in ranked) / len(ranked), 6)
             else:
                 representatives = member_paths[:3]
-                mean_similarity = None
+            # mean_similarity is reported in the original embedding space so the
+            # number stays comparable with earlier analyses and the report; only
+            # the grouping decision uses the centred space.
+            pair_scores = [
+                _cosine_vector(vectors[left], vectors[right])
+                for offset, left in enumerate(member_indices)
+                for right in member_indices[offset + 1:]
+            ]
             results.append({
                 "members": member_paths,
                 "representative_documents": representatives,
-                "mean_similarity": mean_similarity,
+                "mean_similarity": round(sum(pair_scores) / len(pair_scores), 6) if pair_scores else None,
                 "keywords": [],
                 "name": None,
                 "summary": None,
                 "algorithm": algorithm,
-                "algorithm_parameters": {"document_threshold": 500, "cluster_count": len(grouped)},
+                "algorithm_parameters": {
+                    "clustering_strategy": "centroid",
+                    "vector_space": "corpus_centered",
+                    "cluster_count": len(grouped),
+                },
             })
         results.sort(key=lambda cluster: (-len(cluster["members"]), cluster["members"]))
         for index, cluster in enumerate(results, 1):
             cluster["cluster_id"] = "SEM-{:04d}".format(index)
         return results, None
 
+    # ---------------------------------------------------------------- legacy
     similarities = [
         [0.0] * count
         for _ in range(count)
@@ -3283,7 +3418,7 @@ def _semantic_document_clusters(
             "name": None,
             "summary": None,
             "algorithm": "adaptive-average-link",
-            "algorithm_parameters": {"document_threshold": 500, "similarity_threshold": round(threshold, 6)},
+            "algorithm_parameters": {"clustering_strategy": "legacy", "document_threshold": 500, "similarity_threshold": round(threshold, 6)},
         })
 
     results.sort(
@@ -4425,15 +4560,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     parse_mode = requested_scan_mode if requested_scan_mode in {"fast", "accurate", "auto"} else "auto"
     policy_options = dict(large_options or {})
     if preprocess_only:
-        # ``preprocess_only`` is not a reason to turn a small package into a
-        # large-package workflow.  Older code forced the policy on here, which
-        # made sub-1-GiB imports skip their normal confirmation/analysis path.
-        threshold_bytes = int(policy_options.get("threshold_bytes") or 1024 * 1024 * 1024)
-        threshold_files = int(policy_options.get("threshold_files") or 3000)
-        policy_options["force_enabled"] = bool(
-            int(scan.get("total_size") or 0) >= threshold_bytes
-            or int(scan.get("file_count") or 0) >= threshold_files
-        )
+        # Preprocessing must follow the ordinary import path.
         policy_options["background_backfill"] = False
     policy = build_policy(scan, policy_options)
     inventory = (
@@ -5997,7 +6124,9 @@ def refresh_package_coverage(scan_id, scan, storage):
     analysis = storage.get_analysis(scan_id) or {}
     if not analysis:
         return None
-    policy = (analysis.get("policy") or {}).get("large_package") or build_policy(scan)
+    policy = (analysis.get("policy") or {}).get("large_package") or build_policy(
+        scan, {"auto_threshold": False}
+    )
     states = list(storage.iter_file_states(scan_id))
     state_by_path = {item.get("node_path"): item for item in states}
     documents = {}

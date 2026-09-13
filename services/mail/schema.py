@@ -1,0 +1,263 @@
+"""Idempotent SQLite migration for the isolated mail domain."""
+
+from __future__ import annotations
+
+import hashlib
+
+
+SCHEMA_VERSION = 3
+
+DDL = r"""
+CREATE TABLE IF NOT EXISTS mail_schema_migrations (
+  version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, checksum TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mail_packages (
+  package_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, display_name TEXT NOT NULL,
+  source_kind TEXT NOT NULL, source_path TEXT NOT NULL, source_revision TEXT NOT NULL,
+  status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, imported_at TEXT,
+  logical_message_count INTEGER NOT NULL DEFAULT 0, occurrence_count INTEGER NOT NULL DEFAULT 0,
+  index_epoch INTEGER NOT NULL DEFAULT 0, config_json TEXT NOT NULL DEFAULT '{}',
+  error_json TEXT, idempotency_key TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_packages_owner_idempotency ON mail_packages(owner_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mail_packages_owner_updated ON mail_packages(owner_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS mail_sources (
+  source_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, locator_type TEXT NOT NULL,
+  root_path TEXT NOT NULL, container_path TEXT, container_sha256 TEXT,
+  member_name TEXT, member_ordinal INTEGER, source_size INTEGER NOT NULL DEFAULT 0,
+  source_revision TEXT NOT NULL, locator_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(package_id) REFERENCES mail_packages(package_id),
+  UNIQUE(package_id, member_name, member_ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_sources_package ON mail_sources(package_id, member_ordinal);
+CREATE TABLE IF NOT EXISTS mail_messages (
+  message_key TEXT PRIMARY KEY, raw_sha256 TEXT NOT NULL UNIQUE, canonical_message_id_raw TEXT,
+  canonical_message_id_normalized TEXT, subject_raw TEXT, subject_normalized TEXT,
+  date_raw TEXT, sent_at_utc TEXT, timezone_offset_minutes INTEGER,
+  body_preferred_part TEXT, body_plain_part TEXT, body_html_part TEXT, body_language TEXT,
+  parse_status TEXT NOT NULL, parser_version TEXT NOT NULL, source_revision TEXT NOT NULL,
+  headers_json TEXT NOT NULL DEFAULT '{}', warnings_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_mail_messages_date ON mail_messages(sent_at_utc, message_key);
+CREATE INDEX IF NOT EXISTS idx_mail_messages_message_id ON mail_messages(canonical_message_id_normalized);
+CREATE TABLE IF NOT EXISTS mail_occurrences (
+  occurrence_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, source_id TEXT NOT NULL,
+  message_key TEXT NOT NULL, source_member_name TEXT NOT NULL, source_member_ordinal INTEGER NOT NULL,
+  raw_sha256 TEXT NOT NULL, imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(package_id, source_id, source_member_name),
+  FOREIGN KEY(package_id) REFERENCES mail_packages(package_id),
+  FOREIGN KEY(source_id) REFERENCES mail_sources(source_id), FOREIGN KEY(message_key) REFERENCES mail_messages(message_key)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_occurrences_package ON mail_occurrences(package_id, message_key);
+CREATE TABLE IF NOT EXISTS mail_addresses (
+  address_id TEXT PRIMARY KEY, normalized_address TEXT NOT NULL UNIQUE, raw_address_sample TEXT,
+  display_name_sample TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS mail_message_participants (
+  message_key TEXT NOT NULL, address_id TEXT NOT NULL, role TEXT NOT NULL, position INTEGER NOT NULL,
+  PRIMARY KEY(message_key, address_id, role, position),
+  FOREIGN KEY(message_key) REFERENCES mail_messages(message_key), FOREIGN KEY(address_id) REFERENCES mail_addresses(address_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_participants_message ON mail_message_participants(message_key, role, address_id);
+CREATE TABLE IF NOT EXISTS mail_parts (
+  part_id TEXT PRIMARY KEY, message_key TEXT NOT NULL, mime_path TEXT NOT NULL, parent_mime_path TEXT,
+  content_type TEXT NOT NULL, content_disposition TEXT, content_id TEXT, filename_raw TEXT,
+  transfer_encoding TEXT, byte_size INTEGER NOT NULL, payload_sha256 TEXT NOT NULL,
+  part_role TEXT NOT NULL, is_explicit_attachment INTEGER NOT NULL DEFAULT 0,
+  is_inline_resource INTEGER NOT NULL DEFAULT 0, locator_json TEXT NOT NULL DEFAULT '{}',
+  UNIQUE(message_key, mime_path), FOREIGN KEY(message_key) REFERENCES mail_messages(message_key)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_parts_message ON mail_parts(message_key, part_role, is_explicit_attachment);
+CREATE TABLE IF NOT EXISTS mail_part_processing (
+  message_key TEXT NOT NULL, mime_path TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+  parser_name TEXT, parser_version TEXT, text_sha256 TEXT, extracted_chars INTEGER NOT NULL DEFAULT 0,
+  coverage_ratio REAL, warnings_json TEXT NOT NULL DEFAULT '[]', started_at TEXT, finished_at TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0, error_json TEXT,
+  PRIMARY KEY(message_key, mime_path, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_processing_status ON mail_part_processing(stage, status, finished_at);
+CREATE TABLE IF NOT EXISTS mail_text_segments (
+  segment_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, message_key TEXT NOT NULL, mime_path TEXT NOT NULL,
+  source_kind TEXT NOT NULL, language TEXT, ordinal INTEGER NOT NULL, page_number INTEGER, sheet_name TEXT,
+  char_start INTEGER NOT NULL, char_end INTEGER NOT NULL, text TEXT NOT NULL, text_sha256 TEXT NOT NULL,
+  source_revision TEXT NOT NULL, index_epoch INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(package_id) REFERENCES mail_packages(package_id), FOREIGN KEY(message_key) REFERENCES mail_messages(message_key)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_segments_source ON mail_text_segments(message_key, mime_path, ordinal);
+CREATE TABLE IF NOT EXISTS mail_thread_edges (
+  edge_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, source_message_key TEXT NOT NULL,
+  target_message_key TEXT, relation_type TEXT NOT NULL, source_header TEXT NOT NULL,
+  target_message_id_raw TEXT, status TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_mail_thread_source ON mail_thread_edges(package_id, source_message_key, status);
+CREATE TABLE IF NOT EXISTS mail_communication_edges (
+  package_id TEXT NOT NULL, from_address_id TEXT NOT NULL, to_address_id TEXT NOT NULL,
+  recipient_role TEXT NOT NULL, message_key TEXT NOT NULL, sent_at_utc TEXT,
+  occurrence_count INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY(package_id, from_address_id, to_address_id, recipient_role, message_key)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_communication_package ON mail_communication_edges(package_id, from_address_id, to_address_id, sent_at_utc);
+CREATE TABLE IF NOT EXISTS mail_business_relations (
+  relation_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, subject_ref TEXT NOT NULL, predicate TEXT NOT NULL,
+  object_ref TEXT NOT NULL, state TEXT NOT NULL, confidence REAL, method TEXT NOT NULL,
+  evidence_ids_json TEXT NOT NULL DEFAULT '[]', model_version TEXT, created_by TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, reviewed_by TEXT, reviewed_at TEXT, review_note TEXT
+);
+CREATE TABLE IF NOT EXISTS mail_evidence (
+  evidence_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, message_key TEXT NOT NULL, occurrence_id TEXT,
+  mime_path TEXT NOT NULL, segment_id TEXT, page_number INTEGER, sheet_name TEXT,
+  char_start INTEGER, char_end INTEGER, quote_text TEXT NOT NULL, source_revision TEXT NOT NULL,
+  index_epoch INTEGER NOT NULL DEFAULT 0, source_sha256 TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_mail_evidence_message ON mail_evidence(package_id, message_key, mime_path);
+CREATE TABLE IF NOT EXISTS mail_index_epochs (
+  package_id TEXT NOT NULL, index_epoch INTEGER NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+  item_total INTEGER NOT NULL DEFAULT 0, item_ready INTEGER NOT NULL DEFAULT 0, item_failed INTEGER NOT NULL DEFAULT 0,
+  item_pending INTEGER NOT NULL DEFAULT 0, config_fingerprint TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  completed_at TEXT, PRIMARY KEY(package_id, index_epoch, stage)
+);
+CREATE TABLE IF NOT EXISTS mail_result_sets (
+  result_set_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, owner_id TEXT NOT NULL, parent_result_set_id TEXT,
+  source_revision TEXT NOT NULL, index_epoch INTEGER NOT NULL, definition_json TEXT NOT NULL,
+  item_count INTEGER NOT NULL DEFAULT 0, coverage_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT
+);
+CREATE TABLE IF NOT EXISTS mail_result_set_items (
+  result_set_id TEXT NOT NULL, item_type TEXT NOT NULL, item_id TEXT NOT NULL, rank INTEGER NOT NULL,
+  status TEXT, rationale_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(result_set_id, item_type, item_id)
+);
+CREATE TABLE IF NOT EXISTS mail_research_sessions (
+  session_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, owner_id TEXT NOT NULL, title TEXT NOT NULL,
+  active_result_set_id TEXT, scope_json TEXT NOT NULL DEFAULT '{}', source_revision TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_mail_sessions_owner ON mail_research_sessions(owner_id, package_id, updated_at);
+CREATE TABLE IF NOT EXISTS mail_research_turns (
+  turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, owner_id TEXT NOT NULL, question TEXT NOT NULL,
+  task_spec_json TEXT NOT NULL, status TEXT NOT NULL, sufficiency TEXT, result_set_id TEXT, job_id TEXT,
+  source_revision TEXT NOT NULL, index_epoch INTEGER NOT NULL, final_json TEXT, error_json TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_mail_turns_session ON mail_research_turns(session_id, created_at);
+CREATE TABLE IF NOT EXISTS mail_research_steps (
+  step_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL, sequence INTEGER NOT NULL, tool_name TEXT NOT NULL,
+  input_json TEXT NOT NULL, output_ref TEXT, status TEXT NOT NULL, started_at TEXT, finished_at TEXT, error_json TEXT
+);
+CREATE TABLE IF NOT EXISTS mail_research_events (
+  event_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS mail_claims (
+  claim_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL, claim_text TEXT NOT NULL, claim_type TEXT NOT NULL,
+  state TEXT NOT NULL, support_status TEXT NOT NULL, evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+  counter_evidence_ids_json TEXT NOT NULL DEFAULT '[]', verification_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS mail_job_progress (
+  job_id TEXT PRIMARY KEY, phase TEXT NOT NULL, cursor_json TEXT NOT NULL DEFAULT '{}',
+  counts_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+FTS_DDL = r"""
+CREATE VIRTUAL TABLE IF NOT EXISTS mail_search_fts USING fts5(
+  segment_id UNINDEXED, package_id UNINDEXED, message_key UNINDEXED, mime_path UNINDEXED,
+  field UNINDEXED, language UNINDEXED, text, tokenize='unicode61'
+);
+"""
+
+FTS_FALLBACK_DDL = r"""
+CREATE TABLE IF NOT EXISTS mail_search_fts (
+  segment_id TEXT NOT NULL, package_id TEXT NOT NULL, message_key TEXT NOT NULL, mime_path TEXT NOT NULL,
+  field TEXT NOT NULL, language TEXT, text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mail_search_fallback_package ON mail_search_fts(package_id, message_key);
+"""
+
+
+def _ensure_search_index(connection):
+    """FTS5 accelerates recall when available; correctness never depends on it."""
+    try:
+        connection.executescript(FTS_DDL)
+    except Exception as exc:
+        if "fts5" not in str(exc).casefold():
+            raise
+        connection.executescript(FTS_FALLBACK_DDL)
+
+
+# Keep the complete version-2 DDL above byte-for-byte: existing ledgers hash it.
+DDL_V3 = r"""
+CREATE TABLE IF NOT EXISTS mail_embeddings (
+ package_id TEXT NOT NULL, segment_id TEXT NOT NULL, model TEXT NOT NULL, dim INTEGER NOT NULL,
+ vector BLOB NOT NULL, text_sha256 TEXT NOT NULL, index_epoch INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(package_id,segment_id,model));
+CREATE INDEX IF NOT EXISTS idx_mail_embeddings_hash ON mail_embeddings(package_id,model,text_sha256);
+CREATE TABLE IF NOT EXISTS mail_embedding_buckets (
+ package_id TEXT NOT NULL, model TEXT NOT NULL, band INTEGER NOT NULL,bucket INTEGER NOT NULL,segment_id TEXT NOT NULL,
+ PRIMARY KEY(package_id,model,band,bucket,segment_id));
+CREATE TABLE IF NOT EXISTS mail_conversations (
+ conversation_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,root_message_key TEXT,subject_normalized TEXT,
+ started_at TEXT,last_at TEXT,message_count INTEGER NOT NULL,participant_count INTEGER NOT NULL,
+ has_attachment INTEGER NOT NULL,dominant_language TEXT,merge_basis TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_mail_conversations_package ON mail_conversations(package_id,last_at);
+CREATE TABLE IF NOT EXISTS mail_conversation_members (
+ conversation_id TEXT NOT NULL,message_key TEXT NOT NULL,depth INTEGER NOT NULL,is_root INTEGER NOT NULL,
+ PRIMARY KEY(conversation_id,message_key));
+CREATE TABLE IF NOT EXISTS mail_projection_state (
+ package_id TEXT NOT NULL,stage TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(package_id,stage));
+CREATE TABLE IF NOT EXISTS mail_facts (
+ fact_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,message_key TEXT NOT NULL,evidence_id TEXT NOT NULL,segment_id TEXT,
+ fact_type TEXT NOT NULL,fact_key TEXT NOT NULL,subject_ref TEXT NOT NULL,value_raw TEXT NOT NULL,
+ value_normalized TEXT,unit TEXT,confidence REAL,method TEXT NOT NULL,source_revision TEXT NOT NULL,
+ index_epoch INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'mentioned',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_mail_facts_scope ON mail_facts(package_id,subject_ref,fact_type,fact_key);
+CREATE TABLE IF NOT EXISTS mail_fact_conflicts (
+ conflict_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,fact_type TEXT NOT NULL,fact_key TEXT NOT NULL,
+ subject_ref TEXT NOT NULL,fact_ids_json TEXT NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mail_fact_processing (
+ package_id TEXT NOT NULL,message_key TEXT NOT NULL,schema_key TEXT NOT NULL,fingerprint TEXT NOT NULL,
+ status TEXT NOT NULL,error TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ PRIMARY KEY(package_id,message_key,schema_key));
+CREATE TABLE IF NOT EXISTS mail_entities (
+ entity_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,entity_type TEXT NOT NULL,display_name TEXT NOT NULL,
+ basis TEXT NOT NULL,confirmed_by TEXT,confirmed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS mail_entity_addresses (
+ package_id TEXT NOT NULL,entity_id TEXT NOT NULL,address_id TEXT NOT NULL,basis TEXT NOT NULL,
+ PRIMARY KEY(package_id,entity_id,address_id),UNIQUE(package_id,address_id));
+CREATE TABLE IF NOT EXISTS mail_communication_daily (
+ package_id TEXT NOT NULL,day TEXT NOT NULL,from_address_id TEXT NOT NULL,to_address_id TEXT NOT NULL,
+ recipient_role TEXT NOT NULL,message_count INTEGER NOT NULL,occurrence_count INTEGER NOT NULL,
+ PRIMARY KEY(package_id,day,from_address_id,to_address_id,recipient_role));
+CREATE TABLE IF NOT EXISTS mail_attachment_versions (
+ version_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,chain_key TEXT NOT NULL,payload_sha256 TEXT NOT NULL,
+ filename_normalized TEXT NOT NULL,version_ordinal INTEGER NOT NULL,first_message_key TEXT,first_sent_at TEXT,
+ last_message_key TEXT,last_sent_at TEXT,revision_count INTEGER NOT NULL,
+ UNIQUE(package_id,chain_key,payload_sha256));
+CREATE TABLE IF NOT EXISTS mail_attachment_version_links (
+ package_id TEXT NOT NULL,chain_key TEXT NOT NULL,version_ordinal INTEGER NOT NULL,message_key TEXT NOT NULL,
+ mime_path TEXT NOT NULL,payload_sha256 TEXT NOT NULL,
+ PRIMARY KEY(package_id,chain_key,message_key,mime_path));
+"""
+
+
+def migrate(connection):
+    connection.execute("CREATE TABLE IF NOT EXISTS mail_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, checksum TEXT NOT NULL)")
+    migrations = [(2, DDL, DDL + FTS_DDL + FTS_FALLBACK_DDL), (3, DDL_V3, DDL_V3)]
+    changed = False
+    for version, ddl, source in migrations:
+        checksum = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        row = connection.execute("SELECT checksum FROM mail_schema_migrations WHERE version=?", (version,)).fetchone()
+        if row:
+            if row[0] != checksum:
+                raise RuntimeError("邮件数据库迁移校验和不一致：版本 {}".format(version))
+            continue
+        connection.executescript(ddl)
+        if version == 2:
+            _ensure_search_index(connection)
+        connection.execute("INSERT INTO mail_schema_migrations(version,checksum) VALUES (?,?)", (version,checksum))
+        changed = True
+    return changed

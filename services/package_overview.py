@@ -24,7 +24,7 @@ from itertools import islice
 from pathlib import Path
 
 
-SCHEMA_VERSION = "package-overview/1.1"
+SCHEMA_VERSION = "package-overview/1.2"
 NO_EXTENSION = "[no-extension]"
 UNKNOWN = "unknown"
 
@@ -610,6 +610,14 @@ class PackageOverviewAggregator:
             preview.get("dates"),
         ):
             date_values.extend(_values(candidate, 32))
+        table_columns = (document.get("data_profile") or {}).get("columns") or {}
+        for name, column in table_columns.items():
+            if re.fullmatch(r"(?:FAT_)?YEAR(?:MONTH)?", str(name), re.I):
+                for value in (column.get("min"), column.get("max")):
+                    if value is not None:
+                        year = str(int(value))[:4]
+                        if re.fullmatch(r"(?:19|20)\d{2}", year):
+                            date_values.append(year + "-01-01")
         years = sorted({value for value in (_year(item) for item in date_values) if value})
         if years:
             self._document_date_files += 1
@@ -1103,8 +1111,17 @@ def build_package_overview_from_storage(storage, scan_id, *, limits=None, batch_
                 "truncated": catalog.get("truncated", False),
                 "contract": catalog.get("contract") or {},
             }
+    inventory = None
+    if scan.get("inventory_mode") == "durable_paged_v1" and hasattr(storage, "iter_inventory_entries"):
+        # The scan tree is only a paged stub; consume durable physical rows once.
+        scan = dict(scan)
+        scan.pop("tree", None)
+        scan.pop("type_counts", None)
+        inventory = (dict(item.get("payload") or item, path=item.get("path") or (item.get("payload") or {}).get("path"))
+                     for item in storage.iter_inventory_entries(scan_id, kind="file", batch_size=batch_size)
+                     if not (item.get("payload") or item).get("logical_unit"))
     overview = build_package_overview(
-        scan=scan, documents=documents, analysis=analysis, limits=limits,
+        scan=scan, files=inventory, documents=documents, analysis=analysis, limits=limits,
     )
     if limits is None and hasattr(storage, "save_package_overview"):
         storage.save_package_overview(scan_id, overview)
