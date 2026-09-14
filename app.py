@@ -4680,6 +4680,11 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
         checkpoint_callback=checkpoint,
         cancel_check=(lambda: storage.is_job_cancel_requested(job_id)) if job_id else None,
     )
+    before_completed = int(((previous or {}).get("progress") or {}).get("completed_units") or 0)
+    after_completed = int((result.get("progress") or {}).get("completed_units") or 0)
+    # A slice that translated nothing new must not be re-queued immediately;
+    # the caller falls back to the slower retry round in that case.
+    result["slice_advanced"] = after_completed > before_completed
     result["source_level"] = source_level
     if translation_backend == "vllm":
         result["translation_mode"] = "vllm"
@@ -4887,9 +4892,17 @@ def _run_claimed_large_translation_job(job):
                                          job_id=job_id, owner_id=owner_id, **model_options)
         _ensure_job_active(job_id)
         progress = result.get("progress") or {}
-        if backend == "vllm" and progress.get("pending_units") and not progress.get("failed_units"):
+        if backend == "vllm" and progress.get("pending_units") and result.get("slice_advanced", True):
             return {"_requeue_slice": True, "_requeue_message": "大数据包文件译文已保存，继续翻译剩余段落。"}
-        if backend == "vllm" and (progress.get("pending_units") or progress.get("failed_units")):
+        if backend == "vllm" and (
+            progress.get("pending_units")
+            or (progress.get("failed_units") and result.get("slice_advanced", False))
+        ):
+            # Only queue another pass when it can actually change something:
+            # the provider runs at temperature 0, so re-running units that
+            # already exhausted their attempts reproduces the same output and
+            # the same rejection.  Without this the chain climbed to the
+            # 64-round cap and the document never settled.
             continuation_job_id = _schedule_vllm_translation_retry(
                 job, package_id, options, [node_path], owner_id,
             )
@@ -4935,7 +4948,7 @@ def _run_claimed_large_translation_job(job):
                                              job_id=job_id, owner_id=owner_id, **model_options)
             _ensure_job_active(job_id)
             progress = result.get("progress") or {}
-            if backend == "vllm" and progress.get("pending_units") and not progress.get("failed_units"):
+            if backend == "vllm" and progress.get("pending_units") and result.get("slice_advanced", True):
                 return {"_requeue_slice": True, "_requeue_message": "大数据包译文检查点已保存，继续翻译剩余段落。"}
             if backend == "vllm" and (progress.get("pending_units") or progress.get("failed_units")):
                 failed.append({"path": node_path, "status": result.get("status"),
@@ -4957,7 +4970,10 @@ def _run_claimed_large_translation_job(job):
         )
     next_cursor = cursor + len(current)
     continuation_job_id = None
-    if backend == "vllm" and failed:
+    # ``completed`` counts the files this pass actually finished.  A pass
+    # that finished nothing can only reproduce the same deterministic
+    # failures, so the chain stops here instead of burning rounds.
+    if backend == "vllm" and failed and completed:
         continuation_job_id = _schedule_vllm_translation_retry(
             job, package_id, options, [item.get("path") for item in failed], owner_id,
         )
@@ -5001,9 +5017,17 @@ def _run_claimed_translation_job(job):
         result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id, **model_options)
         _ensure_job_active(job_id)
         progress = result.get("progress") or {}
-        if translation_backend == "vllm" and progress.get("pending_units") and not progress.get("failed_units"):
+        if translation_backend == "vllm" and progress.get("pending_units") and result.get("slice_advanced", True):
             return {"_requeue_slice": True, "_requeue_message": "文件译文已保存，继续翻译剩余段落。"}
-        if translation_backend == "vllm" and (progress.get("pending_units") or progress.get("failed_units")):
+        if translation_backend == "vllm" and (
+            progress.get("pending_units")
+            or (progress.get("failed_units") and result.get("slice_advanced", False))
+        ):
+            # Only queue another pass when it can actually change something:
+            # the provider runs at temperature 0, so re-running units that
+            # already exhausted their attempts reproduces the same output and
+            # the same rejection.  Without this the chain climbed to the
+            # 64-round cap and the document never settled.
             continuation_job_id = _schedule_vllm_translation_retry(
                 job, scan_id, options, [node_path], job.get("owner_id") or "legacy",
             )
@@ -5051,7 +5075,7 @@ def _run_claimed_translation_job(job):
             result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id, **model_options)
             _ensure_job_active(job_id)
             progress = result.get("progress") or {}
-            if translation_backend == "vllm" and progress.get("pending_units") and not progress.get("failed_units"):
+            if translation_backend == "vllm" and progress.get("pending_units") and result.get("slice_advanced", True):
                 return {"_requeue_slice": True, "_requeue_message": "译文检查点已保存，继续处理所选文件。"}
             if translation_backend == "vllm" and (progress.get("pending_units") or progress.get("failed_units")):
                 failed.append({"path": node_path, "status": result.get("status"),
@@ -5075,7 +5099,10 @@ def _run_claimed_translation_job(job):
         _ensure_job_active(job_id)
     next_cursor = cursor + len(current)
     continuation_job_id = None
-    if translation_backend == "vllm" and failed:
+    # ``completed`` counts the files this pass actually finished.  A pass
+    # that finished nothing can only reproduce the same deterministic
+    # failures, so the chain stops here instead of burning rounds.
+    if translation_backend == "vllm" and failed and completed:
         continuation_job_id = _schedule_vllm_translation_retry(
             job, scan_id, options, [item.get("path") for item in failed],
             job.get("owner_id") or "legacy",
@@ -7333,6 +7360,117 @@ def _conversation_package_context(scan_id):
         return {"package_id": str(scan_id), "coverage": {"scope": "package", "status": "unavailable"}, "file_summaries": [], "error": str(exc)[:240]}
 
 
+BROAD_EVIDENCE_LIMIT = 50
+
+
+def _is_physical_package_path(path) -> bool:
+    """True for a real file rather than a synthetic node or the package root."""
+    value = str(path or "")
+    return bool(value) and value != "." and not value.startswith(
+        ("node:", "naming:", "group:", "summary:")
+    )
+
+
+def _broad_package_evidence(retrieval_request, package_context, indexed):
+    """One evidence item per file, so a whole-package answer can cover all of them.
+
+    A package-level question ("what does this package cover") is not a ranked
+    search: truncating it to the highest scoring hits describes only those
+    files.  Every file's persisted summary is therefore included, real files
+    first, then any lexical hits, bounded to the same order of magnitude the
+    display layer can already show.
+
+    Ordinary packages only: the large-package branch has its own recall path
+    and never reaches this helper.
+    """
+    scan_id = str(retrieval_request.scan_id)
+    lexical = [dict(item) for item in indexed or []]
+    physical, virtual = [], []
+    for file in (package_context or {}).get("file_summaries") or []:
+        path = str(file.get("path") or "")
+        summary = str(file.get("summary") or "").strip()
+        if not path or not summary:
+            continue
+        item = {
+            "evidence_id": "summary:{}:{}".format(scan_id, path),
+            "source_path": path,
+            "text": summary,
+            "original_text": summary,
+            "location": {"source": "file_summary"},
+            "evidence_role": "文件摘要",
+            "archive_source_path": path,
+        }
+        (physical if _is_physical_package_path(path) else virtual).append(item)
+
+    # Keep the richest lexical chunks as well as one summary per file.
+    #
+    # A package-wide answer is a synthesis over several sources, and the claim
+    # verifier grounds such a sentence by finding overlapping concepts in the
+    # evidence it cites.  One short summary per file carries too few concepts
+    # for that: the synthesis matched nothing, was judged unrelated, and the
+    # whole answer was replaced by "现有证据不足".  Reserving room for a
+    # summary of every file AND for the top lexical chunks gives both full
+    # coverage and evidence a synthesis can actually be grounded in.
+    summaries = physical + virtual
+    reserve = min(len(physical), max(0, BROAD_EVIDENCE_LIMIT - 1))
+    chunk_budget = max(1, BROAD_EVIDENCE_LIMIT - reserve)
+
+    output = []
+    seen_ids = set()
+    covered = set()
+    for item in lexical[:chunk_budget]:
+        key = str(item.get("evidence_id") or "")
+        if key and key in seen_ids:
+            continue
+        seen_ids.add(key)
+        path = str(item.get("source_path") or "")
+        if path:
+            covered.add(path)
+        output.append(dict(item))
+    for item in summaries:
+        if len(output) >= BROAD_EVIDENCE_LIMIT:
+            break
+        path = str(item.get("source_path") or "")
+        if not path or path in covered:
+            continue
+        key = str(item.get("evidence_id") or "")
+        if key and key in seen_ids:
+            continue
+        seen_ids.add(key)
+        covered.add(path)
+        output.append(item)
+    return output
+
+
+def _merge_summary_evidence(retrieval_request, package_context, indexed):
+    """Union keyword evidence with the package's curated per-file summaries.
+
+    Ordinary-package only: the large-package branch keeps its own recall path.
+    """
+    scan_id = str(retrieval_request.scan_id)
+    merged = list(indexed or [])
+    seen = {str(item.get("evidence_id") or "") for item in merged}
+    for file in (package_context or {}).get("file_summaries") or []:
+        path = str(file.get("path") or "")
+        summary = str(file.get("summary") or "").strip()
+        if not path or not summary:
+            continue
+        evidence_id = "summary:{}:{}".format(scan_id, path)
+        if evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+        merged.append({
+            "evidence_id": evidence_id,
+            "source_path": path,
+            "text": summary,
+            "original_text": summary,
+            "location": {"source": "file_summary"},
+            "evidence_role": "文件摘要",
+            "archive_source_path": path,
+        })
+    return merged
+
+
 def _conversation_retrieve(retrieval_request):
     started_at = time.monotonic()
     cache_key = (
@@ -7433,31 +7571,61 @@ def _conversation_retrieve(retrieval_request):
         indexed, projection_fallback = _conversation_projection_fallback(
             retrieval_request
         )
-    if not indexed:
-        # Zero FTS hits do not mean the package lacks relevant material: a
-        # Chinese question over an English corpus (or any cross-lingual or
-        # paraphrased query) legitimately produces no keyword matches even
-        # when every file was parsed and indexed, whatever the intent is.
-        # The persisted per-file summaries are the curated "package reading"
-        # corpus; ranking them against the query keeps answers grounded for
-        # every intent, and retrieve_evidence's score>0 filter still reports
-        # honest "insufficient evidence" for genuinely unrelated questions.
-        summary_files = (package_context or {}).get("file_summaries") or []
-        indexed = [
-            {
-                "evidence_id": "summary:{}:{}".format(
-                    retrieval_request.scan_id, file.get("path")
-                ),
-                "source_path": file.get("path"),
-                "text": str(file.get("summary") or ""),
-                "original_text": str(file.get("summary") or ""),
-                "location": {"source": "file_summary"},
-                "evidence_role": "文件摘要",
-                "archive_source_path": file.get("path"),
-            }
-            for file in summary_files
-            if str(file.get("summary") or "").strip()
-        ]
+    # A package-level question -- "what does this whole package cover" -- must
+    # be answered from the whole package.  The persisted per-file summaries are
+    # the curated package-reading corpus, and for such a question they are
+    # always merged in, whatever the keyword search returned.
+    #
+    # Merge, rather than "fall back only when the keyword search found
+    # nothing": that older rule made coverage depend on the corpus language.
+    # A Chinese question over an all-English package produced zero keyword
+    # hits and therefore searched all summaries, but as soon as a single file
+    # carried Chinese text the same question produced a hit, suppressed the
+    # fallback, and collapsed coverage from 59 files to 2.
+    broad_package_question = (
+        scope.kind in {"package", "directory", "files"}
+        and retrieval_request.intent in {"summary", "analysis", "multi_task"}
+    )
+    if broad_package_question:
+        # A whole-package question is answered from every file: one evidence
+        # item per file, instead of a ranked subset that silently describes
+        # only the files that happened to score highest.
+        indexed = _broad_package_evidence(
+            retrieval_request, package_context, indexed,
+        )
+    elif not indexed:
+        # The summaries keep answers grounded for every intent, and
+        # retrieve_evidence's score>0 filter still reports honest
+        # "insufficient evidence" for genuinely unrelated questions.
+        indexed = _merge_summary_evidence(
+            retrieval_request, package_context, indexed,
+        )
+    # Cross-lingual recall, ordinary packages only.  Ordinary retrieval is
+    # lexical, so a Chinese question over an English package shares no terms
+    # with the files that answer it and only accidentally-translated files
+    # surfaced.  A multilingual vector score per file restores that recall.
+    # This is a separate path from the isolated large-package recall above: no
+    # large-package module, store or index is involved.
+    semantic_scores = {}
+    try:
+        from services import ordinary_recall
+        semantic_scores = ordinary_recall.file_semantic_scores(
+            storage,
+            retrieval_request.scan_id,
+            query,
+            [str(item.get("path")) for item in (package_context or {}).get("file_summaries") or []
+             if item.get("path")],
+            summaries=(package_context or {}).get("file_summaries") or [],
+            logger=logger,
+        )
+        if semantic_scores:
+            indexed = ordinary_recall.augment_candidates(
+                indexed, semantic_scores, package_context, retrieval_request.scan_id,
+            )
+    except Exception:
+        # Recall is an enhancement: never let it break a question.
+        semantic_scores = {}
+        logger.warning("ordinary semantic recall unavailable", exc_info=True)
     if scope.kind == "file_type" and (scope.constraints or {}).get("dimension") == "format":
         expected = str(scope.value or "").lower().strip()
         if expected and not expected.startswith(".") and expected != "[无扩展名]":
@@ -7469,8 +7637,14 @@ def _conversation_retrieve(retrieval_request):
                 or Path(str(item.get("archive_source_path") or item.get("source_path") or "").split("::", 1)[0]).suffix.lower() == expected
             )
         ]
+    result_top_k = int(retrieval_request.top_k or 0)
+    if broad_package_question:
+        # Never truncate a whole-package evidence list below the number of
+        # files it has to cover (retrieve_evidence caps this at 50).
+        result_top_k = max(result_top_k, min(50, len(indexed)))
     result = retrieve_evidence(
-        {}, query, top_k=retrieval_request.top_k, indexed_chunks=indexed,
+        {}, query, top_k=result_top_k, indexed_chunks=indexed,
+        semantic_scores=semantic_scores or None,
     )
     result["package_context"] = package_context
     # Evidence from archive members and structured-file partitions is stored
@@ -7496,9 +7670,6 @@ def _conversation_retrieve(retrieval_request):
     # File discovery is complete at the file level even though the model sees
     # only bounded evidence chunks.  Broad package questions attach every
     # summarized file; focused questions use the complete FTS path pass.
-    broad_package_question = retrieval_request.scope.kind in {"package", "directory", "files"} and retrieval_request.intent in {
-        "summary", "analysis", "multi_task"
-    }
     if broad_package_question:
         result["related_file_paths"] = [
             str(item.get("path")) for item in (package_context or {}).get("file_summaries") or []
@@ -8649,6 +8820,40 @@ def get_conversation(session_id):
         return api_error(str(exc), 404)
 
 
+@app.route("/api/conversation/<session_id>", methods=["DELETE"])
+def delete_conversation(session_id):
+    """Delete one conversation together with its messages, turns and evidence."""
+    owner_id = _request_owner_id() or "legacy"
+    try:
+        turns = storage.list_conversation_turns(session_id, owner_id, limit=500) or []
+        active = [
+            str(item.get("id") or item.get("turn_id") or "")
+            for item in turns
+            if str(item.get("status") or "")
+            in {"queued", "running", "waiting_for_deep_analysis"}
+        ]
+        force = str(request.args.get("force") or "").strip().lower() in {"1", "true", "yes"}
+        if active and not force:
+            # Deleting a session whose turn is still running would strand the
+            # background job, so the caller has to stop it first.
+            return jsonify({
+                "ok": False,
+                "error": "该会话还有正在进行的分析，请先停止或等它完成后再删除。",
+                "code": "conversation_busy",
+                "active_turns": active[:10],
+            }), 409
+        removed = storage.delete_conversation(session_id, owner_id)
+        if removed is None:
+            return api_error("会话不存在", 404)
+        return jsonify({
+            "ok": True,
+            "session_id": str(session_id),
+            "deleted_turns": removed,
+        })
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+
 @app.route("/api/conversation/<session_id>/turns", methods=["POST"])
 def create_conversation_turn(session_id):
     payload = request.get_json(silent=True) or {}
@@ -8899,13 +9104,13 @@ def _large_document_translation(package_id):
         payload = request.get_json(silent=True) or {}
         if not isinstance(payload, dict):
             raise ValueError("请求必须是对象")
-        if not Config.ENABLE_TRANSLATION or not Config.ENABLE_VLLM:
-            return api_error("系统 vLLM 文件翻译未启用", 503)
+        if not Config.ENABLE_TRANSLATION:
+            return api_error("文件翻译未启用", 503)
         _package, _row, path, _resolved = _large_translation_target(package_id, payload.get("path"))
         job_id, _created = storage.create_or_get_typed_job(
             package_id, "translate_document",
             options={"path": path, "require_full": bool(payload.get("require_full", True)),
-                     "translation_backend": "vllm", "package_type": "large"},
+                     "translation_backend": Config.TRANSLATION_FILE_BACKEND, "package_type": "large"},
             owner_id=_request_owner_id() or "legacy",
         )
         return jsonify({"ok": True, "job_id": job_id, "path": path,
@@ -8922,6 +9127,8 @@ def _large_document_translation(package_id):
     original = str((state or {}).get("original_text") if state else document.get("text") or "")
     translated_value = (state or {}).get("translated_text") if state else None
     translated = str(translated_value) if translated_value is not None else None
+    working_value = (state or {}).get("working_text") if state else None
+    working = str(working_value) if working_value else None
 
     def page(text):
         if text is None:
@@ -8946,6 +9153,7 @@ def _large_document_translation(package_id):
                    "translated": (state or {}).get("translated_title")},
         "progress": (state or {}).get("progress"), "errors": (state or {}).get("errors") or [],
         "warnings": (state or {}).get("warnings") or document.get("warnings") or [],
+        "working": page(working), "working_available": bool(working),
     }
     if view in {"original", "bilingual"}:
         response["original"] = page(original)
@@ -8964,8 +9172,8 @@ def _translate_large_package_request(package_id):
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
         raise ValueError("请求必须是对象")
-    if not Config.ENABLE_TRANSLATION or not Config.ENABLE_VLLM:
-        return api_error("系统 vLLM 文件翻译未启用", 503)
+    if not Config.ENABLE_TRANSLATION:
+        return api_error("文件翻译未启用", 503)
     phase = str(payload.get("phase") or "deep_backfill")
     if phase != "deep_backfill":
         raise ValueError("大数据包仅支持翻译已选择的文件")
@@ -8982,7 +9190,7 @@ def _translate_large_package_request(package_id):
     for path in selected_paths:
         _large_translation_target(package_id, path)
     options = {
-        "phase": phase, "cursor": 0, "translation_backend": "vllm",
+        "phase": phase, "cursor": 0, "translation_backend": Config.TRANSLATION_FILE_BACKEND,
         "package_type": "large", "target_paths": selected_paths,
         "selected_only": True, "require_full": bool(payload.get("require_full", True)),
     }
@@ -9066,8 +9274,8 @@ def document_translation(scan_id):
             payload = request.get_json(silent=True) or {}
             if not isinstance(payload, dict):
                 raise ValueError("请求必须是对象")
-            if not Config.ENABLE_TRANSLATION or not Config.ENABLE_VLLM:
-                return api_error("系统 vLLM 文件翻译未启用", 503)
+            if not Config.ENABLE_TRANSLATION:
+                return api_error("文件翻译未启用", 503)
             node_path = str(payload.get("path") or "")
             _translation_inventory_node(scan_result, node_path)
             job_id, _created = storage.create_or_get_typed_job(
@@ -9075,7 +9283,7 @@ def document_translation(scan_id):
                 options={
                     "path": node_path,
                     "require_full": bool(payload.get("require_full", True)),
-                    "translation_backend": "vllm",
+                    "translation_backend": Config.TRANSLATION_FILE_BACKEND,
                 },
                 owner_id=_request_owner_id() or "legacy",
             )
@@ -9105,6 +9313,8 @@ def document_translation(scan_id):
         original = str(original_value or "")
         translated = (state or {}).get("translated_text")
         translated = str(translated) if translated is not None else None
+        working = (state or {}).get("working_text")
+        working = str(working) if working else None
 
         def page(text):
             if text is None:
@@ -9144,6 +9354,8 @@ def document_translation(scan_id):
             "progress": (state or {}).get("progress"),
             "errors": (state or {}).get("errors") or [],
             "warnings": (state or {}).get("warnings") or [],
+            "working": page(working),
+            "working_available": bool(working),
         }
         if view in {"original", "bilingual"}:
             response["original"] = page(original)
@@ -9175,9 +9387,9 @@ def translate_package(scan_id):
         if phase not in {"preview_and_priority", "deep_backfill"}:
             raise ValueError("不支持的翻译阶段")
         requested_paths = payload.get("target_paths", payload.get("paths"))
-        if not Config.ENABLE_TRANSLATION or not Config.ENABLE_VLLM:
-            return api_error("系统 vLLM 文件翻译未启用", 503)
-        options = {"phase": phase, "cursor": 0, "translation_backend": "vllm"}
+        if not Config.ENABLE_TRANSLATION:
+            return api_error("文件翻译未启用", 503)
+        options = {"phase": phase, "cursor": 0, "translation_backend": Config.TRANSLATION_FILE_BACKEND}
         if requested_paths is not None:
             if not isinstance(requested_paths, list):
                 raise ValueError("target_paths 必须是文件路径数组")

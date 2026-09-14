@@ -885,7 +885,10 @@
       host.innerHTML = '<span class="help-text">当前数据包还没有历史会话。</span>';
       return;
     }
-    host.innerHTML = state.conversationList.map((item) => `<button type="button" class="v2-session-item${state.conversation && state.conversation.session_id === item.session_id ? ' active' : ''}" data-session-id="${escapeHtml(item.session_id)}"><strong>${escapeHtml(item.title || '资料问答')}</strong><span>${escapeHtml(scopeSummary(item.scope))} · ${integer(item.message_count)} 条消息</span></button>`).join('');
+    host.innerHTML = state.conversationList.map((item) => {
+      const active = state.conversation && state.conversation.session_id === item.session_id ? ' active' : '';
+      return `<div class="v2-session-row${active}"><button type="button" class="v2-session-item${active}" data-session-id="${escapeHtml(item.session_id)}"><strong>${escapeHtml(item.title || '资料问答')}</strong><span>${escapeHtml(scopeSummary(item.scope))} · ${integer(item.message_count)} 条消息</span></button><button type="button" class="v2-session-delete" data-delete-session="${escapeHtml(item.session_id)}" title="删除这个会话" aria-label="删除会话">×</button></div>`;
+    }).join('');
   }
 
   async function loadConversationList() {
@@ -915,8 +918,13 @@
       ? Object.entries(citation.location).map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join('-') : value}`).join(' · ') : '原文片段';
     const original = citation.original_text ? `<p><b>${fileEvidence ? '文件摘要' : '原文'}：</b>${escapeHtml(citation.original_text)}</p>` : '';
     const translated = citation.translated_text ? `<p><b>中文：</b>${escapeHtml(citation.translated_text)}</p>` : '';
+    const rerankRank = Number(citation.rerank_rank);
     const scoreValue = Number(citation.retrieval_score);
-    const scoreLabel = Number.isFinite(scoreValue) ? `相关度 ${scoreValue.toFixed(2)}` : '';
+    // After a rerank the list order is the honest relevance signal; showing the
+    // raw retrieval score there would look out of order.
+    const scoreLabel = Number.isFinite(rerankRank) && rerankRank > 0
+      ? `综合排序 ${rerankRank}`
+      : (Number.isFinite(scoreValue) ? `相关度 ${scoreValue.toFixed(2)}` : '');
     const matchedKeywords = Array.isArray(citation.matched_keywords) ? citation.matched_keywords.filter(Boolean) : [];
     const matchLabel = citation.match_reason
       ? String(citation.match_reason)
@@ -1077,7 +1085,7 @@
     const completePackageFiles = Boolean(turn && Array.isArray(turn.related_file_paths) && turn.related_file_paths.length);
     const renderedFileResults = completePackageFiles ? fileResults : fileResults.slice(0, 20);
     const fileCountLabel = simpleFileSearch ? '个命中文件' : '个范围文件';
-    const fileCards = fileResults.length ? `<section class="v2-file-results"><header><div><strong>相关文件</strong><span>${integer(turn.file_results_total || fileResults.length)} ${fileCountLabel}${turn.file_results_coverage ? ` · ${escapeHtml(turn.file_results_coverage)}` : ''}</span></div><div class="v2-file-bulk-actions"><span class="v2-file-selection-status" data-file-selection-count>未选择文件</span><button type="button" data-select-all-files>全选</button><button type="button" data-create-node-selected disabled>选中后创建节点</button><button type="button" data-export-file-folder>导出资料夹</button></div></header>${renderedFileResults.map((item) => {
+    const fileCards = fileResults.length ? `<details class="v2-file-results-fold"><summary>相关文件 · ${integer(turn.file_results_total || fileResults.length)} ${fileCountLabel}${turn.file_results_coverage ? ` · ${escapeHtml(turn.file_results_coverage)}` : ''}（点击展开／收起）</summary><section class="v2-file-results"><header><div><strong>相关文件</strong><span>${integer(turn.file_results_total || fileResults.length)} ${fileCountLabel}${turn.file_results_coverage ? ` · ${escapeHtml(turn.file_results_coverage)}` : ''}</span></div><div class="v2-file-bulk-actions"><span class="v2-file-selection-status" data-file-selection-count>未选择文件</span><button type="button" data-select-all-files>全选</button><button type="button" data-create-node-selected disabled>选中后创建节点</button><button type="button" data-export-file-folder>导出资料夹</button></div></header>${renderedFileResults.map((item) => {
       const path = item.node_path || item.path || item.source_path || '';
       const snippets = Array.isArray(item.snippets) ? item.snippets.filter(Boolean) : [];
       const preview = item.preview || {};
@@ -1085,7 +1093,7 @@
       const pages = Array.isArray(item.pages) && item.pages.length ? ` · 页 ${item.pages.slice(0, 3).join(', ')}` : '';
       const status = item.analysis_level || item.status || '';
       return `<article class="v2-file-card"><label class="v2-file-select"><input type="checkbox" data-file-select="${escapeHtml(path)}"><span class="sr-only">选择 ${escapeHtml(basename(path))}</span></label><div><strong title="${escapeHtml(path)}">${escapeHtml(basename(path))}</strong><small>${escapeHtml(path)} · ${escapeHtml(item.extension || '未知类型')}${item.size != null ? ` · ${escapeHtml(formatBytes(item.size))}` : ''}${pages}${status ? ` · ${escapeHtml(status)}` : ''}</small>${previewText ? `<p>${escapeHtml(truncate(previewText, 260))}</p>` : ''}</div><div class="v2-file-card-actions"><button type="button" data-file-open="${escapeHtml(path)}">阅读原文</button><button type="button" data-file-deep-summary="${escapeHtml(path)}">深度摘要</button><button type="button" data-file-collect="${escapeHtml(path)}">加入资料夹</button><button type="button" data-file-node="${escapeHtml(path)}">归入新节点</button></div></article>`;
-    }).join('')}</section>` : '';
+    }).join('')}</section></details>` : '';
     const meta = role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intentLabel(intent))}</span>${task ? `<span>${escapeHtml(task)}</span>` : ''}${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${evidenceStatus && evidenceStatus !== 'not_required' ? `<span>证据：${escapeHtml(evidenceStatus)}</span>` : ''}</div>` : '';
     const content = role === 'assistant' ? safeMarkdown(assistantDisplayText(message.content)) : `<p>${escapeHtml(message.content || '')}</p>`;
     const running = turn && ['queued', 'running', 'waiting_for_deep_analysis'].includes(turn.status);
@@ -1225,6 +1233,24 @@
     } catch (error) {
       notify(error.message || '新建会话失败', true);
     } finally { if (requestSeq === state.conversationRequestSeq) button.disabled = isLargeChatSource() && !chatScanId(); }
+  }
+
+  async function deleteConversation(sessionId, button) {
+    if (!sessionId) return;
+    if (button) button.disabled = true;
+    try {
+      await api(`/api/conversation/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+      if (state.conversation && state.conversation.session_id === sessionId) {
+        state.conversation = null;
+        state.turns = new Map();
+        renderConversation();
+      }
+      await loadConversationList();
+      notify('会话已删除');
+    } catch (error) {
+      if (button) button.disabled = false;
+      notify(error && error.message ? error.message : '删除会话失败', true);
+    }
   }
 
   async function openConversation(sessionId) {
@@ -2323,13 +2349,22 @@
     $('translationDocumentState').className = 'v2-inline-state' + (page.status === 'failed' ? ' is-error' : ' is-ready');
     const original = page.original && page.original.text;
     const translated = page.translated && page.translated.text;
+    // A partially translated document still has usable content: show the
+    // completed portion (unfinished units fall back to their source text)
+    // instead of an empty panel that hides all progress.
+    const working = page.working && page.working.text;
+    const shownTranslation = translated != null ? translated : working;
+    const partialNote = translated == null && working
+      ? '<div class="v2-document-notice">本文档尚未全部完成，以下为已完成部分的译文，未完成处暂保留原文。</div>'
+      : '';
     let content;
     if (state.translationView === 'bilingual') {
-      content = `<div class="v2-bilingual"><section class="v2-document-column"><h3>原文</h3>${original != null ? `<pre>${escapeHtml(original)}</pre>` : '<div class="v2-document-notice">本页未返回原文。</div>'}</section><section class="v2-document-column"><h3>中文译文</h3>${translated != null ? `<pre>${escapeHtml(translated)}</pre>` : '<div class="v2-document-notice">译文尚未生成，请启动当前文件翻译。</div>'}</section></div>`;
+      content = `<div class="v2-bilingual"><section class="v2-document-column"><h3>原文</h3>${original != null ? `<pre>${escapeHtml(original)}</pre>` : '<div class="v2-document-notice">本页未返回原文。</div>'}</section><section class="v2-document-column"><h3>中文译文</h3>${shownTranslation != null ? `${partialNote}<pre>${escapeHtml(shownTranslation)}</pre>` : '<div class="v2-document-notice">译文尚未生成，请启动当前文件翻译。</div>'}</section></div>`;
     } else {
       const isOriginal = state.translationView === 'original';
-      const text = isOriginal ? original : translated;
-      content = `<section class="v2-document-column"><h3>${isOriginal ? '原文' : '中文译文'}</h3>${text != null ? `<pre>${escapeHtml(text)}</pre>` : `<div class="v2-document-notice">${isOriginal ? '本页未返回原文。' : '译文尚未生成，请启动当前文件翻译。'}</div>`}</section>`;
+      const text = isOriginal ? original : shownTranslation;
+      const note = isOriginal ? '' : partialNote;
+      content = `<section class="v2-document-column"><h3>${isOriginal ? '原文' : '中文译文'}</h3>${text != null ? `${note}<pre>${escapeHtml(text)}</pre>` : `<div class="v2-document-notice">${isOriginal ? '本页未返回原文。' : '译文尚未生成，请启动当前文件翻译。'}</div>`}</section>`;
     }
     if (page.errors && page.errors.length) {
       content = `<div class="v2-document-errors">${page.errors.map((error) => escapeHtml(typeof error === 'string' ? error : error.message || error.code || JSON.stringify(error))).join('<br>')}</div>${content}`;
@@ -2338,6 +2373,8 @@
       const warningLabels = page.warnings.map((warning) => {
         if (warning === 'line_structure_changed') return '正文换行已按语义标准化，未影响全文内容';
         if (warning === 'reference_metadata_preserved') return '参考文献、链接与编号按原文保留，确保可回查';
+        if (warning === 'source_preserved_after_quality_review') return '部分图表或标签段落未能译出，已按原文保留，建议人工复核';
+        if (warning === 'figure_label_preserved') return '图表坐标与标签按原文保留，避免误译数值';
         return warning;
       });
       content = `<div class="v2-document-warnings">${warningLabels.map(escapeHtml).join('<br>')}</div>${content}`;
@@ -2639,6 +2676,19 @@
     $('conversationNewBtn').addEventListener('click', createConversation);
     $('conversationListRefreshBtn').addEventListener('click', loadConversationList);
     $('conversationList').addEventListener('click', (event) => {
+      const remove = event.target.closest('[data-delete-session]');
+      if (remove) {
+        // Deleting a conversation is not recoverable, so it is always a
+        // deliberate two-step action.
+        const sessionId = remove.dataset.deleteSession || '';
+        const row = remove.closest('.v2-session-row');
+        const label = row && row.querySelector('.v2-session-item strong');
+        const name = label ? label.textContent.trim() : '这个会话';
+        if (sessionId && window.confirm(`确定删除「${name}」及其全部消息和证据吗？删除后无法恢复。`)) {
+          deleteConversation(sessionId, remove);
+        }
+        return;
+      }
       const button = event.target.closest('[data-session-id]');
       if (button) openConversation(button.dataset.sessionId);
     });

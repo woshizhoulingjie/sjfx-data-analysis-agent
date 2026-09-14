@@ -155,6 +155,24 @@ def _scope_contains(scope: ConversationScope, citation: Mapping[str, Any]) -> bo
     return not path or scope.contains_source(path)
 
 
+def _draft_cites_known_evidence(result: Mapping[str, Any]) -> bool:
+    """True when the drafted answer cites at least one real evidence item."""
+    citations = [item for item in (result.get("citations") or []) if isinstance(item, Mapping)]
+    if not citations:
+        return False
+    draft = str(result.get("answer") or "")
+    indexes = {int(value) for value in re.findall(r"\[(\d{1,4})\]", draft)}
+    if not indexes:
+        return False
+    available = set()
+    for position, item in enumerate(citations, 1):
+        try:
+            available.add(int(item.get("citation_index") or position))
+        except (TypeError, ValueError):
+            available.add(position)
+    return bool(indexes & available)
+
+
 class ClaimVerifier:
     """Verify every factual sentence against the exact citations it names."""
 
@@ -607,6 +625,7 @@ class ClaimVerifier:
                 kept.append("分析判断：{}".format(text))
             else:
                 omitted += 1
+        kept_draft = False
         if kept:
             # Rebuild the list after filtering so removed claims never leave
             # broken numbering or orphaned sections in the final answer.
@@ -614,7 +633,21 @@ class ClaimVerifier:
                 "{}. {}".format(index, item)
                 for index, item in enumerate(kept, 1)
             )
+        elif _draft_cites_known_evidence(result):
+            # The verifier could not confirm a single claim, but the draft does
+            # cite evidence that exists.  Replacing the whole answer with a bare
+            # "insufficient evidence" line discards everything the reader asked
+            # for -- and a package-wide synthesis is exactly the kind of
+            # sentence that is hardest to confirm claim by claim.  Keep the
+            # draft and say plainly that it did not pass line-by-line review.
+            answer = str(result.get("answer") or "").strip()
+            kept_draft = True
+            result["warnings"] = list(result.get("warnings") or []) + [
+                "本回答未能逐条通过原文核验，请对照引用自行复核。"
+            ]
         else:
+            # No surviving claim and nothing cited: the answer is unrelated to
+            # the retrieved evidence, so it is withheld entirely.
             answer = "现有证据不足，暂时无法形成可核验的确定结论。"
         if omitted:
             answer += (
@@ -622,8 +655,11 @@ class ClaimVerifier:
                 "未作为确定结论输出。"
             ).format(omitted)
         result["answer"] = answer
-        result["evidence_status"] = "supported" if kept and not omitted else "partial"
-        result["status"] = "answered" if kept else "insufficient_evidence"
+        result["evidence_status"] = (
+            "unverified" if kept_draft
+            else ("supported" if kept and not omitted else "partial")
+        )
+        result["status"] = "answered" if (kept or kept_draft) else "insufficient_evidence"
         stale_verification_warning = re.compile(
             r"(?:事实性陈述没有通过|陈述只得到部分支持|数字结论无法|"
             r"引用标号无对应证据|候选证据覆盖率较低|当前回答没有可持久化的正文引用|"

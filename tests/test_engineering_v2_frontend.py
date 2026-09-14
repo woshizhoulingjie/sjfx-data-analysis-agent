@@ -17,8 +17,11 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
     def test_page_ids_remain_unique_and_v2_assets_are_local(self):
         ids = re.findall(r'\bid="([^"]+)"', self.html)
         self.assertEqual(len(ids), len(set(ids)), "HTML element ids must remain unique")
-        self.assertIn('/static/engineering-v2.css?v=6', self.html)
-        self.assertIn('/static/engineering-v2.js?v=11', self.html)
+        # Pin intent, not one historical revision: the v2 assets must be
+        # local and cache-busted, and their version number changes whenever
+        # the asset is edited.
+        self.assertRegex(self.html, r'/static/engineering-v2\.css\?v=[\w.\-]+')
+        self.assertRegex(self.html, r'/static/engineering-v2\.js\?v=[\w.\-]+')
         self.assertNotRegex(self.script, r'https?://|\bcdn\b')
         self.assertNotRegex(self.style, r'@import|https?://')
 
@@ -156,7 +159,9 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn('translationListRequestSeq', self.script)
         self.assertIn('language: controls.language', self.script)
         self.assertIn('escapeHtml(original)', self.script)
-        self.assertIn('escapeHtml(translated)', self.script)
+        # A partial document renders the completed working copy, so the pane
+        # uses ``shownTranslation``; the text must still be escaped.
+        self.assertIn('escapeHtml(shownTranslation)', self.script)
 
     def test_translation_work_list_uses_bounded_server_paging_and_filters(self):
         for element_id in (

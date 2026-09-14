@@ -433,6 +433,191 @@ class TranslationCoreTests(unittest.TestCase):
         failed = next(unit for unit in result["units"] if unit["status"] == "failed")
         self.assertEqual(failed["error"]["code"], "source_copied_without_translation")
 
+    def test_a_minority_of_untranslated_segments_is_preserved_with_a_warning(self):
+        """A small tail the model refuses to translate must not block a document.
+
+        The model echoes some figure labels; keeping those segments in their
+        source form lets the document finish and report the fact instead of
+        staying partial for ever.
+        """
+        from services.translation import (
+            PRESERVED_SOURCE_WARNING,
+            _preserve_reviewed_source_units,
+        )
+
+        def settled(status, code=None):
+            return {
+                "translation_required": True, "status": status,
+                "source_text": "Rapid Electrochemical Diagnostics - DCIR",
+                "target_text": None if status == "failed" else "译文",
+                "error": {"code": code} if code else None,
+            }
+
+        units = [settled("completed") for _ in range(9)]
+        units.append(settled("failed", "source_copied_without_translation"))
+        _preserve_reviewed_source_units(units)
+        tail = units[-1]
+        self.assertEqual(tail["status"], "completed")
+        self.assertEqual(tail["preserved_reason"], PRESERVED_SOURCE_WARNING)
+        self.assertIn(PRESERVED_SOURCE_WARNING, tail["qa"]["warnings"])
+        self.assertEqual(tail["target_text"], tail["source_text"])
+        # A preserved segment is unverified, so it must never be reused from
+        # translation memory as though it were a translation.
+        self.assertIsNot(tail["qa"]["passed"], True)
+
+    def test_a_mostly_untranslated_document_is_never_preserved(self):
+        from services.translation import _preserve_reviewed_source_units
+
+        def settled(status, code=None):
+            return {
+                "translation_required": True, "status": status,
+                "source_text": "source text that was never translated",
+                "target_text": None if status == "failed" else "译文",
+                "error": {"code": code} if code else None,
+            }
+
+        units = [settled("completed")]
+        units.extend(
+            settled("failed", "source_copied_without_translation") for _ in range(9)
+        )
+        _preserve_reviewed_source_units(units)
+        self.assertEqual(
+            sum(1 for unit in units if unit["status"] == "failed"), 9
+        )
+
+    def test_integrity_and_provider_failures_are_never_preserved_as_source(self):
+        from services.translation import _preserve_reviewed_source_units
+
+        for code in ("protected_token_mismatch", "empty_translation",
+                     "output_truncated", "unknown_protected_token"):
+            units = [
+                {"translation_required": True, "status": "completed",
+                 "source_text": "source", "target_text": "译文", "error": None}
+                for _ in range(9)
+            ]
+            units.append({"translation_required": True, "status": "failed",
+                          "source_text": "source", "target_text": None,
+                          "error": {"code": code}})
+            _preserve_reviewed_source_units(units)
+            self.assertEqual(units[-1]["status"], "failed", code)
+
+    def test_chart_label_blocks_are_preserved_instead_of_translated(self):
+        """A chart of axis labels and value callouts must never be sent.
+
+        The model echoes such a block, the quality gate rejects it and the
+        document can then only finish through the preservation fallback.  It is
+        cheaper and more honest to keep the block in its source form at plan
+        time.
+        """
+        body = (
+            "NREL    |    15\nRapid Electrochemical Diagnostics - DCIR\nA\nB\nC\n D\n"
+            "x 79 cells\nx 3 temps.\n=\n50,000 pulses\n269 targets\n"
+        )
+        units = build_translation_units(foreign_document(body), preserve_figure_blocks=True)
+        figure = next(unit for unit in units if unit["kind"] == "body")
+        self.assertEqual(figure["block_kind"], "figure")
+        self.assertFalse(figure["translation_required"])
+        self.assertEqual(figure["preserved_reason"], "figure_label_preserved")
+        self.assertIn("figure_label_preserved", figure["qa"]["warnings"])
+        self.assertEqual(figure["target_text"], figure["source_text"])
+
+    def test_prose_and_short_lists_are_never_mistaken_for_a_figure(self):
+        """A paragraph misread as a figure would silently stop being translated."""
+        prose = (
+            "The battery state of health was estimated from voltage relaxation "
+            "after a ten minute rest period at 25 C.\n"
+        )
+        bullets = "Thermal runaway\nFast charging\nCell balancing\nPack architecture\n"
+        prose_with_numbers = (
+            "During 2024 the fleet covered 50,000 pulses and 269 targets were "
+            "reached without a single thermal event.\n"
+        )
+        for label, body in (("prose", prose), ("bullets", bullets),
+                            ("numbers in prose", prose_with_numbers)):
+            units = build_translation_units(foreign_document(body), preserve_figure_blocks=True)
+            bodies = [unit for unit in units if unit["kind"] == "body"]
+            self.assertTrue(bodies, label)
+            for unit in bodies:
+                self.assertNotEqual(unit["block_kind"], "figure", label)
+                self.assertTrue(unit["translation_required"], label)
+
+    def test_a_chinese_page_marker_inside_a_chart_block_is_not_annotated(self):
+        """Only preserved blocks that would have been sent get annotated."""
+        body = ("NREL    |    15\n[第 15 页]\nx 79 cells\nx 3 temps.\n"
+                "50,000 pulses\n269 targets\n")
+        units = build_translation_units(foreign_document(body), preserve_figure_blocks=True)
+        bodies = [unit for unit in units if unit["kind"] == "body"]
+        self.assertTrue(
+            any(unit["preserved_reason"] == "figure_label_preserved" for unit in bodies)
+        )
+        for unit in bodies:
+            if "第" in (unit["source_text"] or ""):
+                self.assertFalse(unit["translation_required"])
+                self.assertIsNone(unit["preserved_reason"])
+
+    def test_mail_and_import_keep_the_historical_document_policies(self):
+        """The new document policies must be opt-in, never a default.
+
+        Mail and the import pipeline share ``TranslationService`` with explicit
+        file translation, so a default-on policy would silently change their
+        behaviour: an untranslated segment would be reported as finished.
+        """
+        policy = TranslationPolicy()
+        self.assertFalse(policy.preserve_figure_blocks)
+        self.assertFalse(policy.preserve_untranslated_tail)
+        body = ("NREL    |    15\nRapid Electrochemical Diagnostics - DCIR\nA\nB\nC\n"
+                "x 79 cells\nx 3 temps.\n=\n50,000 pulses\n269 targets\n")
+        units = build_translation_units(foreign_document(body))
+        self.assertNotIn("figure", [unit["block_kind"] for unit in units])
+        self.assertTrue(
+            all(unit["preserved_reason"] is None for unit in units),
+            "no block may be preserved without the opt-in",
+        )
+
+    def test_the_tail_preservation_step_only_runs_for_an_opted_in_policy(self):
+        from services import translation as translation_module
+
+        class CopyProvider(TranslationProvider):
+            @property
+            def provider_id(self):
+                return "test:copy"
+
+            def translate(self, text, source_language, target_language,
+                          glossary=None, timeout=None, retries=0):
+                return text
+
+        document = foreign_document("これは翻訳が必要な日本語の文書です。")
+        for enabled in (False, True):
+            service = TranslationService(
+                CopyProvider(),
+                policy=TranslationPolicy(
+                    max_attempts=1, preserve_untranslated_tail=enabled,
+                ),
+            )
+            with mock.patch.object(
+                translation_module, "_preserve_reviewed_source_units",
+                side_effect=translation_module._preserve_reviewed_source_units,
+            ) as spy:
+                result = service.translate_document(document)
+            self.assertEqual(spy.call_count, 1 if enabled else 0, enabled)
+            # A mostly untranslated document is never preserved either way.
+            self.assertEqual(result["status"], "failed", enabled)
+
+    def test_explicit_file_translation_opts_into_the_document_policies(self):
+        from services.file_translation import build_file_translation_service
+
+        class FakeClient:
+            model = "qwen3.6:27b"
+            configured = True
+
+        service = build_file_translation_service(FakeClient(), None)
+        self.assertTrue(service.policy.preserve_figure_blocks)
+        self.assertTrue(service.policy.preserve_untranslated_tail)
+
+
+
+
+
     def test_quality_failure_is_corrected_by_local_reviewer(self):
         reviewer = DeterministicProvider()
         service = TranslationService(

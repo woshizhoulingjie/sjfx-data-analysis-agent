@@ -324,6 +324,20 @@ class AnalysisTurnRuntime:
                 scoped_inventory_paths = list(explicit_paths)
                 plan["resolved_file_mentions"] = list(explicit_paths)
             retrieval_override = None
+            # A package-level question ("what does this package cover") must
+            # reach every file.  The default bounds merge about twenty hits,
+            # which describes only the highest ranked files of a package with
+            # thirty or more.  Ordinary packages only: an isolated large
+            # package keeps its own bounds exactly as they are.
+            broad_package_question = (
+                not str(turn["scan_id"]).startswith("lp-")
+                and str(getattr(execution_scope, "kind", "")) in {"package", "directory", "files"}
+                and str(primary_mode) in {"summary", "analysis", "multi_task"}
+            )
+            search_bounds: Dict[str, Any] = (
+                {"max_per_query": 50, "merge_limit": 50}
+                if broad_package_question else {}
+            )
             batch_summary: Dict[str, Any] = {}
             tool_results: Dict[str, Any] = {}
             if not modes.intersection({"casual", "creative", "general_qa"}):
@@ -339,6 +353,8 @@ class AnalysisTurnRuntime:
                     retrieval_top_k = 8 if primary_mode in {
                         "relationship", "contradiction", "risk"
                     } else 10
+                    if broad_package_question:
+                        retrieval_top_k = max(retrieval_top_k, 50)
                     retrieval_override = execute_bounded_searches(
                         self.engine,
                         turn["scan_id"],
@@ -346,6 +362,7 @@ class AnalysisTurnRuntime:
                         plan.get("query_variants") or [turn["question"]],
                         intent=primary_mode,
                         top_k=retrieval_top_k,
+                        **search_bounds,
                     )
                     candidate_files = int(
                         (retrieval_override.get("coverage") or {}).get("candidate_files")
@@ -601,7 +618,8 @@ class AnalysisTurnRuntime:
                     execution_scope,
                     self._repair_queries(plan, verification),
                     intent=primary_mode,
-                    top_k=20,
+                    top_k=50 if broad_package_question else 20,
+                    **search_bounds,
                 )
                 retrieval_override = merge_retrieval_results(
                     [retrieval_override or {}, repair_retrieval], limit=40

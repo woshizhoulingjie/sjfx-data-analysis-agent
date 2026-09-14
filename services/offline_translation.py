@@ -179,9 +179,9 @@ class OfflineNLLBProvider(TranslationProvider):
                 # Keep line separators outside the model. NLLB may normalize
                 # spaces inside a line, but it must never collapse paragraph
                 # or page boundaries in the reconstructed document.
-                line_parts = re.split(r"(\r\n|\n|\r)", part)
+                line_parts = re.split(r"(\r\n|\n|\r|\t+|\|+)", part)
                 for line_part in line_parts:
-                    if line_part in {"\r\n", "\n", "\r"}:
+                    if line_part in {"\r\n", "\n", "\r"} or line_part and set(line_part) <= {"\t", "|"}:
                         layout.append(("literal", line_part))
                         continue
                     if not line_part:

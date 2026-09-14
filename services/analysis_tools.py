@@ -233,7 +233,17 @@ def execute_bounded_searches(
     queries: Sequence[str],
     intent: str = "analysis",
     top_k: int = 12,
+    max_per_query: int = 20,
+    merge_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """Run up to three bounded searches and merge them.
+
+    ``max_per_query`` and ``merge_limit`` default to the historical bounds, so
+    every existing caller is unchanged.  A package-level question raises them,
+    because the default merge of about twenty hits can only ever describe the
+    highest ranked files of a package that has thirty or more.
+    """
+    per_query = max(1, min(int(max_per_query), int(top_k or 12)))
     results = []
     for query in list(queries or [])[:3]:
         results.append(
@@ -242,12 +252,15 @@ def execute_bounded_searches(
                     scan_id=str(scan_id),
                     query=str(query),
                     scope=scope,
-                    top_k=max(1, min(20, int(top_k or 12))),
+                    top_k=per_query,
                     intent=str(intent),
                 )
             )
         )
-    return merge_retrieval_results(results, limit=max(top_k, 8) * 2)
+    return merge_retrieval_results(
+        results,
+        limit=int(merge_limit) if merge_limit else max(top_k, 8) * 2,
+    )
 
 
 def load_candidate_evidence(

@@ -199,7 +199,7 @@ def _match_type(item):
 
 def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
                       candidate_evidence_ids=None, indexed_chunks=None,
-                      use_tfidf=True):
+                      use_tfidf=True, semantic_scores=None):
     query = re.sub(r"\s+", " ", str(query or "")).strip()
     if not query:
         raise ValueError("检索问题不能为空")
@@ -239,18 +239,34 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
     tokenized = [_tokens(text) for text in texts]
     bm25 = _bm25_scores(tokenized, _tokens(query))
     vectors, vector_ready = _tfidf_scores(texts, query) if use_tfidf else ([0.0] * len(texts), False)
+    def _semantic_for(item):
+        if not semantic_scores:
+            return 0.0
+        for key in (item.get("archive_source_path"), item.get("source_path")):
+            key = str(key or "")
+            if key and key in semantic_scores:
+                return float(semantic_scores[key])
+        return 0.0
+
     ranked = []
     for index, item in enumerate(chunks):
         lexical = bm25[index]
         vector = vectors[index]
         combined = 0.58 * lexical + 0.42 * vector if vector_ready else lexical
+        semantic = _semantic_for(item)
+        if semantic_scores is not None:
+            # Cross-lingual recall: the right passage need not share a single
+            # keyword with the question (a Chinese question over English text
+            # shares none), so a semantic score has to be able to carry a
+            # passage past the "no lexical match" filter below.
+            combined = 0.6 * combined + 0.4 * semantic
         if combined <= 0:
             continue
-        ranked.append((combined, lexical, vector, item))
-    ranked.sort(key=lambda value: (-value[0], value[3].get("source_path") or "", value[3].get("evidence_id") or ""))
+        ranked.append((combined, lexical, vector, semantic, item))
+    ranked.sort(key=lambda value: (-value[0], value[4].get("source_path") or "", value[4].get("evidence_id") or ""))
     source_counts = defaultdict(int)
     results = []
-    for combined, lexical, vector, item in ranked:
+    for combined, lexical, vector, semantic, item in ranked:
         source = item.get("source_path") or ""
         if source_counts[source] >= per_source_limit:
             continue
@@ -259,6 +275,8 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
         payload["retrieval_score"] = round(float(combined), 6)
         payload["bm25_score"] = round(float(lexical), 6)
         payload["vector_score"] = round(float(vector), 6)
+        if semantic_scores is not None:
+            payload["semantic_score"] = round(float(semantic), 6)
         payload["match_type"] = _match_type(payload)
         results.append(payload)
         if len(results) >= max(1, min(int(top_k), 50)):
@@ -267,7 +285,10 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
     return {
         "query": query,
         "scope": scope,
-        "method": "BM25 + 本地 TF-IDF 字符向量" if vector_ready else "BM25",
+        "method": (
+            "BM25 + 本地 TF-IDF 字符向量"
+            + (" + 多语言语义向量" if semantic_scores is not None else "")
+        ) if vector_ready else ("BM25 + 多语言语义向量" if semantic_scores is not None else "BM25"),
         "corpus_chunks": len(chunks),
         "result_count": len(results),
         "results": results,

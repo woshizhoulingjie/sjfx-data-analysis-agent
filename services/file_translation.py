@@ -49,14 +49,19 @@ class VLLMFileTranslationProvider(TranslationProvider):
                 temperature=0, max_tokens=output_budget,
                 retries=retries, timeout=timeout, response_format={"type": "json_object"},
             )
-            if result.get("finish_reason") == "length":
-                raise TranslationProviderError(
-                    "vLLM translation reached the output limit", code="output_truncated"
+            truncated = result.get("finish_reason") == "length"
+            try:
+                payload = LocalModelClient._parse_json_content(
+                    result.get("content") or "", required_fields=["translation"],
+                    context="vLLM file translation",
                 )
-            payload = LocalModelClient._parse_json_content(
-                result.get("content") or "", required_fields=["translation"],
-                context="vLLM file translation",
-            )
+            except LocalModelError as exc:
+                if truncated:
+                    raise TranslationProviderError(
+                        "vLLM translation reached the output limit",
+                        code="output_truncated",
+                    ) from exc
+                raise
         except LocalModelError as exc:
             raise TranslationProviderError(str(exc), code="vllm_error") from exc
         translated = payload.get("translation")
@@ -79,6 +84,11 @@ def build_file_translation_service(client, memory, max_unit_chars=1200,
             # instead of ending a whole document on one overlong unit.
             max_unit_chars=min(720, max_unit_chars), max_attempts=max_attempts,
             timeout_seconds=timeout_seconds, coalesce_paragraphs=True,
+            # Explicit file translation is the only caller that opts into
+            # these document policies; mail and the import pipeline keep the
+            # defaults, so their behaviour is byte-for-byte unchanged.
+            preserve_figure_blocks=True,
+            preserve_untranslated_tail=True,
             segmented_recovery_min_chars=240,
             contract_version=TRANSLATION_CONTRACT_VERSION + ":file:" + "vllm:" + client.model,
             checkpoint_unit_interval=1, checkpoint_interval_seconds=3,

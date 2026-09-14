@@ -90,3 +90,47 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .translation-source-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 12px;padding:9px 11px;border:1px solid #dbe1e6;border-radius:6px;background:#f7f8fa}.translation-source-tabs{display:inline-flex;border:1px solid #d5dbe1;border-radius:6px;overflow:hidden;background:#fff}.translation-source-tab{padding:6px 12px;border:0;border-right:1px solid #d5dbe1;background:#fff;color:#455667;font-size:11px;cursor:pointer}.translation-source-tab:last-child{border-right:0}.translation-source-tab.active{background:#41698f;color:#fff}.translation-source-bar select{min-width:220px;max-width:340px;padding:6px 8px;border:1px solid #d5dbe1;border-radius:6px;background:#fff;color:#2b3a48;font-size:11px}.translation-source-bar select:disabled{background:#f4f6f8;color:#93a1ae}.translation-source-state{color:#7b8794;font-size:10px;line-height:1.5;max-width:480px}.translation-source-bar [hidden]{display:none!important}
 .v2-translation-view .v2-translation-selection{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--border,#dbe1e6);font-size:12px}.v2-translation-view .v2-translation-selection label{display:flex;align-items:center;gap:6px;margin:0}.v2-translation-view .v2-translation-row{display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;gap:5px;min-width:0}.v2-translation-view .v2-translation-check{display:flex;justify-content:center;margin:0}.v2-translation-view input[type=checkbox]{width:16px;height:16px;flex:0 0 16px;accent-color:var(--accent,#4169a1)}.v2-translation-view .v2-translation-item{min-width:0}.v2-translation-view .v2-translation-queue{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}.v2-translation-view .v2-translation-queue .v2-inline-state{min-width:0;flex:1 1 220px;overflow-wrap:anywhere}.v2-translation-view #translationDocumentMeta{display:block;overflow-wrap:anywhere;word-break:break-word}
 @media(max-width:780px){.translation-source-bar{align-items:stretch}.translation-source-bar select{max-width:none;flex:1 1 180px}.translation-source-state{flex-basis:100%}}
+
+
+/* ------------------------------------------------------------------
+   SJFX DARK SOURCE SELECTORS
+   The chat and translation "ordinary / large package" bars were built
+   on the light palette and stood out against the shell.  Appearance
+   only: the same selectors are re-coloured, so no markup, id, class
+   or script changes.
+   ------------------------------------------------------------------ */
+.chat-source-bar select,
+.translation-source-bar select {
+  border-color: #2a3446 !important;
+  background: #0d1b30 !important;
+  color: #e6ecf7 !important;
+}
+.chat-source-bar select:disabled,
+.translation-source-bar select:disabled {
+  background: #171c28 !important;
+  color: #8b9ab4 !important;
+}
+.chat-source-tabs,
+.translation-source-tabs {
+  border-color: #2a3446 !important;
+  background: #0d121f !important;
+}
+.chat-source-tab,
+.translation-source-tab {
+  border-right-color: #2a3446 !important;
+  background: transparent !important;
+  color: #a0acc3 !important;
+}
+.chat-source-tab.active,
+.translation-source-tab.active {
+  background: #293453 !important;
+  color: #c5d2ff !important;
+}
+.translation-source-bar {
+  border-color: #2a3446 !important;
+  background: #111622 !important;
+}
+.chat-source-state,
+.translation-source-state {
+  color: #8ea1bd !important;
+}

@@ -78,6 +78,9 @@ tbody tr:hover { background: #edf8f9; }
 .mail-exact-edge { border-left: 3px solid #398aaa; padding: 8px; margin: 5px; }
 #mail-network svg { width: 100%; min-height: 240px; }
 #mail-network line { cursor: pointer; }
+/* SVG 文本不继承 CSS color，缺省 fill 是黑色，在深色面板上不可见。
+   这里显式跟随主题文字色 --ink，浅色/深色主题下都清晰。 */
+#mail-network text { fill: var(--ink); }
 .mail-command-row { flex-wrap: wrap; }
 .mail-command-row label { display: flex; align-items: center; gap: 5px; }
 .mail-results summary { cursor: pointer; padding: 10px 0; font-weight: 600; }
@@ -110,3 +113,46 @@ tbody tr:hover { background: #edf8f9; }
 .mail-segment-source {border-top:1px dashed var(--line);margin-top:10px;padding-top:10px;color:#637084;font-size:13px;}
 .mail-segment-failed {background:#fff8ec;}
 .mail-bilingual .mail-segment-label {color:var(--accent);}
+
+
+/* ------------------------------------------------------------------
+   SJFX DARK MAIL THEME
+   The mail workbench keeps its own light stylesheet.  Re-pointing the
+   palette variables at the shell colours and re-colouring the few
+   hard-coded light surfaces makes the page match the rest of the app.
+   Appearance only: no selector is removed and no markup or script is
+   touched, so every control and id behaves exactly as before.
+   ------------------------------------------------------------------ */
+:root {
+  color-scheme: dark;
+  --ink: #e6ecf7;
+  --muted: #93a4bd;
+  --line: #2a3446;
+  --panel: #111622;
+  --canvas: #07101f;
+  --accent: #2f8f9d;
+  --accent-dark: #256f7a;
+  --alert: #ef7474;
+}
+html, body { background: var(--canvas); color: var(--ink); }
+.mail-shell, .mail-main, .mail-sidebar, .mail-inspector { background: var(--canvas); }
+.mail-header { color: #e8f0f2; background: #0d101a; border-bottom: 1px solid var(--line); }
+.mail-header p { color: #a9b8cf; }
+.mail-question-form, .mail-results, .mail-timeline,
+.mail-relationship-grid > div, .mail-overview, .mail-control-group {
+  background: var(--panel);
+  border-color: var(--line);
+}
+input, select, textarea {
+  border-color: #2a3446;
+  background: #0d1b30;
+  color: var(--ink);
+}
+input::placeholder, textarea::placeholder { color: #7b8ba6; }
+.mail-overview div { border-left-color: #e7ae63; background: #17202f; color: var(--ink); }
+.mail-preview { background: #0d1421; color: var(--ink); }
+.mail-coverage-note { color: #e7ae63; background: #2a2418; }
+.mail-segment-source { color: var(--muted); }
+.mail-segment-failed { background: #2a2418; }
+tbody tr:hover { background: #17202f; }
+thead th, tbody td { border-color: var(--line); }

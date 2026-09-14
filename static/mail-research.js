@@ -1,7 +1,11 @@
 (() => {
   "use strict";
-  const state = { packageId: "", sessionId: "", resultSetId: "", evidenceId: "", jobId: "", turnId: "", pollEpoch: 0, titles: {}, chinese: {}, previewEpoch: 0, resultEpoch: 0, listEpoch: 0, offset: 0, final: null };
+  const state = { packageId: "", sessionId: "", resultSetId: "", evidenceId: "", jobId: "", turnId: "", pollEpoch: 0, titles: {}, chinese: {}, previewEpoch: 0, resultEpoch: 0, listEpoch: 0, offset: 0, final: null, conversationItems: [], conversationOffset: 0, versionItems: [], versionOffset: 0 };
   const byId = (id) => document.getElementById(id);
+  // 分页大小与「邮件与证据」列表保持一致。这两个列表不再截断，全部条目均可翻页抵达。
+  const PANEL_PAGE_SIZE = 25;
+  // 绑定助手：控件缺失时静默跳过，避免旧缓存页面配新脚本时抛错中断整个脚本。
+  const on = (id, handler) => { const node = byId(id); if (node) node.addEventListener("click", handler); };
   const status = (text, error = false) => { const node = byId("mail-status"); node.textContent = text; node.classList.toggle("mail-error", error); };
   const TOKEN_KEYS = ["sjfx_api_token", "sjfxApiToken"];
   const normalizeToken = (value) => {
@@ -154,7 +158,7 @@
   }
   async function loadPackage() {
     state.packageId = byId("mail-package").value;
-    state.pollEpoch++; state.previewEpoch++; state.resultEpoch++; state.listEpoch++;state.previewPages=[];state.previewPayload=null;state.currentResult=null;clear(byId("mail-preview"));clear(byId("mail-original"));clear(byId("mail-detail"));clear(byId("mail-findings"));clear(byId("mail-answer-meta"));clear(byId("mail-limitations"));byId("mail-translation-status").textContent="选择邮件后显示中文译文"; state.offset=0; state.chinese={}; state.titles={}; clear(byId("mail-fields")); clear(byId("mail-evidence-list")); clear(byId("mail-result-items")); byId("mail-answer").textContent="输入你要查找、比较或提取的内容。"; byId("mail-conflicts").textContent=""; state.sessionId = ""; state.resultSetId = ""; state.turnId = ""; byId("mail-export").disabled = true; byId("mail-start").disabled = false; byId("mail-cancel").disabled = true;
+    state.pollEpoch++; state.previewEpoch++; state.resultEpoch++; state.listEpoch++;state.previewPages=[];state.previewPayload=null;state.currentResult=null;clear(byId("mail-preview"));clear(byId("mail-original"));clear(byId("mail-detail"));clear(byId("mail-findings"));clear(byId("mail-answer-meta"));clear(byId("mail-limitations"));byId("mail-translation-status").textContent="选择邮件后显示中文译文"; state.offset=0; state.conversationOffset=0; state.versionOffset=0; state.conversationItems=[]; state.versionItems=[]; state.chinese={}; state.titles={}; clear(byId("mail-fields")); clear(byId("mail-evidence-list")); clear(byId("mail-result-items")); byId("mail-answer").textContent="输入你要查找、比较或提取的内容。"; byId("mail-conflicts").textContent=""; state.sessionId = ""; state.resultSetId = ""; state.turnId = ""; byId("mail-export").disabled = true; byId("mail-start").disabled = false; byId("mail-cancel").disabled = true;
     if (!state.packageId) return;
     const payload = await api(`/api/mail/packages/${encodeURIComponent(state.packageId)}`);
     renderOverview({ ...payload.overview, coverage: payload.coverage });
@@ -328,9 +332,45 @@
     (coverage.items || []).forEach(item=>{const li=document.createElement("li");const button=document.createElement("button");button.type="button";button.className="mail-relation-link";button.textContent=`${zhLabel(item.status)} · ${item.filename_raw || item.mime_path}`;button.addEventListener("click",()=>inspectAttachment(item.message_key,item.mime_path,item.filename_raw).catch(report));li.append(button);gaps.append(li);});
     if (!coverage.total) {const li=document.createElement("li");li.textContent="当前附件没有待处理缺口";gaps.append(li);}
     const history=byId("mail-result-history");clear(history);history.append(option("选择结果集…",""));(results.items || []).forEach(item=>history.append(option(`${item.created_at} · ${item.item_count} 条${item.parent_result_set_id ? " · 追问" : ""}`,item.result_set_id)));history.value=state.resultSetId;
-    const conv=byId("mail-conversations");clear(conv);(conversations.items || []).slice(0,150).forEach(item=>{const li=document.createElement("li");const button=document.createElement("button");button.type="button";button.textContent=`${item.subject_normalized || "无主题"} · ${item.message_count} 封 · ${item.merge_basis}`;button.addEventListener("click",()=>showConversation(item.conversation_id).catch(report));li.append(button);conv.append(li);});
-    const versionList=byId("mail-versions");clear(versionList);(versions.items || []).slice(0,200).forEach(item=>{const li=document.createElement("li");const button=document.createElement("button");button.type="button";button.textContent=`${item.chain_key} · 顺序 ${item.version_ordinal} · ${item.sent_at_utc || "日期未知"}`;button.addEventListener("click",()=>inspectAttachment(item.message_key,item.mime_path,item.chain_key).catch(report));li.append(button);versionList.append(li);});
+    state.conversationItems=conversations.items || []; renderConversationList();
+    state.versionItems=versions.items || []; renderVersionList();
     renderNetwork(network.network || {});
+  }
+  // 分页切片：全量条目始终保留在 state 中，每页只渲染 PANEL_PAGE_SIZE 条。
+  function pageSlice(items,offset){
+    const total=items.length;
+    const maxOffset=total?Math.floor((total-1)/PANEL_PAGE_SIZE)*PANEL_PAGE_SIZE:0;
+    const start=Math.max(0,Math.min(offset,maxOffset));
+    return {items:items.slice(start,start+PANEL_PAGE_SIZE),offset:start};
+  }
+  // 更新页码文字与翻页按钮状态；控件缺失时静默跳过。
+  function updatePager(prefix,total,offset,count){
+    const label=byId(prefix+"-page");
+    if(label)label.textContent=total?`${offset+1}–${offset+count} / ${total}`:"0 条";
+    const prev=byId(prefix+"-prev"); if(prev)prev.disabled=offset===0;
+    const next=byId(prefix+"-next"); if(next)next.disabled=offset+PANEL_PAGE_SIZE>=total;
+  }
+  // 会话列表：不再截断到 150 条，改为分页显示全部。
+  function renderConversationList(){
+    const list=byId("mail-conversations"); if(!list)return;
+    clear(list);
+    const items=state.conversationItems || [];
+    const page=pageSlice(items,state.conversationOffset);
+    state.conversationOffset=page.offset;
+    if(!items.length){const li=document.createElement("li");li.textContent="当前资料包没有会话记录";list.append(li);}
+    page.items.forEach(item=>{const li=document.createElement("li");const button=document.createElement("button");button.type="button";button.textContent=`${item.subject_normalized || "无主题"} · ${item.message_count} 封 · ${item.merge_basis}`;button.addEventListener("click",()=>showConversation(item.conversation_id).catch(report));li.append(button);list.append(li);});
+    updatePager("mail-conversations",items.length,page.offset,page.items.length);
+  }
+  // 附件传递与版本：不再截断到 200 条，改为分页显示全部。
+  function renderVersionList(){
+    const list=byId("mail-versions"); if(!list)return;
+    clear(list);
+    const items=state.versionItems || [];
+    const page=pageSlice(items,state.versionOffset);
+    state.versionOffset=page.offset;
+    if(!items.length){const li=document.createElement("li");li.textContent="当前资料包没有附件版本记录";list.append(li);}
+    page.items.forEach(item=>{const li=document.createElement("li");const button=document.createElement("button");button.type="button";button.textContent=`${item.chain_key} · 顺序 ${item.version_ordinal} · ${item.sent_at_utc || "日期未知"}`;button.addEventListener("click",()=>inspectAttachment(item.message_key,item.mime_path,item.chain_key).catch(report));li.append(button);list.append(li);});
+    updatePager("mail-versions",items.length,page.offset,page.items.length);
   }
   async function showConversation(id) {
     const value=(await api(`/api/mail/conversations/${encodeURIComponent(id)}`)).conversation;const node=byId("mail-conversation-detail");clear(node);
@@ -377,6 +417,10 @@
   byId("mail-entity-form").addEventListener("submit",event=>{event.preventDefault();if(!state.packageId)return;const addresses=byId("mail-entity-addresses").value.split(/[,，;；\s]+/).filter(Boolean);api("/api/mail/entities/confirm",{method:"POST",body:JSON.stringify({package_id:state.packageId,display_name:byId("mail-entity-name").value.trim(),addresses})}).then(()=>loadMiningViews()).then(()=>status("邮箱归并已记录人工确认依据")).catch(report);});
   byId("mail-prev").addEventListener("click",()=>{state.offset=Math.max(0,state.offset-25);loadMessages().catch(report);});
   byId("mail-next").addEventListener("click",()=>{state.offset+=25;loadMessages().catch(report);});
+  on("mail-conversations-prev",()=>{state.conversationOffset=Math.max(0,state.conversationOffset-PANEL_PAGE_SIZE);renderConversationList();});
+  on("mail-conversations-next",()=>{state.conversationOffset+=PANEL_PAGE_SIZE;renderConversationList();});
+  on("mail-versions-prev",()=>{state.versionOffset=Math.max(0,state.versionOffset-PANEL_PAGE_SIZE);renderVersionList();});
+  on("mail-versions-next",()=>{state.versionOffset+=PANEL_PAGE_SIZE;renderVersionList();});
   byId("mail-more-translation").addEventListener("click",()=>{if(state.previewPayload && state.nextTranslationOffset!=null)presentSource({...state.previewPayload,offset:state.nextTranslationOffset},"",true).catch(report);});
   document.querySelectorAll("[data-mail-example]").forEach(button=>button.addEventListener("click",()=>{byId("mail-question").value=button.dataset.mailExample;byId("mail-question").focus();}));
   byId("mail-bilingual").addEventListener("change",()=>{if(state.previewPages)renderTranslationSegments();});

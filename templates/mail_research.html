@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>邮件 Agent 分析 | SJFX</title>
-  <link rel="stylesheet" href="/static/mail-research.css?v=7">
+  <title>邮件分析 | SJFX</title>
+  <link rel="stylesheet" href="/static/mail-research.css?v=9">
 </head>
 <body>
   <main class="mail-shell">
     <header class="mail-header">
       <a class="back-link" href="/">SJFX</a>
-      <h1>邮件 Agent 分析</h1>
+      <h1>邮件分析</h1>
       <p id="mail-status" role="status">选择邮件资料包后开始研究</p>
       <button id="mail-token" class="mail-token" type="button" title="设置访问 Token">Token</button>
     </header>
@@ -86,8 +86,8 @@
           <div class="mail-results-title"><h2>时间线</h2><span id="mail-timeline-count"></span></div>
           <ol id="mail-timeline-list"><li>选择资料包后显示当前筛选范围内的邮件时间线。</li></ol>
         </section>
-        <details class="mail-results"><summary>会话与候选关联</summary><ul id="mail-conversations"></ul><div id="mail-conversation-detail"></div></details>
-        <details class="mail-results"><summary>附件传递与版本</summary><p>同名文件仅为候选版本关系；内容哈希相同表示完全相同。</p><ul id="mail-versions"></ul></details>
+        <details class="mail-results"><summary>会话与候选关联</summary><ul id="mail-conversations"></ul><div class="mail-pagination"><button id="mail-conversations-prev" type="button" disabled>上一页</button><span id="mail-conversations-page"></span><button id="mail-conversations-next" type="button" disabled>下一页</button></div><div id="mail-conversation-detail"></div></details>
+        <details class="mail-results"><summary>附件传递与版本</summary><p>同名文件仅为候选版本关系；内容哈希相同表示完全相同。</p><ul id="mail-versions"></ul><div class="mail-pagination"><button id="mail-versions-prev" type="button" disabled>上一页</button><span id="mail-versions-page"></span><button id="mail-versions-next" type="button" disabled>下一页</button></div></details>
         <details class="mail-results"><summary>通信网络</summary><div id="mail-network"></div><form id="mail-entity-form"><label>确认的实体名称 <input id="mail-entity-name" required></label><label>归属邮箱（用逗号分隔）<textarea id="mail-entity-addresses" rows="2" required></textarea></label><button type="submit">确认这些邮箱属于同一实体</button></form></details>
         <section class="mail-relationship-grid" aria-label="邮件关系">
           <div><h2>通信关系</h2><ul id="mail-communication"></ul></div>
@@ -122,6 +122,6 @@
       <div class="mail-command-row"><button type="submit">连接服务</button><button id="mail-token-cancel" type="button">取消</button></div>
     </form>
   </dialog>
-  <script src="/static/mail-research.js?v=7" defer></script>
+  <script src="/static/mail-research.js?v=8" defer></script>
 </body>
 </html>

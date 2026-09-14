@@ -5481,7 +5481,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     else:
         retrieval = build_retrieval_manifest(canonical_documents, topic_clusters)
         evidence_index_count = storage.replace_evidence_index(
-            scan_id, evidence_corpus(canonical_documents)
+            scan_id,
+            _index_chunks_from_full_documents(storage, scan_id, canonical_documents),
         )
     research_documents = {
         path: document for path, document in canonical_documents.items()
@@ -6119,6 +6120,31 @@ def refresh_package_progress_counts(scan_id, scan, storage):
     return analysis
 
 
+def _index_chunks_from_full_documents(storage, scan_id, fallback_documents):
+    """Build searchable evidence chunks from each file's full document.
+
+    ``iter_documents(hydrate=False)`` yields the bounded overview window --
+    about ``overview_chars_per_file`` characters carrying
+    ``overview_evidence_per_file`` evidence items.  Indexing those payloads
+    produced roughly six chunks per file, so a whole-package search could only
+    ever see a handful of passages from each document however complete the
+    parse was.  The full text is kept in the hydrated payload; index that, one
+    file at a time so peak memory stays bounded.
+
+    Ordinary packages only: the large-package branch keeps its own per-source
+    incremental index and is deliberately untouched.
+    """
+    chunks = []
+    for path, fallback in (fallback_documents or {}).items():
+        document = None
+        try:
+            document = storage.get_document(scan_id, path)
+        except Exception:
+            document = None
+        chunks.extend(evidence_corpus({path: document or fallback}))
+    return chunks
+
+
 def refresh_package_coverage(scan_id, scan, storage):
     """Refresh the visible coverage contract after a file was deep-parsed."""
     analysis = storage.get_analysis(scan_id) or {}
@@ -6212,7 +6238,20 @@ def refresh_package_coverage(scan_id, scan, storage):
         canonical_documents, _canonical_by_path, _aliases = _canonical_projection(documents, exact_groups)
     analysis["exact_duplicate_groups"] = exact_groups
     if not policy.get("enabled"):
-        storage.replace_evidence_index(scan_id, evidence_corpus(canonical_documents))
+        storage.replace_evidence_index(
+            scan_id,
+            _index_chunks_from_full_documents(storage, scan_id, canonical_documents),
+        )
+        # Pre-embed the package's files so the first cross-lingual question does
+        # not pay for embedding every file.  Ordinary packages only, and
+        # strictly best-effort: a failure here must never affect the refresh.
+        try:
+            from services import ordinary_recall
+            ordinary_recall.warm_file_vectors(
+                storage, scan_id, list(canonical_documents),
+            )
+        except Exception:
+            pass
     tree = attach_tree_coverage(analysis.get("analysis_tree") or {}, coverage_for_paths, all_paths)
     analysis["analysis_tree"] = tree
     analysis["coverage"] = package_coverage

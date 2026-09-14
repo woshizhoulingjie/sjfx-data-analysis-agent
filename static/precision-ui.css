@@ -212,3 +212,12 @@ body.nav-collapsed::before{left:calc((100% + 70px)/2)!important;width:min(calc(1
 
 /* Retrieval provenance line on evidence cards (score + why it was kept). */
 .v2-citation-provenance{display:block;margin-top:4px;color:#93a7c9!important;font:11px/1.6 var(--p-mono)!important}
+
+
+/* Collapsible related-file list and the per-conversation delete control. */
+.v2-file-results-fold>summary{cursor:pointer;color:#a0b9ff!important;font-size:14px!important;font-weight:600;padding:6px 0;list-style:revert}
+.v2-file-results-fold[open]>summary{margin-bottom:10px}
+.v2-session-row{display:flex;align-items:stretch;gap:6px}
+.v2-session-row>.v2-session-item{flex:1;min-width:0}
+.v2-session-delete{flex:none;width:30px;min-height:30px;padding:0!important;line-height:1;color:#8fa3c6!important;background:transparent!important;border-color:transparent!important;font-size:16px!important}
+.v2-session-delete:hover:not(:disabled){color:#f48d9e!important;background:#f48d9e14!important;border-color:#f48d9e40!important}

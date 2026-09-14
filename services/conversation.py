@@ -18,7 +18,7 @@ import hashlib
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -889,6 +889,9 @@ def _citation(item: Mapping[str, Any], index: int, structured: bool = False) -> 
         "match_type": item.get("match_type"),
         "matched_keywords": [str(value) for value in (item.get("matched_keywords") or [])][:12],
         "match_reason": item.get("match_reason") or item.get("semantic_reason"),
+        # Position after the local-model rerank pass; the raw retrieval score
+        # is left untouched so both remain auditable.
+        "rerank_rank": item.get("rerank_rank"),
         "evidence_role": item.get("evidence_role") or ("structured_statistic" if structured else "direct_source"),
         "quality": dict(quality),
         **({
@@ -983,6 +986,37 @@ def _sanitize_citation_labels(answer: str, citation_count: int) -> str:
 
     answer = re.sub(r"\[(\d{1,4})\]", replace, str(answer or ""))
     return answer.strip()
+
+
+def _rerank_large_package_items(
+    scan_id: Any,
+    query: str,
+    items: Sequence[Mapping[str, Any]],
+) -> List[Mapping[str, Any]]:
+    """Reorder an isolated large package's final evidence list with the local model.
+
+    A turn can merge several bounded searches, each carrying its own order, so
+    ranking inside any single search would be overwritten by that merge.  This
+    runs once on the list that is actually shown, only for ``lp-`` packages, and
+    stamps ``rerank_rank`` when the order really changed.  ``rerank_candidates``
+    returns its input untouched on any failure, so this can never lose evidence
+    and never affects ordinary packages.
+    """
+    values = list(items or [])
+    if len(values) < 3 or not str(scan_id or "").startswith("lp-"):
+        return values
+    try:
+        from services.large_package_recall import rerank_candidates
+
+        reordered = list(rerank_candidates(query, values, None))
+    except Exception:
+        return values
+    if [id(item) for item in reordered] == [id(item) for item in values]:
+        return values
+    for position, item in enumerate(reordered, 1):
+        if isinstance(item, dict):
+            item["rerank_rank"] = position
+    return reordered
 
 
 class ConversationEngine:
@@ -1397,6 +1431,39 @@ class ConversationEngine:
         turn['file_results_coverage'] = None
         return turn
 
+    def _turn_context_policy(
+        self,
+        session: "ConversationSession",
+        decision: "IntentDecision",
+        scope: "ConversationScope",
+    ) -> "ContextWindowPolicy":
+        """Widen the evidence budgets for a whole-package question.
+
+        A "what does this package cover" question cannot be answered from a
+        fixed number of hits: every file's summary has to reach the model, or
+        the answer silently describes only the highest ranked files.
+
+        Two gates keep every other question -- and the whole large-package
+        path -- bit-for-bit unchanged: an isolated large package returns the
+        shared policy object untouched, and so does any non package-level scope
+        or any intent other than a broad one.
+        """
+        base = self.context_policy
+        scan_id = str(getattr(session, "scan_id", "") or "")
+        if scan_id.startswith("lp-"):
+            # Isolated large packages keep their existing budgets exactly.
+            return base
+        if str(getattr(scope, "kind", "") or "") not in {"package", "directory", "files"}:
+            return base
+        if str(getattr(decision, "name", "") or "") not in {"summary", "analysis", "multi_task"}:
+            return base
+        return replace(
+            base,
+            max_prompt_evidence=50,
+            max_model_evidence_per_file=1,
+            max_model_evidence_chars=max(int(base.max_model_evidence_chars), 32000),
+        )
+
     def _answer_from_retrieval(
         self,
         session: ConversationSession,
@@ -1412,11 +1479,16 @@ class ConversationEngine:
             if isinstance(retrieval_override, Mapping)
             else self._retrieve(session, resolution.resolved_query, scope, decision.name)
         )
+        turn_policy = self._turn_context_policy(session, decision, scope)
         citations = _normalise_citations(
-            self._retrieval_items(retrieval),
-            limit=self.context_policy.max_display_evidence,
+            _rerank_large_package_items(
+                session.scan_id,
+                resolution.resolved_query,
+                self._retrieval_items(retrieval),
+            ),
+            limit=turn_policy.max_display_evidence,
         )
-        model_citations = _select_model_citations(citations, self.context_policy)
+        model_citations = _select_model_citations(citations, turn_policy)
         coverage = CoverageSnapshot.from_values(
             retrieval.get("coverage") if isinstance(retrieval.get("coverage"), Mapping) else None,
             retrieval,
@@ -1446,10 +1518,10 @@ class ConversationEngine:
             "selected_evidence": len(model_citations),
             "display_evidence": len(citations),
             "selected_characters": selected_chars,
-            "evidence_limit": self.context_policy.max_prompt_evidence,
-            "display_limit": self.context_policy.max_display_evidence,
-            "evidence_char_limit": self.context_policy.max_evidence_chars,
-            "model_evidence_char_budget": self.context_policy.max_model_evidence_chars,
+            "evidence_limit": turn_policy.max_prompt_evidence,
+            "display_limit": turn_policy.max_display_evidence,
+            "evidence_char_limit": turn_policy.max_evidence_chars,
+            "model_evidence_char_budget": turn_policy.max_model_evidence_chars,
             "deferred_files": list((retrieval.get("deferred_paths") or retrieval.get("promotion_candidates") or []))[:100],
             "package_reading": {
                 "files_read": reading_manifest.get("files_read"),

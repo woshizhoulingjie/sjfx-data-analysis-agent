@@ -268,6 +268,10 @@ class Config:
     # Translation is local-only by default. Set TRANSLATION_PROVIDER=ollama
     # explicitly to retain the legacy Ollama adapter.
     TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "offline_nllb").strip().lower()
+    # Explicit document/file translation backend. Mail translation is assembled separately.
+    TRANSLATION_FILE_BACKEND = os.getenv("TRANSLATION_FILE_BACKEND", "vllm").strip().lower()
+    if TRANSLATION_FILE_BACKEND not in {"offline_nllb", "vllm"}:
+        TRANSLATION_FILE_BACKEND = "vllm"
     TRANSLATION_MODEL_PATH = os.getenv(
         "TRANSLATION_MODEL_PATH",
         str(BASE_DIR / "models" / "nllb-200-distilled-600m"),

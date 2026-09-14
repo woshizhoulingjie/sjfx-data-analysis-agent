@@ -373,7 +373,10 @@ class ProtectedText:
 
     def restore(self, translated):
         output = str(translated or "")
-        missing = [token for token in self.replacements if output.count(token) != 1]
+        # A placeholder that never appears cannot be restored and stays a hard
+        # failure.  A repeated placeholder still restores every occurrence, so
+        # the QA reports it as a warning instead of discarding the whole unit.
+        missing = [token for token in self.replacements if token not in output]
         if missing:
             raise TranslationQualityError(
                 "模型未完整保留保护标记：{}".format(", ".join(missing[:8])),
@@ -669,6 +672,12 @@ class TranslationPolicy:
     checkpoint_unit_interval: int = 16
     checkpoint_interval_seconds: float = 30.0
     max_intermediate_checkpoints: int = 32
+    # Document-level finishing policies.  Both default to the historical
+    # behaviour, which every existing caller (mail, the import pipeline)
+    # keeps: a segment that cannot be translated fails instead of being
+    # reported as finished.  Only explicit file translation opts in.
+    preserve_figure_blocks: bool = False
+    preserve_untranslated_tail: bool = False
     # Keep the historical 1200-character recovery gate for existing callers
     # (mail/NLLB). Explicit file translation may opt into a lower gate because
     # its vLLM units are deliberately smaller and independently resumable.
@@ -693,6 +702,8 @@ class TranslationPolicy:
         self.segmented_recovery_min_chars = max(
             0, min(12000, int(self.segmented_recovery_min_chars or 1200))
         )
+        self.preserve_figure_blocks = bool(self.preserve_figure_blocks)
+        self.preserve_untranslated_tail = bool(self.preserve_untranslated_tail)
 
 
 def translation_memory_key(source_text, source_language, glossary=None,
@@ -723,6 +734,68 @@ def _normalise_provider_response(value):
     raise TranslationProviderError("翻译提供者返回了不支持的数据类型", retryable=False)
 
 
+# A segment whose every attempt the quality gate judged *untranslated* rather
+# than broken: the model echoed figure labels, a symbol list or a short
+# caption.  Codes that describe real damage -- a lost placeholder, an unknown
+# token, an empty or truncated output -- are deliberately absent, so those
+# still fail the unit.
+_PRESERVED_QUALITY_CODES = frozenset({
+    "target_missing_chinese",
+    "target_contains_untranslated_text",
+    "source_copied_without_translation",
+})
+
+PRESERVED_SOURCE_WARNING = "source_preserved_after_quality_review"
+
+# Only a small tail of a document may be preserved this way.  A document that
+# is mostly untranslated must still be reported as failed rather than quietly
+# presented as complete.
+_MAX_PRESERVED_SHARE = 0.2
+
+
+def _preserve_reviewed_source_units(units, max_share=_MAX_PRESERVED_SHARE):
+    """Settle a small minority of untranslated segments in their source form.
+
+    The document can then finish and surface an explicit warning instead of
+    remaining partial for ever.  ``qa["passed"]`` stays false so a preserved
+    segment is never reused from translation memory as if it were verified.
+    """
+    required = [unit for unit in units if unit.get("translation_required")]
+    failed = [unit for unit in required if unit.get("status") == "failed"]
+    if not failed:
+        return units
+    if not any(unit.get("status") == "completed" for unit in required):
+        return units
+    candidates = [
+        unit for unit in failed
+        if str((unit.get("error") or {}).get("code") or "") in _PRESERVED_QUALITY_CODES
+    ]
+    if not candidates:
+        return units
+    if len(candidates) / float(len(required) or 1) > max_share:
+        return units
+    for unit in candidates:
+        code = str((unit.get("error") or {}).get("code") or "")
+        unit.update({
+            "status": "completed",
+            "target_text": str(unit.get("source_text") or ""),
+            "model": None,
+            "usage": {},
+            "qa": {
+                "passed": False,
+                "errors": [],
+                "warnings": [PRESERVED_SOURCE_WARNING],
+                "source_preserved": True,
+                "review_code": code,
+            },
+            "error": None,
+            "retryable": False,
+            "reused_from": None,
+            "preserved_reason": PRESERVED_SOURCE_WARNING,
+        })
+    return units
+
+
 def validate_translation(source, protected, provider_output, restored,
                          source_language, glossary=None, strict_layout=False):
     """Return a machine-readable QA decision for one translated unit."""
@@ -732,10 +805,17 @@ def validate_translation(source, protected, provider_output, restored,
     restored = str(restored or "")
     if not raw_output.strip():
         errors.append("empty_translation")
+    duplicated_tokens = 0
     for token in protected.replacements:
-        if raw_output.count(token) != 1:
+        count = raw_output.count(token)
+        if count == 0:
+            # A lost placeholder means the original span cannot be restored.
             errors.append("protected_token_mismatch")
             break
+        if count > 1:
+            duplicated_tokens += 1
+    if duplicated_tokens:
+        warnings.append("protected_token_duplicated")
     unknown = [token for token in _TOKEN_RE.findall(raw_output) if token not in protected.replacements]
     if unknown:
         errors.append("unknown_protected_token")
@@ -758,7 +838,9 @@ def validate_translation(source, protected, provider_output, restored,
     if translatable_letters >= 8 and not han_count:
         errors.append("target_missing_chinese")
 
-    raw_without_tokens = _TOKEN_RE.sub("", raw_output)
+    # Only prose is expected to become Chinese; labels, links and citations in
+    # the output are legitimate preserved source text.
+    raw_without_tokens = _prose_only(_TOKEN_RE.sub("", raw_output))
     target_foreign_letters = (
         len(_LATIN_RE.findall(raw_without_tokens)) + len(_CYRILLIC_RE.findall(raw_without_tokens))
         + len(_ARABIC_RE.findall(raw_without_tokens)) + len(_KANA_RE.findall(raw_without_tokens))
@@ -841,6 +923,54 @@ def _heading_texts(structure):
     return values
 
 
+_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-]*")
+_LINK_OR_ID_RE = re.compile(
+    r"(?:https?://\S+|www\.\S+|\bdoi\s*[:/]\s*\S+|\S+@\S+\.\S+|"
+    r"\b[a-z0-9][a-z0-9\-]*\.(?:gov|org|com|edu|net|io|cn|int)(?:/\S*)?)",
+    re.I,
+)
+# A line that reads as bibliographic rather than as prose.  Deliberately
+# narrow: a bare year is not enough, because ordinary sentences contain years.
+_BIBLIOGRAPHIC_LINE_RE = re.compile(
+    r"(?:\bet\s+al\b|"
+    r"[（(]\s*(?:19|20)\d{2}\s*[）)]\s*\d|"
+    r"\b(?:19|20)\d{2}\s*[,;:，；：]\s*\d|"
+    r"\b\d{1,4}\s*[（(]\d{1,3}[）)]\s*\d|"
+    r"\b(?:vol|no|pp|isbn|issn|doi)\.?\s*\d)",
+    re.I,
+)
+_CITATION_LINE_RE = re.compile(
+    r"(?:\b(?:19|20)\d{2}\b|\b(?:vol\.?|no\.?|pp\.?|isbn|issn|doi)\b|"
+    r"^\s*(?:[\[\u3010]\d+[\]\u3011]|\d+[.)、]))",
+    re.I,
+)
+_BARE_DOMAIN_RE = re.compile(
+    r"(?:https?://|www\.|\bdoi\s*[:/]|"
+    r"\b[a-z0-9][a-z0-9\-]*\.(?:gov|org|com|edu|net|io|cn|int)\b)",
+    re.I,
+)
+
+
+def _prose_only(text):
+    """Return only the parts of a translation a reader expects in Chinese.
+
+    Figure keys, chart labels, links, identifiers and bibliographic lines
+    legitimately stay in the source language.  Counting their Latin letters as
+    "untranslated" made correct mixed-language translations fail.
+    """
+    kept = []
+    for raw_line in str(text or "").splitlines():
+        line = _LINK_OR_ID_RE.sub(" ", raw_line).strip()
+        if not line:
+            continue
+        if _BIBLIOGRAPHIC_LINE_RE.search(line) and len(_LATIN_WORD_RE.findall(line)) <= 12:
+            continue
+        if len(_LATIN_WORD_RE.findall(line)) < 4:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _is_reference_metadata(text):
     """Recognise citation-heavy bibliographies that must retain source form.
 
@@ -852,27 +982,96 @@ def _is_reference_metadata(text):
     """
     value = str(text or "")
     lines = [line for line in value.splitlines() if line.strip()]
-    if len(lines) < 6:
+    if not lines:
         return False
     compact_length = max(1, len(re.sub(r"\s+", "", value)))
     digits = len(re.findall(r"\d", value))
-    links = len(re.findall(r"(?:https?://|www\.|\bdoi\s*[:/])", value, re.I))
-    citation_lines = sum(
-        1 for line in lines
-        if re.search(
-            r"(?:\b(?:19|20)\d{2}\b|\b(?:vol\.?|no\.?|pp\.?|isbn|issn|doi)\b|"
-            r"^\s*(?:\[\d+\]|\d+[.)]))",
-            line, re.I,
+    digit_density = digits / float(compact_length)
+    if digit_density < 0.025:
+        return False
+    links = len(_BARE_DOMAIN_RE.findall(value))
+    citation_lines = sum(1 for line in lines if _CITATION_LINE_RE.search(line))
+    if len(lines) >= 6:
+        # A bibliography: several citation lines, and either a link or enough
+        # of the block reading as citations.  The share is relative so a short
+        # reference list is not rejected for having fewer than five entries.
+        return citation_lines >= 3 and (
+            links >= 1 or citation_lines >= max(3, int(len(lines) * 0.4))
         )
-    )
+    # Short blocks must look bibliographic on every line.  A one-line citation
+    # is a reference; a one-line sentence that merely mentions a year is not.
     return (
-        citation_lines >= 3
-        and digits / float(compact_length) >= 0.025
-        and (links >= 1 or citation_lines >= max(5, len(lines) // 5))
+        digit_density >= 0.03
+        and all(_BIBLIOGRAPHIC_LINE_RE.search(line) for line in lines)
     )
 
 
-def _block_kind(text, heading_values, evidence_markers):
+# Block kinds that are kept in their source form at plan time.  A reference
+# list must stay traceable, and a chart/figure block is a set of axis labels,
+# value callouts and symbol lists: a model echoes those instead of translating
+# them, so sending them only produces a rejection and a retry.
+_PRESERVED_BLOCK_KINDS = ("reference", "figure")
+
+_PRESERVED_BLOCK_WARNINGS = {
+    "reference": "reference_metadata_preserved",
+    "figure": "figure_label_preserved",
+}
+
+_PRESERVED_BLOCK_REASONS = {
+    "reference": "reference_metadata",
+    "figure": "figure_label_preserved",
+}
+
+
+def _longest_word_run(text):
+    """Length of the longest run of words joined only by spaces or tabs.
+
+    Punctuation ends a run, so ``Rapid Electrochemical Diagnostics - DCIR``
+    counts as three words while ``Average performance on open-source data
+    sets`` counts as six.  A real sentence therefore always shows a long run.
+    """
+    longest = 0
+    for line in str(text or "").splitlines():
+        current = 0
+        previous_end = None
+        for match in _LATIN_WORD_RE.finditer(line):
+            if previous_end is not None and line[previous_end:match.start()].strip(" \t"):
+                current = 0
+            current += 1
+            longest = max(longest, current)
+            previous_end = match.end()
+    return longest
+
+
+def _looks_like_figure_block(text):
+    """True for chart and figure blocks rather than prose.
+
+    Deliberately conservative: a paragraph that is misread as a figure would
+    silently stop being translated, which is far worse than translating one
+    label too many.  Every condition below is a necessary signal of a chart --
+    several lines, mostly fragment-length lines, at least a quarter of the
+    lines carrying digits, and no sentence anywhere in the block.
+    """
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+    compact = _TOKEN_RE.sub("", str(text or ""))
+    if len(_LATIN_WORD_RE.findall(compact)) > 120:
+        return False
+    fragment_lines = sum(
+        1 for line in lines if len(_LATIN_WORD_RE.findall(line)) < 4
+    )
+    if fragment_lines / float(len(lines)) < 0.7:
+        return False
+    digit_lines = sum(1 for line in lines if re.search(r"\d", line))
+    if digit_lines / float(len(lines)) < 0.25:
+        return False
+    if _longest_word_run(compact) >= 5:
+        return False
+    return True
+
+
+def _block_kind(text, heading_values, evidence_markers, detect_figures=False):
     compact = re.sub(r"\s+", " ", str(text or "")).strip()
     if compact in heading_values:
         return "heading"
@@ -896,12 +1095,15 @@ def _block_kind(text, heading_values, evidence_markers):
         or sum(line.count("|") for line in lines) >= max(4, len(lines) * 2)
     ):
         return "table"
+    if detect_figures and _looks_like_figure_block(text):
+        return "figure"
     return "paragraph"
 
 
 def build_translation_units(document, max_unit_chars=2400, glossary=None,
                             target_language=TARGET_LANGUAGE,
-                            contract_version=TRANSLATION_CONTRACT_VERSION):
+                            contract_version=TRANSLATION_CONTRACT_VERSION,
+                            preserve_figure_blocks=False):
     """Create deterministic title/body units from a unified document."""
     if isinstance(document, str):
         document = {"text": document}
@@ -934,7 +1136,10 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                 unit_paragraph_index = None
             else:
                 paragraph_index += 1
-                block_kind = _block_kind(item["text"], heading_values, evidence_markers)
+                block_kind = _block_kind(
+                    item["text"], heading_values, evidence_markers,
+                    detect_figures=preserve_figure_blocks,
+                )
                 section = next(
                     (heading for position, heading in reversed(heading_positions) if position <= item["start"]),
                     None,
@@ -952,9 +1157,19 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                 piece_end = int(item["start"]) + int(piece["end"])
                 piece_text = piece["text"]
                 detection = detect_language(piece_text)
-                reference_metadata = block_kind == "reference"
+                preserved_kind = (
+                    block_kind if block_kind in _PRESERVED_BLOCK_KINDS else None
+                )
                 translation_required = bool(
-                    detection["needs_translation"] and not reference_metadata
+                    detection["needs_translation"] and not preserved_kind
+                )
+                # Only annotate a preserved block that would otherwise have
+                # been sent for translation.  A Chinese page marker that
+                # happens to sit inside a chart block needs no annotation,
+                # and claiming one would misreport preserved content.
+                annotate_preserved = bool(
+                    preserved_kind == "reference"
+                    or (preserved_kind == "figure" and detection["needs_translation"])
                 )
                 memory_key = translation_memory_key(
                     piece_text, detection["language"], glossary=glossary,
@@ -972,11 +1187,15 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                     "target_text": None if translation_required else piece_text,
                     "attempts": 0, "model": None, "usage": {},
                     "qa": (
-                        {"passed": True, "warnings": ["reference_metadata_preserved"]}
-                        if reference_metadata else None
+                        {"passed": True,
+                         "warnings": [_PRESERVED_BLOCK_WARNINGS[preserved_kind]]}
+                        if annotate_preserved else None
                     ),
                     "error": None, "retryable": True,
-                    "preserved_reason": "reference_metadata" if reference_metadata else None,
+                    "preserved_reason": (
+                        _PRESERVED_BLOCK_REASONS.get(preserved_kind)
+                        if annotate_preserved else None
+                    ),
                 })
     return units
 
@@ -984,10 +1203,12 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
 def build_translation_plan(document, max_unit_chars=2400, glossary=None,
                            target_language=TARGET_LANGUAGE,
                            contract_version=TRANSLATION_CONTRACT_VERSION,
-                           coalesce_paragraphs=False):
+                           coalesce_paragraphs=False,
+                           preserve_figure_blocks=False):
     units = build_translation_units(
         document, max_unit_chars=max_unit_chars, glossary=glossary,
         target_language=target_language, contract_version=contract_version,
+        preserve_figure_blocks=preserve_figure_blocks,
     )
     if coalesce_paragraphs:
         units = _coalesce_fast_paragraph_units(
@@ -1503,6 +1724,7 @@ class TranslationService:
             document, max_unit_chars=self.policy.max_unit_chars, glossary=glossary,
             target_language=TARGET_LANGUAGE,
             contract_version=self.policy.contract_version,
+            preserve_figure_blocks=self.policy.preserve_figure_blocks,
         )
         if (
             self.policy.coalesce_paragraphs
@@ -1628,6 +1850,13 @@ class TranslationService:
             if stop_after_batch:
                 break
 
+        if not cancelled and self.policy.preserve_untranslated_tail:
+            # A cancelled run must never claim completion.  An exhausted run
+            # may settle a small tail of untranslatable segments as preserved
+            # source so the document can finish with an explicit warning.
+            # Off by default: mail and the import pipeline keep failing such
+            # a segment rather than presenting the source as a translation.
+            _preserve_reviewed_source_units(units)
         result = self._result(document, units, glossary, cancelled=cancelled)
         if checkpoint_callback is not None:
             # Nothing owned by the worker is mutated after this point. Passing

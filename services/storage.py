@@ -4538,6 +4538,62 @@ class Storage:
                 )
         return session_id
 
+    def delete_conversation(self, session_id, owner_id):
+        """Delete one conversation and every row that belongs to it.
+
+        The deletion order mirrors the proven ``trg_scans_delete_cascade``
+        trigger so turn children cannot be orphaned.  It is scoped by
+        ``owner_id``: a session id alone can never remove another owner's
+        history.  Returns the number of turns removed, or None when the
+        conversation does not exist for this owner.
+        """
+        session_id = str(session_id or "").strip()
+        owner_id = str(owner_id or "legacy")
+        if not session_id:
+            return None
+        with self.lock, self._connect() as conn:
+            owned = conn.execute(
+                "SELECT id FROM conversations WHERE id=? AND owner_id=?",
+                (session_id, owner_id),
+            ).fetchone()
+            if not owned:
+                return None
+            turn_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM conversation_turns WHERE session_id=?",
+                    (session_id,),
+                )
+            ]
+            for turn_id in turn_ids:
+                conn.execute(
+                    "DELETE FROM conversation_analysis_steps WHERE turn_id=?", (turn_id,)
+                )
+                conn.execute(
+                    "DELETE FROM conversation_turn_events WHERE turn_id=?", (turn_id,)
+                )
+                conn.execute(
+                    "DELETE FROM conversation_turn_evidence WHERE turn_id=?", (turn_id,)
+                )
+                conn.execute(
+                    "DELETE FROM conversation_claims WHERE turn_id=?", (turn_id,)
+                )
+            conn.execute(
+                "DELETE FROM conversation_messages WHERE session_id=?", (session_id,)
+            )
+            conn.execute(
+                "DELETE FROM conversation_research_memory WHERE session_id=?",
+                (session_id,),
+            )
+            conn.execute(
+                "DELETE FROM conversation_turns WHERE session_id=?", (session_id,)
+            )
+            conn.execute(
+                "DELETE FROM conversations WHERE id=? AND owner_id=?",
+                (session_id, owner_id),
+            )
+        return len(turn_ids)
+
     def get_conversation(self, session_id, owner_id, scan_id=None,
                          message_limit=100, before_sequence=None,
                          context_only=False):
