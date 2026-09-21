@@ -172,9 +172,9 @@
     const nested=new Set();
     const branches=(smart.branches || []).map(branch=>{
       const children=(branch.children || []).map(id=>byId.get(id)).filter(Boolean);
-      if (children.length<2)return '';
+      if (!(branch.children || []).length)return '';
       children.forEach(child=>nested.add(child.node_id));
-      const count=children.reduce((sum,child)=>sum+child.files,0);
+      const count=branch.files == null ? children.reduce((sum,child)=>sum+child.files,0) : branch.files;
       const parent=nodeButton('group',branch.node_id,branch.name,count,{description:'根据子目录的共同内容组织，点击可查看所有成员。'});
       const body=children.map(child=>nodeButton('group',child.node_id,child.topic,child.files,child)).join('');
       return '<div class="lp-content-branch">'+parent+'<div class="lp-content-children">'+body+'</div></div>';
@@ -200,7 +200,7 @@
     latestCatalog = catalog;
     setText('largeResultRootPath', catalog.root_path || '');
     setText('largeResultDirectoryStats', `${catalog.files_total || 0} 个文件 · ${(catalog.original?.directories || []).length} 个目录${catalog.original?.truncated ? '（部分显示）' : ''}`);
-    setText('largeResultSmartStats', `${catalog.smart?.topic_total || 0} 个主题 · ${(catalog.smart?.categories || []).length} 个类别`);
+    setText('largeResultSmartStats', `${catalog.smart?.theme_total || 0} 个主题 · ${catalog.smart?.leaf_total || catalog.smart?.topic_total || 0} 个叶子分组`);
     const fingerprint = JSON.stringify(catalog);
     if (fingerprint !== catalogFingerprint) {
       catalogFingerprint = fingerprint;
@@ -325,8 +325,11 @@
     const scroll = sameFile ? host.scrollTop : 0;
     host.dataset.filePath = item.path;
     const { deep, local, type, text } = summaryData(item);
+    const currentPortrait = local.portrait ? {...local.portrait,
+      catalog_status: item.catalog_state || local.portrait.catalog_status,
+      topic: item.catalog_name || local.portrait.topic} : null;
     const basis = local.portrait?.catalog_version ? (local.portrait.catalog_source === 'deep_summary' ? '目录依据：深度摘要' : '目录依据：文件内容') : `置信度 ${Math.round(Number(item.confidence || 0) * 100)}%`;
-    host.innerHTML = `<button id="largeResultBackToFiles" type="button" class="ghost lp-back">← 返回文件列表</button><div class="lp-file-detail-heading"><span class="lp-scope-kind">文件详情</span><h3>${esc(String(item.path || '').split('/').pop())}</h3><p>${esc(item.path)}</p><div class="lp-detail-tags"><span>${esc(item.category || '未分类')}</span><span>${esc(fileStatus(item))}</span><span>${esc(basis)}</span></div></div><section class="lp-summary-block"><h4>${esc(type)}</h4><p>${esc(text)}</p></section>${deep.summary && (local.sample || local.notice) ? `<details class="lp-summary-extra"><summary>本地摘要</summary><p>${esc(local.sample || local.notice)}</p></details>` : ''}${window.SJFXLargePortrait?.portrait(local.portrait) || ''}${deep.text_preview ? `<details class="lp-summary-extra"><summary>已有正文预览</summary><p>${esc(deep.text_preview)}</p></details>` : ''}${item.error ? `<p class="lp-file-error">${esc(item.error)}</p>` : ''}`;
+    host.innerHTML = `<button id="largeResultBackToFiles" type="button" class="ghost lp-back">← 返回文件列表</button><div class="lp-file-detail-heading"><span class="lp-scope-kind">文件详情</span><h3>${esc(String(item.path || '').split('/').pop())}</h3><p>${esc(item.path)}</p><div class="lp-detail-tags"><span>${esc(item.category || '未分类')}</span><span>${esc(fileStatus(item))}</span><span>${esc(basis)}</span></div></div><section class="lp-summary-block"><h4>${esc(type)}</h4><p>${esc(text)}</p></section>${deep.summary && (local.sample || local.notice) ? `<details class="lp-summary-extra"><summary>本地摘要</summary><p>${esc(local.sample || local.notice)}</p></details>` : ''}${window.SJFXLargePortrait?.portrait(currentPortrait) || ''}${deep.text_preview ? `<details class="lp-summary-extra"><summary>已有正文预览</summary><p>${esc(deep.text_preview)}</p></details>` : ''}${item.error ? `<p class="lp-file-error">${esc(item.error)}</p>` : ''}`;
     host.querySelectorAll('details').forEach(el => { if (openDetails.has(detailKey(el))) el.open = true; });
     host.scrollTop = scroll;
   }
@@ -489,14 +492,15 @@
     setText('largeResultDownloadStatus', ready ? (preliminary ? '初步研究简报已生成，可下载；完成深度摘要后将自动更新。' : '研究简报已生成，可下载概览文件。') : (brief.empty_direction_reason || '快速解析形成研究方向后即可下载简报。'));
   }
 
-  function renderControls(item) {
+  function renderControls(item, snapshot = null) {
     latestStatus = item || {};
     const status = String(item.status || '').toLowerCase();
     const active = status === 'queued' || status === 'running';
     const paused = status === 'paused';
-    ['largeResultPauseBtn', 'largePackagePauseBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !active; });
-    ['largeResultResumeBtn', 'largePackageResumeBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !paused; });
-    ['largeResultCancelBtn', 'largePackageCancelBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !active; });
+    const actions = snapshot?.allowed_actions;
+    ['largeResultPauseBtn', 'largePackagePauseBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !(actions ? actions.pause : active); });
+    ['largeResultResumeBtn', 'largePackageResumeBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !(actions ? actions.resume : paused); });
+    ['largeResultCancelBtn', 'largePackageCancelBtn'].forEach((id) => { const b = $(id); if (b) b.hidden = !(actions ? actions.cancel : active); });
     // 暂停后双入口：继续深度摘要（上方"继续处理"）+ 生成情报概览（基于已完成部分）。
     const deepCompleted = Number(latestStatus?.counts?.deep?.completed || 0);
     const briefButton = $('largeResultBuildBrief');
@@ -510,8 +514,11 @@
     const targetId = packageId;
     const response = await api()(`/api/large-packages/${encodeURIComponent(targetId)}/${endpoint}`, { method: 'POST' });
     if (targetId !== packageId) return;
-    const item = response.large_package || {};
-    renderControls(item);
+    const snap = response.snapshot || null;
+    const item = Object.assign({}, response.large_package || {}, snap ? {
+      status: snap.status, phase: snap.phase, progress: snap.progress, message: snap.message,
+    } : {});
+    renderControls(item, snap);
     setText('largeResultStatus', `${item.message || '状态已更新'} · ${item.phase || '—'} · ${item.progress || 0}%`);
     if (endpoint === 'cancel') setText('largeResultDownloadStatus', '任务已停止，已完成结果仍然保留。');
     await load();
@@ -547,8 +554,12 @@
     clearTimeout(liveTimer);
     const status = await api()(`/api/large-packages/${encodeURIComponent(id)}`);
     if (!isCurrent()) return;
-    const item = status.large_package || {};
-    renderControls(item);
+    // 统一口径：/workflow 快照是权威；counts 仍取 large_package（快照不带明细）。
+    const snap = status.workflow || null;
+    const item = Object.assign({}, status.large_package || {}, snap ? {
+      status: snap.status, phase: snap.phase, progress: snap.progress, message: snap.message,
+    } : {});
+    renderControls(item, snap);
     let recognize = $('largeResultRecognize');
     if (!recognize && $('largeResultRefreshBtn')) {
       recognize = document.createElement('button'); recognize.id = 'largeResultRecognize'; recognize.type = 'button'; recognize.textContent = '补充内容识别';
@@ -565,8 +576,18 @@
         finally { recognize.disabled = false; }
       };
     }
-    if (recognize) recognize.disabled = !['completed', 'waiting_for_selection'].includes(item.status);
-    setText('largeResultStatus', `${item.message || '大数据包成果'} · ${item.phase || '—'} · ${item.progress || 0}%`);
+    // 「补充内容识别」是否可用也以 allowed_actions 为准（后端最清楚能不能排队）。
+    if (recognize) recognize.disabled = snap && snap.allowed_actions
+      ? !snap.allowed_actions.recognize
+      : !['completed', 'waiting_for_selection'].includes(item.status);
+    const pendingNote = snap && Number(snap.pending_total || 0)
+      ? ` · 待办 阻塞 ${Number(snap.pending_blocking || 0)} / 可选 ${Number(snap.pending_optional || 0)}` : '';
+    const catalogNote = snap
+      ? ` · 目录 ${snap.catalog_state === 'published' ? '已发布' : (snap.catalog_state || '无')}` +
+        (snap.catalog_id ? `(${String(snap.catalog_id).slice(4, 12)})` : '') +
+        (snap.catalog_degraded ? ` · ⚠ 降级目录（未经语义聚类）` : '')
+      : '';
+    setText('largeResultStatus', `${item.message || '大数据包成果'} · ${item.phase || '—'} · ${item.progress || 0}%${pendingNote}${catalogNote}`);
     setText('largeResultPackageId', packageId);
     const c = item.counts || {};
     const reportPayload = currentStage === 'catalog' ? {report:{coverage:{inventory_files:c.total_files,quick_completed:c.quick?.completed,deep_completed:c.deep?.completed},categories:c.categories || {}}} : await api()(`/api/large-packages/${encodeURIComponent(packageId)}/report`);
@@ -579,7 +600,8 @@
     setText('largeResultDeep', coverage.deep_completed || 0);
     setText('largeResultModel', coverage.model_summaries || 0);
     setText('largeResultFailure', (report.failures || []).length);
-    setText('largeResultOverviewStatus', item.status === 'completed' ? 'REPORT READY' : (item.phase || 'PROCESSING'));
+    const overviewReady = snap ? Boolean(snap.published_view || snap.overview_state === 'published' || item.status === 'completed') : item.status === 'completed';
+    setText('largeResultOverviewStatus', overviewReady ? 'REPORT READY' : (item.phase || 'PROCESSING'));
     const remaining = Math.max(0, Number(coverage.quick_completed || 0) - Number(coverage.deep_completed || 0));
     setText('largeResultOverviewSummary', `本数据包共盘点 ${coverage.inventory_files || 0} 个文件，已完成 ${coverage.quick_completed || 0} 个本地快速摘要；已深度解析 ${coverage.deep_completed || 0} 个，其中 ${coverage.model_summaries || 0} 个生成了模型摘要。${remaining ? `还有 ${remaining} 个文件可随时补充深度解析。` : '当前没有待补充文件。'}`);
     const categories = report.categories || {};

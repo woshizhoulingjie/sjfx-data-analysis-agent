@@ -74,3 +74,21 @@ backups/
 # Server-side snapshots and bounded audit captures; never publish these copies.
 .codex_*
 *.pre-audit-*
+
+# ---------------------------------------------------------------------------
+# Server-side captures, real user samples and packaged third-party binaries.
+# These are environment artifacts produced on this machine, not source code;
+# they must never be published.
+# ---------------------------------------------------------------------------
+/benchmark_capture/
+/gzy_test/
+/.tools/
+/services/mail/_ocr/
+
+# In-place edit backups of tracked sources
+/app.py.pre-*
+/templates/*.pre-*
+/concurrency-changes.patch
+
+# Stray files created by a mis-quoted shell command
+/n' '---*

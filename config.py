@@ -200,13 +200,12 @@ class Config:
     # preserving the configured 32K input context window.
     VLLM_INTERACTIVE_MAX_TOKENS = max(128, min(800, int(os.getenv("VLLM_INTERACTIVE_MAX_TOKENS", "480"))))
     VLLM_INTERACTIVE_TIMEOUT_SECONDS = max(60, min(300, int(os.getenv("VLLM_INTERACTIVE_TIMEOUT_SECONDS", "120"))))
-    # Analysis routes request JSON rather than prose. The legacy Ollama
-    # budgets (1,400--3,200 generated tokens) make a single 24 GiB GPU appear
-    # hung even when the backend is healthy, so ordinary structured work is
-    # constrained to a compact response contract. A caller can explicitly
-    # opt out for a real long-form task (for example, translation).
+    # The benchmark fixture uses 768 generated tokens for every SJFX stage.
+    # Keep that as the capture default, but do not impose an artificial small
+    # upper ceiling: normal product workflows may explicitly require longer
+    # structured output.
     VLLM_STRUCTURED_MAX_TOKENS = max(
-        256, min(1200, int(os.getenv("VLLM_STRUCTURED_MAX_TOKENS", "640")))
+        256, min(32768, int(os.getenv("VLLM_STRUCTURED_MAX_TOKENS", "768")))
     )
     VLLM_STRUCTURED_TIMEOUT_SECONDS = max(
         90, min(600, int(os.getenv("VLLM_STRUCTURED_TIMEOUT_SECONDS", "180")))
@@ -219,6 +218,17 @@ class Config:
     VLLM_EMBED_MODEL = os.getenv("VLLM_EMBED_MODEL", "multilingual-e5-small").strip()
     VLLM_EMBED_TIMEOUT_SECONDS = max(2, min(60, int(os.getenv("VLLM_EMBED_TIMEOUT_SECONDS", "12"))))
     VLLM_EMBED_MAX_BATCH_SIZE = max(1, min(64, int(os.getenv("VLLM_EMBED_MAX_BATCH_SIZE", "8"))))
+    # 大包嵌入车道的**并发请求数**（默认 2 = 嵌入服务的准入上限，不超出它的承受能力）。
+    # 实测依据：服务端配了 OMP 4 线程 × 准入 2（最多 8 路），但客户端原来是串行发块，
+    # 有效并行度只有 2.38（批 8）/3.79（批 16）；并发发块才能用上服务端已有的并行能力。
+    LP_EMBED_CONCURRENCY = max(1, min(4, _positive_int(os.getenv("SJFX_LP_EMBED_CONCURRENCY"), 2)))
+    # 大包嵌入车道的单请求超时（默认 60s）。共享客户端是 8s，而**服务空闲后第一个请求
+    # 实测要 21 秒**（冷启动），8s 会让服务重启后的第一批嵌入必然失败。
+    LP_EMBED_TIMEOUT_SECONDS = max(5, min(600, _positive_int(os.getenv("SJFX_LP_EMBED_TIMEOUT"), 60)))
+    # 嵌入的**备端点**（通常指向 CPU 嵌入服务）。GPU sidecar 有显存守卫，可能拒绝启动
+    # 或返回 503；没有备端点时那等于整条嵌入车道停摆（文件拿不到向量 → 进"未能识别
+    # 内容"桶），那是质量事故。配了备端点就只是慢，不会停。默认空 = 不启用回退。
+    LP_EMBED_FALLBACK_URL = os.getenv("SJFX_LP_EMBED_FALLBACK_URL", "").strip()
     VLLM_EMBED_MAX_CHARS = max(128, min(4000, int(os.getenv("VLLM_EMBED_MAX_CHARS", "1200"))))
     # The client-side mutex must fail fast so an interactive lane can fall back
     # to lexical retrieval immediately, while the socket budget above is what
@@ -436,6 +446,13 @@ class Config:
     # Runtime-only coalescing for preliminary file summaries. The queue and
     # import state machine continue to create one task per file.
     PRELIMINARY_SUMMARY_BATCH_SIZE = max(1, min(4, int(os.getenv("PRELIMINARY_SUMMARY_BATCH_SIZE", "4"))))
+    # 初步摘要同时发起的模型请求数。默认 1 = 一次一批、串行，与历史行为完全一致。
+    # 单卡解码是「读权重」瓶颈，K 路并发能把每 token 的解码时间摊薄到约 1/K；
+    # 必须同时放开 vLLM --max-num-seqs、SJFX_GENERATION_CONCURRENCY 和
+    # LLM_MAX_CONCURRENCY，这里才会真正并行。
+    PRELIMINARY_SUMMARY_CONCURRENCY = max(
+        1, min(8, int(os.getenv("PRELIMINARY_SUMMARY_CONCURRENCY", "1")))
+    )
     # Ordinary preliminary summaries only; candidate/deep defaults remain unchanged.
     PRELIMINARY_SUMMARY_OPTIMIZATION_ENABLED = os.getenv("PRELIMINARY_SUMMARY_OPTIMIZATION_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
     PRELIMINARY_SUMMARY_INPUT_MAX_CHARS = max(2000, min(6500, int(os.getenv("PRELIMINARY_SUMMARY_INPUT_MAX_CHARS", "6500"))))
@@ -469,14 +486,71 @@ class Config:
     SIDECAR_PAYLOAD_BYTES = int(os.getenv("SIDECAR_PAYLOAD_BYTES", str(256 * 1024)))
     # Isolated catalog generation budgets; unrelated import policies stay separate.
     LP_CATALOG_MODEL_NAMING = os.getenv("SJFX_LP_CATALOG_MODEL_NAMING", "1").lower() not in {"0", "false", "off"}
-    LP_CATALOG_REQUESTS = min(1000, _positive_int(os.getenv("SJFX_LP_CATALOG_REQUESTS"), 100))
-    LP_CATALOG_TOTAL_TOKENS = _positive_int(os.getenv("SJFX_LP_CATALOG_TOTAL_TOKENS"), 200000)
-    LP_CATALOG_SECONDS = min(3600, _positive_int(os.getenv("SJFX_LP_CATALOG_SECONDS"), 600))
-    LP_CATALOG_INPUT_TOKENS = min(2500, _positive_int(os.getenv("SJFX_LP_CATALOG_INPUT_TOKENS"), 2500))
-    LP_CATALOG_BATCH_SIZE = min(4, _positive_int(os.getenv("SJFX_LP_CATALOG_BATCH_SIZE"), 4))
-    LP_CATALOG_BATCH_INPUT_TOKENS = min(10000, _positive_int(os.getenv("SJFX_LP_CATALOG_BATCH_INPUT_TOKENS"), 6500))
-    LP_CATALOG_OUTPUT_TOKENS = min(480, _positive_int(os.getenv("SJFX_LP_CATALOG_OUTPUT_TOKENS"), 240))
-    LP_CATALOG_TIMEOUT = min(60, _positive_int(os.getenv("SJFX_LP_CATALOG_TIMEOUT"), 30))
+    # 这三个是**下限/兜底**，不再是固定预算。真正的预算由 `_budget_for_groups()`
+    # 按**实际工作量（需要命名的组数）**推导——命名工作量随叶组数线性增长，
+    # 而固定预算在 100GB 规模必然不够：约 3.3 万文件产生约 1,200 个叶组，
+    # 需要约 300 个批次 / 约 285 万 token / 约 74 分钟，时间和 token 都会先撞上
+    # 上限。一旦耗尽，命名会永久停住、剩下的组只能拿兜底名（实测已复现）。
+    # 注意：这里**不再用 min() 设硬上限**——原来的 min(1000,...) 与 min(3600,...)
+    # 让人根本无法为大规模语料配置足够的预算。
+    LP_CATALOG_REQUESTS = max(1, _positive_int(os.getenv("SJFX_LP_CATALOG_REQUESTS"), 100))
+    LP_CATALOG_TOTAL_TOKENS = max(1, _positive_int(os.getenv("SJFX_LP_CATALOG_TOTAL_TOKENS"), 200000))
+    LP_CATALOG_SECONDS = max(1, _positive_int(os.getenv("SJFX_LP_CATALOG_SECONDS"), 600))
+    # 单位工作量的实测估算，用于把预算折算成"能覆盖多少工作量"。这两个是
+    # **环境属性**（换模型/换机器会变），只用来算预算，不参与目录形状。
+    # 单次调用 token 的**估算值**，只用于把预算折算成"能覆盖多少工作量"。
+    # L3 之后每组输入到 3,000–6,500、批次输入上限 10000，单次调用实际可到
+    # 10,000+，所以估算值同步上调；它不影响目录形状，只影响预算推导的松紧。
+    LP_CATALOG_CALL_TOKENS = max(500, _positive_int(os.getenv("SJFX_LP_CATALOG_CALL_TOKENS"), 13000))
+    LP_CATALOG_CALL_SECONDS = max(1, _positive_int(os.getenv("SJFX_LP_CATALOG_CALL_SECONDS"), 16))
+    # 预算安全系数：为重试与主题层预留余量。
+    LP_CATALOG_BUDGET_MARGIN = 1.6
+    # L3 样本层（2026-09-20）：每组选样份数按**组内异质性自适应**，每份证据
+    # 的正文上限单独可调。同质组少给样本（覆盖少数派只在需要时才付 token），
+    # 异质组多给样本；实际份数还会被 LP_CATALOG_INPUT_TOKENS 反算出的可承受
+    # 份数压住，不会出现"选了一堆却装不进提示词"。
+    LP_CATALOG_SAMPLE_TOKENS = max(120, min(1200, _positive_int(os.getenv("SJFX_LP_CATALOG_SAMPLE_TOKENS"), 450)))
+    LP_CATALOG_SAMPLES_MIN = max(2, min(24, _positive_int(os.getenv("SJFX_LP_CATALOG_SAMPLES_MIN"), 6)))
+    LP_CATALOG_SAMPLES_MAX = max(
+        LP_CATALOG_SAMPLES_MIN, min(32, _positive_int(os.getenv("SJFX_LP_CATALOG_SAMPLES_MAX"), 14)))
+    # 账②（2026-09-20）：命名车道并发路数。vLLM 已开 --max-num-seqs 2，
+    # 但此前 executor 与客户端都写死 1 路，二路批处理能力闲置。上限 4。
+    LP_NAMING_CONCURRENCY = max(1, min(4, _positive_int(os.getenv("SJFX_LP_NAMING_CONCURRENCY"), 2)))
+    # MMR 权重：score = λ·相关性 − (1−λ)·与已选的最大相似度。
+    LP_CATALOG_MMR_LAMBDA = max(0.0, min(1.0, float(os.getenv("SJFX_LP_CATALOG_MMR_LAMBDA", "0.7"))))
+    # L1 取文改造（2026-09-20）：每组输入预算。依据是本地服务实测的时间成本结构：
+    # **输入 0.7ms/token，输出 22ms/token**（3,861 token 预填充 2.70s 且命中前缀
+    # 缓存后 0.66s；输出 768 token 16.75s）。所以"给模型更多证据"很便宜，
+    # "让模型多写字"才贵。L2 画像 + L3 自适应样本数会把每组输入用到 3,000–6,500，
+    # 因此这里从 2500 提到 7000；输出侧同时收紧（见 naming.SYSTEM）。
+    LP_CATALOG_INPUT_TOKENS = min(12000, _positive_int(os.getenv("SJFX_LP_CATALOG_INPUT_TOKENS"), 7000))
+    # W-2b：单请求组数上限 4 → 8。
+    # 实测命名调用中位 0.56s、token 中位 283 —— 一次请求装 4 组远没有用满一次调用的
+    # 往返开销；而命名墙钟里**模型时间只占 15.2%**，瓶颈是"每次只装 4 组"。
+    # 上限由 min(4,…) 提到 min(8,…)：设更大的值也仍然受这里的封顶。
+    LP_CATALOG_BATCH_SIZE = min(8, _positive_int(os.getenv("SJFX_LP_CATALOG_BATCH_SIZE"), 8))
+    # 本进程服务的工作流版本上限。**预留的排他机制**：框架 §11 要求"新包写
+    # workflow_version，新旧 Worker 按版本排他领取；旧进程不能继续消费新包"。
+    # 实现方向是"只消费 <= 自己版本的包"：这样将来出现 v3 包时，v2 进程会
+    # 拒绝领取而不是误读格式。当前所有包都是 1/2，因此行为与改动前一致。
+    LP_WORKFLOW_VERSION = max(1, _positive_int(os.getenv("SJFX_LP_WORKFLOW_VERSION"), 2))
+    # 与 LP_CATALOG_INPUT_TOKENS 同步放宽：单组输入变大后，6500 的批次上限
+    # 会把每次调用压到 1～2 组，反而放大往返开销。批次仍是"按实测 token 打包"。
+    LP_CATALOG_BATCH_INPUT_TOKENS = min(10000, _positive_int(os.getenv("SJFX_LP_CATALOG_BATCH_INPUT_TOKENS"), 10000))
+    # 输出预算必须跟着组数走：批量请求的输出是 cfg['output'] * 组数 + 32，
+    # 原来 240×8+32 = 1952 > 480 的封顶，8 组一定会被截断。
+    LP_CATALOG_OUTPUT_TOKENS = min(2400, _positive_int(os.getenv("SJFX_LP_CATALOG_OUTPUT_TOKENS"), 240))
+    # **单组模型命名**（大包目录）的输出上限，与上面的批量车道分开。
+    # 为什么必须单独给：批量车道一次 4 组、预算按组数放大；而大包目录是**一组一调用**，
+    # 240 对"跨领域大组"不够——实测包 lp-6a7119c7（国务院公报语料）：被切断的组在
+    # 240 下 JSON 从中间断掉 → 整组作废 → 重试得到同样结果 → 5 次后 deferred，
+    # **7 个组 / 276 个文件永远不进目录**（目录页停在 7369/7754）。
+    # 放开到 900 实测这些组最大只要 270 token（中位 129），所以 300 有余量。
+    # 回滚：SJFX_LP_CATALOG_NAMING_OUTPUT_TOKENS=240。
+    LP_CATALOG_NAMING_OUTPUT_TOKENS = min(
+        2000, _positive_int(os.getenv("SJFX_LP_CATALOG_NAMING_OUTPUT_TOKENS"), 300))
+    # 单请求组数翻倍后单次耗时也变长（实测 4 组 p90 约 10s），30s 超时太紧。
+    LP_CATALOG_TIMEOUT = min(120, _positive_int(os.getenv("SJFX_LP_CATALOG_TIMEOUT"), 60))
     # Semantic grouping quality knobs (2026-09-12).  Each defaults to the
     # improved behaviour and can be disabled without code changes:
     #   SJFX_LP_CATALOG_CENTER=0           -> legacy absolute-threshold grouping
@@ -488,13 +562,214 @@ class Config:
     LP_CATALOG_NAME_SINGLETONS = os.getenv("SJFX_LP_CATALOG_NAME_SINGLETONS", "0").lower() not in {"0", "false", "off"}
     LP_CATALOG_SINGLETON_MIN_GROUPS = max(1, min(100000, _positive_int(os.getenv("SJFX_LP_CATALOG_SINGLETON_MIN_GROUPS"), 200)))
     LP_CATALOG_GROUP_MAX = max(0, min(5000, _positive_int(os.getenv("SJFX_LP_CATALOG_GROUP_MAX"), 60)))
+    # 叶子大小的**自适应上限**（默认开）。固定上限与"一叶一主题"直接冲突：
+    # 12,850 个文件按每叶 ≤60 切必然产生 ≥215 片，一个真实主题（平均 584 文件）
+    # 会散成十几片，每片单独命名 —— 于是同名是**必然结果**，不是模型的问题。
+    # 自适应口径：cap = ceil(N有向量 / LP_KM_TARGET_LEAVES × ratio)，下限仍是
+    # LP_CATALOG_GROUP_MAX，上限 LP_CATALOG_GROUP_MAX_CEIL。
+    # 回滚：SJFX_LP_CATALOG_GROUP_MAX_AUTO=0（完整恢复固定 60 的行为）。
+    LP_CATALOG_GROUP_MAX_AUTO = os.getenv("SJFX_LP_CATALOG_GROUP_MAX_AUTO", "1").strip().lower() in {
+        "1", "true", "yes", "on"}
+    LP_CATALOG_GROUP_MAX_RATIO = max(1.0, min(8.0, float(os.getenv("SJFX_LP_CATALOG_GROUP_MAX_RATIO", "1.5"))))
+    LP_CATALOG_GROUP_MAX_CEIL = max(60, min(5000, _positive_int(os.getenv("SJFX_LP_CATALOG_GROUP_MAX_CEIL"), 500)))
+    # **同名合并**的成员上限倍率（2026-09-20）。同名合并（merge_identical_names）如果
+    # 直接沿用叶子上限 cap=ceil(N/120×1.5)，就把自己该修的问题挡住了：实测包 48db486cf0a0
+    # cap=102，而 6 组同名主题的成员合计 121~170，全部"超上限"被跳过 —— 于是"同名重复"
+    # 一条都没并掉，只剩两组小到能塞进 102 的。但 cap 的设计意图恰恰是"让一个真实主题
+    # 留在一个叶子里"（见 effective_group_max 的 docstring），用它拒绝并合同名主题是自相
+    # 矛盾。同名是"同一主题"最强的证据，所以允许更宽的并合：上限取
+    # max(叶子上限, ceil(N有向量/LP_KM_TARGET_LEAVES × 本倍率))，仍留一个上限防止
+    # 一个泛化名把整个包并成一坨。回滚：SJFX_LP_CATALOG_GROUP_MERGE_RATIO=1.5（退回叶子
+    # 上限口径，等价于改修前行为）。
+    LP_CATALOG_GROUP_MERGE_RATIO = max(1.0, min(50.0, float(os.getenv("SJFX_LP_CATALOG_GROUP_MERGE_RATIO", "4.0"))))
+    # 叶组数的**增长上限**：split_oversized 每轮都会被调用，原来没有任何累计上限，
+    # 于是叶组只增不减（实测 cssj4 从 170 单调涨到 412，topic merge 跑了 23,405 次
+    # 却永远收敛不了）。超过 target_leaves × 这个系数就停止再切。
+    LP_CATALOG_LEAF_GROWTH_FACTOR = max(1.0, min(20.0, float(os.getenv("SJFX_LP_CATALOG_LEAF_GROWTH_FACTOR", "2.0"))))
+    # 标签历史每组保留的版本数（恒留第 1 版）。历史表曾经涨到 489.6 MB / 41% 的
+    # 库体积、35.3 倍冗余，而只有"回滚到指定版本"会读它。回滚：设为 0 或负数
+    # 会退化成 1（只留最新一版）；要完全关闭裁剪请改 queue_groups 里的调用。
+    LP_LABEL_HISTORY_KEEP = max(1, min(200, int(os.getenv("SJFX_LP_LABEL_HISTORY_KEEP", "5") or 5)))
+    # 同名叶子归一：只在同一主题内合并，超过 2×cap 才允许再切。
+    LP_CATALOG_NORMALIZE_LEAVES = os.getenv("SJFX_LP_CATALOG_NORMALIZE_LEAVES", "1").strip().lower() in {
+        "1", "true", "yes", "on"}
+    # 情报概览的"研究方向"：**独立预算通道，不占目录命名轮次预算**。
+    # 理由：① 时序不同（目录预算的目的是结构定稿，方向依赖目录**加**深度摘要，是下游）；
+    #      ② 轮次语义已被污染（实测 req=707/1000 就 exhausted，是 3600s 超时）；
+    #      ③ 失败隔离（方向失败不该影响目录）；④ 只需 3 次调用，单列更易审计。
+    # 但与目录**共用**：lp_catalog_calls 计量表 + 并发闸门 + 每包每日硬顶。
+    LP_DIRECTIONS_ENABLED = os.getenv("SJFX_LP_DIRECTIONS", "1").strip().lower() in {
+        "1", "true", "yes", "on"}
+    # 产品口径：**1 个最推荐 + 2 个其他推荐，不做人工确认**。
+    LP_DIRECTION_MAX = max(1, min(5, _positive_int(os.getenv("SJFX_LP_DIRECTION_MAX"), 3)))
+    LP_DIRECTION_TIMEOUT = max(30, min(600, _positive_int(os.getenv("SJFX_LP_DIRECTION_TIMEOUT"), 150)))
+    LP_DIRECTION_MAX_TOKENS = max(256, min(4000, _positive_int(os.getenv("SJFX_LP_DIRECTION_MAX_TOKENS"), 1400)))
+    LP_DIRECTION_REQUESTS_PER_DAY = max(1, min(500, _positive_int(
+        os.getenv("SJFX_LP_DIRECTION_REQUESTS_PER_DAY"), 20)))
+    LP_DIRECTION_CATEGORIES = max(3, min(40, _positive_int(os.getenv("SJFX_LP_DIRECTION_CATEGORIES"), 14)))
     LP_CATALOG_ADAPTIVE_PERCENTILE = max(5, min(90, _positive_int(os.getenv("SJFX_LP_CATALOG_ADAPTIVE_PERCENTILE"), 40)))
     try:
         _lp_similarity = float(os.getenv("SJFX_LP_CATALOG_SIMILARITY", "0") or 0)
     except (TypeError, ValueError):
         _lp_similarity = 0.0
     LP_CATALOG_SIMILARITY = max(0.0, min(0.999, _lp_similarity))
-    LP_PREVIEW_CONCURRENCY = min(4, _positive_int(os.getenv("SJFX_LP_PREVIEW_CONCURRENCY"), 2))
+    # 预览车道的并发路数。**默认仍是 2**（保持现有行为）；上限由 4 放宽到 8，
+    # 因为 100GB/10 小时的预算模型显示：预览（21 万文件 ≈ 3.9h @并发2）是仅次
+    # 于嵌入的第二大项，而机器有 16 核、这里只用 2 路。放宽上限不改默认行为，
+    # 只有显式设 SJFX_LP_PREVIEW_CONCURRENCY 才会生效——并发扩展性需要先做一次
+    # 基准（见 docs/large-catalog-evidence-l1-l3.md 第七节）。
+    LP_PREVIEW_CONCURRENCY = min(8, _positive_int(os.getenv("SJFX_LP_PREVIEW_CONCURRENCY"), 2))
+    # 大数据包"深度解析+模型摘要"阶段的并发文件数。
+    # 默认 1 = 历史行为（一次一个文件，串行）。
+    # 实测（2026-09-16，真实契约 text[:24000] + 500 输出 token，6 个真实 PDF）：
+    #   并发 1 -> 每文件 16.13 秒，输出吞吐 31.0 tok/s，显存峰值 22489 MiB
+    #   并发 2 -> 每文件 11.14 秒，输出吞吐 44.9 tok/s，显存峰值 22489 MiB（+0）
+    #            提速 1.45x；vLLM 侧 Running: 2 reqs, Waiting: 0，KV 池占用 27.7%
+    # 前提：服务端必须能同时跑 2 个序列（--max-num-seqs >= 2），否则设置无效。
+    LP_DEEP_CONCURRENCY = max(1, min(8, _positive_int(os.getenv("SJFX_LP_DEEP_CONCURRENCY"), 1)))
+    # ---- 目录分组模式（2026-09-16 新增）----
+    # 0（默认）= 原有增量贪心分组，行为与改动前完全一致。
+    # 1 = 全量嵌入后按 k-means 重新分组（每 KM_RECLUSTER_EVERY 个文件重算一次）。
+    #     实测（zzdsjb 1004 文件）：原有算法 75% 的组只有 1 个文件；
+    #     k-means 在 k=60 时为 0% 单人组，且主题不再混域。
+    #     回滚：把 SJFX_LP_CATALOG_KMODE 设为 0 或删除该行，重启大包 Worker。
+    LP_CATALOG_KMODE = os.getenv("SJFX_LP_CATALOG_KMODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # 【已废弃】曾经表示"每积累多少个已嵌入文件就重算一次 k-means"。
+    # 这个"批次中途重算"正是目录失真的根因：它在语料只处理一半时就执行全局聚类，
+    # 把尚未解析的文件当成"没有素材"倒进无向量的兜底分组（实测 1040 个文件里
+    # 530 个被吞掉）。现在全局聚类只在"所有有素材的文件都有向量"之后执行一次，
+    # 由 LP_KM_SIGNATURE 变化驱动，本项不再被读取。保留仅为兼容旧 .env。
+    LP_KM_RECLUSTER_EVERY = max(50, min(20000, _positive_int(os.getenv("SJFX_LP_KM_RECLUSTER_EVERY"), 500)))
+    # 叶组数量 = clamp(文件数 / per_group, KM_MIN, KM_MAX)，
+    # 其中 per_group = max(KM_PER_GROUP, 文件数 / KM_TARGET_LEAVES)。
+    # 固定 per_group 在 100GB 规模会失效：实测 1040 文件 → 88 个叶组是可浏览的，
+    # 但按同一比例外推到约 3.5 万文件（100GB）会得到约 2170 个叶组，
+    # 塞进 12 个主题后每个主题约 180 个条目，"两层目录"就失去意义。
+    # 因此改为按"目标叶组数"推导：不论语料多大，叶组数都收敛到可浏览区间。
+    #
+    # ---- k 自适应（闭环，2026-09-20 实测后启用）----
+    # 一律 k=120 的问题是：同一份 8,158 文件的语料，叶组中位 55 个文件时
+    # 模型判"跨领域拼凑(mixed)"的比例实测 **40%**；把 k 提到 300（中位 19 个文件）
+    # 后降到 **27%**，名称也明显更具体（「人口普查数据、经济指标与地理实体条目汇编」
+    # → 「人口普查统计与行政区划资料」）。而 12,883 文件那个包在 k=120 时状态名 0%、
+    # 只有 3% 带复核标记 —— 同一个 k 对两份语料一个太粗、一个正好。
+    # 所以改成**用模型自己的判定当反馈**（不引入任何几何阈值：本语料相似度基线
+    # 0.80–0.85、相关 0.94，判别区间太窄，实测几何判据判别力为零）：
+    #   叶组定稿后统计"purity=mixed"的叶组占比，≥ 阈值就升一档 k 重新聚类，
+    #   最多升 LP_KM_ESCALATE_MAX 档（每档命名成本 ×factor，必须先有上限）。
+    # 代价实测：k 120→300，命名调用 158→364 次（本包 12→28 分钟）。
+    # 回滚：SJFX_LP_KM_ADAPTIVE=0（退回一律 LP_KM_TARGET_LEAVES）。
+    LP_KM_ADAPTIVE = os.getenv("SJFX_LP_KM_ADAPTIVE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    LP_KM_ESCALATE_SHARE = max(0.05, min(0.9, float(os.getenv("SJFX_LP_KM_ESCALATE_SHARE", "0.25"))))
+    LP_KM_ESCALATE_FACTOR = max(1.2, min(4.0, float(os.getenv("SJFX_LP_KM_ESCALATE_FACTOR", "2.0"))))
+    LP_KM_ESCALATE_MAX = max(0, min(3, _positive_int(os.getenv("SJFX_LP_KM_ESCALATE_MAX"), 1)))
+    LP_KM_TARGET_LEAVES = max(8, min(2000, _positive_int(os.getenv("SJFX_LP_KM_TARGET_LEAVES"), 120)))
+    LP_KM_PER_GROUP = max(2, min(200, _positive_int(os.getenv("SJFX_LP_KM_PER_GROUP"), 16)))
+    LP_KM_MIN = max(2, min(100000, _positive_int(os.getenv("SJFX_LP_KM_MIN"), 8)))
+    LP_KM_MAX = max(LP_KM_MIN, min(20000, _positive_int(os.getenv("SJFX_LP_KM_MAX"), 5000)))
+    # 单个叶组的文件数上限。实测同质语料（165 个 3GPP 规范）用普通 k-means 会退化成
+    # 134/12/8/3/2/2/2/1/1（一个组占 81%）；开启上限后超限的组会递归再分。
+    LP_KM_MAX_GROUP = max(4, min(500, _positive_int(os.getenv("SJFX_LP_KM_MAX_GROUP"), 30)))
+    # 单个叶组的文件数下限。**默认 1 = 不下限，允许单文件叶组。**
+    # 实测：设成 4 时，1040 文件的语料里有 13/69 个叶组是"多个互不相关的原始簇
+    # 被强行合并"出来的，模型命名只能退化成"概念A、概念B、概念C"式罗列
+    # （如"心肌Bmal1性别转录调控、衰老线粒体特征、iPSC心肌转录变异性…"）。
+    # 当初设下限是为了避免"单文件叶组变成只含 1 个子组的主题"，但那一条已经由
+    # 主题层的 LP_TOPIC_MIN_CHILDREN + 吸收独立解决，下限不再有必要。
+    # 语料里必然存在"和谁都不相干"的文件，强行合并只会毁掉名字——
+    # 让它自己成为一个叶组才是诚实的。
+    LP_KM_MIN_GROUP = max(1, min(100, _positive_int(os.getenv("SJFX_LP_KM_MIN_GROUP"), 1)))
+    # 病态单元素组的**兜底吸收**开关（默认开）。只在 LP_KM_MIN_GROUP<=1
+    # （即按上面的说明不设常规下限）**且**单元素组占比达到病态阈值时才生效：
+    # 那时才用"按目标叶组数反推的下限"补一次 absorb_undersized。
+    # 为什么必须是条件触发而不是直接设下限：上面已经记录过，常规下限（如 4）
+    # 会把互不相关的原始簇强行合并，模型命名退化成概念罗列——正常语料不应受影响。
+    # 但完全不兜底时，异构语料会失控：实测 6,925 文件的包在旧增量锚点分组下
+    # 产出 4,870 个组、其中 4,435 个是单元素组（91%），目录不可浏览且命名节点数失控。
+    # 回滚：SJFX_LP_KM_MIN_GROUP_AUTO=0，即完整恢复改动前行为。
+    LP_KM_MIN_GROUP_AUTO = os.getenv("SJFX_LP_KM_MIN_GROUP_AUTO", "1").strip().lower() in {
+        "1", "true", "yes", "on"}
+    # 触发兜底的单元素组占比阈值。
+    LP_KM_SINGLETON_ALARM = max(0.05, min(0.95, float(os.getenv("SJFX_LP_SINGLETON_ALARM", "0.25"))))
+    # 叶组命名时若模型指出"某些成员明显不属于本组"，就把这些少数异类摘出去
+    # 单独成为一个叶组，再各自命名。这是**语义判据**，不含任何语料常量，
+    # 因此对不同语料普遍适用；基于相似度的几何阈值在这类语料上不可用
+    # （实测判别区间只有 0.1，阈值 0.90 会把目录炸成 726 个叶组）。
+    LP_LEAF_SPLIT = os.getenv("SJFX_LP_LEAF_SPLIT", "1").strip().lower() in {"1", "true", "yes", "on"}
+    # 每个包允许的最大摘除次数（硬上限，落库计数）。
+    # 这是**失控保护**而不是质量调参：实测模型在学术语料上会高估异类比例，
+    # 没有上限时叶组会从 85 一路涨到 183、待办数不降反升。
+    # 有上限后，无论模型怎么回答，命名调用的总代价都有界。
+    # 注意：不能用 _positive_int——它会把显式的 0 抬成 1，而 0 在这里表示"自动取值"。
+    try:
+        _leaf_split_max = int(str(os.getenv("SJFX_LP_LEAF_SPLIT_MAX", "0")).strip())
+    except Exception:
+        _leaf_split_max = 0
+    LP_LEAF_SPLIT_MAX = max(0, min(100000, _leaf_split_max))
+    # 摘除出来的异类，是**新建一个命名叶组**（旧行为），还是移进本包的"待归并"桶
+    # （km-other-*，默认）。默认移桶的原因见 naming.split_off_outliers 的注释：
+    # 我们实测过四种"搬动前核对"的方案，在本语料上判别力全为零，无法验证这撮人
+    # 真的自成一类，因此安全做法是不给它们起名——父组的名字不再被污染，文件仍然
+    # 留在清单和成员表里，下次重聚类可以重新安置。
+    # 置 1 回到旧行为（每次摘除多 1 个叶组、多 1 次命名调用）。
+    LP_LEAF_SPLIT_NAMED = os.getenv("SJFX_LP_LEAF_SPLIT_NAMED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # 「按子主题整体拆开」是**另一件事**，必须有自己的开关（2026-09-20 修正）。
+    #
+    # 起因：2b 上线时图省事让 split_into_subtopics 复用了 LP_LEAF_SPLIT_NAMED，而那个开关
+    # 的语义是"摘出来的**异类**要不要直接成为命名叶组"——正是第③项明确要去掉的旧行为。
+    # 于是 `SJFX_LP_LEAF_SPLIT_NAMED=1` 一开，子主题拆分开是开了，**异类直接成组也一起
+    # 回来了**（第③项被静默覆盖）。两件事的价值取向相反：
+    #   · 异类（"谁不属于本组"）：无法验证这撮人自成一类 → 不给名字，进待归并桶；
+    #   · 子主题（"整组是跨领域拼凑"）：模型已在同一次调用里给出各子主题的名字与成员，
+    #     零额外调用，且用户口径明确要求"拆开、各自独立、各自有名字"。
+    # 所以拆成两个开关：本开关默认开（子主题拆分），LP_LEAF_SPLIT_NAMED 默认关（异类不成组）。
+    # 回滚：SJFX_LP_LEAF_SPLIT_SUBTOPICS=0（子主题不再拆，异类仍走待归并桶）。
+    LP_LEAF_SPLIT_SUBTOPICS = os.getenv("SJFX_LP_LEAF_SPLIT_SUBTOPICS", "1").strip().lower() in {
+        "1", "true", "yes", "on"}
+    # **重试耗尽的组**给一个抽取式兜底名（默认开）。为什么必须有这条路：
+    # 模型命名失败的重试是同一份证据、同一个提示词，模型给出同一句话 → attempts 到
+    # LP_NAME_MAX_ATTEMPTS 上限后任务不再被拾取；而模型命名开启时抽取式命名 name_batch
+    # 是被禁用的（它会写组状态、把模型命名循环卡死）。两边一夹，那一组**永远没有名字**，
+    # 目录覆盖率的窟窿没人补（生产实测：包 lp-6a7119c7 目录页停在 7369/7754）。
+    # 兜底只写标签（model='fallback-naming'、needs_review=1），**不碰组状态**。
+    # 回滚：SJFX_LP_NAME_FALLBACK=0。
+    LP_NAME_FALLBACK = os.getenv("SJFX_LP_NAME_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
+    # 每个被合并叶组最多是叶子上限的几倍（见 merge_size_ceiling 的钳制）。
+    LP_CATALOG_GROUP_MERGE_MAX_FACTOR = max(
+        1.0, min(20.0, float(os.getenv("SJFX_LP_CATALOG_GROUP_MERGE_MAX_FACTOR", "3.0"))))
+    # 目标叶组数 120 时允许 240 次摘除——足够纠正混杂，又不至于失控。
+    # k-means 迭代次数与质心采样上限（全量文件只参与分配，不参与迭代，保证大包可用）。
+    LP_KM_ITERS = max(5, min(200, _positive_int(os.getenv("SJFX_LP_KM_ITERS"), 40)))
+    LP_KM_FIT_SAMPLE = max(200, min(50000, _positive_int(os.getenv("SJFX_LP_KM_FIT_SAMPLE"), 4000)))
+    # 主题层：0=原行为（单层目录 + 层级归纳，保持不变）；
+    #         1=在叶组命名后，由模型按**叶组名**归并出上位主题（两层目录）。
+    LP_TOPIC_MERGE = os.getenv("SJFX_LP_TOPIC_MERGE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    LP_TOPIC_MERGE_MIN_GROUPS = max(4, min(4000, _positive_int(os.getenv("SJFX_LP_TOPIC_MERGE_MIN_GROUPS"), 12)))
+    # 【形状参数】每个主题下希望看到多少个叶组。这是人浏览第二层的舒适度，
+    # 与语料规模无关。**主题层不再有固定数量配置**：
+    #   主题数   = clamp(叶组数 / 本值, 6, 24)
+    #   子组上限 = ceil(叶组数 / 主题数 * 1.8)
+    # 这样不论导入 100 个还是 10 万个文件，顶层都落在可浏览的 [6, 24]。
+    # 固定值在大规模下会崩：1,200 个叶组配固定 target=12/cap=20 会算出 72 个主题。
+    LP_TOPIC_LEAVES_PER_TOPIC = max(3, min(100, _positive_int(os.getenv("SJFX_LP_TOPIC_LEAVES_PER_TOPIC"), 12)))
+    # 【已废弃】主题数固定值与子组数固定上限。主题层改为按实际叶组数推导后不再读取。
+    # 保留仅为兼容旧 .env，避免历史配置直接报错。
+    LP_TOPIC_TARGET = max(3, min(50, _positive_int(os.getenv("SJFX_LP_TOPIC_TARGET"), 12)))
+    # 主题层的下限仍然是形状常量：少于 3 个子组就不算一个主题。
+    LP_TOPIC_MIN_CHILDREN = max(2, min(50, _positive_int(os.getenv("SJFX_LP_TOPIC_MIN_CHILDREN"), 3)))
+    LP_TOPIC_MAX_CHILDREN = max(LP_TOPIC_MIN_CHILDREN,
+                                min(200, _positive_int(os.getenv("SJFX_LP_TOPIC_MAX_CHILDREN"), 20)))
+    # 【方案 A】情报概览的两个里程碑：
+    #   catalog = 智能目录（含主题层）确定后 —— 主动生成**第一版**并冻结快照
+    #   deep    = 深度摘要排空后        —— 依据深度摘要内容**更新**为第二版
+    # 两版只差"证据层级"（快速预览 → 深度摘要）与研究方向的重估，
+    # **不改变目录结构**。生成失败绝不影响主流程。
+    LP_OVERVIEW_EAGER = os.getenv("SJFX_LP_OVERVIEW_EAGER", "1").strip().lower() in {"1", "true", "yes", "on"}
+    # 目录结构在 catalog_ready 之后冻结：深度摘要会改写正文并触发重新嵌入，
+    # 若继续重算聚类，group id 会全部变化，已生成的目录名与第一版情报概览同时作废。
+    # 需要恢复"深度摘要后重算目录"时设为 0。
+    LP_CATALOG_FREEZE_AFTER_CATALOG = os.getenv(
+        "SJFX_LP_CATALOG_FREEZE_AFTER_CATALOG", "1").strip().lower() in {"1", "true", "yes", "on"}
 
     LARGE_PACKAGE_THRESHOLD_BYTES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_BYTES", str(1024 * 1024 * 1024)))
     LARGE_PACKAGE_THRESHOLD_FILES = int(os.getenv("LARGE_PACKAGE_THRESHOLD_FILES", "3000"))

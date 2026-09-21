@@ -15,6 +15,12 @@
   let fileNodeId = '';
   let fileCategory = '';
   let refreshing = false;
+  // 晚到响应守卫：每次请求记下"这一发是给哪个包的"，回来时若包的上下文已经变了
+  // 就整包丢弃。框架 §7.2 明确要求"前端丢弃较旧请求的晚到响应"——否则用户在
+  // 历史里快速切换数据包时，旧包的响应会盖到新包的界面上。
+  let contextSeq = 0;
+  const contextToken = () => `${packageId}#${contextSeq}`;
+  const stillCurrent = (token) => token === contextToken();
   const selectableStatuses = new Set(['waiting_for_selection', 'completed']);
   const activeStatuses = new Set(['queued', 'running']);
 
@@ -75,25 +81,80 @@
       if (status) status.textContent = '请先在"大数据包导入"页导入，或从数据包历史里打开一个大数据包，再来选择深度摘要文件。';
     }
   }
-  function render(status) {
+  function render(status, workflow) {
     if (!status) return;
-    const counts = status.counts || {};
+    // **状态口径统一**：后端 `/workflow` 快照是唯一权威。有它就优先用它的
+    // status/phase/progress/message、allowed_actions（按钮可见性）与
+    // 阻塞/可选待办拆分；没有快照就完全按原来的 packages 字段推断，旧后端不变。
+    const wf = workflow && typeof workflow === 'object' ? workflow : null;
+    const view = wf ? Object.assign({}, status, {
+      status: wf.status || status.status,
+      phase: wf.phase || status.phase,
+      progress: Number(wf.progress == null ? status.progress : wf.progress) || 0,
+      message: wf.message || status.message,
+    }) : status;
+    const actions = wf && wf.allowed_actions ? wf.allowed_actions : null;
+    const counts = view.counts || {};
     const quick = counts.quick || {};
     const deep = counts.deep || {};
-    const text = `${status.message || ''} · 阶段：${status.phase || '—'} · 进度 ${status.progress || 0}%` +
-      ` · 文件 ${counts.total_files || 0} · 快速摘要 ${quick.completed || 0} · 深度 ${deep.completed || 0}`;
+    // 待办必须分两种口径显示，否则"已完成"和"还有一万多项"会同时出现。
+    const pendingNote = wf && Number(wf.pending_total || 0)
+      ? ` · 待办 阻塞 ${Number(wf.pending_blocking || 0)} / 可选 ${Number(wf.pending_optional || 0)}` : '';
+    // 目录版本与状态：明确"看的目录是哪一版、是草稿还是定稿、有没有降级"。
+    const catalogNote = wf
+      ? ` · 目录 ${wf.catalog_state === 'published' ? '已发布' : (wf.catalog_state || '无')}` +
+        (wf.catalog_id ? `(${String(wf.catalog_id).slice(4, 12)})` : '') +
+        (wf.catalog_degraded ? ` · ⚠ 降级目录（${(wf.catalog_degraded_detail || {}).fragment_groups || '?'}/${(wf.catalog_degraded_detail || {}).groups || '?'} 个叶组是碎片，未经语义聚类）` : '')
+      : '';
+    const text = `${view.message || ''} · 阶段：${view.phase || '—'} · 进度 ${view.progress || 0}%` +
+      ` · 文件 ${counts.total_files || 0} · 快速摘要 ${quick.completed || 0} · 深度 ${deep.completed || 0}` + pendingNote + catalogNote;
     if ($('largePackageStatus')) $('largePackageStatus').textContent = text;
-    if ($('largePackageProgress')) $('largePackageProgress').style.width = `${Math.max(0, Math.min(100, Number(status.progress || 0)))}%`;
-    const ready = selectableStatuses.has(String(status.status || '').toLowerCase());
+    if ($('largePackageProgress')) $('largePackageProgress').style.width = `${Math.max(0, Math.min(100, Number(view.progress || 0)))}%`;
+    const ready = actions ? !!actions.select : selectableStatuses.has(String(view.status || '').toLowerCase());
     if ($('largePackagePanel')) $('largePackagePanel').dataset.ready = String(ready);
     if ($('largePackageSelectionBox')) $('largePackageSelectionBox').hidden = !ready;
     if ($('largePackageSelectionBox')) $('largePackageSelectionBox').hidden = currentStage !== 'select' || !ready;
     if ($('largePackageOpenCatalog')) $('largePackageOpenCatalog').hidden = !Number(counts.total_files || 0);
-    if ($('largePackageOpenOverview')) $('largePackageOpenOverview').hidden = status.status !== 'completed';
-    if ($('largePackagePauseBtn')) $('largePackagePauseBtn').hidden = !activeStatuses.has(String(status.status || '').toLowerCase());
-    if ($('largePackageResumeBtn')) $('largePackageResumeBtn').hidden = status.status !== 'paused';
-    if ($('largePackageCancelBtn')) $('largePackageCancelBtn').hidden = !activeStatuses.has(String(status.status || '').toLowerCase());
-    if ($('largePackageReport') && status.status !== 'completed') $('largePackageReport').textContent = '';
+    // 有**已发布版本**就一定能看成果，哪怕包因为补充解析被重新排队。
+    const hasOverview = wf
+      ? Boolean(wf.published_view || wf.overview_state === 'published' || view.status === 'completed')
+      : view.status === 'completed';
+    if ($('largePackageOpenOverview')) $('largePackageOpenOverview').hidden = !hasOverview;
+    if ($('largePackagePauseBtn')) $('largePackagePauseBtn').hidden = actions ? !actions.pause : !activeStatuses.has(String(view.status || '').toLowerCase());
+    if ($('largePackageResumeBtn')) $('largePackageResumeBtn').hidden = actions ? !actions.resume : view.status !== 'paused';
+    if ($('largePackageCancelBtn')) $('largePackageCancelBtn').hidden = actions ? !actions.cancel : !activeStatuses.has(String(view.status || '').toLowerCase());
+    if ($('largePackageReport') && !hasOverview) $('largePackageReport').textContent = '';
+    // U12：明确"本批依据哪一版目录"，并在目录降级时给出**可执行的修复入口**。
+    // 后端已经有 catalog_degraded / current_selection.catalog_id / POST /catalog/rebuild，
+    // 这里把最后一段接上，否则用户看得见"降级"却无从下手。
+    if ($('largePackageBatchCatalog')) {
+      const sel = (wf && wf.current_selection) || {};
+      $('largePackageBatchCatalog').textContent = sel.catalog_id
+        ? `本批依据目录 ${String(sel.catalog_id).slice(4, 12)}`
+        : '本批未记录目录版本（旧批次）';
+    }
+    let rebuild = $('largePackageRebuildCatalog');
+    if (wf && wf.catalog_degraded && $('largePackageSmartStats') && !rebuild) {
+      rebuild = document.createElement('button');
+      rebuild.id = 'largePackageRebuildCatalog';
+      rebuild.type = 'button';
+      rebuild.className = 'secondary';
+      rebuild.textContent = '重建语义目录（当前为降级目录）';
+      rebuild.onclick = async () => {
+        if (!window.confirm('重建会重排叶子分组与名称，已生成的目录名和报告骨架会随之变化。确定继续？')) return;
+        rebuild.disabled = true;
+        try {
+          const r = await api()(`/api/large-packages/${encodeURIComponent(packageId)}/catalog/rebuild`, {method: 'POST'});
+          const rb = r.rebuild || {};
+          window.alert(`重建完成：叶组 ${rb.groups_before} → ${rb.groups_after}；降级 ${(rb.degraded_before||{}).degraded} → ${(rb.degraded_after||{}).degraded}`);
+          lastCatalogAt = 0;
+          await refresh();
+        } catch (e) {
+          window.alert(e.message || '目录重建失败');
+        } finally { rebuild.disabled = false; }
+      };
+      $('largePackageSmartStats').after(rebuild);
+    }
   }
   function renderCatalog(catalog) {
     if (!catalog) return;
@@ -143,7 +204,7 @@
     const hint = $('largePackageSelectCatalogHint');
     if (hint) {
       hint.textContent = topicCount
-        ? `已生成 ${topicCount} 个内容主题；点击主题或分类，下方只显示该组文件`
+        ? `${smart.theme_total || 0} 个主题 · ${smart.leaf_total || topicCount} 个叶子分组`
         : '智能目录在快速解析完成后生成；当前可按原始列表选择。';
     }
     tree.innerHTML = window.SJFXLargePortrait?.catalog(catalog) || '<p class="large-empty">智能目录尚未生成。</p>';
@@ -185,22 +246,32 @@
     if (!packageId || refreshing) return;
     refreshing = true;
     try {
+      const token = contextToken();
       const data = await api()(`/api/large-packages/${encodeURIComponent(packageId)}`);
-      render(data.large_package);
-      const catalogReady = Number(data.large_package.counts?.total_files || 0) > 0;
+      if (!stillCurrent(token)) return;          // 晚到响应：包的上下文已变，丢弃
+      const pkg = data.large_package || {};
+      const wf = data.workflow || null;
+      render(pkg, wf);
+      const statusValue = String((wf && wf.status) || pkg.status || '').toLowerCase();
+      const catalogReady = Number(pkg.counts?.total_files || 0) > 0;
       if (catalogReady && Date.now() - lastCatalogAt > 5000) await loadCatalog();
-      if (data.large_package.status === 'completed') await loadReport();
-      if (['failed','cancelled'].includes(data.large_package.status) || (data.large_package.status === 'completed' && !directoryPending)) {
+      if (!stillCurrent(token)) return;
+      if (statusValue === 'completed') await loadReport();
+      if (!stillCurrent(token)) return;
+      if (['failed','cancelled'].includes(statusValue) || (statusValue === 'completed' && !directoryPending)) {
         clearInterval(pollTimer); pollTimer = null;
       }
-      if (selectableStatuses.has(String(data.large_package.status || '').toLowerCase()) && currentStage === 'select') await loadFiles();
+      const selectable = wf && wf.allowed_actions ? !!wf.allowed_actions.select : selectableStatuses.has(statusValue);
+      if (selectable && currentStage === 'select') await loadFiles();
     } catch (error) {
       if ($('largePackageStatus')) $('largePackageStatus').textContent = error.message || '状态读取失败';
     } finally { refreshing = false; }
   }
   async function loadFiles() {
+    const token = contextToken();
     const q = $('largePackageSearch')?.value || '';
     const data = await api()(`/api/large-packages/${encodeURIComponent(packageId)}/files?limit=100&offset=${fileOffset}&remaining=${showAllFiles ? 0 : 1}&node_id=${encodeURIComponent(fileNodeId)}&topic=${encodeURIComponent(fileTopic)}&category=${encodeURIComponent(fileCategory)}&q=${encodeURIComponent(q)}`);
+    if (!stillCurrent(token)) return;
     const allFiles = data.files || [];
     files = allFiles;
     const box = $('largePackageFiles');
@@ -248,6 +319,7 @@
   window.openLargePackageHistory = async function (id, requestedStage = '') {
     requestedStage = typeof requestedStage === 'string' ? requestedStage : '';
     packageId = String(id || '');
+    contextSeq += 1;                       // 换包：让所有在途响应立即失效
     window.sjfxLargeResultId = packageId;
     selected = new Set();
     fileOffset = 0; fileTopic = ''; fileCategory = '';
@@ -258,17 +330,21 @@
     await refresh();
     clearInterval(pollTimer);
     const current = await api()(`/api/large-packages/${encodeURIComponent(packageId)}`);
-    const route = requestedStage || (current.large_package?.status === 'completed' ? 'large-overview' : 'large-select');
+    const curStatus = String((current.workflow && current.workflow.status) || current.large_package?.status || '');
+    const route = requestedStage || (curStatus === 'completed' ? 'large-overview' : 'large-select');
     if (window.SJFXShell) window.SJFXShell.activate(route); else setStage(route === 'large-overview' ? 'overview' : 'select');
-    if (!['completed', 'failed', 'cancelled'].includes(current.large_package?.status) || (current.large_package?.status === 'completed' && directoryPending > 0)) pollTimer = setInterval(refresh, 1500);
+    if (!['completed', 'failed', 'cancelled'].includes(curStatus) || (curStatus === 'completed' && directoryPending > 0)) pollTimer = setInterval(refresh, 1500);
   };
   async function control(action) {
     if (!packageId) return;
     const endpoint = action === 'pause' ? 'pause' : action === 'resume' ? 'resume' : 'cancel';
     if (action === 'cancel' && !window.confirm('停止后会保留已完成结果，但未完成文件不会继续处理。确定停止这个数据包吗？')) return;
     const response = await api()(`/api/large-packages/${encodeURIComponent(packageId)}/${endpoint}`, { method: 'POST' });
-    render(response.large_package || {});
+    // pause/resume/cancel 三个接口统一返回 snapshot（改动前 cancel 返回的是
+    // 裸 large_package，页面因此渲染不出来）。两者都接受，然后立刻整体刷新一次。
+    render(response.large_package || {}, response.snapshot || null);
     if (endpoint === 'cancel') clearInterval(pollTimer);
+    await refresh();
   }
   document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('input[name="workflowMode"]').forEach((input) => input.addEventListener('change', setModeText));

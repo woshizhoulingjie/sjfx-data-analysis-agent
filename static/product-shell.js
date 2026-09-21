@@ -250,6 +250,7 @@
     if (route === 'large-catalog' || route === 'large-overview' || route === 'large-result') window.SJFXLargeResult?.activate(window.sjfxLargeResultId || '', route === 'large-catalog' ? 'catalog' : 'overview');
     if (route === 'homogeneous') window.SJFXHomogeneous?.activate();
     window.SJFXEngineering?.activate(route);
+    window.SJFXExportCenter?.activate(route);
     if (route === 'packages') {
       let focus = '';
       try { focus = window.sessionStorage.getItem('sjfx-package-entry-focus-v1') || ''; } catch (_) {}

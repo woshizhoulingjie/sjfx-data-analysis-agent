@@ -8,14 +8,74 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import time
 from contextlib import closing
 
 VERSION = "large-semantic-catalog/2"
 
-def _text(value, limit=6000):
-    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+# 送进模型/嵌入的正文预算。原来固定 3600，且只取 text_preview 的**开头**：
+# 一个 112,786 字符的 PDF 最终只有 3.2% 的内容进入模型，文档尾部的结论、
+# 签署方、附件清单等完全读不到。现在改为在预算内取「头 + 中 + 尾」，
+# 覆盖范围扩展到全文，成本不变（字符数相同）。
+MATERIAL_CHARS = 6000
+PREVIEW_CHARS = 9000
+
+# catalog_input_hash（向量缓存指纹）的取值域。**只能增加，不能减少**：
+# 减少会让已经算好的向量缓存全部失效、触发整包重新嵌入。
+# 新增检索性字段（例如 keywords）时把它排除在指纹之外，缓存才不会被无谓地作废。
+DIGEST_FIELDS = ("text", "deep_summary", "fields", "headings", "source")
+
+# 目录阶段失败后的**有界**重试次数。用尽即落 failed（只能经 /retry-failed 人工重试）。
+# 为什么必须有界：改动前无论成败一律把队列项标 completed，于是"识别失败"的文件
+# 永远不会被自动重试（生产实测 73 个 deferred 文件停在这里，唯一出口是手工点
+# "补充内容识别"）；而如果改成无条件 requeue，就会变成"每 2 秒重复同一条失败路径、
+# 持续数小时"——那正是本项目已经踩过的空转。两者之间只有"有界重试"是对的。
+CATALOG_MAX_ATTEMPTS = max(1, min(10, int(os.getenv("SJFX_LP_CATALOG_MAX_ATTEMPTS", "3") or 3)))
+
+
+def _sample(value, limit):
+    """在 limit 字符内取头部 50% / 中部 25% / 尾部 25%。"""
+    text = str(value or "")
+    limit = max(0, int(limit or 0))
+    if not limit or len(text) <= limit:
+        return text
+    head = int(limit * 0.50)
+    middle = int(limit * 0.25)
+    tail = limit - head - middle
+    middle_start = max(head, (len(text) - middle) // 2)
+    return text[:head] + text[middle_start:middle_start + middle] + (text[-tail:] if tail else "")
+
+
+def _text(value, limit=MATERIAL_CHARS):
+    return re.sub(r"\s+", " ", _sample(value, limit)).strip()
+
+
+# 混进正文的标记语言。生产实测约 5% 的文件首段证据是 `<!DOCTYPE html>...` 源码：
+# 标签既占满证据预算，又让命名模型看不到任何内容。这里只删标签与脚本内容，
+# 不增删真实正文；删完仍然没内容时，material() 会照旧返回 None（走"无正文"路径）。
+_MARKUP_TAG = re.compile(
+    r"<(?:!DOCTYPE|/?(?:html|head|body|div|span|p|a|li|ul|ol|table|thead|tbody|tr|td|th|"
+    r"script|style|meta|link|br|hr|h[1-6]|img|form|input|button|nav|footer|header|"
+    r"section|article|iframe|svg|noscript)\b)[^>]{0,300}>", re.I)
+_MARKUP_BLOCK = re.compile(r"<(script|style)\b[^>]*>.*?</\1\s*>", re.I | re.S)
+
+
+def strip_markup(value):
+    """去掉正文里的 HTML/XML 源码，保留可读文字。仅当标签密度足够高时才动手。"""
+    text = str(value or "")
+    if not text or "<" not in text:
+        return text
+    if len(_MARKUP_TAG.findall(text[:4000])) < 3:
+        return text
+    text = _MARKUP_BLOCK.sub(" ", text)
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+    text = _MARKUP_TAG.sub(" ", text)
+    for entity, char in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"),
+                         ("&gt;", ">"), ("&quot;", '"'), ("&#39;", "'")):
+        text = text.replace(entity, char)
+    return re.sub(r"[ \t\u3000]{2,}", " ", text).strip()
 
 
 def material(row):
@@ -35,18 +95,24 @@ def material(row):
         text = local.get("sample") or ""
     deep_ready = row.get("deep_status") == "completed" and deep.get("summary_type") != "local_deep_failed"
     summary = _text(deep.get("summary"), 1800) if deep_ready else ""
-    full_preview = _text(deep.get("text_preview"), 6000) if deep_ready else ""
+    full_preview = _text(deep.get("text_preview"), PREVIEW_CHARS) if deep_ready else ""
     if full_preview:
         text = full_preview
-    text = _text(text, 3600)
+    text = _text(text, MATERIAL_CHARS)
+    text = strip_markup(text)
     fields = [_text(x, 100) for x in info.get("fields", [])[:20]]
     headings = [_text(x, 140) for x in info.get("headings", [])[:8]]
+    keywords = [_text(x, 40) for x in (local.get("keywords") or [])[:16]]
     if len(text) < 20 and len(summary) < 20 and len(fields) < 2:
         return None
     value = {"text": text, "deep_summary": summary, "fields": fields, "headings": headings,
+             "keywords": keywords,
              "source": "deep_summary" if summary else "deep_content" if full_preview else "content_preview"}
     # File names and old rule labels are intentionally absent from model input.
-    digest = hashlib.sha256((VERSION + json.dumps(value, ensure_ascii=False, sort_keys=True)).encode()).hexdigest()
+    # 指纹只覆盖"决定向量内容"的字段：新增 keywords 之类的检索性字段不得让
+    # 已经算好的向量缓存整包失效（否则一次低成本改造会触发全量重新嵌入）。
+    fingerprint = {key: value[key] for key in DIGEST_FIELDS}
+    digest = hashlib.sha256((VERSION + json.dumps(fingerprint, ensure_ascii=False, sort_keys=True)).encode()).hexdigest()
     return value, digest
 
 
@@ -131,8 +197,31 @@ def _save(store, package_id, path, digest, result=None, error=""):
         local.update(portrait=info, category=info["category"])
         conn.execute("""UPDATE files SET local_summary=?,category=?,topic=?,recognition_status=?,confidence=0,updated_at=?
           WHERE package_id=? AND path=?""", (json.dumps(local, ensure_ascii=False), info["category"], info["topic"], info["recognition_status"], time.time(), package_id, path))
-        conn.execute("UPDATE queue SET status='completed',error=?,updated_at=? WHERE package_id=? AND path=? AND stage='catalog'",
-                     (_text(error, 240) or None, time.time(), package_id, path))
+        # 目录队列项收尾：成功 → completed；失败 → 按 attempts 有界重试。
+        # `attempts` 由 claim() 每次领取自增，所以它就是"已经试过几次"的真值。
+        row = conn.execute("SELECT COALESCE(attempts,0) FROM queue "
+                           "WHERE package_id=? AND path=? AND stage='catalog'",
+                           (package_id, path)).fetchone()
+        attempts = int(row[0]) if row else 0
+        if result:
+            queue_status = "completed"
+        elif attempts < CATALOG_MAX_ATTEMPTS:
+            queue_status = "queued"
+        else:
+            queue_status = "failed"
+        conn.execute("UPDATE queue SET status=?,error=?,leased_at=NULL,lease_token=NULL,updated_at=? "
+                     "WHERE package_id=? AND path=? AND stage='catalog'",
+                     (queue_status, _text(error, 240) or None, time.time(), package_id, path))
+        if result:
+            # 目录阶段已经给出**确定的识别结论**（recognition_status=identified），
+            # 补充识别队列里这一项的目的就达到了，同一个事务里收掉它。
+            # 改动前只结束 catalog 行，recognize 行永远留在 queued：生产实测
+            # 12,397 个已 identified 的文件仍被算作"待补充识别"，一次点击就要
+            # 把它们全部重跑一遍（每个文件一次模型调用）。
+            conn.execute("UPDATE queue SET status='completed',leased_at=NULL,lease_token=NULL,updated_at=? "
+                         "WHERE package_id=? AND path=? AND stage='recognize' "
+                         "AND status IN ('queued','running','retry')",
+                         (time.time(), package_id, path))
         conn.commit()
     store._catalog_cache.pop(package_id, None)
     return True

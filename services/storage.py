@@ -7811,8 +7811,13 @@ class Storage:
                 created += 1
         return created
 
-    def list_jobs(self, owner_id=None, statuses=None, limit=50):
-        """Return an owner-scoped task history for the product task center."""
+    def list_jobs(self, owner_id=None, statuses=None, limit=50, task_types=None):
+        """Return an owner-scoped task history for the product task center.
+
+        `task_types` 让调用方在 SQL 层就收窄任务类型。通用任务流里完成态的
+        摘要类任务数量远多于导出任务，只在结果集上过滤会让导出记录被挤出
+        limit 之外（实测 29 条导出只剩 2 条可见）。
+        """
         limit = max(1, min(200, int(limit or 50)))
         clauses = []
         values = []
@@ -7823,6 +7828,10 @@ class Storage:
         if statuses:
             clauses.append("status IN ({})".format(",".join("?" for _ in statuses)))
             values.extend(statuses)
+        task_types = [str(item) for item in (task_types or []) if item]
+        if task_types:
+            clauses.append("task_type IN ({})".format(",".join("?" for _ in task_types)))
+            values.extend(task_types)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         values.append(limit)
         with self._connect() as conn:

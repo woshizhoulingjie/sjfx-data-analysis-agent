@@ -1,8 +1,10 @@
 """Ordinary preliminary-only generation and versioned, per-job ready results."""
 import json
 import logging
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from config import Config
@@ -70,11 +72,16 @@ def _prompt(rows):
     )
 
 
-def _call(llm, rows, ledger):
+def _call(llm, rows, ledger, lock=None):
     call_id = uuid.uuid4().hex
     started = time.monotonic()
     record = {"model_call_id": call_id, "files": len(rows), "success": False}
-    ledger.append(record)
+    # 多路并发时共享同一本调用账本，append 必须加锁，否则记录会丢。
+    if lock is None:
+        ledger.append(record)
+    else:
+        with lock:
+            ledger.append(record)
     try:
         response = llm.chat_json(
             "你是严谨的中文资料预读助手。独立分析每个文件，输出简短、完整且有来源支持的JSON。",
@@ -127,7 +134,9 @@ def _prepare(row, raw, response, ledger, batch_id, batch_size, fallback_reason=N
     for field in ("key_facts", "arguments", "methodology", "conclusions", "uncertainties", "warnings"):
         summary.setdefault(field, [])
     summary.setdefault("title", (document.get("structure") or {}).get("title") or path)
-    summary["evidence_chain"] = select_evidence(document.get("evidence") or [], topics=summary.get("topics") or [], max_items=3, per_source=3, max_chars=360)
+    # 2026-09-15：向量检索只影响排序、不影响 claim_match 准入（实测 0.92 门槛在真实语料上
+    # 从未触发），但每文件要付 7-10 秒 CPU 嵌入，且阻塞在模型调用之后使 GPU 空转。改为词法。
+    summary["evidence_chain"] = select_evidence(document.get("evidence") or [], topics=summary.get("topics") or [], max_items=3, per_source=3, max_chars=360, use_embeddings=False)
     if (document.get("parser") or {}).get("name") == "structured-table":
         from services.tabular_document import grounded_table_summary
         summary = grounded_table_summary(summary, document)
@@ -159,50 +168,96 @@ def _prepare(row, raw, response, ledger, batch_id, batch_size, fallback_reason=N
             "created_at": time.time(), "result": result}
 
 
-def generate_ready_results(llm, storage, lead_job, fallback):
-    jobs = collect_jobs(storage, lead_job, limit=Config.PRELIMINARY_SUMMARY_BATCH_SIZE)
-    rows = []
-    estimated = 1700
+def _batch_width():
+    """一次并发发起的初步摘要请求数（默认 1 = 与历史行为完全一致）。"""
+    try:
+        return max(1, min(8, int(getattr(Config, "PRELIMINARY_SUMMARY_CONCURRENCY", 1))))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _collect_groups(storage, jobs, per_call, width):
+    """把候选任务分成最多 width 组、每组最多 per_call 个文件。
+
+    每组的上下文预算判断与改动前逐字一致；width=1 时只可能产出一组，
+    因此「装不下就停」的语义和改动前的 break 完全相同。
+    """
+    groups, current, estimated = [], [], 1700
     for job in jobs:
         snapshot = storage.preliminary_document_snapshot(job)
         if not snapshot:
-            if job["id"] == lead_job["id"]:
+            if job["id"] == jobs[0]["id"]:
                 raise ValueError("初步摘要的文档或任务身份已失效")
             continue
         started = time.monotonic()
         text = build_preliminary_input(snapshot["document"], Config.PRELIMINARY_SUMMARY_INPUT_MAX_CHARS)
         cost = _estimated_tokens(text) + 900
-        if rows and estimated + cost > Config.LLM_CONTEXT_TOKENS - 1500:
-            break
+        full = bool(current) and (
+            len(current) >= per_call
+            or estimated + cost > Config.LLM_CONTEXT_TOKENS - 1500
+        )
+        if full:
+            if len(groups) + 1 >= width:
+                # width=1 时等价于改动前的 break：剩下的文件留给后续任务。
+                break
+            groups.append(current)
+            current, estimated = [], 1700
         estimated += cost
-        rows.append({"job": job, "document": snapshot["document"], "stamp": snapshot["stamp"],
-                     "input": text, "input_build_ms": round((time.monotonic() - started) * 1000, 2)})
+        current.append({"job": job, "document": snapshot["document"], "stamp": snapshot["stamp"],
+                        "input": text, "input_build_ms": round((time.monotonic() - started) * 1000, 2)})
+    if current:
+        groups.append(current)
+    return groups
+
+
+def generate_ready_results(llm, storage, lead_job, fallback):
+    width = _batch_width()
+    per_call = max(1, int(Config.PRELIMINARY_SUMMARY_BATCH_SIZE))
+    jobs = collect_jobs(storage, lead_job, limit=per_call * width)
+    groups = _collect_groups(storage, jobs, per_call, width)
+    rows = [row for group in groups for row in group]
     batch_id, ledger, output = uuid.uuid4().hex, [], {}
-    response, error = {}, "模型输出未通过逐文件校验"
-    try:
-        response = _call(llm, rows, ledger)
-        valid = _validated(response, rows)
-    except Exception as exc:
-        valid = {}
-        error = str(exc)[:300]
+    ledger_lock = threading.Lock()
+
+    def run(group):
+        try:
+            return group, _call(llm, group, ledger, ledger_lock), None
+        except Exception as exc:  # noqa: BLE001
+            return group, {}, str(exc)[:300]
+
+    if len(groups) <= 1:
+        # width=1：完全走改动前的串行路径，一次一批。
+        outcomes = [run(groups[0])] if groups else []
+    else:
+        # 单卡解码受显存带宽限制（读权重），K 路请求共享同一次权重读取，
+        # 因此并发 K 路能把解码吞吐提高到约 K 倍；预填充是算力瓶颈，总时长不变。
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            outcomes = list(pool.map(run, groups))
+
+    responses = {}
+    for group, response, error in outcomes:
+        valid = _validated(response, group) if response else {}
+        for row in group:
+            responses[row["job"]["id"]] = (response, valid.get(row["job"]["id"]), error, len(group))
+
     for row in rows:
         job_id = row["job"]["id"]
         if storage.is_job_cancel_requested(job_id):
             continue
-        raw, item_response = valid.get(job_id), response
+        item_response, raw, error, group_size = responses[job_id]
         reason = None
         if raw is None:
             # One recovery call per failed file; successful siblings are never repeated.
             try:
-                item_response = _call(llm, [row], ledger)
+                item_response = _call(llm, [row], ledger, ledger_lock)
                 raw = _validated(item_response, [row]).get(job_id)
                 if raw is None:
                     raise ValueError("初步摘要恢复请求未通过文件身份或内容校验")
             except Exception as exc:
-                reason = str(exc)[:300] or error
+                reason = str(exc)[:300] or error or "模型输出未通过逐文件校验"
                 raw = fallback(row["document"], row["job"]["options"]["path"], reason)
                 item_response = {}
-        output[job_id] = _prepare(row, raw, item_response, ledger, batch_id, len(rows), reason)
+        output[job_id] = _prepare(row, raw, item_response, ledger, batch_id, group_size, reason)
     # All rows share a call ledger. Keep IDs so aggregation does not count it per file.
     for ready in output.values():
         ready["result"]["preliminary_timing"]["model_calls"] = list(ledger)

@@ -857,7 +857,13 @@ def run_forever():
                     logger.info("自动唤醒 %s 个到期文件重试任务", awakened)
             except Exception:
                 logger.warning("到期文件重试唤醒失败，将在下一轮重试", exc_info=True)
-            job = storage.claim_next_job(WORKER_ID)
+            try:
+                job = storage.claim_next_job(WORKER_ID)
+            except Exception as exc:  # noqa: BLE001
+                # 一次瞬时 SQLITE_BUSY 不能打死 Worker：记日志、退避、继续。
+                logger.warning("领取任务失败，将在下一轮重试: %r", exc, exc_info=True)
+                time.sleep(max(1.0, float(Config.WORKER_POLL_SECONDS)))
+                continue
             if not job:
                 time.sleep(Config.WORKER_POLL_SECONDS)
                 continue

@@ -14,6 +14,8 @@
   <link rel="stylesheet" href="/static/navigation-collapse.css?v=2">
   <link rel="stylesheet" href="/static/precision-ui.css?v=contrast-fix-4">
   <link rel="stylesheet" href="/static/directory-supplement.css?v=1">
+  <link rel="stylesheet" href="/static/export-center.css?v=1">
+  <link rel="stylesheet" href="/static/reading-layout.css?v=1">
   <style>.mail-research-link { text-decoration: none; }</style>
 </head>
 <body>
@@ -188,7 +190,31 @@
 
         <section class="app-view utility-view" data-view="settings"><div class="page-heading compact"><div><div class="eyebrow">SYSTEM / LOCAL RUNTIME</div><h1>系统设置</h1><p>查看本地模型、解析边界和访问安全状态。</p></div></div><div class="settings-grid"><article class="surface settings-card"><span class="section-kicker">LOCAL MODEL</span><h2>本地模型服务</h2><div class="setting-line"><span>模型运行方式</span><b>服务器本机 vLLM</b></div><div class="setting-line"><span>数据是否出网</span><b class="safe-text">否 · 本地处理</b></div><div class="setting-line"><span>模型并发</span><b>1（GPU 安全模式）</b></div><button id="settingsTestBtn" class="secondary" data-forward="testBtn">测试本地模型</button></article><article class="surface settings-card"><span class="section-kicker">ACCESS CONTROL</span><h2>访问与目录边界</h2><div class="setting-line"><span>API 访问 Token</span><b>已启用</b></div><div class="setting-line"><span>扫描目录白名单</span><b>服务端配置</b></div><div class="setting-line"><span>结果隔离</span><b>按用户权限隔离</b></div><button class="secondary" id="headerTokenBtnSecondary">重新设置 Token</button></article><article class="surface settings-card"><span class="section-kicker">PARSER LIMITS</span><h2>解析资源</h2><div class="setting-line"><span>CPU 解析并发</span><b>默认 4</b></div><div class="setting-line"><span>单文件超时</span><b>受配置限制</b></div><div class="setting-line"><span>压缩包安全</span><b>路径穿越防护</b></div></article></div></section>
 
-        <section class="app-view utility-view" data-view="exports"><div class="page-heading compact"><div><div class="eyebrow">HANDOFF / EXPORTS</div><h1>导出中心</h1><p>选择主题、文档或证据，生成去重后的原始资料与分析成果交接包。</p></div><button class="primary" data-go-route="analysis">选择内容并导出</button></div><div class="empty-state surface"><div class="placeholder-icon"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg></div><h2>导出从智能目录发起</h2><p>在智能目录中勾选节点后，系统会自动去重文件，并将目录树、覆盖率、问题—回答—证据链和失败清单写入交接包。</p><button class="secondary" data-go-route="analysis">打开智能目录</button></div></section>
+        <section class="app-view utility-view" data-view="exports">
+  <div class="page-heading compact"><div><div class="eyebrow">HANDOFF / EXPORTS</div><h1>导出中心</h1><p>在智能目录里勾选主题、子目录或单个文件，导出为压缩包；导出记录常驻在这里，随时可以重新下载。</p></div></div>
+  <div class="export-center-panel">
+    <div class="surface export-picker">
+      <div class="export-mode-tabs" role="tablist" aria-label="导出类型"><button type="button" class="export-mode-tab active" data-export-mode="large" role="tab" aria-selected="true">大数据包导出</button><button type="button" class="export-mode-tab" data-export-mode="ordinary" role="tab" aria-selected="false">普通文件导出</button></div>
+      <div class="export-source-row"><label class="field-label">数据包<select id="exportSourceSelect"><option value="">正在读取…</option></select></label><label class="field-label">整编任务主题<input id="exportTaskTopic" type="text" maxlength="200" placeholder="例如：按业务主题交付原始资料"></label></div>
+      <div class="export-tree-toolbar"><span id="exportTreeState" class="inline-state">正在读取智能目录…</span><div class="export-tree-actions"><button id="exportExpandAllBtn" class="secondary" type="button">展开全部</button><button id="exportCollapseAllBtn" class="secondary" type="button">折叠</button><button id="exportClearSelectionBtn" class="secondary" type="button">清空选择</button><button id="exportRefreshBtn" class="secondary" type="button">刷新目录</button></div></div>
+      <p class="export-notice" id="exportNotice" hidden></p>
+      <div id="exportTree" class="export-tree" role="tree" aria-label="智能目录"></div>
+    </div>
+    <div class="surface export-cart">
+      <div class="surface-heading"><div><span class="section-kicker">SELECTION</span><h3>已选内容</h3></div><span id="exportCartCount" class="export-cart-count">尚未选择</span></div>
+      <div id="exportCartList" class="export-cart-list empty">在上方智能目录中勾选主题、子目录或单个文件。</div>
+      <div class="export-cart-actions"><span id="exportCartSummary" class="export-cart-summary">请选择要导出的内容</span><button id="exportSubmitBtn" class="primary" type="button" disabled>导出为压缩包</button></div>
+      <label class="export-auto"><input id="exportAutoDownload" type="checkbox" checked>完成后自动开始下载</label>
+      <div id="exportJobState" class="export-job-state" aria-live="polite"></div>
+      <div class="export-progress" id="exportJobProgress" hidden><i style="width:0"></i></div>
+      <div id="exportResultBox" class="export-result" hidden></div>
+    </div>
+  </div>
+  <div class="surface export-records">
+    <div class="surface-heading"><div><span class="section-kicker">EXPORT RECORDS</span><h3>导出记录</h3></div><button id="exportRecordsRefreshBtn" class="secondary" type="button">刷新记录</button></div>
+    <div id="exportRecords" class="export-records-list"><div class="ex-empty">正在读取导出记录…</div></div>
+  </div>
+</section>
 
         <section class="app-view utility-view" data-view="tasks"><div class="page-heading compact"><div><div class="eyebrow">QUEUE / OPERATIONS</div><h1>任务中心</h1><p>长时间任务独立运行，实时查看队列位置、Worker 心跳、当前文件、失败和取消状态。</p></div><button class="secondary" id="taskCenterRefreshBtn">立即同步</button></div><div class="task-center-grid"><article class="surface task-center-main"><div class="surface-heading"><div><span class="section-kicker">FOCUSED JOB</span><h2>当前关注的任务</h2></div><span id="taskCenterSyncState" class="task-sync-state">正在同步队列</span></div><div class="task-pipeline-mount" id="taskPipelineMount"><div class="progress-track"><div id="taskCenterProgressBar" class="progress-bar"></div></div><div id="taskCenterProgressText">当前没有关注的任务。</div></div><div class="task-actions"><button id="taskCenterCancelBtn" class="danger" disabled>取消当前任务</button><button class="secondary" data-go-route="packages">前往数据包管理</button></div><div class="task-list-heading-row"><div><span class="section-kicker">ACTIVE QUEUE</span><h2>任务列表</h2></div><span id="taskCenterActiveCount">队列空闲</span></div><div id="activeTaskList" class="task-list empty"><div class="task-list-empty"><strong>当前没有任务</strong><span>导入数据包后，排队、运行、取消和失败状态会显示在这里。</span></div></div></article><article class="surface task-center-side"><span class="section-kicker">RECOVERY</span><h3>任务可恢复</h3><p>Worker 会从 SQLite 检查点继续未完成文件；单文件失败不会阻塞其他文件，可在数据包页面重试失败文件。</p><div class="task-recovery-points"><span>取消排队任务会立即生效</span><span>运行任务在安全检查点停止</span><span>页面断网不会改变后台任务</span><span>恢复连接后自动继续轮询</span></div></article></div></section>
       </div>
@@ -204,14 +230,16 @@
       <pre id="fileReaderContent" class="file-reader-content"></pre>
     </div>
   </section>
-  <script src="/static/product-shell.js?v=15"></script>
-  <script src="/static/large-package-portrait.js?v=1&catalog=2"></script>
-  <script src="/static/large-package.js?v=11&catalog=2"></script>
-  <script src="/static/large-package-result.js?v=12&catalog=2"></script>
+  <script src="/static/product-shell.js?v=16"></script>
+  <script src="/static/large-package-portrait.js?v=2&catalog=3"></script>
+  <script src="/static/large-package.js?v=12&catalog=3"></script>
+  <script src="/static/large-package-result.js?v=13&catalog=3"></script>
   <script src="/static/app.js?v=56" data-cache-compat="/static/app.js?v=27" data-cache-compat-legacy="/static/app.js?v=44" data-cache-compat-older="/static/app.js?v=23"></script>
   <script src="/static/directory-supplement.js?v=1"></script>
   <script src="/static/engineering-v2.js?v=40&large-chat=1" data-cache-compat="/static/engineering-v2.js?v=31&ordinary=20260912"></script>
+  <script src="/static/export-center.js?v=2"></script>
   <script src="/static/homogeneous-analysis.js?v=8"></script>
   <script src="/static/ui-polish.js?v=5&ordinary=20260911"></script>
+  <script src="/auth-static/userbar.js?v=1"></script>
 </body>
 </html>

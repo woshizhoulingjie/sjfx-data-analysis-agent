@@ -156,3 +156,118 @@ input::placeholder, textarea::placeholder { color: #7b8ba6; }
 .mail-segment-failed { background: #2a2418; }
 tbody tr:hover { background: #17202f; }
 thead th, tbody td { border-color: var(--line); }
+
+/* ------------------------------------------------------------------
+
+   邮件分析：功能模块导航与模块容器
+
+   纯呈现层。所有规则都限定在新增的 .mail-module-* / .mail-module 上，
+   不改动任何既有选择器，也不影响任何既有元素的 id、事件或请求流程。
+
+   为什么左侧保留「资料包」与「筛选范围」：这两项是所有模块共用的上下文。
+   尤其"通信关系"点击后会写入筛选范围里的参与方，若把它藏进某个模块，
+   点击就会看起来毫无反应。保留在常驻栏里，反馈链路才和拆分前一致。
+
+   ------------------------------------------------------------------ */
+
+.mail-module[hidden] { display: none !important; }
+
+.mail-module { display: block; }
+
+.mail-module-head { margin: 0 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+
+.mail-module-head h2 { margin: 0 0 6px; font-size: 18px; font-weight: 700; }
+
+.mail-module-head p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; max-width: 70ch; }
+
+/* 模块导航 */
+
+.mail-module-nav {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 18px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.mail-module-nav-title {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.mail-module-nav .mail-module-link {
+  min-height: 34px;
+  padding: 7px 11px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-size: 13px;
+}
+
+.mail-module-nav .mail-module-link:hover:not(:disabled) {
+  background: #17202f;
+  color: var(--ink);
+}
+
+.mail-module-nav .mail-module-link.is-active {
+  border-color: #2f8f9d;
+  background: #12303a;
+  color: #e8f6f8;
+  font-weight: 650;
+}
+
+/* 模块内的表单块：在中间栏里需要有自己的面板底色 */
+
+.mail-module .mail-control-group {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.mail-module .mail-control-group:last-child { margin-bottom: 0; }
+
+/* 概览卡片在宽栏里自动铺开，避免固定两列显得空 */
+
+.mail-module .mail-overview {
+  margin: 0 0 16px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+@media (max-width: 720px) {
+  .mail-module-nav { display: flex; flex-wrap: nowrap; overflow-x: auto; gap: 6px; }
+  .mail-module-nav-title { display: none; }
+  .mail-module-nav .mail-module-link { white-space: nowrap; }
+}
+
+/* ------------------------------------------------------------------
+
+   桌面端尺寸调整（只改尺寸，不改功能）
+
+   依据 1366px 宽下的实测截图：
+   - 「会话与候选关联」「附件传递与版本」被 max-height:320px 压成一条缝，
+     各只露出约 10 条就要滚动 —— 这两块是真的小。
+   - 「通信网络」的关系图已经铺满中栏宽度（高度 = 列宽 × 0.75，
+     由 SVG 的 viewBox="0 0 800 600" 比例推导），它缺的不是高度而是宽度。
+     给这样的 SVG 加 min-height 只会让它按 meet 居中、上下留白，
+     图形本身一点都不会变大，所以这里不动它，改为把两侧栏收窄让出宽度。
+
+   ------------------------------------------------------------------ */
+
+/* 两个列表：320px -> 视口高度的 74%，两块各自是所在模块的主要内容。 */
+#mail-conversations, #mail-versions { max-height: 74vh; }
+
+/* 两侧栏各收窄 30px，把宽度让给中间内容；关系图随列宽等比放大。
+   必须限定在 >=1101px：文件后面的 @media(max-width:1100px) 会把工作区
+   改成两栏，若用无条件的同名规则覆盖会破坏窄屏布局。 */
+@media (min-width: 1101px) {
+  .mail-workspace {
+    grid-template-columns: minmax(220px, 250px) minmax(420px, 1fr) minmax(260px, 330px);
+  }
+}

@@ -10,7 +10,16 @@
   function catalog(data) {
     const smart = data?.smart || {};
     const states = Object.entries(smart.catalog_states || smart.recognition || {}).map(([k,v]) => `${catalogLabels[k] || labels[k] || k} ${v}`).join(' · ');
-    const topics = (smart.topics || []).map(t => `<details class="large-result-node large-smart-category" data-large-node-type="${t.node_id ? 'group' : 'topic'}" data-large-node-value="${esc(t.node_id || t.topic)}"><summary><b>${esc(t.topic)}</b><span>${t.files} 个文件</span></summary><small>${esc(t.basis)}</small>${(t.sample || []).map(f => `<p><b>${esc(f.path)}</b><br>${esc(f.basis)}${(f.evidence || []).map(e => `<br><small>${esc(e.location)}：${esc(e.text).slice(0, 220)}</small>`).join('')}</p>`).join('')}</details>`).join('');
+    const leaf = t => `<details class="large-result-node large-smart-category" data-large-node-type="${t.node_id ? 'group' : 'topic'}" data-large-node-value="${esc(t.node_id || t.topic)}"><summary><b>${esc(t.topic)}</b><span>${t.files} 个文件</span></summary><small>${esc(t.basis)}</small>${(t.sample || []).map(f => `<p><b>${esc(f.path)}</b><br>${esc(f.basis)}${(f.evidence || []).map(e => `<br><small>${esc(e.location)}：${esc(e.text).slice(0, 220)}</small>`).join('')}</p>`).join('')}</details>`;
+    const byId = new Map((smart.topics || []).map(t => [t.node_id, t]));
+    const nested = new Set();
+    const themes = (smart.branches || []).map(branch => {
+      const children = (branch.children || []).map(id => byId.get(id)).filter(Boolean);
+      if (!(branch.children || []).length) return '';
+      children.forEach(t => nested.add(t.node_id));
+      return `<details class="large-result-node" data-large-node-type="group" data-large-node-value="${esc(branch.node_id)}"><summary><b>${esc(branch.name)}</b><span>${Number(branch.files) || 0} 个文件</span></summary><div class="lp-content-children">${children.map(leaf).join('')}</div></details>`;
+    }).join('');
+    const topics = themes + (smart.topics || []).filter(t => !nested.has(t.node_id)).map(leaf).join('');
     const categories = (smart.categories || []).map(c => `<details class="large-result-node" data-large-node-type="category" data-large-node-value="${esc(c.category)}"><summary>${esc(c.category)} · ${c.files}</summary><small>${(c.sample || []).map(f => esc(f.path)).join(' · ')}</small></details>`).join('');
     const names = {role:'文档用途', project:'项目/编号线索', entity:'参与者线索', date:'样本时间'};
     const facets = Object.entries(smart.facets || {}).map(([kind,items]) => `<details><summary>${names[kind]}（样本线索）</summary>${items.map(x => `<details data-large-node-type="${kind}" data-large-node-value="${esc(x.value)}"><summary>${esc(x.value)} · ${x.files}</summary></details>`).join('')}</details>`).join('');

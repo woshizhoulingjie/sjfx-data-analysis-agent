@@ -46,7 +46,8 @@ def collect_jobs(storage, lead_job, limit=4):
     """Read compatible queued siblings without changing their queue state."""
     if not eligible_job(lead_job):
         return [lead_job]
-    limit = max(1, min(4, int(limit or 4)))
+    # 调用方默认仍然传 4（历史行为不变）；并发改造后允许一次收集多组。
+    limit = max(1, min(32, int(limit or 4)))
     owner_id = str(lead_job.get("owner_id") or "legacy")
     scan_id = str(lead_job.get("scan_id") or "")
     priority = int(lead_job.get("priority") or 0)

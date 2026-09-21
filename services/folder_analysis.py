@@ -829,11 +829,18 @@ def _bounded_node_inputs(file_summaries, clusters, catalog, byte_budget=22000):
         prefix = value[:limit]
         boundary = max(prefix.rfind("。"), prefix.rfind(";"), prefix.rfind("；"), prefix.rfind("\n"))
         return prefix[:boundary + 1] if boundary >= 0 else "（长摘要请查看文件摘要）"
-    summaries = [{"path":f.get("path"), "title":brief(f.get("title"),120),
-                  "summary":brief(f.get("summary") or f.get("core_summary"),500),
-                  "key_facts":[x for x in f.get("key_facts") or [] if len(str(x))<=220][:2],
-                  "file_conclusions":[x for x in f.get("file_conclusions") or [] if len(str(x))<=400][:2]}
-                 for f in file_summaries]
+    def _node_summary_row(f):
+        item = {"path":f.get("path"), "title":brief(f.get("title"),120),
+                "summary":brief(f.get("summary") or f.get("core_summary"),500),
+                "key_facts":[x for x in f.get("key_facts") or [] if len(str(x))<=220][:2],
+                "file_conclusions":[x for x in f.get("file_conclusions") or [] if len(str(x))<=400][:2]}
+        # 分层汇总时携带该批次的文件清单，避免节点摘要丢失文件身份。
+        # 普通文件摘要没有这个字段，因此输出与改动前逐字节一致。
+        if f.get("batch_paths"):
+            item["batch_paths"] = [str(path)[:200] for path in f["batch_paths"]]
+            item["batch_file_count"] = int(f.get("batch_file_count") or 0)
+        return item
+    summaries = [_node_summary_row(f) for f in file_summaries]
     # Rotate across sources before selecting additional evidence from one file.
     by_source = {}
     for e in catalog:
@@ -859,6 +866,209 @@ def _bounded_node_inputs(file_summaries, clusters, catalog, byte_budget=22000):
     if size()>byte_budget:
         raise ValueError("节点文件摘要超过安全上下文预算，请拆分节点后汇总")
     return summaries, compact_clusters, evidence
+
+
+# =============================================================
+# 节点摘要分层汇总
+#
+# 历史问题：文件数较多的节点，压缩到极限后仍超出单次请求预算，
+# ``_bounded_node_inputs`` 直接抛 ValueError。由于该调用位于
+# ``analyze_folder`` 的 try 之外，异常逃逸出去导致整个节点摘要任务
+# 永久失败（生产日志中观测到同一节点每 5 分钟重试一次、持续数天）。
+#
+# 现在改为三层降级，保证节点摘要一定能产出，并尽量不损失质量：
+#   第 1 层：全部文件摘要能放进一次请求 —— 保持原有行为，逐字节不变
+#   第 2 层：分批 map 汇总 → 再 reduce —— 覆盖**全部**文件，质量不降
+#   第 3 层：极端情况下裁剪批次摘要并如实标注，绝不再抛错
+# =============================================================
+
+# 分批 map 时每批放多少个文件的摘要。
+#
+# 生产实测（scan d12d954f6035, deep 层）：33 个文件的摘要共 193,245 字节，
+# 平均每个文件 5,856 字节，而单次请求预算只有 22,000 字节 —— 连 4 个文件都放不下，
+# 因此该节点的节点摘要连续失败 647 次。
+#
+# map 阶段每个文件只取 title(120) + summary(400) + key_facts(2x200) ≈ 920 字符，
+# 中文按 UTF-8 约 2.8KB。取 12 则单批约 33KB（≈10k tokens），
+# 在 32768 上下文下留足输出余量。
+NODE_SUMMARY_BATCH_FILES = 12
+
+
+def _split_node_summaries(file_summaries, batch_size=NODE_SUMMARY_BATCH_FILES):
+    """把节点文件摘要切成确定性的、有界的批次。"""
+    rows = [item for item in (file_summaries or []) if isinstance(item, dict)]
+    if not rows:
+        return []
+    size = max(1, int(batch_size or NODE_SUMMARY_BATCH_FILES))
+    return [rows[index:index + size] for index in range(0, len(rows), size)]
+
+
+def _local_batch_digest(index, total, rows):
+    """批次模型调用不可用时的本地降级摘要（不丢失文件清单）。"""
+    paths = [str(item.get("path") or "") for item in rows if item.get("path")]
+    titles = [
+        str(item.get("title") or "").strip()
+        for item in rows
+        if str(item.get("title") or "").strip()
+    ]
+    facts = []
+    for item in rows:
+        for fact in (item.get("key_facts") or []):
+            text = str(fact or "").strip()
+            if text and text not in facts:
+                facts.append(text)
+        if len(facts) >= 6:
+            break
+    summary = "本批共 {} 个文件。".format(len(rows))
+    summary += "；".join(titles[:6]) if titles else "；".join(paths[:6])
+    if facts:
+        summary += " 关键信息：" + "；".join(facts[:4])
+    return {
+        "path": "批次 {}/{}".format(index + 1, total),
+        "title": "批次摘要",
+        "summary": summary,
+        "key_facts": facts[:4],
+        "file_conclusions": [],
+        "batch_paths": paths,
+        "batch_file_count": len(rows),
+        "batch_digest_source": "local",
+    }
+
+
+def _summarize_node_batch(llm, index, total, rows):
+    """map 阶段：把一个批次的文件摘要压成有界的中间汇总。
+
+    批次里每个文件的路径都会原样回填，因此最终的节点摘要仍然能覆盖
+    节点的完整成员范围，不会有文件被静默丢弃。
+    """
+    digest = _local_batch_digest(index, total, rows)
+    if llm is None:
+        return digest
+    payload = [
+        {
+            "path": str(item.get("path") or ""),
+            "title": str(item.get("title") or "")[:120],
+            "summary": str(item.get("summary") or item.get("core_summary") or "")[:400],
+            "key_facts": [str(value)[:200] for value in (item.get("key_facts") or [])[:2]],
+        }
+        for item in rows
+    ]
+    prompt = (
+        "这是分层节点摘要的第一步分批汇总（第 {index}/{total} 批，共 {count} 个文件）。"
+        "请把这批文件的摘要压缩成一段有信息量的中间汇总，供后续节点级汇总使用。"
+        "保留可核验的事实、数字、专有名词与限制条件；不得引入材料之外的信息；"
+        "不得把本批说成整个节点。"
+        "输出务必精简：batch_summary 不超过 400 字，topics 最多 5 个，notable 最多 4 项。"
+        "只输出 JSON："
+        '{{"batch_summary":"...","topics":["..."],"notable":["..."]}}\n'
+        "批次文件摘要：{payload}"
+    ).format(
+        index=index + 1,
+        total=total,
+        count=len(rows),
+        payload=json.dumps(payload, ensure_ascii=False),
+    )
+    try:
+        result = llm.chat_json(
+            "你是严谨的资料包分层汇总助手，只压缩给定内容，不添加外部信息。"
+            + CHINESE_CONCLUSION_RULE,
+            prompt,
+            # 实测：12 个文件的中间汇总需要 538~608 个输出 token。
+            # 早先 420 的上限会让 JSON 在字符串中途被截断（Unterminated string），
+            # 该批次静默退化为本地摘要。这里按批大小留出充足余量。
+            max_tokens=max(900, min(2400, 300 + 60 * len(rows))),
+            long_output=True,
+            strict=True,
+            retries=0,
+            timeout=120,
+            required_fields=("batch_summary",),
+            output_context="节点摘要分批汇总",
+        )
+        data = result.get("json") or {}
+        text = str(data.get("batch_summary") or "").strip()
+        if not text:
+            digest["batch_digest_error"] = "模型未返回 batch_summary"
+            return digest
+        digest.update({
+            "summary": text,
+            "key_facts": [
+                str(value)[:200]
+                for value in (data.get("notable") or [])[:4]
+                if str(value or "").strip()
+            ],
+            "batch_digest_source": "model",
+        })
+        return digest
+    except Exception as exc:
+        # 单个批次失败只影响该批次的精细度，不影响整个节点摘要产出。
+        # 但必须把原因记录下来，避免"静默降级"无法排查。
+        digest["batch_digest_error"] = str(exc)[:300]
+        return digest
+
+
+def _node_summary_inputs(llm, file_summaries, clusters, catalog):
+    """构造节点提示词输入；分层降级，保证节点摘要一定能完成。
+
+    返回值除三元组外还包括一个 batching 元信息字典，供结果标注使用。
+    """
+    meta = {"strategy": "single_request", "batches": 0, "files": len(file_summaries or [])}
+
+    # 第 1 层：历史行为，逐字节不变。
+    try:
+        inputs = _bounded_node_inputs(file_summaries, clusters, catalog)
+        return inputs[0], inputs[1], inputs[2], meta
+    except Exception:
+        # 任何形态的输入问题都转入分层汇总，绝不让节点摘要任务失败。
+        pass
+
+    batches = _split_node_summaries(file_summaries)
+    if batches:
+        digests = [
+            _summarize_node_batch(llm, index, len(batches), rows)
+            for index, rows in enumerate(batches)
+        ]
+        meta = {
+            "strategy": "hierarchical",
+            "batches": len(batches),
+            "batch_files": NODE_SUMMARY_BATCH_FILES,
+            "files": len(file_summaries or []),
+            "model_batches": sum(1 for item in digests if item.get("batch_digest_source") == "model"),
+            "degraded_batches": sum(1 for item in digests if item.get("batch_digest_error")),
+            "batch_errors": [
+                item["batch_digest_error"]
+                for item in digests
+                if item.get("batch_digest_error")
+            ][:3],
+        }
+
+        # 第 2 层：用批次摘要覆盖全部文件。
+        try:
+            inputs = _bounded_node_inputs(digests, clusters, catalog)
+            return inputs[0], inputs[1], inputs[2], meta
+        except Exception:
+            pass
+
+        # 第 3 层：逐条裁剪批次摘要，直到能放进请求；绝不抛错。
+        remaining = list(digests)
+        while len(remaining) > 1:
+            remaining.pop()
+            try:
+                inputs = _bounded_node_inputs(remaining, clusters, catalog)
+                meta["strategy"] = "hierarchical_trimmed"
+                meta["retained_batches"] = len(remaining)
+                return inputs[0], inputs[1], inputs[2], meta
+            except Exception:
+                continue
+
+    # 终极兜底：不带文件摘要，仅用簇与证据目录构造输入。
+    # ``_bounded_node_inputs`` 在这种情况下会先丢弃证据直到放得下。
+    try:
+        inputs = _bounded_node_inputs([], clusters, catalog)
+        meta["strategy"] = "evidence_only"
+        return inputs[0], inputs[1], inputs[2], meta
+    except Exception:
+        meta["strategy"] = "empty"
+        return [], [], [], meta
 
 
 def analyze_folder(
@@ -980,7 +1190,12 @@ def analyze_folder(
     # 对虚拟节点来说，可以传主题名称。
     # =========================================================
     file_summaries = context.get("file_summaries") or []
-    prompt_summaries, prompt_clusters, prompt_catalog = _bounded_node_inputs(file_summaries, clusters, catalog)
+    prompt_summaries, prompt_clusters, prompt_catalog, summary_batching = _node_summary_inputs(
+        llm,
+        file_summaries,
+        clusters,
+        catalog
+    )
     prompt = """请对分析节点“{path}”做正式节点摘要。节点摘要必须先综合该节点下每个文件已经生成的文件摘要，再用证据目录校验关键结论；不能只根据文件名、文件类型或少量片段猜测。
 
 真实统计：文件 {files} 个，子目录 {dirs} 个，总大小 {size}，类型 {types}。
@@ -1057,12 +1272,19 @@ def analyze_folder(
 
             # The evidence-backed object can exceed the generic structured cap.
             # Permit enough output room for a complete vLLM JSON object.
-            max_tokens=650,
+            # 2026-09-15 实测：650 会把节点摘要截断在字符串中间
+            # （finish_reason=length、completion=650），触发 chat_json 的结构化
+            # 重试并让 max_tokens 翻倍重跑；27 个节点里 62.5% 命中。重试后真正
+            # 需要的长度是 619~989 token。1100 覆盖实测最大值并留 11% 余量；
+            # vLLM 命中 stop 即停，所以更大的上限本身不额外增加耗时。
+            max_tokens=1100,
             long_output=True,
 
             strict=True,
 
-            retries=0,
+            # 节点摘要失败会直接退化为本地兜底（完全没有模型摘要），
+            # 因此对可重试的瞬时错误给一次重试机会。
+            retries=1,
 
             timeout=120,
 
@@ -1106,6 +1328,7 @@ def analyze_folder(
         summary["file_summary_count"] = context.get("file_summary_count", len(file_summaries))
         summary["file_summaries_complete"] = bool(context.get("file_summaries_complete", False))
         summary["deep_file_summaries_complete"] = bool(context.get("deep_file_summaries_complete", False))
+        summary["node_summary_batching"] = summary_batching
 
         return (
             summary,

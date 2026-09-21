@@ -1424,10 +1424,14 @@ def _group_similar(documents, exact_groups, max_distance=8):
                 checked.add(pair)
                 ratio = min(sizes[left], sizes[right]) / float(max(sizes[left], sizes[right]))
                 containment = 0.0
-                if ratio < 0.55:
+                # 2026-09-15：先算 hamming（O(1)）。hamming > max_distance+6 时
+                # _feature_containment 的结果不进任何判定条件，跳过它。
+                # 实测输出逐字相同，该函数耗时 597.8s -> 32.2s（18.5x）。
+                hamming_value = _hamming(fingerprints[left], fingerprints[right])
+                if ratio < 0.55 and hamming_value <= max_distance + 6:
                     containment = _feature_containment(texts[left], texts[right])
                 distance_limit = max_distance + 6 if containment >= 0.80 else max_distance
-                if (ratio >= 0.55 or containment >= 0.80) and _hamming(fingerprints[left], fingerprints[right]) <= distance_limit:
+                if (ratio >= 0.55 or containment >= 0.80) and hamming_value <= distance_limit:
                     union.union(left, right)
     groups = defaultdict(list)
     for path in fingerprints:
@@ -1791,6 +1795,10 @@ def _file_summary(path, document):
     duplicate = document.get("deduplication") or {}
     if duplicate.get("role") == "duplicate_alias":
         summary += "该文件是 {} 的字节级重复副本，不重复参与主题与价值计算。".format(duplicate.get("canonical_path"))
+    # 供初步摘要调度判定"零信息文件"用的机器可读字段。
+    # 解析失败或完全没有正文/证据的文件送进模型只会拿到元数据，
+    # 模型只能产空话或编造，因此这类文件直接用本地摘要。
+    body_text = str(_analysis_text(document) or "").strip()
     return {
         "schema_version": 4,
         "summary_type": "file",
@@ -1807,6 +1815,9 @@ def _file_summary(path, document):
         "deduplication": duplicate,
         "representative_documents": [path],
         "evidence_chain": evidence,
+        "parser_name": str((document.get("parser") or {}).get("name") or ""),
+        "body_text_chars": len(body_text),
+        "eligible_evidence_count": len(evidence),
         "generated_by": "local-unified-parser",
         "analysis_depth": "preview",
         "deep_analysis": False,
@@ -2073,6 +2084,7 @@ def _enrich_analysis_tree(tree, documents):
             member_paths,
             topics=[topic_name] + list(topic_node.get("related_topics", [])),
             max_items=8,
+            use_embeddings=False,
         )
         topic_node.update(_evidence_diversity_metrics(topic_node["evidence_chain"]))
 
@@ -2086,6 +2098,7 @@ def _enrich_analysis_tree(tree, documents):
                 paths,
                 topics=[topic_name, subtopic_name] + partition["topics"],
                 max_items=5,
+                use_embeddings=False,
             )
             confidence = "高" if len(paths) >= 3 else "中" if len(paths) >= 2 else "低"
             analysis_question = "“{}”主题中的“{}”具体讨论了什么，现有资料能够形成哪些可回查判断？".format(
@@ -2159,6 +2172,7 @@ def _enrich_analysis_tree(tree, documents):
                     [path],
                     topics=[topic_name, subtopic_name] + _content_topics(document, 5),
                     max_items=3,
+                    use_embeddings=False,
                 )
                 file_node["children"] = [
                     {
@@ -3536,14 +3550,32 @@ def _valid_semantic_name(value):
     return name.replace("/", "与").replace("|", "与")
 
 
+# 单批命名多少个语义簇。
+#
+# 实测（服务器 qwen3.6:27b, 32768 上下文）：
+#   10 个簇一次命名 -> 输入 16,215 tok / 输出 1,093 tok / 40.8s      正常
+#   17 个簇一次命名 -> 输入 27,450 tok / 输出 1,800 tok 撞上上限      被截断
+#   32 个簇一次命名 -> 输入约 47,000 tok                              超出上下文
+#
+# 输出撞上 max_tokens 时 finish_reason=length，JSON 不完整，整批命名失败并
+# 静默退化为本地兜底名称（用户看到的是"数字文件名"式目录）。因此超过本阈值
+# 时改为分批命名，每批的输入与输出都留有余量。
+SEMANTIC_NAMING_BATCH_CLUSTERS = 8
+
+
 def _name_semantic_clusters(
     clusters,
     documents,
     llm=None,
     cached_names=None,
+    reserved_names=None,
+    batch_label=None,
 ):
     """
-    Name all semantic clusters in one bounded model call.
+    Name semantic clusters in bounded model calls.
+
+    未命名的簇不超过 ``SEMANTIC_NAMING_BATCH_CLUSTERS`` 时保持原有单次调用
+    行为不变；超过时交给 ``_name_semantic_clusters_batched`` 分批处理。
     """
     if not clusters:
         return clusters, None
@@ -3580,6 +3612,19 @@ def _name_semantic_clusters(
 
     if llm is None or all(cluster.get("naming_status") == "enhanced" for cluster in clusters):
         return clusters, None
+
+    pending_count = len([
+        cluster for cluster in clusters
+        if cluster.get("naming_status") != "enhanced"
+    ])
+    if pending_count > SEMANTIC_NAMING_BATCH_CLUSTERS:
+        return _name_semantic_clusters_batched(
+            clusters,
+            documents,
+            llm,
+            cached_names=cached_names,
+            reserved_names=reserved_names,
+        )
 
     lines = []
 
@@ -3640,6 +3685,24 @@ def _name_semantic_clusters(
 
             lines.append(line)
 
+    # 分批命名时把"已分配给其它批次的名称"一并给出，避免跨批次撞名。
+    # 两个变量都为空时，下方模板渲染结果与改动前逐字节一致。
+    scope_line = ""
+    if batch_label:
+        scope_line = (
+            "8. 本批只是整个目录的一部分（{}），"
+            "只为本批列出的 cluster_id 命名，不要输出其它簇。\n"
+        ).format(batch_label)
+
+    reserved_block = ""
+    if reserved_names:
+        reserved_block = (
+            "已经分配给其它批次的主题名称（不要重复使用；"
+            "只有当两组内容确实指向不同主题时才可使用相近名称）：\n"
+            + "\n".join("- {}".format(str(name)) for name in reserved_names[:100])
+            + "\n\n"
+        )
+
     prompt = """你正在为一个完全未知的数据包自动生成分析目录。
 下面每个语义簇已经由本地 embedding 根据文档内容自动聚类。
 每个簇提供若干代表文档的文件名、可用标题以及真实正文片段。
@@ -3655,8 +3718,8 @@ def _name_semantic_clusters(
 5. summary 用一句话说明这一组主要研究什么。
 6. keywords 给出 3-6 个主题关键词。
 7. 必须保持 cluster_id 不变。
-
-语义簇：
+{scope_line}
+{reserved_block}语义簇：
 {}
 
 输出 JSON：
@@ -3670,7 +3733,9 @@ def _name_semantic_clusters(
     }}
   ]
 }}""".format(
-        "\n".join(lines)
+        "\n".join(lines),
+        scope_line=scope_line,
+        reserved_block=reserved_block,
     )
 
     try:
@@ -3679,7 +3744,7 @@ def _name_semantic_clusters(
             prompt,
             max_tokens=1800,
             strict=True,
-            retries=0,
+            retries=1,
             timeout=180,
             required_fields=("clusters",),
             output_context="主题聚类命名",
@@ -3747,6 +3812,75 @@ def _name_semantic_clusters(
         for cluster in clusters:
             cluster["naming_degradation_reason"] = "模型命名失败：{}".format(str(exc)[:180])
         return clusters, None
+
+
+def _name_semantic_clusters_batched(
+    clusters,
+    documents,
+    llm,
+    cached_names=None,
+    reserved_names=None,
+):
+    """分批命名语义簇；每批复用单批命名逻辑，并把已确定的名称传给后续批次。
+
+    这样既避免了单次请求的输入/输出超限，又通过"已用名称"提示保持了跨批次
+    的目录一致性。单个批次失败只影响该批次（保留其本地回退名称），
+    不会让整个目录失去语义命名。
+    """
+    pending = [
+        cluster for cluster in clusters
+        if cluster.get("naming_status") != "enhanced"
+    ]
+    reserved = [
+        str(name) for name in (reserved_names or []) if str(name or "").strip()
+    ]
+    for cluster in clusters:
+        if cluster.get("naming_status") == "enhanced":
+            name = str(cluster.get("name") or "").strip()
+            if name:
+                reserved.append(name)
+
+    size = max(1, int(SEMANTIC_NAMING_BATCH_CLUSTERS))
+    batches = [
+        pending[index:index + size]
+        for index in range(0, len(pending), size)
+    ]
+
+    results = []
+    for index, batch in enumerate(batches):
+        try:
+            batch, result = _name_semantic_clusters(
+                batch,
+                documents,
+                llm=llm,
+                cached_names=cached_names,
+                reserved_names=list(reserved),
+                batch_label="第 {}/{} 批".format(index + 1, len(batches)),
+            )
+        except Exception as exc:
+            # 批次隔离：该批退化为本地回退名称，其它批次继续。
+            for cluster in batch:
+                cluster["naming_degradation_reason"] = "模型命名失败：{}".format(str(exc)[:180])
+            continue
+        if result:
+            results.append(result)
+        for cluster in batch:
+            if cluster.get("naming_status") == "enhanced":
+                name = str(cluster.get("name") or "").strip()
+                if name:
+                    reserved.append(name)
+
+    # 分批后可能跨批次撞名；沿用原有 used_names 规则补序号后缀。
+    used = Counter()
+    for cluster in clusters:
+        name = str(cluster.get("name") or "").strip()
+        if not name:
+            continue
+        used[name] += 1
+        if used[name] > 1 and cluster.get("naming_status") == "enhanced":
+            cluster["name"] = "{}（{}）".format(name, used[name])
+
+    return clusters, (results[-1] if results else None)
 
 
 def _name_lexical_topic_nodes(tree, documents, llm=None):
@@ -5230,7 +5364,14 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 translation_pipeline and translation_pipeline.abort()
                 raise
 
-    failed_paths = {item.get("path") for item in failures}
+    # 2026-09-15：只有真正的解析异常才进"解析失败"分支。
+    # 正文覆盖不完整（needs_attention，例如超过单文档字符上限被截断）的文件
+    # 已经正常解析、参与了主题聚类，把它们列成"解析失败（需重试）"既不真实，
+    # 又与 file_analysis_states 的 retryable=False 矛盾，还造成同一文件重复展示。
+    failed_paths = {
+        item.get("path") for item in failures
+        if not item.get("needs_attention")
+    }
     workflow_after_parse = {
         item.get("node_path"): item
         for item in storage.iter_file_workflow_states(scan_id)

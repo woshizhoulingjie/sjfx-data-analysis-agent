@@ -1,0 +1,11 @@
+/* 文件阅读窗口放大（桌面端）。
+
+   原规则在 style.css： .file-reader-panel{ width:min(960px,100%) }
+   这里放宽到 min(1440px, 96%)，便于阅读长文档与摘要。
+
+   安全性：全项目没有任何 JS 读取该弹窗的尺寸（app.js 完全不引用它，
+   engineering-v2.js 只用 dataset.path 与 hidden），所以纯尺寸改动
+   不影响任何功能。窄屏（<=760px）另有 precision-ui.css 的
+   width:calc(100% - 20px)!important 兜底，本规则不会影响它。 */
+
+.file-reader-panel { width: min(1440px, 96%); }

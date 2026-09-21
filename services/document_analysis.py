@@ -384,7 +384,8 @@ def _preview_claim_contract(summary, evidence_items):
             if not text or text.casefold() in seen:
                 continue
             seen.add(text.casefold())
-            supports = select_evidence(evidence_items, topics=[text], max_items=2, per_source=2, max_chars=360)
+            # 2026-09-15：同上，初步/预览阶段的 claim 证据挂载改为词法（覆盖 7 条预览路径）。
+            supports = select_evidence(evidence_items, topics=[text], max_items=2, per_source=2, max_chars=360, use_embeddings=False)
             record = {
                 "conclusion_id": "PREVIEW-%03d" % (len(formal) + len(arguments) + 1),
                 "type": claim_type,
@@ -451,7 +452,9 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
     result = llm.chat_json(
         "你是严谨的文献预读助手。只根据代表性内容提炼候选摘要和论点，不得冒充全文校验结论。" + CHINESE_CONCLUSION_RULE,
         prompt,
-        max_tokens=600,
+        # The observed 600-token response was truncated; use the successful
+        # retry budget on the first request.
+        max_tokens=1200,
         long_output=False,
         strict=True,
         retries=0,
@@ -488,7 +491,7 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
             "coverage": unified_document.get("coverage") or {},
             "local_model": result.get("model"),
             "usage": result.get("usage") or {},
-            "model_calls": [_model_call_profile("candidate_preview", result, 640, context_window_tokens, 1)],
+            "model_calls": [_model_call_profile("candidate_preview", result, 1200, context_window_tokens, 1)],
             "degraded": False,
         },
         "generated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
@@ -536,7 +539,9 @@ methodology、conclusions、uncertainties、warnings 必须使用简体中文；
     result = llm.chat_json(
         "你是严谨的文献预读助手。一次处理多个文件，每个文件独立返回结果。" + CHINESE_CONCLUSION_RULE,
         prompt,
-        max_tokens=max(per_file_tokens, min(1600, per_file_tokens * len(rows))),
+        # The representative batch previously hit ``length`` at 480 tokens;
+        # issue the proven 960-token retry budget immediately.
+        max_tokens=960,
         # A multi-file object needs its per-file output budget; the ordinary
         # structured cap is sized for one compact object and caused truncation.
         long_output=True,

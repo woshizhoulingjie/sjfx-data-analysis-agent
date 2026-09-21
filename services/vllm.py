@@ -8,6 +8,8 @@ so the analysis services do not depend on a particular serving backend.
 from __future__ import annotations
 
 import json
+import os
+import re
 import urllib.error
 import urllib.request
 
@@ -26,6 +28,7 @@ class VLLMClient(LocalModelClient):
     def __init__(self, base_url, model, timeout=600, max_concurrency=1, api_key=None):
         super().__init__(base_url, model, timeout=timeout, max_concurrency=max_concurrency)
         self.api_key = str(api_key or "").strip()
+        self._trace_metadata_cache = None
 
     @property
     def privacy_label(self):
@@ -69,6 +72,52 @@ class VLLMClient(LocalModelClient):
                 "error": str(exc),
             }
 
+    def _trace_metadata(self):
+        from services.llm_trace import build_manifest_metadata
+
+        if self._trace_metadata_cache is not None:
+            return self._trace_metadata_cache
+        root_url = self.base_url.rstrip("/")
+        if root_url.endswith("/v1"):
+            root_url = root_url[:-3]
+        model_root = None
+        version = None
+        try:
+            request = urllib.request.Request(
+                self.base_url.rstrip("/") + "/models",
+                headers=self._headers(), method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                models = json.loads(response.read().decode("utf-8"))
+            selected = next(
+                (item for item in models.get("data", []) if item.get("id") == self.model),
+                {},
+            )
+            model_root = selected.get("root")
+            request = urllib.request.Request(root_url + "/version", method="GET")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                version = json.loads(response.read().decode("utf-8")).get("version")
+        except Exception:
+            pass
+        self._trace_metadata_cache = build_manifest_metadata(
+            self.model, model_root, version
+        )
+        return self._trace_metadata_cache
+
+    def _prefix_cache_hits_total(self):
+        root_url = self.base_url.rstrip("/")
+        if root_url.endswith("/v1"):
+            root_url = root_url[:-3]
+        request = urllib.request.Request(root_url + "/metrics", method="GET")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            text = response.read().decode("utf-8", errors="replace")
+        match = re.search(
+            r'^vllm:prefix_cache_hits_total\{[^\n]*\}\s+([0-9.eE+-]+)\s*$',
+            text,
+            flags=re.MULTILINE,
+        )
+        return float(match.group(1)) if match else None
+
     @serialized_generation
     def chat(self, system_prompt, user_prompt, temperature=0.2, max_tokens=1800,
              retries=2, timeout=None, response_format=None):
@@ -86,6 +135,15 @@ class VLLMClient(LocalModelClient):
             # thinking trace instead of returning its final answer.
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        if os.getenv("SJFX_BENCHMARK_DETERMINISTIC", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            payload.update({"temperature": 0, "top_p": 1.0, "seed": 42})
+        from services.llm_trace import get_recorder
+        recorder = get_recorder()
+        if recorder is not None:
+            payload.update({"return_token_ids": True, "return_prompt_text": True})
+            recorder.ensure_manifest(self._trace_metadata())
         if response_format:
             payload["response_format"] = response_format
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -98,18 +156,42 @@ class VLLMClient(LocalModelClient):
         effective_timeout = max(1, int(timeout if timeout is not None else self.timeout))
         attempts = LocalModelClient._retry_limit(retries) + 1
         data = None
+        completed_trace = None
         # This deployment intentionally allows one generation at a time on a
         # 24 GB GPU. Do not let an interactive request wait behind a long
         # package-analysis generation forever; return a clear retryable error.
-        queue_wait = min(15, effective_timeout)
+        benchmark_mode = os.getenv("SJFX_BENCHMARK_DETERMINISTIC", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        queue_wait = effective_timeout if benchmark_mode else min(15, effective_timeout)
         for attempt in range(attempts):
+            trace_state = None
+            raw_response = None
+            cache_hits_before = None
             try:
                 acquired = self._semaphore.acquire(timeout=queue_wait)
                 if not acquired:
                     raise LocalModelError("vLLM is busy with another generation; please retry shortly")
                 try:
+                    if recorder is not None:
+                        cache_hits_before = self._prefix_cache_hits_total()
+                        trace_state = recorder.begin(payload, system_prompt)
                     with urllib.request.urlopen(request, timeout=effective_timeout) as response:
-                        data = json.loads(response.read().decode("utf-8"))
+                        raw_response = response.read().decode("utf-8")
+                        data = json.loads(raw_response)
+                    if recorder is not None:
+                        cache_hits_after = self._prefix_cache_hits_total()
+                        cache_delta = (
+                            max(0, int(round(cache_hits_after - cache_hits_before)))
+                            if cache_hits_before is not None and cache_hits_after is not None
+                            else None
+                        )
+                        completed_trace = (
+                            trace_state, raw_response, cache_delta,
+                            "vllm:prefix_cache_hits_total_delta"
+                            if cache_delta is not None else None,
+                        )
+                        trace_state = None
                 finally:
                     self._semaphore.release()
                 break
@@ -117,12 +199,30 @@ class VLLMClient(LocalModelClient):
                 detail = exc.read().decode("utf-8", errors="replace")
                 message = "vLLM HTTP {}: {}".format(exc.code, detail[:500])
                 if not LocalModelClient._retryable_http(exc.code) or attempt + 1 >= attempts:
+                    if recorder is not None and trace_state is not None:
+                        recorder.finish(trace_state, response_raw=detail, error=message)
                     raise LocalModelError(message) from exc
+                if recorder is not None and trace_state is not None:
+                    recorder.abandon(trace_state)
             except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
                 message = "本机 vLLM 调用失败：{}".format(exc)
                 if attempt + 1 >= attempts:
+                    if recorder is not None and trace_state is not None:
+                        recorder.finish(trace_state, error=message)
                     raise LocalModelError(message) from exc
+                if recorder is not None and trace_state is not None:
+                    recorder.abandon(trace_state)
             LocalModelClient._backoff(attempt)
+
+        if recorder is not None and completed_trace is not None:
+            trace_state, raw_response, cache_delta, cache_source = completed_trace
+            recorder.finish(
+                trace_state,
+                response=data,
+                response_raw=raw_response,
+                source_cached_tokens=cache_delta,
+                source_cached_tokens_source=cache_source,
+            )
 
         choices = (data or {}).get("choices") or []
         message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
