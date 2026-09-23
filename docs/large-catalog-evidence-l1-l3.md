@@ -661,17 +661,19 @@ R2 每子组 ≥3 且 ≥10% | 0% ✓ | **0%** ✗（小组全被拦） | +6% |
 | # | 改动 | 关键点 |
 |---|---|---|
 **a** | 命名调用新增结构化字段 `purity`（same/mixed/unsure）+ `subtopics`（子主题名 + 成员编号）；`VERSION` 7→8 | 用**结构化字段**而不是关键词匹配——后者才是"只针对一个包"的写法。升 VERSION 是必须的：digest 含 VERSION 而不含提示词文本，不升则旧缓存继续命中旧问法 |
-**b** | `split_into_subtopics()`：按子主题建真实分组，**复用模型给的名字**（零额外调用），needs_review=1 | 尺寸感知守卫 + 预算 `lp_leaf_splits` + 待归并桶兜底 + 接受/拒绝原因日志；受 `SJFX_LP_LEAF_SPLIT_NAMED` 控制（回滚开关） |
+**b** | `split_into_subtopics()`：按子主题建真实分组，**复用模型给的名字**（零额外调用），needs_review=1 | 尺寸感知守卫 + 预算 `lp_leaf_splits` + 待归并桶兜底 + 接受/拒绝原因日志；子主题拆分受 **`SJFX_LP_LEAF_SPLIT_SUBTOPICS=0`** 控制（回滚开关，默认开）。**注意**：`SJFX_LP_LEAF_SPLIT_NAMED` 只管"异类是否单独成组"，关不掉子主题拆分——本文档早期版本把两者写混了 |
 **c** | `merge_identical_names()`：**同名叶子确定性合并**（零模型调用，排除诊断状态名，受 `effective_group_max` 约束）；合并候选去掉 `needs_review=0`；早退改为**留痕** | 同名是"同一主题"最强的证据，不该等模型判 |
 **d** | 「证据不足」放宽：引用证据短**不再丢掉模型给的名字**，只标 needs_review + `naming_status='thin_evidence'`；只有引用证据一个字都没有时才退化成状态名 | |
 
-**已上线参数**：`SJFX_LP_LEAF_SPLIT_NAMED=1`（重启脚本，备份 `.codex-backups/named-split-on-*/`）。
+**已上线参数**：`SJFX_LP_LEAF_SPLIT_SUBTOPICS` 默认即为开（无需写进重启脚本）；
+`SJFX_LP_LEAF_SPLIT_NAMED` 默认 0 ＝ "异类不成组"，与第③项的取向一致。
 
 **测试**：`test_catalog_evidence_quality.py` 116 条通过（新增 15 条：purity 解析 5 条、尺寸守卫 4 条、
 同名合并 2 条、子主题拆分 3 条、thin_evidence 2 条，并改写了原有的"证据不足"契约）；
 相关套件 229 通过；全量 **807 通过 / 8 失败**（8 个失败＝7 个既有 + 1 个外部改动引入，无新增）。
 
-**回滚**：删掉重启脚本里的 `SJFX_LP_LEAF_SPLIT_NAMED=1` 一行 + 从 `.codex-backups/topic-integrity-20260920-152122/`
+**回滚**：在重启脚本里加 `SJFX_LP_LEAF_SPLIT_SUBTOPICS=0`（子主题不再拆，异类仍走待归并桶）
++ 从 `.codex-backups/topic-integrity-20260920-152122/`
 恢复 `large_package_catalog_naming.py` / `large_package_catalog_merge.py`（含 SHA256SUMS）。
 
 **范围**：只管以后新跑的包，不做历史回填/迁移（用户明确要求）。

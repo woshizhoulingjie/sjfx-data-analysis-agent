@@ -51,10 +51,11 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertIn("parse_scratch_insufficient", plan["blockers"])
         self.assertEqual(plan["mandatory_hash_read_bytes"], 100 * 1024 ** 3)
 
-    def test_large_package_default_is_resumable_500_file_full_queue(self):
+    def test_large_directory_default_is_resumable_without_deep_backfill(self):
         policy = build_policy({"file_count": 3000, "total_size": 1})
         self.assertTrue(policy["enabled"])
-        self.assertTrue(policy["full_inventory_processing"])
+        self.assertFalse(policy["full_inventory_processing"])
+        self.assertFalse(policy["background_backfill"])
         self.assertEqual(policy["batch_files"], 500)
         self.assertEqual(policy["batch_completion"], "continue_until_inventory_exhausted")
         self.assertEqual(policy["batch_checkpoint_scope"], "per_file")
@@ -210,6 +211,42 @@ class AnalysisContractTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertGreater(candidates[0]["score"], 0)
         self.assertEqual(candidates[0]["evidence_ids"], ["E1"])
+
+    def test_evidence_rich_small_topic_outranks_high_volume_weak_topic(self):
+        big_paths = ["bulk/doc{}.pdf".format(i) for i in range(90)]
+        small_paths = ["focus/source{}.pdf".format(i) for i in range(3)]
+        small_evidence = [{
+            "evidence_id": "E-small-{}".format(i),
+            "source_path": path,
+            "source_sha256": "sha-small-{}".format(i),
+            "label": "paragraph",
+            "text": "独立来源记录新型病原体变异突增与高危传播，报告检测结果、比较对照组，"
+                    "并讨论监测方法和应对措施。",
+        } for i, path in enumerate(small_paths)]
+        analysis = {
+            "statistics": {"parsed_files": 100},
+            "coverage": {"parsed_file_ratio": 1.0},
+            "research_topic_clusters": [
+                {"topic": "综合资料目录概览", "members": big_paths,
+                 "mean_similarity": 0.9,
+                 "evidence_chain": [{
+                     "evidence_id": "E-bulk", "source_path": big_paths[0],
+                     "label": "paragraph",
+                     "text": "大量文件目录汇编列出多类资料，但没有可复核的共同发现。",
+                 }]},
+                {"topic": "病原体变异突增与高危传播监测", "members": small_paths,
+                 "mean_similarity": 0.9, "evidence_chain": small_evidence},
+            ],
+            "document_index": [{
+                "source": {"path": path, "extension": ".pdf",
+                           "modified_at": "2026-09-20T10:00:00+00:00"},
+                "classification": {"topic_memberships": ["病原体变异突增", "高危传播检测"]},
+                "structure": {"headings": ["病原体监测与异常突增"]},
+            } for path in small_paths],
+        }
+        candidates = _direction_candidates({}, analysis)
+        assert candidates[0]["title"] == "病原体变异突增与高危传播监测"
+        assert candidates[0]["independent_source_count"] == 3
 
     def test_direction_candidates_use_official_tree_evidence(self):
         evidence = {

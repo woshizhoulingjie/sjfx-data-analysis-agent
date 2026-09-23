@@ -225,6 +225,17 @@ def _score01(value, default=0.0):
         return default
 
 
+def _direction_topic_terms(value):
+    """Compact topic-name features for cross-topic distinctiveness scoring."""
+    text = str(value or "").lower()
+    terms = set(re.findall(r"[a-z][a-z0-9-]{2,}", text))
+    for run in re.findall(r"[\u4e00-\u9fff]+", text):
+        for size in (2, 3, 4):
+            terms.update(run[index:index + size]
+                         for index in range(max(0, len(run) - size + 1)))
+    return terms
+
+
 def _analysis_tree_direction_clusters(analysis):
     """Project official top-level analysis nodes into recommendation candidates.
 
@@ -279,6 +290,13 @@ def _direction_candidates(scan, analysis, limit=5):
         ((analysis.get("value_judgment") or {}).get("task_relevance") or {}).get("score"),
         0.5,
     )
+    topic_terms_by_index = [
+        _direction_topic_terms(cluster.get("topic") or cluster.get("name"))
+        for cluster in clusters
+    ]
+    topic_term_frequency = Counter(
+        term for terms in topic_terms_by_index for term in terms
+    )
     technical_terms = {
         "漏洞", "攻击", "恶意", "威胁", "利用", "检测", "响应", "溯源", "认证", "加密",
         "vulnerability", "exploit", "attack", "malware", "threat", "detection", "cve", "cvss",
@@ -332,8 +350,16 @@ def _direction_candidates(scan, analysis, limit=5):
             newest = newest.replace(tzinfo=timezone.utc)
         age_days = max(0, (datetime.now(timezone.utc) - newest).days) if newest else None
 
+        topic_terms = _direction_topic_terms(topic)
+        unique_topic_terms = sum(
+            1 for term in topic_terms if topic_term_frequency.get(term, 0) == 1
+        )
+        topical_distinctiveness = (
+            unique_topic_terms / float(len(topic_terms)) if topic_terms else 0.5
+        )
         dimensions = {
             "scale": min(1.0, math.log1p(len(members)) / math.log1p(max(2, parsed))),
+            "topical_distinctiveness": topical_distinctiveness,
             "concentration": _score01(
                 cluster.get("mean_similarity"),
                 _score01(cluster.get("classification_confidence"), min(1.0, len(members) / float(parsed))),
@@ -348,10 +374,14 @@ def _direction_candidates(scan, analysis, limit=5):
             "user_relevance": task_relevance,
         }
         weights = {
-            "scale": 0.12, "concentration": 0.10, "information_richness": 0.15,
-            "independent_sources": 0.12, "recency": 0.08, "anomaly_signal": 0.08,
-            "technical_impact": 0.12, "reportability": 0.10, "novelty": 0.07,
-            "user_relevance": 0.06,
+            # File volume has a deliberately small, logarithmic contribution.
+            # Evidence diversity, cross-topic specificity and actionable signals
+            # determine the recommendation more strongly than category size.
+            "scale": 0.08, "topical_distinctiveness": 0.04,
+            "concentration": 0.10, "information_richness": 0.14,
+            "independent_sources": 0.14, "recency": 0.07,
+            "anomaly_signal": 0.08, "technical_impact": 0.11,
+            "reportability": 0.11, "novelty": 0.10, "user_relevance": 0.03,
         }
         score = round(100 * sum(dimensions[key] * weight for key, weight in weights.items()), 1)
         if score >= 70 and evidence_count >= 3 and independent_sources >= 2:
@@ -360,7 +390,11 @@ def _direction_candidates(scan, analysis, limit=5):
             priority = "中"
         else:
             priority = "低"
-        confidence_score = min(1.0, 0.45 * dimensions["information_richness"] + 0.35 * dimensions["independent_sources"] + 0.20 * _score01(coverage.get("parsed_file_ratio")))
+        confidence_score = min(1.0,
+            0.40 * dimensions["information_richness"]
+            + 0.35 * dimensions["independent_sources"]
+            + 0.15 * dimensions["topical_distinctiveness"]
+            + 0.10 * _score01(coverage.get("parsed_file_ratio")))
         confidence = "高" if confidence_score >= 0.78 else ("中" if confidence_score >= 0.42 else "低")
         limitations = list(coverage.get("limitations") or [])
         if not evidence:
@@ -387,7 +421,7 @@ def _direction_candidates(scan, analysis, limit=5):
                 "newest_source_modified_at": newest.isoformat() if newest else None,
                 "recency_basis": "源文件修改时间，仅作时效代理，不等同于资料形成时间",
             },
-            "rationale": "该方向包含 {} 个已解析成员、{} 条合格证据和 {} 个独立来源；综合规模、集中度、丰富度、时效、异常、技术影响、可成稿性、新颖性与任务相关性后得分 {:.1f}。".format(len(members), evidence_count, independent_sources, score),
+            "rationale": "该方向包含 {} 个已解析成员、{} 条合格证据和 {} 个独立来源；评分降低文件数量的影响，并综合证据丰富度、跨主题独特性、时效、异常、技术影响、可成稿性与新颖性，得分 {:.1f}。".format(len(members), evidence_count, independent_sources, score),
             "basis": "优先级由十维可解释评分计算；所有正文判断均回链到证据，时效仅以源文件修改时间为代理。",
             "research_questions": [
                 "围绕“{}”，不同资料对{}给出了哪些一致结论、差异和适用条件？".format(topic, focus),
@@ -484,8 +518,8 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
 2. “推荐研究方向”和“深入方向”都是推论，必须列出支撑它的 evidence_ids。证据不足时明确写出不足，不得强行给高置信度。
 3. 优先发现资料之间的共同主题、分歧、版本关系、证据缺口、可验证问题及合适的研究方法。
 4. 本地分类是确定性结构，不能重写或新增分类。
-5. 推荐方向必须使用本地十维评分候选的第 1 名；你只能改善理由、研究问题和方法，不能改名、换序或另造方向。
-6. 覆盖本地类别中的主流主题和可见的小众主题；主动核对跨来源、跨时间的矛盾、证据缺口及未解析范围，证据不足时明确写出，不能只围绕最早出现的主题或文件作概括。
+5. 推荐方向只能从本地评分候选中选择，候选分数和次序是参考；你可以根据证据的独立来源、跨主题独特性、影响、时效、矛盾与证据缺口重新排序，不得另造主题。
+6. 文件数量只说明材料规模，不等于研究价值。综合比较主要主题与有依据的小众主题，核对跨来源和跨时间的相互印证、分歧与未解析范围；不因某类文件最多就自动优先。
 
 输出一个合法 JSON 对象：
 {{
@@ -511,7 +545,7 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
 
 扫描统计：{scan}
 本地内容分类：{categories}
-本地十维评分候选（排序不可更改）：{candidates}
+本地评分候选（分数是透明参考，可按证据质量重新排序）：{candidates}
 已有节点摘要：{summaries}
 证据目录：{evidence}""".format(
         scan=json.dumps({
@@ -1020,22 +1054,31 @@ def merge_model_report(local_report, model_report, evidence_catalog=None):
     fallback_evidence = local_primary.get("evidence_chain", [])
     recommendation = model_report.get("recommended_research_direction")
     if isinstance(recommendation, dict) and recommendation.get("title"):
-        # The local model may improve language and questions, but it must not erase
-        # locally generated traceability or the inference label.
+        # Let synthesis choose among locally grounded candidates, while keeping
+        # each candidate's scope and evidence boundary fixed.
         recommendation = dict(recommendation)
         recommendation["model_proposed_title"] = recommendation.get("title")
-        # Ranking and scope are deterministic. The model may improve wording
-        # and questions, but cannot replace the top-ranked local candidate.
-        recommendation["title"] = local_primary.get("title") or recommendation.get("title")
-        for key in ("direction", "rank", "score", "score_breakdown", "priority", "confidence_score", "representative_documents"):
-            if key in local_primary:
-                recommendation[key] = local_primary[key]
+        local_candidates = list(local_report.get("direction_candidates") or [])
+        chosen = next((item for item in local_candidates
+                       if str(item.get("title") or "").strip()
+                       == str(recommendation.get("title") or "").strip()), None)
+        if chosen is None:
+            chosen = local_primary
+        chosen = dict(chosen or {})
+        recommendation["title"] = chosen.get("title") or local_primary.get("title") or recommendation.get("title")
+        for key in ("direction", "rank", "score", "score_breakdown", "priority",
+                    "confidence_score", "representative_documents"):
+            if key in chosen:
+                recommendation[key] = chosen[key]
         recommendation["type"] = "推论"
         selected_ids = [str(value) for value in recommendation.get("evidence_ids", [])]
+        allowed_ids = {str(value) for value in chosen.get("evidence_ids", []) if value}
+        selected_ids = [value for value in selected_ids if value in allowed_ids]
+        recommendation.pop("evidence_ids", None)
         recommendation["evidence_chain"] = _model_evidence_chain(
             evidence_catalog,
-            recommendation.pop("evidence_ids", []),
-            fallback_evidence,
+            selected_ids,
+            chosen.get("evidence_chain") or fallback_evidence,
             claim=recommendation.get("rationale") or recommendation.get("title"),
         )
         recommendation["supports_evidence_ids"] = [

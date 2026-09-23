@@ -6,6 +6,7 @@ import itertools
 import json
 import sqlite3
 import time
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from services import large_package_catalog as catalog
 from services import large_package_semantic as semantic
 from services import large_package_catalog_naming as naming
 from services import large_package_catalog_profile as profile
+from services import large_package_evidence_store as feature_store
 
 
 class StripMarkupTests(unittest.TestCase):
@@ -69,7 +71,8 @@ class ValidateStatusTests(unittest.TestCase):
 
     def _validate(self, name, ids=('E1', 'E2'), evidence=None):
         body = {'name': name, 'description': '共同范围说明文字，用于通过长度校验。',
-                'evidence_ids': list(ids), 'outliers': [], 'needs_review': False}
+                'evidence_ids': list(ids), 'outliers': [], 'needs_review': False,
+                'purity': 'same'}
         return naming.validate(json.dumps(body, ensure_ascii=False),
                                {'evidence': evidence if evidence is not None else self.EVIDENCE})
 
@@ -250,26 +253,40 @@ class _FakeConn(object):
         return self._real.execute(*args, **kwargs)
 
     def close(self):
+        # Keep the single in-memory SQLite connection alive between calls.
         pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 class _FakeStore(object):
-    """最小只读替身：为 group_profiles() 与签名查询提供最小表结构。"""
+    """Minimal in-memory store with the schema used by feature extraction."""
 
     def __init__(self):
+        self.db_path = ':memory:catalog-profile-test'
+        self._lock = threading.RLock()
         self.real = sqlite3.connect(':memory:')
         self.real.row_factory = sqlite3.Row
-        self.real.execute('CREATE TABLE large_catalog_members('
-                          'package_id TEXT, group_id TEXT, path TEXT)')
-        self.real.execute('CREATE TABLE files('
-                          'package_id TEXT, path TEXT, local_summary TEXT)')
-        self.real.execute('CREATE TABLE large_catalog_groups('
-                          'package_id TEXT, id TEXT, content_revision INTEGER, '
-                          'updated_at REAL)')
+        self.real.execute('CREATE TABLE packages(id TEXT PRIMARY KEY)')
+        self.real.execute(
+            'CREATE TABLE files(package_id TEXT, path TEXT, local_summary TEXT, '
+            'deep_summary TEXT, deep_status TEXT, sensitive INTEGER, size INTEGER, '
+            'modified_at_ns INTEGER, updated_at REAL, PRIMARY KEY(package_id,path))')
+        self.real.execute(
+            'CREATE TABLE large_catalog_members(package_id TEXT, group_id TEXT, path TEXT)')
+        self.real.execute(
+            'CREATE TABLE large_catalog_groups(package_id TEXT, id TEXT, content_revision INTEGER, updated_at REAL)')
+        self.real.execute(
+            'CREATE TABLE lp_catalog_rounds(id TEXT, package_id TEXT, started REAL)')
+        self.real.execute('INSERT INTO packages VALUES(?)', ('p',))
+        feature_store.init(self.real)
+        self.real.commit()
 
     def add_group(self, group_id, revision=1, updated=0.0):
         self.real.execute('INSERT INTO large_catalog_groups VALUES(?,?,?,?)',
                           ('p', group_id, revision, updated))
+        self.real.commit()
 
     def add(self, path, evidence_text, keywords=None):
         self.real.execute('INSERT INTO large_catalog_members VALUES(?,?,?)', ('p', 'g', path))
@@ -277,15 +294,18 @@ class _FakeStore(object):
                               'portrait': {'evidence': [{'kind': 'text', 'text': evidence_text}],
                                            'headings': ['标题'], 'fields': ['字段']}},
                              ensure_ascii=False)
-        self.real.execute('INSERT INTO files VALUES(?,?,?)', ('p', path, payload))
+        self.real.execute('INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?)',
+                          ('p', path, payload, '{}', 'idle', 0, len(evidence_text), 0, time.time()))
+        self.real.commit()
 
     def _connect(self):
         return _FakeConn(self.real)
 
     def _row(self, raw):
         row = dict(raw)
-        if isinstance(row.get('local_summary'), str):
-            row['local_summary'] = json.loads(row['local_summary'])
+        for field in ('local_summary', 'deep_summary'):
+            if isinstance(row.get(field), str):
+                row[field] = json.loads(row[field])
         return row
 
 
@@ -368,7 +388,7 @@ class GroupProfileEntryTests(unittest.TestCase):
     def test_group_profile_shape_and_cache(self):
         store = _FakeStore()
         for i in range(4):
-            store.add('doc%d.txt' % i, '数据库事务隔离与并发控制要点之%d。' % i)
+            store.add('doc%d.txt' % i, '数据库事务隔离与并发控制要点之%d，系统性能测评。' % i)
         first = profile.group_profile(store, 'p', 'g', 3)
         self.assertIn('distinctive', first)
         self.assertIn('templates', first)
@@ -807,7 +827,7 @@ class HeldOutSupportTests(unittest.TestCase):
     def _validate(self, name=None, **kwargs):
         payload = json.dumps({'name': name or self.NAME,
                               'description': '这是一段足够长的内容范围说明。',
-                              'evidence_ids': ['E1']}, ensure_ascii=False)
+                              'evidence_ids': ['E1'], 'purity': 'same'}, ensure_ascii=False)
         return naming.validate(payload, self._material(**kwargs))
 
     def test_name_only_supported_by_read_evidence_is_flagged_for_review(self):
@@ -1150,10 +1170,15 @@ class TopicPurityTests(unittest.TestCase):
         return base
 
     def test_mixed_with_two_subtopics_is_parsed(self):
+        second = {'id': 'E2', 'source_path': 'b.txt',
+                  'text': '机器学习模型压缩涉及蒸馏与低比特量化部署。' * 4,
+                  'headings': []}
         out = self._validate(self._payload(
-            purity='mixed',
+            purity='mixed', evidence_ids=['E1', 'E2'],
             subtopics=[{'name': '数据库并发控制', 'members': ['E1']},
-                       {'name': '机器学习模型压缩', 'members': ['E1']}]))
+                       {'name': '机器学习模型压缩', 'members': ['E2']}]),
+            evidence=[{'id': 'E1', 'source_path': 'a.txt', 'text': self.CITED,
+                       'headings': []}, second])
         self.assertEqual(out['purity'], 'mixed')
         self.assertEqual([s['name'] for s in out['subtopics']],
                          ['数据库并发控制', '机器学习模型压缩'])
@@ -1164,10 +1189,11 @@ class TopicPurityTests(unittest.TestCase):
         self.assertEqual(out['purity'], 'unsure')
         self.assertEqual(out['subtopics'], [])
 
-    def test_missing_purity_defaults_to_same(self):
-        # 缓存里可能有旧格式结果；缺字段一律当 same（安全侧：不拆）
+    def test_missing_purity_is_unknown_and_never_splits(self):
+        # 缺失字段按未知处理；保守地不拆，并提示复核。
         out = self._validate(self._payload())
-        self.assertEqual(out['purity'], 'same')
+        self.assertEqual(out['purity'], 'unsure')
+        self.assertTrue(out['needs_review'])
         self.assertEqual(out['subtopics'], [])
 
     def test_subtopic_members_outside_evidence_are_dropped(self):

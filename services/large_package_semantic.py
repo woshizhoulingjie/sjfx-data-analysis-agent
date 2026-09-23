@@ -378,6 +378,27 @@ CALIBRATION_MIN = 24
 #
 # WHERE 子句让"分组与内容都没变的重放"不产生任何写入：既避免无谓的写放大，
 # 也避免成员内容修订号被空更新推动（那会让命名任务被反复判成过期）。
+def _card_readable(conn, package_id, path):
+    """这份文件的轻量特征卡是否可读 —— 决定它能否自成一个单文件条目。
+
+    只读 lp_naming_features，不做任何计算；缺卡或不可读都返回 False
+    （那种文件交给 km-other 桶，不硬起名）。
+    """
+    try:
+        from services.large_package_evidence import FEATURE_VERSION
+        row = conn.execute(
+            'SELECT card FROM lp_naming_features WHERE package_id=? AND path=? AND version=?',
+            (package_id, path, FEATURE_VERSION)).fetchone()
+    except Exception:
+        return False
+    if not row or not row['card']:
+        return False
+    try:
+        return bool(json.loads(row['card']).get('readable'))
+    except (TypeError, ValueError):
+        return False
+
+
 _MEMBER_UPSERT = (
     'INSERT INTO large_catalog_members(package_id,path,group_id,input_hash,vector) '
     'VALUES(?,?,?,?,?) ON CONFLICT(package_id,path) DO UPDATE SET '
@@ -387,6 +408,13 @@ _MEMBER_UPSERT = (
 
 
 # 少于等于这么多个成员的组，视为"碎片"而不是"语义分组"。
+# 方案 B 的开关：默认**开**。让"有内容、却最终没进任何组"的文件各自成为一个
+# 单文件条目，走**现有的命名链路**起名，而不是在界面上显示成"内容线索：<原始片段>"。
+# 关掉（SJFX_LP_SOLO_GROUP_NAMING=0）则回到"全部塞进 km-other 待归并桶"的旧行为。
+# 注意：它只影响**今后新跑的包与显式重建**；已冻结的包结构不变。
+SOLO_GROUP_NAMING = str(os.getenv('SJFX_LP_SOLO_GROUP_NAMING', '1') or '1').strip().lower() \
+    in {'1', 'true', 'yes', 'on'}
+
 FRAGMENT_MAX_MEMBERS = 3
 # 组数达到这么多才值得判定"本该聚类" —— 2 个文件的包不需要 k-means。
 DEGRADED_MIN_GROUPS = 10
@@ -1535,15 +1563,41 @@ def kmeans_recluster(store, package_id, force=False):
                 'AND path NOT IN (SELECT path FROM queue WHERE package_id=? AND stage=\'catalog\' '
                 '                AND status IN (\'queued\',\'retry\',\'running\'))',
                 (package_id, package_id, package_id)).fetchall()
-            stragglers, deferred = [], []
+            stragglers, deferred, solos = [], [], []
             for raw in candidates:
                 row = store._row(raw)
                 if catalog.material(row):
                     # 有素材却没有向量 —— 说明嵌入还没跑完，绝不能兜底。
                     # 把它退回队列重试，否则会被永久写进无向量的桶里再也出不来。
                     deferred.append(row['path'])
+                    continue
+                # 方案 B：没有向量、也进不了任何组的文件，此前一律塞进 km-other 桶，
+                # 界面上就显示成"内容线索：<原始片段>"这样一个假目录项。按设计
+                # "单文件条目也可以，直接命名就行"—— 只要这份文件的特征卡**可读**，
+                # 就让它自成一个单文件条目，交给现有命名链路按同一套规则起名。
+                # 特征卡不可读（正文确实提取不出来）的仍走 km-other，
+                # "未能识别内容"这个诚实出口不变。
+                if SOLO_GROUP_NAMING and _card_readable(conn, package_id, row['path']):
+                    solos.append(row['path'])
                 else:
                     stragglers.append(row['path'])
+            if solos:
+                solo_prefix = 'km-solo-' + hashlib.sha256(package_id.encode()).hexdigest()[:8]
+                for index, path in enumerate(sorted(solos)):
+                    gid = '%s-%05d' % (solo_prefix, index)
+                    # 空质心：它没有语义质心可算（组里只有一份文件），而且给空组算质心
+                    # 会让它出现在相邻组搜索里、被邻居的名字带偏。
+                    # status='queued'：进命名队列，由命名链路写正式名称。
+                    conn.execute(
+                        'INSERT INTO large_catalog_groups(package_id,id,model,anchor,'
+                        'representative,result,status,updated_at,member_count) '
+                        'VALUES(?,?,?,?,?,?,?,?,0) '
+                        'ON CONFLICT(package_id,id) DO UPDATE SET '
+                        'representative=excluded.representative,updated_at=excluded.updated_at',
+                        (package_id, gid, model, b'', path, '{}', 'queued', now))
+                    conn.execute(_MEMBER_UPSERT, (package_id, path, gid, '', b''))
+                changed += len(solos)
+                LOGGER.info('solo groups package=%s created=%d', package_id, len(solos))
             if deferred:
                 LOGGER.warning('k-means deferred %d material files without vectors: %s',
                                len(deferred), package_id)

@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import sys
 from pathlib import Path
 import re
 import time
@@ -629,11 +630,15 @@ def validate_catalog(store, package_id):
         #     用户按主题浏览时看不到 —— 这才是要阻断的事（实测 cssj4 有 181 个）。
         # 系统桶 km-other-* 按设计不属于任何主题，单独计数（files_in_system_bucket），
         # 不计入违规。
+        # 修补 9：原来用 `instr(b.children, g.id) > 0` 判"该组是否被某个主题覆盖"，
+        # 那是**子串**匹配；同一函数下游解析同一个 children 字段用的是 json.loads。
+        # 两个 id 互为子串时会误判"已覆盖"。改为按 JSON 数组成员判定（语义等价，
+        # 在真实库上与旧写法结果一致，已用副本比对验证）。
         placeholders = int(q("SELECT COUNT(*) FROM large_catalog_members m JOIN large_catalog_groups g "
                              "ON g.package_id=m.package_id AND g.id=m.group_id "
                              "WHERE m.package_id=? AND g.id NOT LIKE 'km-other-%' AND NOT EXISTS ("
-                             "  SELECT 1 FROM lp_catalog_branches b WHERE b.package_id=g.package_id "
-                             "    AND instr(b.children, g.id) > 0)",
+                             "  SELECT 1 FROM lp_catalog_branches b, json_each(b.children) je "
+                             "  WHERE b.package_id=g.package_id AND je.value=g.id)",
                              (package_id,)) or 0)
         system_bucket = int(q("SELECT COUNT(*) FROM large_catalog_members m JOIN large_catalog_groups g "
                               "ON g.package_id=m.package_id AND g.id=m.group_id "
@@ -801,6 +806,10 @@ def prune_history(store, package_id, keep=None):
     只在该包的历史行数超过 `keep*64` 时才动手，避免每个命名切片都做一次全表统计。
     """
     try:
+        # 修补 4：本模块没有模块级 Config，全文的 `from config import Config` 都是函数内
+        # 局部导入，本函数此前漏了 —— getattr 抛 NameError 被下面 except 吞成 5，
+        # 于是 SJFX_LP_LABEL_HISTORY_KEEP 永远不生效（对一张曾占整库 41% 的表失去调控）。
+        from config import Config
         keep = int(keep if keep is not None else getattr(Config, 'LP_LABEL_HISTORY_KEEP', 5))
     except Exception:
         keep = 5
@@ -870,7 +879,11 @@ def maintain_catalog(store, package_id, force=False):
     # 反过来会形成"合并 → 被切回 → 再合并"的无解循环；而切分侧新增的增长
     # 上限又保证叶组数不会像改动前那样单调上涨（实测 170→412）。
     try:
-        if (os.getenv('SJFX_LP_SEMANTIC_LEAF_MERGE', '1').lower() in {'0', 'false', 'off'}
+        # 修补 1：判据原先写反了 —— 默认值 '1' 永远不满足 `in {'0','false','off'}`，
+        # 于是"叶层唯一的收缩入口"在默认环境下永不执行（只有把它显式设成"关闭"的
+        # 值时才跑）。改成与 merge.py 一致的 kill-switch 语义：默认执行，
+        # SJFX_LP_SEMANTIC_LEAF_MERGE=0 才停。
+        if (os.getenv('SJFX_LP_SEMANTIC_LEAF_MERGE', '1').lower() not in {'0', 'false', 'off'}
                 and duplicate_name_groups(store, package_id)):
             normalize_leaves(store, package_id)
     except Exception:
@@ -879,17 +892,18 @@ def maintain_catalog(store, package_id, force=False):
         from services import large_package_semantic as semantic
         semantic.split_oversized(store, package_id)
     except Exception:
-        pass
+        # 修补 5：原来静默 pass，结构维护失败零日志，只能从"目录没变好"反推。
+        LOGGER.exception('split_oversized deferred: %s', package_id)
     # 历史裁剪放在收缩/切分之后：这一步只删"回滚用不到的旧版本"，
     # 不影响当前标签，也不改变任何命名结果。
     try:
         prune_history(store, package_id)
     except Exception:
-        pass
+        LOGGER.exception('prune_history deferred: %s', package_id)
     try:
         label_singletons(store, package_id)
     except Exception:
-        pass
+        LOGGER.exception('label_singletons deferred: %s', package_id)
     _MAINTENANCE_STATE[package_id] = (
         catalog_mutation_signature(store, package_id) or signature, time.time())
     return True
@@ -1298,17 +1312,34 @@ def representatives(store, package_id, group_id, limit=None):
     return rows, dict(group)
 
 _tokenizers={}
+# 修补 7：tokenizer 加载**失败的冷却期**（秒）。
+# 原来是"失败即永久缓存 None"，于是 tokenizer 文件后来到位也不会恢复，本进程
+# 生命周期内一直用字节数兜底（中文约 3x 高估 token → 过度裁剪），只能靠重启。
+# 但完全不缓存也不行：`bundle_key` 每次建包都调 `_tokenizer_version()` → `_tokenizer()`，
+# 一个大包会变成上万次失败的文件打开（热循环）。所以用**有界冷却 + 带退避的
+# 失败原因记录**：窗口内不重复尝试，窗口过后自动重试，恢复无需重启。
+_TOKENIZER_FAIL_TTL = 120.0
+_TOKENIZER_FAIL = {}
 
 def _tokenizer():
     from config import Config
     model_path=Path(Config.VLLM_MODEL_PATH)/'tokenizer.json'
     key=str(model_path)
     if key not in _tokenizers:
+        failed = _TOKENIZER_FAIL.get(key)
+        if failed and time.time() - failed[0] < _TOKENIZER_FAIL_TTL:
+            return None
         try:
             from tokenizers import Tokenizer
             _tokenizers[key]=Tokenizer.from_file(key)
+            _TOKENIZER_FAIL.pop(key,None)
         except Exception:
-            _tokenizers[key]=None
+            reason=str(sys.exc_info()[1])
+            if not _TOKENIZER_FAIL.get(key) or _TOKENIZER_FAIL[key][1]!=reason:
+                LOGGER.warning('tokenizer unavailable, using byte-length fallback: %s (%s)',
+                               key,reason)
+            _TOKENIZER_FAIL[key]=(time.time(),reason)
+            return None
     return _tokenizers[key]
 
 
@@ -1346,6 +1377,10 @@ def content_snippet(text):
 
 # 命名证据策略版本：取文 / 画像 / 选样口径变化时递增，用来作废按修订号的缓存。
 EVIDENCE_POLICY_VERSION = 'evidence-policy/2'
+# 修补 3c 的开关：默认**关**。它会改变送进模型的证据正文（因此改变未来新包的命名
+# 结果），属"改输入"而不是纯 bug 修复，必须由运维显式开启。
+#   SJFX_LP_EVIDENCE_TEMPLATE_STRIP=1  开启；不设或 0 则保持现状。
+EVIDENCE_TEMPLATE_STRIP = str(os.getenv('SJFX_LP_EVIDENCE_TEMPLATE_STRIP','0') or '0').strip().lower() in {'1','true','yes','on'}
 # 邻组名（有界消歧线索）在输入预算里的预留。它可有可无，所以装不下时先丢它。
 NEIGHBOR_RESERVE = 80
 _BUNDLE_CACHE = {}
@@ -1398,19 +1433,25 @@ def _neighbor_context(store, package_id, group_id, anchor_bytes, model):
     return neighbors
 
 
-def held_out_members(store, package_id, group_id, used, want=4, chars=200):
+def held_out_members(store, package_id, group_id, used, want=4, max_tokens=200):
     """取**没有参与起草名称**的成员短片段，只供校验，绝不进模型 payload。
 
     为什么需要（专家报告 §4.4）：要检验"名称是不是只在那几份模型读过的材料里有支撑"，
     必须有模型**没看过**的材料做对照，否则"名称与证据一致"就是循环论证。
-    这里按路径散列确定性地取 want 份、排除已经当证据的成员，各截 chars 字。
+    这里按路径散列确定性地取 want 份、排除已经当证据的成员。
+    **取名与单位**：末位参数原名 `chars`，但它被同时用在两处、含义不同 ——
+    候选池读取用 `compact_text(chars=...)`（字符），最终裁剪用 `clip(text, ...)`
+    （token）。为避免误用，参数改名为 `max_tokens` 并统一说明：候选读取取
+    `max_tokens` 个字符，最终每条截 `max_tokens` 个 token。
 
     成本：只在证据核心构建时读一次（核心按修订号缓存，见账①），且只读这几份文件。
     它不进 payload、也不参与 digest —— 送进模型的输入一个字都没变，所以模型结果
     缓存继续有效，不因为加了校验材料而重算。
 
-    **成员数不超过证据样本上限时返回空列表**：那种情况下全部成员都参与了起草，
-    "留出"无从谈起（生产上小组就是如此），评分会自动跳过而不是拿全组当对照。
+    **没有显式的"小组跳过"守卫**：可用的留出成员数是"组成员减去已被引用为证据的
+    成员"，候选按路径散列取 `want*3` 份、再命中 `want` 份为止。成员数不超过证据样本
+    上限时，结果自然接近空列表 —— 这是采样的结果，不是一条专门的判断。
+    评分侧对空结果跳过，不拿全组当对照。
     """
     from services.large_package_catalog import material as catalog_material
     from services.large_package_catalog_profile import strip_templates
@@ -1437,7 +1478,7 @@ def held_out_members(store, package_id, group_id, used, want=4, chars=200):
             text = source['deep_summary']
         elif parts:
             from services.large_package_evidence import compact_text
-            text = compact_text(parts, chars=chars)
+            text = compact_text(parts, chars=max_tokens)
         else:
             text = source.get('text') or ' / '.join(source.get('fields') or [])
         if not text or not str(text).strip():
@@ -1468,18 +1509,24 @@ def held_out_members(store, package_id, group_id, used, want=4, chars=200):
         if len(text) < 20:
             continue
         snippets.append({'id': 'H%d' % (len(snippets) + 1), 'source_path': path,
-                         'text': clip(text, chars)})
+                         'text': clip(text, max_tokens)})
     return snippets
 
 
 def _bundle_core(store, package_id, group_id):
     from services import large_package_evidence as source_evidence
-    from services.large_package_catalog_profile import group_profile, filter_meta
+    from services.large_package_catalog_profile import group_profile, filter_meta, strip_templates
     rows,group=representatives(store,package_id,group_id)
     if not group:
         raise ValueError('暂无足够内容可命名')
     profile=group_profile(store,package_id,group_id,group.get('content_revision'))
-    meta_block=profile.get('meta_templates') or []
+    # 修补 3b：字段模板原先只取 meta_templates，而它依赖 background['meta_df'] 与
+    # 卡片里的 headings/fields（生产实测绝大多数卡片这两项为空），于是常年为空列表、
+    # filter_meta 一个字段都不滤。profile 里已经算好了 templates（包级跨文件模板词典），
+    # 这里以它为主、meta_templates 作补充，两者都是有界的小列表。不改命名规则，
+    # 只是把已经算出来的东西真正用于"哪些字段是版式"这个既有判断。
+    meta_block=list(dict.fromkeys(list(profile.get('templates') or [])+
+                                  list(profile.get('meta_templates') or [])))[:24]
     _,_,per_sample,_=_sample_policy()
     terms=[x['term'] for x in (profile.get('common') or [])+(profile.get('distinctive') or [])[:12]]
     filename_only=False
@@ -1499,6 +1546,18 @@ def _bundle_core(store, package_id, group_id):
             parts=[{'text':value.get('text') or ' / '.join(value.get('fields') or []),
                     'location':'保存的内容预览','kind':'unknown'}]
         text,blocks=source_evidence.naming_excerpt(parts,per_sample,token_count,clip,terms=terms)
+        if text.strip() and EVIDENCE_TEMPLATE_STRIP and meta_block:
+            # 修补 3c：把页眉/版式短语从**送进模型的正文**里剥掉。实测这份语料的
+            # 页眉（'研究院 编号 摘要 本文汇编 篇资料，围绕…相关内容进行整理'）会占满
+            # 证据正文与 term 词表，而设计原本要求"名称来自材料内容、不被页眉污染"。
+            # **默认关闭**：它会改变模型看到的输入（进而改变未来新包的命名结果），
+            # 由运维显式开启 SJFX_LP_EVIDENCE_TEMPLATE_STRIP=1 生效。
+            try:
+                stripped=strip_templates(text,meta_block)
+                if len(stripped)>=20:
+                    text=stripped
+            except Exception:
+                LOGGER.exception('evidence template strip skipped: %s/%s',package_id,group_id)
         if not text.strip():
             continue
         evidence.append({'id':'E'+str(len(evidence)+1),'source_path':row['path'],
@@ -2682,8 +2741,23 @@ def apply(store,package_id,group_id,material,result,model):
     split = apply_topic_split(store, package_id, group_id, material, result)
     if split and result.get('purity') == 'mixed':
         # Split labels describe the resulting children. Do not overwrite them with the old mixed name.
+        #
+        # 修补 2：`apply_topic_split` 在子主题拆分被拒（尺寸守卫/预算/歧义）时会**退回**
+        # `split_off_outliers`，后者成功同样返回 True；而它刚把本组 content_revision
+        # 重置为 1。此时若只把任务标 completed，本组就永久停在一个"修订号匹配"的旧名上
+        # （界面据 revision==content_revision 判为新鲜 model 名，queue_groups 也因
+        # revision 未变不再派任务）；无旧标签时则被兜底写成文件标题。
+        # 事实是成员已被搬走、这一组的内容确实变了 —— 按既有设计它该重新命名一次。
+        # 这里只重排任务，不改任何命名规则，也不替它写名字。
         with store._lock,closing(store._connect()) as c:
-            c.execute("UPDATE lp_catalog_jobs SET status='completed',revision=(SELECT content_revision FROM large_catalog_groups g WHERE g.package_id=lp_catalog_jobs.package_id AND g.id=lp_catalog_jobs.group_id) WHERE package_id=? AND group_id=?",(package_id,group_id))
+            c.execute("INSERT INTO lp_catalog_jobs(package_id,group_id,revision,status,"
+                      "attempts,leased,next_at,error) "
+                      "VALUES(?,?,(SELECT content_revision FROM large_catalog_groups "
+                      "WHERE package_id=? AND id=?),'queued',0,NULL,0,'') "
+                      "ON CONFLICT(package_id,group_id) DO UPDATE SET "
+                      "revision=excluded.revision,status='queued',attempts=0,"
+                      "leased=NULL,next_at=0,error=''",
+                      (package_id, group_id, package_id, group_id))
         return True
     evidence=[e for e in material['evidence'] if e['id'] in result['evidence_ids']]
     with store._lock,closing(store._connect()) as c:
@@ -2954,6 +3028,8 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
 
 
 def _leaf_centroids(store, package_id, leaves):
+    # UNWIRED（修补 12 标记）：无调用者。早期 merge_topics 自研聚类的遗留，
+    # 现由 services/large_package_catalog_merge.py 与 large_package_catalog_tree 承担。
     """算出每个叶组的向量质心（用组内成员的向量求平均）。
 
     叶子层已经把所有向量存进 large_catalog_members，所以这里不需要重新嵌入。
@@ -2984,6 +3060,7 @@ def _leaf_centroids(store, package_id, leaves):
 
 
 def _cluster_vectors(vectors, k, iters=30, seed=11):
+    # UNWIRED（修补 12 标记）：无调用者，同上。
     """球面 k-means（k-means++ 初始化）——与叶子层同一套算法。
     返回每个向量的簇编号。"""
     import numpy as np

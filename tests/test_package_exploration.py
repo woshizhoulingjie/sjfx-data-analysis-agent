@@ -378,7 +378,7 @@ class PackageExplorationTests(unittest.TestCase):
             )
 
             refreshed = storage.get_file_preview(scan_id, "a.txt")
-            self.assertEqual(refreshed["schema_version"], "file-preview/1.3")
+            self.assertEqual(refreshed["schema_version"], "file-preview/1.4")
             self.assertIn("Alice Johnson", analysis["content_map"]["entities"]["people"][0]["name"])
 
     def test_large_package_only_deep_parses_selected_representatives(self):

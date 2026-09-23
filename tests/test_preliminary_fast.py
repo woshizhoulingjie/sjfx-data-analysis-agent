@@ -229,6 +229,57 @@ def test_ready_does_not_overwrite_deep_summary(setup):
     assert store.get_summary("scan", "a.txt", "deep_file_summary")["summary"] == "deep result"
 
 
+def test_unversioned_active_summary_jobs_are_reused_without_duplicates(setup, monkeypatch):
+    import app
+    store, ids = setup
+    monkeypatch.setattr(app, "storage", store)
+    now = time.time()
+    checkpoint = {"selected_paths": ["a.txt", "b.txt", "c.txt", "d.txt"],
+                  "preliminary_summary_job_ids": ids}
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO import_tasks(task_id,scan_id,root_path,status,current_phase,checkpoint,owner_id,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("import", "scan", "/test", "parsed_overview", "parsed_overview",
+             json.dumps(checkpoint), "owner", now, now),
+        )
+    assert app._queue_preliminary_file_summaries("scan", "owner") == ids
+    jobs = [item for item in store.list_jobs(owner_id="owner")
+            if item["task_type"] == "generate_summary"]
+    assert len(jobs) == len(ids)
+    assert {item["id"] for item in jobs} == set(ids)
+
+
+def test_ready_node_starts_before_unrelated_file_jobs_finish(setup, monkeypatch):
+    import app
+    store, ids = setup
+    monkeypatch.setattr(app, "storage", store)
+    paths = ["a.txt", "b.txt", "c.txt", "d.txt"]
+    checkpoint = {"selected_paths": paths, "preliminary_summary_job_ids": ids}
+    now = time.time()
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO import_tasks(task_id,scan_id,root_path,status,current_phase,checkpoint,owner_id,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("import", "scan", "/test", "preliminary_summarizing", "preliminary_summarizing",
+             json.dumps(checkpoint), "owner", now, now),
+        )
+    monkeypatch.setattr(app, "_build_candidate_preview_directory", lambda _scan_id: {
+        "topics": [
+            {"node_id": "ready", "name": "已完成节点", "member_paths": ["a.txt", "b.txt"]},
+            {"node_id": "waiting", "name": "等待节点", "member_paths": ["c.txt", "d.txt"]},
+        ]
+    })
+    for _ in range(2):
+        job, ready = prepared(store)
+        assert store.commit_preliminary_result(job, ready[job["id"]]) == "completed"
+    node_ids = app._queue_preliminary_node_summaries("scan", "owner")
+    assert node_ids
+    assert store.get_job(node_ids[0])["options"]["node_id"] == "ready"
+    assert not any(store.get_job(job_id)["options"].get("node_id") == "waiting"
+                   for job_id in node_ids)
+
+
 def test_file_completion_advances_existing_node_and_overview_hooks(setup, monkeypatch):
     import app
     store, ids = setup
@@ -253,7 +304,11 @@ def test_file_completion_advances_existing_node_and_overview_hooks(setup, monkey
     assert app._queue_preliminary_node_summaries("scan", "owner") == nodes
     assert app._queue_preliminary_overview("scan", "owner") is None
     node = store.claim_next_job("worker")
-    store.save_summary("scan", "node:topic", "preliminary_node_summary", {"analysis_stage": "preliminary", "member_paths": paths, "summary": "node summary"})
+    store.save_summary("scan", "node:topic", "preliminary_node_summary", {
+        "analysis_stage": "preliminary", "member_paths": paths,
+        "member_source_fingerprint": node["options"]["member_source_fingerprint"],
+        "summary": "node summary",
+    })
     store.finalize_job(node["id"], result={})
     report = app._queue_preliminary_overview("scan", "owner")
     assert report

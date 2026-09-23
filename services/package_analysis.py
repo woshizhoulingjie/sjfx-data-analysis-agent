@@ -2520,6 +2520,7 @@ def _adaptive_tree(scan, documents, node_summaries, enrich=True):
     一级目录只根据实际正文主题生成。
     document_role 仅作为文件标签保留，不再作为一级目录。
     """
+    boundary_review_sources = {}
 
     def stable_group_id(name, member_paths):
         return _stable_group_node_id("内容主题", name, member_paths)
@@ -5752,26 +5753,49 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             for path, document in classified_batch
         ])
 
-    progress(72, "执行精确去重与高相似文档聚类")
-    if policy.get("enabled"):
-        exact_groups = _large_exact_groups(content_map, documents)
-        canonical_documents, canonical_by_path, aliases_by_canonical = _canonical_projection(
-            documents, exact_groups
-        )
-    else:
-        exact_groups = _group_exact(documents)
-        canonical_documents, canonical_by_path, aliases_by_canonical = _canonical_projection(
-            documents, exact_groups
-        )
-    # Persist the canonical/alias relationship on every original path.  It is
-    # visible in the physical tree and survives a Worker restart.
+    progress(72, "检查完全重复的文件")
+    stage_started = time.perf_counter()
+    exact_groups = (
+        _large_exact_groups(content_map, documents)
+        if policy.get("enabled") else _group_exact(documents)
+    )
+    pipeline_timing_ms["exact_duplicate_grouping"] = round(
+        (time.perf_counter() - stage_started) * 1000, 2
+    )
+    progress(73, "完全重复检查完成：{} 组，正在整理规范文档".format(len(exact_groups)))
+
+    stage_started = time.perf_counter()
+    canonical_documents, canonical_by_path, aliases_by_canonical = _canonical_projection(
+        documents, exact_groups
+    )
+    pipeline_timing_ms["canonical_document_projection"] = round(
+        (time.perf_counter() - stage_started) * 1000, 2
+    )
+    progress(74, "规范文档整理完成：{} / {} 个".format(
+        len(canonical_documents), len(documents)
+    ))
+
+    # Persist the canonical/alias relationship in one bounded write instead of
+    # opening a transaction for every file in ordinary packages.
     if not policy.get("enabled"):
-        for document_path, document in documents.items():
-            storage.save_document(
-                scan_id, document_path, _document_without_analysis_overlay(document)
-            )
+        storage.save_documents(scan_id, [
+            (path, _document_without_analysis_overlay(document))
+            for path, document in documents.items()
+        ])
+
+    stage_started = time.perf_counter()
     similar_groups = [] if policy.get("enabled") else _group_similar(documents, exact_groups)
+    pipeline_timing_ms["high_similarity_grouping"] = round(
+        (time.perf_counter() - stage_started) * 1000, 2
+    )
+    progress(75, "高相似文档分析完成：{} 组，正在识别跨文件主题".format(len(similar_groups)))
+
+    stage_started = time.perf_counter()
     topic_clusters = _topic_clusters(canonical_documents)
+    pipeline_timing_ms["cross_document_topic_clustering"] = round(
+        (time.perf_counter() - stage_started) * 1000, 2
+    )
+    progress(76, "跨文件主题识别完成：{} 个主题".format(len(topic_clusters)))
     if policy.get("enabled"):
         # Preview checkpoints and deep parses update this catalog per source.
         # Never clear and rebuild the whole package for a 20-50 file slice.
@@ -5823,12 +5847,12 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
 
     if embedding_client is not None and canonical_documents and not policy.get("enabled"):
         try:
-            progress(74, "生成文档级语义向量")
+            progress(77, "生成文档级语义向量")
             semantic_cluster_started = time.perf_counter()
 
             def semantic_progress(done, total):
-                percent = 74 + int(
-                    4 * done / max(1, total)
+                percent = 77 + int(
+                    3 * done / max(1, total)
                 )
                 progress(
                     percent,
@@ -5852,7 +5876,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             )
 
             progress(
-                79,
+                81,
                 "生成语义主题名称",
             )
             semantic_naming_started = time.perf_counter()

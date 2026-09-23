@@ -141,6 +141,33 @@ def snapshot_key(store,package_id):
         row=c.execute('SELECT id FROM lp_catalog_rounds WHERE package_id=? ORDER BY started DESC LIMIT 1',(package_id,)).fetchone()
     return row[0] if row else 'initial'
 
+def _meta_df(store,package_id):
+    """包级**元数据**文档频次（headings/fields），供 profile.meta_templates 判版式。
+
+    修补 3a：这一项此前恒为空 dict，而 profile.meta_templates 的判据是
+    `meta_df[item] >= minimum and df[item] < minimum`。meta_df 为空时它退化成
+    `background.get('meta_df') or background.get('df')` —— 两个数是同一个对象，
+    **永远不可能同时满足**，于是"模型看到的 headings/fields 是否该被当版式剔除"
+    这条判断从来没生效过。这里按卡片的 headings/fields 真实统计一份。
+    代价实测约 0.10s / 8182 张卡，且随包级轮次快照一起缓存（每包每轮一次）。
+    """
+    df={}
+    with closing(store._connect()) as c:
+        rows=c.execute('SELECT card FROM lp_naming_features WHERE package_id=? AND version=?',
+                       (package_id,FEATURE_VERSION)).fetchall()
+    for row in rows:
+        try:
+            card=json.loads(row['card'] or '{}')
+        except (TypeError,ValueError):
+            continue
+        for key in ('headings','fields'):
+            for item in set(card.get(key) or []):
+                item=str(item or '').strip()
+                if 2<=len(item)<=40:
+                    df[item]=df.get(item,0)+1
+    return df
+
+
 def background(store,package_id):
     ensure_package(store,package_id)
     key=identity(store,package_id)+(snapshot_key(store,package_id),)
@@ -154,7 +181,8 @@ def background(store,package_id):
                 meta=c.execute('SELECT * FROM lp_feature_meta WHERE package_id=?',(package_id,)).fetchone()
                 value={'files':meta['readable'],'feature_files':meta['files'],
                        'df':dict(c.execute('SELECT term,n FROM lp_feature_df WHERE package_id=?',(package_id,))),
-                       'meta_df':{},'scope':'retained_features_snapshot','revision':meta['revision']}
+                       'meta_df':_meta_df(store,package_id),
+                       'scope':'retained_features_snapshot','revision':meta['revision']}
                 c.execute('INSERT OR REPLACE INTO lp_feature_snapshot VALUES(?,?,?,?)',
                           (package_id,key[-1],meta['revision'],json.dumps(value,ensure_ascii=False,separators=(',',':'))))
             c.commit()

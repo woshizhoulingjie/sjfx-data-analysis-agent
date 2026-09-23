@@ -16,7 +16,7 @@ from services import large_package_evidence_store as feature_store
 
 LOGGER = logging.getLogger(__name__)
 
-POLICY_VERSION = 'evidence-profile/2'
+POLICY_VERSION = 'evidence-profile/3'
 
 # 模板检测：12 字窗口的文档频次 ≥30% 且至少出现在 3 份文件里，才算模板。
 TEMPLATE_NGRAM = 12
@@ -218,7 +218,27 @@ def template_terms(texts, ngram=TEMPLATE_NGRAM, min_share=TEMPLATE_MIN_SHARE,
     seeds = set(g for g, count in counter.items() if count >= need)
     if not seeds:
         return []
-    return [p for p in _merge_phrases(seeds, texts, ngram) if evidence.is_boilerplate(p)]
+    # Long, repeated headers often merge with adjacent layout terms and stop
+    # matching the boilerplate lexicon as a whole. Recheck their individual
+    # segments so the recognizable header terms remain removable.
+    found = []
+    for phrase in _merge_phrases(seeds, texts, ngram):
+        segments = _segments(phrase)
+        layout_context = (evidence.is_boilerplate(phrase)
+                          or _structural_phrase(phrase)
+                          or any(evidence.is_boilerplate(segment)
+                                 or _structural_phrase(segment)
+                                 for segment in segments))
+        if evidence.is_boilerplate(phrase) or _structural_phrase(phrase):
+            found.append(phrase)
+        for index, segment in enumerate(segments):
+            if evidence.is_boilerplate(segment) or _structural_phrase(segment):
+                found.append(segment)
+            elif layout_context and index > 0 and _informative(segment):
+                # Keep the first repeated segment as the collection/topic title;
+                # later segments belong to the shared masthead/layout block.
+                found.append(segment)
+    return list(dict.fromkeys(found))[:TEMPLATE_MAX_PHRASES]
 
 
 # ---------------------------------------------------------------------------
@@ -416,10 +436,28 @@ def _meta_items(row, info):
 
 
 def meta_templates(profiles, background):
-    # Frequency alone is not evidence that a scientific/business topic is noise.
-    items = {str(item) for p in profiles for key in ('headings','fields','keywords')
-             for item in (p.get(key) or [])}
-    return sorted((x for x in items if evidence.is_boilerplate(x)), key=lambda x:(-len(x),x))[:24]
+    # Treat a metadata phrase as layout noise only when its wording is structural
+    # and the package-wide metadata supports that reading. A topic repeated in a
+    # small group must not be removed merely because it is common locally.
+    background = background or {}
+    files = int(background.get('files') or 0)
+    if files < 10:
+        return []
+    meta_df = background.get('meta_df') or background.get('df') or {}
+    minimum = max(3, int(math.ceil(files * TEMPLATE_MIN_SHARE)))
+    items = {str(item).strip() for p in profiles
+             for key in ('headings', 'fields', 'keywords')
+             for item in (p.get(key) or []) if str(item).strip()}
+    candidates = []
+    for item in items:
+        support = int(meta_df.get(item, 0) or 0)
+        body_support = int((background.get('df') or {}).get(item, 0) or 0)
+        # A phrase present in most package metadata but absent from body evidence
+        # is a repeated masthead/label, even when a domain-specific organization
+        # name is not covered by a hand-maintained boilerplate vocabulary.
+        if support >= minimum and body_support < minimum:
+            candidates.append(item)
+    return sorted(candidates, key=lambda x: (-len(x), x))[:24]
 
 
 def template_vocabulary(templates):
@@ -463,6 +501,13 @@ def ctfidf_terms(texts, background, templates=()):
             df_group[gram] = max(df_group.get(gram, 0), count)
     bg_df = (background or {}).get('df') or {}
     bg_files = int((background or {}).get('files') or 0) or 1
+    def background_term_support(phrase):
+        if bg_files < 10:
+            return 0
+        candidates = [int(count or 0) for term, count in bg_df.items()
+                      if len(str(term)) >= 3 and str(term) in phrase]
+        return max(candidates or [0])
+
     scored = []
     blocked = set()
     for gram, count in df_group.items():
@@ -484,10 +529,15 @@ def ctfidf_terms(texts, background, templates=()):
     phrases = _merge_supported(candidates, texts, support)
 
     def phrase_stats(phrase):
-        """Count the complete phrase in retained text; never inherit a seed's DF."""
+        """Count the complete phrase and use supported background phrase DF."""
         pattern = _term_pattern(phrase)
         exact_df = sum(bool(pattern.search(text)) for text in texts)
-        idf = math.log(1.0 + bg_files / float(1 + bg_df.get(phrase, 0)))
+        background_df = max(
+            [int(bg_df.get(phrase, 0) or 0)]
+            + [int(count or 0) for term, count in bg_df.items()
+               if len(str(term)) >= 3 and str(term) in phrase]
+        )
+        idf = math.log(1.0 + bg_files / float(1 + background_df))
         return (exact_df / float(total)) * idf, exact_df
 
     items = []
@@ -506,6 +556,12 @@ def ctfidf_terms(texts, background, templates=()):
             continue
         score, count = phrase_stats(phrase)
         if not count:
+            continue
+        corpus_support = background_term_support(phrase)
+        # Terms common across most of the corpus are not distinctive when they
+        # only appear in a minority of this group; keep genuine group-wide
+        # topics intact and lower (rather than erase) moderate background terms.
+        if corpus_support / float(bg_files) >= 0.80 and count / float(total) < 0.80:
             continue
         items.append({'term': phrase, 'df': int(count), 'score': round(float(score), 4)})
     items.sort(key=lambda item: (-item['score'], -len(item['term']), item['term']))

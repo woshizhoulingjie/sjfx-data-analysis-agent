@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import time
 import os
@@ -17,7 +18,7 @@ from pathlib import Path
 LOGGER = logging.getLogger(__name__)
 SCHEMA = "large-package-report/2.5"
 # 研究方向规则的版本：它参与缓存键，规则变了就必须重建报告。
-DIRECTION_RULES_VERSION = "directions/1"
+DIRECTION_RULES_VERSION = "directions/2"
 # 占位分类：**永远不得成为推荐研究方向**。改动前首选方向按 score(≈文件数) 排序，
 # 于是"内容待归纳"这个最大的占位桶必然夺魁（实测 cssj4 的首选方向字面就是
 # 「内容待归纳的主题与证据研究」）。
@@ -69,10 +70,78 @@ def report_directory(store, package_id):
     return directory
 
 
-def _direction(category, data):
-    examples = data["examples"]
+def _direction_topic_profile(groups):
+    """Build corpus-wide topic document frequency once for all candidates."""
+    group_df = Counter()
+    for value in groups.values():
+        group_df.update({str(word).strip().lower()
+                         for word, _ in (value.get("keywords") or Counter()).most_common(200)
+                         if str(word).strip()})
+    return max(1, len(groups)), group_df
+
+
+def _direction_metrics(groups, category, total_files=None, topic_profile=None):
+    """Score a direction from support, independent sources and specificity."""
+    data = groups.get(category) or {}
+    files = max(0, int(data.get("files") or 0))
+    total_files = max(files, int(total_files or sum(
+        int(value.get("files") or 0) for value in groups.values()
+    ) or files or 1))
+    keywords = [str(word).strip().lower() for word, _ in
+                (data.get("keywords") or Counter()).most_common(20)
+                if str(word).strip()]
+    category_count, group_df = topic_profile or _direction_topic_profile(groups)
+    idf = [math.log((category_count + 1.0) / (group_df[word] + 1.0))
+           for word in keywords]
+    distinctiveness = (
+        sum(sorted(idf, reverse=True)[:6])
+        / max(1, len(idf[:6]))
+        / max(1.0, math.log(category_count + 1.0))
+        if idf else 0.35
+    )
+    examples = [item for item in (data.get("examples") or [])
+                if _text(item.get("text"), 100)]
+    unique_sources = {
+        str(item.get("source_sha256") or item.get("source_path") or "")
+        for item in examples
+        if item.get("source_sha256") or item.get("source_path")
+    }
+    source_diversity = min(1.0, len(unique_sources) / 3.0)
+    evidence_coverage = min(1.0, len(examples) / 3.0)
+    deep_ratio = sum(bool(item.get("deep")) for item in examples) / max(1, len(examples))
+    evidence_quality = 0.70 * evidence_coverage + 0.30 * deep_ratio
+    summary_coverage = min(1.0, float(data.get("models") or 0) / max(1, files))
+    leaves = data.get("leaves") or Counter()
+    leaf_total = sum(leaves.values())
+    topic_focus = max(leaves.values()) / float(leaf_total) if leaf_total else 0.5
+    scale = min(1.0, math.log1p(files) / math.log1p(max(2, total_files)))
+    score = (
+        0.10 * scale + 0.25 * evidence_quality + 0.20 * source_diversity
+        + 0.25 * distinctiveness + 0.10 * summary_coverage + 0.10 * topic_focus
+    )
+    confidence = min(1.0, 0.45 * evidence_quality + 0.35 * source_diversity
+                     + 0.20 * summary_coverage)
+    return {
+        "score": round(score * 100, 1),
+        "confidence": round(confidence, 3),
+        "file_scale": round(scale, 4),
+        "evidence_quality": round(evidence_quality, 4),
+        "independent_sources": len(unique_sources),
+        "distinctiveness": round(distinctiveness, 4),
+        "summary_coverage": round(summary_coverage, 4),
+        "topic_focus": round(topic_focus, 4),
+        "keywords": keywords[:8],
+    }
+
+
+def _direction(category, data, groups=None, total_files=None, topic_profile=None):
+    if category in _PLACEHOLDER_CATEGORIES:
+        return None
+    examples = data.get("examples") or []
     if not examples:
         return None
+    groups = groups or {category: data}
+    metrics = _direction_metrics(groups, category, total_files, topic_profile)
     playbooks = {
         "财务资料": ("财务指标与业务变化核验", ["不同期间的收入、成本和预算有何变化？", "汇总数字能否与明细及对应文件一致？"], ["先核对字段、币种和统计口径，再做同口径比较", "交叉核验汇总表与原始凭证，定位差异来源"]),
         "结构化数据": ("结构化数据质量与指标研究", ["各文件的字段、主键和统计口径是否一致？", "哪些缺失值、异常值或指标变化值得深入核验？"], ["确认完整行数、字段含义及去重规则", "对选定数据做完整质量检查后再汇总或比较"]),
@@ -80,22 +149,23 @@ def _direction(category, data):
         "项目与技术": ("项目进展与技术依据研究", ["项目目标、里程碑和交付结果之间如何对应？", "技术方案的关键假设和风险有什么支撑资料？"], ["按项目及时间整理代表文件", "交叉核验需求、方案、变更记录与交付证据"]),
     }
     title, questions, methods = playbooks.get(category, (
-        category + "的主题与证据研究",
-        ["这些资料集中讨论哪些主题、对象和问题？", "不同文件对同一事项的描述有何一致或差异？"],
-        ["先深度解析代表文件，确认主题与关键术语", "按主题比对原文并建立来源证据表"],
+        category + "的主题与证据核验",
+        ["不同资料对该主题有哪些一致发现、分歧和适用条件？", "哪些关键判断仍缺少独立来源或可复核指标？"],
+        ["按来源和时间对照代表性证据", "回到原文核验相互印证、差异及证据缺口"],
     ))
-    keywords = [word for word, _ in data["keywords"].most_common(6)]
-    confidence = round(data["confidence"] / max(1, data["files"]), 3)
+    keywords = metrics["keywords"][:6]
     return {
-        "title": title, "category": category, "priority": "优先核验" if data["models"] else "候选方向",
-        "confidence": confidence, "confidence_note": "沿用文件分类平均置信度，仅供线索排序，不代表研究结论可信度。",
-        "rationale": "该类别有 {} 个文件，其中 {} 个有可读内容预览、{} 个已有模型摘要。{}建议从所列代表文件开始核验。".format(
-            data["files"], data["text_files"], data["models"], "预览关键词包括 {}。".format("、".join(keywords)) if keywords else ""),
+        "title": title, "category": category,
+        "priority": "优先核验" if data["models"] else "候选方向",
+        "confidence": metrics["confidence"],
+        "confidence_note": "根据可读证据、独立来源和摘要覆盖综合估计；不是结论正确率。",
+        "rationale": "该主题有 {} 个文件、{} 个可读代表样本、{} 个独立来源和 {} 个模型摘要。关键词包括 {}；建议核对不同来源的相互印证、差异与适用条件。".format(
+            data["files"], data["text_files"], metrics["independent_sources"], data["models"], "、".join(keywords) or "暂无稳定关键词"),
         "research_questions": questions, "methods": methods,
         "representative_documents": [item["source_path"] for item in examples],
-        "evidence_chain": examples, "basis": "内容语义目录、已保存深度摘要与可追溯的内容片段",
-        "limitations": ["本项是基于现有内容的研究建议，需结合代表文件全文核验。"],
-        "score": data["models"] * 10 + data["text_files"],
+        "evidence_chain": examples, "basis": "跨主题区分性、独立来源、可读证据与摘要覆盖综合排序",
+        "limitations": ["基于当前可读取的代表证据，正式结论需回到源文件核验。"],
+        "score": metrics["score"], "score_breakdown": metrics,
     }
 
 
@@ -265,7 +335,11 @@ def build_report(store, item):
         # 排序，"内容待归纳"这个最大占位桶必然夺魁，首选方向字面就是
         # 「内容待归纳的主题与证据研究」。
         from config import Config as _Cfg
-        template = sorted(filter(None, (_direction(key, value) for key, value in groups.items())),
+        topic_profile = _direction_topic_profile(groups)
+        template = sorted(filter(None, (
+            _direction(key, value, groups, coverage.get("inventory_files"), topic_profile)
+            for key, value in groups.items()
+        )),
                           key=lambda x: (1 if str(x.get("category") or "") in _PLACEHOLDER_CATEGORIES else 0,
                                          -x["score"], str(x.get("title") or "")))
         try:
@@ -289,26 +363,8 @@ def build_report(store, item):
         candidates = list(candidates)[:_max_dirs]
         direction_primary = candidates[0] if candidates else {}
         direction_rest = candidates[1:] if len(candidates) > 1 else []
-        # Quick parsing can classify a package even when no category has a
-        # readable excerpt. Keep the overview useful in that case by exposing
-        # a clearly preliminary, evidence-limited direction from the dominant
-        # category/topic counts. Deep summaries will replace it automatically.
-        if not candidates and groups:
-            category, data = max(groups.items(), key=lambda pair: (pair[1]["files"], pair[0]))
-            generic = {"未分类", "无法识别内容", "资料类别", "其他"}
-            topic = next((str(name) for name, count in topic_counts.most_common() if str(name).strip() and str(name).strip() not in generic), "")
-            label = topic or (str(category).strip() if str(category).strip() not in generic else "资料内容")
-            candidates = [{
-                "title": "围绕“{}”资料的主题与证据核验".format(label),
-                "category": category, "priority": "初步研判", "confidence": round(data["confidence"] / max(1, data["files"]), 3),
-                "confidence_note": "该方向只依据快速解析的分类和主题统计，完成深度摘要后自动更新。",
-                "rationale": "快速解析显示“{}”相关资料占当前范围较大比例，建议先核验其主题边界、关键事实和资料之间的一致性。".format(label),
-                "research_questions": ["“{}”资料主要涉及哪些主题和可验证事实？".format(label), "哪些判断需要深度摘要进一步核验？"],
-                "methods": ["按主题和文件来源分组比对", "对代表文件进行深度摘要并回溯原文证据"],
-                "representative_documents": [item["source_path"] for item in data["examples"]],
-                "evidence_chain": data["examples"], "basis": "快速解析分类与主题统计", "limitations": ["尚未结合用户选定文件的深度摘要"],
-                "score": data["files"],
-            }]
+        # With no readable evidence there is no defensible research direction;
+        # preserve the categories and coverage, and let the report disclose the gap.
         total = coverage["inventory_files"]
         coverage["quick_ratio"] = round(coverage["quick_completed"] / max(1, total), 4)
         coverage["deep_ratio"] = round(coverage["deep_completed"] / max(1, total), 4)
@@ -388,7 +444,7 @@ def build_report(store, item):
             "total_bytes": total_bytes, "total_size_human": _size(total_bytes), "formats": dict(formats),
             "deep_files": deep_files, "failures": failures, "topic_summaries": topic_summaries,
             "research_brief": {
-                "title": "大数据包情况概览", "available": bool(candidates), "ready": brief_ready,
+                "title": "大数据包情况概览", "available": bool(candidates or categories or topic_summaries), "ready": brief_ready,
                 "preliminary": preliminary_direction,
                 "generation_mode": "local_evidence_preliminary" if preliminary_direction else "local_evidence_brief",
                 "basic_information": basic, "key_findings": findings,
@@ -441,33 +497,65 @@ def _diff_overview(first, current):
     }
 
 
-def _direction_evidence(groups, limit_categories=14, per_category=2, snippet=300):
-    """把主题/叶组的代表证据整理成给模型的紧凑输入（研究方向的**证据汇总步骤**）。
-
-    为什么不能只把字段重新拼接：专家明确指出「不能只把字段重新拼接称为综合研判，
-    也不应默认通过增加模型调用解决」。所以这里先做一个明确的证据汇总：每个主题
-    带上文件数、代表关键词与可回到原文的片段，模型只负责在这些证据上提出方向。
-    """
-    items = []
-    for key in sorted(groups, key=lambda k: (-groups[k]["files"], str(k))):
+def _direction_evidence(groups, limit_categories=14, per_category=2, snippet=3000):
+    """Build a balanced evidence set; category size is only a small prior."""
+    total_files = sum(int(value.get("files") or 0) for value in groups.values())
+    topic_profile = _direction_topic_profile(groups)
+    candidates = []
+    for key, data in groups.items():
         name = str(key or "").strip()
         if not name or name in _PLACEHOLDER_CATEGORIES:
-            continue                      # 占位分类不得成为研究方向
-        data = groups[key]
-        ev = []
-        for e in (data.get("examples") or [])[:per_category]:
-            txt = _text(e.get("text"), snippet)
-            if txt:
-                ev.append({"path": e.get("source_path") or "", "text": txt})
-        if not ev:
             continue
-        items.append({"topic": name, "files": int(data.get("files") or 0),
-                      "with_summary": int(data.get("models") or 0),
-                      "keywords": [w for w, _ in data["keywords"].most_common(6)],
-                      "evidence": ev})
-        if len(items) >= int(limit_categories):
-            break
-    return items
+        metrics = _direction_metrics(groups, key, total_files, topic_profile)
+        evidence_rows = []
+        used_sources = set()
+        for e in sorted(data.get("examples") or [], key=lambda item: not bool(item.get("deep"))):
+            source = str(e.get("source_sha256") or e.get("source_path") or "")
+            if source and source in used_sources:
+                continue
+            txt = _text(e.get("text"), snippet)
+            if not txt:
+                continue
+            if source:
+                used_sources.add(source)
+            evidence_rows.append({"path": e.get("source_path") or "", "text": txt,
+                                 "scope": e.get("scope") or "可读内容预览"})
+            if len(evidence_rows) >= max(1, int(per_category)):
+                break
+        if not evidence_rows:
+            continue
+        candidates.append({
+            "topic": name,
+            "files": int(data.get("files") or 0),
+            "with_summary": int(data.get("models") or 0),
+            "keywords": metrics["keywords"],
+            "assessment": {key: value for key, value in metrics.items() if key != "keywords"},
+            "evidence": evidence_rows,
+            "_terms": set(metrics["keywords"]),
+            "_score": float(metrics["score"]) / 100.0,
+        })
+    # Greedy maximal marginal relevance prevents near-duplicate themes from
+    # consuming the bounded prompt just because they have more files.
+    selected = []
+    remaining = list(candidates)
+    target = max(1, int(limit_categories))
+    while remaining and len(selected) < target:
+        def rank(item):
+            overlap = 0.0
+            if selected and item["_terms"]:
+                overlap = max(
+                    len(item["_terms"] & prior["_terms"])
+                    / float(max(1, len(item["_terms"] | prior["_terms"])))
+                    for prior in selected
+                )
+            return item["_score"] - 0.25 * overlap, item["topic"]
+        chosen = max(remaining, key=rank)
+        remaining.remove(chosen)
+        selected.append(chosen)
+    for item in selected:
+        item.pop("_terms", None)
+        item.pop("_score", None)
+    return selected
 
 
 def _direction_prompt(items, coverage, strict=False):
@@ -493,6 +581,8 @@ def _direction_prompt(items, coverage, strict=False):
     user = (
         "以下是一批资料的智能目录证据汇总（主题含文件数、关键词与代表片段）。\n"
         "请提出 **{n} 个**研究方向：第 1 个是最推荐方向，其余是次推荐方向。\n"
+        "文件数仅作规模信息，不是优先级；请综合比较证据质量、独立来源、主题独特性、\n"
+        "研究影响、摘要覆盖以及可见的跨来源差异与证据缺口。\n"
         "要求：\n"
         "1) 方向必须落在上列主题的证据范围内；禁止使用「内容待归纳」这类占位说法；\n"
         "2) 每个方向给出以下字段：\n"
@@ -502,7 +592,8 @@ def _direction_prompt(items, coverage, strict=False):
         "   methods   2 条研究方法\n"
         "   evidence_paths  1-3 个路径，**必须逐字复制**下面的候选路径列表\n"
         "   confidence      0 到 1 之间的小数\n"
-        "3) 证据不足时减少方向数量，而不是编造。\n"
+        "3) 方向须综合跨来源支持、独特性、影响、时间或版本差异与证据缺口；不得按文件数排序。\n"
+        "4) 证据不足时减少方向数量，而不是编造。\n"
         "只输出 JSON：{{\"directions\":[{{\"title\":\"...\",\"why\":\"...\","
         "\"questions\":[\"...\"],\"methods\":[\"...\"],"
         "\"evidence_paths\":[\"...\"],\"confidence\":0.7}}]}}\n\n"

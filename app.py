@@ -2856,7 +2856,10 @@ def _queue_preliminary_file_summaries(scan_id, owner_id=None):
                 if (
                     str(options.get("workflow_source") or "") == "preliminary_model_summary"
                     and str(options.get("path") or "") == path
-                    and str(options.get("source_fingerprint") or "") == current_fingerprint
+                    and (
+                        not options.get("source_fingerprint")
+                        or str(options.get("source_fingerprint") or "") == current_fingerprint
+                    )
                 ):
                     active_for_path = True
                     retained.append(str(row["id"]))
@@ -2920,15 +2923,31 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
         if str(item)
     ]
     file_states = {}
-    if file_job_ids:
-        with storage._connect() as conn:
-            rows = conn.execute(
-                "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(
-                    ",".join("?" for _ in file_job_ids)
-                ),
-                [str(scan_id)] + file_job_ids,
-            ).fetchall()
-        file_states = {str(row["id"]): str(row["status"] or "") for row in rows}
+    active_file_jobs_by_path = {}
+    job_filter = " OR id IN ({})".format(",".join("?" for _ in file_job_ids)) if file_job_ids else ""
+    with storage._connect() as conn:
+        rows = conn.execute(
+            "SELECT id,status,options FROM analysis_jobs WHERE scan_id=? "
+            "AND task_type='generate_summary' AND (status IN ('queued','running','cancelling'){} )".format(job_filter),
+            [str(scan_id)] + file_job_ids,
+        ).fetchall()
+    active_statuses = {"queued", "running", "cancelling"}
+    for row in rows:
+        job_id = str(row["id"])
+        status = str(row["status"] or "")
+        if job_id in file_job_ids:
+            file_states[job_id] = status
+        if status not in active_statuses:
+            continue
+        try:
+            options = json.loads(row["options"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            options = {}
+        if str(options.get("workflow_source") or "") != "preliminary_model_summary":
+            continue
+        path = str(options.get("path") or "")
+        if path:
+            active_file_jobs_by_path.setdefault(path, set()).add(job_id)
     all_file_jobs_complete = all(
         file_states.get(job_id) == "completed" for job_id in file_job_ids
     )
@@ -2988,6 +3007,9 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
         member_summaries = []
         ready = True
         for path in sorted(members):
+            if active_file_jobs_by_path.get(path):
+                ready = False
+                break
             identity = _preliminary_summary_identity(scan_id, path)
             if identity is None:
                 ready = False
@@ -4689,21 +4711,29 @@ def _run_claimed_analysis_job(job):
         batch_size = max(1, min(8, int(getattr(Config, "CANDIDATE_PREVIEW_BATCH_SIZE", 4)))) if candidate_preview else 1
         for offset in range(0, len(summary_paths), batch_size):
             path_batch = summary_paths[offset:offset + batch_size]
+            summary_options = {
+                "scan_id": scan_id,
+                "path": path_batch[0] if len(path_batch) == 1 else None,
+                "paths": path_batch if candidate_preview else None,
+                "kind": "file",
+                "force": True,
+                "analysis_level": summary_analysis_level,
+                "workflow_source": summary_source,
+                "candidate_deadline_at": options.get("candidate_deadline_at"),
+                "deep_batch_id": deep_batch_id if not candidate_preview else None,
+                "selection_plan": options.get("selection_plan") if large_selection else None,
+            }
+            if summary_source == "preliminary_model_summary" and len(path_batch) == 1:
+                summary_document = storage.get_document(scan_id, path_batch[0]) or {}
+                source_fingerprint = document_source_fingerprint(summary_document)
+                if source_fingerprint:
+                    summary_options.update({
+                        "source_fingerprint": source_fingerprint,
+                        "summary_input_version": "preview-source-blocks-v2",
+                        "summary_prompt_version": "preview-claims-evidence-v2",
+                    })
             summary_job_id, _created = storage.create_or_get_typed_job(
-                scan_id,
-                "generate_summary",
-                options={
-                    "scan_id": scan_id,
-                    "path": path_batch[0] if len(path_batch) == 1 else None,
-                    "paths": path_batch if candidate_preview else None,
-                    "kind": "file",
-                    "force": True,
-                    "analysis_level": summary_analysis_level,
-                    "workflow_source": summary_source,
-                    "candidate_deadline_at": options.get("candidate_deadline_at"),
-                    "deep_batch_id": deep_batch_id if not candidate_preview else None,
-                    "selection_plan": options.get("selection_plan") if large_selection else None,
-                },
+                scan_id, "generate_summary", options=summary_options,
                 owner_id=job.get("owner_id") or "legacy",
             )
             if candidate_preview:

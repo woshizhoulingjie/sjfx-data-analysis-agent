@@ -271,8 +271,16 @@ def test_real_text_parser_appends_documents_and_rebuilds_combined_tree(tmp_path,
     store.save_scan(scan, 'actual', owner_id='owner')
     parser = UnifiedDocumentParser(max_chars=10000)
     options = {'threshold_bytes': 10**12, 'threshold_files': 100000}
-    first = analyze_package('actual', scan, store, parser, target_paths=['A/doc.txt'],
+    progress_events = []
+    first = analyze_package('actual', scan, store, parser,
+                            progress=lambda percent, message: progress_events.append((percent, message)),
+                            target_paths=['A/doc.txt'],
                             workflow_source='selected_file_parse', large_options=options, parse_mode_override='fast')
+    for expected in (72, 73, 74, 75, 76):
+        assert any(percent == expected for percent, _message in progress_events)
+    phase_messages = [message for percent, message in progress_events
+                      if percent in {72, 73, 74, 75, 76}]
+    assert len(phase_messages) >= 5
     store.save_summary('actual', 'A/doc.txt', 'deep_file_summary', {'deep_analysis': True, 'analysis_level': 'deep', 'summary': 'preserve original'})
     old_doc = store.get_document('actual', 'A/doc.txt')
     second = analyze_package('actual', scan, store, parser, target_paths=['B/doc.txt'],
