@@ -15,18 +15,9 @@ import json
 import time
 from services import large_package_catalog_naming as naming
 
-BATCH_SYSTEM = naming.SYSTEM.split("只输出JSON：", 1)[0] + (
-    '\n本次输入含多个独立内容组 groups。逐组完成相同的命名任务；'
-    '每组证据编号只在本组有效，不混用任何其他组的事实。'
-    '只输出JSON：{"groups":[{"id":"G1","name":"名称","description":"范围",'
-    '"evidence_ids":["E1"],"outliers":[],"needs_review":false}]}。'
-    '"outliers" 只列出该组中**明显不属于本组共同主题**的证据编号，'
-    '**确实没有就填空数组 []——这是绝大多数组的正确回答**。'
-    '同一领域的不同侧面、同一政策的不同条款、同一研究的不同方法，都属于同一个共同主题；'
-    '名称里出现顿号也只说明内容有层次，不代表成员无关。'
-    '只有某一两项确实是另一件毫不相干的事时才列出，且不得超过本组半数。'
-    '证据编号必须来自对应组。不得自行改成员。'
-    '每个输入组恰好返回一项，id 原样返回。')
+BATCH_SYSTEM = (naming.NAMING_RULES + naming.NAMING_OUTPUT_RULES +
+    '本次groups包含多个独立组。各组事实和证据编号不得混用，每组恰好返回一项，id原样返回。'
+    '只输出JSON：{"groups":[{"id":"G1",' + naming.NAMING_RESULT_SCHEMA[1:] + ']}')
 
 
 def process_batch(store, package_id, cancelled=lambda: False, model_client=None):
@@ -56,7 +47,7 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None)
             jobs = [dict(row) for row in c.execute("""SELECT j.*,g.member_count n
                 FROM lp_catalog_jobs j JOIN large_catalog_groups g ON g.package_id=j.package_id AND g.id=j.group_id
                 WHERE j.package_id=? AND j.status='queued' AND j.next_at<=?
-                ORDER BY n """ + order + ",j.group_id LIMIT ?", (package_id,time.time(),size))]
+                ORDER BY n """ + order + ",j.group_id LIMIT ?", (package_id,time.time(),min(24,size*3)))]
             for job in jobs:
                 c.execute("UPDATE lp_catalog_jobs SET status='running',leased=? WHERE package_id=? AND group_id=? AND revision=?", (time.time(),package_id,job['group_id'],job['revision']))
         c.commit()
@@ -68,6 +59,7 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None)
         return cancelled() or not package or package['status'] in {'paused','cancelled'} or time.time() >= current['deadline']
 
     pending, payload = [], []
+    oversized = False
     call_id = None
     response = {}
     started = time.monotonic()
@@ -79,11 +71,26 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None)
         model_client = model_client or naming.client()
         if not model_client:
             raise ValueError('本机命名模型未启用')
+        prepared=[]
         for job in jobs:
+            if stop():break
+            try:
+                material=naming.bundle(store,package_id,job['group_id'])
+                prepared.append((job,material))
+            except Exception as exc:
+                one=naming.classify_failure(exc)
+                naming.release_job(store,package_id,job['group_id'],job['revision'],attempts=job['attempts'],error=str(exc),category=one)
+        # Alternate ordering inherited from the claim prevents large groups from starving.
+        prepared.sort(key=lambda pair:(pair[1].get('route','clear'),pair[1].get('tokens',0)),reverse=order=='DESC')
+        batch_route=None
+        for job,material in prepared:
             if stop():
                 break
             try:
-                material = naming.bundle(store, package_id, job['group_id'])
+                difficulty=material.get('route','clear')
+                if len(pending)>=size or (batch_route is not None and difficulty!=batch_route):
+                    naming.release_job(store,package_id,job['group_id'],job['revision'],attempts=job['attempts'])
+                    continue
                 with closing(store._connect()) as c:
                     cached = c.execute('SELECT result FROM lp_catalog_cache WHERE owner_id=? AND model=? AND digest=?', (material['owner_id'],model_client.model,material['digest'])).fetchone()
                 if cached:
@@ -93,9 +100,11 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None)
                     continue
                 item = {'id':'G'+str(len(pending)+1), **json.loads(material['user'])}
                 proposed = json.dumps({'groups':payload+[item]}, ensure_ascii=False,separators=(',',':'))
-                if pending and naming.token_count(BATCH_SYSTEM+'\n'+proposed)+64 > getattr(Config,'LP_CATALOG_BATCH_INPUT_TOKENS',6500):
+                if naming.token_count(BATCH_SYSTEM+'\n'+proposed)+64 > getattr(Config,'LP_CATALOG_BATCH_INPUT_TOKENS',6500):
+                    oversized = True
                     naming.release_job(store,package_id,job['group_id'],job['revision'],attempts=job['attempts'])
                     continue
+                batch_route=difficulty
                 pending.append((job,material,item['id']))
                 payload.append(item)
             except Exception as exc:
@@ -103,10 +112,13 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None)
                 failed.append({'group': job['group_id'], 'category': one})
                 naming.release_job(store, package_id, job['group_id'], job['revision'],
                                    attempts=job['attempts'], error=str(exc), category=one)
+        if not pending and oversized and not stop():
+            return naming.process_one(store,package_id,cancelled,model_client)
         if not pending or stop():
             return True
         user = json.dumps({'groups':payload},ensure_ascii=False,separators=(',',':'))
-        output = cfg['output'] * len(pending) + 32
+        from services.large_package_catalog_schema import output_budget
+        output = sum(output_budget(cfg,m) for _,m,_ in pending)+32
         reserved = naming.token_count(BATCH_SYSTEM+'\n'+user)+64+output
         # A batch that cannot fit the remaining token budget must not exhaust
         # the round if an ordinary single-group request can still fit.
@@ -121,7 +133,8 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None)
         kwargs = {'temperature':.1,'max_tokens':output,'retries':0,
                   'timeout':min(cfg['timeout'],max(1,int(current['deadline']-time.time())))}
         if getattr(model_client,'supports_json_response_format',False):
-            kwargs['response_format']={'type':'json_object'}
+            from services.large_package_catalog_schema import response as schema_response
+            kwargs['response_format']=schema_response(pending=pending)
         with background_generation(stop):
             response=model_client.chat(BATCH_SYSTEM,user,**kwargs)
         if response.get('finish_reason')=='length':

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
+from itertools import combinations
 from typing import Any, Dict, List, Mapping, Optional
 
 from services.conversation import ConversationScope
 from services.evidence import verify_claim_evidence
 from services.evidence_ledger import build_evidence_ledger
+from services import answer_quality as aq
 
 
 NUMBER_RE = re.compile(
@@ -15,10 +17,12 @@ NUMBER_RE = re.compile(
 )
 SECTION_LABEL_RE = re.compile(
     r"^(?:直接回答|资料依据|主要结论|分析结论|核验后的结论|核验说明|进一步分析或建议|风险提示|"
-    r"时间线|关系分析|矛盾检查|统计结果)[:：]?$"
+    r"时间线|关系分析|矛盾检查|统计结果|进一步分析|主要差异|比较结果|下一步建议)[:：]?$"
 )
 VERIFICATION_NOTE_RE = re.compile(
-    r"(?:条陈述因证据不足|未作为确定结论输出|未找到直接原文支持|避免伪造事实)"
+    r"(?:条陈述因证据不足|未作为确定结论输出|未找到直接原文支持|避免伪造事实|"
+    r"^以上概括中，部分细节的依据还不充分，需结合原文进一步确认[。]?$|"
+    r"^资料暂时无法支持的内容没有纳入这份回答[。]?$)"
 )
 PROVENANCE_NOTE_RE = re.compile(
     r"^(?:(?:本次|当前|以上)?(?:分析|回答|结论|核验)(?:是)?(?:基于|依据|引用自)|"
@@ -80,7 +84,7 @@ def _attribute_claim(
         return None
     scored: List[Any] = []
     for position, citation in enumerate(citations, 1):
-        if not _scope_contains(scope, citation):
+        if not _scope_contains(scope, citation) or (aq.enabled() and aq.source_kind(citation) == "preview"):
             continue
         evidence_concepts = _concepts(_citation_item(citation).get("text"))
         if not evidence_concepts:
@@ -103,6 +107,27 @@ def _attribute_claim(
     coverage = len(union) / float(len(claim_concepts) or 1)
     if coverage < min_coverage:
         return None
+    # Six overlapping matches need not become six inline references. Find the
+    # smallest subset retaining exactly the same matched concepts and numbers;
+    # never lower the attribution bar just to make a sentence look cleaner.
+    source_numbers = {
+        int(item.get("citation_index") or position): _numbers(_citation_item(item).get("text"))
+        for position, item in enumerate(citations, 1)
+    }
+    needed_numbers = _numbers(claim_text) & set().union(
+        *(source_numbers[index] for _count, index, _overlap in selected)
+    )
+    reduced = None
+    for size in range(max(2, min_sources), len(selected)):
+        for subset in combinations(selected, size):
+            concepts = set().union(*(overlap for _count, _index, overlap in subset))
+            numbers = set().union(*(source_numbers[index] for _count, index, _overlap in subset))
+            if concepts == union and needed_numbers.issubset(numbers):
+                reduced = list(subset)
+                break
+        if reduced is not None:
+            selected = reduced
+            break
     return {
         "indexes": [index for _count, index, _overlap in selected],
         "coverage": coverage,
@@ -173,6 +198,71 @@ def _draft_cites_known_evidence(result: Mapping[str, Any]) -> bool:
     return bool(indexes & available)
 
 
+def _readable_guard_blocks(claims):
+    """Keep the author's paragraph structure while filtering failed claims.
+
+    No new factual prose is generated here. Citation attribution is copied only
+    from the verified ledger. Headings survive only with a surviving body.
+    """
+    blocks = []
+    pending_headings = []
+    last_paragraph = None
+    last_was_heading = False
+    partial = 0
+    omitted = 0
+    for position, claim in enumerate(claims):
+        status = claim.get("status")
+        raw = str(claim.get("raw_text") or claim.get("text") or "").strip()
+        if not raw:
+            continue
+        if status == "section_label":
+            if not last_was_heading:
+                pending_headings = []
+            if not re.fullmatch(r"[| :\-]+", raw):
+                pending_headings.append(raw)
+            last_was_heading = True
+            last_paragraph = None
+            continue
+        last_was_heading = False
+        if status not in {"supported", "partially_supported", "analysis_or_advice"}:
+            omitted += 1
+            continue
+        if status == "partially_supported":
+            partial += 1
+        # Preserve the actual references when the verifier attributed an
+        # uncited synthesis; never guess a reference from paragraph position.
+        indexes = claim.get("citation_indexes") or []
+        if indexes and not re.search(r"\[\d{1,4}\]", raw):
+            labels = " ".join("[{}]".format(int(index)) for index in indexes)
+            ending = raw[-1:] if raw.endswith(("。", "！", "？", ".", "!", "?")) else ""
+            raw = (raw[:-1] if ending else raw) + " " + labels + ending
+        if pending_headings:
+            blocks.extend(pending_headings)
+            pending_headings = []
+        paragraph = claim.get("paragraph_index", position)
+        if blocks and paragraph == last_paragraph:
+            separator = "" if blocks[-1].endswith(("。", "！", "？")) else " "
+            blocks[-1] += separator + raw
+        else:
+            blocks.append(raw)
+        last_paragraph = paragraph
+    heading_texts={str(c.get('raw_text') or c.get('text') or '').strip() for c in claims if c.get('status')=='section_label'}
+    blocks=[block for index,block in enumerate(blocks)
+            if not (re.sub(r'\[\d{1,4}\]', '', block).strip().endswith(('：', ':'))
+                    and (index+1==len(blocks) or blocks[index+1] in heading_texts))]
+    blocks=[block for index,block in enumerate(blocks)
+            if block not in heading_texts or (index+1<len(blocks) and blocks[index+1] not in heading_texts)]
+    # Removing an unsupported list item must not leave numbering such as 2,3,4.
+    number = 0
+    for index, block in enumerate(blocks):
+        if re.match(r'^\d{1,3}[.)、]\s+', block):
+            number += 1
+            blocks[index] = re.sub(r'^\d{1,3}([.)、])', str(number)+r'\1', block, count=1)
+        else:
+            number = 0
+    return blocks, omitted, partial
+
+
 class ClaimVerifier:
     """Verify every factual sentence against the exact citations it names."""
 
@@ -188,6 +278,8 @@ class ClaimVerifier:
         tool_results = dict(tool_results or plan.get("tool_results") or {})
         batch_summary = dict(batch_summary or plan.get("batch_summary") or {})
         citations = list(turn_result.get("citations") or [])
+        if aq.enabled() and "model_citations" in turn_result:
+            citations = list(turn_result.get("model_citations") or [])
         by_index = {
             int(item.get("citation_index") or index): item
             for index, item in enumerate(citations, 1)
@@ -196,7 +288,7 @@ class ClaimVerifier:
         casual = "casual" in (plan.get("modes") or [])
         scope = ConversationScope.from_dict(plan.get("scope") or {"kind": "package"})
         warnings: List[str] = []
-        invalid_labels = 0
+        invalid_labels = len((turn_result.get("input_manifest") or {}).get("invalid_generated_citation_indexes") or [])
         numeric_failures = 0
         out_of_scope = [item for item in citations if not _scope_contains(scope, item)]
 
@@ -205,7 +297,7 @@ class ClaimVerifier:
             claim = dict(claim)
             text = str(claim.get("text") or "").strip()
             indexes = list(claim.get("citation_indexes") or [])
-            if SECTION_LABEL_RE.match(text) or _is_section_lead_in(text):
+            if claim.get("status") == "section_label" or SECTION_LABEL_RE.match(_claim_body(text)) or _is_section_lead_in(text):
                 claim.update({"status": "section_label", "evidence_ids": []})
                 verified_claims.append(claim)
                 continue
@@ -225,13 +317,15 @@ class ClaimVerifier:
                 invalid_labels += len(missing)
             named = [by_index[index] for index in indexes if index in by_index]
             evaluations = [
-                verify_claim_evidence(check_text, _citation_item(item)) for item in named
+                verify_claim_evidence(check_text, aq.claim_source(_citation_item(item), check_text) if aq.enabled() else _citation_item(item)) for item in named
             ]
             claim_concepts = _concepts(check_text)
             for evaluation, item in zip(evaluations, named):
+                if aq.enabled() and aq.source_kind(item) == "preview":
+                    continue
                 if evaluation.get("support_status") != "insufficient":
                     continue
-                evidence_text = _citation_item(item).get("text") or ""
+                evidence_text = (aq.claim_source(_citation_item(item), check_text) if aq.enabled() else _citation_item(item)).get("text") or ""
                 overlap = claim_concepts.intersection(_concepts(evidence_text))
                 same_polarity = bool(NEGATION_RE.search(check_text)) == bool(
                     NEGATION_RE.search(evidence_text)
@@ -316,32 +410,23 @@ class ClaimVerifier:
             for item in named:
                 citation_numbers.update(_numbers(_citation_item(item).get("text")))
             numeric_supported = not claim_numbers or claim_numbers.issubset(citation_numbers)
-            claim_identifiers = _identifiers(check_text)
-            if claim_numbers and numeric_supported and claim_identifiers:
+            if aq.enabled() and claim_numbers and numeric_supported:
+                eligible = [item for item in named if aq.source_kind(item) != "preview"]
+                numeric_supported = bool(eligible) and all(
+                    any(aq.numeric_relation_supported(check_text, _citation_item(item).get("text", ""), {number}) for item in eligible)
+                    for number in claim_numbers
+                )
+                # Precise key/value facts may have very few lexical concepts.
+                # Upgrade only when one complete eligible clause binds the value.
                 for evaluation, item in zip(evaluations, named):
-                    evidence_identifiers = _identifiers(
-                        _citation_item(item).get("text")
-                    )
-                    if claim_identifiers.intersection(evidence_identifiers):
-                        evaluation.update({
-                            "support_status": "supported",
-                            "support_score": max(
-                                0.92, float(evaluation.get("support_score") or 0)
-                            ),
-                            "support_reason": "字段名和精确数值均可在对应原文中直接核对。",
-                            "support_relation": "exact_field_value",
-                            "matched_identifiers": sorted(
-                                claim_identifiers.intersection(evidence_identifiers)
-                            )[:8],
-                        })
-                supported = [
-                    item for item in evaluations
-                    if item.get("support_status") == "supported"
-                ]
-                partial = [
-                    item for item in evaluations
-                    if item.get("support_status") == "partially_supported"
-                ]
+                    if aq.source_kind(item) != "preview" and aq.numeric_relation_supported(check_text, _citation_item(item).get("text", ""), claim_numbers):
+                        evaluation.update({"support_status": "supported", "support_score": 0.9,
+                                           "support_reason": "对象、字段与数值在同一原文句段中对应。",
+                                           "support_relation": "local_field_value"})
+                supported = [item for item in evaluations if item.get("support_status") == "supported"]
+                partial = [item for item in evaluations if item.get("support_status") == "partially_supported"]
+            if aq.enabled() and named and all(aq.source_kind(item) == "preview" for item in named):
+                supported, partial = [], []
             if not numeric_supported:
                 numeric_failures += 1
 
@@ -360,9 +445,10 @@ class ClaimVerifier:
                 failure_reason = "陈述没有关联正文引用"
             elif not numeric_supported:
                 missing_numbers = sorted(claim_numbers - citation_numbers)
-                failure_reason = "引用中缺少数值：{}".format(
-                    "、".join(missing_numbers)
-                )
+                failure_reason = ("引用中缺少数值：{}".format("、".join(missing_numbers))
+                                  if missing_numbers else "数值与对应对象、字段、时间或否定条件不一致")
+            elif aq.enabled() and named and all(aq.source_kind(item) == "preview" for item in named):
+                failure_reason = "预览内容不能作为正式事实依据"
             elif status == "unsupported":
                 failure_reason = "引用正文与陈述的核心含义不匹配"
             elif status == "partially_supported":
@@ -554,6 +640,16 @@ class ClaimVerifier:
             "deep_analysis_coverage": quality_metrics["candidate_deep_coverage"],
             "evidence_support_ratio": support_ratio,
         })
+        missing_aspects = aq.missing_answer_aspects(
+            str(turn_result.get("answer") or ""),
+            (turn_result.get("input_manifest") or {}).get("answer_contract") or {},
+        ) if aq.enabled() else []
+        quality_metrics["possibly_missing_answer_aspects"] = missing_aspects
+        if missing_aspects:
+            warnings.append("请检查是否漏答以下明确问题要点：{}。".format("、".join(missing_aspects)))
+            if status == "verified":
+                status = "partial"
+                quality_metrics["verification_status"] = status
         ledger.update(
             {
                 "claims": verified_claims,
@@ -578,6 +674,7 @@ class ClaimVerifier:
                     or invalid_labels
                     or numeric_failures
                     or out_of_scope
+                    or missing_aspects
                 )
             ),
             "scope_checked": True,
@@ -586,6 +683,7 @@ class ClaimVerifier:
             "numeric_values_checked": True,
             "counter_evidence_checked": counter_search_performed,
             "warnings": warnings,
+            "missing_answer_aspects": missing_aspects,
             "failed_claims": [
                 {
                     "claim_id": item.get("claim_id"),
@@ -612,7 +710,10 @@ class ClaimVerifier:
         claims = list((verification.get("ledger") or {}).get("claims") or [])
         kept: List[str] = []
         omitted = 0
-        for claim in claims:
+        partial = 0
+        if aq.enabled():
+            kept, omitted, partial = _readable_guard_blocks(claims)
+        for claim in ([] if aq.enabled() else claims):
             status = claim.get("status")
             text = _strip_list_marker(str(claim.get("text") or "").strip())
             if not text or status == "section_label":
@@ -629,11 +730,10 @@ class ClaimVerifier:
         if kept:
             # Rebuild the list after filtering so removed claims never leave
             # broken numbering or orphaned sections in the final answer.
-            answer = "\n".join(
-                "{}. {}".format(index, item)
-                for index, item in enumerate(kept, 1)
+            answer = "\n\n".join(kept) if aq.enabled() else "\n".join(
+                "{}. {}".format(index, item) for index, item in enumerate(kept, 1)
             )
-        elif _draft_cites_known_evidence(result):
+        elif not aq.enabled() and _draft_cites_known_evidence(result):
             # The verifier could not confirm a single claim, but the draft does
             # cite evidence that exists.  Replacing the whole answer with a bare
             # "insufficient evidence" line discards everything the reader asked
@@ -649,7 +749,15 @@ class ClaimVerifier:
             # No surviving claim and nothing cited: the answer is unrelated to
             # the retrieved evidence, so it is withheld entirely.
             answer = "现有证据不足，暂时无法形成可核验的确定结论。"
-        if omitted:
+        if aq.enabled() and kept:
+            notes = []
+            if partial:
+                notes.append("以上概括中，部分细节的依据还不充分，需结合原文进一步确认。")
+            if omitted:
+                notes.append("资料暂时无法支持的内容没有纳入这份回答。")
+            if notes:
+                answer += "\n\n" + "".join(notes)
+        elif omitted and not aq.enabled():
             answer += (
                 "\n\n核验说明\n- {} 条陈述因证据不足或仅得到部分支持，"
                 "未作为确定结论输出。"
@@ -657,7 +765,7 @@ class ClaimVerifier:
         result["answer"] = answer
         result["evidence_status"] = (
             "unverified" if kept_draft
-            else ("supported" if kept and not omitted else "partial")
+            else ("supported" if kept and not omitted and not partial else "partial")
         )
         result["status"] = "answered" if (kept or kept_draft) else "insufficient_evidence"
         stale_verification_warning = re.compile(

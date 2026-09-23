@@ -217,7 +217,7 @@ def page(title, body, script=""):
         '%%3Crect width=\'32\' height=\'32\' rx=\'8\' fill=\'%%234d7cfe\'/%%3E'
         '%%3Ctext x=\'16\' y=\'23\' font-size=\'19\' text-anchor=\'middle\''
         ' fill=\'white\'%%3E%%E2%%97%%86%%3C/text%%3E%%3C/svg%%3E">\n'
-        '<style>%s</style>\n</head>\n<body>\n%s\n<script>%s</script>\n</body>\n</html>\n'
+        '<style>%s</style>\n<script src="/protection/bridge.js"></script></head>\n<body>\n%s\n<script>%s</script>\n</body>\n</html>\n'
         % (title, _BASE_CSS, body, _COMMON_JS + "\n" + script)
     )
 

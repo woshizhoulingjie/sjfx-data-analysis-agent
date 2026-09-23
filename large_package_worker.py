@@ -112,6 +112,7 @@ class LargePackageWorker:
         self.stop_requested = False
         from services.large_package_preview_runner import PreviewRunner
         self.preview_runner = PreviewRunner()
+        self._preview_runners = [self.preview_runner]+[PreviewRunner() for _ in range(max(1,Config.LP_PREVIEW_CONCURRENCY)-1)]
         self._naming_executor = None
         self._naming_future = None
         # 已做过主题归并的包 → 当时的叶组签名。仅进程内有效；
@@ -285,6 +286,9 @@ class LargePackageWorker:
         try:
             cancelled = lambda: self._interrupted(package_id)
             claimed = embed_batch(self.store, package_id, cancelled=cancelled)
+            if not cancelled():
+                from services.large_package_feature_delta import ensure_package
+                ensure_package(self.store,package_id,max_batches=2)
             self._ensure_km_finalized(package_id, claimed=claimed)
             name_batch(self.store, package_id, cancelled=cancelled)
         except Exception:
@@ -319,28 +323,56 @@ class LargePackageWorker:
             from config import Config
             if not getattr(Config, "LP_CATALOG_KMODE", False):
                 return False
+            from services.large_package_semantic import (
+                _km_signature, _km_state_get, kmeans_recluster, material_pending_count)
             # 方案 A：目录结构在"智能目录确定"（catalog_ready）之后**冻结**。
             # 深度摘要会改写正文并重新嵌入，若继续重算聚类，group id 会全部变化，
             # 已生成的目录名与第一版情报概览会同时作废；而情报概览的更新只升级
             # 证据层级、不改变结构。需要恢复"深度摘要后重算目录"时把
             # SJFX_LP_CATALOG_FREEZE_AFTER_CATALOG 设为 0。
-            if getattr(Config, "LP_CATALOG_FREEZE_AFTER_CATALOG", True):
+            #
+            # **冻结只对"已经聚类成功过"的包生效。** 这一条限定是必须的，不是放宽：
+            # 判据是 km_state 里到底有没有这个包的记录。旧写法只看 phase，于是
+            # 「聚类失败 → 相位照常推进到 catalog_ready → 冻结 → 永不重试」形成死锁，
+            # 包会永久停在占位分组上（生产实测：lp-085e413e2… 7484 份文件全在
+            # km-pending 一个组里，worker 一个多小时不再重试，界面只剩「待归并主题」）。
+            # 从没聚类成功过的包没有任何 group 名可作废，重试它不构成"静默重分组"。
+            frozen = bool(_km_state_get(self.store, package_id))
+            if getattr(Config, "LP_CATALOG_FREEZE_AFTER_CATALOG", True) and frozen:
                 current = self.store.get(package_id) or {}
                 if str(current.get("phase") or "") in {"catalog_ready", "deep_parse", "report_ready"}:
-                    # **冻结是无条件的**，这条产品规则不能被削弱。
-                    #
-                    # 我一度把它改成"只冻结已经聚类过的包"，想顺手治好 10 个碎片目录
-                    # （生产实测 23 个非取消包全部被冻结，其中 10 个的叶组 88%~100%
-                    # 是 ≤3 个成员的碎片）。但那样做的真实后果是：**从未聚类过的包会
-                    # 在正常调度里被静默重聚类**——正是框架 §11 明令禁止的"不静默重分组"，
-                    # 也是我自己说过不做的事。仓库里 4 个契约用例当场由通过变失败
-                    # （抽取式目录被 k-means 目录整体替换，`catalog_model`/`catalog_group`
-                    # 直接消失），证明这个口子影响面远超"那 10 个包"。
-                    #
-                    # 正确的出口是**显式重建**：`naming.rebuild_catalog()` 直接调用
-                    # kmeans_recluster，不经过本函数，所以不需要在这里放宽任何条件。
-                    # 人点了 POST /catalog/rebuild 才重排目录。
-                    return False
+                    # 已聚类过的包：结构冻结，只有显式重建（naming.rebuild_catalog，
+                    # 它直接调用 kmeans_recluster，不经过本函数）或指纹未变才继续。
+                    if _km_signature(self.store, package_id) == _km_state_get(self.store, package_id):
+                        return False
+                    # 收尾点 3/5：向唯一判定口取证（只记录，不改变本函数原有闸门 ——
+                    # 聚类必须等"所有有素材的文件都有向量"，那条件比 advance() 的 gates 更严）。
+                    try:
+                        _v = self.store.advance(package_id) or {}
+                        if _v.get("blocked_by"):
+                            LOGGER.debug("km finalize: package=%s advance blocked_by=%s",
+                                         package_id, _v.get("blocked_by"))
+                    except Exception:
+                        pass
+                    quick = self.store.stage_counts(package_id, "quick")
+                    if any(int(quick.get(k) or 0) for k in ("queued", "retry", "running")):
+                        return False
+                    stage = self.store.stage_counts(package_id, "catalog")
+                    if any(int(stage.get(k) or 0) for k in ("queued", "retry", "running")):
+                        return False
+                    pending = material_pending_count(self.store, package_id)
+                    if pending:
+                        LOGGER.info("large package %s k-means waits for %d material files",
+                                    package_id, pending)
+                        return False
+                    from services.large_package_catalog_quality import repair_changed
+                    repaired = repair_changed(self.store, package_id)
+                    if repaired is None:
+                        LOGGER.info("large package %s catalog change too large to repair while "
+                                    "frozen; explicit rebuild required", package_id)
+                        return False
+                    LOGGER.info("large package %s repaired %s groups while frozen", package_id, repaired)
+                    return bool(repaired)
             # 收尾点 3/5：向唯一判定口取证（只记录，不改变本函数原有闸门 ——
             # 聚类必须等"所有有素材的文件都有向量"，那条件比 advance() 的 gates 更严）。
             try:
@@ -356,8 +388,6 @@ class LargePackageWorker:
             stage = self.store.stage_counts(package_id, "catalog")
             if any(int(stage.get(k) or 0) for k in ("queued", "retry", "running")):
                 return False
-            from services.large_package_semantic import (
-                _km_signature, _km_state_get, kmeans_recluster, material_pending_count)
             pending = material_pending_count(self.store, package_id)
             if pending:
                 LOGGER.info("large package %s k-means waits for %d material files",
@@ -366,7 +396,7 @@ class LargePackageWorker:
             signature = _km_signature(self.store, package_id)
             if signature == _km_state_get(self.store, package_id):
                 return False
-            changed = kmeans_recluster(self.store, package_id, force=True)
+            changed = kmeans_recluster(self.store, package_id, force=force)
             LOGGER.info("large package %s k-means finalized changed=%s", package_id, changed)
             # 叶组变了，让命名队列按新分组重建。
             # 这里必须无条件执行：占位分组阶段可能已经给部分 group_id 写入过
@@ -576,7 +606,7 @@ class LargePackageWorker:
             _prof[key] = _prof.get(key, 0.0) + (time.monotonic() - t0)
         updated = 0.0
         _t = time.monotonic()
-        runners = [self.preview_runner] + [PreviewRunner() for _ in range(Config.LP_PREVIEW_CONCURRENCY-1)]
+        runners = self._preview_runners
         _lap('mk_runners', _t)
         since_catalog = 0
         slice_deadline = time.monotonic() + 30
@@ -590,22 +620,18 @@ class LargePackageWorker:
                     # 改动前是"先领满 len(runners) 个，再按**提交顺序** future.result()"，
                     # 一个慢文件会把同批里已经跑完的车道一起挂住——实测一个 4 秒
                     # 超时文件能让其余 3 个空闲车道白等（预览预算是 4 秒/文件）。
-                    while free_runners and time.monotonic() < slice_deadline:
-                        _t = time.monotonic()
-                        claimed = self.store.claim("quick", 1, package_id=package_id)
-                        _lap('claim', _t)
-                        if not claimed:
-                            break
-                        _, path, lease = claimed[0]
-                        runner = free_runners.pop()
-                        _t = time.monotonic()
-                        item = self.store.get_file(package_id, path)
-                        _lap('getfile', _t)
-                        _t = time.monotonic()
-                        future = pool.submit(runner.run, package['root_path'], item,
-                                             cancel_check=lambda: self._interrupted(package_id))
-                        _lap('submit', _t)
-                        inflight[future] = (path, runner, lease)
+                    if free_runners and time.monotonic() < slice_deadline:
+                        _t=time.monotonic()
+                        claimed=self.store.claim('quick',len(free_runners),package_id=package_id)
+                        _lap('claim',_t)
+                        _t=time.monotonic()
+                        items=self.store.preview_files(package_id,[p for _,p,_ in claimed])
+                        _lap('getfile',_t)
+                        for _,path,lease in claimed:
+                            runner=free_runners.pop()
+                            future=pool.submit(runner.run,package['root_path'],items.get(path) or {'path':path},
+                                               cancel_check=lambda:self._interrupted(package_id))
+                            inflight[future]=(path,runner,lease)
                     if not inflight:
                         stage = self.store.stage_counts(package_id, "quick")
                         if any(stage.get(k) for k in ('running','queued','retry')):
@@ -621,20 +647,27 @@ class LargePackageWorker:
                     _prof['n_wait'] = _prof.get('n_wait', 0) + 1
                     _prof['n_batch'] = _prof.get('n_batch', 0) + len(finished)
                     _t = time.monotonic()
+                    commits=[];followups=[]
+                    prior=self.store.preview_files(package_id,[inflight[f][0] for f in finished])
                     for future in finished:
-                        path, runner, lease = inflight.pop(future)
-                        free_runners.append(runner)
+                        path,runner,lease=inflight.pop(future);free_runners.append(runner)
                         try:
                             summary,_=future.result()
-                            self._commit_preview(package_id, path, summary, lease)
+                            if summary.get('status')=='failed':raise RuntimeError(summary.get('error') or '轻量解析失败')
+                            fields=self._preview_fields(summary,prior.get(path),False)
+                            commits.append(dict(package_id=package_id,path=path,stage='quick',token=lease,file_fields=fields))
+                            followups.append((path,bool((summary.get('portrait') or {}).get('needs_refine'))))
                         except PreviewCancelled:
                             self.store.requeue(package_id,path,'quick',token=lease)
                         except Exception as exc:
-                            self.store.commit_stage_result(
-                                package_id, path, 'quick', lease, ok=False,
-                                error=str(exc)[:500],
-                                file_fields={'quick_status':'failed','error':str(exc)[:500]})
+                            commits.append(dict(package_id=package_id,path=path,stage='quick',token=lease,ok=False,
+                                error=str(exc)[:500],file_fields={'quick_status':'failed','error':str(exc)[:500]}))
+                            followups.append((path,False))
                         done+=1
+                    if commits:
+                        outcomes=self.store.commit_stage_batch(commits)
+                        for (ok,reason),(path,refine) in zip(outcomes,followups):
+                            if ok and refine:self.store.enqueue_recognition(package_id,path)
                     _lap('collect', _t)
                     # 目录增量改为异步后台车道：节奏仍是每 32 个文件一次，
                     # 但不再占用预览主线程（详情见 _schedule_catalog_incremental）。
@@ -662,10 +695,11 @@ class LargePackageWorker:
                         package_id, path, 'quick', lease, ok=False, error=str(exc)[:500],
                         file_fields={'quick_status': 'failed', 'error': str(exc)[:500]})
             _t = time.monotonic()
-            self._drain_catalog_lane()
+            if self._interrupted(package_id):self._drain_catalog_lane()
             _lap('drain', _t)
             _t = time.monotonic()
-            for runner in runners[1:]:runner.close()
+            if self._interrupted(package_id):
+                for runner in runners:runner.close()
             _lap('close_runners', _t)
             _total = time.monotonic() - _started
             _n = done - _done0
@@ -1001,6 +1035,9 @@ class LargePackageWorker:
         self._topic_stale_at[package_id] = now
         try:
             with closing(self.store._connect()) as c:
+                from services.large_package_catalog_tree import stale as tree_stale
+                tree_state=tree_stale(c,package_id)
+                if tree_state is not None:return tree_state
                 # **必须与 merge_topics 的叶组口径一致**：只算"有成员、且标签
                 # 与 content_revision 对齐（或已锁定）"的真实叶组。
                 #
@@ -1081,7 +1118,18 @@ class LargePackageWorker:
                     "WHERE l.package_id=? AND g.id NOT LIKE 'km-other-%' "
                     "AND (l.revision=g.content_revision OR l.locked=1)",
                     (package_id,)).fetchone()
+                from services.large_package_catalog_tree import fingerprint as tree_fingerprint
+                leaf_versions=[dict(r) for r in conn.execute('''SELECT g.id group_id,g.content_revision,l.version,l.name
+                    FROM large_catalog_groups g JOIN lp_catalog_labels l ON l.package_id=g.package_id AND l.group_id=g.id
+                    WHERE g.package_id=? AND g.member_count>0 AND (l.revision=g.content_revision OR l.locked=1)
+                    AND g.id NOT LIKE 'km-other-%' AND g.id NOT LIKE 'km-pending-%' ''',(package_id,))]
+                tree_key=tree_fingerprint(leaf_versions)
+                tree_row=conn.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',(package_id,)).fetchone()
+                if tree_row and json.loads(tree_row[0]).get('pending_names'):
+                    latest=conn.execute('SELECT id FROM lp_catalog_rounds WHERE package_id=? ORDER BY started DESC LIMIT 1',(package_id,)).fetchone()
+                    if latest:tree_key+=':'+latest[0]
             signature = tuple(int(x or 0) for x in (row or (0, 0, 0)))
+            signature += (tree_key,)
             if self._topics_merged.get(package_id) == signature:
                 # 签名回到"已归并"的那个点上：没有欠账了，清掉去抖标记，
                 # 否则 _topic_rebuild_owed 会一直认为还欠一次重建而挡住定稿。
@@ -1707,6 +1755,8 @@ class LargePackageWorker:
         return False
 
     def _catalog_background(self):
+        from services.large_package_catalog_refine import process_one as refine_one
+        if not self.stop_requested and refine_one(self):return True
         from services.large_package_semantic import embed_batch, name_batch
         with closing(self.store._connect()) as conn:
             pending = conn.execute("""SELECT q.package_id FROM queue q JOIN packages p ON p.id=q.package_id
@@ -1881,7 +1931,7 @@ class LargePackageWorker:
                 if not self.run_once():
                     time.sleep(self.poll_seconds)
         finally:
-            self.preview_runner.close()
+            for runner in self._preview_runners:runner.close()
             if self._catalog_lane:
                 self._catalog_lane.shutdown(wait=True, cancel_futures=True)
             if self._naming_executor:

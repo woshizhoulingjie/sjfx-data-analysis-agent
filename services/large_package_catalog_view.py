@@ -96,16 +96,18 @@ def enhance_catalog(store,package_id,result,limit=200,offset=0,query=''):
                            'files':group['files'],'basis':'已有内容线索，尚未完成语义归组','sample':[], 'naming_status':'unread'})
         from services.large_package_catalog_hierarchy import visible
         branches=visible(c,package_id)
+        navigation=[dict(node_id=r['id'],name=r['name'] or '内容正在归纳',topic=r['name'] or '内容正在归纳',files=r['member_count'])
+                    for r in c.execute('SELECT g.id,g.member_count,l.name FROM large_catalog_groups g LEFT JOIN lp_catalog_labels l ON l.package_id=g.package_id AND l.group_id=g.id WHERE g.package_id=? AND g.member_count>0 ORDER BY g.id',(package_id,))]
         content=c.execute("SELECT COUNT(*) FROM files WHERE package_id=? AND length(COALESCE(json_extract(local_summary,'$.sample'),''))>=20",(package_id,)).fetchone()[0]
         attempted=c.execute("SELECT COUNT(*) FROM files WHERE package_id=? AND quick_status IN ('completed','failed')",(package_id,)).fetchone()[0]
         catalog_states = dict(c.execute('SELECT ' + CATALOG_STATE_SQL +
                                        ',COUNT(*) FROM files f WHERE f.package_id=? GROUP BY 1', (package_id,)))
     inventory=(store.get(package_id) or {}).get('counts') or {}
     result['inventory']={key:inventory.get(key) for key in ('inventory_complete','inventory_error_count','inventory_errors')}
-    result['smart'].update(topics=topics,branches=branches,topic_total=total+unknown_total,
+    result['smart'].update(topics=topics,branches=branches,navigation=navigation,topic_total=total+unknown_total,
                            catalog_states=catalog_states,
                            theme_total=sum(b.get('status') != 'pending' for b in branches),
-                           leaf_total=total, hierarchy='theme_leaf_files',
+                           leaf_total=total, hierarchy='recursive_content_tree',
                            topics_truncated=offset+len(topics)<total+unknown_total,
                            naming=state(store,package_id),node_offset=offset,node_limit=limit,
                            content_files=content,attempted_files=attempted)
@@ -168,6 +170,15 @@ def catalog_tree(store, package_id):
             'status': branch.get('status') or 'current',
             'leaves': leaves,
         })
+    # Branch children remain flattened for selection; display recursively without duplicate leaves.
+    by_id={item['node_id']:item for item in themes}
+    for branch in branches:
+        item=by_id.get(branch['node_id'])
+        if item is None:continue
+        direct=branch.get('child_nodes')
+        item['children']=[by_id[k] for k in (direct or []) if k in by_id]
+        if direct is not None:item['leaves']=[groups[k] for k in direct if k in groups]
+    themes=[by_id[b['node_id']] for b in branches if not b.get('parent_id') and b['node_id'] in by_id]
     try:
         counts = store.counts(package_id) or {}
     except Exception:
@@ -180,7 +191,7 @@ def catalog_tree(store, package_id):
         'name': os.path.basename(str(package.get('root_path') or '').rstrip('/')) or package_id,
         'file_count': int(counts.get('total_files') or 0),
         'theme_total': len(themes),
-        'leaf_total': sum(len(item['leaves']) for item in themes),
+        'leaf_total': len({p for b in branches for p in b['children'] if p in groups}),
         'ungrouped_files': int(ungrouped or 0),
         'themes': themes,
     }

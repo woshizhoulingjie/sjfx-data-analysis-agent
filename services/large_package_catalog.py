@@ -112,6 +112,12 @@ def material(row):
     # 指纹只覆盖"决定向量内容"的字段：新增 keywords 之类的检索性字段不得让
     # 已经算好的向量缓存整包失效（否则一次低成本改造会触发全量重新嵌入）。
     fingerprint = {key: value[key] for key in DIGEST_FIELDS}
+    # The selected representation can use blocks beyond the legacy three windows.
+    # Changes there must invalidate the source identity too; labels/keywords do not.
+    from services.large_package_evidence import row_parts
+    blocks=row_parts(row)
+    if blocks:
+        fingerprint['source_evidence_v1']=[{k:p.get(k) for k in ('text','kind','location','truncated')} for p in blocks]
     digest = hashlib.sha256((VERSION + json.dumps(fingerprint, ensure_ascii=False, sort_keys=True)).encode()).hexdigest()
     return value, digest
 

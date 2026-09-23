@@ -1,21 +1,6 @@
-"""组级取文画像（L1.2 跨文件模板检测 / L2 组画像）。
+"""Naming profiles: all-member bounded features plus sampled layout evidence.
 
-为什么单独成模块：命名与画像都需要"这一组到底在讲什么"，而现有实现只把
-5 份随机代表的裸片段交给模型。本模块基于**该组全部成员（有界抽样）**的档案
-做两件事：
-
-1. **跨文件模板检测**：真正的模板是"同一批文件里反复出现的那段文字"
-   （页眉页脚、封面、免责声明、汇编目录页），只有跨文件比较才能发现。实测
-   65% 的组其命名证据含这类模板词、31% 的名称直接照抄了证据片段——名字是从
-   封面抄来的，不是从内容看出来的。这里用**文档频次**（DF）而不是出现次数：
-   一段文字在一份文件里出现 200 次不算模板，出现在 30% 以上的独立文件里才算。
-
-2. **组画像（c-TF-IDF）**：字符 n-gram + DF 支撑，剔除模板词之后给出
-   "被多篇文档共同支撑的区分性短语"。生产环境没有 jieba，而 services/retrieval.py
-   已有 `TfidfVectorizer(analyzer="char", ngram_range=(2,4))` 的先例，因此用
-   字符 n-gram，不新增依赖。整步是纯 CPU，**不消耗任何模型 token**。
-
-产物按（组 ID + 成员修订号 + 策略版本）缓存：命名任务在成员未变时能直接复用。
+Document counts describe retained features, never full-document coverage.
 """
 from __future__ import annotations
 
@@ -25,10 +10,13 @@ import logging
 import math
 import re
 from contextlib import closing
+from collections import Counter
+from services import large_package_evidence as evidence
+from services import large_package_evidence_store as feature_store
 
 LOGGER = logging.getLogger(__name__)
 
-POLICY_VERSION = 'evidence-profile/1'
+POLICY_VERSION = 'evidence-profile/2'
 
 # 模板检测：12 字窗口的文档频次 ≥30% 且至少出现在 3 份文件里，才算模板。
 TEMPLATE_NGRAM = 12
@@ -75,7 +63,7 @@ would year years you your yours yourself yourselves
 '''.split())
 
 _CACHE = {}
-_CACHE_LIMIT = 4096
+_CACHE_LIMIT = 256
 
 # 学术/出版类样板词：它们不是主题，却因为"每篇论文都有"而在组内高频。
 # 实测论文组的画像被 perpetuity / granted / licenseavailab / authorscontrib /
@@ -161,7 +149,7 @@ def group_profiles(store, package_id, group_id, limit=PROFILE_SAMPLE_MEMBERS):
         with closing(store._connect()) as conn:
             marks = ','.join('?' for _ in paths)
             rows = conn.execute(
-                'SELECT path,local_summary FROM files WHERE package_id=? AND path IN (%s)' % marks,
+                'SELECT path,local_summary FROM files WHERE package_id=? AND sensitive=0 AND path IN (%s)' % marks,
                 [package_id] + paths).fetchall()
     except Exception:
         LOGGER.exception('group profile read failed: %s/%s', package_id, group_id)
@@ -171,8 +159,7 @@ def group_profiles(store, package_id, group_id, limit=PROFILE_SAMPLE_MEMBERS):
         info = (row.get('local_summary') or {}).get('portrait') or {}
         parts = [p for p in (info.get('evidence') or [])
                  if isinstance(p, dict) and p.get('text')]
-        text = ' '.join(str(p.get('text') or '') for p in parts[:3])
-        text = re.sub(r'\s+', ' ', text).strip()[:PROFILE_TEXT_CHARS]
+        text = evidence.compact_text(parts, chars=PROFILE_TEXT_CHARS)
         profiles.append({'path': str(row.get('path') or ''),
                          'text': text,
                          'headings': [str(h) for h in (info.get('headings') or [])[:6]],
@@ -231,7 +218,7 @@ def template_terms(texts, ngram=TEMPLATE_NGRAM, min_share=TEMPLATE_MIN_SHARE,
     seeds = set(g for g, count in counter.items() if count >= need)
     if not seeds:
         return []
-    return _merge_phrases(seeds, texts, ngram)
+    return [p for p in _merge_phrases(seeds, texts, ngram) if evidence.is_boilerplate(p)]
 
 
 # ---------------------------------------------------------------------------
@@ -412,48 +399,8 @@ def _background_paths(store, package_id, limit):
 
 
 def package_background(store, package_id):
-    """本包的有界背景语料：{gram: 文档频次} + 元数据频次，按（包 + 文件数）缓存。
-
-    只用于算 IDF（"这个短语是不是本组特有"）与识别全语料套话，不参与任何命名授权。
-    样本在整包范围内均匀抽取（见 _background_paths）。
-    """
-    files = _package_file_count(store, package_id)
-    key = ('background', str(package_id), BACKGROUND_VERSION, files)
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-    paths = _background_paths(store, package_id, PACKAGE_SAMPLE_FILES)
-    texts, meta = [], []
-    if paths:
-        try:
-            with closing(store._connect()) as conn:
-                marks = ','.join('?' for _ in paths)
-                rows = conn.execute('SELECT path,local_summary FROM files '
-                                    'WHERE package_id=? AND sensitive=0 AND path IN (%s)' % marks,
-                                    [package_id] + paths).fetchall()
-        except Exception:
-            LOGGER.exception('package background read failed: %s', package_id)
-            rows = []
-        for raw in rows:
-            row = store._row(raw)
-            info = (row.get('local_summary') or {}).get('portrait') or {}
-            parts = [p for p in (info.get('evidence') or [])
-                     if isinstance(p, dict) and p.get('text')]
-            blob = re.sub(r'\s+', ' ', ' '.join(str(p.get('text') or '') for p in parts[:2])).strip()
-            if blob:
-                texts.append(blob[:PROFILE_TEXT_CHARS])
-            meta.append(_meta_items(row, info))
-    counter = {}
-    for ngram in range(PROFILE_NGRAM[0], PROFILE_NGRAM[1] + 1):
-        for gram, count in _df_counter(texts, ngram, confine=True).items():
-            counter[gram] = counter.get(gram, 0) + count
-    meta_df = {}
-    for items in meta:
-        for item in items:
-            meta_df[item] = meta_df.get(item, 0) + 1
-    value = {'files': len(texts), 'df': counter, 'meta_df': meta_df}
-    _cache_put(key, value)
-    return value
+    """One package-wide DF pass over persisted bounded features, not raw files."""
+    return feature_store.background(store, package_id)
 
 
 def _meta_items(row, info):
@@ -469,36 +416,10 @@ def _meta_items(row, info):
 
 
 def meta_templates(profiles, background):
-    """本组"版式型"元数据：本组高频 **且** 整包背景也高频。
-
-    只按本组高频会误伤主题——同质组里"人工智能与机器学习"本来就该出现在多数
-    成员的关键词里。加上"整包背景同样高频"这一条，才分得清版式与主题。
-    """
-    total = len(profiles)
-    if total < TEMPLATE_MIN_FILES:
-        return []
-    need = max(TEMPLATE_MIN_FILES, int(math.ceil(total * META_MIN_SHARE)))
-    bg_meta = (background or {}).get('meta_df') or {}
-    bg_files = int((background or {}).get('files') or 0)
-    counter = {}
-    for p in profiles:
-        for item in set(list(p.get('keywords') or []) + list(p.get('headings') or []) + list(p.get('fields') or [])):
-            text = re.sub(r'\s+', ' ', str(item or '')).strip()
-            if 2 <= len(text) <= 40:
-                counter[text] = counter.get(text, 0) + 1
-    out = []
-    for text, count in counter.items():
-        if count < need:
-            continue
-        if bg_files < META_BACKGROUND_MIN_FILES:
-            # 背景样本不足时判不了"版式 vs 主题"，保守地不判模板（宁可留着）。
-            continue
-        if bg_meta.get(text, 0) < max(2, int(bg_files * META_MIN_SHARE)):
-            # 只在**本组**常见 → 它可能就是这个组的主题，不能当版式删掉。
-            continue
-        out.append(text)
-    out.sort(key=len, reverse=True)
-    return out[:24]
+    # Frequency alone is not evidence that a scientific/business topic is noise.
+    items = {str(item) for p in profiles for key in ('headings','fields','keywords')
+             for item in (p.get(key) or [])}
+    return sorted((x for x in items if evidence.is_boilerplate(x)), key=lambda x:(-len(x),x))[:24]
 
 
 def template_vocabulary(templates):
@@ -553,56 +474,28 @@ def ctfidf_terms(texts, background, templates=()):
             continue
         if _contains_template(gram, exclude):
             continue
-        if (bg_files >= META_BACKGROUND_MIN_FILES
-                and bg_df.get(gram, 0) >= max(3, int(bg_files * BACKGROUND_MAX_SHARE))):
-            # 整包范围都在用的短语（同一套汇编的页眉/封面）不具备区分度。
-            blocked.add(gram)
-            continue
         share = count / float(total)
-        if bg_files >= META_BACKGROUND_MIN_FILES:
-            backdrop = bg_df.get(gram, 0) / float(bg_files)
-            if backdrop >= BACKDROP_SHARE and share <= backdrop * DISTINCTIVE_RATIO:
-                # 整包层面已经很常见、在本组又没有明显更常见 → 是全语料套话
-                # （出版商许可声明、页脚免责声明），不是本组的区分性短语。
-                continue
         idf = math.log(1.0 + bg_files / float(1 + bg_df.get(gram, 0)))
         scored.append((share * idf, gram, count, idf))
     scored.sort(key=lambda item: (-item[0], -len(item[1]), item[1]))
     # 先按分数取候选，再合并成更长短语（短 n-gram 便宜且稳健，长短语更好读）
     candidates = [gram for _, gram, _, _ in scored[:PROFILE_TOP_TERMS * 4]]
     support = {gram: count for _, gram, count, _ in scored}
-    by_idf = {gram: idf for _, gram, _, idf in scored}
     phrases = _merge_supported(candidates, texts, support)
 
     def phrase_stats(phrase):
-        """短语的支撑度与区分度。
-
-        DF 取**组成它的种子里最大**（有多少文档支撑这个说法），IDF 取**最小**——
-        一条短语的区分度由它最不具区分度的成分决定；取最大会让 '常见短语在'
-        从 '短语在' 这类背景罕见的子串拿到高分，等于把整包套话又抬回来。
-
-        注意这里遍历的是种子而不是 2–4 字符子串：旧写法假定短语一定由
-        PROFILE_NGRAM 规定的短窗口拼成，于是 'machine learning' 这种
-        **整词/词组型种子**的短语算不出分数，会被整条丢掉。
-        """
-        best_df, worst_idf = 0, None
-        for seed, count in support.items():
-            if not seed or seed not in phrase:
-                continue
-            best_df = max(best_df, count)
-            idf = by_idf.get(seed)
-            if idf is not None:
-                worst_idf = idf if worst_idf is None else min(worst_idf, idf)
-        if worst_idf is None:
-            return 0.0, 0
-        return (best_df / float(total)) * worst_idf, best_df
+        """Count the complete phrase in retained text; never inherit a seed's DF."""
+        pattern = _term_pattern(phrase)
+        exact_df = sum(bool(pattern.search(text)) for text in texts)
+        idf = math.log(1.0 + bg_files / float(1 + bg_df.get(phrase, 0)))
+        return (exact_df / float(total)) * idf, exact_df
 
     items = []
     layout = _layout_phrases(texts, [p for p in phrases])
     for phrase in phrases:
         if _structural_phrase(phrase):
             continue
-        if phrase in layout:
+        if phrase in layout and evidence.is_boilerplate(phrase):
             # 固定位置重复的短语是页眉页脚（版权声明、页码、期刊名），不是主题词。
             continue
         # 合并会"跨过"被拉黑的词重建出整包套话（实测：'工程技术'+'术中心'
@@ -683,25 +576,53 @@ def _merge_supported(candidates, texts, support):
 
 
 def group_profile(store, package_id, group_id, revision):
-    """返回该组的画像字典，按（组 + 成员修订号 + 策略版本）缓存。"""
-    key = ('profile', str(package_id), str(group_id), int(revision or 0), POLICY_VERSION)
+    feature_store.ensure_package(store, package_id)
+    epoch = feature_store.snapshot_key(store, package_id)
+    key = ('profile', str(store.db_path), str(package_id), str(group_id), int(revision or 0), epoch, POLICY_VERSION)
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    profiles, templates = group_evidence_profile(store, package_id, group_id, revision)
-    if not profiles:
-        return {'distinctive': [], 'common': [], 'minority': [], 'sampled': 0,
-                'background_files': 0, 'templates': list(templates)}
+    rows = feature_store.group_cards(store, package_id, group_id)
+    cards = [card for _,card in rows if card is not None]
+    readable = [card for card in cards if card.get('readable')]
+    counter = Counter()
+    for card in readable:
+        counter.update(set(card.get('terms') or []))
     background = package_background(store, package_id)
-    value = ctfidf_terms([p['text'] for p in profiles], background, templates)
-    value['templates'] = list(templates)[:12]
-    # 模板词表（含拆出的段）：只用于过滤字段与画像，不用于剥离正文——
-    # 正文里删掉一个"本组高频"的段有误伤主题的风险，而字段/画像按段过滤更安全。
-    value['template_terms'] = sorted(template_vocabulary(templates), key=len, reverse=True)[:40]
-    # 版式型元数据（关键词/标题里的套话）：只用于过滤字段，不用于剥离正文——
-    # 正文里删掉一个"本组高频"的词有误伤主题的风险，而字段是版式的可能性更高。
-    value['meta_templates'] = meta_templates(profiles, background)
-    _cache_put(key, value)
+    bg_count = max(1, int(background.get('files') or 0))
+    bg_df = background.get('df') or {}
+    total = len(readable)
+    items = []
+    for term,count in counter.items():
+        if count < min(PROFILE_MIN_DF,max(1,total)) or evidence.is_boilerplate(term) or _structural_phrase(term):
+            continue
+        score = count/max(1,total)*math.log(1+bg_count/(1+bg_df.get(term,0)))
+        items.append({'term':term,'df':count,'score':round(score,4), 'support_scope':'retained_features'})
+    def compact(pool, limit):
+        kept=[]
+        for item in pool:
+            # Remove nested duplicates only when they have identical support.
+            if any(item['term'] in other['term'] and item['df']==other['df'] for other in kept):
+                continue
+            kept.append(item)
+            if len(kept)>=limit:
+                break
+        return kept
+    distinctive=compact(sorted(items,key=lambda x:(-x['score'],-len(x['term']),x['term'])),PROFILE_TOP_TERMS)
+    common=compact(sorted((x for x in items if x['df']/max(1,total)>=COMMON_MIN_SHARE),
+                          key=lambda x:(-x['df'],-len(x['term']),x['term'])),8)
+    minority=compact(sorted((x for x in items if x['df']/max(1,total)<=MINORITY_MAX_SHARE),
+                            key=lambda x:(-x['score'],-len(x['term']),x['term'])),8)
+    # Layout inspection stays bounded; it is not the population used for DF.
+    profiles,templates=group_evidence_profile(store,package_id,group_id,revision)
+    value={'distinctive':distinctive,'common':common,'minority':minority,
+           'members':len(rows),'feature_files':len(cards),'readable_files':total,
+           'missing_features':len(rows)-len(cards),'sampled':total,
+           'statistics_scope':'all_available_member_features',
+           'coverage':'sampled_content','layout_sampled':len(profiles),
+           'background_files':int(background.get('files') or 0),'templates':templates[:12],
+           'template_terms':templates[:12],'meta_templates':meta_templates(profiles,background)}
+    _cache_put(key,value)
     return value
 
 
@@ -790,7 +711,7 @@ def _cache_put(key, value):
 
 def group_evidence_profile(store, package_id, group_id, revision):
     """返回 (profiles, templates)，按（组 + 成员修订号 + 策略版本）缓存。"""
-    key = (str(package_id), str(group_id), int(revision or 0), POLICY_VERSION)
+    key = (str(store.db_path), str(package_id), str(group_id), int(revision or 0), feature_store.snapshot_key(store,package_id), POLICY_VERSION)
     cached = _cache_get(key)
     if cached is not None:
         return cached
@@ -808,3 +729,4 @@ def group_templates(store, package_id, group_id, revision):
 
 def clear_cache():
     _CACHE.clear()
+    feature_store.clear_cache()

@@ -181,7 +181,7 @@ class BoundedSearchBoundsTests(unittest.TestCase):
 
 
 class CitedDraftGuardTests(unittest.TestCase):
-    """A cited draft survives review; an uncited unrelated one is withheld."""
+    """Existing citation numbers cannot bypass failed factual verification."""
 
     @staticmethod
     def _turn(answer):
@@ -199,7 +199,7 @@ class CitedDraftGuardTests(unittest.TestCase):
     def _verification(claim):
         return {"ledger": {"claims": [claim]}, "status": "failed", "warnings": []}
 
-    def test_a_cited_draft_is_kept_with_an_unverified_warning(self):
+    def test_an_unsupported_draft_is_withheld_even_with_existing_labels(self):
         from services.claim_verifier import ClaimVerifier
         verifier = ClaimVerifier()
         claim = {
@@ -208,13 +208,9 @@ class CitedDraftGuardTests(unittest.TestCase):
         }
         guarded = verifier.guard_result(
             self._turn(claim["text"]), self._verification(claim))
-        self.assertNotIn("现有证据不足", str(guarded["answer"]))
-        self.assertEqual(guarded["status"], "answered")
-        self.assertTrue(
-            any("请对照引用自行复核" in str(item)
-                for item in (guarded.get("warnings") or [])),
-            guarded.get("warnings"),
-        )
+        self.assertNotIn(claim["text"], str(guarded["answer"]))
+        self.assertEqual(guarded["status"], "insufficient_evidence")
+        self.assertNotEqual(guarded["evidence_status"], "unverified")
 
     def test_an_uncited_unrelated_draft_is_still_withheld(self):
         from services.claim_verifier import ClaimVerifier
@@ -231,4 +227,3 @@ class CitedDraftGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

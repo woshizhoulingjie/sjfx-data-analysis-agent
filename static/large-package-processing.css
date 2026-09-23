@@ -90,3 +90,6 @@
 }
 
 .lp-content-branch{margin:8px 0}.lp-content-branch>.lp-node{font-weight:700}.lp-content-children{margin:0 0 8px 14px;padding-left:10px;border-left:1px solid var(--line,#34445c)}.lp-scope-description{margin:8px 0;color:inherit;line-height:1.65}
+.large-result-view .lp-content-branch>.lp-nav-row>.lp-node{font-weight:650}
+.large-result-view .lp-content-children[hidden]{display:none}
+.large-result-view .lp-content-branch .lp-nav-row{align-items:center;min-width:0}

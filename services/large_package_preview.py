@@ -17,9 +17,11 @@ from collections import Counter
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
+from html.parser import HTMLParser
+from services import large_package_evidence as evidence
 from xml.etree import ElementTree as ET
 
-SCHEMA = "large-content-portrait/1"
+SCHEMA = "large-content-portrait/2"
 TEXT = {".txt", ".md", ".markdown", ".log", ".html", ".htm", ".xml", ".yaml", ".yml", ".ini", ".cfg"}
 IMAGES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 BOILERPLATE = re.compile(r"免责声明|版权所有|目录$|保密声明|all rights reserved|disclaimer|confidential", re.I)
@@ -92,42 +94,137 @@ class Budget:
         return data
 
 
-def _record(parts, location, text, kind="text"):
-    value = clean(text, 1800)
-    if value and len(parts) < 48:
-        parts.append({"location": location, "text": value, "kind": kind, "preview_only": True})
+def _record(parts, location, text, kind="text", **metadata):
+    evidence.record(parts, location, text, kind, **metadata)
 
 
 def _windows(path, budget, count):
     size = path.stat().st_size
-    n = min(count, max(1, size // 4096))
-    width = max(1, min(size, (budget.limit - budget.used) // n))
-    offsets = sorted(set(round(max(0, size - width) * i / max(1, n - 1)) for i in range(n)))
     with path.open("rb") as stream:
+        probe = budget.read(stream, min(4, size))
+        bom = probe[:2] if probe.startswith((b"\xff\xfe", b"\xfe\xff")) else b""
+        newline = b"\n\x00" if bom == b"\xff\xfe" else b"\x00\n" if bom else b"\n"
+        n = min(count, max(1, size // 4096))
+        width = max(1, min(size, (budget.limit - budget.used) // n))
+        if bom:
+            width = max(2, width - width % 2)
+        offsets = sorted(set(round(max(0, size-width)*i/max(1, n-1)) for i in range(n)))
         for offset in offsets:
+            if bom:
+                offset -= offset % 2
             stream.seek(offset)
             blob = budget.read(stream, width)
             if offset:
-                # Partial lines are not represented as complete records.
-                blob = blob.partition(b"\n")[2]
+                blob = blob.partition(newline)[2]
             if offset + width < size:
-                blob = blob.rpartition(b"\n")[0]
+                blob = blob.rpartition(newline)[0]
+            if bom and blob and not blob.startswith(bom):
+                blob = bom + blob
             yield offset, blob
 
 
 def _text(path, budget, options, parts, fields, headings):
     for offset, blob in _windows(path, budget, 5 if options["ocr_pages"] else 3):
         value = decode(blob)
-        lines = [clean(line, 180) for line in value.splitlines() if clean(line)]
-        useful = [line for line in lines if not BOILERPLATE.search(line)]
-        for line in useful[:3]:
-            if len(line) < 100:
-                headings.append(line.lstrip("# "))
-        _record(parts, "字节 {} 附近完整行".format(offset), "\n".join(useful) or value)
+        for line in value.splitlines():
+            title = re.match(r"^\s*#{1,6}\s+(.+)", line)
+            if title:
+                headings.append(clean(title.group(1), 100))
+        _record(parts, "字节 {} 附近完整行".format(offset), value, "text",
+                source_window=offset, structure="paragraphs")
+
+
+
+class _HTMLBlocks(HTMLParser):
+    """Offline bounded fragments; never fetch assets or execute page scripts."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.buffer, self.blocks = [], [], []
+        self.suppressed = 0
+        self.count = 0
+        self.row_cells, self.table_headers = [], []
+
+    def append_block(self, text, kind):
+        self.count += 1
+        self.blocks.append({'text':text,'kind':kind,'location':'HTML 元素 {}'.format(self.count),
+                            'structure':'html_fragment','preview_only':True})
+        evidence.trim_reservoir(self.blocks)
+
+    def flush(self):
+        text = ''.join(self.buffer).strip()
+        self.buffer = []
+        if not text:
+            return
+        tags = set(self.stack)
+        kind = 'title' if 'title' in tags else 'heading' if tags & {'h1','h2','h3','h4','h5','h6'} else 'fields' if 'th' in tags else 'record' if tags & {'td','tr'} else 'text'
+        if tags & {'th','td'}:
+            self.row_cells.append((text,'th' in tags))
+            return
+        self.append_block(text,kind)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'table':
+            self.table_headers = []
+        if tag == 'tr':
+            self.row_cells = []
+        if tag in {'script','style','nav','footer','noscript'}:
+            self.flush()
+            self.suppressed += 1
+        if tag in {'p','div','article','section','li','tr','td','th','title','h1','h2','h3','h4','h5','h6','br'}:
+            self.flush()
+        if tag not in {'br','hr','img','input','meta','link','source','wbr','area','base','embed'}:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if tag in {'p','div','article','section','li','tr','td','th','title','h1','h2','h3','h4','h5','h6'}:
+            self.flush()
+        if tag == 'tr' and self.row_cells:
+            values = [text for text,_ in self.row_cells]
+            is_header = all(header for _,header in self.row_cells)
+            if is_header:
+                self.table_headers = values
+            elif self.table_headers and len(self.table_headers) == len(values):
+                values = ['{}={}'.format(k,v) for k,v in zip(self.table_headers,values)]
+            self.append_block(' | '.join(values),'fields' if is_header else 'record')
+            self.row_cells = []
+        if tag in self.stack:
+            index = len(self.stack)-1-self.stack[::-1].index(tag)
+            removed = self.stack[index:]
+            self.stack = self.stack[:index]
+            self.suppressed = max(0, self.suppressed-sum(x in {'script','style','nav','footer','noscript'} for x in removed))
+
+    def handle_data(self, data):
+        if not self.suppressed:
+            self.buffer.append(data)
+
+
+def _html_blocks(value):
+    parser = _HTMLBlocks()
+    parser.feed(value)
+    parser.close()
+    parser.flush()
+    if parser.row_cells:
+        parser.handle_endtag('tr')
+    return parser.blocks
+
+
+def _html(path, budget, options, parts, fields, headings):
+    # Preserve minified HTML: parsing occurs before any line/character clipping.
+    with path.open('rb') as stream:
+        value = decode(budget.read(stream, budget.limit))
+    for block in _html_blocks(value):
+        budget.check()
+        if block['kind'] in {'title','heading'}:
+            headings.append(clean(block['text'],100))
+        if block['kind'] == 'fields':
+            fields.extend(clean(value,100) for value in block['text'].split(' | ')[:40])
+        _record(parts, block['location']+'（有界前缀）', block['text'], block['kind'],
+                structure='html_fragment', truncated=True)
 
 
 def _csv(path, budget, options, parts, fields, headings):
     header = []
+    original_columns = 0
     for offset, blob in _windows(path, budget, 5 if options["ocr_pages"] else 3):
         text = decode(blob)
         try:
@@ -140,7 +237,9 @@ def _csv(path, budget, options, parts, fields, headings):
             continue
         reader = csv.reader(io.StringIO(text), dialect, strict=True)
         if offset == 0:
-            header = [clean(x, 100) for x in next(reader, [])][:40]
+            raw_header = next(reader, [])
+            original_columns = len(raw_header)
+            header = [clean(x, 100) for x in raw_header[:40]]
             fields.extend(header)
             _record(parts, "表头", " | ".join(header), "fields")
         kept = 0
@@ -150,7 +249,7 @@ def _csv(path, budget, options, parts, fields, headings):
             except (StopIteration, csv.Error):
                 break
             budget.check()
-            if header and len(row) != len(header):
+            if original_columns and len(row) != original_columns:
                 continue
             _record(parts, "字节 {} 附近记录 {}".format(offset, kept + 1),
                     " | ".join("{}={}".format(k, clean(v, 100)) for k, v in zip(header, row)) if header else " | ".join(row), "record")
@@ -160,34 +259,39 @@ def _csv(path, budget, options, parts, fields, headings):
 
 
 def _json(path, budget, options, parts, fields, headings):
-    # Keep encoding detection within the same explicit byte budget. JSONL can
-    # sample independent complete lines; a JSON array needs a bounded prefix.
     if path.suffix.lower() == ".jsonl":
+        windows = list(_windows(path, budget, 5 if options["ocr_pages"] else 3))
         rows = []
-        for offset, blob in _windows(path, budget, 5 if options["ocr_pages"] else 3):
-            for line in decode(blob).splitlines():
+        for window_index, (offset, blob) in enumerate(windows):
+            quota = options["records"] // max(1,len(windows)) + (window_index < options["records"] % max(1,len(windows)))
+            kept = 0
+            for line_index, line in enumerate(decode(blob).splitlines()):
                 budget.check()
+                if kept >= quota:
+                    break
                 try:
                     row = json.loads(line)
                 except ValueError:
                     continue
                 if isinstance(row, dict):
-                    rows.append(("JSONL 字节 {} 附近完整记录".format(offset), row))
-                if len(rows) >= options["records"]:
-                    break
+                    rows.append(("JSONL 字节 {} 窗口内记录 {}".format(offset,line_index+1),row))
+                    kept += 1
     else:
         from services.structured_profile import _iter_json_incremental
         with path.open("rb") as stream:
             probe = stream.read(min(1024, budget.limit))
         encoding = "utf-16" if probe.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
-        records, metadata = _iter_json_incremental(path, encoding, options["records"], max(1, budget.limit - len(probe)))
-        budget.used = min(budget.limit, len(probe) + int(metadata.get("sampled_bytes") or 0))
-        rows = [("JSON 记录 {}（有界前缀）".format(i + 1), row) for i, row in enumerate(records)]
-    for location, row in rows[:options["records"]]:
-        if isinstance(row, dict):
-            fields.extend(str(x)[:100] for x in row)
-            _record(parts, location, json.dumps(row, ensure_ascii=False), "record")
-    _record(parts, "JSON 字段", " | ".join(dict.fromkeys(fields)), "fields")
+        records, metadata = _iter_json_incremental(path, encoding, options["records"], max(1,budget.limit-len(probe)))
+        budget.used = min(budget.limit,len(probe)+int(metadata.get("sampled_bytes") or 0))
+        rows = [("JSON 记录 {}（有界前缀）".format(i+1),row) for i,row in enumerate(records)]
+    for location,row in rows:
+        if isinstance(row,dict):
+            for key,value in list(row.items())[:40]:
+                fields.append(str(key)[:100]+":"+type(value).__name__)
+                if isinstance(value,dict):
+                    fields.extend((str(key)+"."+str(k))[:100] for k in list(value)[:8])
+            _record(parts,location,json.dumps(row,ensure_ascii=False),"record")
+    _record(parts,"JSON 字段"," | ".join(dict.fromkeys(fields)),"fields")
 
 
 def _zip_open(path):
@@ -225,103 +329,164 @@ def _xml_text(blob, tag="t"):
 
 
 def _office(path, budget, options, parts, fields, headings):
+    def elements(blob, tag):
+        parser = ET.XMLPullParser(['end'])
+        try:
+            parser.feed(blob)
+        except ET.ParseError:
+            pass
+        try:
+            for _,element in parser.read_events():
+                if element.tag.rsplit('}',1)[-1] == tag:
+                    yield element
+        except ET.ParseError:
+            pass
+
+    def texts(element):
+        return ''.join(x.text or '' for x in element.iter() if x.tag.rsplit('}',1)[-1] == 't')
+
+    def relation_target(prefix, target):
+        # ZIP members are POSIX names on every operating system.
+        from posixpath import normpath
+        member = normpath(target.lstrip('/') if target.startswith('/') else prefix+'/'+target)
+        return member if not member.startswith('../') and member in names else ''
+
     ext = path.suffix.lower()
     with _zip_open(path) as archive:
         names = set(archive.namelist())
-        if ext == ".docx":
-            # Prioritise document content, not ZIP member order or style XML.
-            for member in ("docProps/core.xml", "word/document.xml"):
-                if member in names:
-                    limit = 2048 if member.startswith("docProps") else budget.limit
-                    blob = _member_bytes(archive, member, budget, limit)
-                    values = _xml_text(blob, "title" if member.startswith("docProps") else "t")
-                    headings.extend(v for v in values[:8] if 2 < len(v) < 100 and not BOILERPLATE.search(v))
-                    # Keep several sections of the decoded prefix, not just its first sentence.
-                    for i in range(0, min(len(values), 150), 20):
-                        _record(parts, "{} 文本段 {}".format(member, i + 1), "\n".join(values[i:i + 20]))
-        elif ext == ".pptx":
-            slides = sorted((x for x in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", x)), key=lambda x: int(re.search(r"slide(\d+)", x).group(1)))
-            indices = sorted(set(round(i * max(0, len(slides) - 1) / max(1, options["pages"] - 1)) for i in range(min(len(slides), options["pages"]))))
+        if ext == '.docx':
+            if 'docProps/core.xml' in names:
+                for title in _xml_text(_member_bytes(archive,'docProps/core.xml',budget,2048),'title'):
+                    headings.append(title)
+                    _record(parts,'文档属性标题',title,'title')
+            if 'word/document.xml' in names:
+                blob = _member_bytes(archive,'word/document.xml',budget)
+                for i,element in enumerate(elements(blob,'p')):
+                    budget.check()
+                    value = texts(element)
+                    styles = [x.attrib for x in element.iter() if x.tag.rsplit('}',1)[-1] in {'pStyle','outlineLvl'}]
+                    is_heading = any(re.search(r'heading|标题',str(attrs),re.I) for attrs in styles)
+                    is_heading = is_heading or any(x.tag.rsplit('}',1)[-1]=='outlineLvl' for x in element.iter())
+                    if is_heading:
+                        headings.append(clean(value,100))
+                    _record(parts,'Word 段落 {}（有界前缀）'.format(i+1),value,'heading' if is_heading else 'text')
+                for i,element in enumerate(elements(blob,'tr')):
+                    cells = [texts(x) for x in element if x.tag.rsplit('}',1)[-1]=='tc']
+                    is_header = any(x.tag.rsplit('}',1)[-1]=='tblHeader' for x in element.iter())
+                    if is_header:
+                        fields.extend(cells[:40])
+                    _record(parts,'Word 表格行 {}（有界前缀）'.format(i+1),' | '.join(cells), 'fields' if is_header else 'record')
+        elif ext == '.pptx':
+            slides = []
+            if 'ppt/presentation.xml' in names and 'ppt/_rels/presentation.xml.rels' in names:
+                rels = _member_bytes(archive,'ppt/_rels/presentation.xml.rels',budget,8192)
+                mapping = {x.attrib.get('Id'):x.attrib.get('Target','') for x in elements(rels,'Relationship') if x.attrib.get('TargetMode')!='External'}
+                content = _member_bytes(archive,'ppt/presentation.xml',budget,8192)
+                for slide in elements(content,'sldId'):
+                    rid = slide.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                    member = relation_target('ppt',mapping.get(rid,''))
+                    if member:
+                        slides.append(member)
+            if not slides:
+                slides = sorted((x for x in names if re.fullmatch(r'ppt/slides/slide\d+\.xml',x)),key=lambda x:int(re.search(r'slide(\d+)',x).group(1)))
+                order_note = '（关系未完整解析，按编号采样）'
+            else:
+                order_note = '（已解析的演示顺序）'
+            indices = sorted(set(round(i*max(0,len(slides)-1)/max(1,options['pages']-1)) for i in range(min(len(slides),options['pages']))))
             for i in indices:
-                values = _xml_text(_member_bytes(archive, slides[i], budget, max(4096, budget.limit // max(1, len(indices)))))
-                if values:
-                    headings.append(values[0][:100])
-                _record(parts, "幻灯片 {}".format(i + 1), "\n".join(values))
+                budget.check()
+                blob = _member_bytes(archive,slides[i],budget,max(1,(budget.limit-budget.used)//max(1,len(indices))))
+                for shape_index,shape in enumerate(elements(blob,'sp')):
+                    placeholder = next((x.attrib.get('type','body') for x in shape.iter() if x.tag.rsplit('}',1)[-1]=='ph'),'body')
+                    value = '\n'.join(texts(x) for x in shape.iter() if x.tag.rsplit('}',1)[-1]=='p')
+                    kind = 'title' if placeholder in {'title','ctrTitle'} else 'footer' if placeholder in {'ftr','dt','sldNum'} else 'text'
+                    if kind == 'title':
+                        headings.append(clean(value,100))
+                    _record(parts,'幻灯片 {} / 文本框 {}{}'.format(i+1,shape_index+1,order_note),value,kind)
+                for row_index,row in enumerate(elements(blob,'tr')):
+                    _record(parts,'幻灯片 {} / 表格行 {}'.format(i+1,row_index+1),' | '.join(texts(x) for x in row),'record')
         else:
             shared = []
-            if "xl/sharedStrings.xml" in names:
-                blob = _member_bytes(archive, "xl/sharedStrings.xml", budget, budget.limit // 3)
-                parser = ET.XMLPullParser(["end"])
-                try:
-                    parser.feed(blob)
-                    for _, el in parser.read_events():
-                        if el.tag.rsplit("}", 1)[-1] == "si":
-                            shared.append("".join(x.text or "" for x in el.iter() if x.tag.rsplit("}", 1)[-1] == "t"))
-                            el.clear()
-                except ET.ParseError:
-                    pass
-            workbook = _member_bytes(archive, "xl/workbook.xml", budget, 8192) if "xl/workbook.xml" in names else b""
-            rels = _member_bytes(archive, "xl/_rels/workbook.xml.rels", budget, 8192) if "xl/_rels/workbook.xml.rels" in names else b""
-            mapping = {}
-            try:
-                mapping = {r.attrib.get("Id"): r.attrib.get("Target", "") for r in ET.fromstring(rels)}
-                sheets = list(ET.fromstring(workbook).iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet"))
-            except ET.ParseError:
-                sheets = []
-            for sheet in sheets[:options["pages"]]:
-                title = sheet.attrib.get("name", "工作表")
+            if 'xl/sharedStrings.xml' in names:
+                blob = _member_bytes(archive,'xl/sharedStrings.xml',budget,budget.limit//3)
+                shared = [texts(x) for x in elements(blob,'si')]
+            workbook = _member_bytes(archive,'xl/workbook.xml',budget,8192) if 'xl/workbook.xml' in names else b''
+            rels = _member_bytes(archive,'xl/_rels/workbook.xml.rels',budget,8192) if 'xl/_rels/workbook.xml.rels' in names else b''
+            mapping = {r.attrib.get('Id'):r.attrib.get('Target','') for r in elements(rels,'Relationship') if r.attrib.get('TargetMode')!='External'}
+            sheets = list(elements(workbook,'sheet'))
+            indices = sorted(set(round(i*max(0,len(sheets)-1)/max(1,options['pages']-1)) for i in range(min(len(sheets),options['pages']))))
+            for i in indices:
+                sheet = sheets[i]
+                title = sheet.attrib.get('name','工作表')
                 headings.append(title)
-                rid = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-                target = mapping.get(rid, "")
-                member = target.lstrip("/") if target.startswith("/") else "xl/" + target
-                if member not in names or ".." in member.split("/"):
+                rid = sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                member = relation_target('xl',mapping.get(rid,''))
+                if not member:
                     continue
-                blob = _member_bytes(archive, member, budget, max(4096, budget.limit // max(1, min(len(sheets), options["pages"]))))
-                parser = ET.XMLPullParser(["end"])
-                try:
-                    parser.feed(blob)
-                except ET.ParseError:
-                    pass
-                count = 0
-                try:
-                    for _, el in parser.read_events():
-                        if el.tag.rsplit("}", 1)[-1] != "row":
-                            continue
-                        values = []
-                        for cell in el:
-                            text = "".join(x.text or "" for x in cell.iter() if x.tag.rsplit("}", 1)[-1] in {"t", "v"})
-                            if cell.attrib.get("t") == "s":
-                                index = int(text) if text.isdigit() else -1
-                                text = shared[index] if 0 <= index < len(shared) else "[共享字符串未采样]"
-                            values.append(clean(text, 120))
-                        if count == 0:
-                            fields.extend(v for v in values if v and not v.startswith("["))
-                        _record(parts, "工作表 {} / 第 {} 行".format(title, el.attrib.get("r", count + 1)), " | ".join(values), "fields" if count == 0 else "record")
-                        count += 1
-                        el.clear()
-                        if count >= options["records"] + 1:
-                            break
-                except ET.ParseError:
-                    pass
+                blob = _member_bytes(archive,member,budget,max(1,(budget.limit-budget.used)//max(1,len(indices))))
+                sampled = []
+                for row_index,row in enumerate(elements(blob,'row')):
+                    budget.check()
+                    if row_index >= options['records']+1:
+                        break
+                    cells = []
+                    for cell in list(row)[:80]:
+                        coordinate = cell.attrib.get('r','?')
+                        raw = next((x.text or '' for x in cell if x.tag.rsplit('}',1)[-1]=='v'),'')
+                        value = texts(cell) if cell.attrib.get('t') == 'inlineStr' else raw
+                        missing = False
+                        if cell.attrib.get('t') == 's':
+                            index = int(raw) if raw.isdigit() else -1
+                            missing = not 0 <= index < len(shared)
+                            value = '[共享字符串未采样]' if missing else shared[index]
+                        cells.append((coordinate,clean(value,120),missing))
+                    sampled.append((row.attrib.get('r',str(row_index+1)),cells))
+                header_index = None
+                for j,(_,cells) in enumerate(sampled[:4]):
+                    values = [v for _,v,missing in cells if v and not missing]
+                    if len(values) >= 2 and sum(not re.fullmatch(r'[-+\d.,% /]+',v) for v in values)/len(values) >= .7:
+                        header_index = j
+                        break
+                for j,(number,cells) in enumerate(sampled):
+                    if j == header_index:
+                        fields.extend(v for _,v,missing in cells if v and not missing)
+                    _record(parts,'工作表 {} / 第 {} 行'.format(title,number),
+                            ' | '.join('{}={}'.format(c,v) for c,v,_ in cells),
+                            'fields' if j == header_index else 'record',
+                            missing_values=sum(m for _,_,m in cells),header_candidate=j == header_index)
 
 
 def _mail(path, budget, options, parts, fields, headings):
-    with path.open("rb") as stream:
-        blob = budget.read(stream, budget.limit)
+    with path.open('rb') as stream:
+        blob = budget.read(stream,budget.limit)
     message = BytesParser(policy=policy.default).parsebytes(blob)
-    for name in ("Subject", "From", "To", "Cc", "Date", "Message-ID", "In-Reply-To"):
+    for name in ('Subject','From','To','Cc','Date','Message-ID','In-Reply-To'):
         if message.get(name):
-            _record(parts, "邮件头 " + name, str(message[name]), "header")
-    headings.append(str(message.get("Subject") or ""))
+            _record(parts,'邮件头 '+name,str(message[name]),'title' if name=='Subject' else 'header')
+    headings.append(str(message.get('Subject') or ''))
     for item in message.walk():
         budget.check()
         if item.get_filename():
-            _record(parts, "附件名称", item.get_filename(), "attachment")
-        if item.get_content_type() == "text/plain":
-            try:
-                _record(parts, "邮件正文（有界前缀）", item.get_content())
-            except (LookupError, UnicodeError):
-                _record(parts, "邮件正文", decode(item.get_payload(decode=True) or b""))
+            _record(parts,'附件名称',item.get_filename(),'attachment')
+            continue
+        if item.get_content_type() not in {'text/plain','text/html'}:
+            continue
+        try:
+            value = item.get_content()
+        except (LookupError,UnicodeError):
+            value = decode(item.get_payload(decode=True) or b'')
+        if item.get_content_type() == 'text/html':
+            for block in _html_blocks(str(value)):
+                _record(parts,'邮件 HTML 正文 / '+block['location'],block['text'],block['kind'])
+        else:
+            current,quoted = [],[]
+            historical = False
+            for line in str(value).splitlines():
+                if re.match(r'^\s*(?:--\s*$|On .+wrote:|在.+写道|[- ]*Original Message)',line,re.I):
+                    historical = True
+                (quoted if historical or line.lstrip().startswith('>') else current).append(line)
+            _record(parts,'邮件当前正文（有界前缀）','\n'.join(current),'text')
+            _record(parts,'邮件引用历史或签名（有界前缀）','\n'.join(quoted),'quoted_history')
 
 
 def _ocr(image):
@@ -451,7 +616,9 @@ def portrait(item, parts, fields, headings, refine=False, warnings=None):
     projects = re.findall(r"(?:项目名称|项目编号|合同编号|事项编号)\s*[:：=]\s*([^\s,，;；|]{2,50})", body)[:8]
     # Explicit project identifiers are facets, not evidence that every similarly
     # named file belongs to one matter.
-    evidence = [dict(p, source_path=item.get("path")) for p in parts[:16]]
+    metadata_parts = [p for p in parts if p.get('kind') in {'attachment','member_names'}][:4]
+    selected_parts = evidence.select_blocks(parts, limit=16-len(metadata_parts), chars=9600)
+    kept_evidence = [dict(p, source_path=item.get("path")) for p in selected_parts + metadata_parts]
     return {
         "schema": SCHEMA, "topic": topic, "category": category, "document_role": role,
         "recognition_status": state, "quality": quality, "needs_refine": needs_refine and not refine,
@@ -459,7 +626,7 @@ def portrait(item, parts, fields, headings, refine=False, warnings=None):
         "ambiguous": ambiguous, "headings": headings, "fields": fields,
         "keywords": _terms(weighted), "entities": entities, "projects": projects, "dates": dates,
         "language": "中文" if re.search(r"[\u4e00-\u9fff]", body) else "英文或其他" if body else "未知",
-        "evidence": evidence, "warnings": list(warnings or [])[:8],
+        "evidence": kept_evidence, "evidence_version": evidence.VERSION, "warnings": list(warnings or [])[:8],
         "confidence": min(.9, .55 + .07 * scores[0][0]) if supported else .3 if body else 0,
         "confidence_note": "规则支持强度，用于导航；不是校准概率或研究结论置信度",
     }
@@ -486,6 +653,8 @@ def preview_file(root, item, refine=False):
             _csv(path, budget, options, parts, fields, headings)
         elif ext in {".json", ".jsonl"}:
             _json(path, budget, options, parts, fields, headings)
+        elif ext in {".html", ".htm"}:
+            _html(path, budget, options, parts, fields, headings)
         elif ext in TEXT:
             _text(path, budget, options, parts, fields, headings)
         elif ext in {".docx", ".pptx", ".xlsx", ".xlsm"}:
@@ -532,10 +701,12 @@ def preview_file(root, item, refine=False):
         info.update(needs_refine=False, recognition_status="unsupported")
     material = json.dumps(parts, ensure_ascii=False, sort_keys=True).encode()
     coverage = {"complete": False, "preview_only": True, "sampled_bytes": budget.used, "byte_budget": budget.limit,
-                "seconds_budget": options["seconds"], "sample_locations": [p["location"] for p in parts], **extra}
+                "seconds_budget": options["seconds"], "sample_locations": list(dict.fromkeys(p["location"] for p in parts)),
+                "retained_locations": list(dict.fromkeys(p["location"] for p in info["evidence"])),
+                "truncated_blocks": sum(bool(p.get("truncated")) for p in info["evidence"]), **extra}
     return {
         "schema_version": SCHEMA, "summary_type": "local", "title": headings[0] if headings else path.stem,
-        "category": info["category"], "keywords": info["keywords"], "sample": "\n".join(p["text"] for p in parts)[:4000],
+        "category": info["category"], "keywords": info["keywords"], "sample": evidence.compact_text(parts, chars=4000) or "\n".join(p['text'] for p in parts)[:4000],
         "size": stat.st_size, "sampled_bytes": budget.used, "complete": False, "portrait": info, "coverage": coverage,
         "sample_sha256": hashlib.sha256(material).hexdigest(), "source_hash_kind": "pending",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "notice": "；".join(warnings),

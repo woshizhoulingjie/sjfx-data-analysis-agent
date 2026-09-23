@@ -79,7 +79,11 @@ class CatalogBatchTests(unittest.TestCase):
         def capture(system,user,**kwargs):
             inputs.append(json.loads(user));return original(system,user,**kwargs)
         self.model.chat=capture
-        with patch.object(Config,'LP_CATALOG_BATCH_INPUT_TOKENS',1500):
+        # Derive a budget that fits one real evidence bundle but cannot fit two.
+        from services.large_package_catalog_batch import BATCH_SYSTEM
+        items=[dict(id='G%d'%(i+1),**json.loads(naming.bundle(self.store,self.pid,gid)['user'])) for i,gid in enumerate(self.gids)]
+        counts=[naming.token_count(BATCH_SYSTEM+'\n'+json.dumps({'groups':[item]},ensure_ascii=False,separators=(',',':')))+64 for item in items]
+        with patch.object(Config,'LP_CATALOG_BATCH_INPUT_TOKENS',max(counts)+1):
             process_batch(self.store,self.pid,model_client=self.model)
         self.assertGreaterEqual(len(inputs),1)
         self.assertLess(len(inputs[0]['groups']),4)
@@ -122,6 +126,44 @@ class CatalogBatchTests(unittest.TestCase):
                 count=c.execute('SELECT COUNT(*) FROM large_catalog_members WHERE group_id=?',(row['id'],)).fetchone()[0]
                 self.assertEqual(row['member_count'],count)
         LargePackageStore(self.root/'state.db')
+
+
+    def test_partial_batch_records_per_group_outcomes(self):
+        """§10/§13.3：一次调用里有的组发布、有的组校验失败，台账必须如实记成 partial。"""
+        original = self.model.chat
+        def chat(system, user, **kwargs):
+            response = original(system, user, **kwargs)
+            data = json.loads(response['content'])
+            data['groups'][0]['evidence_ids'] = ['E999']          # 只让第一组校验失败
+            response['content'] = json.dumps(data, ensure_ascii=False)
+            return response
+        self.model.chat = chat
+        process_batch(self.store, self.pid, model_client=self.model)
+        with closing(self.store._connect()) as c:
+            row = c.execute('SELECT status,detail FROM lp_catalog_calls ORDER BY started DESC LIMIT 1').fetchone()
+        self.assertEqual(row['status'], 'partial')
+        detail = json.loads(row['detail'])
+        self.assertEqual(len(detail['published']), 3)
+        self.assertEqual(len(detail['failed']), 1)
+        self.assertEqual(detail['failed'][0]['category'], 'invalid_output')
+        self.assertEqual(detail['usage_state'], 'measured')
+        self.assertEqual(detail['mode'], 'batch')
+
+    def test_batch_treats_an_outage_like_the_single_path(self):
+        """§10：批量路径遇到"依赖不可用"也要长退避、不烧 attempts、退回轮次额度。"""
+        def chat(*args, **kwargs):
+            raise RuntimeError('Connection refused')
+        self.model.chat = chat
+        process_batch(self.store, self.pid, model_client=self.model)
+        with closing(self.store._connect()) as c:
+            call = c.execute('SELECT status FROM lp_catalog_calls ORDER BY started DESC LIMIT 1').fetchone()
+            requests = c.execute('SELECT requests FROM lp_catalog_rounds ORDER BY started DESC LIMIT 1').fetchone()[0]
+            attempts = c.execute('SELECT COALESCE(SUM(attempts),0) FROM lp_catalog_jobs').fetchone()[0]
+            states = {r[0] for r in c.execute('SELECT DISTINCT status FROM lp_catalog_jobs')}
+        self.assertEqual(call['status'], 'refunded', '没调成的那次不该占轮次额度')
+        self.assertEqual(requests, 0)
+        self.assertEqual(attempts, 0, '依赖不可用不该烧掉重试额度')
+        self.assertEqual(states, {'deferred'})
 
 
 if __name__=='__main__':unittest.main()

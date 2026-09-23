@@ -858,6 +858,16 @@ class Config:
     LARGE_PACKAGE_BATCH_FILES = max(
         1, min(500, int(os.getenv("LARGE_PACKAGE_BATCH_FILES", "500")))
     )
+    # QA composition policy; disable for a quick rollback without schema changes.
+    LARGE_QA_ENABLED = os.getenv("LARGE_QA_ENABLED", "1").lower() not in {"0", "false", "off"}
+    LARGE_QA_INDEX_DIR = Path(os.getenv("LARGE_QA_INDEX_DIR", str(DATA_DIR / "large_qa")))
+    LARGE_QA_REFINE_TOPICS = os.getenv("LARGE_QA_REFINE_TOPICS", "1").lower() not in {"0", "false", "off"}
+    CONVERSATION_QUALITY_ENABLED = os.getenv("CONVERSATION_QUALITY_ENABLED", "1").lower() not in {"0", "false", "off"}
+    CONVERSATION_TOKENIZER_PATH = os.getenv("CONVERSATION_TOKENIZER_PATH", VLLM_MODEL_PATH)
+    CONVERSATION_MAX_ANSWER_TOKENS = max(800, min(4096, int(os.getenv("CONVERSATION_MAX_ANSWER_TOKENS", "3000"))))
+    CONVERSATION_ANSWER_TIMEOUT_SECONDS = max(30, min(180, int(os.getenv("CONVERSATION_ANSWER_TIMEOUT_SECONDS", "120"))))
+    CONVERSATION_CONTEXT_TOKENS = max(4096, min(LLM_CONTEXT_TOKENS, int(os.getenv("CONVERSATION_CONTEXT_TOKENS", "32768"))))
+
     CONVERSATION_ANALYSIS_BATCH_FILES = max(
         20, min(50, int(os.getenv("CONVERSATION_ANALYSIS_BATCH_FILES", "30")))
     )

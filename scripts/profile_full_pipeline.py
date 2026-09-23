@@ -472,9 +472,11 @@ class ProfilingAgentRuntime:
 
 def runtime_imports():
     from config import Config
+    from services.agent_runtime import PydanticAgentRuntime
     from services.exporter import create_report_docx
     from services.ollama import OllamaEmbeddingClient
     from services.package_analysis import analyze_package
+    from services.multiturn_structured_qa import run_multiturn_structured_qa
     from services.reporting import (
         build_local_report,
         build_report_analysis_prompt,
@@ -483,18 +485,23 @@ def runtime_imports():
     from services.scanner import scan_directory
     from services.storage import Storage
     from services.unified_parser import UnifiedDocumentParser
+    from services.vllm import VLLMClient, VLLMEmbeddingClient
 
     return {
         "Config": Config,
+        "PydanticAgentRuntime": PydanticAgentRuntime,
         "create_report_docx": create_report_docx,
         "OllamaEmbeddingClient": OllamaEmbeddingClient,
         "analyze_package": analyze_package,
+        "run_multiturn_structured_qa": run_multiturn_structured_qa,
         "build_local_report": build_local_report,
         "build_report_analysis_prompt": build_report_analysis_prompt,
         "merge_model_report": merge_model_report,
         "scan_directory": scan_directory,
         "Storage": Storage,
         "UnifiedDocumentParser": UnifiedDocumentParser,
+        "VLLMClient": VLLMClient,
+        "VLLMEmbeddingClient": VLLMEmbeddingClient,
     }
 
 
@@ -540,11 +547,11 @@ def aggregate_stage_rows(coarse_rows, analysis_rows, model_rows):
     return rows
 
 
-def configure_isolated_environment(state_dir, parse_temp_dir):
+def configure_isolated_environment(state_dir, parse_temp_dir, llm_concurrency=1):
     os.environ["SJFX_STATE_DIR"] = str(state_dir)
     os.environ["SJFX_PARSE_TEMP_DIR"] = str(parse_temp_dir)
     os.environ["PARSE_MAX_CONCURRENCY"] = "1"
-    os.environ["LLM_MAX_CONCURRENCY"] = "1"
+    os.environ["LLM_MAX_CONCURRENCY"] = str(max(1, int(llm_concurrency)))
     os.environ["DOCLING_CPU_THREADS"] = "2"
     os.environ["OMP_NUM_THREADS"] = "2"
     os.environ["MKL_NUM_THREADS"] = "2"
@@ -566,6 +573,8 @@ def build_parser():
     parser.add_argument("--idle-seconds", type=int, default=30)
     parser.add_argument("--max-wait-seconds", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=600)
+    parser.add_argument("--model-backend", choices=("ollama", "vllm"), default="vllm")
+    parser.add_argument("--llm-concurrency", type=int, default=2)
     parser.add_argument("--skip-input-hash", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     return parser
@@ -591,7 +600,12 @@ def run(args):
     parse_temp_dir = state_dir / "parse_temp"
     output_dir.mkdir(parents=True, exist_ok=False)
     state_dir.mkdir(parents=True, exist_ok=False)
-    configure_isolated_environment(state_dir, parse_temp_dir)
+    configure_isolated_environment(state_dir, parse_temp_dir, args.llm_concurrency)
+    trace_path = output_dir / "trace.jsonl"
+    if args.model_backend == "vllm":
+        os.environ["SJFX_LLM_TRACE_PATH"] = str(trace_path)
+        os.environ["SJFX_TRACE_WORKFLOW_ID"] = run_id
+        os.environ["SJFX_BENCHMARK_DETERMINISTIC"] = "1"
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -661,25 +675,44 @@ def run(args):
 
         runtime = runtime_imports()
         Config = runtime["Config"]
-        health_transport = ProfilingOllamaTransport(
-            base_url=Config.OLLAMA_BASE_URL,
-            model=Config.OLLAMA_MODEL,
-            timeout=args.request_timeout,
-            context_window_tokens=args.context_window_tokens,
-            monitor=monitor,
-            recorder=request_recorder,
-            production_db=production_db,
-        )
+        if args.model_backend == "vllm":
+            health_transport = runtime["VLLMClient"](
+                Config.VLLM_BASE_URL,
+                Config.VLLM_MODEL,
+                timeout=args.request_timeout,
+                max_concurrency=args.llm_concurrency,
+                api_key=Config.VLLM_API_KEY,
+            )
+        else:
+            health_transport = ProfilingOllamaTransport(
+                base_url=Config.OLLAMA_BASE_URL,
+                model=Config.OLLAMA_MODEL,
+                timeout=args.request_timeout,
+                context_window_tokens=args.context_window_tokens,
+                monitor=monitor,
+                recorder=request_recorder,
+                production_db=production_db,
+            )
         health = health_transport.health_check(timeout=10)
         result["model_health"] = health
         if not health.get("reachable") or not health.get("model_available"):
             raise RuntimeError("configured Ollama model is unavailable: {}".format(health))
-        llm = ProfilingAgentRuntime(health_transport)
-        embedding_client = runtime["OllamaEmbeddingClient"](
-            Config.OLLAMA_BASE_URL,
-            Config.OLLAMA_EMBED_MODEL,
-            timeout=min(600, args.request_timeout),
-        )
+        if args.model_backend == "vllm":
+            llm = runtime["PydanticAgentRuntime"](health_transport)
+            embedding_client = runtime["VLLMEmbeddingClient"](
+                Config.VLLM_EMBED_BASE_URL,
+                Config.VLLM_EMBED_MODEL,
+                timeout=min(60, args.request_timeout),
+                max_batch_size=Config.VLLM_EMBED_MAX_BATCH_SIZE,
+                max_chars=Config.VLLM_EMBED_MAX_CHARS,
+            )
+        else:
+            llm = ProfilingAgentRuntime(health_transport)
+            embedding_client = runtime["OllamaEmbeddingClient"](
+                Config.OLLAMA_BASE_URL,
+                Config.OLLAMA_EMBED_MODEL,
+                timeout=min(600, args.request_timeout),
+            )
 
         scan = coarse.run(
             "inventory",
@@ -738,6 +771,22 @@ def run(args):
         prompt, evidence_catalog = runtime["build_report_analysis_prompt"](
             scan, summaries, analysis, local_report
         )
+        structured_qa = coarse.run(
+            "structured_qa_multiturn",
+            lambda: runtime["run_multiturn_structured_qa"](
+                llm,
+                evidence_catalog,
+                local_report=local_report,
+                request_timeout=args.request_timeout,
+                answer_batches=3,
+            ),
+        )
+        atomic_write_json(output_dir / "structured_qa.json", structured_qa)
+        prompt += (
+            "\n\n以下是经过问题规划、分组证据回答和综合审核的结构化问答结果。"
+            "报告必须消费这些结果；不得恢复已被审核删除的说法。\n"
+            + json.dumps(structured_qa["final_answers"], ensure_ascii=False)
+        )
         report_result = coarse.run(
             "report_research_direction",
             lambda: llm.chat_json(
@@ -773,6 +822,7 @@ def run(args):
             "coverage": analysis.get("coverage") or {},
             "value_judgment": analysis.get("value_judgment") or {},
             "model_analysis": report_data.get("model_analysis") or {},
+            "structured_qa": structured_qa,
         })
     except Exception as exc:
         fatal_error = {
@@ -801,6 +851,18 @@ def run(args):
             aggregate_stage_rows(coarse.rows, analysis_progress.phases, result["model_stage_summary"]),
         )
         atomic_write_json(output_dir / "summary.json", result)
+        if args.model_backend == "vllm" and trace_path.is_file():
+            try:
+                from services.llm_trace import write_calls_json, write_cases_jsonl
+                write_calls_json(
+                    trace_path,
+                    output_dir / "llm_calls.json",
+                    output_dir / "metadata.json",
+                )
+                write_cases_jsonl(trace_path, output_dir / "cases.jsonl")
+            except Exception as exc:
+                result["trace_export_error"] = "{}: {}".format(type(exc).__name__, exc)
+                atomic_write_json(output_dir / "summary.json", result)
         try:
             monitor.close()
         except Exception:

@@ -226,6 +226,14 @@ class AnalysisTurnRuntime:
     def _repair_queries(
         self, plan: Mapping[str, Any], verification: Mapping[str, Any]
     ) -> Sequence[str]:
+        from services.answer_quality import enabled, question_aspects
+        if enabled():
+            base = str(plan.get("objective") or "").strip()
+            queries = [base] if base else []
+            for aspect in question_aspects(base):
+                queries.append("{} {} 原文 条件 例外".format(base, aspect["name"]))
+            queries.extend(plan.get("query_variants") or [])
+            return list(dict.fromkeys(q for q in queries if q))[:3]
         queries = []
         for claim in (verification.get("ledger") or {}).get("claims") or []:
             if claim.get("status") in {"unsupported", "partially_supported"}:
@@ -338,6 +346,9 @@ class AnalysisTurnRuntime:
                 {"max_per_query": 50, "merge_limit": 50}
                 if broad_package_question else {}
             )
+            large_qa_enabled = str(turn["scan_id"]).startswith("lp-") and bool(getattr(Config, "LARGE_QA_ENABLED", False))
+            if large_qa_enabled:
+                search_bounds = {"max_per_query": 50, "merge_limit": 70}
             batch_summary: Dict[str, Any] = {}
             tool_results: Dict[str, Any] = {}
             if not modes.intersection({"casual", "creative", "general_qa"}):
@@ -353,7 +364,7 @@ class AnalysisTurnRuntime:
                     retrieval_top_k = 8 if primary_mode in {
                         "relationship", "contradiction", "risk"
                     } else 10
-                    if broad_package_question:
+                    if broad_package_question or large_qa_enabled:
                         retrieval_top_k = max(retrieval_top_k, 50)
                     retrieval_override = execute_bounded_searches(
                         self.engine,
@@ -401,7 +412,19 @@ class AnalysisTurnRuntime:
                     "structured", "comparison", "timeline", "relationship",
                     "contradiction", "risk",
                 }
-                if modes.intersection(deep_modes):
+                if modes.intersection(deep_modes) and (retrieval_override or {}).get("retrieval_mode") == "large_qa":
+                    from services.analysis_tools import reduce_evidence_batches
+                    evidence = list((retrieval_override or {}).get("results") or [])
+                    batch_summary = reduce_evidence_batches(
+                        evidence, str(plan.get("objective") or ""), scoped_inventory_paths,
+                        batch_size=self.batch_size, cancel_check=self.cancel_check,
+                    )
+                    batch_summary["candidate_evidence"] = evidence
+                    tool_results = self._execute_tools(turn_id, plan, batch_summary)
+                    plan["batch_summary"] = self._batch_metrics(batch_summary)
+                    plan["tool_results"] = self._tool_summaries(tool_results)
+                    plan["tool_context"] = compact_tool_context(tool_results, batch_summary)
+                elif modes.intersection(deep_modes):
                     self._publish(
                         turn,
                         "running",
@@ -636,6 +659,11 @@ class AnalysisTurnRuntime:
                     )
                 )
                 repair_plan["verification_feedback"] = {
+                    "missing_answer_aspects": list(verification.get("missing_answer_aspects") or []),
+                    "previous_answer": str(turn_result.get("answer") or "")[:12000],
+                    "supported_claims": [x.get("text") for x in (verification.get("ledger") or {}).get("claims", []) if x.get("status") == "supported"][:20],
+                    "revision_instruction": "保留已有依据且未被新证据推翻的内容；针对明确错误、漏答和缺失条件修改，并把受影响的段落重新组织成连贯叙述，检查删改后主语、指代和主题衔接是否完整。保留有用的主题标题与段落，不输出核验标签或逐句核验清单。引用编号以本轮证据重新匹配，不沿用旧编号。新证据推翻旧判断时同步修正全文。",
+                    "failures": list(verification.get("failed_claims") or [])[:12],
                     "warnings": list(verification.get("warnings") or [])[:12],
                     "unsupported_claims": [
                         item.get("text")
@@ -691,7 +719,14 @@ class AnalysisTurnRuntime:
                     "package_reading_coverage": package_reading.get("summary_coverage"),
                     "package_reading_complete": package_reading.get("complete"),
                 })
+            if (turn_result.get("input_manifest") or {}).get("large_qa"):
+                quality_metrics["summary_index_complete"] = package_reading.get("complete", False)
+                quality_metrics["package_reading_complete"] = False
+                quality_metrics["original_indexed_files"] = (turn_result.get("package_coverage") or {}).get("original_indexed_files", 0)
             turn_result["quality_metrics"] = quality_metrics
+            if verification.get("missing_answer_aspects") and turn_result.get("status") == "answered":
+                turn_result["status"] = "partial"
+                turn_result["warnings"] = list(dict.fromkeys(list(turn_result.get("warnings") or []) + list(verification.get("warnings") or [])))
             turn_result["citation_verification_status"] = verification.get("status")
             turn_result["scope_completeness"] = (
                 "candidate_only"

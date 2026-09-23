@@ -228,10 +228,11 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
         }
     # File paths are metadata, not document content. Including them here lets
     # names such as "Q3" or "财报" contaminate BM25/TF-IDF ranking.
+    from services import answer_quality as aq
     texts = [
         "{} {} {}".format(
             item.get("section") or "",
-            item["text"][:5000],
+            aq.extract_passage(item["text"], query, 5000) if aq.enabled() else item["text"][:5000],
             str(item.get("translated_text") or "")[:5000],
         )
         for item in chunks

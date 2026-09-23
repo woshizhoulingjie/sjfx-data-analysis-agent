@@ -545,129 +545,122 @@ class LargePackageStore:
     def commit_stage_result(self, package_id, path, stage, token, *, ok=True,
                             file_fields=None, error=None, require_source_hash=None,
                             drop_catalog_queue=False):
-        """**原子提交**：同一个事务里校验租约 → 写文件结果 → 落队列终态。
+        return self.commit_stage_batch([dict(package_id=package_id,path=path,stage=stage,token=token,
+            ok=ok,file_fields=file_fields,error=error,require_source_hash=require_source_hash,
+            drop_catalog_queue=drop_catalog_queue)])[0]
 
-        为什么必须合并（改动前是两段独立写入）：
-          `_deep_worker` 先 `update_file(deep_status="completed", deep_summary=...)`
-          再 `finish_queue(..., token=lease)`，而且**忽略后者的返回值**。
-          `stale_running_to_retry()` 轮换令牌后，失联的旧任务即使被队列拒绝，
-          摘要也已经写进 files —— 旧结果覆盖新结果，而调用方仍返回成功。
-          本地已复现：队列明确拒绝旧令牌，文件记录却已被改写。
+    def commit_stage_batch(self, items):
+        if len(items)>32:raise ValueError('A preview commit batch is limited to 32 files')
+        results=[]
+        with self._lock,closing(self._connect()) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                for item in items:
+                    conn.execute('SAVEPOINT preview_item')
+                    result=self._commit_stage_conn(conn,**item)
+                    if not result[0]:conn.execute('ROLLBACK TO preview_item')
+                    conn.execute('RELEASE preview_item')
+                    results.append(result)
+                conn.commit()
+            except Exception:
+                conn.rollback();raise
+        return results
 
-        返回值 `(ok, reason)`。**调用方必须处理 False，不得当作成功。**
-
-        - `token=None` 保留无条件写入语义（仅测试与旧调用方使用）。
-        - `require_source_hash` 给出时，若 files.sha256 与领取时不一致
-          （源文件中途变化）则拒绝提交并返回 'source_changed'。
-        """
-        now = time.time()
-        _pf = {} if _PROFILE_COMMIT else None
-        _t0 = time.monotonic()
-        with self._lock, closing(self._connect()) as conn:
-            _m(_pf, 'lock+connect', _t0); _t0 = time.monotonic()
-            conn.execute("BEGIN IMMEDIATE")
-            _m(_pf, 'begin', _t0); _t0 = time.monotonic()
-            row = conn.execute(
-                "SELECT status,lease_token FROM queue WHERE package_id=? AND path=? AND stage=?",
-                (str(package_id), str(path), str(stage))).fetchone()
-            _m(_pf, 'queue_sel', _t0)
-            if not row:
-                conn.rollback()
-                return False, "no_queue_row"
-            if token is not None:
-                if str(row["status"]) != "running":
-                    conn.rollback()
-                    return False, "not_running"
-                if str(row["lease_token"] or "") != str(token):
-                    conn.rollback()
-                    LOGGER.warning("stale lease rejected commit: package=%s path=%s stage=%s",
-                                   package_id, path, stage)
-                    return False, "stale_lease"
-            if require_source_hash:
-                cur = conn.execute("SELECT sha256 FROM files WHERE package_id=? AND path=?",
-                                   (str(package_id), str(path))).fetchone()
-                if not cur or str(cur["sha256"] or "") != str(require_source_hash):
-                    conn.rollback()
-                    LOGGER.warning("source changed, result rejected: package=%s path=%s",
-                                   package_id, path)
-                    return False, "source_changed"
-            if file_fields:
-                # 与 update_file 保持**同一套语义**：字段白名单、dict 序列化、
-                # prepare_update 的内容处理，以及它带出的 catalog 重排队副作用。
-                # 区别只有一个：这些全部发生在**同一个事务**里，所以租约被回收时
-                # 什么都不会写进去。
-                allowed = {"sha256", "quick_status", "deep_status", "category", "confidence",
-                           "local_summary", "deep_summary", "error", "file_type", "topic",
-                           "recognition_status", "document_role",
-                           "summary_quality", "summary_coverage", "source_changed"}
-                fields = dict((k, v) for k, v in file_fields.items() if k in allowed)
-                schedule_catalog = False
-                if "local_summary" in fields or "deep_summary" in fields:
-                    from services.large_package_catalog import prepare_update
-                    _t0 = time.monotonic()
-                    previous = conn.execute("SELECT * FROM files WHERE package_id=? AND path=?",
-                                            (str(package_id), str(path))).fetchone()
-                    _m(_pf, 'files_sel_2nd', _t0)
-                    if previous is None:
-                        conn.rollback()
-                        return False, "no_file_row"
-                    _t0 = time.monotonic()
-                    fields, schedule_catalog = prepare_update(self._row(previous), fields)
-                    _m(_pf, 'prepare_update', _t0)
-                    fields = dict((k, v) for k, v in fields.items() if k in allowed or k == "updated_at")
-                if "local_summary" in fields:
-                    info = (fields["local_summary"] or {}).get("portrait") or {}
-                    if info.get("schema"):
-                        from services.large_package_topics import assign
-                        _t0 = time.monotonic()
-                        fields["topic"] = assign(conn, str(package_id), str(path), info)
-                        _m(_pf, 'assign', _t0)
-                cols, args = [], []
+    def _commit_stage_conn(self, conn, package_id, path, stage, token, *, ok=True,
+                            file_fields=None, error=None, require_source_hash=None,
+                            drop_catalog_queue=False):
+        now=time.time();_pf=None;_t0=time.monotonic()
+        row = conn.execute(
+            "SELECT status,lease_token FROM queue WHERE package_id=? AND path=? AND stage=?",
+            (str(package_id), str(path), str(stage))).fetchone()
+        _m(_pf, 'queue_sel', _t0)
+        if not row:
+            return False, "no_queue_row"
+        if token is not None:
+            if str(row["status"]) != "running":
+                return False, "not_running"
+            if str(row["lease_token"] or "") != str(token):
+                LOGGER.warning("stale lease rejected commit: package=%s path=%s stage=%s",
+                               package_id, path, stage)
+                return False, "stale_lease"
+        if require_source_hash:
+            cur = conn.execute("SELECT sha256 FROM files WHERE package_id=? AND path=?",
+                               (str(package_id), str(path))).fetchone()
+            if not cur or str(cur["sha256"] or "") != str(require_source_hash):
+                LOGGER.warning("source changed, result rejected: package=%s path=%s",
+                               package_id, path)
+                return False, "source_changed"
+        if file_fields:
+            # 与 update_file 保持**同一套语义**：字段白名单、dict 序列化、
+            # prepare_update 的内容处理，以及它带出的 catalog 重排队副作用。
+            # 区别只有一个：这些全部发生在**同一个事务**里，所以租约被回收时
+            # 什么都不会写进去。
+            allowed = {"sha256", "quick_status", "deep_status", "category", "confidence",
+                       "local_summary", "deep_summary", "error", "file_type", "topic",
+                       "recognition_status", "document_role",
+                       "summary_quality", "summary_coverage", "source_changed"}
+            fields = dict((k, v) for k, v in file_fields.items() if k in allowed)
+            schedule_catalog = False
+            if "local_summary" in fields or "deep_summary" in fields:
+                from services.large_package_catalog import prepare_update
                 _t0 = time.monotonic()
-                for key, value in fields.items():
-                    if key == "updated_at":
-                        continue
-                    cols.append(key + "=?")
-                    args.append(_json(value) if key in ("local_summary", "deep_summary") else value)
-                _m(_pf, 'json_build', _t0)
-                if cols:
+                previous = conn.execute("SELECT * FROM files WHERE package_id=? AND path=?",
+                                        (str(package_id), str(path))).fetchone()
+                _m(_pf, 'files_sel_2nd', _t0)
+                if previous is None:
+                    return False, "no_file_row"
+                _t0 = time.monotonic()
+                fields, schedule_catalog = prepare_update(self._row(previous), fields)
+                _m(_pf, 'prepare_update', _t0)
+                fields = dict((k, v) for k, v in fields.items() if k in allowed or k == "updated_at")
+            if "local_summary" in fields:
+                info = (fields["local_summary"] or {}).get("portrait") or {}
+                if info.get("schema"):
+                    from services.large_package_topics import assign
                     _t0 = time.monotonic()
-                    conn.execute("UPDATE files SET " + ",".join(cols) +
-                                 ",updated_at=? WHERE package_id=? AND path=?",
-                                 args + [now, str(package_id), str(path)])
-                    _m(_pf, 'files_update', _t0)
-                if schedule_catalog:
-                    _t0 = time.monotonic()
-                    conn.execute("UPDATE large_catalog_groups SET content_revision=content_revision+1 "
-                                 "WHERE package_id=? AND id IN (SELECT group_id FROM large_catalog_members "
-                                 "WHERE package_id=? AND path=?)",
-                                 (str(package_id), str(package_id), str(path)))
-                    conn.execute("INSERT INTO queue(package_id,path,stage,status,updated_at) "
-                                 "VALUES(?,?,'catalog','queued',?) ON CONFLICT(package_id,path,stage) "
-                                 "DO UPDATE SET status='queued',attempts=0,leased_at=NULL,"
-                                 "lease_token=NULL,error=NULL,updated_at=excluded.updated_at",
-                                 (str(package_id), str(path), now))
-                    _m(_pf, 'schedule_catalog', _t0)
+                    fields["topic"] = assign(conn, str(package_id), str(path), info)
+                    _m(_pf, 'assign', _t0)
+            cols, args = [], []
             _t0 = time.monotonic()
-            conn.execute("UPDATE queue SET status=?,error=?,updated_at=?,lease_token=NULL "
-                         "WHERE package_id=? AND path=? AND stage=?",
-                         ("completed" if ok else "failed", error, now,
-                          str(package_id), str(path), str(stage)))
-            if drop_catalog_queue:
-                conn.execute("DELETE FROM queue WHERE package_id=? AND path=? AND stage='catalog'",
-                             (str(package_id), str(path)))
-            _m(_pf, 'queue_update', _t0)
-            _t0 = time.monotonic()
-            conn.commit()
-            _m(_pf, 'commit', _t0)
-        if _pf is not None:
-            _total = sum(_pf.values())
-            if _total * 1000 >= _PROFILE_COMMIT_MIN_MS:
-                LOGGER.info("commit profile stage=%s total=%.2fms | %s", stage, _total * 1000,
-                            " ".join("%s=%.2f" % (k, v * 1000)
-                                     for k, v in sorted(_pf.items(), key=lambda kv: -kv[1])))
-        store = None  # 缓存失效由调用方负责（与 finish_queue 语义一致）
-        return True, ""
+            for key, value in fields.items():
+                if key == "updated_at":
+                    continue
+                cols.append(key + "=?")
+                args.append(_json(value) if key in ("local_summary", "deep_summary") else value)
+            _m(_pf, 'json_build', _t0)
+            if cols:
+                _t0 = time.monotonic()
+                conn.execute("UPDATE files SET " + ",".join(cols) +
+                             ",updated_at=? WHERE package_id=? AND path=?",
+                             args + [now, str(package_id), str(path)])
+                _m(_pf, 'files_update', _t0)
+            if schedule_catalog:
+                _t0 = time.monotonic()
+                conn.execute("UPDATE large_catalog_groups SET content_revision=content_revision+1 "
+                             "WHERE package_id=? AND id IN (SELECT group_id FROM large_catalog_members "
+                             "WHERE package_id=? AND path=?)",
+                             (str(package_id), str(package_id), str(path)))
+                conn.execute("INSERT INTO queue(package_id,path,stage,status,updated_at) "
+                             "VALUES(?,?,'catalog','queued',?) ON CONFLICT(package_id,path,stage) "
+                             "DO UPDATE SET status='queued',attempts=0,leased_at=NULL,"
+                             "lease_token=NULL,error=NULL,updated_at=excluded.updated_at",
+                             (str(package_id), str(path), now))
+                _m(_pf, 'schedule_catalog', _t0)
+        _t0 = time.monotonic()
+        conn.execute("UPDATE queue SET status=?,error=?,updated_at=?,lease_token=NULL "
+                     "WHERE package_id=? AND path=? AND stage=?",
+                     ("completed" if ok else "failed", error, now,
+                      str(package_id), str(path), str(stage)))
+        if drop_catalog_queue:
+            conn.execute("DELETE FROM queue WHERE package_id=? AND path=? AND stage='catalog'",
+                         (str(package_id), str(path)))
+        return True,''
+
+    def preview_files(self,package_id,paths):
+        if not paths:return {}
+        with closing(self._connect()) as c:
+            rows=c.execute('SELECT * FROM files WHERE package_id=? AND path IN ('+','.join('?' for _ in paths)+')',[package_id]+list(paths))
+            return {r['path']:self._row(r) for r in rows}
 
     def holds_lease(self, package_id, path, stage, token):
         """只读检查：该队列项仍由这个令牌持有且处于 running。"""

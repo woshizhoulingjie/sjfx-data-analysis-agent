@@ -171,6 +171,9 @@ def apply_merge(store, package_id, rows, result, model, cancelled=lambda:False):
             rows = [rows[i] for i in keep]
         host = max(snapshots,key=lambda s:(len(s['paths']),s['label']['group_id']))['label']['group_id']
         ids = [r['group_id'] for r in rows]
+        from services.large_package_catalog_quality import compatible_groups
+        if not compatible_groups(c,package_id,ids):
+            c.rollback();return 0
         marks = ','.join('?' for _ in ids)
         total, center = 0, None
         for r in c.execute('SELECT vector FROM large_catalog_members WHERE package_id=? AND group_id IN ('+marks+')', [package_id]+ids):
@@ -317,6 +320,9 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
             for row in items[1:]:
                 if cap > 1 and running + row['member_count'] > cap:
                     continue                 # 规模上限：宁可不并，也不产出名字必然失真的巨组
+                from services.large_package_catalog_quality import compatible_groups
+                if not compatible_groups(c, package_id, [r['group_id'] for r in keep]+[row['group_id']]):
+                    continue
                 keep.append(row)
                 running += row['member_count']
             if len(keep) < 2:
@@ -340,7 +346,7 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
                       [package_id] + victims)
             anchor, representative = naming._group_geometry(c, package_id, host_id)
             c.execute('UPDATE large_catalog_groups SET anchor=COALESCE(?,anchor),'
-                      'representative=COALESCE(?,representative),content_revision=1,'
+                      'representative=COALESCE(?,representative),'
                       "status='named' WHERE package_id=? AND id=?",
                       (anchor, representative, package_id, host_id))
             if anchor:
@@ -349,7 +355,7 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
                 for band, bucket in enumerate(_buckets(centre)):
                     c.execute('INSERT OR IGNORE INTO large_catalog_buckets VALUES(?,?,?,?)',
                               (package_id, band, bucket, host_id))
-            c.execute('UPDATE lp_catalog_labels SET revision=1,needs_review=1,'
+            c.execute('UPDATE lp_catalog_labels SET revision=(SELECT content_revision FROM large_catalog_groups g WHERE g.package_id=lp_catalog_labels.package_id AND g.id=lp_catalog_labels.group_id),needs_review=1,'
                       "model='merge-identical',updated=? WHERE package_id=? AND group_id=?",
                       (time.time(), package_id, host_id))
             LOGGER.info('identical-name merge package=%s host=%s name=%s merged=%d groups '

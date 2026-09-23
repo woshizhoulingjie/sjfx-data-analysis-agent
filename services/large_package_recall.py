@@ -418,8 +418,10 @@ def rerank_candidates(query: str, results: Sequence[Mapping[str, Any]],
         return items
 
     pool = items[:RERANK_CANDIDATES]
+    from services.answer_quality import extract_passage, enabled
     listing = "\n".join(
-        "{}. {}".format(position, str(item.get("source_path") or ""))
+        "{}. {}{}".format(position, str(item.get("source_path") or ""),
+                          " | " + extract_passage(item.get("original_text") or item.get("text"), question, 420) if enabled() else "")
         for position, item in enumerate(pool, 1)
     )
     payload = json.dumps({

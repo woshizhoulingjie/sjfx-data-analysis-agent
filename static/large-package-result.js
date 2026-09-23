@@ -168,18 +168,28 @@
     const smart = catalog.smart || {};
     const labels = { pending: '待语义分组', grouped: '待主题命名', classified: '已按语义归类', deferred: '主题待确认', no_content: '待提取内容', legacy: '旧版目录', identified: '已识别主题', needs_more: '待补充采样', needs_ocr: '待 OCR', needs_review: '待核查', metadata_only: '仅元数据', restricted: '受限文件', unsupported: '暂不支持' };
     const group = (key, title, content, count) => `<section class="lp-nav-group"><button type="button" class="lp-group-toggle" data-lp-group="${esc(key)}" aria-expanded="${browseStates.smart.expanded.has(key)}"><span class="lp-group-arrow" aria-hidden="true">›</span><span>${esc(title)}</span>${count == null ? '' : `<small>${count}</small>`}</button><div class="lp-group-content" ${browseStates.smart.expanded.has(key) ? '' : 'hidden'}>${content}</div></section>`;
-    const byId=new Map((smart.topics || []).map(item=>[item.node_id,item]));
+    const byId=new Map([...(smart.navigation || []),...(smart.topics || [])].map(item=>[item.node_id,item]));
+    const branchesById=new Map((smart.branches || []).map(b=>[b.node_id,b]));
     const nested=new Set();
-    const branches=(smart.branches || []).map(branch=>{
-      const children=(branch.children || []).map(id=>byId.get(id)).filter(Boolean);
-      if (!(branch.children || []).length)return '';
-      children.forEach(child=>nested.add(child.node_id));
-      const count=branch.files == null ? children.reduce((sum,child)=>sum+child.files,0) : branch.files;
-      const parent=nodeButton('group',branch.node_id,branch.name,count,{description:'根据子目录的共同内容组织，点击可查看所有成员。'});
-      const body=children.map(child=>nodeButton('group',child.node_id,child.topic,child.files,child)).join('');
-      return '<div class="lp-content-branch">'+parent+'<div class="lp-content-children">'+body+'</div></div>';
-    }).join('');
-    const topics = branches+(smart.topics || []).filter(item=>!nested.has(item.node_id)).map(item => nodeButton(item.node_id ? 'group' : 'topic', item.node_id || item.topic, item.topic, item.files, item)).join('');
+    const branchHTML=(branch,visited=new Set())=>{
+      if(visited.has(branch.node_id))return '';
+      const seen=new Set(visited);seen.add(branch.node_id);
+      const key='theme:'+branch.node_id;
+      const open=browseStates.smart.expanded.has(key);
+      const children=branch.child_nodes || branch.children || [];
+      const body=children.map(id=>{
+        const next=branchesById.get(id);
+        if(next)return branchHTML(next,seen);
+        const child=byId.get(id);if(!child)return '';
+        nested.add(id);
+        return nodeButton('group',id,child.topic || child.name,child.files,child);
+      }).join('');
+      const description=branch.status==='stale'?'内容已更新，主题名称正在复核。':branch.status==='needs_review'?'目录范围已整理，主题名称待完善。':'根据子目录共同内容组织，点击查看全部成员。';
+      const parent=nodeButton('group',branch.node_id,branch.name,branch.files,{description});
+      return `<div class="lp-content-branch"><div class="lp-nav-row"><button type="button" class="lp-expand" data-lp-expand="${esc(key)}" aria-expanded="${open}" aria-label="${open?'收起':'展开'} ${esc(branch.name)}"><span aria-hidden="true">›</span></button>${parent}</div><div class="lp-content-children" ${open?'':'hidden'}>${body}</div></div>`;
+    };
+    const branches=(smart.branches || []).filter(b=>!b.parent_id).map(b=>branchHTML(b)).join('');
+    const topics=branches+[...byId.values()].filter(item=>!nested.has(item.node_id)).map(item=>nodeButton(item.node_id?'group':'topic',item.node_id || item.topic,item.topic || item.name,item.files,item)).join('');
     const categories = (smart.categories || []).map(item => nodeButton('category', item.category, item.category || '未分类', item.files, item)).join('');
     const facets = Object.entries(smart.facets || {}).filter(([kind]) => ['role', 'project', 'entity', 'date'].includes(kind)).map(([kind, items]) => group('facet:' + kind, scopeLabels[kind] + '线索', (items || []).map(item => nodeButton(kind, item.value, item.value, item.files, item)).join(''), items.length)).join('');
     const naming = smart.naming || {};
@@ -234,7 +244,7 @@
     const basis = [info.description || info.basis, namingText, info.needs_review ? '组内内容需要进一步复核' : ''].filter(Boolean).join(' · ') || (state.node.type === 'directory' ? '文件按原始路径归属，包含该目录下的子目录文件。' : '');
     const samples = (info.sample || []).map(item => typeof item === 'string' ? `<li>${esc(item)}</li>` : `<li><b>${esc(item.path)}</b>${item.basis ? `<p>${esc(item.basis)}</p>` : ''}${(item.evidence || []).map(e => `<p><span>${esc(e.location)}</span>：${esc(e.text)}</p>`).join('')}</li>`).join('');
     const details = basis || samples ? `<details class="lp-scope-evidence"><summary>节点信息与代表文件</summary>${basis ? `<p>${esc(basis)}</p>` : ''}${samples ? `<ul>${samples}</ul>` : ''}</details>` : '';
-    const content = `<div class="lp-scope-top"><div><span class="lp-scope-kind">${esc(scopeLabels[state.node.type] || '当前范围')}</span><h3 title="${esc(state.node.value || label)}">${esc(label)}</h3></div><button id="largeResultClearScope" type="button" class="ghost">查看全包</button></div>${state.node.value && state.node.type === 'directory' ? `<p class="lp-scope-path">${esc(state.node.value)}</p>` : ''}${info.description ? `<p class="lp-scope-description">${esc(info.description)}</p>` : ''}<p class="lp-scope-count">${state.total == null ? '正在读取文件…' : `当前范围匹配 ${state.total} 个文件`}${state.query || state.category ? ' · 已应用筛选' : ''}</p>${state.notice ? `<p class="lp-scope-notice">${esc(state.notice)}</p>` : ''}${details}${state.node.type === 'group' && !state.node.value.startsWith('preview:') && !state.node.value.startsWith('branch:') ? '<button type="button" data-lp-rename>确认或修改名称</button>' : ''}`;
+    const content = `<div class="lp-scope-top"><div><span class="lp-scope-kind">${esc(scopeLabels[state.node.type] || '当前范围')}</span><h3 title="${esc(state.node.value || label)}">${esc(label)}</h3></div><button id="largeResultClearScope" type="button" class="ghost">查看全包</button></div>${state.node.value && state.node.type === 'directory' ? `<p class="lp-scope-path">${esc(state.node.value)}</p>` : ''}${info.description ? `<p class="lp-scope-description">${esc(info.description)}</p>` : ''}<p class="lp-scope-count">${state.total == null ? '正在读取文件…' : `当前范围匹配 ${state.total} 个文件`}${state.query || state.category ? ' · 已应用筛选' : ''}</p>${state.notice ? `<p class="lp-scope-notice">${esc(state.notice)}</p>` : ''}${details}${state.node.type === 'group' && !state.node.value.startsWith('preview:') && !state.node.value.startsWith('branch:') && !state.node.value.startsWith('topic:') ? '<button type="button" data-lp-rename>确认或修改名称</button>' : ''}`;
     const host = $('largeResultNodeSummary');
     if (host && host._lpMarkup !== content) {
       const wasOpen = host.querySelector('details')?.open;

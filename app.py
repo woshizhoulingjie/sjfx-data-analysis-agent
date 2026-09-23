@@ -718,6 +718,7 @@ def require_scan(scan_id):
     scan = storage.get_scan(scan_id, owner_id=_request_owner_id())
     if not scan:
         raise ValueError("扫描任务不存在、已失效或不属于当前访问用户")
+    _file_protection.guard_root(scan.get("root") or "")
     scan.setdefault("_scan_id", str(scan_id))
     return scan
 def _walk_analysis_nodes(node):
@@ -6341,6 +6342,7 @@ def scan():
         # The supervised Worker performs the authoritative allow-list and
         # existence check, where a cancel request can terminate a blocked call.
         root = _validate_scan_path_request(path)
+        _file_protection.guard_root(root)
         job_id = storage.create_scan_job(
             root, payload.get("max_files", Config.MAX_SCAN_FILES), parse_mode,
             payload.get("max_depth", Config.MAX_SCAN_DEPTH),
@@ -8214,6 +8216,16 @@ def _merge_summary_evidence(retrieval_request, package_context, indexed):
 
 
 def _conversation_retrieve(retrieval_request):
+    if str(retrieval_request.scan_id).startswith("lp-") and Config.LARGE_QA_ENABLED:
+        import sqlite3
+        from services.large_qa_search import retrieve as retrieve_large_qa
+        try:
+            indexed = retrieve_large_qa(large_package_store, retrieval_request)
+        except (sqlite3.Error, OSError):
+            app.logger.exception("Large QA index unavailable; using existing retrieval")
+            indexed = None
+        if indexed is not None:
+            return indexed
     started_at = time.monotonic()
     cache_key = (
         str(retrieval_request.scan_id),
@@ -8279,7 +8291,7 @@ def _conversation_retrieve(retrieval_request):
             "scope": scope.kind, "total_files": len(files),
             "candidate_files": len(files),
             "inspected_files": len(result.get("results") or []),
-            "query_coverage": 1.0 if files else 0.0,
+            "query_coverage": None,
             "coverage_basis": "package_summary",
             "package_reading_files": reading_manifest.get("files_read"),
             "summary_backed_files": reading_manifest.get("summary_backed_files"),
@@ -11415,6 +11427,7 @@ def create_download_ticket():
     ticket = storage.create_download_ticket(
         filename, owner_id, ttl_seconds=Config.DOWNLOAD_TICKET_TTL_SECONDS
     )
+    _file_protection.bind_download(filename, ticket, Config.DOWNLOAD_TICKET_TTL_SECONDS)
     return jsonify({
         "ok": True,
         "download_url": "/outputs/{}?ticket={}".format(
@@ -11972,6 +11985,7 @@ def create_large_package():
         root = str(payload.get("path") or "").strip()
         if not root:
             raise ValueError("请输入要处理的大数据包目录")
+        _file_protection.guard_root(root)
         item = large_package_store.create(root, owner_id=_effective_owner())
         return jsonify({"ok": True, "large_package": item, "package_id": item["id"]}), 202
     except (ValueError, OSError) as exc:
@@ -11982,6 +11996,7 @@ def _large_package_owned(package_id):
     item = large_package_store.get(package_id, owner_id=_effective_owner())
     if not item:
         raise ValueError("大数据包任务不存在、已失效或不属于当前访问用户")
+    _file_protection.guard_root(item.get("root_path") or "")
     return item
 
 
@@ -12174,6 +12189,19 @@ def _large_package_document(package_id):
     row = large_package_store.get_file(package_id, node_path)
     if not row:
         raise ValueError("文件不属于当前大数据包")
+    if row.get("sensitive"):
+        raise ValueError("当前文件仅允许查看元数据")
+    if Config.LARGE_QA_ENABLED:
+        import sqlite3
+        from services.large_qa_search import original_document
+        try:
+            original = original_document(package_id, package["root_path"], node_path,
+                                         full=str(request.args.get("full") or "").lower() in {"1", "true", "yes"})
+        except (sqlite3.Error, OSError):
+            app.logger.exception("Large QA reader unavailable; using existing preview")
+            original = None
+        if original is not None:
+            return jsonify({"ok": True, "document": original})
     local = row.get("local_summary") if isinstance(row.get("local_summary"), dict) else {}
     deep = row.get("deep_summary") if isinstance(row.get("deep_summary"), dict) else {}
     deep_ready = deep.get("summary_type") not in (None, "model_pending")
@@ -12242,26 +12270,22 @@ def _large_package_document(package_id):
         "evidence_count": len(evidence),
     }})
 
-def _large_package_inventory_paths(package_id, limit=100000):
+def _large_package_inventory_paths(package_id, limit=None):
     """Complete manifest path list for an isolated large package.
 
     The isolated store keeps no ordinary inventory table, so its durable file
     manifest is the equivalent complete file set for a conversation turn.
     """
-    paths = []
-    offset = 0
-    while len(paths) < limit:
-        page = large_package_store.list_files(package_id, limit=500, offset=offset)
-        if not page:
-            break
-        for row in page:
-            path = str((row or {}).get("path") or "").strip()
-            if path:
-                paths.append(path)
-        offset += len(page)
-        if len(page) < 500:
-            break
-    return paths
+    # Only paths are needed here. Decorating every row used to load all large
+    # summaries again before the indexed question could even start.
+    from contextlib import closing
+    with closing(large_package_store._connect()) as connection:
+        query = "SELECT path FROM files WHERE package_id=? AND sensitive=0 ORDER BY path"
+        args = [package_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            args.append(max(1, int(limit)))
+        return [str(row[0]) for row in connection.execute(query, args) if row[0]]
 
 
 
@@ -12699,6 +12723,15 @@ def cancel_large_package(package_id):
     except ValueError as exc:
         return api_error(str(exc), 404)
 
+
+
+# Isolated file protection: off by default, separate state and no model/runtime initialization.
+from sjfx_protection.integration import install as _install_file_protection
+_file_protection = _install_file_protection(
+    app, state_dir=Config.DATA_DIR / "file_protection",
+    allowed_roots=Config.SCAN_ALLOWED_ROOTS,
+    session_resolver=lambda sid: _multi_user_store.resolve_session(sid) if _multi_user_store else None,
+)
 
 
 if __name__ == "__main__":

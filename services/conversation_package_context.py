@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, defaultdict
+from services import answer_quality as aq
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -85,7 +86,7 @@ def _reading_manifest(files: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         path = str(item.get("path") or "").strip()
         if not path:
             continue
-        summary = _text(item.get("summary"), 4000)
+        summary = _text(item.get("summary"), 12000)
         has_summary = bool(summary)
         directory = _directory_key(path)
         directory_row = directories[directory]
@@ -130,7 +131,7 @@ def _reading_manifest(files: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 
 
 def _representative_capsules(
-    files: Sequence[Mapping[str, Any]], max_chars: int
+    files: Sequence[Mapping[str, Any]], max_chars: int, query: str = ""
 ) -> List[Dict[str, Any]]:
     """Provide a bounded, directory-balanced reading sample for the model."""
     if max_chars <= 0:
@@ -139,6 +140,21 @@ def _representative_capsules(
     for item in files or []:
         if item.get("path"):
             grouped[_directory_key(str(item.get("path")))].append(item)
+    if query and aq.enabled():
+        capsules = []
+        used = 0
+        ranked = sorted(files, key=lambda row: -aq.relevance(query, row.get("summary", "")))
+        for item in ranked:
+            if not aq.relevance(query, item.get("summary", "")):
+                continue
+            capsule = {"path": item.get("path"), "summary_type": item.get("summary_type"),
+                       "summary": aq.extract_passage(item.get("summary"), query, 900)}
+            cost = len(json.dumps(capsule, ensure_ascii=False))
+            if used + cost > max_chars:
+                continue
+            capsules.append(capsule)
+            used += cost
+        return capsules
     capsules: List[Dict[str, Any]] = []
     used = 0
     # One early and one late record per directory avoids a lexical-tail bias.
@@ -162,7 +178,7 @@ def _representative_capsules(
     return capsules
 
 
-def build_standard_context(storage: Any, scan_id: str, max_summary_chars: int = 700) -> dict:
+def build_standard_context(storage: Any, scan_id: str, max_summary_chars: int = 8000) -> dict:
     """Build a read-only whole-scan context from existing persisted artifacts."""
     overview = storage.get_package_overview(scan_id) or {}
     analysis = storage.get_analysis_overview(scan_id) or {}
@@ -235,7 +251,7 @@ def build_standard_context(storage: Any, scan_id: str, max_summary_chars: int = 
     }
 
 
-def build_large_context(store: Any, package_id: str, max_summary_chars: int = 700) -> Optional[dict]:
+def build_large_context(store: Any, package_id: str, max_summary_chars: int = 8000) -> Optional[dict]:
     """Build context from the isolated large-package manifest and summaries."""
     package = store.get(package_id)
     if not package:
@@ -283,7 +299,7 @@ def build_reading_manifest(files: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
     return _reading_manifest(files)
 
 
-def model_digest(context: Mapping[str, Any], max_chars: int = 36000) -> str:
+def model_digest(context: Mapping[str, Any], max_chars: int = 36000, query: str = "") -> str:
     """Serialize an all-file reading layer without unsafe tail truncation.
 
     Every persisted summary is consumed by ``_reading_manifest``.  The prompt
@@ -312,7 +328,33 @@ def model_digest(context: Mapping[str, Any], max_chars: int = 36000) -> str:
         ),
     }
     base_size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    large_qa = context.get("large_qa") or {}
+    if large_qa:
+        payload["topic_overview"] = {
+            "instruction": "主题要点来自分批摘要，仅供组织脉络，具体事实仍须对应编号证据；未完成的主题不得宣称全面覆盖。",
+            "topic_count": len(large_qa.get("topics") or []),
+            "map_topics_processed": large_qa.get("map_topics_processed"),
+            "map_complete": large_qa.get("map_complete", False),
+            "notes": list(large_qa.get("map_notes") or [])[:48],
+        }
+        base_size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     payload["representative_file_capsules"] = _representative_capsules(
-        files, max(0, int(max_chars) - base_size - 200)
+        files, max(0, int(max_chars) - base_size - 200), query=query
     )
+    if aq.enabled():
+        payload["instruction"] = "账本表示程序遍历摘要的范围，不表示模型已阅读全部内容。以下仅为摘要样本与统计；具体事实以编号证据为准。不得把样本当成全包穷尽结论。"
+        dump = lambda: json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        while len(dump()) > max_chars and payload["representative_file_capsules"]:
+            payload["representative_file_capsules"].pop()
+        while len(dump()) > max_chars and (payload.get("topic_overview") or {}).get("notes"):
+            payload["topic_overview"]["notes"].pop()
+        for key in ("directory_atlas", "semantic_signals", "missing_summary_sample"):
+            while len(dump()) > max_chars and payload["all_file_reading"].get(key):
+                payload["all_file_reading"][key] = payload["all_file_reading"][key][:-1]
+        for key in ("analysis_overview", "package_overview"):
+            if len(dump()) > max_chars:
+                payload[key] = aq.extract_passage(payload[key], query, max(0, len(payload[key]) - (len(dump()) - max_chars) - 50))
+        if len(dump()) > max_chars:
+            payload = {"instruction": "上下文预算不足，仅保留覆盖计数；不代表完整阅读。", "summary_records": len(files)}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

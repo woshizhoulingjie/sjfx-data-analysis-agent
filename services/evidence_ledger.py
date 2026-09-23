@@ -20,18 +20,27 @@ def build_evidence_ledger(answer: str, citations: Sequence[Mapping[str, Any]]) -
     }
     claims: List[Dict[str, Any]] = []
     unsupported = 0
-    for raw in CLAIM_SPLIT_RE.split(str(answer or "")):
+    source = re.sub(r"([。！？!?])[ \t]*((?:\[\d{1,4}\][ \t]*)+)", r" \2\1", str(answer or ""))
+    cursor = 0
+    for raw in CLAIM_SPLIT_RE.split(source):
+        start = source.find(raw, cursor)
+        cursor = start + len(raw)
+        paragraph_index = source.count("\n", 0, start)
         text = raw.strip().lstrip("-•*# ").strip()
-        if len(text) < 4:
+        heading = bool(re.fullmatch(r"\s*(?:#{1,6}\s+.{1,40}|\*\*.{1,40}\*\*)\s*", raw))
+        if len(text) < 4 and not heading:
             continue
         indexes = [int(value) for value in CITATION_RE.findall(text)]
         evidence_ids = [
             str(by_index[index].get("evidence_id"))
             for index in indexes if index in by_index and by_index[index].get("evidence_id")
         ]
-        if evidence_ids:
+        if heading or re.fullmatch(r"[| :\-]+", raw):
+            status = "section_label"
+        elif evidence_ids:
             status = "supported"
-        elif ADVISORY_RE.search(text):
+        elif (re.match(r"^(?:建议|可以考虑|可考虑|分析判断[:：]|推测[:：]|假设[:：]|下一步(?:可以|建议))", text)
+              and not re.search(r"已经|明确记载|资料显示|(?:预算|金额|收入|支出).{0,8}(?:为|是|达到)", text)):
             status = "analysis_or_advice"
         else:
             status = "unsupported"
@@ -40,6 +49,8 @@ def build_evidence_ledger(answer: str, citations: Sequence[Mapping[str, Any]]) -
         claims.append({
             "claim_id": claim_id,
             "text": text,
+            "raw_text": raw.strip(),
+            "paragraph_index": paragraph_index,
             "status": status,
             "evidence_ids": list(dict.fromkeys(evidence_ids)),
             "citation_indexes": indexes,

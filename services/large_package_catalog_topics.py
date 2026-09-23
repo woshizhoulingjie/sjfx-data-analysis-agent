@@ -214,7 +214,8 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
             kwargs = {'temperature': .1, 'max_tokens': 80*len(items)+32, 'retries': 0,
                       'timeout': min(cfg['timeout'], max(1, int(round_state['deadline']-time.time())))}
             if getattr(model_client, 'supports_json_response_format', False):
-                kwargs['response_format'] = {'type': 'json_object'}
+                from services.large_package_catalog_schema import themes
+                kwargs['response_format'] = themes(['T%d'%i for i in range(len(items))])
             with background_generation(stop):
                 response = model_client.chat(SYSTEM, payload_for(items), **kwargs)
             if response.get('finish_reason') == 'length':

@@ -17,6 +17,14 @@ def _run_import(code, state_dir, **overrides):
             "SJFX_STATE_DIR": str(state_dir),
             "SJFX_PARSE_TEMP_DIR": str(state_dir.parent / "parse-temp"),
             "HOST": "127.0.0.1",
+            # **部署环境的额外绑定地址必须清掉。** 本用例断言的是"只有显式本地开发
+            # 才开 API 文档"这条契约，而 config 判定"是否回环部署"用的是
+            # `(HOST,) + EXTRA_BIND_HOSTS` **全体**：本机部署为了对外访问设了
+            # `SJFX_EXTRA_BIND_HOSTS=100.120.119.161`，于是 `_LOOPBACK_HOST` 变 False、
+            # 安全闸门强制 `AUTH_REQUIRED=1` 并拒绝启动，用例就因**环境**而红
+            # （实测：同一份代码在未设该变量的环境里通过）。清掉它，用例才在
+            # 测代码而不是测这台机器的部署参数。
+            "SJFX_EXTRA_BIND_HOSTS": "",
             "AUTH_REQUIRED": "0",
             "ENABLE_API_DOCS": "0",
             "ENABLE_TRANSLATION": "0",

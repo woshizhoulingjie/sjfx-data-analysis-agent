@@ -228,40 +228,18 @@
         const data = await api(`/api/large-packages/${encodeURIComponent(state.sourceId)}/catalog/tree`);
         if (seq !== state.treeRequest) return;
         const tree = data.tree || {};
-        state.roots = (tree.themes || []).map((theme) => {
-          const node = {
-            key: `t:${theme.node_id}`,
-            kind: "theme",
-            name: theme.name || "未命名主题",
-            nodeId: theme.node_id ? String(theme.node_id) : null,
-            path: null,
-            count: Number(theme.files || 0),
-            sizeHuman: "",
-            hasChildren: true,
-            children: [],
-            hasMore: false,
-            ancestors: [],
-            status: theme.status || "current",
-          };
-          node.children = (theme.leaves || []).map((leaf) => {
-            const child = {
-              key: `l:${leaf.node_id}`,
-              kind: "leaf",
-              name: leaf.name || "未命名目录",
-              nodeId: leaf.node_id ? String(leaf.node_id) : null,
-              path: null,
-              count: Number(leaf.files || 0),
-              sizeHuman: "",
-              hasChildren: true,
-              children: [],
-              hasMore: false,
-              ancestors: [node],
-            };
-            return child;
-          });
-          state.loaded.add(node.key);
-          return node;
-        });
+        const mapTheme=(theme,ancestors=[])=>{
+          const node={key:`t:${theme.node_id}`,kind:'theme',name:theme.name || '未命名主题',
+            nodeId:theme.node_id ? String(theme.node_id):null,path:null,count:Number(theme.files || 0),
+            sizeHuman:'',hasChildren:true,children:[],hasMore:false,ancestors,status:theme.status || 'current'};
+          const lineage=[...ancestors,node];
+          node.children=[...(theme.children || []).map(child=>mapTheme(child,lineage)),
+            ...(theme.leaves || []).map(leaf=>({key:`l:${leaf.node_id}`,kind:'leaf',name:leaf.name || '未命名目录',
+              nodeId:leaf.node_id ? String(leaf.node_id):null,path:null,count:Number(leaf.files || 0),
+              sizeHuman:'',hasChildren:true,children:[],hasMore:false,ancestors:lineage}))];
+          state.loaded.add(node.key);return node;
+        };
+        state.roots=(tree.themes || []).map(theme=>mapTheme(theme));
         registerNodes(state.roots);
         const notice = $("exportNotice");
         if (notice) {

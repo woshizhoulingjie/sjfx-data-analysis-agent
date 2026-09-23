@@ -45,7 +45,7 @@ class AnalysisPlanner:
     FILE_SEARCH_RE = re.compile(
         r"(?:搜索|查找|找一下|找出|找到|列出|显示|筛选)\s*\S+"
         r"|(?:包含|命中|有关|关于).{0,80}(?:文件|资料|文档)"
-        r"|(?:文件|资料|文档).{0,40}(?:搜索|查找|列表|清单|在哪|有哪些|包含|命中)"
+        r"|(?:文件|资料|文档).{0,40}(?:搜索|查找|列表|清单|在哪|有哪些(?!发现|结论|成果|特点|问题|变化|影响|风险|建议|方法)|包含|命中)"
         r"|\bfiles?\b",
         re.I,
     )
@@ -78,7 +78,7 @@ class AnalysisPlanner:
     CREATIVE_RE = re.compile(r"\u5199(?:\u4e00?\u7bc7|\u4e00?\u4e2a)?(?:\u5c0f\u8bf4|\u6545\u4e8b|\u8bd7|\u8bd7\u6b4c)|\u521b\u4f5c|\u7f16(?:\u4e00\u4e2a|\u4e2a)?\u6545\u4e8b|\u751f\u6210(?:\u4e00\u7bc7|\u4e00\u4e2a)?(?:\u5c0f\u8bf4|\u6545\u4e8b|\u8bd7\u6b4c)|\u626e\u6f14|write\s+(?:a\s+)?(?:story|novel|poem)", re.I)
     DOCUMENT_HINT_RE = re.compile(r"\u6570\u636e\u5305|\u8d44\u6599|\u6587\u6863|\u6587\u4ef6|\u539f\u6587|\u9644\u4ef6|\u672c\u9879\u76ee|\u8fd9\u4e2a\u9879\u76ee|\u8fd9\u4efd|\u4e0a\u8ff0|\u524d\u8ff0|\u5176\u4e2d|\u626b\u63cf|\u7d22\u5f15|\u5408\u540c|\u62a5\u544a|\u8bb0\u5f55|\u914d\u7f6e|\u4ee3\u7801", re.I)
     GENERAL_QA_RE = re.compile(r"^(?:\u4ec0\u4e48\u662f|\u4ec0\u4e48\u53eb|\u4e3a\u4ec0\u4e48|\u600e\u4e48(?:\u6837|\u529e|\u505a)|\u5982\u4f55|\u80fd\u5426|\u662f\u5426|\u8bf7(?:\u89e3\u91ca|\u4ecb\u7ecd)|\u89e3\u91ca\u4e00\u4e0b|\u4ecb\u7ecd\u4e00\u4e0b|what is|why |how to|can you)", re.I)
-    SUMMARY_RE = re.compile(r"总结|概括|综述|概览|主要内容|梳理|summary|overview", re.I)
+    SUMMARY_RE = re.compile(r"总结|概括|综述|概览|整体介绍|总体介绍|主要(?:内容|主题|方向)|资料.{0,16}(?:研究什么|讲什么)|梳理|summary|overview", re.I)
     REPORT_RE = re.compile(r"报告|研究报告|完整分析|深入分析|综合分析|report", re.I)
 
     def plan(self, question: str, scope: Mapping[str, Any],
@@ -95,7 +95,8 @@ class AnalysisPlanner:
             objective = "{}；当前追问：{}".format(previous_objective, question)
         casual = bool(self.CASUAL_RE.search(question))
         creative = bool(self.CREATIVE_RE.search(question))
-        general_qa = bool(self.GENERAL_QA_RE.search(question)) and not bool(self.DOCUMENT_HINT_RE.search(question))
+        from services.answer_quality import enabled
+        general_qa = ((not enabled()) or bool(re.search(r"^(?:什么是|什么叫|what is\b)", question, re.I))) and bool(self.GENERAL_QA_RE.search(question)) and not bool(self.DOCUMENT_HINT_RE.search(question))
         modes: List[str] = []
         checks = (
             ("file_search", self.FILE_SEARCH_RE),
@@ -116,7 +117,8 @@ class AnalysisPlanner:
         elif general_qa:
             modes.append("general_qa")
         else:
-            modes.extend(name for name, pattern in checks if pattern.search(question))
+            intent_text = re.sub(r"(?:不要|不必|无需|避免)(?:只|仅)?(?:列出|罗列|显示)[^。！？；;]{0,50}(?:目录|清单|列表)", "", question)
+            modes.extend(name for name, pattern in checks if pattern.search(intent_text))
             if not modes:
                 # Keep ordinary factual questions on the fast retrieval path.
                 # Deep analysis is selected only when the user explicitly asks

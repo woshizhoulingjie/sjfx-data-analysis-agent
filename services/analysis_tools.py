@@ -115,6 +115,8 @@ def merge_retrieval_results(
     package_context: Optional[Mapping[str, Any]] = None
     candidate_depth_values: List[float] = []
     coverage_bases = set()
+    indexed_coverage = {}
+    indexed_mode = False
     for result in results or []:
         result = dict(result or {})
         if package_context is None and isinstance(result.get("package_context"), Mapping):
@@ -135,6 +137,9 @@ def merge_retrieval_results(
             seen.add(key)
             merged.append(dict(item))
         coverage = dict(result.get("coverage") or {})
+        if result.get("retrieval_mode") == "large_qa":
+            indexed_mode = True
+            indexed_coverage = coverage
         reported_candidate_files = max(
             reported_candidate_files, int(coverage.get("candidate_files") or 0)
         )
@@ -202,6 +207,8 @@ def merge_retrieval_results(
         warnings = [item for item in warnings if not stale_no_evidence.search(item)]
     return {
         "results": merged,
+        "candidate_paths": list(dict.fromkeys(_source(item) for item in merged if _source(item))),
+        "retrieval_mode": "large_qa" if indexed_mode else "merged",
         "related_file_paths": related_file_paths[:5000],
         "package_context": dict(package_context or {}),
         "coverage": {
@@ -220,6 +227,7 @@ def merge_retrieval_results(
             "candidate_files": max(reported_candidate_files, visible_candidate_files),
             "inspected_files": visible_candidate_files,
             "retrieved_files": visible_candidate_files,
+            **({**indexed_coverage, "query_coverage": None, "inspected_files": visible_candidate_files} if indexed_mode else {}),
         },
         "needs_promotion": bool(deferred),
         "warnings": list(dict.fromkeys(warnings)),

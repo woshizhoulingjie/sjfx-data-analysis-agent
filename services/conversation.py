@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - exercised only by legacy Python.
 
 from services.evidence import evidence_quality
 from config import Config
+from services import answer_quality as aq
 
 
 SCHEMA_VERSION = "conversation-answer/1.1"
@@ -100,7 +101,7 @@ class ConversationScope:
         if kind not in SCOPE_KINDS:
             raise ValueError("不支持的会话范围：{}".format(kind))
         object.__setattr__(self, "kind", kind)
-        paths = tuple(_validated_scope_path(path) for path in _unique_strings(self.source_paths))
+        paths = tuple(_validated_scope_path(path) for path in _unique_strings(self.source_paths, limit=100000))
         object.__setattr__(self, "source_paths", paths)
         object.__setattr__(self, "constraints", dict(self.constraints or {}))
 
@@ -112,7 +113,7 @@ class ConversationScope:
         elif kind == "files":
             paths = self.source_paths
             if not paths and isinstance(self.value, (list, tuple, set)):
-                paths = tuple(_validated_scope_path(path) for path in _unique_strings(self.value))
+                paths = tuple(_validated_scope_path(path) for path in _unique_strings(self.value, limit=100000))
                 object.__setattr__(self, "source_paths", paths)
             if not paths:
                 raise ValueError("指定文件范围至少需要一个文件路径")
@@ -392,7 +393,7 @@ class IntentDecision:
 class IntentRouter:
     """Deterministic first-pass routing; no model is needed to choose tools."""
 
-    TRANSLATION_RE = re.compile(r"翻译|译成|中文(?:版|翻译)?|中英对照|双语|原文|translate|translation", re.I)
+    TRANSLATION_RE = re.compile(r"翻译|译成|译文|中文版|中英对照|双语|(?:只看|只要|仅看|展示|查看|显示|输出|提供)\s*原文|translate|translation", re.I)
     RELATION_RE = re.compile(r"关系|联系|关联|往来|互动|通信|谁.{0,8}谁|relationship|correspondence", re.I)
     STRUCTURED_RE = re.compile(
         r"合计|总和|总计|总额|累计|平均|均值|最大值|最高值|最小值|最低值|"
@@ -404,11 +405,11 @@ class IntentRouter:
     FILE_SEARCH_RE = re.compile(
         r"(?:搜索|查找|找一下|找出|找到|列出|显示|筛选)\s*\S+"
         r"|(?:包含|命中|有关|关于).{0,80}(?:文件|资料|文档)"
-        r"|(?:文件|资料|文档).{0,40}(?:搜索|查找|列表|清单|在哪|有哪些|包含|命中)"
+        r"|(?:文件|资料|文档).{0,40}(?:搜索|查找|列表|清单|在哪|有哪些(?!发现|结论|成果|特点|问题|变化|影响|风险|建议|方法)|包含|命中)"
         r"|\bfiles?\b",
         re.I,
     )
-    SUMMARY_RE = re.compile(r"总结|概括|概览|综述|梳理|主要(?:讲|内容|发现)|重点是什么|摘要|overview|summari[sz]e", re.I)
+    SUMMARY_RE = re.compile(r"总结|概括|概览|综述|梳理|整体介绍|总体介绍|主要(?:讲|内容|发现|主题|方向)|资料.{0,16}(?:研究什么|讲什么)|重点是什么|摘要|overview|summari[sz]e", re.I)
     CASUAL_RE = re.compile(
         r"^(?:你好|您好|嗨|hi|hello|谢谢|感谢|辛苦了|再见|你是谁|你能做什么|怎么用|帮助)(?:[呀啊吗呢！!。.？?\s]*)$",
         re.I,
@@ -443,6 +444,8 @@ class IntentRouter:
         # intent detection cannot silently discard constraints from a long
         # natural-language instruction.
         text = _clean_text(question, 8000)
+        # Presentation constraints are not requests to list files.
+        text = re.sub(r"(?:不要|不必|无需|避免)(?:只|仅)?(?:列出|罗列|显示)[^。！？；;]{0,50}(?:目录|清单|列表)", "", text)
         if self.CASUAL_RE.search(text):
             return IntentDecision(name="casual", confidence=0.99, reason="普通交流或系统使用咨询")
         if self.CREATIVE_RE.search(text):
@@ -788,6 +791,7 @@ def _model_text(
     max_tokens: int = 1800,
     timeout: Optional[int] = None,
     interactive: bool = True,
+    response_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     if model is None:
         return ""
@@ -822,6 +826,8 @@ def _model_text(
     else:
         raise TypeError("回答模型必须实现 chat/generate 或可调用协议")
     if isinstance(value, Mapping):
+        if response_metadata is not None:
+            response_metadata.update({"finish_reason": value.get("finish_reason"), "usage": dict(value.get("usage") or {})})
         value = value.get("content") or value.get("text") or value.get("answer") or ""
     return str(value or "").strip()
 
@@ -846,8 +852,9 @@ def _translation_text(value: Any) -> Optional[str]:
     return text or None
 
 
-def _citation(item: Mapping[str, Any], index: int, structured: bool = False) -> Optional[Dict[str, Any]]:
-    original = _clean_text(item.get("original_text") or item.get("source_text") or item.get("text"), 4000)
+def _citation(item: Mapping[str, Any], index: int, structured: bool = False, query: str = "") -> Optional[Dict[str, Any]]:
+    raw_text = item.get("original_text") or item.get("source_text") or item.get("text")
+    original = aq.extract_passage(raw_text, query, 4000) if aq.enabled() else _clean_text(raw_text, 4000)
     if not original:
         return None
     if not structured:
@@ -865,12 +872,13 @@ def _citation(item: Mapping[str, Any], index: int, structured: bool = False) -> 
     )
     source_path = str(item.get("source_path") or item.get("path") or "未知来源")
     location = {
-        key: item.get(key)
+        **dict(item.get("location") or {}),
+        **{key: item.get(key)
         for key in (
             "page", "section", "paragraph_index", "block_index", "char_start", "char_end",
             "table", "row", "row_range", "bbox", "archive_member",
         )
-        if item.get(key) is not None
+        if item.get(key) is not None}
     }
     return {
         "citation_index": index,
@@ -894,22 +902,23 @@ def _citation(item: Mapping[str, Any], index: int, structured: bool = False) -> 
         "rerank_rank": item.get("rerank_rank"),
         "evidence_role": item.get("evidence_role") or ("structured_statistic" if structured else "direct_source"),
         "quality": dict(quality),
+        **{key: item[key] for key in ("preview_only", "coverage", "analysis_level", "archive_source_path", "index_kind", "label", "source_hash", "topic_id", "large_global") if key in item},
         **({
             "source_package": dict(item["source_package"]),
-            "evidence_level": "file",
-            "location": {"source": "file_summary"},
+            "evidence_level": item.get("evidence_level") or "file",
+            "location": location if item.get("evidence_level") == "passage" else {"source": "file_summary"},
         } if isinstance(item.get("source_package"), Mapping)
         and item["source_package"].get("type") == "large" else {}),
     }
 
 
-def _normalise_citations(items: Iterable[Mapping[str, Any]], limit: int, structured: bool = False) -> List[Dict[str, Any]]:
+def _normalise_citations(items: Iterable[Mapping[str, Any]], limit: int, structured: bool = False, query: str = "") -> List[Dict[str, Any]]:
     output: List[Dict[str, Any]] = []
     seen = set()
     for item in items or []:
         if not isinstance(item, Mapping):
             continue
-        candidate = _citation(item, len(output) + 1, structured=structured)
+        candidate = _citation(item, len(output) + 1, structured=structured, query=query)
         if not candidate:
             continue
         key = (candidate["evidence_id"], candidate["source_path"], json.dumps(candidate["location"], sort_keys=True, ensure_ascii=False))
@@ -922,9 +931,22 @@ def _normalise_citations(items: Iterable[Mapping[str, Any]], limit: int, structu
     return output
 
 
+def _compact_citation_numbers(citations, selected):
+    """Make model references contiguous while keeping the source panel aligned."""
+    wanted=[x['citation_index'] for x in selected]
+    positions={value:rank for rank,value in enumerate(wanted)}
+    ordered=sorted(citations,key=lambda x:positions.get(x['citation_index'],len(wanted)+x['citation_index']))
+    numbers={x['citation_index']:index for index,x in enumerate(ordered,1)}
+    def renumber(item):
+        number=numbers[item['citation_index']]
+        return {**item,'citation_index':number,'citation_label':'[{}]'.format(number)}
+    return [renumber(x) for x in ordered],[renumber(x) for x in selected]
+
+
 def _select_model_citations(
     citations: Sequence[Mapping[str, Any]],
     policy: "ContextWindowPolicy",
+    query: str = "",
 ) -> List[Mapping[str, Any]]:
     """Choose the evidence that actually enters the model prompt.
 
@@ -934,6 +956,8 @@ def _select_model_citations(
     window.  Citation labels are preserved: the model and the page must agree
     on what ``[7]`` refers to.
     """
+    if aq.enabled():
+        return aq.select_evidence(citations, policy, query)
     ordered = [item for item in citations if isinstance(item, Mapping)]
     if not ordered:
         return []
@@ -1003,6 +1027,8 @@ def _rerank_large_package_items(
     and never affects ordinary packages.
     """
     values = list(items or [])
+    if any(str(item.get("evidence_id") or "").startswith("lpqa:") for item in values):
+        return values
     if len(values) < 3 or not str(scan_id or "").startswith("lp-"):
         return values
     try:
@@ -1030,17 +1056,35 @@ class ConversationEngine:
         "区分资料直接说明、模型分析判断和一般建议，不得伪造人物关系、数字、日期或文件内容。"
         "回答要像耐心、懂行的人在和用户交流：先自然地回应问题，再在需要时补充依据；"
         "避免模板化开场、机械复述问题、连续堆砌小标题和暴露检索/编排/模型内部流程。"
-        "正文先用一小段直接回答，再用少量短段解释关键脉络、例外和必要推断；事实引用贴在对应句末。"
+        "开头最多用一句概括主要判断；细节直接放到对应段落，同一事实不要在开头和后文各讲一遍；事实引用贴在对应句末。"
         "除非用户明确要清单，不要按文件逐份流水账，也不要把证据卡中已经展示的原文重复堆进正文。"
-        "资料不足时直接说明缺口，并告诉用户下一步能查什么；不要为了显得完整而编造结论。"
+        "资料不足时直接说明具体缺口，其他有依据部分正常回答；不要为了完整编造结论。"
+        "逐项回应问题中的各个要点，解释必要的条件、例外、时间与单位。"
+        "比较时采用相同维度；综合资料时围绕主题组织，而非逐份复述。"
+        "原文、摘要和预览的证据身份不同；摘要支持只能表述为摘要所记载，不得声称已核验原文。"
+        "资料没有记载原因时，不把时间先后或共现写成因果；建议要连接已确认问题。"
+        "篇幅随问题复杂度与有效信息量调整；自然连贯、重点清楚，避免套话、重复和空泛总结。"
+        "同一事实只在最合适的位置展开，不先完整总结后再逐项重复依据。用户要求详细时补充有效条件与解释，不添加资料未提及的泛泛风险。"
+        "关于缺失信息，只能说本轮所见资料没有提供，不能推断全部文件均无记载。"
+        "组织回答时，先想清楚这些资料共同在讲什么，再按主题把相关内容合在一起讲清楚。"
+        "默认使用连贯的自然段，每段围绕一个明确主题展开：说明研究或事情在做什么，再解释重要发现、适用条件和与问题的关系。"
+        "相邻主题之间用具体内容自然衔接，不要连续用‘涵盖’‘涉及’‘部分证据支持’开头，不要把内部核验标签写成正文。"
+        "使用完整句子，主语和指代明确；尤其不要在没有交代主题时突然说‘这是占比最大的主题’。"
+        "专业术语在资料足以解释时用简明中文说明作用，确有必要再保留英文缩写，不堆砌缩写。"
+        "长回答可以用少量简短主题标题；段落内正常叙述，不强制每句话单列一段，不把每个主题套进相同小标题。"
+        "只有资料确实提供数量统计时才使用‘最多’‘占比最大’等比较判断。"
+        "共同的资料范围限制集中交代一次；某个结论特有的不确定性放在该结论旁，用自然语言说明具体缺口。"
+        "娓娓道来不等于增加修辞或背景知识：不补写无依据的因果、价值判断或例子，保留数字、条件、例外和对应引用。"
+        "数字与百分比要连同原文的统计对象、样本范围和时间一起表达，不把样本结果泛化到整个行业；必要时保留原句的准确措辞。"
+        "部分文献的资助来源、研究方法和结论不能扩展为全部资料的共同属性；跨主题概括只陈述各来源共同支持的内容。"
     )
 
     INTENT_INSTRUCTIONS = {
         "retrieval": "直接回答用户问题，优先给出可核验事实。",
         "file_search": "这是文件发现请求。只说明命中的文件和关键片段，不要把没有正文证据改写成证据不足的资料结论。",
         "relationship": "说明实体/文件之间的关系、方向、时间与依据；证据只能证明共现时，不得声称因果。",
-        "summary": "概括当前会话范围的主要内容，并明确这只是命中证据的概览。",
-        "analysis": "先回答，再分开列出资料依据与进一步分析；推断必须明确标为分析判断。",
+        "summary": "根据本轮可见资料作连贯概括。开头简要说明资料共同关注的内容，随后按主题展开，把同类材料合并讲清楚；每个主题选择有依据的代表性发现和必要细节，不逐篇罗列。主题转换要交代主语，不把多个摘要直接拼接。范围限制自然说明一次，不声称读完未输入的全文；结尾仅在有新的综合信息时补充，不重复开头。",
+        "analysis": "先直接回答，再围绕用户关心的要点展开解释；依据融入相应段落，推断明确标识，不重复列出整套资料依据。",
         "creative": "\u5b8c\u6210\u7528\u6237\u8981\u6c42\u7684\u521b\u4f5c\uff0c\u8bed\u8a00\u81ea\u7136\uff0c\u4e0d\u8981\u628a\u8d44\u6599\u5305\u5185\u5bb9\u4f2a\u88c5\u6210\u521b\u4f5c\u4e8b\u5b9e\u3002",
     }
 
@@ -1106,6 +1150,14 @@ class ConversationEngine:
             previous_intent=self._previous_intent(session),
             is_follow_up=resolution.is_follow_up,
         )
+        # An existing package establishes document mode even for "why/is it".
+        if (aq.enabled() and session.scan_id and decision.name == "general_qa"
+                and not re.search(r"^(?:什么是|什么叫|what is\b)", resolution.original_question, re.I)):
+            decision = IntentDecision("retrieval", 0.98, "当前资料范围内的事实问题")
+        if aq.enabled() and analysis_plan and decision.name == "retrieval":
+            modes = list(analysis_plan.get("modes") or [])
+            if modes and modes[0] in {"comparison", "timeline", "risk", "contradiction", "relationship"}:
+                decision = IntentDecision(modes[0], 0.98, "沿用本轮资料分析计划")
         context = session.context_text(self.context_policy)
         if analysis_plan:
             plan_context = {
@@ -1479,7 +1531,16 @@ class ConversationEngine:
             if isinstance(retrieval_override, Mapping)
             else self._retrieve(session, resolution.resolved_query, scope, decision.name)
         )
+        large_qa = (retrieval.get("package_context") or {}).get("large_qa")
+        if large_qa and large_qa.get("global_mode"):
+            from services.large_qa_synthesis import prepare_global
+            retrieval = prepare_global(retrieval, resolution.resolved_query, self.answer_model)
         turn_policy = self._turn_context_policy(session, decision, scope)
+        if large_qa:
+            turn_policy = replace(turn_policy, max_prompt_evidence=40, max_display_evidence=70,
+                                  max_model_evidence_chars=26000)
+            if large_qa.get("global_mode"):
+                turn_policy = replace(turn_policy, max_evidence_chars=1100, max_model_evidence_per_file=1)
         citations = _normalise_citations(
             _rerank_large_package_items(
                 session.scan_id,
@@ -1487,8 +1548,11 @@ class ConversationEngine:
                 self._retrieval_items(retrieval),
             ),
             limit=turn_policy.max_display_evidence,
+            query=resolution.resolved_query,
         )
-        model_citations = _select_model_citations(citations, turn_policy)
+        model_citations = _select_model_citations(citations, turn_policy, resolution.resolved_query)
+        if large_qa:
+            citations, model_citations = _compact_citation_numbers(citations, model_citations)
         coverage = CoverageSnapshot.from_values(
             retrieval.get("coverage") if isinstance(retrieval.get("coverage"), Mapping) else None,
             retrieval,
@@ -1512,6 +1576,7 @@ class ConversationEngine:
                 selected_paths.append(path)
             selected_chars += len(str(item.get("original_text") or ""))
         input_manifest = {
+            "large_qa": {key: value for key, value in ((retrieval.get("package_context") or {}).get("large_qa") or {}).items() if key not in {"topics", "map_notes"}},
             "candidate_files": len(retrieval.get("candidate_paths") or retrieval.get("paths") or []),
             "selected_files": len(selected_paths),
             "selected_paths": selected_paths[:100],
@@ -1597,6 +1662,7 @@ class ConversationEngine:
                     decision.name, resolution.resolved_query, context, model_citations,
                     package_context=retrieval.get("package_context"),
                     evidence_total=len(citations),
+                    generation_manifest=input_manifest,
                 )
                 warnings.extend(model_warnings)
             else:
@@ -1606,6 +1672,7 @@ class ConversationEngine:
                 decision.name, resolution.resolved_query, context, model_citations,
                 package_context=retrieval.get("package_context"),
                 evidence_total=len(citations),
+                generation_manifest=input_manifest,
             )
             warnings.extend(model_warnings)
 
@@ -1732,6 +1799,101 @@ class ConversationEngine:
             return "", warnings
         return "\n\n".join(blocks), warnings
 
+    def _quality_grounded_answer(
+        self, intent, query, context, citations, package_context, evidence_total,
+        generation_manifest=None,
+    ):
+        """Budget the final serialized prompt and compose in one model call."""
+        from services.conversation_package_context import model_digest
+
+        selected = [dict(item) for item in citations if aq.source_kind(item) != "preview"]
+        output_tokens = aq.output_budget(query, intent)
+        window = int(getattr(Config, "CONVERSATION_CONTEXT_TOKENS", 32768))
+        allowance = max(512, window - output_tokens - 512)
+        history = context
+        digest = model_digest(package_context, max_chars=6500, query=query) if package_context else "无"
+        instruction = {
+            "comparison": "围绕同一组维度比较，先给关键差异，再解释条件与影响；适合时使用简短表格。",
+            "timeline": "按资料中的时间串联关键事件，区分日期事实与因果推断。",
+            "risk": "将风险连接到具体依据，说明触发条件、影响与可行建议。",
+            "contradiction": "并列呈现冲突双方的依据、时间和适用范围，不擅自选定真相。",
+        }.get(intent, self.INTENT_INSTRUCTIONS.get(intent, self.INTENT_INSTRUCTIONS["retrieval"]))
+        if (package_context or {}).get("large_qa"):
+            if package_context["large_qa"].get("global_mode"):
+                instruction = self.INTENT_INSTRUCTIONS["summary"] + "这是大包总览，不能把某一篇的摘要当作整个资料包的结论。先把不同主题组织成清楚的脉络，再用少量代表性材料解释。"
+            instruction += "用户没有明确要求清单、步骤或表格时，以连贯自然段讲述：先说这批或这份资料的主线，再把问题、方法、发现和限制自然串联，每个主题一至两段，不使用嵌套条目，不逐项套用核心问题、研究方法、主要发现、适用范围模板。保留资料中的具体内容，不直接复制摘要或HTML标记。引用编号只使用每条编号证据外层的citation字段，资料内部原有的脚注数字不是本轮引用编号。"
+
+        def render():
+            return (
+                "任务类型：{}\n任务要求：{}\n会话上下文（历史回答不是证据）：\n{}\n\n"
+                "全包阅读层（程序统计与有限摘要样本，不等于已读全文）：\n{}\n\n"
+                "当前问题：{}\n\n回答要点与资料缺口：{}\n\n"
+                "编号证据（具体事实仅据以下内容，保留各条 source_kind 的来源身份）：\n{}"
+            ).format(intent, instruction, history or "无", digest, query,
+                     json.dumps(aq.answer_contract(query, selected), ensure_ascii=False),
+                     json.dumps([aq.evidence_payload(x) for x in selected], ensure_ascii=False))
+
+        prompt = render()
+        # Keep source facts before general background; never truncate a JSON
+        # payload or a selected sentence after recording it in the manifest.
+        if aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+            history = aq.extract_passage(context, query, 2400)
+            digest = model_digest(package_context, max_chars=1800, query=query) if package_context else "无"
+            prompt = render()
+        if aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+            history = ""
+            digest = "背景已按预算省略；回答仅据下方证据。"
+            prompt = render()
+        while selected and aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+            selected.pop()
+            prompt = render()
+        if isinstance(citations, list):
+            citations[:] = selected
+        metadata = generation_manifest if generation_manifest is not None else {}
+        metadata.update({
+            "selected_files": len({x.get("source_path") for x in selected}),
+            "selected_paths": list(dict.fromkeys(x.get("source_path") for x in selected)),
+            "selected_evidence": len(selected),
+            "selected_characters": sum(len(x.get("original_text", "")) for x in selected),
+            "actual_citation_indexes": [x["citation_index"] for x in selected],
+            "prompt_tokens": aq.count_tokens(self.SYSTEM_PROMPT + prompt),
+            "token_count_method": aq.token_count_method(),
+            "context_tokens": window, "output_token_budget": output_tokens,
+            "chat_template_token_reserve": 512,
+            "answer_contract": aq.answer_contract(query, selected),
+        })
+        if not selected or metadata["prompt_tokens"] > allowance:
+            return "当前可用资料未能在本轮预算内形成完整依据，暂时无法可靠回答这个问题。", ["资料问答输入预算不足；没有发送超限请求。"]
+        warnings = []
+        try:
+            answer = _model_text(
+                self.answer_model, self.SYSTEM_PROMPT, prompt,
+                max_tokens=output_tokens,
+                timeout=int(getattr(Config, "CONVERSATION_ANSWER_TIMEOUT_SECONDS", 120)),
+                interactive=False,
+                response_metadata=metadata,
+            )
+        except Exception as exc:
+            answer = ""
+            warnings.append("本地回答模型不可用，已返回相关证据摘录：{}".format(_clean_text(exc, 180)))
+        if not answer:
+            answer = "根据当前可回查证据：\n\n" + "\n\n".join(
+                "{} {}".format(aq.extract_passage(x["original_text"], query, 500), x["citation_label"])
+                for x in selected[:3]
+            )
+        allowed = {x["citation_index"] for x in selected}
+        invalid = [int(x) for x in re.findall(r"\[(\d{1,4})\]", answer) if int(x) not in allowed]
+        if invalid:
+            # Keep invalid labels for the verifier to identify and repair; silently
+            # removing them could let automatic attribution hide the failure.
+            warnings.append("回答引用了本轮未输入的证据编号，须经核验修订。")
+        metadata["invalid_generated_citation_indexes"] = invalid
+        if metadata.get("finish_reason") == "length":
+            metadata["output_truncated"] = True
+            warnings.append("回答达到本轮生成预算，可能尚未展开完全部细节。")
+        answer = re.sub(r"\[(\d{1,4})\]", lambda m: m.group(0) if int(m.group(1)) in allowed else "", answer)
+        return answer.strip(), warnings
+
     def _grounded_answer(
         self,
         intent: str,
@@ -1740,7 +1902,10 @@ class ConversationEngine:
         citations: Sequence[Mapping[str, Any]],
         package_context: Optional[Mapping[str, Any]] = None,
         evidence_total: Optional[int] = None,
+        generation_manifest: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, List[str]]:
+        if aq.enabled():
+            return self._quality_grounded_answer(intent, query, context, citations, package_context, evidence_total, generation_manifest)
         evidence_payload = [
             {
                 "citation": item["citation_label"],

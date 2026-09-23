@@ -912,7 +912,7 @@
       name: (state.chatSourceList.find((item) => item.scan_id === legacyPackageId) || {}).name,
       type: 'large'
     } : null);
-    const fileEvidence = citation.evidence_level === 'file' || Boolean(sourcePackage && sourcePackage.type === 'large');
+    const fileEvidence = citation.evidence_level === 'file' || Boolean(sourcePackage && sourcePackage.type === 'large' && citation.evidence_level !== 'passage');
     const packageLabel = sourcePackage ? `<small>大数据包：${escapeHtml(sourcePackage.name || sourcePackage.id)} · ${escapeHtml(sourcePackage.id)}</small>` : '';
     const location = fileEvidence ? '文件级证据 · 已保存摘要，非全文原文' : citation.location && Object.keys(citation.location).length
       ? Object.entries(citation.location).map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join('-') : value}`).join(' · ') : '原文片段';
@@ -943,11 +943,11 @@
     const summaryFiles = integer(reading.summary_backed_files);
     const missing = numeric(reading.files_without_summary);
     const coverage = reading.summary_coverage == null ? '' : ` · 摘要覆盖 ${Math.round(numeric(reading.summary_coverage) * 100)}%`;
-    const status = reading.complete ? '完整阅读层' : '待补全阅读层';
+    const status = reading.complete ? '摘要已齐备' : '摘要待补全';
     const detail = reading.complete
       ? `已逐份纳入 ${filesRead} 个文件的已持久化摘要${coverage}`
       : `已纳入 ${summaryFiles}/${filesRead} 份可用摘要${coverage}，仍有 ${integer(missing)} 份等待补全`;
-    return `<section class="v2-package-reading ${reading.complete ? 'is-complete' : 'is-partial'}" aria-label="全包阅读范围"><div><strong>全包阅读</strong><span>${escapeHtml(status)}</span></div><p>${escapeHtml(detail)}</p></section>`;
+    return `<section class="v2-package-reading ${reading.complete ? 'is-complete' : 'is-partial'}" aria-label="资料摘要覆盖范围"><div><strong>摘要覆盖</strong><span>${escapeHtml(status)}</span></div><p>${escapeHtml(detail)}；这不表示模型已读完全部原文。</p></section>`;
   }
 
   function analysisTurnStatusLabel(status) {

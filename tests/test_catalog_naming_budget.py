@@ -23,6 +23,34 @@ class Model:
         return {'content':json.dumps({'name':'远程证明中的设备证据验证','description':'讨论设备如何提供可信证据以及验证方如何完成校验。','evidence_ids':[payload['evidence'][0]['id']],'needs_review':False},ensure_ascii=False),'usage':{'prompt_tokens':100,'completion_tokens':50},'finish_reason':'stop'}
 
 
+class _DistinctNameModel(Model):
+    """给每个组返回**不同**名字的夹具模型。
+
+    为什么需要它（DEF-16）：本文件默认的 `Model` 对任何输入都返回同一个名字
+    `远程证明中的设备证据验证`。而 `normalize_leaves` 会把"同一主题内完全同名"
+    的叶组合并成一个 —— **那正是产品要求的行为**（同名叶子必须合并）。
+    于是默认夹具下 3 个组会被合并成 1 个叶子，而
+    `test_optional_hierarchy_uses_budget_and_preserves_members` 需要至少 3 个叶子
+    才能考"上层目录把叶子归成分支"，于是 `hierarchy.process` 提前 return、
+    不写任何分支，用例在 `branches[0]` 上 IndexError。
+    换句话说：不是合并逻辑错，是夹具的名字退化到只剩一个主题。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.named = 0
+
+    def chat(self, system, user, **kwargs):
+        self.named += 1
+        result = super().chat(system, user, **kwargs)
+        import json as _json
+        data = _json.loads(result['content'])
+        data['name'] = '设备证据验证主题%d' % self.named
+        data['description'] = '第 %d 组设备证据验证的内容范围与边界。' % self.named
+        result['content'] = _json.dumps(data, ensure_ascii=False)
+        return result
+
+
 class NamingTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
@@ -71,6 +99,106 @@ class NamingTests(unittest.TestCase):
         with closing(self.store._connect()) as c:c.execute('UPDATE lp_catalog_rounds SET deadline=?',(time.time()-1,))
         self.assertFalse(self.run_name());self.assertEqual(self.model.calls,0)
         self.assertTrue(self.store.catalog(self.pid)['smart']['topics']);self.assertEqual(naming.state(self.store,self.pid)['status'],'exhausted')
+    def test_model_outage_does_not_burn_retries_or_budget(self):
+        """模型不可用**不该消耗重试额度、也不该消耗轮次预算**。
+
+        背景（2026-09-19 生产故障）：`reserve()` 在调用模型**之前**就 `requests+1`，
+        失败不退。模型一次宕机（实测 **2 小时 20 分**）就把任务的 5 次重试与轮次预算
+        一起烧光 —— 叶组永久拿不到名字，主题层只能在残缺集合上生成，其余全部落进
+        「待归并主题」。
+
+        钉住的性质：
+          * 连接类失败（`LocalModelError`）→ attempts **不变**、预算**退还**、
+            长退避后重试（模型回来就接着做完）；
+          * 内容类失败（`ValueError`）→ 照旧计入 attempts
+            （模型给的名字不合法，重试有限次是对的）。
+        """
+        from services.ollama import LocalModelError
+        self.add('a.txt', 'Remote attestation verifies device evidence and freshness. ' * 4)
+        naming.queue_groups(self.store, self.pid)
+        naming.ensure_round(self.store, self.pid)
+
+        def _job():
+            with closing(self.store._connect()) as c:
+                return c.execute("SELECT status, attempts FROM lp_catalog_jobs "
+                                 "WHERE package_id=?", (self.pid,)).fetchone()
+
+        def _requests():
+            with closing(self.store._connect()) as c:
+                return c.execute("SELECT requests FROM lp_catalog_rounds "
+                                 "WHERE package_id=?", (self.pid,)).fetchone()[0]
+
+        # ① 连接类失败：不烧重试次数、退还预算
+        before, budget_before = _job(), _requests()
+        with patch.object(self.model, 'chat',
+                          side_effect=LocalModelError('本机 vLLM 调用失败：Connection refused')):
+            self.run_name()
+        after = _job()
+        self.assertEqual(after['attempts'], before['attempts'],
+                         '模型不可用不该消耗重试次数 —— 否则一次宕机就烧光额度')
+        self.assertEqual(after['status'], 'deferred')
+        self.assertEqual(_requests(), budget_before,
+                         '没调成的那次必须退还轮次预算')
+
+        # ② 内容类失败：照旧计入 attempts
+        #    先把①留下的退避窗口清掉，否则任务还没到期、根本不会被拾取。
+        with closing(self.store._connect()) as c:
+            c.execute("UPDATE lp_catalog_jobs SET status='queued', next_at=0 "
+                      "WHERE package_id=?", (self.pid,))
+        before = _job()
+        with patch.object(self.model, 'chat',
+                          side_effect=ValueError('目录名称不能使用状态或字段名')):
+            self.run_name()
+        after = _job()
+        self.assertEqual(after['attempts'], before['attempts'] + 1,
+                         '内容不合法要计入重试次数')
+
+    def test_deferred_job_is_retried_until_the_attempt_cap(self):
+        """命名任务失败后被打成 deferred，**必须有出路**。
+
+        背景（2026-09-19 生产故障，17 个包里坏了 5 个）：任务失败两次会被写成
+        `status='deferred'`，而拾取只认 `status='queued'`，`_catalog_background`
+        选包时也只认 queued/retry —— 于是只要模型短暂不可用（一次 vLLM 宕机），
+        任务就**永久搁置**：叶组拿不到名字，主题层只能在残缺的叶组集合上生成，
+        其余全部落进「待归并主题」。实测单包 133 个任务的 next_at 停在 100 分钟
+        前、轮次预算还剩 79%，却没有任何代码去取它们。
+
+        钉住的性质：
+          * deferred 且**未到重试上限、且已到期** → 必须被拾起；
+          * 达到上限后 → 不再拾取（避免模型长期不可用时无限空转）。
+        """
+        self.add('a.txt', 'Remote attestation verifies device evidence and freshness. ' * 4)
+        naming.queue_groups(self.store, self.pid)
+        naming.ensure_round(self.store, self.pid)
+        cap = max(1, int(getattr(Config, 'LP_NAME_MAX_ATTEMPTS', 5) or 5))
+
+        def _set_job(status, attempts, next_at):
+            with closing(self.store._connect()) as c:
+                c.execute("UPDATE lp_catalog_jobs SET status=?, attempts=?, next_at=?, "
+                          "error='本机 vLLM 调用失败：Connection refused' WHERE package_id=?",
+                          (status, attempts, next_at, self.pid))
+
+        def _job_status():
+            with closing(self.store._connect()) as c:
+                return c.execute("SELECT status, attempts FROM lp_catalog_jobs "
+                                 "WHERE package_id=?", (self.pid,)).fetchone()
+
+        # ① 已到期、还有重试额度的 deferred —— 必须被拾起
+        _set_job('deferred', 1, time.time() - 60)
+        self.model.calls = 0
+        self.run_name()
+        self.assertGreaterEqual(
+            self.model.calls, 1,
+            'deferred 任务到期后必须被拾起 —— 否则模型一次抖动就会让目录永久残废')
+
+        # ② 额度用尽的 deferred —— 不得再拾取（避免模型长期不可用时无限空转）
+        _set_job('deferred', cap, time.time() - 60)
+        self.model.calls = 0
+        self.run_name()
+        self.assertEqual(self.model.calls, 0, '达到重试上限后不得再拾取')
+        row = _job_status()
+        self.assertEqual(row[0], 'deferred', '额度用尽的任务应保持 deferred')
+
     def test_same_label_different_groups_never_merge(self):
         a=self.add('a.txt','Remote attestation verifies remote evidence. '*4,[1,0])
         b=self.add('b.txt','Memory encryption isolates virtual machine pages. '*4,[0,1])
@@ -97,8 +225,14 @@ class NamingTests(unittest.TestCase):
     def test_invalid_evidence_and_invented_identifier_rejected(self):
         gid=self.add('a.txt','Remote attestation verifies device evidence and freshness. '*4)
         bundle=naming.bundle(self.store,self.pid,gid)
-        for name,ids in [('未知XYZ产品的设备证据验证',['E1']),('设备可信证据的校验流程',['E999']),('相关资料',['E1'])]:
+        # 不存在的证据编号、泛化名：仍然拒绝（这里不变）。
+        for name,ids in [('设备可信证据的校验流程',['E999']),('相关资料',['E1'])]:
             with self.assertRaises(ValueError):naming.validate(json.dumps({'name':name,'description':'设备如何产生可信证据并进行验证。','evidence_ids':ids}),bundle)
+        # 编造的缩写（XYZ）：2026-09-20 起不再让整条作废，而是**从名字里删掉**并标复核
+        # ——整条作废 + 重试同一提示 = 永远没有名字（生产实测 7 组 / 276 个文件踩过）。
+        got=naming.validate(json.dumps({'name':'未知XYZ产品的设备证据验证','description':'设备如何产生可信证据并进行验证。','evidence_ids':['E1']}),bundle)
+        self.assertNotIn('XYZ',got['name'])
+        self.assertTrue(got['needs_review'])
     def test_cached_names_and_single_settlement(self):
         gid=self.add('a.txt','Remote attestation verifies device evidence and freshness. '*4)
         self.run_name()
@@ -180,7 +314,9 @@ class NamingTests(unittest.TestCase):
         self.run_name()
         self.assertEqual(self.model.calls,1)
 
-    def test_optional_hierarchy_uses_budget_and_preserves_members(self):
+    def test_optional_hierarchy_preserves_unrelated_members_without_forced_parent(self):
+        # 用"每组名字都不同"的夹具，保证 3 个叶子不会被同名归一并掉（见类注释）
+        self.model=_DistinctNameModel()
         groups=[]
         for i,vector in enumerate(([1,0,0],[0,1,0],[0,0,1])):
             groups.append(self.add('doc%s.txt'%i,'Remote attestation verifies evidence for case %s. '%i*4,vector))
@@ -196,9 +332,10 @@ class NamingTests(unittest.TestCase):
         self.store._catalog_cache.clear()
         catalog=self.store.catalog(self.pid)
         branch=catalog['smart']['branches'][0]
-        self.assertEqual(self.store.file_page(self.pid,node_id=branch['node_id'])['total'],2)
+        self.assertEqual(branch['status'],'pending')
+        self.assertEqual(self.store.file_page(self.pid,node_id=branch['node_id'])['total'],3)
         self.assertEqual(len(catalog['smart']['topics']),3)
-        self.assertEqual(naming.state(self.store,self.pid)['requests'],4)
+        self.assertEqual(naming.state(self.store,self.pid)['requests'],3)
 
     def test_explicit_different_projects_do_not_merge_by_template(self):
         from services.large_package_catalog import material

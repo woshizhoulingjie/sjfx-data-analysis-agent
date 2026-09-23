@@ -703,12 +703,23 @@ def _split_one(store, package_id, group, limit):
     right = [index for index in range(len(paths)) if not assign[index]]
     if min(len(left), len(right)) < 2:
         return 0
+    if len(paths)!=len(rows):return 0
+    a=_norm(matrix[left].mean(axis=0));b=_norm(matrix[right].mean(axis=0))
+    own=np.maximum(matrix@a,matrix@b)
+    old=_norm(matrix.mean(axis=0))
+    if float(a@b)>.94 or float(np.mean(own)-np.mean(matrix@old))<.025:return 0
+    gaps=np.abs(matrix@a-matrix@b)
+    if float(np.quantile(gaps,.1))<.015:return 0
     keep, move = (left, right) if len(left) >= len(right) else (right, left)
     new_id = hashlib.sha256((group_id + '\0' + paths[move[0]] + '\0' + str(len(move))).encode()).hexdigest()[:24]
     keep_anchor = _norm(matrix[keep].mean(axis=0))
     move_anchor = _norm(matrix[move].mean(axis=0))
     with store._lock, closing(store._connect()) as conn:
         conn.execute('BEGIN IMMEDIATE')
+        actual=conn.execute('SELECT g.content_revision,COALESCE(l.locked,0) locked FROM large_catalog_groups g LEFT JOIN lp_catalog_labels l ON l.package_id=g.package_id AND l.group_id=g.id WHERE g.package_id=? AND g.id=?',(package_id,group_id)).fetchone()
+        package=conn.execute('SELECT status,control_state FROM packages WHERE id=?',(package_id,)).fetchone()
+        if not actual or not verified or actual[0]!=verified[0] or actual[1] or not package or any(v in {'paused','cancelled'} for v in package):
+            conn.rollback();return 0
         conn.execute("INSERT OR REPLACE INTO large_catalog_groups(package_id,id,model,anchor,representative,result,status,updated_at) VALUES(?,?,?,?,?,'{}','queued',?)",
                      (package_id, new_id, model, move_anchor.tobytes(), paths[move[0]], time.time()))
         conn.executemany('UPDATE large_catalog_members SET group_id=? WHERE package_id=? AND path=?',
@@ -806,41 +817,8 @@ def catalog_mixed_share(store, package_id):
 
 
 def maybe_escalate_k(store, package_id, force=False):
-    """叶组定稿后调用：模型自认"混杂"的叶组太多 → 升一档 k，要求重新聚类。
-
-    只在 LP_KM_ADAPTIVE 打开、且还没升满档位时动作。返回 True 表示已升档，
-    调用方应让这一轮重新聚类（本函数会把 km 指纹清空，使下一次
-    `kmeans_recluster` 认为向量集变了而重算）。
-    """
-    try:
-        from config import Config
-        if not getattr(Config, 'LP_KM_ADAPTIVE', False) and not force:
-            return False
-        threshold = float(getattr(Config, 'LP_KM_ESCALATE_SHARE', 0.25) or 0.25)
-        top = max(0, int(getattr(Config, 'LP_KM_ESCALATE_MAX', 0) or 0))
-    except Exception:
-        return False
-    boost = _km_boost_get(store, package_id)
-    if boost >= top:
-        return False
-    mixed, known, share = catalog_mixed_share(store, package_id)
-    if share is None or known < 8:
-        return False
-    if share < threshold:
-        return False
-    if not _km_boost_set(store, package_id, boost + 1):
-        return False
-    try:
-        with closing(store._connect()) as conn:
-            conn.execute('UPDATE large_catalog_km_state SET signature=? WHERE package_id=?',
-                         ('', package_id))
-            conn.commit()
-    except Exception:
-        LOGGER.exception('k escalation signature reset failed: %s', package_id)
-    LOGGER.info('k adaptive: package=%s mixed=%d/%d=%.0f%% ≥%.0f%% → k 升到第 %d 档'
-                '（重新聚类后重命名；上限 %d 档）',
-                package_id, mixed, known, 100.0 * share, 100.0 * threshold, boost + 1, top)
-    return True
+    from services.large_package_catalog_quality import repair_mixed
+    return repair_mixed(store,package_id)
 
 
 def effective_group_max(store, package_id, override=None):
@@ -964,7 +942,7 @@ def clean_catalog_content(text, headings=()):
     return text,kept
 
 
-def embedding_passage(value):
+def _legacy_embedding_passage(value):
     global _embedding_tokenizer, _embedding_tokenizer_checked
     if not _embedding_tokenizer_checked:
         _embedding_tokenizer_checked = True
@@ -996,6 +974,29 @@ def embedding_passage(value):
         width=budget//3
         ids=ids[:width]+ids[len(ids)//2-width//2:len(ids)//2+width//2]+ids[-width:]
     return 'passage: '+tokenizer.decode(title+ids,skip_special_tokens=True)
+
+
+def embedding_passage(value, policy=1):
+    if policy == 1:
+        return _legacy_embedding_passage(value)
+    from services.large_package_evidence import select_blocks, is_boilerplate
+    parts = value.get('evidence_blocks') or [{'text': value.get('text') or '', 'kind': 'text'}]
+    chosen = select_blocks(parts, limit=5, chars=2200)
+    headings = [h for h in value.get('headings', []) if not is_boilerplate(h)][:2]
+    # Initialize the same local tokenizer, then enforce the actual model token budget.
+    _legacy_embedding_passage({'text':'', 'deep_summary':'', 'fields':[], 'headings':[]})
+    tokenizer = _embedding_tokenizer
+    if tokenizer is None:
+        return 'query: '+(' / '.join(headings)+'\n'+'\n'.join(b['text'][:280] for b in chosen))[:1180]
+    ids = tokenizer.encode(' / '.join(headings), add_special_tokens=False).ids[:52]
+    budget = 440-len(ids)
+    encoded = [tokenizer.encode(b['text'], add_special_tokens=False).ids for b in chosen]
+    # Give each selected source span a fair share; unused space goes to the strongest span.
+    shares = [min(len(x), budget//max(1,len(encoded))) for x in encoded]
+    rest = budget-sum(shares)
+    for i,tokens in enumerate(encoded):
+        extra = min(rest,len(tokens)-shares[i]);shares[i]+=extra;rest-=extra
+    return 'query: '+tokenizer.decode(ids+[t for x,n in zip(encoded,shares) for t in x[:n]],skip_special_tokens=True)
 
 
 def _km_settings():
@@ -1165,7 +1166,7 @@ def _balanced_labels(X, k, cap, iters, seed=7, depth=0):
     if n <= cap and (depth > 0 or int(k) <= 1):
         return [0] * n
     if depth >= 6 or np.allclose(X, X[:1], rtol=0, atol=1e-7):
-        return (np.arange(n) // cap).tolist()
+        return [0] * n
     k = max(2, min(int(k), max(2, n // 2)))
     try:
         C = _kmeans_fit(X, k, iters, seed=seed + depth)
@@ -1270,29 +1271,9 @@ def absorb_undersized(labels, vectors, floor, cap):
 
 
 def _km_signature(store, package_id):
-    """当前"用于聚类的向量集"指纹。
-
-    取的是每个成员 (path, input_hash) 的有序哈希，其中 input_hash 是生成该向量
-    时素材内容的摘要。因此：
-      * 新文件进入聚类 → 多一条记录 → 指纹变；
-      * 深度解析改写正文 → 素材摘要变 → 指纹变（数量没变也能捕捉到）；
-      * 只是分组被重排、拆分组、写标签 → 指纹**不变**，不会触发多余的重新聚类。
-
-    早先的实现用 SUM(content_revision) 当指纹，而 split_oversized / 命名兜底都会
-    改动分组表，于是聚类被无谓地重复触发（实测一次导入聚类跑了两次，66 组→69 组）。
-    也正因如此，kmeans_recluster 写成员时必须保留原 input_hash，不能清空。
-    """
+    from services.large_package_catalog_quality import vector_signature
     with closing(store._connect()) as conn:
-        rows = conn.execute(
-            'SELECT path, input_hash FROM large_catalog_members '
-            'WHERE package_id=? AND LENGTH(vector)>0 ORDER BY path', (package_id,)).fetchall()
-    digest = hashlib.sha256()
-    for path, input_hash in rows:
-        digest.update(str(path).encode('utf-8', 'replace'))
-        digest.update(b'\x00')
-        digest.update(str(input_hash or '').encode('utf-8', 'replace'))
-        digest.update(b'\x01')
-    return '%d:%s' % (len(rows), digest.hexdigest()[:32])
+        return vector_signature(conn,package_id)
 
 
 def _km_state_get(store, package_id):
@@ -1365,9 +1346,16 @@ def kmeans_recluster(store, package_id, force=False):
     if not _km_enabled():
         return 0
     cfg = _km_settings()
+    prior_signature = _km_state_get(store,package_id)
+    if not force and prior_signature:
+        if prior_signature == _km_signature(store,package_id):return 0
+        from services.large_package_catalog_quality import repair_changed
+        repaired=repair_changed(store,package_id)
+        if repaired is not None:return repaired
     with closing(store._connect()) as conn:
+        locked={r[0] for r in conn.execute('SELECT group_id FROM lp_catalog_labels WHERE package_id=? AND locked=1',(package_id,))}
         rows = conn.execute(
-            'SELECT path, vector, input_hash FROM large_catalog_members '
+            'SELECT path, vector, input_hash, group_id FROM large_catalog_members '
             'WHERE package_id=? ORDER BY path',
             (package_id,)).fetchall()
     n = len(rows)
@@ -1382,6 +1370,7 @@ def kmeans_recluster(store, package_id, force=False):
 
     paths, vecs, input_hashes = [], [], {}
     for r in rows:
+        if r['group_id'] in locked:continue
         try:
             v = _vector(np.frombuffer(r['vector'], dtype=np.float32))
         except Exception:
@@ -1474,10 +1463,16 @@ def kmeans_recluster(store, package_id, force=False):
     try:
         with store._lock, closing(store._connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
+            from services.large_package_catalog_quality import vector_signature,save_signature
+            live_locks={r[0] for r in conn.execute('SELECT group_id FROM lp_catalog_labels WHERE package_id=? AND locked=1',(package_id,))}
+            package=conn.execute('SELECT status,control_state FROM packages WHERE id=?',(package_id,)).fetchone()
+            if vector_signature(conn,package_id)!=signature or live_locks!=locked or not package or any(v in {'paused','cancelled'} for v in package):
+                conn.rollback();return 0
             for lab, members in buckets.items():
                 if not members:
                     continue
                 gid = 'km-%s-%05d' % (hashlib.sha256(package_id.encode()).hexdigest()[:8], lab)
+                while gid in locked:gid+='-auto'
                 rep = paths[pick_representative(members)]
                 member_vecs = X[members]
                 centroid = member_vecs.mean(axis=0)
@@ -1582,13 +1577,15 @@ def kmeans_recluster(store, package_id, force=False):
                          (package_id, ph))
             conn.execute('DELETE FROM large_catalog_groups WHERE package_id=? AND id=?',
                          (package_id, ph))
+            conn.execute('DELETE FROM lp_catalog_changes WHERE package_id=?',(package_id,))
+            conn.execute('DELETE FROM lp_catalog_removed_groups WHERE package_id=?',(package_id,))
+            save_signature(conn,package_id,len(paths))
             conn.commit()
     except Exception:
         LOGGER.exception('k-means assign failed: %s', package_id)
         return 0
     # 存入"本次聚类所用向量集"的指纹。必须在写库之后重算：
     # 聚类本身会删除未被分配到的旧组，从而改变 content_revision 之和。
-    _km_state_put(store, package_id, _km_signature(store, package_id), len(paths))
     LOGGER.info('k-means recluster package=%s vectors=%d k=%d groups=%d ceil=%d floor=%d',
                 package_id, len(paths), k, len(buckets), cap, floor)
     return changed
@@ -1687,12 +1684,17 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
     # 那些文件因此被静默丢弃、永远没有向量。
     # 现在改为始终暂存，并在写成员时**沿用该文件已有的分组**，
     # 这样既不会把文件拖回占位分组，也不会丢掉数据。
+    from services.large_package_catalog_quality import representation
+    from services.large_package_evidence import row_parts
+    policy = representation(store,package_id)
     rows = []
     for _, path, _lease in claimed:
         row = catalog.get_file(store, package_id, path)
         source = catalog.material(row) if row else None
         if source:
-            rows.append((path, *source))
+            value,digest=source
+            if policy >= 2:value=dict(value,evidence_blocks=row_parts(row))
+            rows.append((path,value,digest))
         else:
             store.finish_queue(package_id, path, 'catalog', True, token=leases.get(path))
     # 统一正文质量闸门（k-means 启用路径）。此前 is_garbled() 只挂在旧的
@@ -1717,8 +1719,8 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
         vectors, pending, cache_keys = {}, {}, {}
         with closing(store._connect()) as conn:
             for path, value, digest in rows:
-                passage = embedding_passage(value)
-                cache_key = hashlib.sha256(('catalog-passage/2\0'+passage).encode()).hexdigest()
+                passage = embedding_passage(value,policy)
+                cache_key = hashlib.sha256(('catalog-representation/%d\0'%policy+passage).encode()).hexdigest()
                 cache_keys[digest] = cache_key
                 cached = conn.execute('SELECT vector FROM large_catalog_embeddings WHERE model=? AND digest=?', (model,cache_key)).fetchone()
                 if cached:
@@ -1762,6 +1764,13 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
                     # 二次增长（35,180 文件约 3,870 万行）。语义完全等价：
                     # 下面的取值只用 `existing.get(path, ...)`，未命中的路径
                     # 本来就拿不到值、回落占位分组。
+                    valid_rows=[]
+                    for path,value,digest in rows:
+                        lease=conn.execute("SELECT 1 FROM queue WHERE package_id=? AND path=? AND stage='catalog' AND status='running' AND lease_token=?",(package_id,path,leases.get(path))).fetchone()
+                        live=conn.execute('SELECT * FROM files WHERE package_id=? AND path=?',(package_id,path)).fetchone()
+                        source=catalog.material(store._row(live)) if live else None
+                        if lease and source and source[1]==digest:valid_rows.append((path,value,digest))
+                    rows=valid_rows
                     batch_paths = [path for path, _value, _digest in rows]
                     existing = {}
                     if batch_paths:

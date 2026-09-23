@@ -223,7 +223,10 @@ def augment_candidates(indexed: Sequence[Mapping[str, Any]],
     current = {str(item.get("source_path") or "") for item in merged}
     current.discard("")
     if len(current) >= min_files:
-        return merged
+        from services.answer_quality import enabled
+        if not enabled():
+            return merged
+        top_files = min(top_files, 3)
     summaries = {
         str(item.get("path") or ""): item
         for item in ((package_context or {}).get("file_summaries") or [])

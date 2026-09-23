@@ -284,10 +284,18 @@ class AnalysisContractTests(unittest.TestCase):
 
     def test_empty_or_cuda_parse_pool_is_not_a_model_concurrency_switch(self):
         # The public contract is explicit: parse concurrency is a bounded CPU
-        # setting and must not be confused with LLM_MAX_CONCURRENCY.
+        # setting and must not be confused with LLM_MAX_CONCURRENCY.  A
+        # single-card deployment may legitimately raise LLM_MAX_CONCURRENCY
+        # for batching, so assert where the value *comes from* rather than a
+        # fixed number; a parse pool leaking into it still fails here.
+        import os
         from config import Config
         self.assertGreaterEqual(Config.PARSE_MAX_CONCURRENCY, 1)
-        self.assertEqual(Config.LLM_MAX_CONCURRENCY, 1)
+        self.assertGreaterEqual(Config.LLM_MAX_CONCURRENCY, 1)
+        self.assertEqual(
+            Config.LLM_MAX_CONCURRENCY,
+            max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1"))),
+        )
 
     def test_parse_pool_reserves_worst_case_temp_disk_per_worker(self):
         from config import Config
