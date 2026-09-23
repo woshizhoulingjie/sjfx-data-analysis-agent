@@ -14,6 +14,7 @@ from services.document_analysis import (
     _estimated_tokens,
     _normalise_summary_topics,
     _preview_input,
+    document_source_fingerprint,
 )
 from services.evidence import select_evidence
 
@@ -82,13 +83,16 @@ def _make_rows(storage, jobs, max_chars):
         document = storage.get_document(job.get("scan_id"), path)
         if not document:
             continue
+        input_started = time.perf_counter()
         selected = _preview_input(document, max_chars=max_chars)
+        input_build_ms = round((time.perf_counter() - input_started) * 1000, 2)
         if selected.strip():
             rows.append({
                 "job_id": str(job.get("id") or ""),
                 "path": path,
                 "document": document,
                 "input": selected,
+                "input_build_ms": input_build_ms,
             })
     return rows
 
@@ -134,14 +138,18 @@ def analyze_preliminary_batch(llm, storage, jobs, max_chars=8000,
 每条结论、事实、论点、方法、风险和不确定性都必须使用简体中文表达；文件原文中的专有名词、缩写和文件路径可以保留原文。
 必须返回 JSON，并且每个对象必须原样带回对应的 file_id 和 path。
 
+原文片段中的 evidence_id 是唯一可用的来源 ID。请在 claim_evidence 中为每条关键事实或结论
+原样列出 statement 和直接相关 ID；没有直接来源时留空。来源可回查不等于主张已被验证。
+
 {rows}
 
 返回格式：
 {{"documents":[{{"file_id":"任务ID","path":"原文件路径","title":"中文标题",
 "core_summary":"中文摘要","topics":["中文主题"],"key_facts":["中文事实"],
 "arguments":["中文论点"],"methodology":["中文方法"],"conclusions":["中文结论"],
-"uncertainties":["中文不确定性"],"warnings":["中文提示"]}}]}}
+"uncertainties":["中文不确定性"],"warnings":["中文提示"],"claim_evidence":[{{"statement":"主张原句","evidence_ids":["输入中已有的E-..."]}}]}}]}}
 不要遗漏文件，不要重复 file_id，不要在文件之间交叉引用。""".format(rows=prompt_rows)
+    model_started = time.perf_counter()
     result = llm.chat_json(
         "你是严谨的中文资料摘要助手。只输出有证据支持的、逐文件隔离的中文结果。",
         prompt,
@@ -154,6 +162,7 @@ def analyze_preliminary_batch(llm, storage, jobs, max_chars=8000,
         required_fields=("documents",),
         output_context="多文件初步摘要",
     )
+    model_generation_ms = round((time.perf_counter() - model_started) * 1000, 2)
     values = (result.get("json") or {}).get("documents")
     if not isinstance(values, list):
         raise PreliminaryBatchProtocolError("多文件初步摘要返回格式无效")
@@ -197,6 +206,13 @@ def analyze_preliminary_batch(llm, storage, jobs, max_chars=8000,
             "preview_source_chars": len(str(row["document"].get("text") or "")),
             "preview_coverage": {"mode": "selective", "selected_chars": len(row["input"]), "complete": False},
             "parser_info": {"model": result.get("model"), "usage": result.get("usage") or {}, "batch_size": len(rows)},
+            "source_fingerprint": document_source_fingerprint(row["document"]),
+            "summary_input_version": "preview-source-blocks-v2",
+            "summary_prompt_version": "preliminary-batch-claims-evidence-v2",
+            "pipeline_timing_ms": {
+                "input_selection": row.get("input_build_ms", 0),
+                "shared_model_generation_ms": model_generation_ms,
+            },
         })
         output[row["job_id"]] = {"summary": summary, "result": result, "path": row["path"]}
     return output, [row["job_id"] for row in rows]

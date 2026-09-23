@@ -2,7 +2,7 @@
 import json
 import re
 
-INPUT_VERSION = "selective-6500-v1"
+INPUT_VERSION = "selective-6500-v2-source-ids"
 
 
 def _clean(value):
@@ -65,7 +65,9 @@ def build_preliminary_input(document, max_chars=6500):
     if evidence:
         for ratio in (0.2, 0.4, 0.6, 0.8):
             e = evidence[min(len(evidence) - 1, int((len(evidence) - 1) * ratio))]
-            label = "原文" + ("第%s页" % e["page"] if e.get("page") else _clean(e.get("section"))[:50])
+            evidence_id = _clean(e.get("evidence_id"))
+            label = "原文证据" + ("(ID=" + evidence_id + ")" if evidence_id else "")
+            label += ("第%s页" % e["page"] if e.get("page") else _clean(e.get("section"))[:50])
             mid_sources.append((label, e["text"]))
     else:
         for ratio in (0.2, 0.4, 0.6, 0.8):
@@ -91,14 +93,16 @@ def build_preliminary_input(document, max_chars=6500):
         numeric = [e for e in evidence if re.search(r"\d", str(e.get("text") or ""))]
         for e in numeric[:8]:
             before = sum(len(p) for p in parts)
-            add("数值原文", e["text"], 500)
+            evidence_id = _clean(e.get("evidence_id"))
+            add("数值原文" + ("(ID=" + evidence_id + ")" if evidence_id else ""), e["text"], 500)
             if sum(len(p) for p in parts) - before > 0:
                 break
     # Reassign unused budgets to distinct middle evidence, without repeating text.
     for ratio in (0.5, 0.3, 0.7, 0.1, 0.9):
         if evidence:
             e = evidence[min(len(evidence) - 1, int((len(evidence) - 1) * ratio))]
-            add("补充原文", e["text"], 900)
+            evidence_id = _clean(e.get("evidence_id"))
+            add("补充原文" + ("(ID=" + evidence_id + ")" if evidence_id else ""), e["text"], 900)
         elif raw:
             start = int(len(raw) * ratio)
             add("补充原文", raw[start:start + 1000], 900)

@@ -34,6 +34,7 @@ from services.document_analysis import (
     analyze_document,
     analyze_document_preview,
     analyze_document_previews_batch,
+    document_source_fingerprint,
 )
 from services.import_pipeline import parse_plan
 from services.import_state_machine import summary_type as staged_summary_type
@@ -1227,6 +1228,11 @@ def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
         if not summary:
             missing_file_summaries.append(path)
             continue
+        if summary_stage == "preliminary" and not _preliminary_summary_identity(
+            scan_id, path, summary=summary,
+        ):
+            missing_file_summaries.append(path)
+            continue
         def _short(value, limit):
             return " ".join(str(value or "").split())[:limit]
         level = str(summary.get("analysis_level") or summary.get("analysis_depth") or "unknown").lower()
@@ -1282,6 +1288,10 @@ def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
                 })
         file_summaries.append({
             "path": path,
+            "source_fingerprint": summary.get("source_fingerprint"),
+            "summary_input_version": summary.get("summary_input_version"),
+            "summary_prompt_version": summary.get("summary_prompt_version"),
+            "summary_content_fingerprint": _preliminary_summary_content_fingerprint(summary),
             "title": _short(summary.get("title") or summary.get("core_summary"), 160),
             "summary": _short(summary.get("summary") or summary.get("core_summary"), 500),
             "topics": [str(item)[:50] for item in (summary.get("topics") or [])[:4]],
@@ -1372,6 +1382,14 @@ def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
         if len(topic_clusters) >= 8:
             break
 
+    member_source_fingerprint = _preliminary_member_source_fingerprint(file_summaries)
+    for item in file_summaries:
+        for internal_key in (
+            "source_fingerprint", "summary_input_version", "summary_prompt_version",
+            "summary_content_fingerprint",
+        ):
+            item.pop(internal_key, None)
+
     return {
         "member_paths": sorted(member_paths),
         "inventory": [
@@ -1393,6 +1411,7 @@ def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
 
         "documents": sampled_documents,
         "file_summaries": file_summaries,
+        "member_source_fingerprint": member_source_fingerprint,
         "file_summary_count": len(file_summaries),
         "missing_file_summaries": missing_file_summaries,
         "non_deep_file_summaries": non_deep_file_summaries,
@@ -1910,6 +1929,7 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
     prompt, evidence_catalog = build_report_analysis_prompt(
         scan_result, summaries, analysis, report_data
     )
+    model_started = time.perf_counter()
     try:
         result = llm.chat_json(
             "你是严谨的数据包分析与研究规划助手。你必须从证据中归纳，不得使用固定领域模板。"
@@ -1927,6 +1947,7 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
             "status": "completed",
             "model": result.get("model"),
             "evidence_catalog_size": len(evidence_catalog),
+            "elapsed_ms": round((time.perf_counter() - model_started) * 1000, 2),
         }
         return (
             merged,
@@ -1935,11 +1956,20 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
             None,
         )
     except LocalModelError as exc:
-        report_data["model_analysis"] = {"status": "failed", "error": str(exc)}
+        report_data["model_analysis"] = {
+            "status": "failed", "error": str(exc),
+            "elapsed_ms": round((time.perf_counter() - model_started) * 1000, 2),
+        }
         return report_data, None, {}, "模型研究方向分析失败：{}。报告未使用关键词规则替代。".format(exc)
 
 
-def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=None):
+def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=None,
+                          source_fingerprint=None):
+    overview_started = time.perf_counter()
+    if summary_stage == "preliminary" and source_fingerprint:
+        current_fingerprint = _preliminary_overview_source_fingerprint(scan_id)
+        if current_fingerprint != source_fingerprint:
+            raise ValueError("初步摘要或节点摘要版本已变化，拒绝生成过期情报概览")
     scan_result = require_scan(scan_id)
     analysis = dict(storage.get_analysis(scan_id) or {})
     # Reports consume the same edge contract exposed to graph/search/dialogue
@@ -1967,9 +1997,12 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         ) if str(path)
     }
     if selected_paths:
-        # A selected-scope report must not silently reintroduce summaries from
-        # files that were only inventoried. Keep file and node evidence inside
-        # the current selection; metadata inventory remains available separately.
+        # Keep selected file results, and only node summaries still represented
+        # by the current directory or current queued node jobs.
+        valid_node_paths = (
+            _preliminary_expected_node_paths(scan_id, selected_paths)
+            if summary_stage == "preliminary" else None
+        )
         scoped = []
         for item in summaries:
             node_path = str((item.get("payload") or {}).get("node_path") or item.get("path") or "")
@@ -1979,7 +2012,11 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
             members = {
                 str(path) for path in ((item.get("payload") or {}).get("member_paths") or []) if str(path)
             }
-            if node_path.startswith("node:") and members and members.issubset(selected_paths):
+            if (
+                node_path.startswith("node:") and members
+                and members.issubset(selected_paths)
+                and (valid_node_paths is None or node_path in valid_node_paths)
+            ):
                 scoped.append(item)
         summaries = scoped
         analysis["selected_scope_paths"] = sorted(selected_paths)
@@ -1996,7 +2033,13 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
                 changed = True
         if changed:
             storage.save_analysis(scan_id, analysis)
+    aggregation_started = time.perf_counter()
     report_data = build_local_report(scan_result, summaries, analysis)
+    if summary_stage == "preliminary" and source_fingerprint:
+        report_data["source_fingerprint"] = source_fingerprint
+    report_data.setdefault("pipeline_timing_ms", {})["local_overview_aggregation"] = round(
+        (time.perf_counter() - aggregation_started) * 1000, 2
+    )
     if summary_stage in {"preliminary", "deep"}:
         stage_files = [item.get("payload") or {} for item in summaries if item.get("type") == staged_summary_type(summary_stage,"file")]
         stage_nodes = [item.get("payload") or {} for item in summaries if item.get("type") == staged_summary_type(summary_stage,"node")]
@@ -2161,6 +2204,16 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
             "classification_coverage": float((content_map.get("coverage") or {}).get("classification_coverage") or 1.0),
             "directory_stage": "formal_taxonomy_with_bounded_model_evidence",
         })
+    report_data.setdefault("pipeline_timing_ms", {})["model_report_generation"] = (
+        (report_data.get("model_analysis") or {}).get("elapsed_ms")
+    )
+    report_data.setdefault("pipeline_timing_ms", {})["overview_total_before_export"] = round(
+        (time.perf_counter() - overview_started) * 1000, 2
+    )
+    if summary_stage == "preliminary" and source_fingerprint:
+        current_fingerprint = _preliminary_overview_source_fingerprint(scan_id)
+        if current_fingerprint != source_fingerprint:
+            raise ValueError("初步摘要在概览生成期间发生变化，拒绝保存过期情报概览")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     name = "情况概览报告_{}_{}_自动.docx".format(safe_name(Path(scan_result["root"]).name), stamp)
     create_report_docx(report_data, scan_result, _output_path_for_write(name, owner_id))
@@ -2653,8 +2706,75 @@ def _local_preliminary_summary(local_summary, path, reason):
     }
 
 
+PRELIMINARY_SUMMARY_VERSION_PAIRS = frozenset({
+    ("preview-source-blocks-v2", "preview-claims-evidence-v2"),
+    ("preview-source-blocks-v2", "preliminary-batch-claims-evidence-v2"),
+    ("selective-6500-v2-source-ids", "compact-6500-evidence-v2"),
+    ("local-no-content-v1", "local-no-content-v1"),
+})
+
+
+def _preliminary_summary_content_fingerprint(summary):
+    fields = (
+        "title", "summary", "core_summary", "topics", "key_facts", "arguments",
+        "methodology", "conclusions", "file_conclusions", "evidence_chain",
+        "limitations", "file_limitations", "structure_overview", "warnings",
+    )
+    material = {field: (summary or {}).get(field) for field in fields}
+    return hashlib.sha256(
+        json.dumps(material, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _preliminary_summary_identity(scan_id, path, summary=None, document=None):
+    summary = summary if summary is not None else (
+        storage.get_summary(scan_id, path, staged_summary_type("preliminary", "file")) or {}
+    )
+    document = document if document is not None else storage.get_document(scan_id, path)
+    if not isinstance(document, dict) or not document:
+        return None
+    if str(summary.get("analysis_stage") or "").lower() != "preliminary":
+        return None
+    current_fingerprint = document_source_fingerprint(document)
+    if summary.get("source_fingerprint") != current_fingerprint:
+        return None
+    input_version = str(summary.get("summary_input_version") or "")
+    prompt_version = str(summary.get("summary_prompt_version") or "")
+    if (input_version, prompt_version) not in PRELIMINARY_SUMMARY_VERSION_PAIRS:
+        return None
+    return {
+        "path": str(path),
+        "source_fingerprint": current_fingerprint,
+        "summary_input_version": input_version,
+        "summary_prompt_version": prompt_version,
+        "summary_content_fingerprint": _preliminary_summary_content_fingerprint(summary),
+    }
+
+
+def _preliminary_member_source_fingerprint(file_summaries):
+    rows = []
+    for item in file_summaries or []:
+        path = str((item or {}).get("path") or "")
+        source_fingerprint = str((item or {}).get("source_fingerprint") or "")
+        input_version = str((item or {}).get("summary_input_version") or "")
+        prompt_version = str((item or {}).get("summary_prompt_version") or "")
+        content_fingerprint = str((item or {}).get("summary_content_fingerprint") or "")
+        if not path or not source_fingerprint or not content_fingerprint:
+            return ""
+        rows.append((path, source_fingerprint, input_version, prompt_version, content_fingerprint))
+    if not rows:
+        return ""
+    payload = {
+        "contract": "preliminary-node-members-v3",
+        "members": sorted(rows),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def _queue_preliminary_file_summaries(scan_id, owner_id=None):
-    """Reconcile the selected-file preliminary lane after retries or restarts."""
+    """Reconcile selected-file summaries using source-versioned cache checks."""
     task = storage.get_import_task(scan_id) or {}
     if task.get("status") not in {"parsed_overview", "preliminary_summarizing"}:
         return []
@@ -2668,7 +2788,10 @@ def _queue_preliminary_file_summaries(scan_id, owner_id=None):
     ]
     if not selected:
         return []
-    prior_ids = [str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or []) if str(item)]
+    prior_ids = [
+        str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or [])
+        if str(item)
+    ]
     with storage._connect() as conn:
         rows = conn.execute(
             "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(
@@ -2677,39 +2800,64 @@ def _queue_preliminary_file_summaries(scan_id, owner_id=None):
             [str(scan_id)] + prior_ids,
         ).fetchall() if prior_ids else []
     states = {str(row["id"]): str(row["status"] or "") for row in rows}
-    retained = [job_id for job_id in prior_ids if states.get(job_id) in {"queued", "running", "completed", "cancelling"}]
+    retained = [
+        job_id for job_id in prior_ids
+        if states.get(job_id) in {"queued", "running", "completed", "cancelling"}
+    ]
     jobs = []
     local_only = 0
     for path in selected:
-        summary = storage.get_summary(scan_id, path, staged_summary_type("preliminary", "file")) or {}
+        document = storage.get_document(scan_id, path) or {}
+        current_fingerprint = document_source_fingerprint(document)
+        summary = storage.get_summary(
+            scan_id, path, staged_summary_type("preliminary", "file")
+        ) or {}
         stage = str(summary.get("analysis_stage") or summary.get("analysis_depth") or "").lower()
         generated = str(summary.get("generated_by") or "").lower()
-        if stage in {"preliminary", "preliminary_document"} or generated in {
-            "model-preliminary-analysis", "local-skipped-zero-information",
-        }:
+        is_preliminary = (
+            stage in {"preliminary", "preliminary_document"}
+            or generated in {"model-preliminary-analysis", "local-skipped-zero-information"}
+        )
+        if (
+            is_preliminary
+            and summary.get("source_fingerprint") == current_fingerprint
+            and (
+                summary.get("summary_input_version"),
+                summary.get("summary_prompt_version"),
+            ) in PRELIMINARY_SUMMARY_VERSION_PAIRS
+        ):
             continue
-        # 零信息文件（解析失败 / 无正文无证据 / 字节级重复副本）直接产出本地
-        # preliminary 摘要，不进模型队列：模型对空输入只会产空话或编造。
         local_summary = storage.get_summary(scan_id, path, "file") or {}
         local_only_reason = _preliminary_local_only_reason(local_summary)
         if local_only_reason:
+            ready = _local_preliminary_summary(local_summary, path, local_only_reason)
+            ready.update({
+                "source_fingerprint": current_fingerprint,
+                "summary_input_version": "local-no-content-v1",
+                "summary_prompt_version": "local-no-content-v1",
+            })
             storage.save_summary(
-                scan_id, path, staged_summary_type("preliminary", "file"),
-                _local_preliminary_summary(local_summary, path, local_only_reason),
+                scan_id, path, staged_summary_type("preliminary", "file"), ready,
             )
             local_only += 1
             continue
         active_for_path = False
         with storage._connect() as conn:
-            for row in conn.execute(
-                "SELECT id,options,status FROM analysis_jobs WHERE scan_id=? AND task_type='generate_summary' AND status IN ('queued','running','cancelling')",
+            active_rows = conn.execute(
+                "SELECT id,options,status FROM analysis_jobs WHERE scan_id=? "
+                "AND task_type='generate_summary' AND status IN ('queued','running','cancelling')",
                 (str(scan_id),),
-            ):
+            )
+            for row in active_rows:
                 try:
                     options = json.loads(row["options"] or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     options = {}
-                if str(options.get("workflow_source") or "") == "preliminary_model_summary" and str(options.get("path") or "") == path:
+                if (
+                    str(options.get("workflow_source") or "") == "preliminary_model_summary"
+                    and str(options.get("path") or "") == path
+                    and str(options.get("source_fingerprint") or "") == current_fingerprint
+                ):
                     active_for_path = True
                     retained.append(str(row["id"]))
                     break
@@ -2727,31 +2875,33 @@ def _queue_preliminary_file_summaries(scan_id, owner_id=None):
                 "analysis_level": "preview",
                 "workflow_source": "preliminary_model_summary",
                 "deep_batch_id": checkpoint.get("deep_batch_id"),
+                "source_fingerprint": current_fingerprint,
+                "summary_input_version": "preview-source-blocks-v2",
+                "summary_prompt_version": "preview-claims-evidence-v2",
             },
             owner_id=owner_id or "legacy",
         )
         if job_id:
             jobs.append(str(job_id))
     all_ids = list(dict.fromkeys(retained + jobs))
-    # 即使全部选中文件都是零信息（local_only>0）也要推进状态机，
-    # 否则任务会因为没有待跑任务而永久停在 parsed_overview。
     if all_ids or local_only:
         checkpoint["preliminary_summary_job_ids"] = all_ids
         checkpoint["preliminary_summary_expected"] = len(all_ids)
-        checkpoint["preliminary_summary_completed"] = sum(1 for job_id in all_ids if states.get(job_id) == "completed")
+        checkpoint["preliminary_summary_completed"] = sum(
+            1 for job_id in all_ids if states.get(job_id) == "completed"
+        )
         checkpoint["selected_paths"] = list(dict.fromkeys(selected))
         checkpoint["preliminary_local_only_count"] = local_only
         storage.transition_import_task(
-            scan_id,
-            "preliminary_summarizing",
-            checkpoint=checkpoint,
+            scan_id, "preliminary_summarizing", checkpoint=checkpoint,
         )
         storage.set_package_processing_state(
             scan_id, "preliminary_summarizing", "选中文件已解析，正在生成文件初步摘要。",
         )
     return all_ids
+
 def _queue_preliminary_node_summaries(scan_id, owner_id=None):
-    """Queue node-level preliminary summaries for the selected file scope only."""
+    """Queue each selected node as soon as its member file summaries are ready."""
     task = storage.get_import_task(scan_id) or {}
     if task.get("status") not in {"preliminary_summarizing", "preliminary_nodes"}:
         return []
@@ -2763,12 +2913,13 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
             or []
         ) if str(path)
     }
+    if not selected:
+        return []
     file_job_ids = [
         str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or [])
         if str(item)
     ]
-    if not selected:
-        return []
+    file_states = {}
     if file_job_ids:
         with storage._connect() as conn:
             rows = conn.execute(
@@ -2777,17 +2928,10 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
                 ),
                 [str(scan_id)] + file_job_ids,
             ).fetchall()
-        states = {str(row["id"]): str(row["status"] or "") for row in rows}
-        if any(states.get(job_id) != "completed" for job_id in file_job_ids):
-            return []
-    for path in selected:
-        summary = storage.get_summary(scan_id, path, staged_summary_type("preliminary", "file")) or {}
-        if (
-            str(summary.get("analysis_stage") or "").lower() != "preliminary"
-            and str(summary.get("generated_by") or "").lower()
-                != "model-preliminary-analysis"
-        ):
-            return []
+        file_states = {str(row["id"]): str(row["status"] or "") for row in rows}
+    all_file_jobs_complete = all(
+        file_states.get(job_id) == "completed" for job_id in file_job_ids
+    )
 
     analysis_tree = (storage.get_analysis(scan_id) or {}).get("analysis_tree") or {}
     nodes = list((_build_candidate_preview_directory(scan_id) or {}).get("topics") or [])
@@ -2799,11 +2943,39 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
             nodes.append(node)
             seen.add(node_id)
 
-    jobs = []
-    existing_job_ids = [
+    with storage._connect() as conn:
+        existing_rows = conn.execute(
+            "SELECT id,status,options FROM analysis_jobs WHERE scan_id=? AND task_type='generate_summary' "
+            "AND status IN ('queued','running','cancelling')",
+            (str(scan_id),),
+        ).fetchall()
+    active_nodes = {}
+    for row in existing_rows:
+        try:
+            options = json.loads(row["options"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            options = {}
+        if str(options.get("workflow_source") or "") == "preliminary_node_summary":
+            key = (str(options.get("node_id") or ""), str(options.get("member_source_fingerprint") or ""))
+            active_nodes[key] = str(row["id"])
+
+    prior_node_ids = [
         str(item) for item in (checkpoint.get("preliminary_node_job_ids") or [])
         if str(item)
     ]
+    with storage._connect() as conn:
+        prior_rows = conn.execute(
+            "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(
+                ",".join("?" for _ in prior_node_ids) or "NULL"
+            ),
+            [str(scan_id)] + prior_node_ids,
+        ).fetchall() if prior_node_ids else []
+    prior_states = {str(row["id"]): str(row["status"] or "") for row in prior_rows}
+    retained = [
+        job_id for job_id in prior_node_ids
+        if prior_states.get(job_id) in {"queued", "running", "cancelling", "completed"}
+    ]
+    jobs = []
     for node in nodes:
         node_id = str(node.get("node_id") or "")
         members = {
@@ -2813,10 +2985,35 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
         }
         if not node_id or not members or not members.issubset(selected):
             continue
+        member_summaries = []
+        ready = True
+        for path in sorted(members):
+            identity = _preliminary_summary_identity(scan_id, path)
+            if identity is None:
+                ready = False
+                break
+            member_summaries.append(identity)
+        if not ready:
+            continue
+        member_fingerprint = _preliminary_member_source_fingerprint(member_summaries)
+        if not member_fingerprint:
+            continue
         node_path = "node:{}".format(node_id)
-        existing = storage.get_summary(scan_id, node_path, staged_summary_type("preliminary", "node")) or {}
-        existing_members = {str(path) for path in (existing.get("member_paths") or []) if str(path)}
-        if str(existing.get("analysis_stage") or "").lower() == "preliminary" and existing_members == members:
+        existing = storage.get_summary(
+            scan_id, node_path, staged_summary_type("preliminary", "node")
+        ) or {}
+        existing_members = {
+            str(path) for path in (existing.get("member_paths") or []) if str(path)
+        }
+        if (
+            str(existing.get("analysis_stage") or "").lower() == "preliminary"
+            and existing_members == members
+            and existing.get("member_source_fingerprint") == member_fingerprint
+        ):
+            continue
+        active_id = active_nodes.get((node_id, member_fingerprint))
+        if active_id:
+            retained.append(active_id)
             continue
         job_id, _created = storage.create_or_get_typed_job(
             scan_id,
@@ -2826,6 +3023,7 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
                 "node_id": node_id,
                 "node_name": node.get("name") or node.get("title") or "选中文件节点",
                 "member_paths": sorted(members),
+                "member_source_fingerprint": member_fingerprint,
                 "kind": "group",
                 "workflow_source": "preliminary_node_summary",
                 "analysis_level": "preview",
@@ -2835,23 +3033,126 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
         if job_id:
             jobs.append(str(job_id))
 
-    node_job_ids = list(dict.fromkeys(existing_job_ids + jobs))
+    node_job_ids = list(dict.fromkeys(retained + jobs))
     checkpoint["preliminary_node_job_ids"] = node_job_ids
     checkpoint["preliminary_node_expected"] = len(node_job_ids)
-    storage.transition_import_task(
-        scan_id,
-        "preliminary_nodes",
-        checkpoint=checkpoint,
-    )
-    storage.set_package_processing_state(
-        scan_id, "preliminary_nodes",
-        "选中文件初步摘要已完成，正在生成对应节点初步摘要。",
-    )
+    if task.get("status") == "preliminary_summarizing" and all_file_jobs_complete:
+        storage.transition_import_task(
+            scan_id, "preliminary_nodes", checkpoint=checkpoint,
+        )
+        storage.set_package_processing_state(
+            scan_id, "preliminary_nodes", "选中文件初步摘要已完成，正在生成对应节点初步摘要。",
+        )
+    else:
+        storage.update_import_task(scan_id, checkpoint=checkpoint)
     return node_job_ids
+
+def _preliminary_expected_node_paths(scan_id, selected_paths=None):
+    selected = {str(path) for path in (selected_paths or []) if str(path)}
+    if not selected:
+        return set()
+    valid_ids = set()
+    analysis_tree = (storage.get_analysis(scan_id) or {}).get("analysis_tree") or {}
+    nodes = list(_walk_analysis_nodes(analysis_tree))
+    nodes.extend((_build_candidate_preview_directory(scan_id) or {}).get("topics") or [])
+    for node in nodes:
+        node_id = str(node.get("node_id") or "")
+        members = {
+            str(path) for path in (node.get("member_paths") or node.get("source_paths") or [])
+            if str(path)
+        }
+        if node_id and members and members.issubset(selected):
+            valid_ids.add(node_id)
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = task.get("checkpoint") or {}
+    job_ids = [
+        str(item) for item in (checkpoint.get("preliminary_node_job_ids") or [])
+        if str(item)
+    ]
+    if job_ids:
+        with storage._connect() as conn:
+            rows = conn.execute(
+                "SELECT options FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(
+                    ",".join("?" for _ in job_ids)
+                ),
+                [str(scan_id)] + job_ids,
+            ).fetchall()
+        for row in rows:
+            try:
+                options = json.loads(row["options"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            node_id = str(options.get("node_id") or "")
+            members = {
+                str(path) for path in (options.get("member_paths") or []) if str(path)
+            }
+            if node_id and members and members.issubset(selected):
+                valid_ids.add(node_id)
+    return {"node:" + node_id for node_id in valid_ids}
+
+
+def _preliminary_overview_source_fingerprint(scan_id):
+    task = storage.get_import_task(scan_id) or {}
+    checkpoint = task.get("checkpoint") or {}
+    selected = sorted({
+        str(path) for path in (
+            checkpoint.get("selected_paths") or checkpoint.get("deep_selected_paths") or []
+        ) if str(path)
+    })
+    if not selected:
+        return ""
+    files = []
+    current_identities = {}
+    for path in selected:
+        identity = _preliminary_summary_identity(scan_id, path)
+        if identity is None:
+            return ""
+        current_identities[path] = identity
+        summary = storage.get_summary(
+            scan_id, path, staged_summary_type("preliminary", "file")
+        ) or {}
+        files.append((
+            path, identity["source_fingerprint"],
+            identity["summary_input_version"],
+            identity["summary_prompt_version"],
+            identity["summary_content_fingerprint"],
+            summary.get("generated_at"),
+        ))
+    nodes = []
+    expected_node_paths = _preliminary_expected_node_paths(scan_id, selected)
+    for row in storage.list_summaries(scan_id):
+        payload = row.get("payload") or {}
+        node_path = str(payload.get("node_path") or row.get("path") or "")
+        members = sorted({
+            str(path) for path in (payload.get("member_paths") or []) if str(path)
+        })
+        if (
+            node_path in expected_node_paths
+            and str(payload.get("analysis_stage") or "").lower() == "preliminary"
+            and members and set(members).issubset(selected)
+        ):
+            expected_member_fingerprint = _preliminary_member_source_fingerprint(
+                [current_identities[path] for path in members]
+            )
+            if payload.get("member_source_fingerprint") != expected_member_fingerprint:
+                return ""
+            nodes.append((
+                node_path, payload.get("member_source_fingerprint"),
+                payload.get("generated_at"),
+            ))
+    material = {
+        "contract": "preliminary-overview-source-v3",
+        "selection_version": checkpoint.get("selection_version"),
+        "files": files,
+        "nodes": sorted(nodes),
+    }
+    return hashlib.sha256(
+        json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def _queue_preliminary_overview(scan_id, owner_id=None):
-    """Queue the selected-scope overview only after both preliminary layers settle."""
+    """Queue the overview only after current file and node layers settle."""
     task = storage.get_import_task(scan_id) or {}
     if task.get("status") not in {"preliminary_nodes", "preliminary_overview"}:
         return None
@@ -2859,31 +3160,45 @@ def _queue_preliminary_overview(scan_id, owner_id=None):
     file_ids = [str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or []) if str(item)]
     node_ids = [str(item) for item in (checkpoint.get("preliminary_node_job_ids") or []) if str(item)]
     all_ids = file_ids + node_ids
-    if not all_ids:
-        return None
-    with storage._connect() as conn:
-        rows = conn.execute(
-            "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(",".join("?" for _ in all_ids)),
-            [str(scan_id)] + all_ids,
-        ).fetchall()
-    states = {str(row["id"]): str(row["status"] or "") for row in rows}
+    states = {}
+    if all_ids:
+        with storage._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(
+                    ",".join("?" for _ in all_ids)
+                ),
+                [str(scan_id)] + all_ids,
+            ).fetchall()
+        states = {str(row["id"]): str(row["status"] or "") for row in rows}
     if any(states.get(job_id) != "completed" for job_id in all_ids):
         return None
+    source_fingerprint = _preliminary_overview_source_fingerprint(scan_id)
+    if not source_fingerprint:
+        return None
     report_id = str(checkpoint.get("preliminary_overview_job_id") or "")
-    if report_id and states.get(report_id) == "completed":
-        return report_id
-    if report_id:
+    previous_fingerprint = str(checkpoint.get("preliminary_overview_fingerprint") or "")
+    if report_id and previous_fingerprint == source_fingerprint:
+        if states.get(report_id) == "completed":
+            return report_id
         with storage._connect() as conn:
-            row = conn.execute("SELECT status FROM analysis_jobs WHERE id=? AND scan_id=?", (report_id, str(scan_id))).fetchone()
+            row = conn.execute(
+                "SELECT status FROM analysis_jobs WHERE id=? AND scan_id=?",
+                (report_id, str(scan_id)),
+            ).fetchone()
         if row and str(row["status"] or "") in {"queued", "running", "cancelling", "completed"}:
             return report_id
     report_id, _created = storage.create_or_get_typed_job(
         scan_id,
         "generate_report",
-        options={"workflow_source": "preliminary_results_report", "selection_version": checkpoint.get("selection_version")},
+        options={
+            "workflow_source": "preliminary_results_report",
+            "selection_version": checkpoint.get("selection_version"),
+            "source_fingerprint": source_fingerprint,
+        },
         owner_id=owner_id or "legacy",
     )
     checkpoint["preliminary_overview_job_id"] = report_id
+    checkpoint["preliminary_overview_fingerprint"] = source_fingerprint
     storage.transition_import_task(
         scan_id, "preliminary_overview", checkpoint=checkpoint,
     )
@@ -2891,6 +3206,7 @@ def _queue_preliminary_overview(scan_id, owner_id=None):
         scan_id, "preliminary_overview", "文件和节点初步摘要已完成，正在生成选中范围情报概览。",
     )
     return report_id
+
 def _preliminary_chain_ready_for_idle(scan_id):
     """The low-priority lane may start only after both preliminary layers settle."""
     task = storage.get_import_task(scan_id) or {}
@@ -3307,7 +3623,11 @@ def _run_claimed_report_job(job):
     _ensure_job_active(job_id)
     workflow_source = str((job.get("options") or {}).get("workflow_source") or "")
     summary_stage = "preliminary" if workflow_source == "preliminary_results_report" else ("deep" if workflow_source == "deep_results_report" else None)
-    report = _write_local_overview(scan_id, owner_id=job.get("owner_id"), job_id=job_id, summary_stage=summary_stage)
+    report = _write_local_overview(
+        scan_id, owner_id=job.get("owner_id"), job_id=job_id,
+        summary_stage=summary_stage,
+        source_fingerprint=(job.get("options") or {}).get("source_fingerprint"),
+    )
     _ensure_job_active(job_id)
     return {"scan_id": scan_id, "overview": report}
 
@@ -3434,6 +3754,9 @@ def _prepare_node_summary(scan_id, payload):
     )
     if not context.get("file_summaries_complete"):
         raise ValueError("候选节点仍有文件摘要未完成，不能生成节点摘要")
+    expected_member_fingerprint = str(payload.get("member_source_fingerprint") or "")
+    if expected_member_fingerprint and context.get("member_source_fingerprint") != expected_member_fingerprint:
+        raise ValueError("节点成员文件摘要版本已变化，请重新排队")
     return {
         "node_id": node_id, "plan": plan, "node": node, "context": context,
         "declared_count": declared_count, "workflow_source": workflow_source,
@@ -3472,6 +3795,7 @@ def _generate_node_summary(scan_id, prepared, node_llm):
         # Evidence is scoped to the model subset, while the displayed
         # category count remains the full selected category count.
         "member_paths": context.get("member_paths") or [], "file_count": declared_count,
+        "member_source_fingerprint": context.get("member_source_fingerprint") or "",
         "member_paths_lazy": bool(node.get("member_paths_lazy") or plan.get("schema_version")),
         "total_size": int(
             node.get("total_bytes")
@@ -3524,6 +3848,15 @@ def _generate_node_summary(scan_id, prepared, node_llm):
         ),
     }
     if is_preliminary_node:
+        current_members = [
+            _preliminary_summary_identity(scan_id, path)
+            for path in (context.get("member_paths") or [])
+        ]
+        if any(item is None for item in current_members) or (
+            _preliminary_member_source_fingerprint(current_members)
+            != context.get("member_source_fingerprint")
+        ):
+            raise ValueError("节点摘要生成期间成员文件或摘要版本发生变化，拒绝保存过期结果")
         summary_type = staged_summary_type("preliminary", "node")
     elif is_deep_node:
         summary_type = staged_summary_type("deep", "node")
@@ -3552,6 +3885,8 @@ def _node_summary_reuse(scan_id, node_id, context):
     saved = sorted(str(path) for path in (existing.get("member_paths") or []) if str(path))
     current = sorted(str(path) for path in (context.get("member_paths") or []) if str(path))
     if not saved or saved != current:
+        return None
+    if existing.get("member_source_fingerprint") != context.get("member_source_fingerprint"):
         return None
     return existing
 
@@ -3706,6 +4041,13 @@ def _execute_summary_job(job):
             for item in documents:
                 path = item["path"]
                 summary = dict((batch_result.get(path) or {}).get("summary") or {})
+                expected_fingerprint = str(payload.get("source_fingerprint") or "")
+                current_fingerprint = document_source_fingerprint(item.get("document") or {})
+                if expected_fingerprint and expected_fingerprint != current_fingerprint:
+                    raise ValueError("初步摘要任务的来源文件已变化，拒绝保存旧版本结果")
+                summary.setdefault("source_fingerprint", current_fingerprint)
+                summary.setdefault("summary_input_version", "preview-source-blocks-v2")
+                summary.setdefault("summary_prompt_version", "preview-claims-evidence-v2")
                 summary.setdefault("node_path", path)
                 summary.setdefault("summary_type", "file")
                 summary.setdefault("analysis_level", "preview")
@@ -3733,6 +4075,10 @@ def _execute_summary_job(job):
                             "status": "review",
                         }],
                     })
+                latest_document = storage.get_document(scan_id, path) or {}
+                if document_source_fingerprint(latest_document) != current_fingerprint:
+                    logger.info("文件源在批量初步摘要期间发生变化，跳过旧结果 scan_id=%s path=%s", scan_id, path)
+                    continue
                 summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
                 storage.save_summary(
                     scan_id,
@@ -3752,6 +4098,10 @@ def _execute_summary_job(job):
         document = storage.get_document(scan_id, node_path)
         if not document:
             raise ValueError("候选文件尚未完成统一解析：{}".format(node_path))
+        current_fingerprint = document_source_fingerprint(document)
+        expected_fingerprint = str(payload.get("source_fingerprint") or "")
+        if expected_fingerprint and expected_fingerprint != current_fingerprint:
+            raise ValueError("初步摘要任务的来源文件已变化，拒绝保存旧版本结果")
         try:
             if prefetched_summary:
                 summary = dict(prefetched_summary.get("summary") or {})
@@ -3792,6 +4142,9 @@ def _execute_summary_job(job):
             degraded = True
         summary["node_path"] = node_path
         summary["summary_type"] = "file"
+        summary.setdefault("source_fingerprint", current_fingerprint)
+        summary.setdefault("summary_input_version", "preview-source-blocks-v2")
+        summary.setdefault("summary_prompt_version", "preview-claims-evidence-v2")
         if str(payload.get("workflow_source") or "") == "preliminary_model_summary":
             # Keep the same preview claim/evidence contract for both the
             # original single-file path and the runtime-batched path.
@@ -3813,6 +4166,9 @@ def _execute_summary_job(job):
                     "status": "review",
                 }],
             })
+        latest_document = storage.get_document(scan_id, node_path) or {}
+        if document_source_fingerprint(latest_document) != current_fingerprint:
+            raise ValueError("初步摘要生成期间源文件发生变化，拒绝保存过期结果")
         summary["generated_at"] = datetime.now().isoformat(timespec="seconds")
         if str(payload.get("workflow_source") or "") == "preliminary_model_summary":
             storage.save_summary(scan_id, node_path, staged_summary_type("preliminary", "file"), summary)

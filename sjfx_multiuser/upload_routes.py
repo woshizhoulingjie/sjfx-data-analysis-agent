@@ -70,7 +70,7 @@ def upload_page_html(max_chunk_bytes):
     等于白送攻击者一份目录结构情报（虽然这里有权限保护，但没有必要暴露）。
     """
     mb = max_chunk_bytes / 1024.0 / 1024.0
-    return """<!doctype html>
+    return r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>上传数据包</title>
@@ -101,8 +101,7 @@ def upload_page_html(max_chunk_bytes):
   <p class="sub">文件会按 __MB__ MB 一片切分上传，中途断开可以续传。
      上传完成后在「新建分析」里就能选到。</p>
   <div class="note">
-    <b>大文件（几十 GB）建议用命令行客户端</b> —— 浏览器页面会占用大量内存，
-    且关闭标签页即中断。<code>tools/upload_client.py</code> 支持断点续传。
+    <b>断点续传</b>：暂停后重新选择相同文件即可继续。续传记录保存在当前浏览器标签页，关闭标签页后可能无法自动找回；服务端暂存会在 7 天后清理。
   </div>
   <div class="row">
     <label>数据包名称（可留空，默认用第一个文件名）</label>
@@ -122,15 +121,15 @@ def upload_page_html(max_chunk_bytes):
 </div>
 <script>
 const CHUNK = __CHUNK__;
+const STORAGE_KEY = 'sjfx.upload.resume.v2';
 let stopFlag = false;
 const $ = id => document.getElementById(id);
-function log(s){ const el=$('log'); el.textContent += s + "\\n"; el.scrollTop = el.scrollHeight; }
+function log(s){ const el=$('log'); el.textContent += s + "\n"; el.scrollTop = el.scrollHeight; }
 function say(s){ $('stat').textContent = s; }
 function setBar(p){ $('bar').style.width = Math.max(0, Math.min(100, p)).toFixed(1) + '%'; }
 
 function relPath(f){
-  // 去掉浏览器可能带上的顶层目录前缀，保持与客户端扫描一致的相对路径
-  return (f.webkitRelativePath || f.name).replace(/^\\/+/, '');
+  return (f.webkitRelativePath || f.name).replace(/^\/+/, '');
 }
 
 async function sha256Hex(buf){
@@ -142,68 +141,184 @@ async function api(path, opts){
   const r = await fetch(path, Object.assign({credentials:'same-origin'}, opts||{}));
   let j = null;
   try { j = await r.json(); } catch(e){}
-  if (!r.ok) throw new Error((j && (j.error || j.detail)) || ('HTTP ' + r.status));
+  if (!r.ok) {
+    const error = new Error((j && (j.error || j.detail)) || ('HTTP ' + r.status));
+    error.status = r.status;
+    throw error;
+  }
   return j;
+}
+
+function fingerprint(files, packageName){
+  const stable = files.map(f => ({
+    rel_path: f.rel_path, size: f.size, last_modified: f.last_modified
+  })).sort((a,b) => a.rel_path.localeCompare(b.rel_path));
+  return JSON.stringify({package_name: packageName, files: stable});
+}
+
+function readResume(){
+  try { return JSON.parse(sessionStorage.getItem(STORAGE_KEY) || 'null'); }
+  catch(e) { sessionStorage.removeItem(STORAGE_KEY); return null; }
+}
+
+function saveResume(sessionId, key){
+  sessionStorage.setItem(STORAGE_KEY, JSON.stringify({
+    session_id: sessionId, fingerprint: key
+  }));
+}
+
+function clearResume(){ sessionStorage.removeItem(STORAGE_KEY); }
+
+function matchesRemote(remoteFiles, localFiles){
+  if (!Array.isArray(remoteFiles) || remoteFiles.length !== localFiles.length) return false;
+  const local = new Map(localFiles.map(f => [f.rel_path, f.size]));
+  if (local.size !== localFiles.length) return false;
+  return remoteFiles.every(f => local.has(f.rel_path) && local.get(f.rel_path) === f.size);
+}
+
+function receivedBytes(status){
+  return (status.files || []).reduce((sum, f) => sum + (Number(f.received_bytes) || 0), 0);
 }
 
 $('go').onclick = async () => {
   const picked = [...$('files').files];
-  if (!picked.length) { log('先选文件'); return; }
-  $('go').disabled = true; $('stop').disabled = false; stopFlag = false;
+  if (!picked.length) { log('先选择原来的文件，再点开始或继续上传'); return; }
+  $('go').disabled = true;
+  $('stop').disabled = false;
+  stopFlag = false;
   try {
-    const manifest = picked.map(f => ({rel_path: relPath(f), size: f.size}));
-    log('建立上传会话…');
-    const s = await api('/api/uploads', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({package_name: $('pkg').value || null, files: manifest})
-    });
-    const sid = s.session_id;
-    log('会话 ' + sid + '：' + s.file_count + ' 个文件，共 ' + s.total_bytes + ' 字节');
+    const packageName = $('pkg').value.trim() || null;
+    const files = picked.map(f => ({
+      file: f, rel_path: relPath(f), size: f.size,
+      last_modified: Number(f.lastModified) || 0
+    }));
+    const key = fingerprint(files, packageName);
+    let saved = readResume();
+    let status = null;
+    let sessionId = null;
 
-    let doneBytes = 0;
-    for (let i = 0; i < picked.length; i++){
-      const f = picked[i];
-      let offset = 0;
-      while (offset < f.size){
-        if (stopFlag) { log('已暂停 —— 重新点开始会从断点继续'); return; }
-        const end = Math.min(offset + CHUNK, f.size);
-        const blob = f.slice(offset, end);
-        const buf = await blob.arrayBuffer();
+    if (saved && saved.fingerprint === key && saved.session_id) {
+      try {
+        status = await api('/api/uploads/' + encodeURIComponent(saved.session_id));
+        if (status.max_chunk_bytes !== CHUNK || !matchesRemote(status.files, files)) {
+          log('原续传会话与当前文件不匹配，将另建上传会话；旧暂存数据会按服务端期限清理。');
+          status = null;
+          clearResume();
+        } else {
+          sessionId = saved.session_id;
+          log('恢复会话 ' + sessionId + '，从服务器确认的进度继续。');
+        }
+      } catch(e) {
+        if (e.status !== 404) throw e;
+        log('原续传会话已过期，将重新上传。');
+        clearResume();
+        status = null;
+      }
+    } else if (saved) {
+      log('所选文件或数据包名称已变化，将另建上传会话；旧暂存数据会按服务端期限清理。');
+      clearResume();
+    }
+
+    if (!status) {
+      log('建立上传会话…');
+      const created = await api('/api/uploads', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          package_name: packageName,
+          files: files.map(f => ({rel_path: f.rel_path, size: f.size}))
+        })
+      });
+      sessionId = created.session_id;
+      saveResume(sessionId, key);
+      status = await api('/api/uploads/' + encodeURIComponent(sessionId));
+      if (!matchesRemote(status.files, files)) throw new Error('服务器清单与所选文件不一致，已停止上传');
+      log('会话 ' + sessionId + '：' + status.file_count + ' 个文件，共 ' + status.total_bytes + ' 字节');
+    }
+
+    const serverFiles = new Map(status.files.map((f, index) => [f.rel_path, Object.assign({index}, f)]));
+    let doneBytes = receivedBytes(status);
+    const totalBytes = Number(status.total_bytes) || 0;
+    setBar(totalBytes ? doneBytes / totalBytes * 100 : 100);
+
+    for (const item of files) {
+      let entry = serverFiles.get(item.rel_path);
+      if (!entry) throw new Error('服务器缺少文件：' + item.rel_path);
+      if (entry.state === 'complete') {
+        log('✓ 已完成，跳过 ' + item.file.name);
+        continue;
+      }
+      let offset = Number(entry.received_bytes) || 0;
+      let chunkIndex = Number(entry.chunks_done) || 0;
+      while (offset < item.size) {
+        if (stopFlag) {
+          log('已暂停。重新选择相同文件并点击“开始上传”即可从服务器确认的断点继续。');
+          return;
+        }
+        const end = Math.min(offset + CHUNK, item.size);
+        const buf = await item.file.slice(offset, end).arrayBuffer();
         const digest = await sha256Hex(buf);
         let guard = 0;
-        for (;;){
+        for (;;) {
           try {
-            await api('/api/uploads/' + sid + '/chunks/' + i + '?sha256=' + digest, {
-              method:'PUT', headers:{'Content-Type':'application/octet-stream'}, body: buf
-            });
+            const ack = await api('/api/uploads/' + encodeURIComponent(sessionId) +
+              '/chunks/' + entry.index + '?chunk_index=' + chunkIndex + '&sha256=' + digest, {
+                method:'PUT', headers:{'Content-Type':'application/octet-stream'}, body:buf
+              });
+            const nextOffset = Math.min(item.size, offset + buf.byteLength);
+            doneBytes += nextOffset - offset;
+            offset = nextOffset;
+            chunkIndex = Number(ack.chunks_done) || chunkIndex + 1;
+            entry.received_bytes = offset;
+            entry.chunks_done = chunkIndex;
+            entry.state = ack.file_complete ? 'complete' : entry.state;
             break;
-          } catch (e) {
+          } catch(e) {
             if (++guard > 4) throw e;
-            log('  第 ' + (offset/CHUNK|0) + ' 片失败，重试 ' + guard + '：' + e.message);
+            log('  第 ' + chunkIndex + ' 片请求未确认，检查服务器进度后重试：' + e.message);
             await new Promise(r => setTimeout(r, 800 * guard));
+            const latest = await api('/api/uploads/' + encodeURIComponent(sessionId));
+            const fresh = latest.files && latest.files[entry.index];
+            if (!fresh || fresh.rel_path !== item.rel_path) throw new Error('无法确认服务器分片状态');
+            const confirmed = Number(fresh.chunks_done) || 0;
+            if (confirmed > chunkIndex) {
+              const advanced = (Number(fresh.received_bytes) || 0) - offset;
+              doneBytes += Math.max(0, advanced);
+              offset = Number(fresh.received_bytes) || 0;
+              chunkIndex = confirmed;
+              entry = Object.assign({index: entry.index}, fresh);
+              break;
+            }
+            if (confirmed < chunkIndex) throw new Error('服务器进度早于当前分片，请刷新状态后重试');
           }
         }
-        offset = end; doneBytes += buf.byteLength;
-        const pct = doneBytes / s.total_bytes * 100;
+        const pct = totalBytes ? doneBytes / totalBytes * 100 : 100;
         setBar(pct);
-        say(f.name + '  ' + pct.toFixed(1) + '%  共 ' + doneBytes + ' / ' + s.total_bytes + ' 字节');
+        say(item.file.name + '  ' + pct.toFixed(1) + '%  共 ' + doneBytes + ' / ' + totalBytes + ' 字节');
       }
-      log('✓ ' + f.name);
+      log('✓ ' + item.file.name);
     }
+
+    if (stopFlag) {
+      log('已暂停。重新选择相同文件并点击“开始上传”即可继续。');
+      return;
+    }
+    $('stop').disabled = true;
     log('全部分片已到服务器，正在组装…');
-    // 不指定 dest：由服务端决定默认落点（避免把服务端路径渲染进页面）
-    const res = await api('/api/uploads/' + sid + '/finalize', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'
+    const result = await api('/api/uploads/' + encodeURIComponent(sessionId) + '/finalize', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'
     });
-    log('✓ 组装完成：' + res.file_count + ' 个文件 → ' + res.dest_dir);
+    log('✓ 组装完成：' + result.file_count + ' 个文件 → ' + result.dest_dir);
     say('完成');
-    $('go').disabled = false; $('stop').disabled = true;
-  } catch (e) {
+    setBar(100);
+    clearResume();
+  } catch(e) {
     log('✗ ' + e.message);
-    $('go').disabled = false; $('stop').disabled = true;
+  } finally {
+    $('go').disabled = false;
+    $('stop').disabled = true;
   }
 };
-$('stop').onclick = () => { stopFlag = true; };
+$('stop').onclick = () => { stopFlag = true; $('stop').disabled = true; };
 </script></body></html>""".replace("__CHUNK__", str(max_chunk_bytes)).replace(
         "__MB__", "%.0f" % mb)
 

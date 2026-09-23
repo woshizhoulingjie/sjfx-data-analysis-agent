@@ -8,14 +8,17 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from config import Config
-from services.document_analysis import _estimated_tokens, _normalise_summary_topics, _preview_claim_contract, _model_call_profile
+from services.document_analysis import (
+    _estimated_tokens, _normalise_summary_topics, _preview_claim_contract,
+    _model_call_profile, document_source_fingerprint,
+)
 from services.evidence import select_evidence
 from services.preliminary_summary_batch import collect_jobs, eligible_job
 from services.preliminary_summary_input import INPUT_VERSION, build_preliminary_input
 
 LOG = logging.getLogger("sjfx.preliminary")
-CONTRACT = "preliminary-ready-v1"
-PROMPT_VERSION = "compact-6500-v1"
+CONTRACT = "preliminary-ready-v2-source-ids"
+PROMPT_VERSION = "compact-6500-evidence-v2"
 
 
 def enabled(job):
@@ -51,6 +54,7 @@ def _prompt(rows):
         "file_id": "原ID", "path": "原路径", "title": "简短中文标题",
         "core_summary": "简洁摘要", "topics": [], "key_facts": [], "arguments": [],
         "methodology": [], "conclusions": [], "uncertainties": [], "warnings": [],
+        "claim_evidence": [{"statement": "主张原句", "evidence_ids": ["输入中已有的E-..."]}],
     }
     # Preserve the pre-existing single-file contract; the existing batch contract
     # does not ask the model to generate a second outline/research report per file.
@@ -66,6 +70,7 @@ def _prompt(rows):
         "不要在摘要、事实、论点、结论中反复表达同一句话。"
         "保留重要数字、单位、日期、否定条件和限制，不得为压缩字数改变事实。"
         "uncertainties/warnings保留影响判断的事项，无依据的字段留空，不凑字段。\n"
+        "claim_evidence只引用输入中逐字出现的evidence_id，并为每条结论和事实给出直接来源；来源可回查不等于主张已获验证。"
         "仅输出所列字段；如包含结构概览，只列最多3个短章节名；研究方向最多一个简短问题，理由一句话。"
         "输出JSON：" + json.dumps({"documents": [contract]}, ensure_ascii=False, separators=(",", ":"))
         + "\n分析材料：\n" + json.dumps(files, ensure_ascii=False, separators=(",", ":"))
@@ -119,6 +124,17 @@ def _validated(response, rows):
             continue
         if "title" in item and not isinstance(item["title"], str):
             continue
+        if "claim_evidence" in item and (
+            not isinstance(item["claim_evidence"], list)
+            or any(
+                not isinstance(citation, dict)
+                or not isinstance(citation.get("statement"), str)
+                or not isinstance(citation.get("evidence_ids", []), list)
+                or any(not isinstance(value, str) for value in citation.get("evidence_ids", []))
+                for citation in item["claim_evidence"]
+            )
+        ):
+            continue
         if any(k in item and not isinstance(item[k], dict) for k in ("structure_overview", "recommended_research_direction")):
             continue
         output[job_id] = item
@@ -149,6 +165,8 @@ def _prepare(row, raw, response, ledger, batch_id, batch_size, fallback_reason=N
         "analysis_level": "preview", "verification_status": "preliminary",
         "preview_only": True, "deep_analysis": False,
         "preview_input_chars": len(row["input"]), "preview_source_chars": len(str(document.get("text") or "")),
+        "source_fingerprint": document_source_fingerprint(document),
+        "summary_input_version": INPUT_VERSION, "summary_prompt_version": PROMPT_VERSION,
         "preview_coverage": {"mode": "selective", "selected_chars": len(row["input"]), "complete": False},
         "file_review_items": [{"type": "preliminary", "text": "初步摘要已结合已解析内容和支撑原文；后续深度摘要将继续校验全文。", "status": "review"}],
         "parser_info": {"parser": (document.get("parser") or {}).get("name"), "coverage": document.get("coverage") or {},

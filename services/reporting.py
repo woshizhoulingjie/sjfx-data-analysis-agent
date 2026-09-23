@@ -16,37 +16,158 @@ def _valid_summaries(summaries):
     return [item for item in summaries if item.get("payload", {}).get("schema_version") in (3, 4)]
 
 
-def _analysis_evidence(analysis, limit=8):
-    output = []
-    seen = set()
+def _analysis_evidence(analysis, limit=8, categories=None):
+    """Collect evidence across query and topic pools without retrieval-order bias."""
+    pools = []
     for retrieval_key in ("research_retrieval", "retrieval"):
-        for search in analysis.get(retrieval_key, {}).get("queries", []):
-            for item in search.get("results", []):
-                key = item.get("evidence_id") or (item.get("source_path"), item.get("content_sha256"), item.get("text"))
+        retrieval = analysis.get(retrieval_key) or {}
+        for search in retrieval.get("queries") or []:
+            topic = str(search.get("query") or search.get("topic") or "").strip()
+            items = [item for item in (search.get("results") or []) if isinstance(item, dict)]
+            if items:
+                pools.append((topic or "retrieval", items))
+    for cluster in analysis.get("topic_clusters") or []:
+        topic = str(cluster.get("name") or cluster.get("topic") or "").strip()
+        items = [
+            item for item in (cluster.get("evidence_chain") or [])
+            if isinstance(item, dict)
+        ]
+        if items:
+            pools.append((topic or "topic_cluster", items))
+    root_summary = (analysis.get("node_summaries") or {}).get(".", {}) or {}
+    root_items = [
+        item for item in (root_summary.get("evidence_chain") or [])
+        if isinstance(item, dict)
+    ]
+    if root_items:
+        pools.append(("root_summary", root_items))
+
+    representative_paths = {
+        str(path)
+        for category in (categories or [])
+        for path in (category.get("representative_documents") or [])
+        if str(path)
+    }
+    if not pools:
+        return []
+    pools = [
+        (topic, sorted(items, key=lambda item: (
+            str(item.get("source_path") or "") not in representative_paths,
+            str(item.get("source_path") or ""),
+        )))
+        for topic, items in pools
+    ]
+    per_pool = [0] * len(pools)
+    output, seen = [], set()
+    per_source = Counter()
+    target = max(0, int(limit or 0))
+    while len(output) < target:
+        progressed = False
+        for index, (_topic, items) in enumerate(pools):
+            while per_pool[index] < len(items):
+                item = items[per_pool[index]]
+                per_pool[index] += 1
+                key = item.get("evidence_id") or (
+                    item.get("source_path"), item.get("content_sha256"), item.get("text")
+                )
                 if key in seen:
                     continue
+                source = str(item.get("source_path") or item.get("archive_source_path") or "")
+                if source and per_source[source] >= 2:
+                    continue
                 seen.add(key)
+                if source:
+                    per_source[source] += 1
                 output.append(item)
-                if len(output) >= limit:
-                    return output
-        if output:
-            return output[:limit]
-    for cluster in analysis.get("topic_clusters", []):
-        for item in cluster.get("evidence_chain", []):
-            key = item.get("evidence_id") or (item.get("source_path"), item.get("text"))
-            if key in seen:
-                continue
-            seen.add(key)
-            output.append(item)
-            if len(output) >= limit:
-                return output
-    root_summary = analysis.get("node_summaries", {}).get(".", {})
-    for item in root_summary.get("evidence_chain", []):
-        key = item.get("evidence_id") or item.get("source_path")
-        if key not in seen:
-            seen.add(key)
-            output.append(item)
-    return output[:limit]
+                progressed = True
+                break
+            if len(output) >= target:
+                break
+        if not progressed:
+            break
+    return output
+
+
+def _balanced_report_summaries(summaries, categories, limit=6):
+    """Select summaries across category representatives and distinct themes."""
+    valid = _valid_summaries(summaries)
+    selected = []
+    selected_paths = set()
+    by_path = {str(item.get("path") or ""): item for item in valid}
+
+    def add(item):
+        path = str(item.get("path") or "")
+        if not path or path in selected_paths or len(selected) >= max(0, int(limit)):
+            return False
+        selected.append(item)
+        selected_paths.add(path)
+        return True
+
+    category_rows = list(categories or [])
+    category_limit = max(0, int(limit or 0))
+    take = min(len(category_rows), category_limit)
+    category_indices = sorted(set(
+        round(index * (len(category_rows) - 1) / float(max(1, take - 1)))
+        for index in range(take)
+    )) if take else []
+    # Categories are ordered by the existing report ranking. Sampling across
+    # that order keeps smaller tail categories visible when there are many.
+    for category_index in category_indices:
+        category = category_rows[category_index]
+        if len(selected) >= category_limit:
+            break
+        representatives = [
+            str(path) for path in (category.get("representative_documents") or [])
+            if str(path)
+        ]
+        chosen = next((by_path[path] for path in representatives if path in by_path and path not in selected_paths), None)
+        if chosen is None:
+            terms = [
+                str(value).strip().casefold()
+                for value in [category.get("name")] + list(category.get("topics") or [])
+                if str(value or "").strip()
+            ]
+            matches = []
+            for item in valid:
+                if str(item.get("path") or "") in selected_paths:
+                    continue
+                payload = item.get("payload") or {}
+                topic_text = " ".join(str(value) for value in (payload.get("topics") or []))
+                text = " ".join([
+                    str(payload.get("title") or ""),
+                    str(payload.get("summary") or payload.get("core_summary") or ""),
+                    topic_text,
+                ]).casefold()
+                score = sum(1 for term in terms if term in text)
+                if score:
+                    matches.append((score, item))
+            if matches:
+                chosen = max(matches, key=lambda pair: pair[0])[1]
+        if chosen is not None:
+            add(chosen)
+
+    remaining = [item for item in valid if str(item.get("path") or "") not in selected_paths]
+    while remaining and len(selected) < max(0, int(limit)):
+        selected_topics = {
+            str(topic).casefold()
+            for item in selected
+            for topic in ((item.get("payload") or {}).get("topics") or [])
+            if str(topic).strip()
+        }
+        ranked = []
+        for index, item in enumerate(remaining):
+            topics = {
+                str(topic).casefold()
+                for topic in ((item.get("payload") or {}).get("topics") or [])
+                if str(topic).strip()
+            }
+            novelty = len(topics - selected_topics)
+            ranked.append((novelty, -index, item))
+        chosen = max(ranked, key=lambda row: (row[0], row[1]))[2]
+        add(chosen)
+        remaining.remove(chosen)
+    return selected
+
 
 
 def _cluster_evidence(cluster, analysis, topic, limit=8):
@@ -324,8 +445,16 @@ def _research_direction(_scan, _summaries, analysis):
 
 def build_report_analysis_prompt(scan, summaries, analysis, local_report, evidence_limit=8, excerpt_limit=650):
     """Build a bounded, traceable input for the report-planning model."""
+    categories = [{
+        "name": item.get("name"),
+        "dimension": item.get("dimension"),
+        "file_count": item.get("file_count"),
+        "topics": item.get("topics", [])[:8],
+        "representative_documents": item.get("representative_documents", [])[:4],
+    } for item in local_report.get("global_categories", [])]
+
     catalog = []
-    for item in _analysis_evidence(analysis, evidence_limit):
+    for item in _analysis_evidence(analysis, evidence_limit, categories=categories):
         evidence_id = str(item.get("evidence_id") or "").strip()
         if not evidence_id:
             continue
@@ -338,7 +467,7 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
         })
 
     summaries_context = []
-    for item in _valid_summaries(summaries)[:6]:
+    for item in _balanced_report_summaries(summaries, categories, limit=6):
         payload = item.get("payload", {})
         summaries_context.append({
             "path": item.get("path"),
@@ -348,14 +477,6 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
             "key_facts": payload.get("key_facts", [])[:8],
         })
 
-    categories = [{
-        "name": item.get("name"),
-        "dimension": item.get("dimension"),
-        "file_count": item.get("file_count"),
-        "topics": item.get("topics", [])[:8],
-        "representative_documents": item.get("representative_documents", [])[:4],
-    } for item in local_report.get("global_categories", [])]
-
     prompt = """你正在为一个未知数据包撰写《数据包情况概览报告》的研究规划部分。请基于证据目录和本地分类做实质性分析，而不是按关键词套用固定题目。
 
 硬约束：
@@ -364,6 +485,7 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
 3. 优先发现资料之间的共同主题、分歧、版本关系、证据缺口、可验证问题及合适的研究方法。
 4. 本地分类是确定性结构，不能重写或新增分类。
 5. 推荐方向必须使用本地十维评分候选的第 1 名；你只能改善理由、研究问题和方法，不能改名、换序或另造方向。
+6. 覆盖本地类别中的主流主题和可见的小众主题；主动核对跨来源、跨时间的矛盾、证据缺口及未解析范围，证据不足时明确写出，不能只围绕最早出现的主题或文件作概括。
 
 输出一个合法 JSON 对象：
 {{

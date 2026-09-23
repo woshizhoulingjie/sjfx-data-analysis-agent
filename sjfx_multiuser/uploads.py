@@ -51,6 +51,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 
 #: 单片上限（字节）。必须 <= app.py 的 max_content_length（实测 4MB）。
@@ -386,15 +387,7 @@ class UploadManager(object):
     # ---------------- 组装 ----------------
 
     def assemble(self, owner_id, session_id, dest_dir, allowed_root=None):
-        """把所有 `.done` 文件搬到目标目录（保留相对路径）。
-
-        返回组装结果。**不删会话目录**（保留清单便于排查；由清理任务统一回收）。
-
-        `allowed_root`：目标目录必须落在哪个根之下。
-        真实场景里包要组装进**扫描目录**（`SCAN_ALLOWED_ROOTS`）才能被分析，
-        硬限制成"必须在 uploads/ 之下"会让上传完的文件无法进入分析流程，
-        所以由调用方传入允许的根（路由层传 `SCAN_ALLOWED_ROOTS`）。
-        """
+        """Assemble all .done files into the destination and support finalize retries."""
         m = self._load(owner_id, session_id)
         pending = [f["rel_path"] for f in m["files"] if f["state"] != "complete"]
         if pending:
@@ -409,37 +402,99 @@ class UploadManager(object):
                     or dest_dir.startswith(allowed_root + os.sep)):
                 raise UploadError("目标目录必须位于 %s 之下" % allowed_root)
 
+        prior_dest = m.get("assembly_destination") or m.get("assembled_to")
+        if prior_dest and os.path.abspath(prior_dest) != dest_dir:
+            raise UploadError("该上传会话已开始组装到另一个目录，拒绝改写目标")
+
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        m.setdefault("assembled_files", {})
+        m["assembly_destination"] = dest_dir
+        self._save(owner_id, session_id, m)
+
         written = []
         for idx, entry in enumerate(m["files"]):
-            # 0 字节文件没有 .done，就地生成即可
-            if entry["size"] == 0:
-                target = os.path.join(dest_dir, *safe_rel_path(entry["rel_path"]).split("/"))
-                os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-                with open(target, "wb"):
-                    pass
-                written.append({"rel_path": entry["rel_path"], "path": target,
-                                "size": 0})
-                continue
-
-            src = os.path.join(sdir, "files", "%d.done" % idx)
-            if not os.path.isfile(src):
-                raise UploadError("文件 %s 的已完成分片丢失" % entry["rel_path"])
-            # 防御性重校验：即便 session.json 被篡改，也写不出目标目录
-            target = os.path.join(dest_dir, *safe_rel_path(entry["rel_path"]).split("/"))
+            rel = safe_rel_path(entry["rel_path"])
+            target = os.path.abspath(os.path.join(dest_dir, *rel.split("/")))
             if not (target == dest_dir or target.startswith(dest_dir + os.sep)):
                 raise UploadError("文件 %s 的目标路径越界" % entry["rel_path"])
             os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-            # 原子就位（同分区 rename）；若跨分区则退回复制
-            try:
-                os.replace(src, target)
-            except OSError:
-                shutil.copy2(src, target)
-                os.remove(src)
+            key = str(idx)
+            record = m["assembled_files"].get(key)
+
+            if record:
+                if (record.get("rel_path") != entry["rel_path"]
+                        or record.get("size") != entry["size"]
+                        or not os.path.isfile(target)
+                        or os.path.getsize(target) != entry["size"]):
+                    raise UploadError("已组装文件与会话记录不一致：%s" % entry["rel_path"])
+                written.append({"rel_path": entry["rel_path"], "path": target,
+                                "size": entry["size"]})
+                continue
+
+            src = os.path.join(sdir, "files", "%d.done" % idx)
+            pending_idx = m.get("assembling_file")
+            if pending_idx == idx and os.path.isfile(target):
+                if os.path.getsize(target) != entry["size"]:
+                    raise UploadError("组装中断且目标文件大小不符，保留现场供检查：%s"
+                                      % entry["rel_path"])
+                # A previous attempt may have stopped after placing the file.
+                if os.path.isfile(src):
+                    os.remove(src)
+            else:
+                if os.path.exists(target):
+                    raise UploadError("目标文件已存在，拒绝覆盖：%s" % target)
+                m["assembling_file"] = idx
+                self._save(owner_id, session_id, m)
+
+                if entry["size"] == 0:
+                    with open(target, "xb"):
+                        pass
+                else:
+                    if not os.path.isfile(src):
+                        raise UploadError("文件 %s 的已完成分片丢失" % entry["rel_path"])
+                    temp_fd, temp_path = tempfile.mkstemp(
+                        prefix=".sjfx-assemble-", suffix=".tmp",
+                        dir=os.path.dirname(target),
+                    )
+                    try:
+                        with open(src, "rb") as source, os.fdopen(temp_fd, "wb") as output:
+                            temp_fd = None
+                            shutil.copyfileobj(source, output, 1024 * 1024)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        try:
+                            os.link(temp_path, target)  # atomic, same filesystem, no overwrite
+                        except FileExistsError:
+                            raise UploadError("目标文件已存在，拒绝覆盖：%s" % target)
+                        except OSError:
+                            # Rare filesystems may disallow hard links. Use exclusive
+                            # creation as a last resort; the complete copy is staged first.
+                            try:
+                                with open(temp_path, "rb") as source, open(target, "xb") as output:
+                                    shutil.copyfileobj(source, output, 1024 * 1024)
+                                    output.flush()
+                                    os.fsync(output.fileno())
+                            except FileExistsError:
+                                raise UploadError("目标文件已存在，拒绝覆盖：%s" % target)
+                        shutil.copystat(src, target)
+                        os.remove(src)
+                    finally:
+                        if temp_fd is not None:
+                            os.close(temp_fd)
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+
+            m["assembled_files"][key] = {
+                "rel_path": entry["rel_path"], "size": entry["size"]
+            }
+            m["assembling_file"] = None
+            self._save(owner_id, session_id, m)
             written.append({"rel_path": entry["rel_path"], "path": target,
                             "size": entry["size"]})
 
         m["assembled_at"] = time.time()
         m["assembled_to"] = dest_dir
+        m["assembling_file"] = None
         self._save(owner_id, session_id, m)
         return {"ok": True, "file_count": len(written), "dest_dir": dest_dir,
                 "files": written}

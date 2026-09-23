@@ -714,17 +714,8 @@ def _resume_preliminary_imports():
             # repeatedly.  This repairs a missed worker callback without
             # creating duplicate jobs.
             if task.get("status") == "preliminary_summarizing":
-                file_ids = [str(item) for item in (checkpoint.get("preliminary_summary_job_ids") or []) if str(item)]
-                if not file_ids:
-                    continue
-                with storage._connect() as conn:
-                    states = conn.execute(
-                        "SELECT id,status FROM analysis_jobs WHERE scan_id=? AND id IN ({})".format(",".join("?" for _ in file_ids)),
-                        [scan_id] + file_ids,
-                    ).fetchall()
-                state_map = {str(item["id"]): str(item["status"] or "") for item in states}
-                if any(state_map.get(job_id) != "completed" for job_id in file_ids):
-                    continue
+                # Queue any node whose own member-file summaries are ready;
+                # unrelated files may still be running after a restart.
                 _queue_preliminary_node_summaries(scan_id, owner_id)
 
             current = storage.get_import_task(scan_id) or {}
@@ -938,11 +929,18 @@ def run_forever():
                         if source in {"manual_selection", "idle_deep_backfill"}:
                             options = job.get("options") or {}
                             if source == "manual_selection":
-                                from app import _queue_preliminary_file_summaries, _queue_preliminary_node_summaries
+                                from app import (
+                                    _queue_preliminary_file_summaries,
+                                    _queue_preliminary_node_summaries,
+                                    _queue_preliminary_overview,
+                                )
                                 _queue_preliminary_file_summaries(
                                     job.get("scan_id"), job.get("owner_id")
                                 )
                                 _queue_preliminary_node_summaries(
+                                    job.get("scan_id"), job.get("owner_id")
+                                )
+                                _queue_preliminary_overview(
                                     job.get("scan_id"), job.get("owner_id")
                                 )
                             else:

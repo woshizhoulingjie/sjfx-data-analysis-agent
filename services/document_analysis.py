@@ -1,12 +1,17 @@
+import hashlib
 import json
 import math
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 
 from services.ollama import LocalModelError
 from services.evidence import build_file_claims, select_evidence
 from services.scanner import extract_text
+
+
+PREVIEW_SUMMARY_PROMPT_VERSION = "preview-claims-evidence-v2"
 
 
 CHINESE_CONCLUSION_RULE = (
@@ -317,50 +322,113 @@ def _model_metadata(unified_document):
 
 
 
-def _preview_input(unified_document, max_chars=24000):
-    """Build a bounded, structure-aware model input for candidate analysis.
+def document_source_fingerprint(unified_document):
+    """Stable content/parser identity for invalidating stale preliminary results."""
+    document = unified_document or {}
+    source = document.get("source") or {}
+    parser = document.get("parser") or {}
+    source_hash = str(source.get("sha256") or document.get("content_sha256") or "").strip()
+    if not source_hash:
+        source_hash = hashlib.sha256(
+            str(document.get("text") or "").encode("utf-8", errors="replace")
+        ).hexdigest()
+    material = {
+        "contract": "ordinary-document-source-v2",
+        "source_sha256": source_hash,
+        "parser": str(parser.get("name") or parser.get("parser") or ""),
+        "parser_version": str(parser.get("version") or ""),
+    }
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
-    Candidate analysis intentionally does not read the entire document.  It
-    samples the title/structure, the beginning and end, and a few source
-    evidence blocks so the first directory is useful without paying the cost
-    of a deep, chunk-by-chunk analysis.
-    """
+
+def _preview_input(unified_document, max_chars=24000):
+    """Build a bounded preview with source IDs and coverage across the document."""
     document = unified_document or {}
     source = document.get("source") or {}
     structure = document.get("structure") or {}
-    title = structure.get("title") or source.get("name") or ""
-    headings = [str(item).strip() for item in (structure.get("headings") or []) if str(item).strip()]
+    limit = max(2000, int(max_chars or 24000))
+    title = " ".join(str(structure.get("title") or source.get("name") or "").split())
+    headings = [
+        " ".join(str(item).split())
+        for item in (structure.get("headings") or [])
+        if str(item).strip()
+    ]
     raw = " ".join(str(document.get("text") or "").split())
+
     pieces = []
     if title:
-        pieces.append("标题：{}".format(title))
+        pieces.append("标题：" + title[:min(600, max(120, limit // 12))])
     if headings:
-        pieces.append("章节：{}".format("、".join(headings[:36])))
-    if raw:
-        head = raw[: max(1500, int(max_chars * 0.30))]
-        tail = raw[-max(1500, int(max_chars * 0.24)) :]
-        pieces.append("正文开头：{}".format(head))
-        if tail and tail != head:
-            pieces.append("正文结尾：{}".format(tail))
+        heading_text = "章节：" + "、".join(headings[:48])
+        pieces.append(heading_text[:min(1500, max(240, limit // 6))])
+    prefix = "\n\n".join(pieces)
+    remaining = max(0, limit - len(prefix) - (2 if prefix else 0))
+
+    def safe_int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    evidence = [
+        item for item in (document.get("evidence") or [])
+        if isinstance(item, dict) and str(item.get("text") or "").strip()
+    ]
+    evidence.sort(key=lambda item: (
+        safe_int(item.get("page")), safe_int(item.get("char_start"))
+    ))
+    deduped = []
     seen = set()
-    evidence_parts = []
-    for item in sorted(
-        [item for item in (document.get("evidence") or []) if str(item.get("text") or "").strip()],
-        key=lambda item: (int(item.get("page") or 0), int(item.get("char_start") or 0)),
-    ):
+    for item in evidence:
         text = " ".join(str(item.get("text") or "").split())
-        key = text[:500].casefold()
-        if not text or key in seen:
+        key = str(item.get("evidence_id") or text[:500].casefold())
+        if key in seen:
             continue
         seen.add(key)
-        locator = item.get("page") and "第 {} 页".format(item.get("page")) or item.get("section") or "正文片段"
-        evidence_parts.append("[{}] {}".format(locator, text[:1200]))
-        if len(evidence_parts) >= 8:
-            break
-    if evidence_parts:
-        pieces.append("代表性原文片段：\n{}".format("\n".join(evidence_parts)))
+        deduped.append((item, text))
+
+    evidence_budget = min(4500, remaining // 3) if deduped else 0
+    body_budget = max(0, remaining - evidence_budget)
+    if raw and body_budget > 0:
+        if len(raw) + len("正文：") <= body_budget:
+            body_part = "正文：" + raw
+        else:
+            labels = ("正文开头：", "正文中段：", "正文结尾：")
+            content_budget = max(0, body_budget - sum(map(len, labels)) - 4)
+            each = max(1, content_budget // 3)
+            middle_start = max(0, len(raw) // 2 - each // 2)
+            tail_start = max(0, len(raw) - each)
+            body_part = "\n".join((
+                labels[0] + raw[:each],
+                labels[1] + raw[middle_start:middle_start + each],
+                labels[2] + raw[tail_start:],
+            ))
+        pieces.append(body_part)
+
+    if deduped and evidence_budget > 0:
+        header = "代表性原文证据（方括号内 ID 可用于结论回查）："
+        available = max(0, evidence_budget - len(header) - 2)
+        sample_count = min(8, len(deduped), max(3, available // 360))
+        positions = sorted(set(
+            round(index * (len(deduped) - 1) / float(max(1, sample_count - 1)))
+            for index in range(sample_count)
+        ))
+        chosen = [deduped[index] for index in positions]
+        per_item = max(80, (available - len(chosen) * 32) // max(1, len(chosen)))
+        rows = []
+        for item, text in chosen:
+            evidence_id = str(item.get("evidence_id") or "").strip()
+            locator = (
+                "第 {} 页".format(item.get("page")) if item.get("page")
+                else str(item.get("section") or "正文片段")
+            )
+            label = "〔{}｜{}〕".format(evidence_id or "无ID", locator[:80])
+            rows.append(label + " " + text[:max(40, per_item - len(label) - 1)])
+        pieces.append(header + "\n" + "\n".join(rows))
+
     text = "\n\n".join(pieces)
-    return text[:max(2000, int(max_chars))]
+    return text[:limit]
 
 
 def _preview_claim_contract(summary, evidence_items):
@@ -368,6 +436,24 @@ def _preview_claim_contract(summary, evidence_items):
     pretending that the sampled input has passed full source verification."""
     source = summary if isinstance(summary, dict) else {}
     evidence_items = [item for item in (evidence_items or []) if isinstance(item, dict)]
+    declared_evidence = {}
+    available_by_id = {
+        str(item.get("evidence_id")): item
+        for item in evidence_items if item.get("evidence_id")
+    }
+    for citation in source.get("claim_evidence") or []:
+        if not isinstance(citation, dict):
+            continue
+        statement = " ".join(str(citation.get("statement") or "").split()).casefold()
+        if not statement:
+            continue
+        ids = [
+            str(value).strip()
+            for value in (citation.get("evidence_ids") or [])
+            if str(value).strip() in available_by_id
+        ]
+        if ids:
+            declared_evidence[statement] = list(dict.fromkeys(ids))
     groups = (
         ("conclusions", "conclusion", "文件结论"),
         ("key_facts", "fact", "关键事实"),
@@ -385,7 +471,14 @@ def _preview_claim_contract(summary, evidence_items):
                 continue
             seen.add(text.casefold())
             # 2026-09-15：同上，初步/预览阶段的 claim 证据挂载改为词法（覆盖 7 条预览路径）。
-            supports = select_evidence(evidence_items, topics=[text], max_items=2, per_source=2, max_chars=360, use_embeddings=False)
+            cited_ids = declared_evidence.get(text.casefold(), [])
+            supports = [available_by_id[evidence_id] for evidence_id in cited_ids[:2]]
+            citation_source = "model_source_ids" if supports else "lexical_retrieval"
+            if not supports:
+                supports = select_evidence(
+                    evidence_items, topics=[text], max_items=2, per_source=2,
+                    max_chars=360, use_embeddings=False,
+                )
             record = {
                 "conclusion_id": "PREVIEW-%03d" % (len(formal) + len(arguments) + 1),
                 "type": claim_type,
@@ -404,6 +497,7 @@ def _preview_claim_contract(summary, evidence_items):
                 "support_score": None,
                 "support_score_type": "preview_estimate",
                 "supports": supports,
+                "citation_source": citation_source,
                 "preview_only": True,
             }
             (arguments if claim_type in {"argument", "method"} else formal).append(record)
@@ -433,13 +527,19 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
     """Run one bounded model call for candidate/import preview analysis."""
     if unified_document is None:
         raise ValueError("候选分析缺少统一文档内容")
+    total_started = time.perf_counter()
+    input_started = time.perf_counter()
     selected_text = _preview_input(unified_document, max_chars=max_chars)
+    input_selection_ms = round((time.perf_counter() - input_started) * 1000, 2)
     if not selected_text.strip():
         raise ValueError("未能从该文件提取候选分析内容")
     metadata = _model_metadata(unified_document)
     prompt = """你正在进行文献候选集预读。输入只包含文件的结构和代表性片段，不是全文。
 请只根据给定内容生成与正式文件摘要相同类型的结果；不要把未提供的全文内容当成事实。
 候选结论必须标记为待深度校验，输出要简洁，不能写成长篇报告。
+输入片段中的 evidence_id 是唯一允许引用的来源 ID。请在 claim_evidence 中为每条
+结论、事实、论点或方法原样列出 statement，并仅填写直接相关的 evidence_ids；没有
+直接来源时留空。引用 ID 仍只表示可回查来源，不代表已经验证其蕴含该主张。
 
 文件：{path}
 解析元数据：{metadata}
@@ -447,8 +547,9 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
 {text}
 
 输出 JSON：
-{{"title":"标题","structure_overview":{{"sections":["章节"],"document_type":"类型"}},"core_summary":"摘要","key_facts":["事实"],"arguments":["论点"],"methodology":["方法"],"conclusions":["候选结论"],"uncertainties":["不确定信息"],"warnings":["预览限制"],"recommended_research_direction":{{"title":"方向","rationale":"理由","questions":["问题"]}}}}
+{{"title":"标题","structure_overview":{{"sections":["章节"],"document_type":"类型"}},"core_summary":"摘要","key_facts":["事实"],"arguments":["论点"],"methodology":["方法"],"conclusions":["候选结论"],"uncertainties":["不确定信息"],"warnings":["预览限制"],"recommended_research_direction":{{"title":"方向","rationale":"理由","questions":["问题"]}},"claim_evidence":[{{"statement":"结论或事实的完整原句","evidence_ids":["输入中已有的E-..."]}}]}}
 """.format(path=node_path, metadata=json.dumps(metadata, ensure_ascii=False), text=selected_text)
+    model_started = time.perf_counter()
     result = llm.chat_json(
         "你是严谨的文献预读助手。只根据代表性内容提炼候选摘要和论点，不得冒充全文校验结论。" + CHINESE_CONCLUSION_RULE,
         prompt,
@@ -463,6 +564,8 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
         required_fields=("core_summary",),
         output_context="候选文件预读分析",
     )
+    model_generation_ms = round((time.perf_counter() - model_started) * 1000, 2)
+    postprocess_started = time.perf_counter()
     summary = _normalise_summary_topics(result["json"], selected_text, node_path)
     summary["summary"] = summary.get("summary") or summary.get("core_summary") or ""
     summary["evidence_chain"] = select_evidence(
@@ -494,6 +597,17 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
             "model_calls": [_model_call_profile("candidate_preview", result, 1200, context_window_tokens, 1)],
             "degraded": False,
         },
+        "source_fingerprint": document_source_fingerprint(unified_document),
+        "summary_input_version": "preview-source-blocks-v2",
+        "summary_prompt_version": PREVIEW_SUMMARY_PROMPT_VERSION,
+        "pipeline_timing_ms": {
+            "input_selection": input_selection_ms,
+            "model_generation": model_generation_ms,
+            "evidence_linking_and_persist_prep": round(
+                (time.perf_counter() - postprocess_started) * 1000, 2
+            ),
+            "total": round((time.perf_counter() - total_started) * 1000, 2),
+        },
         "generated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
     })
     return summary, result
@@ -516,9 +630,14 @@ def analyze_document_previews_batch(llm, documents, max_chars=8000,
         document = (item or {}).get("document") or {}
         if not path:
             continue
+        input_started = time.perf_counter()
         selected = _preview_input(document, max_chars=max_chars)
+        input_build_ms = round((time.perf_counter() - input_started) * 1000, 2)
         if selected.strip():
-            rows.append({"path": path, "input": selected})
+            rows.append({
+                "path": path, "input": selected, "document": document,
+                "input_build_ms": input_build_ms,
+            })
     if not rows:
         raise ValueError("未能从候选文件提取预览内容")
     prompt_rows = "\n\n".join(
@@ -527,15 +646,18 @@ def analyze_document_previews_batch(llm, documents, max_chars=8000,
     )
     prompt = """你正在进行文献候选集预读。下面包含多个文件的结构和代表性片段，
 不是全文。请严格依据每个文件自己的内容分别输出简洁候选摘要，不要把文件之间的内容混合，
-也不要把候选结论写成全文校验结论。所有 title、core_summary、topics、key_facts、arguments、
+也不要把候选结论写成全文校验结论。方括号内 evidence_id 是唯一允许引用的来源 ID；
+请在 claim_evidence 中为每条事实或结论原样给出 statement 和直接相关的 evidence_ids，
+没有直接来源时留空，来源可回查不等于主张已被验证。所有 title、core_summary、topics、key_facts、arguments、
 methodology、conclusions、uncertainties、warnings 必须使用简体中文；专业术语可在中文后保留英文缩写。
 
 %s
 
 只输出 JSON：{"documents":[{"path":"原文件路径","title":"标题","core_summary":"摘要",
 "topics":["主题"],"key_facts":["事实"],"arguments":["论点"],"methodology":["方法"],
-"conclusions":["候选结论"],"uncertainties":["不确定信息"],"warnings":["预览限制"]}]}""" % prompt_rows
+"conclusions":["候选结论"],"uncertainties":["不确定信息"],"warnings":["预览限制"],"claim_evidence":[{"statement":"完整主张原句","evidence_ids":["E-..."]}]}]}""" % prompt_rows
     per_file_tokens = max(160, min(360, int(output_tokens_per_file or 240)))
+    model_started = time.perf_counter()
     result = llm.chat_json(
         "你是严谨的文献预读助手。一次处理多个文件，每个文件独立返回结果。" + CHINESE_CONCLUSION_RULE,
         prompt,
@@ -552,31 +674,31 @@ methodology、conclusions、uncertainties、warnings 必须使用简体中文；
         required_fields=("documents",),
         output_context="候选文件批量预读分析",
     )
+    model_generation_ms = round((time.perf_counter() - model_started) * 1000, 2)
     payload = result.get("json") or {}
     values = payload.get("documents") if isinstance(payload, dict) else None
     if not isinstance(values, list):
         raise ValueError("候选批量预读返回格式无效")
     by_path = {str(item.get("path") or ""): item for item in values if isinstance(item, dict)}
     output = {}
-    for row in rows:
+    for row_index, row in enumerate(rows):
         path = row["path"]
         raw = dict(by_path.get(path) or {})
         # Models sometimes omit the path or normalize it; use positional fallback
         # only when there is no collision with another returned path.
         if not raw:
-            index = rows.index(row)
-            if index < len(values) and isinstance(values[index], dict):
-                raw = dict(values[index])
+            if row_index < len(values) and isinstance(values[row_index], dict):
+                raw = dict(values[row_index])
         summary = _normalise_summary_topics(raw, row["input"], path)
         summary["summary"] = summary.get("summary") or summary.get("core_summary") or ""
         summary["path"] = path
         summary["evidence_chain"] = select_evidence(
-            (documents[rows.index(row)].get("document") or {}).get("evidence") or [],
+            (row.get("document") or {}).get("evidence") or [],
             topics=summary.get("topics") or [], max_items=3, per_source=3,
             max_chars=360,
         )
         summary.update(_preview_claim_contract(
-            summary, (documents[rows.index(row)].get("document") or {}).get("evidence") or []
+            summary, (row.get("document") or {}).get("evidence") or []
         ))
         summary.update({
             "schema_version": 4,
@@ -591,6 +713,13 @@ methodology、conclusions、uncertainties、warnings 必须使用简体中文；
             "preview_input_chars": len(row["input"]),
             "preview_coverage": {"mode": "selective", "selected_chars": len(row["input"]), "complete": False},
             "parser_info": {"model": result.get("model"), "usage": result.get("usage") or {}, "batch_size": len(rows)},
+            "source_fingerprint": document_source_fingerprint(row.get("document") or {}),
+            "summary_input_version": "preview-source-blocks-v2",
+            "summary_prompt_version": PREVIEW_SUMMARY_PROMPT_VERSION,
+            "pipeline_timing_ms": {
+                "input_selection": row.get("input_build_ms", 0),
+                "shared_model_generation_ms": model_generation_ms,
+            },
             "generated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
         })
         output[path] = {"summary": summary, "usage": result.get("usage") or {},

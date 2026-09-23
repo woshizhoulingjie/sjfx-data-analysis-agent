@@ -2949,6 +2949,45 @@ def _adaptive_tree(scan, documents, node_summaries, enrich=True):
         "cardinality": len(children),
     }]
 
+    if boundary_review_sources:
+        reviewed_paths = sorted(boundary_review_sources)
+        review_size = sum(
+            int((documents.get(path) or {}).get("source", {}).get("size") or 0)
+            for path in reviewed_paths
+        )
+        related_topics = sorted({
+            topic for topics in boundary_review_sources.values() for topic in topics
+        })
+        for path in reviewed_paths:
+            documents[path].setdefault("classification", {}).update({
+                "primary_topic": "边界待复核",
+                "topic_memberships": [],
+                "confidence": None,
+                "confidence_kind": "unverified_boundary",
+                "classification_status": "needs_review",
+                "classification_reason": "边界抽样显示该文件可能不属于当前语义簇，已从主题组移出等待复核。",
+            })
+        children.append({
+            "kind": "group",
+            "node_id": _stable_group_node_id("边界待复核", "", reviewed_paths),
+            "dimension": "分类复核",
+            "topic_key": "边界待复核",
+            "name": "边界待复核",
+            "summary": "语义簇边界抽样标记了 {} 个可能不匹配的文件；这些文件未被强行归入主题。".format(len(reviewed_paths)),
+            "classification_status": "needs_review",
+            "member_paths": reviewed_paths,
+            "file_count": len(reviewed_paths),
+            "total_size": review_size,
+            "total_size_human": human_size(review_size),
+            "related_topics": related_topics,
+            "boundary_review": {
+                "status": "flagged",
+                "flagged_paths": reviewed_paths,
+                "source_topics": boundary_review_sources,
+            },
+            "children": [file_leaf(path) for path in reviewed_paths],
+        })
+
     tree = {
         "kind": "analysis_root",
 
@@ -3008,46 +3047,42 @@ def _topic_clusters(documents):
 
 
 def _semantic_document_profile(path, document, max_chars=1700):
-    """Build one bounded semantic representation for one parsed document."""
-    structure = document.get("structure", {})
+    """Build one bounded, balanced semantic representation for one document."""
+    limit = max(64, int(max_chars or 1700))
+    structure = document.get("structure", {}) or {}
     headings = [
         " ".join(str(value or "").split())
-        for value in structure.get("headings", [])[:8]
+        for value in (structure.get("headings") or [])[:12]
         if str(value or "").strip()
     ]
+    title = " ".join(str(_analysis_title(document) or Path(path).stem).split())
+    body = " ".join(_analysis_text(document).split())
 
-    title = _analysis_title(document) or Path(path).stem
+    title_block = "标题：" + title[:min(240, max(16, limit // 4))]
+    heading_text = " | ".join(headings)
+    heading_block = ("章节：" + heading_text[:min(720, max(16, limit // 3))]
+                     if heading_text and limit >= 160 else "")
+    prefix = "\n".join(part for part in (title_block, heading_block) if part)
+    remaining = max(0, limit - len(prefix) - 8)
+    if not body or remaining <= 0:
+        return prefix[:limit]
 
-    body = " ".join(
-        _analysis_text(document).split()
+    if len(body) <= remaining - len("正文："):
+        return (prefix + "\n正文：" + body)[:limit]
+
+    labels = ("开头：", "中段：", "结尾：")
+    body_budget = max(0, remaining - sum(len(label) for label in labels) - 4)
+    if body_budget <= 0:
+        return prefix[:limit]
+    segment = max(1, body_budget // 3)
+    middle_start = max(0, len(body) // 2 - segment // 2)
+    tail_start = max(0, len(body) - segment)
+    body_parts = (
+        labels[0] + body[:segment],
+        labels[1] + body[middle_start:middle_start + segment],
+        labels[2] + body[tail_start:],
     )
-
-    parts = [
-        "标题：" + str(title),
-    ]
-
-    if headings:
-        parts.append(
-            "章节：" + " | ".join(headings[:6])
-        )
-
-    # 不只取正文开头，同时保留中段和结尾，
-    # 避免只根据摘要/版权页判断主题。
-    if body:
-        if len(body) <= 1200:
-            parts.append("正文：" + body)
-        else:
-            middle_start = max(
-                0,
-                len(body) // 2 - 220,
-            )
-            parts.extend([
-                "开头：" + body[:520],
-                "中段：" + body[middle_start:middle_start + 440],
-                "结尾：" + body[-520:],
-            ])
-
-    return "\n".join(parts)[:max_chars]
+    return (prefix + "\n" + "\n".join(body_parts))[:limit]
 
 
 def _cosine_vector(left, right):
@@ -3119,10 +3154,14 @@ def _semantic_document_clusters(
     if not paths:
         return [], None
 
+    # Match the representation to the exact client-side input cap. This avoids
+    # hashing one profile and then silently embedding a second, shorter prefix.
+    profile_limit = int(getattr(embedding_client, "max_chars", 1700) or 1700)
     profiles = {
         path: _semantic_document_profile(
             path,
             documents[path],
+            max_chars=profile_limit,
         )
         for path in paths
     }
@@ -3130,7 +3169,7 @@ def _semantic_document_clusters(
     model_name = str(getattr(embedding_client, "model", "local-embedding"))
     cache_keys = {
         path: hashlib.sha256(
-            "{}|{}".format(
+            "semantic-profile-v2|{}|{}".format(
                 (documents[path].get("source") or {}).get("sha256") or "",
                 profiles[path],
             ).encode("utf-8", errors="replace")
@@ -3188,6 +3227,9 @@ def _semantic_document_clusters(
         return [{
             "cluster_id": "SEM-0001",
             "members": [paths[0]],
+            "profile_fingerprint": hashlib.sha256(
+                str(cache_keys[paths[0]]).encode("utf-8")
+            ).hexdigest(),
             "representative_documents": [paths[0]],
             "mean_similarity": None,
             "keywords": [],
@@ -3209,9 +3251,68 @@ def _semantic_document_clusters(
     ).strip().lower()
 
     if clustering_strategy != "legacy":
-        cluster_count = max(1, min(96, int(round(math.sqrt(count)))))
+        baseline_k = max(1, min(96, int(round(math.sqrt(count)))))
+        cluster_count = baseline_k
+        selection_meta = {
+            "method": "sqrt_fallback",
+            "baseline_k": baseline_k,
+            "selected_k": baseline_k,
+            "sample_size": 0,
+            "silhouette_scores": {},
+            "embedding_cache_hits": len(cached),
+            "embedding_cache_misses": len(missing_paths),
+        }
         try:
             from sklearn.cluster import MiniBatchKMeans
+            from sklearn.metrics import silhouette_score
+
+            # Compare a small, deterministic set of nearby k values on a bounded
+            # sample. This adapts the split count to corpus geometry without an
+            # extra model call or an O(n^2) full-corpus calculation.
+            sample_size = min(count, 512)
+            selection_meta["sample_size"] = sample_size
+            if sample_size >= 6:
+                sample_indices = [
+                    (index * count) // sample_size
+                    for index in range(sample_size)
+                ]
+                sample_vectors = [cluster_vectors[index] for index in sample_indices]
+                candidates = sorted({
+                    max(2, min(count - 1, int(round(baseline_k * scale))))
+                    for scale in (0.65, 1.0, 1.35)
+                    if count > 2
+                })
+                scored = []
+                for candidate_k in candidates:
+                    if candidate_k >= sample_size:
+                        continue
+                    try:
+                        probe = MiniBatchKMeans(
+                            n_clusters=candidate_k,
+                            random_state=42,
+                            batch_size=min(256, sample_size),
+                            n_init=1,
+                            max_iter=60,
+                        )
+                        probe_labels = probe.fit_predict(sample_vectors).tolist()
+                        if len(set(probe_labels)) < 2 or len(set(probe_labels)) >= sample_size:
+                            continue
+                        score = float(silhouette_score(sample_vectors, probe_labels))
+                        # Prefer the simpler split when scores are nearly tied.
+                        adjusted = score - 0.01 * max(
+                            0.0, (candidate_k - baseline_k) / float(max(1, baseline_k))
+                        )
+                        selection_meta["silhouette_scores"][str(candidate_k)] = round(score, 5)
+                        scored.append((adjusted, -candidate_k, candidate_k))
+                    except Exception:
+                        continue
+                if scored:
+                    cluster_count = max(scored)[2]
+                    selection_meta.update({
+                        "method": "sampled_silhouette",
+                        "selected_k": cluster_count,
+                    })
+
             model = MiniBatchKMeans(
                 n_clusters=min(cluster_count, count),
                 random_state=42,
@@ -3243,8 +3344,13 @@ def _semantic_document_clusters(
                     key=lambda item: (-item[0], item[1]),
                 )
                 representatives = [path for _score, path in ranked[:3]]
+                boundary_documents = [
+                    path for _score, path in ranked[-2:]
+                    if path not in representatives
+                ]
             else:
                 representatives = member_paths[:3]
+                boundary_documents = member_paths[-2:] if len(member_paths) > 3 else []
             # mean_similarity is reported in the original embedding space so the
             # number stays comparable with earlier analyses and the report; only
             # the grouping decision uses the centred space.
@@ -3253,8 +3359,15 @@ def _semantic_document_clusters(
                 for offset, left in enumerate(member_indices)
                 for right in member_indices[offset + 1:]
             ]
+            member_profile_fingerprint = hashlib.sha256(
+                json.dumps(
+                    [(path, cache_keys[path]) for path in member_paths],
+                    ensure_ascii=False, sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
             results.append({
                 "members": member_paths,
+                "profile_fingerprint": member_profile_fingerprint,
                 "representative_documents": representatives,
                 "mean_similarity": round(sum(pair_scores) / len(pair_scores), 6) if pair_scores else None,
                 "keywords": [],
@@ -3265,6 +3378,7 @@ def _semantic_document_clusters(
                     "clustering_strategy": "centroid",
                     "vector_space": "corpus_centered",
                     "cluster_count": len(grouped),
+                    "candidate_selection": selection_meta,
                 },
             })
         results.sort(key=lambda cluster: (-len(cluster["members"]), cluster["members"]))
@@ -3563,6 +3677,17 @@ def _valid_semantic_name(value):
 SEMANTIC_NAMING_BATCH_CLUSTERS = 8
 
 
+def _semantic_naming_cache_id(cluster):
+    payload = {
+        "contract": "semantic-naming-cache-v3",
+        "members": sorted(str(path) for path in (cluster.get("members") or [])),
+        "profile_fingerprint": str(cluster.get("profile_fingerprint") or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:32]
+
+
 def _name_semantic_clusters(
     clusters,
     documents,
@@ -3597,9 +3722,10 @@ def _name_semantic_clusters(
         cluster["naming_status"] = "degraded"
         cluster["naming_confidence"] = 0.35
         cluster["naming_degradation_reason"] = "尚未获得通过中文质量校验的模型命名"
-        cached = cached_names.get(_stable_group_node_id("内容主题", cluster["name"], cluster.get("members") or [])) or {}
+        cached = cached_names.get(_semantic_naming_cache_id(cluster)) or {}
         cached_name = _valid_semantic_name(cached.get("name"))
-        if cached_name:
+        cache_has_boundary_review = cached.get("boundary_review_schema") == 1
+        if cached_name and (not cluster.get("boundary_documents") or cache_has_boundary_review):
             cluster.update({
                 "name": cached_name,
                 "summary": str(cached.get("summary") or cluster["summary"])[:300],
@@ -3607,6 +3733,9 @@ def _name_semantic_clusters(
                 "naming_source": "persistent_cache",
                 "naming_status": "enhanced",
                 "naming_confidence": cached.get("confidence", 0.82),
+                "boundary_review": cached.get("boundary_review") or {
+                    "status": "not_run", "flagged_paths": []
+                },
             })
             cluster.pop("naming_degradation_reason", None)
 
@@ -3637,10 +3766,17 @@ def _name_semantic_clusters(
             )
         )
 
-        for path in cluster.get(
-            "representative_documents",
-            [],
-        )[:3]:
+        samples = [
+            (path, "中心代表")
+            for path in cluster.get("representative_documents", [])[:3]
+        ]
+        seen_samples = {path for path, _role in samples}
+        samples.extend(
+            (path, "边界抽样")
+            for path in cluster.get("boundary_documents", [])[:2]
+            if path not in seen_samples
+        )
+        for path, role in samples:
             doc = documents[path]
             headings = (
                 doc.get("structure", {})
@@ -3659,16 +3795,16 @@ def _name_semantic_clusters(
                 for value in headings[1:4]
             )
 
-            # fast 模式下 headings/title 可能只有文件编号，
-            # 因此主题命名不能只依赖结构标题。
-            # 同时提供正文语义摘要，让模型根据真实内容命名。
+            # Sample both central and boundary documents in the same naming
+            # request, so the label must explain the group rather than only its
+            # easiest examples.
             profile = _semantic_document_profile(
                 path,
                 doc,
                 max_chars=850,
             )
 
-            line = "- 文件：{}".format(path)
+            line = "- {}文件：{}".format(role, path)
 
             if title and str(title).strip() not in {
                 Path(path).stem,
@@ -3717,7 +3853,8 @@ def _name_semantic_clusters(
 4. 不要使用“其他资料”“综合内容”这类无信息名称，除非资料确实无法概括。
 5. summary 用一句话说明这一组主要研究什么。
 6. keywords 给出 3-6 个主题关键词。
-7. 必须保持 cluster_id 不变。
+7. 边界抽样用于检查组内一致性；若某个边界文件明显不属于本主题，只能从给出的边界路径中逐字列入 boundary_mismatches，不要扩大主题来勉强覆盖。
+8. 必须保持 cluster_id 不变。
 {scope_line}
 {reserved_block}语义簇：
 {}
@@ -3729,7 +3866,8 @@ def _name_semantic_clusters(
       "cluster_id": "SEM-0001",
       "name": "主题名称",
       "summary": "一句话主题说明",
-      "keywords": ["关键词"]
+      "keywords": ["关键词"],
+      "boundary_mismatches": ["仅列明显不匹配的边界文件路径"]
     }}
   ]
 }}""".format(
@@ -3780,6 +3918,25 @@ def _name_semantic_clusters(
                 )
 
             cluster["name"] = name
+            allowed_boundary_paths = set(cluster.get("boundary_documents") or [])
+            if "boundary_mismatches" in item:
+                raw_mismatches = item.get("boundary_mismatches")
+                mismatches = [
+                    str(path).strip()
+                    for path in (raw_mismatches if isinstance(raw_mismatches, list) else [])
+                    if str(path).strip() in allowed_boundary_paths
+                ]
+                cluster["boundary_review"] = {
+                    "status": "flagged" if mismatches else "passed",
+                    "flagged_paths": list(dict.fromkeys(mismatches)),
+                    "method": "batched_model_boundary_sample",
+                }
+            else:
+                cluster["boundary_review"] = {
+                    "status": "unverified",
+                    "flagged_paths": [],
+                    "method": "batched_model_boundary_sample",
+                }
             if proposed:
                 cluster["naming_source"] = "local_model"
                 cluster["naming_status"] = "enhanced"
@@ -4058,14 +4215,21 @@ def _semantic_adaptive_tree(
             ],
         }
 
+    boundary_review_sources = {}
+    for cluster in semantic_clusters:
+        review = cluster.get("boundary_review") or {}
+        if review.get("status") != "flagged":
+            continue
+        topic_name = str(cluster.get("name") or "未命名主题")
+        for path in review.get("flagged_paths") or []:
+            if path in (cluster.get("boundary_documents") or []):
+                boundary_review_sources.setdefault(str(path), []).append(topic_name)
+
     children = []
 
     for cluster in semantic_clusters:
         member_paths = sorted(
-            cluster.get(
-                "members",
-                [],
-            )
+            set(cluster.get("members") or []) - set(boundary_review_sources)
         )
 
         if not member_paths:
@@ -4093,7 +4257,9 @@ def _semantic_adaptive_tree(
             documents[path].setdefault("classification", {}).update({
                 "primary_topic": name,
                 "topic_memberships": [name],
-                "confidence": round(float(cluster.get("mean_similarity") or 0.8), 3),
+                "confidence": None,
+                "confidence_kind": "uncalibrated_embedding_similarity",
+                "classification_similarity": cluster.get("mean_similarity"),
                 "classification_status": "classified",
                 "classification_reason": "文档通过本地语义向量聚类归入该唯一主主题。",
                 "evidence_ids": [item.get("evidence_id") for item in selected if item.get("evidence_id")],
@@ -4140,6 +4306,10 @@ def _semantic_adaptive_tree(
             "naming_status": cluster.get("naming_status", "degraded"),
             "naming_confidence": cluster.get("naming_confidence"),
             "naming_degradation_reason": cluster.get("naming_degradation_reason"),
+            "boundary_documents": cluster.get("boundary_documents", []),
+            "boundary_review": cluster.get("boundary_review") or {
+                "status": "not_run", "flagged_paths": []
+            },
             "children": [
                 file_leaf(path)
                 for path in member_paths
@@ -4661,6 +4831,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     aggregation_depth=0, aggregation_interval=3, translation_pipeline=None,
                     preprocess_only=False, selection_plan=None):
     progress = progress or (lambda percent, message: None)
+    pipeline_started = time.perf_counter()
+    pipeline_timing_ms = {}
     workflow_hint = str(workflow_source or "").strip().lower()
     requested_selection_paths = list(dict.fromkeys(
         str(path) for path in (target_paths or []) if str(path)
@@ -5652,6 +5824,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
     if embedding_client is not None and canonical_documents and not policy.get("enabled"):
         try:
             progress(74, "生成文档级语义向量")
+            semantic_cluster_started = time.perf_counter()
 
             def semantic_progress(done, total):
                 percent = 74 + int(
@@ -5674,18 +5847,22 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     storage=storage,
                 )
             )
+            pipeline_timing_ms["semantic_profile_embedding_clustering"] = round(
+                (time.perf_counter() - semantic_cluster_started) * 1000, 2
+            )
 
             progress(
                 79,
                 "生成语义主题名称",
             )
+            semantic_naming_started = time.perf_counter()
 
             if llm is not None:
                 naming_cache = {}
                 for cluster in semantic_clusters:
-                    cache_id = _stable_group_node_id("内容主题", "", cluster.get("members") or [])
+                    cache_id = _semantic_naming_cache_id(cluster)
                     cached = storage.get_summary(scan_id, "naming:{}".format(cache_id), "semantic_naming")
-                    if cached and cached.get("schema_version") == 1:
+                    if cached and cached.get("schema_version") == 3:
                         naming_cache[cache_id] = cached
                 semantic_clusters, naming_result = (
                     _name_semantic_clusters(
@@ -5699,13 +5876,18 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 for cluster in semantic_clusters:
                     if cluster.get("naming_status") != "enhanced":
                         continue
-                    cache_id = _stable_group_node_id("内容主题", "", cluster.get("members") or [])
+                    cache_id = _semantic_naming_cache_id(cluster)
                     storage.save_summary(scan_id, "naming:{}".format(cache_id), "semantic_naming", {
-                        "schema_version": 1,
+                        "schema_version": 3,
+                        "boundary_review_schema": 1,
+                        "profile_fingerprint": cluster.get("profile_fingerprint"),
                         "name": cluster.get("name"),
                         "summary": cluster.get("summary"),
                         "keywords": cluster.get("keywords") or [],
                         "confidence": cluster.get("naming_confidence"),
+                        "boundary_review": cluster.get("boundary_review") or {
+                            "status": "not_run", "flagged_paths": []
+                        },
                     })
 
                 if naming_result:
@@ -5717,6 +5899,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                     semantic_clusters, canonical_documents, llm=None,
                 )
                 semantic_error = "本地模型不可用；目录已显式标记为待智能命名"
+            pipeline_timing_ms["semantic_cluster_naming"] = round(
+                (time.perf_counter() - semantic_naming_started) * 1000, 2
+            )
 
         except Exception as exc:
             semantic_error = str(exc)
@@ -5810,6 +5995,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         node_summaries["."]["retrieval_method"] = retrieval.get("method")
         storage.save_summary(scan_id, ".", "folder", node_summaries["."])
 
+    directory_tree_started = time.perf_counter()
     if semantic_clusters:
         adaptive_tree = _semantic_adaptive_tree(
             scan,
@@ -5847,6 +6033,9 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         node_summaries,
     )
     adaptive_tree = _add_related_topic_mounts(adaptive_tree, documents)
+    pipeline_timing_ms["directory_tree_and_relationships"] = round(
+        (time.perf_counter() - directory_tree_started) * 1000, 2
+    )
     # The content tree annotates documents with their primary topic,
     # confidence and classification evidence.  Persist those annotations so a
     # restart or later export sees the same auditable decision.
@@ -6041,6 +6230,13 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "finish_reason": call_result.get("finish_reason"),
             "timing": call_result.get("timing") or {},
         })
+    pipeline_timing_ms["package_analysis_total"] = round(
+        (time.perf_counter() - pipeline_started) * 1000, 2
+    )
+    semantic_selection_meta = dict(
+        (((semantic_clusters[0].get("algorithm_parameters") or {}).get("candidate_selection") or {}))
+        if semantic_clusters else {}
+    )
     ordered_contexts = sorted(item["context_tokens"] for item in package_model_calls)
     context_p95 = (
         ordered_contexts[int(math.ceil(0.95 * len(ordered_contexts))) - 1]
@@ -6082,6 +6278,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "similar_document_clusters": len(similar_groups),
             "topic_clusters": len(topic_clusters),
             "semantic_topic_clusters": len(semantic_clusters),
+            "directory_embedding_cache_hits": int(semantic_selection_meta.get("embedding_cache_hits") or 0),
+            "directory_embedding_cache_misses": int(semantic_selection_meta.get("embedding_cache_misses") or 0),
             "semantic_cluster_threshold": semantic_threshold,
             "semantic_cluster_error": semantic_error,
             "subtopic_nodes": sum(len(item.get("children", [])) for item in adaptive_tree.get("children", [])),
@@ -6134,6 +6332,8 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         "research_retrieval": research_retrieval,
         "semantic_topic_clusters": semantic_clusters,
         "semantic_cluster_threshold": semantic_threshold,
+        "semantic_clustering_selection": semantic_selection_meta,
+        "pipeline_timing_ms": pipeline_timing_ms,
         "semantic_naming_model": semantic_naming_model,
         "lexical_topic_naming_model": (lexical_naming_result or {}).get("model") if lexical_naming_result else None,
         "subtopic_naming_model": (subtopic_naming_result or {}).get("model") if subtopic_naming_result else None,
