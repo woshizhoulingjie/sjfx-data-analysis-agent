@@ -2708,8 +2708,10 @@ def _local_preliminary_summary(local_summary, path, reason):
 
 PRELIMINARY_SUMMARY_VERSION_PAIRS = frozenset({
     ("preview-source-blocks-v2", "preview-claims-evidence-v2"),
+    ("preview-source-blocks-v2", "preview-claims-qualifiers-v3"),
     ("preview-source-blocks-v2", "preliminary-batch-claims-evidence-v2"),
     ("selective-6500-v2-source-ids", "compact-6500-evidence-v2"),
+    ("selective-6500-v2-source-ids", "compact-6500-qualifiers-v3"),
     ("local-no-content-v1", "local-no-content-v1"),
 })
 

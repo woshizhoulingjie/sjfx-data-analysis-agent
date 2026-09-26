@@ -14,6 +14,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from config import Config
+from services.summary_fidelity import SUMMARY_QUALIFIER_INSTRUCTION, summary_qualifier_patch
 from services.large_package_isolated import LargePackageStore, iter_inventory, quick_preview
 from services.large_package_resources import (AdmissionGuard, ResourcePressure,
     defer_lease, pressure, resource_code, show_wait, sqlite_temp_directory)
@@ -2055,7 +2056,7 @@ class LargePackageWorker:
             # 提示词本身要求的就是"轻度摘要"，500 的上限本就在浪费。
             # 回滚：SJFX_LP_DEEP_SUMMARY_MAX_TOKENS=500。
             limit = max(128, min(2000, int(os.getenv("SJFX_LP_DEEP_SUMMARY_MAX_TOKENS", "400"))))
-            result = client.chat("你是资料摘要助手，只输出简洁中文摘要。", "请为文件 {} 生成轻度摘要，包含主题、关键事实、风险和后续建议：\n{}".format(path, text), temperature=0.1, max_tokens=limit)
+            result = client.chat("你是资料摘要助手，只输出简洁中文摘要。" + SUMMARY_QUALIFIER_INSTRUCTION, "请为文件 {} 生成轻度摘要，包含主题、关键事实、风险和后续建议：\n{}".format(path, text), temperature=0.1, max_tokens=limit)
             # finish_reason 必须检查。改动前完全不看，而实测 p50 18.51 s 恰好等于
             # 500 token 的生成时间，说明大部分文件正在撞上限、摘要是被截断的。
             # 截断结果仍然保存（它是有用的事实层产物），但显式标注出来，
@@ -2079,6 +2080,10 @@ class LargePackageWorker:
                 payload["quality"] = "empty"
             else:
                 payload["quality"] = "complete"
+            payload.update(summary_qualifier_patch(payload, [{
+                "source_path": path, "text": text,
+                "evidence_id": "SUMMARY-INPUT-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+            }]))
             return payload
         except Exception as exc:
             if resource_code(exc):

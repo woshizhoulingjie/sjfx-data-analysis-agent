@@ -9,14 +9,16 @@ from collections import Counter
 from services.ollama import LocalModelError
 from services.evidence import build_file_claims, select_evidence
 from services.scanner import extract_text
+from services.summary_fidelity import SUMMARY_QUALIFIER_INSTRUCTION, summary_qualifier_patch
 
 
-PREVIEW_SUMMARY_PROMPT_VERSION = "preview-claims-evidence-v2"
+PREVIEW_SUMMARY_PROMPT_VERSION = "preview-claims-qualifiers-v3"
 
 
 CHINESE_CONCLUSION_RULE = (
     " 所有摘要、事实、论点、方法、结论、风险和不确定性必须使用简体中文表达；"
     "原文专有名词、缩写、CVE、数字和文件路径可以保留原文。"
+    + SUMMARY_QUALIFIER_INSTRUCTION
 )
 
 
@@ -434,8 +436,10 @@ def _preview_input(unified_document, max_chars=24000):
 def _preview_claim_contract(summary, evidence_items):
     """Expose preview claims in the same shape as deep claims, without
     pretending that the sampled input has passed full source verification."""
-    source = summary if isinstance(summary, dict) else {}
+    source = dict(summary) if isinstance(summary, dict) else {}
     evidence_items = [item for item in (evidence_items or []) if isinstance(item, dict)]
+    fidelity_patch = summary_qualifier_patch(source, evidence_items)
+    source.update(fidelity_patch)
     declared_evidence = {}
     available_by_id = {
         str(item.get("evidence_id")): item
@@ -506,6 +510,7 @@ def _preview_claim_contract(summary, evidence_items):
         if len(formal) + len(arguments) >= 18:
             break
     return {
+        **fidelity_patch,
         "file_conclusions": formal,
         "file_arguments": arguments,
         "file_review_items": [],

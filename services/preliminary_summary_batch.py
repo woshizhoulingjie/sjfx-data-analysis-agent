@@ -17,6 +17,7 @@ from services.document_analysis import (
     document_source_fingerprint,
 )
 from services.evidence import select_evidence
+from services.summary_fidelity import SUMMARY_QUALIFIER_INSTRUCTION
 
 
 class PreliminaryBatchProtocolError(ValueError):
@@ -151,7 +152,7 @@ def analyze_preliminary_batch(llm, storage, jobs, max_chars=8000,
 不要遗漏文件，不要重复 file_id，不要在文件之间交叉引用。""".format(rows=prompt_rows)
     model_started = time.perf_counter()
     result = llm.chat_json(
-        "你是严谨的中文资料摘要助手。只输出有证据支持的、逐文件隔离的中文结果。",
+        "你是严谨的中文资料摘要助手。只输出有证据支持的、逐文件隔离的中文结果。" + SUMMARY_QUALIFIER_INSTRUCTION,
         prompt,
         max_tokens=max(160, min(1600, int(output_tokens_per_file) * len(rows))),
         long_output=True,

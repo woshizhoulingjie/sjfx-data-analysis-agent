@@ -15,10 +15,11 @@ from services.document_analysis import (
 from services.evidence import select_evidence
 from services.preliminary_summary_batch import collect_jobs, eligible_job
 from services.preliminary_summary_input import INPUT_VERSION, build_preliminary_input
+from services.summary_fidelity import SUMMARY_QUALIFIER_INSTRUCTION
 
 LOG = logging.getLogger("sjfx.preliminary")
 CONTRACT = "preliminary-ready-v2-source-ids"
-PROMPT_VERSION = "compact-6500-evidence-v2"
+PROMPT_VERSION = "compact-6500-qualifiers-v3"
 
 
 def enabled(job):
@@ -72,7 +73,8 @@ def _prompt(rows):
         "uncertainties/warnings保留影响判断的事项，无依据的字段留空，不凑字段。\n"
         "claim_evidence只引用输入中逐字出现的evidence_id，并为每条结论和事实给出直接来源；来源可回查不等于主张已获验证。"
         "仅输出所列字段；如包含结构概览，只列最多3个短章节名；研究方向最多一个简短问题，理由一句话。"
-        "输出JSON：" + json.dumps({"documents": [contract]}, ensure_ascii=False, separators=(",", ":"))
+        + SUMMARY_QUALIFIER_INSTRUCTION
+        + "输出JSON：" + json.dumps({"documents": [contract]}, ensure_ascii=False, separators=(",", ":"))
         + "\n分析材料：\n" + json.dumps(files, ensure_ascii=False, separators=(",", ":"))
     )
 

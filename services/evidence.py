@@ -10,6 +10,7 @@ import math
 import re
 from collections import defaultdict
 from services.grounded_clauses import compound_support, status_strength_mismatch
+from services.summary_fidelity import summary_qualifier_patch
 
 
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,8}")
@@ -979,8 +980,12 @@ def build_file_claims(summary, evidence_items, max_claims=24, max_supports=3):
     one original evidence unit passes ``verify_claim_evidence``; other candidates
     are exposed as review items so the UI never presents unsupported prose as fact.
     """
-    source = summary if isinstance(summary, dict) else {}
+    source = dict(summary) if isinstance(summary, dict) else {}
     evidence_items = [item for item in (evidence_items or []) if isinstance(item, dict)]
+    fidelity_patch = summary_qualifier_patch(source, evidence_items)
+    source.update(fidelity_patch)
+    qualified_statements = {" ".join(item['replacement'].split()) for item in
+        (source.get('summary_fidelity') or {}).get('statement_changes') or []}
     fields = (
         ("conclusions", "conclusion", "文件结论"),
         ("key_facts", "fact", "关键事实"),
@@ -1006,6 +1011,13 @@ def build_file_claims(summary, evidence_items, max_claims=24, max_supports=3):
                 continue
             seen.add(key)
             considered += 1
+            if normalized in qualified_statements:
+                review_items.append({
+                    "type": claim_type, "label": label, "text": normalized,
+                    "status": "review",
+                    "reason": "已按原文补回不确定性或授权限定；不将自动修正的措辞升级为正式结论。",
+                })
+                continue
             supports = _claim_supports(normalized, evidence_items, max_items=max_supports)
             if not supports:
                 review_items.append({
@@ -1066,6 +1078,7 @@ def build_file_claims(summary, evidence_items, max_claims=24, max_supports=3):
         "status": "verified" if all_formal and not review_items else ("partial" if all_formal else "insufficient"),
     }
     return {
+        **fidelity_patch,
         "file_conclusions": formal,
         "file_arguments": arguments,
         "file_review_items": review_items,
