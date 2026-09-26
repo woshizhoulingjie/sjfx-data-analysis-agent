@@ -32,6 +32,7 @@ import time
 import uuid
 from contextlib import closing
 from pathlib import Path
+from services.scanner import human_size
 
 import logging
 import re
@@ -742,6 +743,7 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
         "directory_count": len(directories),
         "scanned_node_count": len(records) + len(directories) + 1,
         "total_size": total_bytes,
+        "total_size_human": human_size(total_bytes),
         "type_counts": type_counts,
         "truncated": False,
         # 来源信息（文档 §6）
