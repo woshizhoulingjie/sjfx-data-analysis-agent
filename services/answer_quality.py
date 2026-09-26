@@ -280,8 +280,13 @@ def numeric_evidence_text(value):
 
 
 def _quantity_label_text(value):
-    # Remove only a presentation label attached to an unchanged quantity role.
-    return re.sub(r'(实收|尚缺|还缺|缺少)数量\s*(?:为|是|[:：])?\s*', r'\1', value)
+    # Canonicalize explicit quantity labels only for matching, not citations.
+    # Missing-count synonyms share a role; received and missing never do.
+    # Keep prefixes (project/date, plans, negation) and the number/unit intact.
+    pattern = (r'\*{0,2}(?P<role>实收|尚缺|还缺|缺少)(?:数量)?\*{0,2}\s*'
+               r'(?:(?:为|是)\s*)?(?:[:：]\s*)?'
+               r'(?=\*{0,2}' + QUANTITY_VALUE + r')')
+    return re.sub(pattern, lambda match: '实收' if match['role'] == '实收' else '尚缺', value)
 
 
 def _projects(value):
@@ -295,6 +300,14 @@ def _quantity_roles(value):
     if re.search(r'尚缺|还缺|缺少', value):
         roles.add('missing')
     return roles
+
+
+def _quantity_denials(value):
+    # Compare the negation attached to each canonical role independently of
+    # unrelated negations elsewhere in the clause. Unconfirmed is not denied.
+    return set(re.findall(
+        r'(?:未|没有|不|非|无)(?:曾经|已经|真正|确实|实际|仍然|仍|再|曾|是|为|被|\s){0,3}'
+        r'(实收|尚缺)', value))
 
 
 def _quantity_context_clauses(evidence, boundary):
@@ -390,6 +403,8 @@ def _numeric_clause_supported(local, clauses, pattern):
         if identifiers and not identifiers.issubset(set(re.findall(RECORD_ID, clause))):
             continue
         if roles and roles != _quantity_roles(clause):
+            continue
+        if roles and _quantity_denials(local) != _quantity_denials(clause):
             continue
         if roles and (bool(re.search(r'计划|预计|希望|拟', local)) !=
                       bool(re.search(r'计划|预计|希望|拟', clause))):
