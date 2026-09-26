@@ -1552,16 +1552,21 @@ class LargePackageWorker:
             from config import Config
             if not getattr(Config, "LP_OVERVIEW_EAGER", True):
                 return False
-            from services.large_package_reporting import build_overview, report_directory
+            from services.large_package_reporting import (
+                build_overview, published_report, catalog_input_revision)
             item = self.store.get(package_id)
             if not item:
                 return False
-            directory = report_directory(self.store, package_id)
             note = ""
+            previous_report = None
             if milestone == "catalog":
-                if (directory / "overview-v1.json").exists():
-                    return False                      # 第一版已经生成过
+                previous_report = published_report(self.store, item)
                 with closing(self.store._connect()) as conn:
+                    conn.execute("BEGIN")
+                    revision = catalog_input_revision(conn, package_id)
+                    if (previous_report and
+                            previous_report.get("catalog_input_revision") == revision):
+                        return False
                     leaves = int(conn.execute(
                         "SELECT COUNT(*) FROM large_catalog_groups WHERE package_id=? "
                         "AND id NOT LIKE 'km-other-%' AND id NOT LIKE 'km-pending-%'",
@@ -1574,11 +1579,12 @@ class LargePackageWorker:
                         (package_id,)).fetchone()[0] or 0)
                     queued = int(conn.execute(
                         "SELECT COUNT(*) FROM lp_catalog_jobs WHERE package_id=? "
-                        "AND status='queued'", (package_id,)).fetchone()[0] or 0)
+                        "AND status IN ('queued','running','retry','deferred')",
+                        (package_id,)).fetchone()[0] or 0)
                 # 判据不能用"有没有未完成任务"：只要有任务陷入重试，第一版就永久
                 # 阻塞（实测 2 个孤儿任务卡死了第一版）。改成**目录稳定性**：
                 # 叶组数/主题数/标签数/待办数连续 stable 秒不再变化，就认为目录已定稿。
-                sig = (leaves, branches, labels, queued)
+                sig = (leaves, branches, labels, queued, revision)
                 now = time.time()
                 prev = self._overview_state.get(package_id)
                 if prev is None or prev[0] != sig:
@@ -1604,7 +1610,12 @@ class LargePackageWorker:
                         str(b) for b in _vo.get('blocked_by') or [])
             except Exception:
                 pass
-            build_overview(self.store, item, milestone=milestone, note=note)
+            # Refreshing directory names must never downgrade completed deep evidence.
+            if previous_report and previous_report.get("milestone") == "deep":
+                milestone = "deep"
+            result = build_overview(self.store, item, milestone=milestone, note=note)
+            if not result.get("published"):
+                return False
             LOGGER.info("large package %s overview built milestone=%s", package_id, milestone)
             return True
         except Exception:
@@ -1623,7 +1634,7 @@ class LargePackageWorker:
             from config import Config
             if not getattr(Config, "LP_OVERVIEW_EAGER", True):
                 return False
-            from services.large_package_reporting import report_directory
+            from services.large_package_reporting import published_report
             with closing(self.store._connect()) as conn:
                 rows = conn.execute(
                     "SELECT id,status FROM packages "
@@ -1631,26 +1642,13 @@ class LargePackageWorker:
                     "ORDER BY updated_at DESC LIMIT 20").fetchall()
             for row in rows:
                 package_id = row["id"]
-                directory = report_directory(self.store, package_id)
-                if (directory / "overview-v1.json").exists():
-                    continue
-                # 已经进入版本链的包不再兜底。
-                #
-                # 改动前只有上面那一个判据，而 **"deep" 里程碑根本不写
-                # overview-v1.json** —— 于是走 deep 路线的包每一轮都判定成
-                # "还没有概览"，每 30 秒重建一次（实测 lp-1e0887 反复打印
-                # "overview built milestone=deep"，published-*.json 的 mtime
-                # 一直在变，即每轮重写 127 KB + 重建一次全量报告）。
-                # 兜底的本意只是"给还没有第一版的包补一次触发"；既然已经有了
-                # 版本链记录，后续更新应当由 `_deep_finish` / `run_slice` 在
-                # **内容真的变了**时主动触发，而不是靠轮询。
-                with closing(self.store._connect()) as conn:
-                    if conn.execute("SELECT 1 FROM lp_overview_versions "
-                                    "WHERE package_id=? LIMIT 1", (package_id,)).fetchone():
-                        continue
+                # Existing reports also need catch-up after async naming/splitting.
+                # The content signature gate avoids repeated writes/model calls,
+                # including deep reports which intentionally have no v1 file.
+                existing = published_report(self.store, {"id": package_id})
                 # 已经跑完深度摘要的包：直接出**第二版**（它没有"目录就绪"这个
                 # 中间态可等，硬出一版 catalog 会把它标成第一版，语义上不对）。
-                milestone = "deep" if row["status"] == "completed" else "catalog"
+                milestone = "deep" if row["status"] == "completed" and not existing else "catalog"
                 if self._build_overview(package_id, milestone):
                     return True
             return False

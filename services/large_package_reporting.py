@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA = "large-package-report/2.5"
+SCHEMA = "large-package-report/2.6"
 # 研究方向规则的版本：它参与缓存键，规则变了就必须重建报告。
 DIRECTION_RULES_VERSION = "directions/2"
 # 占位分类：**永远不得成为推荐研究方向**。改动前首选方向按 score(≈文件数) 排序，
@@ -169,6 +169,30 @@ def _direction(category, data, groups=None, total_files=None, topic_profile=None
     }
 
 
+def catalog_input_revision(conn, package_id):
+    """Hash report-relevant catalog content, not polling timestamps or vectors.
+
+    Call within the caller's read/write transaction so the signature describes
+    exactly the snapshot consumed by the report. Include pending work so a
+    partial publication is refreshed after naming drains even without a rename.
+    """
+    groups = [tuple(row) for row in conn.execute(
+        "SELECT g.id,g.content_revision,g.member_count,l.revision,l.version,"
+        "l.name,l.description,l.digest,l.needs_review,l.locked "
+        "FROM large_catalog_groups g LEFT JOIN lp_catalog_labels l "
+        "ON l.package_id=g.package_id AND l.group_id=g.id "
+        "WHERE g.package_id=? ORDER BY g.id", (package_id,))]
+    branches = [tuple(row) for row in conn.execute(
+        "SELECT id,name,children,revisions FROM lp_catalog_branches "
+        "WHERE package_id=? ORDER BY id", (package_id,))]
+    pending = [tuple(row) for row in conn.execute(
+        "SELECT status,COUNT(*) FROM lp_catalog_jobs WHERE package_id=? "
+        "AND status IN ('queued','running','retry','deferred') GROUP BY status ORDER BY status",
+        (package_id,))]
+    return hashlib.sha256(json.dumps([package_id, groups, branches, pending],
+        ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()[:24]
+
+
 def build_report(store, item):
     """One streaming database pass; retain only bounded representative excerpts.
 
@@ -179,6 +203,7 @@ def build_report(store, item):
     directory = report_directory(store, package_id)
     with _lock, closing(store._connect()) as conn:
         conn.execute("BEGIN")
+        catalog_revision = catalog_input_revision(conn, package_id)
         revision = conn.execute("SELECT COUNT(*),MAX(updated_at) FROM files WHERE package_id=?", (package_id,)).fetchone()
 # 缓存键必须覆盖**主题层**与**研究方向规则版本**：改动前只含 files 与
         # lp_catalog_labels 的 (COUNT, MAX)，于是"只新增了主题层"时报告仍命中
@@ -197,7 +222,7 @@ def build_report(store, item):
         cache_key = hashlib.sha256(json.dumps([SCHEMA, DIRECTION_RULES_VERSION, package_id,
             item.get("updated_at"), list(revision),
             list(conn.execute("SELECT COUNT(*),MAX(updated) FROM lp_catalog_labels WHERE package_id=?",(package_id,)).fetchone()),
-            branch_rev, member_rev]).encode()).hexdigest()[:20]
+            branch_rev, member_rev, catalog_revision]).encode()).hexdigest()[:20]
         cached = directory / "overview.json"
         try:
             report = json.loads(cached.read_text(encoding="utf-8"))
@@ -431,6 +456,7 @@ def build_report(store, item):
         preliminary_direction = bool(candidates) and not brief_ready
         report = {
             "schema_version": SCHEMA, "revision": cache_key, "package_id": package_id,
+            "catalog_input_revision": catalog_revision,
             "generated_at": datetime.now(timezone.utc).isoformat(), "status": item.get("status"), "phase": item.get("phase"),
             "root_path": item["root_path"], "coverage": dict(coverage), "categories": categories,
             # 报告骨架用的是哪一套：topic=智能目录的主题层，category=快速解析分类器
@@ -822,11 +848,7 @@ def build_overview(store, item, milestone="catalog", note=""):
         report["research_brief"] = brief
         report["partial"] = True
     directory = report_directory(store, item["id"])
-    if milestone == "catalog":
-        snapshot = directory / "overview-v1.json"
-        if not snapshot.exists():
-            _atomic(snapshot, report)
-    else:
+    if milestone != "catalog":
         try:
             first = json.loads((directory / "overview-v1.json").read_text(encoding="utf-8"))
             report["changes_since_v1"] = _diff_overview(first, report)
@@ -844,6 +866,10 @@ def build_overview(store, item, milestone="catalog", note=""):
         if published:
             report["report_id"] = published["report_id"]
             report["published"] = True
+            if milestone == "catalog":
+                snapshot = directory / "overview-v1.json"
+                if not snapshot.exists():
+                    _atomic(snapshot, report)
     except Exception:
         LOGGER.exception("publish overview failed: %s", item.get("id"))
     return report
@@ -854,35 +880,30 @@ def _publish_overview(store, item, report, milestone):
     package_id = str(item["id"])
     directory = report_directory(store, package_id)
     digest = hashlib.sha256(json.dumps(
-        [report.get("revision"), milestone, DIRECTION_RULES_VERSION, report.get("version")],
+        [report.get("revision"), milestone, DIRECTION_RULES_VERSION, report.get("version"),
+         report.get("catalog_input_revision"), report.get("partial"),
+         (report.get("research_brief") or {}).get("limitations")],
         ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:20]
     report_id = "rep-" + digest
     filename = "published-%s.json" % digest
-    _atomic(directory / filename, report)
     catalog_id = ""
     evidence_id = ""
-    try:
-        # **先确保目录版本反映当前形状**，再登记发布视图。改动前只读最新一条，
-        # 于是目录在归一/重命名之后，发布视图仍指向过期快照
-        # （实测 cssj4 叶子 412→270，/workflow 一直显示 412）。
-        from services.large_package_catalog_naming import ensure_catalog_version
-        catalog_id = ensure_catalog_version(store, package_id) or ""
-    except Exception:
-        LOGGER.exception("catalog version refresh failed: %s", package_id)
-    try:
-        with closing(store._connect()) as conn:
-            if not catalog_id:
-                row = conn.execute("SELECT catalog_id FROM lp_catalog_versions WHERE package_id=? "
-                                   "ORDER BY created DESC LIMIT 1", (package_id,)).fetchone()
-                catalog_id = str(row[0]) if row and row[0] else ""
-            row = conn.execute("SELECT evidence_id FROM lp_evidence_snapshots WHERE package_id=? "
-                               "ORDER BY created DESC LIMIT 1", (package_id,)).fetchone()
-            evidence_id = str(row[0]) if row and row[0] else ""
-    except Exception:
-        pass
     now = time.time()
     with store._lock, closing(store._connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        # A model call can outlive the catalog snapshot it read. Never attach
+        # those old findings to the newer catalog or supersede a good report.
+        if report.get("catalog_input_revision") != catalog_input_revision(conn, package_id):
+            conn.rollback()
+            LOGGER.info("overview publication deferred: catalog changed during build: %s", package_id)
+            return None
+        from services.large_package_catalog_naming import ensure_catalog_version
+        catalog_id = ensure_catalog_version(
+            store, package_id, connection=conn, allow_previous=False) or ""
+        row = conn.execute("SELECT evidence_id FROM lp_evidence_snapshots WHERE package_id=? "
+                           "ORDER BY created DESC LIMIT 1", (package_id,)).fetchone()
+        evidence_id = str(row[0]) if row and row[0] else ""
+        _atomic(directory / filename, report)
         conn.execute("INSERT INTO lp_overview_versions(report_id,package_id,milestone,catalog_id,"
                      "evidence_id,rules_version,schema_version,status,payload,digest,created,published)"
                      " VALUES(?,?,?,?,?,?,?,'published',?,?,?,1) "

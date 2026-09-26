@@ -796,7 +796,7 @@ def validate_catalog(store, package_id):
             "warnings": warnings, "blocking": bool(violations)}
 
 
-def ensure_catalog_version(store, package_id, connection=None):
+def ensure_catalog_version(store, package_id, connection=None, allow_previous=True):
     """Record a content/revision-specific version using the caller's transaction."""
     from contextlib import nullcontext
     context = nullcontext(connection) if connection is not None else closing(store._connect())
@@ -831,7 +831,7 @@ def ensure_catalog_version(store, package_id, connection=None):
                           'ensure_catalog_version', time.time()))
             if own_transaction:
                 conn.commit()
-            return previous_id
+            return previous_id if allow_previous else ''
         run = conn.execute("SELECT run_id FROM lp_runs WHERE package_id=? ORDER BY started DESC LIMIT 1",
                            (package_id,)).fetchone()
         leaves = sum(1 for row in labels if row[2] and (row[4] == row[1] or row[6]))
