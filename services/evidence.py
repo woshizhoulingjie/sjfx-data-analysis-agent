@@ -9,6 +9,7 @@ import hashlib
 import math
 import re
 from collections import defaultdict
+from services.grounded_clauses import compound_support, status_strength_mismatch
 
 
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,8}")
@@ -410,13 +411,6 @@ def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexic
             "support_score": 0.0,
             "support_reason": "轻量预览只能用于候选检索，不能作为正式证据",
         })
-    quality = evidence_quality(item)
-    if not quality.get("eligible"):
-        return result({
-            "support_status": "insufficient",
-            "support_score": 0.0,
-            "support_reason": quality.get("reason") or "证据质量不合格",
-        })
     claim_text = " ".join(str(claim or "").split())
     text = " ".join(_semantic_evidence_text(item).split())
     if not claim_text:
@@ -424,6 +418,29 @@ def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexic
             "support_status": "insufficient",
             "support_score": 0.0,
             "support_reason": "结论为空，无法验证证据关系",
+        })
+
+    if status_strength_mismatch(claim_text, text):
+        return result({
+            "support_status": "insufficient", "support_score": 0.0,
+            "hard_reject": True, "support_relation": "status_strength_mismatch",
+            "support_reason": "原文只说明尚未确认或计划执行，不能证明已经完成或尚未完成。",
+        })
+    quality = evidence_quality(item)
+    if not quality.get("eligible"):
+        return result({
+            "support_status": "insufficient",
+            "support_score": 0.0,
+            "support_reason": quality.get("reason") or "证据质量不合格",
+        })
+    compound = compound_support(claim_text, text)
+    if compound is not None:
+        return result({
+            "support_status": "supported" if compound["supported"] else "insufficient",
+            "support_score": 0.9 if compound["supported"] else 0.0,
+            "hard_reject": not compound["supported"],
+            "support_relation": "bounded_compound",
+            "support_reason": compound["reason"],
         })
 
     claim_numbers = _claim_numbers(claim_text)

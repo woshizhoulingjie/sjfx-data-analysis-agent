@@ -7,7 +7,8 @@ from itertools import combinations
 from typing import Any, Dict, List, Mapping, Optional
 
 from services.conversation import ConversationScope
-from services.evidence import verify_claim_evidence
+from services.evidence import evidence_quality, verify_claim_evidence
+from services.grounded_clauses import compound_support
 from services.evidence_ledger import build_evidence_ledger
 from services import answer_quality as aq
 
@@ -321,6 +322,11 @@ class ClaimVerifier:
             ]
             claim_concepts = _concepts(check_text)
             for evaluation, item in zip(evaluations, named):
+                full_check = verify_claim_evidence(check_text, _citation_item(item))
+                if full_check.get("hard_reject"):
+                    evaluation.update(full_check)
+                if evaluation.get("hard_reject"):
+                    continue
                 if aq.enabled() and aq.source_kind(item) == "preview":
                     continue
                 if evaluation.get("support_status") != "insufficient":
@@ -368,6 +374,9 @@ class ClaimVerifier:
                 # named, of the retrieved evidence it actually matches) so a
                 # covered synthesis is kept instead of being discarded.
                 pool = named if named else citations
+                pool = [item for item in pool if not verify_claim_evidence(
+                    check_text, _citation_item(item)
+                ).get("hard_reject")]
                 attribution = _attribute_claim(
                     check_text, claim_concepts, pool, scope
                 )
@@ -411,7 +420,8 @@ class ClaimVerifier:
                 citation_numbers.update(_numbers(aq.numeric_evidence_text(_citation_item(item).get("text"))))
             numeric_supported = not claim_numbers or claim_numbers.issubset(citation_numbers)
             if aq.enabled() and claim_numbers and numeric_supported:
-                eligible = [item for item in named if aq.source_kind(item) != "preview"]
+                eligible = [item for evaluation, item in zip(evaluations, named)
+                            if aq.source_kind(item) != "preview" and not evaluation.get("hard_reject")]
                 numeric_supported = bool(eligible) and all(
                     any(aq.numeric_relation_supported(check_text, _citation_item(item).get("text", ""), {number}) for item in eligible)
                     for number in claim_numbers
@@ -419,12 +429,32 @@ class ClaimVerifier:
                 # Precise key/value facts may have very few lexical concepts.
                 # Upgrade only when one complete eligible clause binds the value.
                 for evaluation, item in zip(evaluations, named):
-                    if aq.source_kind(item) != "preview" and aq.numeric_relation_supported(check_text, _citation_item(item).get("text", ""), claim_numbers):
+                    if not evaluation.get("hard_reject") and aq.source_kind(item) != "preview" and aq.numeric_relation_supported(check_text, _citation_item(item).get("text", ""), claim_numbers):
                         evaluation.update({"support_status": "supported", "support_score": 0.9,
                                            "support_reason": "对象、字段与数值在同一原文句段中对应。",
                                            "support_relation": "local_field_value"})
                 supported = [item for item in evaluations if item.get("support_status") == "supported"]
                 partial = [item for item in evaluations if item.get("support_status") == "partially_supported"]
+            # Conjunctions are not a bag of numbers. Each recognized atom must
+            # be proven within one eligible, in-scope source record. Never
+            # splice two unrelated citations or let numeric fallback override it.
+            compound_checks = []
+            for item in named:
+                source = _citation_item(item)
+                proof = compound_support(check_text, source.get("text", ""))
+                if proof is not None:
+                    proof = dict(proof)
+                    proof["supported"] = bool(proof["supported"]
+                        and _scope_contains(scope, item)
+                        and aq.source_kind(item) != "preview"
+                        and not source.get("preview_only")
+                        and str((source.get("coverage") or {}).get("level") or "").lower() != "preview"
+                        and evidence_quality(source).get("eligible"))
+                    compound_checks.append(proof)
+            if compound_checks:
+                numeric_supported = any(proof["supported"] for proof in compound_checks)
+                supported = [proof for proof in compound_checks if proof["supported"]]
+                partial = []
             if aq.enabled() and named and all(aq.source_kind(item) == "preview" for item in named):
                 supported, partial = [], []
             if not numeric_supported:
@@ -475,6 +505,7 @@ class ClaimVerifier:
                         "numeric_supported": numeric_supported,
                         "failure_reason": failure_reason,
                         "evidence_checks": evaluations,
+                        "compound_checks": compound_checks,
                     },
                 }
             )
