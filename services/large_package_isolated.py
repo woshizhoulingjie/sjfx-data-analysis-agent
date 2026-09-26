@@ -304,6 +304,20 @@ class LargePackageStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_files_deep_updated ON files(package_id,deep_status,updated_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_files_topic ON files(package_id,topic)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_files_recognition ON files(package_id,recognition_status)")
+            # Polling must not read summary payloads or terminal queue history.
+            # Existing databases may have stats for old indexes only: leaving a
+            # new index unanalyzed can make unrelated GROUP BY queries pick it
+            # instead of their covering index. Build and sample atomically,
+            # once, not on each read or each process start.
+            for name, ddl in (
+                ("idx_lp_files_quality",
+                 "CREATE INDEX idx_lp_files_quality ON files(package_id,summary_quality)"),
+                ("idx_lp_queue_pending_counts",
+                 "CREATE INDEX idx_lp_queue_pending_counts ON queue(package_id,stage) WHERE status IN ('queued','running','retry')"),
+            ):
+                if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone():
+                    conn.execute(ddl)
+                    conn.execute("ANALYZE " + name)
             conn.commit()
             from services.large_package_topics import init
             init(conn)
@@ -748,6 +762,8 @@ class LargePackageStore:
         """
         pid = str(package_id)
         with closing(self._connect()) as conn:
+            # Core control, queues and published versions share a snapshot.
+            conn.execute("BEGIN")
             row = conn.execute("SELECT * FROM packages WHERE id=?", (pid,)).fetchone()
             if not row:
                 return None
@@ -1177,14 +1193,15 @@ class LargePackageStore:
         self._catalog_cache.pop(str(package_id), None)
 
     def counts(self, package_id):
-        with self._connect() as conn:
+        # Workers can commit between SELECTs: pin one short read snapshot.
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
             total = conn.execute("SELECT COUNT(*) FROM files WHERE package_id=?", (str(package_id),)).fetchone()[0]
             quick = dict(conn.execute("SELECT quick_status,COUNT(*) n FROM files WHERE package_id=? GROUP BY quick_status", (str(package_id),)).fetchall())
             deep = dict(conn.execute("SELECT deep_status,COUNT(*) n FROM files WHERE package_id=? GROUP BY deep_status", (str(package_id),)).fetchall())
             cats = dict(conn.execute("SELECT category,COUNT(*) n FROM files WHERE package_id=? GROUP BY category ORDER BY n DESC", (str(package_id),)).fetchall())
             recognition = dict(conn.execute("SELECT recognition_status,COUNT(*) FROM files WHERE package_id=? GROUP BY recognition_status", (str(package_id),)).fetchall())
-        # 队列口径的待办：完成判据必须用它（files 状态永远看不到 retry）。
-        with closing(self._connect()) as conn:
+            # Queue states include retry, which is not a file status.
             queue_pending = {
                 str(r["stage"]): int(r["n"]) for r in conn.execute(
                     "SELECT stage,COUNT(*) n FROM queue WHERE package_id=? "
