@@ -9,7 +9,7 @@ import json
 import re
 from collections import Counter
 
-VERSION = 'naming-evidence/2'
+VERSION = 'naming-evidence/3'
 FEATURE_VERSION = 'naming-features/2'
 MAX_CANDIDATES = 64
 MAX_BLOCKS = 16
@@ -174,6 +174,14 @@ def select_blocks(parts, limit=8, chars=4000, terms=()):
 
 
 def compact_text(parts, chars=1800, terms=()):
+    # Ranking is needed only when source content exceeds the budget. Repeated
+    # sentence selection otherwise drops subjects, quantities and qualifiers
+    # from even a short note. Keep source order, never inventory-only names.
+    source = [p for p in (parts or [])[:64] if isinstance(p, dict)
+              and p.get('kind') not in {'attachment', 'member_names'}
+              and str(p.get('text') or '').strip()]
+    if len(parts or []) <= 64 and sum(len(str(p['text'])) + 1 for p in source) <= chars + 1:
+        return '\n'.join(normalize(p['text']) for p in source)
     return '\n'.join(p['text'] for p in select_blocks(parts, chars=chars, terms=terms))
 
 
@@ -202,8 +210,17 @@ def record(parts, location, text, kind='text', **metadata):
         if len(parts) > 64:
             parts[:] = parts[:32] + parts[-32:]
         return
-    selected = select_blocks([dict(text=raw, location=location, kind=kind, **metadata)],
-                             limit=4, chars=1800)
+    if len(raw) <= 1800:
+        # This is a complete retained window, not a claim that the file is
+        # complete. Keep any truncation reported by the parser. Larger windows
+        # retain the existing selector, reservoir and byte/time budgets.
+        block = dict(text=raw, raw_text=raw, location=location, kind=kind, **metadata)
+        block['id'] = block.get('id') or 'B' + hashlib.sha256(
+            (str(location)+'\0'+raw).encode()).hexdigest()[:12]
+        selected = [block]
+    else:
+        selected = select_blocks([dict(text=raw, location=location, kind=kind, **metadata)],
+                                 limit=4, chars=1800)
     for block in selected:
         block.update(preview_only=True, reader_version=VERSION)
         block['truncated'] = bool(block.get('truncated') or len(raw) > sum(len(p['text']) for p in selected))
