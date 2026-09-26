@@ -171,7 +171,8 @@ class LargePackageStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
-            for name, default in (("topic", ""), ("recognition_status", "legacy"), ("document_role", "")):
+            for name, default in (("topic", ""), ("recognition_status", "legacy"), ("document_role", ""),
+                                  ("source_kind", "")):
                 if name not in columns:
                     conn.execute("ALTER TABLE files ADD COLUMN " + name + " TEXT NOT NULL DEFAULT '" + default + "'")
             queue_columns = {row[1] for row in conn.execute("PRAGMA table_info(queue)")}
@@ -472,12 +473,14 @@ class LargePackageStore:
                 values = (str(package_id), item["path"], item["name"], item.get("extension", ""),
                           int(item.get("size") or 0), int(item.get("modified_at_ns") or 0),
                           item.get("sha256"), 1 if item.get("sensitive") else 0,
-                          item.get("file_type") or item.get("extension") or "", now)
-                conn.execute("""INSERT INTO files(package_id,path,name,extension,size,modified_at_ns,sha256,sensitive,file_type,updated_at)
-                  VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(package_id,path) DO UPDATE SET
+                          item.get("file_type") or item.get("extension") or "", now,
+                          item.get("source_kind") if item.get("source_kind") in {"physical_file", "archive_member"} else "")
+                conn.execute("""INSERT INTO files(package_id,path,name,extension,size,modified_at_ns,sha256,sensitive,file_type,updated_at,source_kind)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(package_id,path) DO UPDATE SET
                   name=excluded.name,extension=excluded.extension,size=excluded.size,
                   modified_at_ns=excluded.modified_at_ns,sensitive=excluded.sensitive,
-                  file_type=excluded.file_type,updated_at=excluded.updated_at""", values)
+                  file_type=excluded.file_type,updated_at=excluded.updated_at,
+                  source_kind=excluded.source_kind""", values)
                 conn.execute("INSERT OR IGNORE INTO queue(package_id,path,stage,status,updated_at) VALUES(?,?,?,'queued',?)",
                              (str(package_id), item["path"], "quick", now))
             conn.commit()
@@ -1551,6 +1554,7 @@ class LargePackageStore:
                 member_paths.append(path)
                 inventory[path] = {
                     "kind": "file", "path": path, "name": item.get("name") or Path(path).name,
+                    "source_kind": item.get("source_kind") or "",
                     "extension": item.get("extension") or Path(path).suffix.lower(),
                     "size": int(item.get("size") or 0),
                     "modified_at_ns": int(item.get("modified_at_ns") or 0),
@@ -1778,6 +1782,7 @@ def iter_inventory(root, on_error=None):
                 continue
             yield {
                 "path": rel, "name": entry.name, "extension": path.suffix.lower(),
+                "source_kind": "physical_file",
                 "size": int(stat.st_size), "modified_at_ns": int(stat.st_mtime_ns),
                 "sensitive": is_sensitive_file(entry.name),
             }

@@ -102,7 +102,8 @@ class IsolatedPortraitTests(unittest.TestCase):
 
     def test_json_records_and_fields(self):
         value = self.preview('rows.json', json.dumps([{'销售额':100, '回款状态':'未回款'}], ensure_ascii=False))
-        self.assertIn('销售额', value['portrait']['fields'])
+        # JSON recognition preserves field types, unlike plain CSV headers.
+        self.assertEqual(value['portrait']['fields'], ['销售额:int', '回款状态:str'])
         self.assertEqual(value['portrait']['topic'], '销售与回款')
 
     def test_email_headers_are_decoded(self):

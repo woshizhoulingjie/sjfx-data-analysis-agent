@@ -41,14 +41,15 @@ LOGGER = logging.getLogger("sjfx.large_catalog_import")
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:")
 
 # §8.2：压缩包内部成员同时有"物理容器路径"和"逻辑成员路径"，不能把逻辑路径当成
-# 普通物理文件。首版按文档要求明确提示"暂不支持直接进入普通导入"。
+# 普通物理文件。新清点以来源库的物理来源标记判定；旧数据仍保守处理。
 _ARCHIVE_SUFFIXES = ('.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz')
 
 
 def looks_like_archive_member(path):
     """路径里某一层是压缩包、其后还有成员段 → 压缩包内部成员。"""
     parts = str(path or '').replace('\\', '/').split('/')
-    return any(part.lower().endswith(_ARCHIVE_SUFFIXES) for part in parts[:-1])
+    return (any(part.lower().endswith(_ARCHIVE_SUFFIXES) for part in parts[:-1])
+            or any(suffix + '::' in str(path or '').lower() for suffix in _ARCHIVE_SUFFIXES))
 
 
 def file_fingerprint(sha256, size, modified_at_ns):
@@ -66,17 +67,21 @@ def load_file_fingerprints(large_store, package_id, paths, *, strict=False):
         with closing(large_store._connect()) as conn:
             # All bounded batches must observe the same source-index revision.
             conn.execute('BEGIN')
+            # Older live stores may not yet have undergone the additive migration.
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(files)')}
+            origin = 'source_kind' if 'source_kind' in columns else "'' AS source_kind"
             for chunk_start in range(0, len(paths), 500):
                 chunk = list(paths[chunk_start:chunk_start + 500])
                 marks = ','.join('?' * len(chunk))
                 for row in conn.execute(
-                        "SELECT path,sha256,size,modified_at_ns,sensitive FROM files "
+                        "SELECT path,sha256,size,modified_at_ns,sensitive," + origin + " FROM files "
                         "WHERE package_id=? AND path IN (%s)" % marks,
                         [str(package_id)] + chunk):
                     out[str(row['path'])] = {'sha256': row['sha256'],
                                              'size': row['size'],
                                              'modified_at_ns': row['modified_at_ns'],
-                                             'sensitive': bool(row['sensitive'])}
+                                             'sensitive': bool(row['sensitive']),
+                                             'source_kind': str(row['source_kind'] or '')}
     except Exception:
         LOGGER.exception('load_file_fingerprints failed: %s', package_id)
         if strict:
@@ -612,17 +617,24 @@ def _inventory_records(selection, large_package, fingerprints=None):
         if bool(item.get("sensitive")) or bool(mark.get('sensitive')):
             excluded["sensitive"] += 1
             continue
-        if looks_like_archive_member(path):
+        # Trust only the source database, never a caller-supplied inventory flag.
+        # A real directory called reports.zip is not an archive container.
+        source_kind = str(mark.get('source_kind') or '')
+        if source_kind == 'archive_member' or (source_kind != 'physical_file' and looks_like_archive_member(path)):
             excluded["archive_member"] += 1
             continue
         parent = path.rsplit("/", 1)[0] if "/" in path else "."
-        directories.setdefault(parent, True)
+        ancestor = parent
+        while ancestor != '.' and ancestor not in directories:
+            directories[ancestor] = True
+            ancestor = ancestor.rsplit('/', 1)[0] if '/' in ancestor else '.'
         records.append({
             "path": path,
             "parent_path": parent,
             "position": len(records),
             "payload": {
                 "kind": "file",
+                "source_kind": source_kind,
                 "path": path,
                 "name": item.get("name") or Path(path).name,
                 "extension": item.get("extension") or Path(path).suffix.lower(),
@@ -767,10 +779,23 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
                        "directory" if r["payload"].get("kind") == "directory" else "file", _dumps(r))
                       for r in (records + directory_records)]
     inventory_rows.append((scan_id, ".", None, 0, "directory", root_payload))
-    tree_rows = [(scan_id, "physical", r["path"], r["parent_path"], r["position"], _dumps(r), 0)
+    # The paged UI consumes immediate-child counts and sibling positions.
+    # Reuse the already sorted full tree instead of marking every folder as a
+    # leaf or giving the root its total descendant count (phantom next pages).
+    child_counts, sibling_positions = {}, {}
+    pending = [scan_payload["tree"]]
+    while pending:
+        node = pending.pop()
+        children = node.get("children") or []
+        child_counts[node["path"]] = len(children)
+        for position, child in enumerate(children):
+            sibling_positions[child["path"]] = position
+            pending.append(child)
+    tree_rows = [(scan_id, "physical", r["path"], r["parent_path"],
+                  sibling_positions[r["path"]], _dumps(r), child_counts[r["path"]])
                  for r in (records + directory_records)]
     tree_rows.append((scan_id, "physical", ".", None, 0, root_payload,
-                      len(records) + len(directory_records)))
+                      child_counts["."]))
 
     checkpoint = {"selected_paths": paths, "selection_version": 1,
                   "preliminary_summary_job_ids": [], "preliminary_node_job_ids": [],
