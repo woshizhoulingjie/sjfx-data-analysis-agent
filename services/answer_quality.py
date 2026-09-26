@@ -21,6 +21,10 @@ def enabled():
 STOP = {'资料', '文件', '文档', '问题', '这个', '什么', '如何', '是否', '为什么',
         '请问', '告诉', '说明', '一下', '详细', '分析', '哪些', 'the', 'and', 'is', 'are', 'of', 'in'}
 ASPECTS = (
+    ('实收数量', r'(?:实收|实际收到|已收到|收到|到货)[^。！？?\n]{0,18}(?:多少|几[台件份套辆箱]|数量)',
+     r'(?:实收|实际收到|实际到货|已收到|收到|已到货)(?:到货)?(?:数量)?\s*(?:为|是|：|:|共|了)?\s*\d+(?:\.\d+)?\s*(?:台|件|份|套|辆|箱|个|吨|千克)'),
+    ('缺少数量', r'(?:还缺|尚缺|缺少|缺口|未交付|待补交)[^。！？?\n]{0,12}(?:多少|几|数量)',
+     r'(?:还缺|尚缺|缺少|缺口|未交付|待补交)(?:数量)?\s*(?:为|是|：|:|共)?\s*\d+(?:\.\d+)?\s*(?:台|件|份|套|辆|箱|个|吨|千克)'),
     ('原因', r'为什么|原因|为何|why|cause', r'原因|由于|因为|因.{1,30}(?:延期|故障|导致)|导致|造成|because|due to|cause'),
     ('影响', r'影响|后果|impact|consequence', r'影响|后果|损失|延误|增加|减少|impact|loss|delay'),
     ('下一步', r'怎么办|下一步|建议|措施|如何改|怎么改|recommend|next step', r'建议|措施|计划|应当|需要|下一步|recommend|plan'),
@@ -207,8 +211,13 @@ def answer_contract(query, citations):
         hits = [item for item in citations if re.search(aspect['signal'], item.get('original_text', ''), re.I)]
         rows.append({'aspect': aspect['name'], 'candidate_citations': [x['citation_label'] for x in hits],
                      'state': 'candidate_support' if hits else 'not_located'})
-    return {'required_aspects': rows, 'question': query,
-            'instruction': '逐项回应用户问题。候选命中仅为词语信号，不代表事实充分；请核对条件、例外和矛盾。未定位不等于资料不存在。局部缺口不影响回答其他有依据部分。'}
+    instruction = '逐项回应用户问题。候选命中仅为词语信号，不代表事实充分；请核对条件、例外和矛盾。未定位不等于资料不存在。局部缺口不影响回答其他有依据部分。'
+    if any(row['aspect'] in {'实收数量', '缺少数量'} for row in rows):
+        instruction += ('数量问题分别写明实收与缺少的数值、单位及引用，不能用到货情况标题或验收状态代替数量。'
+                        '每项数量单独成句并紧接来源引用；优先忠实引用含数量的原文短句，不在同一句追加原文没有直接绑定的主语、日期或编号。'
+                        '优先用来源中的明确字段组成简洁事实句；独立记载的日期、编号和条件分别说明，不拼接成来源未明确记载的单一断言。'
+                        '资料没有数量时明确说明未能确定，不从其他对象借用数值。')
+    return {'required_aspects': rows, 'question': query, 'instruction': instruction}
 
 
 def output_budget(query, intent):
@@ -221,9 +230,10 @@ def output_budget(query, intent):
 def missing_answer_aspects(answer, contract):
     """Flag explicit multi-part omissions; do not pretend to judge sufficiency."""
     rows = contract.get('required_aspects') or []
-    if len(rows) < 2:
+    if not rows or (len(rows) < 2 and rows[0].get('aspect') not in {'实收数量', '缺少数量'}):
         return []
     patterns = {name: signal for name, _, signal in ASPECTS}
+    answer = str(answer or '').replace('**', '')
     return [row['aspect'] for row in rows
             if row.get('candidate_citations') and row.get('aspect') in patterns
             and not re.search(patterns[row['aspect']], answer, re.I)]
@@ -243,51 +253,72 @@ def claim_source(item, claim):
     return result
 
 
+def numeric_evidence_text(value):
+    """Bind only an explicit key's unit to its own value, never a nearby unit."""
+    unit = r'万元|亿元|元|吨|千克|公斤|台|件|份|套|辆|箱|人|个|%|％'
+    pattern = (r'(?P<key>[\u4e00-\u9fffA-Za-z_]{1,40}?)'
+               r'(?:[（(](?P<wrapped>' + unit + r')[）)]|(?P<plain>' + unit + r'))'
+               r'\s*[:：=]\s*(?P<number>[+-]?\d+(?:\.\d+)?)(?![\d.])')
+    return re.sub(pattern, lambda m: m['key'] + '=' + m['number'] + (m['wrapped'] or m['plain']), str(value or ''))
+
+
+def _quantity_label_text(value):
+    # Remove only a presentation label attached to an unchanged quantity role.
+    return re.sub(r'(实收|尚缺|还缺|缺少)数量\s*(?:为|是|[:：])?\s*', r'\1', value)
+
+
 def numeric_relation_supported(claim, evidence, numbers):
     """Conservative local entity/attribute check, not an entailment model.
 
     Each claimed number needs its own matching clause. No cross-clause union
     can transfer Beta's amount to Alpha. Unknown relations stay unverified.
     """
-    clean = re.sub(r'\[\d+\]', '', claim)
+    clean = _quantity_label_text(re.sub(r'\[\d+\]', '', claim))
+    evidence = _quantity_label_text(numeric_evidence_text(evidence))
     # Chinese commas always separate clauses. Only a comma between two digits
     # can be a numeric separator; a lead-in followed by ", 63.1%" is not one.
-    boundary = r'[。！？!?;；\n，]|\band\b|(?<!\d),|,(?!\d)'
+    boundary = r'[。！？!?;；\n，|]|\band\b|(?<!\d),|,(?!\d)'
     clauses = re.split(boundary + r'|(?<=[.!?])\s+', evidence, flags=re.I)
     claim_clauses = re.split(boundary, clean, flags=re.I)
     for number in numbers:
         value = re.sub(r'\s+', '', number)
-        local = next((c for c in claim_clauses if value in re.sub(r'\s+', '', c)), clean)
-        normalized = local.replace('的', '')
-        normalized = re.sub(r'\d+(?:\.\d+)?\s*(?:万元|亿元|万|亿|元|%|％|天|年|月|日)?', ' ', normalized)
-        anchors = terms(normalized) - {'is', 'was', '为', '万元'}
-        attributes = set(re.findall(r'预算|收入|支出|成本|利润|人数|面积|温度|交付|付款|验收|budget|income|cost|profit|temperature', local, re.I))
-        dates = re.findall(r'\d{4}年(?:\d{1,2}月)?(?:\d{1,2}日)?', local)
-        # Named English entities and explicit Chinese subject prefixes are hard anchors.
-        names = set(re.findall(r'\b[A-Z][a-zA-Z]{2,}\b', local)) - {'The', 'This', 'According'}
-        subject = re.search(r'([\u4e00-\u9fffA-Za-z0-9_-]{1,24}?)(?:的)?(?:预算|金额|付款|收入|支出|成本|利润|人数)', local)
-        subject = subject.group(1).strip('该本其中') if subject else ''
-        matches = []
-        for clause in clauses:
-            flat = re.sub(r'\s+', '', clause)
-            suffix = r'(?![\d.])' if value[-1:].isdigit() else ''
-            if not re.search(r'(?<![\d.])' + re.escape(value) + suffix, flat):
-                continue
-            if names and not all(name.lower() in clause.lower() for name in names):
-                continue
-            if subject and subject not in clause:
-                continue
-            if attributes and not all(a.lower() in clause.lower() for a in attributes):
-                continue
-            positions = [clause.find(date) for date in dates]
-            if dates and (min(positions) < 0 or positions != sorted(positions)):
-                continue
-            overlap = len(anchors & terms(clause.replace('的', ''))) / max(1, len(anchors))
-            if anchors and overlap < (0.30 if len(dates) >= 2 else 0.45):
-                continue
-            if bool(re.search(r'未|没有|不再|not\b', local, re.I)) != bool(re.search(r'未|没有|不再|not\b', clause, re.I)):
-                continue
-            matches.append(clause)
-        if not matches:
+        suffix = r'(?!\d|\.\d)' if value[-1:].isdigit() else ''
+        pattern = re.compile(r'(?<![\d.])' + re.escape(value) + suffix)
+        locals_for_value = [c for c in claim_clauses if pattern.search(re.sub(r'\s+', '', c))]
+        if not locals_for_value or not all(_numeric_clause_supported(local, clauses, pattern) for local in locals_for_value):
             return False
     return True
+
+
+def _numeric_clause_supported(local, clauses, pattern):
+    # Every occurrence must retain its field/entity binding. A first valid
+    # occurrence cannot validate the same value reused for another object.
+    normalized = local.replace('的', '')
+    normalized = re.sub(r'\d+(?:\.\d+)?\s*(?:万元|亿元|万|亿|元|%|％|天|年|月|日)?', ' ', normalized)
+    anchors = terms(normalized) - {'is', 'was', '为', '万元'}
+    attributes = set(re.findall(r'预算|收入|支出|成本|利润|人数|面积|温度|交付|付款|验收|budget|income|cost|profit|temperature', local, re.I))
+    dates = re.findall(r'\d{4}年(?:\d{1,2}月)?(?:\d{1,2}日)?', local)
+    # Named English entities and explicit Chinese subject prefixes are hard anchors.
+    names = set(re.findall(r'\b[A-Z][a-zA-Z]{2,}\b', local)) - {'The', 'This', 'According'}
+    subject = re.search(r'([\u4e00-\u9fffA-Za-z0-9_-]{1,24}?)(?:的)?(?:预算|金额|付款|收入|支出|成本|利润|人数)', local)
+    subject = subject.group(1).strip('该本其中') if subject else ''
+    for clause in clauses:
+        flat = re.sub(r'\s+', '', clause)
+        if not pattern.search(flat):
+            continue
+        if names and not all(name.lower() in clause.lower() for name in names):
+            continue
+        if subject and subject not in clause:
+            continue
+        if attributes and not all(a.lower() in clause.lower() for a in attributes):
+            continue
+        positions = [clause.find(date) for date in dates]
+        if dates and (min(positions) < 0 or positions != sorted(positions)):
+            continue
+        overlap = len(anchors & terms(clause.replace('的', ''))) / max(1, len(anchors))
+        if anchors and overlap < (0.30 if len(dates) >= 2 else 0.45):
+            continue
+        if bool(re.search(r'未|没有|不再|not\b', local, re.I)) != bool(re.search(r'未|没有|不再|not\b', clause, re.I)):
+            continue
+        return True
+    return False

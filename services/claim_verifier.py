@@ -13,7 +13,7 @@ from services import answer_quality as aq
 
 
 NUMBER_RE = re.compile(
-    r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*(?:%|％|万|亿|吨|元|天|次|例|倍|项|种|个|份|人|年|月|日)?"
+    r"(?<![A-Za-z0-9])[+-]?\d+(?:\.\d+)?\s*(?:%|％|万|亿|吨|元|天|次|例|倍|项|种|个|份|人|年|月|日)?"
 )
 SECTION_LABEL_RE = re.compile(
     r"^(?:直接回答|资料依据|主要结论|分析结论|核验后的结论|核验说明|进一步分析或建议|风险提示|"
@@ -408,7 +408,7 @@ class ClaimVerifier:
             claim_numbers = _numbers(check_text)
             citation_numbers = set()
             for item in named:
-                citation_numbers.update(_numbers(_citation_item(item).get("text")))
+                citation_numbers.update(_numbers(aq.numeric_evidence_text(_citation_item(item).get("text"))))
             numeric_supported = not claim_numbers or claim_numbers.issubset(citation_numbers)
             if aq.enabled() and claim_numbers and numeric_supported:
                 eligible = [item for item in named if aq.source_kind(item) != "preview"]
@@ -640,8 +640,11 @@ class ClaimVerifier:
             "deep_analysis_coverage": quality_metrics["candidate_deep_coverage"],
             "evidence_support_ratio": support_ratio,
         })
+        # Repair the answer that can survive the final guard, not a draft whose
+        # rejected statements only appear to cover the requested question.
+        retained_blocks = _readable_guard_blocks(verified_claims)[0] if aq.enabled() else []
         missing_aspects = aq.missing_answer_aspects(
-            str(turn_result.get("answer") or ""),
+            "\n\n".join(retained_blocks),
             (turn_result.get("input_manifest") or {}).get("answer_contract") or {},
         ) if aq.enabled() else []
         quality_metrics["possibly_missing_answer_aspects"] = missing_aspects
