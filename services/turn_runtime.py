@@ -16,6 +16,10 @@ from services.analysis_tools import (
     merge_retrieval_results,
 )
 from services.claim_verifier import ClaimVerifier
+from services import answer_quality as aq
+from services.answer_retention import (
+    advance_evidence_state, capture_candidate, evidence_state, select_candidate,
+)
 from services.conversation import ConversationScope, ConversationSession
 from services.research_memory import update_research_memory
 
@@ -619,11 +623,17 @@ class AnalysisTurnRuntime:
                     },
                 }
             revision_attempts = 0
+            retention_candidates = []
+            observed_evidence = evidence_state(retrieval_override)
             while (
                 verification.get("needs_revision")
                 and revision_attempts < self.max_revision_attempts
                 and verification_required
             ):
+                if aq.enabled():
+                    retention_candidates.append(capture_candidate(
+                        turn_result, verification, plan, working_session.as_dict(), observed_evidence
+                    ))
                 revision_attempts += 1
                 self._publish(
                     turn,
@@ -644,6 +654,7 @@ class AnalysisTurnRuntime:
                     top_k=50 if broad_package_question else 20,
                     **search_bounds,
                 )
+                observed_evidence = advance_evidence_state(observed_evidence, repair_retrieval)
                 retrieval_override = merge_retrieval_results(
                     [retrieval_override or {}, repair_retrieval], limit=40
                 )
@@ -691,6 +702,18 @@ class AnalysisTurnRuntime:
                     turn_id, repair_plan, turn_result, tool_results, batch_summary
                 )
                 plan = repair_plan
+
+            if retention_candidates:
+                retention_candidates.append(capture_candidate(
+                    turn_result, verification, plan, working_session.as_dict(), observed_evidence
+                ))
+                selected = select_candidate(
+                    retention_candidates, self.verifier, turn["question"],
+                    tool_results, batch_summary, self._checkpoint,
+                )
+                turn_result, verification, plan = (selected[key] for key in ("result", "verification", "plan"))
+                working_session = ConversationSession.from_dict(selected["session"])
+                turn_result = apply_scope_guard(turn_result)
 
             hard_unsupported = any(
                 item.get("status") == "unsupported"
