@@ -57,25 +57,30 @@ def file_fingerprint(sha256, size, modified_at_ns):
     return ("sha256:" + digest) if digest else "meta:%d:%d" % (int(size or 0), int(modified_at_ns or 0))
 
 
-def load_file_fingerprints(large_store, package_id, paths):
+def load_file_fingerprints(large_store, package_id, paths, *, strict=False):
     """从**大包库**读取选中文件的 sha256/大小/修改时间（§9.2 快照要用）。"""
     if not large_store or not paths:
         return {}
     out = {}
     try:
         with closing(large_store._connect()) as conn:
+            # All bounded batches must observe the same source-index revision.
+            conn.execute('BEGIN')
             for chunk_start in range(0, len(paths), 500):
                 chunk = list(paths[chunk_start:chunk_start + 500])
                 marks = ','.join('?' * len(chunk))
                 for row in conn.execute(
-                        "SELECT path,sha256,size,modified_at_ns FROM files "
+                        "SELECT path,sha256,size,modified_at_ns,sensitive FROM files "
                         "WHERE package_id=? AND path IN (%s)" % marks,
                         [str(package_id)] + chunk):
                     out[str(row['path'])] = {'sha256': row['sha256'],
                                              'size': row['size'],
-                                             'modified_at_ns': row['modified_at_ns']}
+                                             'modified_at_ns': row['modified_at_ns'],
+                                             'sensitive': bool(row['sensitive'])}
     except Exception:
         LOGGER.exception('load_file_fingerprints failed: %s', package_id)
+        if strict:
+            raise SelectionError('暂时无法核验来源文件版本，请稍后重试；未创建导入任务', 503)
     return out
 
 
@@ -278,6 +283,64 @@ def build_snapshot(selection, large_package):
     }
 
 
+def _import_identity(records, root_path, owner_id, parse_mode):
+    """Bounded metadata hashing, never a second read/copy of large source files."""
+    digest = hashlib.sha256()
+    for record in sorted(records, key=lambda item: item['path']):
+        item = record['payload']
+        version = [record['path'], str(item.get('sha256') or ''),
+                   int(item.get('size') or 0), int(item.get('modified_at_ns') or 0)]
+        digest.update(json.dumps(version, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+        digest.update(bytes([10]))
+    return {'version': 1, 'owner_id': str(owner_id or 'legacy'),
+            'parse_mode': 'fast' if parse_mode == 'fast' else 'accurate',
+            'root_path': str(Path(root_path)), 'source_versions': digest.hexdigest()}
+
+
+def _stored_import_identity(conn, record, snapshot):
+    """Recover pre-upgrade identity from persisted job options and inventory."""
+    scan = conn.execute('SELECT root_path,owner_id FROM scans WHERE id=?',
+                        (record['scan_id'],)).fetchone()
+    job = conn.execute('SELECT options,owner_id FROM analysis_jobs WHERE id=? AND scan_id=?',
+                       (record.get('job_id'), record['scan_id'])).fetchone()
+    if (not scan or not job or scan['owner_id'] != record.get('owner_id')
+            or job['owner_id'] != scan['owner_id']):
+        return None
+    try:
+        options = json.loads(job['options'] or '{}')
+        if not isinstance(options, dict) or options.get('parse_mode') not in {'fast', 'accurate', 'auto'}:
+            return None
+        if 'import_identity' in snapshot:
+            identity = snapshot['import_identity']
+            if (not isinstance(identity, dict) or identity.get('owner_id') != scan['owner_id']
+                    or identity.get('root_path') != str(Path(scan['root_path']))
+                    or identity.get('parse_mode') != ('fast' if options['parse_mode'] == 'fast' else 'accurate')
+                    or not _same_target_paths(snapshot.get('imported_paths'), options.get('target_paths'))):
+                return None
+            return identity
+        records = []
+        for row in conn.execute(
+                "SELECT node_path,payload FROM inventory_entries WHERE scan_id=? AND kind='file'",
+                (record['scan_id'],)):
+            item = json.loads(row['payload'] or '{}')
+            if not isinstance(item, dict) or item.get('path') != row['node_path']:
+                return None
+            records.append({'path': row['node_path'], 'payload': item})
+        if not records:
+            return None
+        if not _same_target_paths([item['path'] for item in records], options.get('target_paths')):
+            return None
+        return _import_identity(records, scan['root_path'], scan['owner_id'], options['parse_mode'])
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_target_paths(expected, actual):
+    return (isinstance(expected, list) and isinstance(actual, list)
+            and all(isinstance(path, str) for path in expected + actual)
+            and len(expected) == len(actual) and set(expected) == set(actual))
+
+
 # --------------------------------------------------------------------------
 # 幂等与引用（文档 §5.3 / §9.3）
 # --------------------------------------------------------------------------
@@ -300,20 +363,24 @@ def find_import(storage, large_package_id, request_key, *, conn=None):
     return dict(row) if row else None
 
 
-def find_active_import_by_fingerprint(storage, large_package_id, fingerprint, *, conn=None):
+def find_active_import_by_fingerprint(storage, large_package_id, fingerprint, *, identity=None, conn=None):
     """§5.3：同一大包内选择指纹相同且任务仍活动的导入 → 复用，避免重复解析。"""
     if not fingerprint:
         return None
     if conn is None:
         _ensure_table(storage)
         with storage._connect() as current:
-            return find_active_import_by_fingerprint(storage, large_package_id, fingerprint, conn=current)
+            return find_active_import_by_fingerprint(storage, large_package_id, fingerprint,
+                                                     identity=identity, conn=current)
     # Do not lose active jobs behind an arbitrary recent-history limit. Iterate
     # records instead of loading all selection snapshots into Python memory.
+    owner_clause = ' AND i.owner_id=? AND s.owner_id=?' if identity else ''
+    params = [str(large_package_id)]
+    if identity:
+        params.extend([identity['owner_id'], identity['owner_id']])
     rows = conn.execute(
         "SELECT i.* FROM large_catalog_imports i JOIN scans s ON s.id=i.scan_id "
-        "WHERE i.large_package_id=? ORDER BY i.created_at DESC",
-        (str(large_package_id),))
+        "WHERE i.large_package_id=?" + owner_clause + " ORDER BY i.created_at DESC", params)
     for row in rows:
         record = dict(row)
         try:
@@ -322,11 +389,15 @@ def find_active_import_by_fingerprint(storage, large_package_id, fingerprint, *,
             continue
         if not isinstance(prior, dict) or prior.get("selection_fingerprint") != fingerprint:
             continue
+        if identity is not None and _stored_import_identity(conn, record, prior) != identity:
+            continue
         scan_id = record.get("scan_id")
-        job = conn.execute("SELECT status FROM analysis_jobs WHERE scan_id=? "
-                           "ORDER BY created_at DESC LIMIT 1", (scan_id,)).fetchone()
+        job = conn.execute('SELECT status FROM analysis_jobs WHERE id=? AND scan_id=?',
+                           (record.get('job_id'), scan_id)).fetchone()
         task = conn.execute("SELECT status FROM import_tasks WHERE scan_id=? LIMIT 1",
                             (scan_id,)).fetchone()
+        if not job or not task:
+            continue
         job_status = str((job or {})["status"] if job else "")
         task_status = str((task or {})["status"] if task else "")
         done = {"completed", "partial", "failed", "cancelled", "deleted"}
@@ -347,15 +418,19 @@ def _scan_alive(storage, scan_id, *, conn=None):
     return bool(row)
 
 
-def _request_reuse(existing, fingerprint):
+def _request_reuse(existing, fingerprint, *, identity=None, storage=None, conn=None):
     """The same key has the same conflict rules before and inside a transaction."""
+    if identity is not None and conn is None:
+        with storage._connect() as current:
+            return _request_reuse(existing, fingerprint, identity=identity, conn=current)
     try:
         prior = json.loads(existing.get("selection_snapshot") or "{}")
     except (TypeError, ValueError):
         prior = {}
-    if not isinstance(prior, dict) or (prior.get("selection_fingerprint") and
-                                      prior["selection_fingerprint"] != fingerprint):
+    if not isinstance(prior, dict) or prior.get("selection_fingerprint") != fingerprint:
         raise SelectionError("相同请求号的选择与首次不一致，请更换请求号重试", 409)
+    if identity is not None and _stored_import_identity(conn, existing, prior) != identity:
+        raise SelectionError('相同请求号的账号、解析模式或来源文件版本已变化，请刷新后使用新请求号', 409)
     return {"scan_id": existing["scan_id"], "job_id": existing.get("job_id"),
             "selected_file_count": int(existing.get("selected_file_count") or 0),
             "selected_bytes": int(existing.get("selected_bytes") or 0),
@@ -533,7 +608,8 @@ def _inventory_records(selection, large_package, fingerprints=None):
         path = str(item.get("path") or "")
         if not path:
             continue
-        if bool(item.get("sensitive")):
+        mark = fingerprints.get(path) or {}
+        if bool(item.get("sensitive")) or bool(mark.get('sensitive')):
             excluded["sensitive"] += 1
             continue
         if looks_like_archive_member(path):
@@ -541,7 +617,6 @@ def _inventory_records(selection, large_package, fingerprints=None):
             continue
         parent = path.rsplit("/", 1)[0] if "/" in path else "."
         directories.setdefault(parent, True)
-        mark = fingerprints.get(path) or {}
         records.append({
             "path": path,
             "parent_path": parent,
@@ -582,17 +657,47 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
     paths = list(snapshot["paths"])
     if not paths:
         raise SelectionError("没有可导入的有效文件")
+    if parse_mode not in {'auto', 'fast', 'accurate'}:
+        raise SelectionError('解析模式只能是 auto、fast 或 accurate')
+    root_path = str(large_package.get('root_path') or '')
+    owner = str(owner_id or 'legacy')
+    marks = load_file_fingerprints(large_store, package_id, paths, strict=True)
+    inventory = selection.get('inventory') or {}
+    if set(inventory) != set(paths):
+        raise SelectionError('选择与文件清单不一致，请刷新后重试', 409)
+    for path in paths:
+        item = inventory[path] or {}
+        if item.get('path') != path:
+            raise SelectionError('选择与文件清单不一致，请刷新后重试', 409)
+        if large_store is not None:
+            mark = marks.get(path)
+            if mark is None or any(int(mark.get(field) or 0) != int(item.get(field) or 0)
+                                   for field in ('size', 'modified_at_ns')):
+                raise SelectionError('来源文件在选择后发生变化，请刷新目录后重试', 409)
+    records, directories, excluded_counts = _inventory_records(
+        selection, large_package, fingerprints=marks)
+    if not records:
+        if excluded_counts['archive_member']:
+            raise SelectionError('压缩包内部成员暂不支持直接进入普通导入（首版限制）', 409)
+        if excluded_counts['sensitive']:
+            raise SelectionError('选中的文件都被标记为敏感，不能进入普通导入')
+        raise SelectionError('没有可导入的有效文件')
+    identity = _import_identity(records, root_path, owner, parse_mode)
+    snapshot['import_identity'] = identity
+    # Keep the requested scope for audit, but never send excluded paths to a worker.
+    paths = [record['path'] for record in records]
+    snapshot['imported_paths'] = paths
 
     existing = find_import(storage, package_id, request_key)
     if existing and _scan_alive(storage, existing.get("scan_id")):
-        return _request_reuse(existing, fingerprint)
+        return _request_reuse(existing, fingerprint, identity=identity, storage=storage)
     if existing:
         # Phase 3 任务恢复：幂等记录还在、普通数据包已被删除 → 不返回死 id，重建。
         LOGGER.warning('large catalog import request=%s 指向的普通数据包已不存在，重建任务',
                        request_key)
 
     # §5.3 第三条：相同文件集合且任务仍活动 → 复用，不做第二次解析。
-    active = find_active_import_by_fingerprint(storage, package_id, fingerprint)
+    active = find_active_import_by_fingerprint(storage, package_id, fingerprint, identity=identity)
     if active:
         LOGGER.info('large catalog import reused by fingerprint package=%s scan=%s',
                     package_id, active.get("scan_id"))
@@ -604,20 +709,12 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
     scan_id = "scan-" + uuid.uuid4().hex[:12]
     job_id = uuid.uuid4().hex[:12]
     bridge_id = uuid.uuid4().hex[:16]
-    root_path = str(large_package.get("root_path") or "")
     now = time.time()
-    owner = str(owner_id or "legacy")
-
-    records, directories, excluded_counts = _inventory_records(
-        selection, large_package,
-        fingerprints=load_file_fingerprints(large_store, package_id, paths))
-    if not records:
-        if excluded_counts["archive_member"]:
-            raise SelectionError("压缩包内部成员暂不支持直接进入普通导入（首版限制）", 409)
-        if excluded_counts["sensitive"]:
-            raise SelectionError("选中的文件都被标记为敏感，不能进入普通导入")
-        raise SelectionError("没有可导入的有效文件")
     total_bytes = sum(int(r["payload"]["size"]) for r in records)
+    snapshot['requested_file_count'] = snapshot['selected_file_count']
+    snapshot['requested_bytes'] = snapshot['selected_bytes']
+    snapshot['selected_file_count'] = len(records)
+    snapshot['selected_bytes'] = total_bytes
     type_counts = {}
     for record in records:
         ext = record["payload"]["extension"] or "(none)"
@@ -626,7 +723,7 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
     scan_payload = {
         "root": root_path, "scan_id": scan_id,
         "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "parse_mode": "accurate" if parse_mode == "accurate" else "fast",
+        "parse_mode": identity['parse_mode'],
         "inventory_mode": "large_catalog_selection_v1",
         "inventory_complete": True,
         "file_count": len(records),
@@ -687,7 +784,7 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
         # Provenance remains separately recorded in the scan and checkpoint.
         "workflow_source": "selected_file_parse",
         "scope_label": "来自大数据包智能目录的选择（%d 个文件）" % len(paths),
-        "parse_mode": parse_mode if parse_mode != "auto" else "accurate",
+        "parse_mode": identity['parse_mode'],
         "continue_full": False,
         "candidate_preview": False,
         "selection_version": 1,
@@ -718,8 +815,9 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
             # before inserting anything; no nested DDL/connection may release it.
             existing = find_import(storage, package_id, request_key, conn=conn)
             if existing and _scan_alive(storage, existing.get("scan_id"), conn=conn):
-                return _request_reuse(existing, fingerprint)
-            active = find_active_import_by_fingerprint(storage, package_id, fingerprint, conn=conn)
+                return _request_reuse(existing, fingerprint, identity=identity, conn=conn)
+            active = find_active_import_by_fingerprint(storage, package_id, fingerprint,
+                                                       identity=identity, conn=conn)
             if active:
                 return {"scan_id": active["scan_id"], "job_id": active.get("job_id"),
                         "selected_file_count": int(active.get("selected_file_count") or 0),

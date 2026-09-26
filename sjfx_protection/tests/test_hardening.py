@@ -58,10 +58,18 @@ def test_absolute_local_paths(path):
     assert local_path(path)
 
 
-@pytest.mark.parametrize('value', [float('nan'), float('inf'), -1, 'invalid', None, time.time() + 600])
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), -1, 'invalid', None, 1_700_000_600, 1_700_000_300.001])
 def test_bad_event_clock(value):
+    # Collection-to-execution delays must not move an invalid future event
+    # inside the permitted clock-skew window during a long regression run.
     with pytest.raises(ProtectionError):
-        timestamp(value, time.time())
+        timestamp(value, 1_700_000_000)
+
+
+@pytest.mark.parametrize('offset', [-0.001, 0, 300])
+def test_event_clock_permitted_boundary(offset):
+    now = 1_700_000_000
+    assert timestamp(now + offset, now) == now + offset
 
 
 def test_modified_without_fingerprint_invalidates_gate(scenario):
