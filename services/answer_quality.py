@@ -253,18 +253,94 @@ def claim_source(item, claim):
     return result
 
 
+NUMERIC_UNITS = r'万元|亿元|千克|公斤|毫米|厘米|公里|平方米|立方米|%|％|万|亿|吨|元|台|件|套|辆|箱|米|天|次|例|倍|项|种|个|份|人|年|月|日'
+QUANTITY_VALUE = r'[+-]?\d+(?:\.\d+)?\s*(?:台|件|份|套|辆|箱|个|吨|千克|公斤|毫米|厘米|米)'
+RECORD_ID = r'(?<![A-Za-z0-9])[A-Z][A-Z0-9]{0,15}(?:-\d+){1,3}(?![A-Za-z0-9-])'
+
+
+def numeric_text(value):
+    """Normalize valid three-digit grouping only, retaining signs and scale."""
+    return re.sub(r'(?<![A-Za-z0-9_.,])([+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?)(?![\d,]|\.\d)',
+                  lambda match: match[0].replace(',', ''), str(value or ''))
+
+
+def _numeric_match_text(value):
+    # Whitespace can separate two independent numbers (an ID and a date).
+    # Normalize only a quantity's number/unit spacing, never join tokens.
+    return re.sub(r'(?<=\d)\s+(?=(?:' + NUMERIC_UNITS + '))', '', value)
+
+
 def numeric_evidence_text(value):
     """Bind only an explicit key's unit to its own value, never a nearby unit."""
     unit = r'万元|亿元|元|吨|千克|公斤|台|件|份|套|辆|箱|人|个|%|％'
     pattern = (r'(?P<key>[\u4e00-\u9fffA-Za-z_]{1,40}?)'
                r'(?:[（(](?P<wrapped>' + unit + r')[）)]|(?P<plain>' + unit + r'))'
                r'\s*[:：=]\s*(?P<number>[+-]?\d+(?:\.\d+)?)(?![\d.])')
-    return re.sub(pattern, lambda m: m['key'] + '=' + m['number'] + (m['wrapped'] or m['plain']), str(value or ''))
+    return re.sub(pattern, lambda m: m['key'] + '=' + m['number'] + (m['wrapped'] or m['plain']), numeric_text(value))
 
 
 def _quantity_label_text(value):
     # Remove only a presentation label attached to an unchanged quantity role.
     return re.sub(r'(实收|尚缺|还缺|缺少)数量\s*(?:为|是|[:：])?\s*', r'\1', value)
+
+
+def _projects(value):
+    return set(re.findall(r'[\u4e00-\u9fffA-Za-z0-9_-]{1,24}项目', value))
+
+
+def _quantity_roles(value):
+    roles = set()
+    if re.search(r'实收|实际收到|已收到|已到货', value):
+        roles.add('received')
+    if re.search(r'尚缺|还缺|缺少', value):
+        roles.add('missing')
+    return roles
+
+
+def _quantity_context_clauses(evidence, boundary):
+    """Carry identity/date metadata, never another clause's facts or amounts.
+
+    Only explicit short records seed context. A new project or record date
+    replaces it; field/line boundaries and distance expire it. Context is an
+    internal matching aid, never generated prose or a rewritten citation.
+    """
+    pieces = re.split('(' + boundary + r'|(?<=[.!?])\s+)', evidence, flags=re.I)
+    output, projects, identifiers, date = [], set(), {}, ''
+    offset, origin, age = 0, -1000, 0
+    for index in range(0, len(pieces), 2):
+        clause = pieces[index]
+        separator = pieces[index + 1] if index + 1 < len(pieces) else ''
+        age += 1
+        if offset - origin > 500 or age > 8:
+            projects, identifiers, date = set(), {}, ''
+        current = _projects(clause)
+        if current and current != projects:
+            projects, identifiers, date = set(), {}, ''
+        record = bool(re.search(r'记录|台账|清单', clause))
+        disallowed = bool(re.search(r'无关|不涉及|若|如果|假设|假如', clause))
+        if record and re.search(r'计划|预计|希望|拟', clause):
+            disallowed = True
+        quantity = bool(re.search(QUANTITY_VALUE, clause))
+        field_only = bool(re.match(r'^\s*(?:计划交付|实收|尚缺|还缺|缺少|已收到|实际收到|已到货)', clause))
+        if disallowed or (quantity and not field_only):
+            projects, identifiers, date = set(), {}, ''
+        if len(current) == 1 and record and not disallowed:
+            projects, origin, age = current, offset, 0
+        dated = re.search(r'(?:记录时间|记录日期|巡检日期|统计日期)\s*[:：]?\s*(\d{4}年\d{1,2}月\d{1,2}日)', clause)
+        if dated and not disallowed:
+            date, origin, age = dated[1], offset, 0
+        if (projects or date) and not disallowed:
+            for identifier in re.findall(RECORD_ID, clause):
+                identifiers[identifier.split('-')[0]] = identifier
+        if quantity and field_only and (projects or date) and not disallowed:
+            context = ' '.join(sorted(projects) + list(identifiers.values()) + ([date] if date else []))
+            output.append(clause + ' ' + context)
+        else:
+            output.append(clause)
+        offset += len(clause) + len(separator)
+        if re.search(r'[\n;；|]', separator):
+            projects, identifiers, date = set(), {}, ''
+    return output
 
 
 def numeric_relation_supported(claim, evidence, numbers):
@@ -273,18 +349,18 @@ def numeric_relation_supported(claim, evidence, numbers):
     Each claimed number needs its own matching clause. No cross-clause union
     can transfer Beta's amount to Alpha. Unknown relations stay unverified.
     """
-    clean = _quantity_label_text(re.sub(r'\[\d+\]', '', claim))
+    clean = _quantity_label_text(numeric_text(re.sub(r'\[\d+\]', '', claim)))
     evidence = _quantity_label_text(numeric_evidence_text(evidence))
     # Chinese commas always separate clauses. Only a comma between two digits
     # can be a numeric separator; a lead-in followed by ", 63.1%" is not one.
     boundary = r'[。！？!?;；\n，|]|\band\b|(?<!\d),|,(?!\d)'
-    clauses = re.split(boundary + r'|(?<=[.!?])\s+', evidence, flags=re.I)
+    clauses = _quantity_context_clauses(evidence, boundary)
     claim_clauses = re.split(boundary, clean, flags=re.I)
     for number in numbers:
-        value = re.sub(r'\s+', '', number)
+        value = re.sub(r'\s+', '', numeric_text(number))
         suffix = r'(?!\d|\.\d)' if value[-1:].isdigit() else ''
         pattern = re.compile(r'(?<![\d.])' + re.escape(value) + suffix)
-        locals_for_value = [c for c in claim_clauses if pattern.search(re.sub(r'\s+', '', c))]
+        locals_for_value = [c for c in claim_clauses if pattern.search(_numeric_match_text(c))]
         if not locals_for_value or not all(_numeric_clause_supported(local, clauses, pattern) for local in locals_for_value):
             return False
     return True
@@ -294,7 +370,7 @@ def _numeric_clause_supported(local, clauses, pattern):
     # Every occurrence must retain its field/entity binding. A first valid
     # occurrence cannot validate the same value reused for another object.
     normalized = local.replace('的', '')
-    normalized = re.sub(r'\d+(?:\.\d+)?\s*(?:万元|亿元|万|亿|元|%|％|天|年|月|日)?', ' ', normalized)
+    normalized = re.sub(r'[+-]?\d+(?:\.\d+)?\s*(?:' + NUMERIC_UNITS + ')?', ' ', normalized)
     anchors = terms(normalized) - {'is', 'was', '为', '万元'}
     attributes = set(re.findall(r'预算|收入|支出|成本|利润|人数|面积|温度|交付|付款|验收|budget|income|cost|profit|temperature', local, re.I))
     dates = re.findall(r'\d{4}年(?:\d{1,2}月)?(?:\d{1,2}日)?', local)
@@ -302,9 +378,21 @@ def _numeric_clause_supported(local, clauses, pattern):
     names = set(re.findall(r'\b[A-Z][a-zA-Z]{2,}\b', local)) - {'The', 'This', 'According'}
     subject = re.search(r'([\u4e00-\u9fffA-Za-z0-9_-]{1,24}?)(?:的)?(?:预算|金额|付款|收入|支出|成本|利润|人数)', local)
     subject = subject.group(1).strip('该本其中') if subject else ''
+    projects = _projects(local)
+    identifiers = set(re.findall(RECORD_ID, local))
+    roles = _quantity_roles(local)
     for clause in clauses:
-        flat = re.sub(r'\s+', '', clause)
+        flat = _numeric_match_text(clause)
         if not pattern.search(flat):
+            continue
+        if projects and projects != _projects(clause):
+            continue
+        if identifiers and not identifiers.issubset(set(re.findall(RECORD_ID, clause))):
+            continue
+        if roles and roles != _quantity_roles(clause):
+            continue
+        if roles and (bool(re.search(r'计划|预计|希望|拟', local)) !=
+                      bool(re.search(r'计划|预计|希望|拟', clause))):
             continue
         if names and not all(name.lower() in clause.lower() for name in names):
             continue

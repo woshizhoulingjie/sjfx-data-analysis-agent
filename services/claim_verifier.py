@@ -13,7 +13,7 @@ from services import answer_quality as aq
 
 
 NUMBER_RE = re.compile(
-    r"(?<![A-Za-z0-9])[+-]?\d+(?:\.\d+)?\s*(?:%|％|万|亿|吨|元|天|次|例|倍|项|种|个|份|人|年|月|日)?"
+    r"(?<![A-Za-z0-9])[+-]?\d+(?:\.\d+)?\s*(?:" + aq.NUMERIC_UNITS + r")?"
 )
 SECTION_LABEL_RE = re.compile(
     r"^(?:直接回答|资料依据|主要结论|分析结论|核验后的结论|核验说明|进一步分析或建议|风险提示|"
@@ -33,7 +33,7 @@ NEGATION_RE = re.compile(r"(?:未|无|没有|不能|无法|不可|并非|不再|
 
 
 def _numbers(value: Any) -> set:
-    value = re.sub(r"\[\d+\]", "", str(value or ""))
+    value = aq.numeric_text(re.sub(r"\[\d+\]", "", str(value or "")))
     return {re.sub(r"\s+", "", item) for item in NUMBER_RE.findall(value)}
 
 
