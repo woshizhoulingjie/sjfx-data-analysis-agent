@@ -296,6 +296,10 @@ class LargePackageStore:
             # and catalog telemetry.  Without these, growth in one package
             # makes each worker poll scan rows belonging to every package.
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_queue_package_ready ON queue(package_id,stage,status,updated_at)")
+            # Ready-only ordered indexes avoid sorting a whole remaining package
+            # on every lane refill; terminal history is not part of these indexes.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_lp_claim_ready_time ON queue(package_id,stage,updated_at) WHERE status IN ('queued','retry')")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_lp_claim_ready_priority ON queue(package_id,stage,attempts,priority,updated_at) WHERE status IN ('queued','retry')")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_files_deep_updated ON files(package_id,deep_status,updated_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_files_topic ON files(package_id,topic)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_files_recognition ON files(package_id,recognition_status)")
@@ -311,6 +315,8 @@ class LargePackageStore:
             # databases as well as existing production databases.
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_catalog_calls_package_status ON lp_catalog_calls(package_id,status,started)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_large_catalog_labels_package_revision ON lp_catalog_labels(package_id,revision,group_id)")
+            from services.large_qa_changes import install as init_qa_changes
+            init_qa_changes(conn)
 
     @staticmethod
     def _row(row):
@@ -1255,12 +1261,36 @@ class LargePackageStore:
 
     def get_file(self, package_id, path):
         """Fetch one manifest row by its exact relative path."""
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT * FROM files WHERE package_id=? AND path=?",
                 (str(package_id), str(path)),
             ).fetchone()
         return self._decorate_files(package_id, [self._row(row)])[0] if row else None
+
+    def get_files(self, package_id, paths, *, decorate=True):
+        """Read exact paths in bounded batches, without changing file contents.
+
+        This is an internal package-scoped equivalent of repeated get_file calls.
+        Missing paths are omitted; callers retain their own ranking/order. No
+        result is cached across calls, so source changes cannot reuse stale rows.
+        """
+        paths = list(dict.fromkeys(str(path) for path in paths))
+        if not paths:
+            return {}
+        result = {}
+        with closing(self._connect()) as conn:
+            for offset in range(0, len(paths), 128):
+                chunk = paths[offset:offset + 128]
+                marks = ','.join('?' for _ in chunk)
+                rows = conn.execute(
+                    'SELECT * FROM files WHERE package_id=? AND path IN (' + marks + ')',
+                    [str(package_id)] + chunk).fetchall()
+                files = [self._row(row) for row in rows]
+                if decorate:
+                    files = self._decorate_files(package_id, files)
+                result.update((row['path'], row) for row in files)
+        return result
 
     def _decorate_files(self, package_id, files):
         from services.large_package_catalog_view import decorate_files
@@ -1719,6 +1749,7 @@ def _closing_entries(entries):
 
 
 def iter_inventory(root, on_error=None):
+    from services.large_package_resources import resource_code
     root = _under_allowed_root(root)
     stack = [root]
     while stack:
@@ -1726,6 +1757,8 @@ def iter_inventory(root, on_error=None):
         try:
             entries = os.scandir(folder)
         except OSError as exc:
+            if resource_code(exc):
+                raise
             if on_error:on_error(str(folder),str(exc))
             continue
         for entry in _closing_entries(entries):
@@ -1733,6 +1766,8 @@ def iter_inventory(root, on_error=None):
             try:
                 stat = entry.stat(follow_symlinks=False)
             except OSError as exc:
+                if resource_code(exc):
+                    raise
                 if on_error:on_error(str(path),str(exc))
                 continue
             rel = str(path.relative_to(root)).replace("\\", "/")

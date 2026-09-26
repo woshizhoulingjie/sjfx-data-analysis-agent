@@ -5,9 +5,12 @@ import logging
 import re
 import threading
 from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
+import unicodedata
 
 from services.large_qa_index import LargeQAIndex, loads, tokens, plain_text
+from services import large_qa_thai as thai
 
 LOGGER=logging.getLogger(__name__)
 _vectors=OrderedDict()
@@ -114,10 +117,10 @@ def rrf(lists,k=60):
     return scores
 
 
-def select_material(rows,query,limit=40,global_mode=False):
-    remaining=[dict(r) for r in rows]; chosen=[]; topics=set(); bodies=set(); terms_q=set(tokens(query))
+def select_material(rows,query,limit=40,global_mode=False,tokenizer=tokens):
+    remaining=[dict(r) for r in rows]; chosen=[]; topics=set(); bodies=set(); terms_q=set(tokenizer(query))
     for row in remaining:
-        row['_terms']=set(tokens(row['text']))
+        row['_terms']=set(tokenizer(row['text']))
         row['_redundancy']=0
         row['_rel']=len(row['_terms']&terms_q)/max(1,len(terms_q))
         row['_exception']=bool(re.search(r'例外|争议|但是|除非|however|unless|except',row['text'],re.I))
@@ -217,6 +220,23 @@ def retrieve(store,request,base=None,query_vector=None):
         # query_only disallows temp writes too; use bound IN clauses in manageable batches.
         lexical=[]; lexical_seen=set()
         terms=list(dict.fromkeys(tokens(query)))[:48]
+        thai_lexical=[]
+        tokenizer=tokens
+        if thai.has_thai(query):
+            try:
+                if not thai.ready(c,meta):
+                    warnings.append('泰文关键词索引正在准备或需要更新；本轮仍使用已有检索，可能遗漏泰文材料。')
+                else:
+                    thai_terms=list(dict.fromkeys(thai.thai_tokens(query)))[:48]
+                    thai_lexical=thai.candidates(c,thai_terms,allowed)
+                    query_words=[(term,bytes.fromhex(term[2:]).decode('utf8')) for term in thai_terms]
+                    @lru_cache(maxsize=512)
+                    def tokenizer(text):
+                        normalized=unicodedata.normalize('NFC',text)
+                        return tokens(text)+thai.thai_tokens(text)+[term for term,word in query_words if word in normalized]
+            except Exception:
+                LOGGER.warning('Thai lexical retrieval unavailable',exc_info=True)
+                warnings.append('泰文关键词检索暂不可用；本轮仍使用已有检索，可能遗漏泰文材料。')
         if terms and allowed:
             expression=' OR '.join('"'+t.replace('"','""')+'"' for t in terms)
             # Authorization is included before LIMIT, so a tiny scope cannot be
@@ -241,13 +261,15 @@ def retrieve(store,request,base=None,query_vector=None):
                 rows[chunk_id]=dict(row)
         for chunk_id,_ in lexical:
             get_chunk(chunk_id)
+        for chunk_id,_ in thai_lexical:
+            get_chunk(chunk_id)
         vector_ids=[]
         for path,_ in vectors:
             candidates=c.execute('SELECT c.*,d.topic,d.topic_name,d.size,d.mtime FROM chunks c JOIN documents d USING(path) WHERE path=? ORDER BY kind,ordinal',(path,)).fetchall()
             # Full cached file text is indexed; choose query-relevant windows,
             # not merely the first paragraph of a semantic file hit.
-            q=set(terms)
-            candidates=sorted(candidates,key=lambda r:len(q&set(tokens(r['text']))),reverse=True)[:3]
+            q=set(tokenizer(query)) if tokenizer is not tokens else set(terms)
+            candidates=sorted(candidates,key=lambda r:len(q&set(tokenizer(r['text']))),reverse=True)[:3]
             for row in candidates:
                 vector_ids.append(row['id']);rows[row['id']]=dict(row)
         topics=index.topic_material(c,allowed) if global_mode else []
@@ -266,7 +288,7 @@ def retrieve(store,request,base=None,query_vector=None):
                     row=c.execute('SELECT c.*,d.topic,d.topic_name,d.size,d.mtime FROM chunks c JOIN documents d USING(path) WHERE path=? ORDER BY kind,ordinal LIMIT 1',(path,)).fetchone()
                     if row:
                         rows[row['id']]=dict(row);topic_ids.append(row['id'])
-        scores=rrf([[x[0] for x in lexical],vector_ids,topic_ids])
+        scores=rrf([[x[0] for x in lexical],vector_ids,topic_ids,[x[0] for x in thai_lexical]])
         for key,row in rows.items():
             row['fusion']=scores.get(key,0)
         # Physical changes invalidate both original excerpts and old summaries.
@@ -282,7 +304,7 @@ def retrieve(store,request,base=None,query_vector=None):
             except OSError:
                 continue
             fresh.append(row)
-        chosen=select_material(fresh,query,50 if global_mode else max(10,min(40,request.top_k)),global_mode)
+        chosen=select_material(fresh,query,50 if global_mode else max(10,min(40,request.top_k)),global_mode,tokenizer=tokenizer)
         counts={'total':len(allowed),'summaries':0,'originals':0,'partial':0}
         for row in c.execute('SELECT path,summary!="" summary,parse_complete,parse_status FROM documents'):
             if row['path'] in allowed:
@@ -313,6 +335,7 @@ def retrieve(store,request,base=None,query_vector=None):
                                    'summary_coverage':counts['summaries']/max(1,counts['total']),
                                    'complete':counts['summaries']==counts['total'],'basis':'summary_index_only'}},
                 'retrieval_stats':{'keyword_candidates':len(lexical),'semantic_files':len(vectors),'vector_backend':backend,
+                                   'thai_keyword_candidates':len(thai_lexical),
                                    'selected_evidence':len(chosen),'scope_files':len(allowed)}}
     try:
         index.enqueue([r['path'] for r in chosen])

@@ -52,6 +52,24 @@ def decorate_files(store, package_id, files):
     return files
 
 
+def _pending_reason(package):
+    """A5：把"这份目录还没跑完"如实告诉界面，避免用户以为是命名失败。
+
+    为什么必须有它：`cancelled`/`paused` 的包会留下半成品目录（实测 4 个包共
+    26,054 个文件），没有名字的组会显示成"内容线索：<原始片段>"，看起来像命名
+    出了错，实际是任务被取消/暂停。只读，不写任何东西。
+    """
+    status=str((package or {}).get('status') or '')
+    phase=str((package or {}).get('phase') or '')
+    if status=='cancelled':
+        return {'code':'cancelled','status':status,'phase':phase,
+                'message':'该包已取消：目录是取消时的中间结果，部分条目尚未命名'}
+    if status=='paused':
+        return {'code':'paused','status':status,'phase':phase,
+                'message':'该包已暂停：目录尚未跑完，恢复后会继续命名'}
+    return {}
+
+
 def enhance_catalog(store,package_id,result,limit=200,offset=0,query=''):
     with closing(store._connect()) as c:
         total=c.execute('SELECT COUNT(*) FROM large_catalog_groups WHERE package_id=?',(package_id,)).fetchone()[0]
@@ -102,9 +120,11 @@ def enhance_catalog(store,package_id,result,limit=200,offset=0,query=''):
         attempted=c.execute("SELECT COUNT(*) FROM files WHERE package_id=? AND quick_status IN ('completed','failed')",(package_id,)).fetchone()[0]
         catalog_states = dict(c.execute('SELECT ' + CATALOG_STATE_SQL +
                                        ',COUNT(*) FROM files f WHERE f.package_id=? GROUP BY 1', (package_id,)))
+    catalog_pending=_pending_reason(store.get(package_id) or {})
     inventory=(store.get(package_id) or {}).get('counts') or {}
     result['inventory']={key:inventory.get(key) for key in ('inventory_complete','inventory_error_count','inventory_errors')}
-    result['smart'].update(topics=topics,branches=branches,navigation=navigation,topic_total=total+unknown_total,
+    result['smart'].update(catalog_pending=catalog_pending,
+                           topics=topics,branches=branches,navigation=navigation,topic_total=total+unknown_total,
                            catalog_states=catalog_states,
                            theme_total=sum(b.get('status') != 'pending' for b in branches),
                            leaf_total=total, hierarchy='recursive_content_tree',

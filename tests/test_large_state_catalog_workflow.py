@@ -211,7 +211,7 @@ class StateCatalogTests(unittest.TestCase):
         self.assertEqual(self.store.file_page(self.pid, node_id='topic:fixture')['total'], 2)
         smart = self.store.catalog(self.pid)['smart']
         self.assertEqual(smart['theme_total'], 1)
-        self.assertEqual(smart['hierarchy'], 'theme_leaf_files')
+        self.assertEqual(smart['hierarchy'], 'recursive_content_tree')
         self.assertEqual(smart['branches'][0]['files'], 2)
 
     def test_stale_revision_does_not_hide_real_members(self):
@@ -235,7 +235,7 @@ class StateCatalogTests(unittest.TestCase):
         smart = enhance_catalog(self.store, self.pid, {'smart': {}})['smart']
         self.assertEqual(smart['topics'][0]['files'], 1)
 
-    def test_small_package_generates_theme_above_leaf(self):
+    def test_small_package_keeps_single_leaf_browsable_without_inventing_theme(self):
         self.group('g1', ['one.txt'])
         model = Mock()
         model.supports_json_response_format = True
@@ -244,8 +244,12 @@ class StateCatalogTests(unittest.TestCase):
             result = naming.merge_topics(self.store, self.pid, {'id': 'round', 'deadline': time.time() + 60}, model_client=model)
         self.assertTrue(result)
         smart = self.store.catalog(self.pid)['smart']
-        self.assertEqual(smart['theme_total'], 1)
+        self.assertEqual(smart['theme_total'], 0)
+        self.assertEqual(smart['branches'][0]['node_id'], 'branch:unassigned')
         self.assertEqual(smart['branches'][0]['children'], ['g1'])
+        self.assertEqual(self.store.file_page(self.pid, node_id='g1')['total'], 1)
+        self.assertEqual(self.store.file_page(self.pid, node_id='branch:unassigned')['total'], 1)
+        model.chat.assert_not_called()
 
     def test_directory_and_file_states_are_derived_without_mutating_portrait(self):
         self.group('g1', ['one.txt'])
@@ -270,11 +274,12 @@ class StateCatalogTests(unittest.TestCase):
             raise PreviewCancelled()
         runner = Mock()
         runner.run.side_effect = pause
-        self.worker.preview_runner = runner
-        with patch.object(Config, 'LP_PREVIEW_CONCURRENCY', 2), patch(
-                'services.large_package_preview_runner.PreviewRunner', return_value=runner):
+        with patch.object(self.worker, '_preview_runners', [runner, runner]):
             self.worker._quick_one(self.store.get(self.pid))
+        self.assertGreaterEqual(runner.run.call_count, 1)
         self.assertEqual(self.store.stage_counts(self.pid, 'quick'), {'queued': 2})
+        with closing(self.store._connect()) as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM queue WHERE package_id=? AND stage='quick' AND lease_token IS NOT NULL", (self.pid,)).fetchone()[0], 0)
 
     def test_preview_complete_with_catalog_backlog_has_visible_separate_phase(self):
         self.seed('one.txt', stage='quick', status='completed')

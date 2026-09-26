@@ -1,0 +1,28 @@
+/* Scoped to the new correspondence surface. Existing theme and layout remain authoritative. */
+.mp-workbench{color:var(--ink);font-family:inherit;min-width:0;margin-bottom:28px}
+.mp-header{padding:22px;border:1px solid var(--line);border-radius:12px;background:linear-gradient(125deg,var(--panel),var(--canvas))}
+.mp-header h2{font-size:23px;margin:8px 0}.mp-header p{margin:8px 0 0;color:var(--muted);line-height:1.8}
+.mp-eyebrow{font-size:10px;font-weight:700;letter-spacing:.13em;color:var(--accent)}
+.mp-notice{padding:12px 14px;border:1px solid var(--line);border-radius:8px;color:var(--muted);line-height:1.7;overflow-wrap:anywhere}
+.mp-notice.mp-error{border-color:var(--alert);color:var(--alert)}
+.mp-layout{display:grid;grid-template-columns:minmax(160px,210px) minmax(0,1fr);gap:16px;min-width:0}
+.mp-contacts{padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);align-self:start;min-width:0}
+.mp-contacts label,.mp-analysis label{display:grid;gap:8px;font-size:12px;color:var(--muted)}
+.mp-contacts>button{width:100%;margin:8px 0}.mp-contact-list{display:grid;gap:8px;margin:8px 0;max-height:700px;overflow:auto}
+.mp-contact{display:grid;gap:5px;text-align:left;background:var(--canvas);color:var(--ink);border-color:var(--line);padding:12px;overflow-wrap:anywhere;min-width:0}
+.mp-contact[aria-pressed=true]{border-color:var(--accent);box-shadow:inset 3px 0 var(--accent)}
+.mp-contact span,.mp-contact small{font-size:11px;color:var(--muted)}
+.mp-content{min-width:0}.mp-person-title{font-size:18px;overflow-wrap:anywhere;margin:0 0 14px}
+.mp-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:16px}.mp-stats>div{padding:14px;border:1px solid var(--line);border-radius:9px;background:var(--panel);display:grid;gap:5px}.mp-stats strong{font-size:25px}.mp-stats span{color:var(--muted);font-size:11px}
+.mp-card{border:1px solid var(--line);border-radius:11px;background:var(--panel);padding:18px;margin-bottom:16px;min-width:0}.mp-card h3{margin:0 0 10px;font-size:16px}
+.mp-muted{color:var(--muted);font-size:12px;line-height:1.8;overflow-wrap:anywhere}
+.mp-graph{width:100%;max-height:350px;color:var(--accent)}.mp-graph text{fill:var(--ink);font-family:inherit;font-size:11px}.mp-graph g[role=button]{cursor:pointer}.mp-graph g:focus{outline:2px solid var(--accent)}
+.mp-relation{padding:10px 0;border-top:1px solid var(--line);display:grid;gap:5px}.mp-relation span{color:var(--accent);font-size:12px}.mp-relation small{color:var(--muted);font-size:10px}
+.mp-text-button{color:var(--ink);background:transparent;border:0;padding:0;text-align:left;min-height:28px;overflow-wrap:anywhere;white-space:normal}.mp-text-button:hover:not(:disabled){background:transparent;color:var(--accent);text-decoration:underline}
+.mp-mail-row{display:grid;gap:5px;border-bottom:1px solid var(--line);padding:12px 0}.mp-mail-row small{color:var(--muted);overflow-wrap:anywhere}
+.mp-pager{display:flex;align-items:center;justify-content:space-between;gap:5px;flex-wrap:wrap;margin-top:14px;font-size:11px;color:var(--muted)}.mp-pager button{font-size:11px;padding:4px 7px}
+.mp-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.mp-history{margin-bottom:14px}.mp-findings{display:grid;gap:12px}
+.mp-finding{padding:16px;border:1px solid var(--line);border-radius:9px;background:var(--canvas);overflow-wrap:anywhere}.mp-chip{color:var(--accent);font-size:11px;font-weight:700}.mp-finding h4{font-size:15px;line-height:1.8;margin:8px 0}.mp-finding blockquote{margin:10px 0;padding:10px 12px;border-left:3px solid var(--accent);background:var(--panel);white-space:pre-wrap;word-break:normal;overflow-wrap:anywhere;line-height:1.9}.mp-finding small{font-size:10px;color:var(--muted)}.mp-finding summary{cursor:pointer;font-size:12px;color:var(--accent)}
+.mp-original{color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:12px;width:min(800px,90vw);max-height:85vh;padding:22px}.mp-original::backdrop{background:#0009}.mp-original pre{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.9;font-family:inherit}
+@media(max-width:1450px){.mp-layout{grid-template-columns:1fr}.mp-contact-list{grid-template-columns:repeat(auto-fit,minmax(155px,1fr));max-height:220px}}
+@media(max-width:550px){.mp-header,.mp-card{padding:13px}.mp-stats>div{padding:10px}.mp-stats strong{font-size:21px}.mp-graph text{font-size:12px}}

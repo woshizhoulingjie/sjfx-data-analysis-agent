@@ -50,6 +50,12 @@ class VLLMFileTranslationProvider(TranslationProvider):
                 retries=retries, timeout=timeout, response_format={"type": "json_object"},
             )
             truncated = result.get("finish_reason") == "length"
+            # Valid JSON does not prove that a length-limited response is complete.
+            if truncated:
+                raise TranslationProviderError(
+                    "vLLM translation reached the output limit",
+                    code="output_truncated",
+                )
             try:
                 payload = LocalModelClient._parse_json_content(
                     result.get("content") or "", required_fields=["translation"],
@@ -88,9 +94,10 @@ def build_file_translation_service(client, memory, max_unit_chars=1200,
             # these document policies; mail and the import pipeline keep the
             # defaults, so their behaviour is byte-for-byte unchanged.
             preserve_figure_blocks=True,
-            preserve_untranslated_tail=True,
+            # Keep failed prose retryable instead of completing with original text.
+            preserve_untranslated_tail=False,
             segmented_recovery_min_chars=240,
-            contract_version=TRANSLATION_CONTRACT_VERSION + ":file:" + "vllm:" + client.model,
+            contract_version=TRANSLATION_CONTRACT_VERSION + ":file:strict-v2:vllm:" + client.model,
             checkpoint_unit_interval=1, checkpoint_interval_seconds=3,
         ),
     )

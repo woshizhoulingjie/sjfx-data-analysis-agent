@@ -148,7 +148,25 @@ def _validate(value, payload):
     }, ensure_ascii=False), material)['name']
 
 
+LAST_REPORT = {}
+
+
 def name_topics(store, package_id, buckets, centroids, round_state, cancelled, model_client):
+    """给上层簇起名。
+
+    本次结果**如实**写进模块级 `LAST_REPORT[package_id]`（拿到几个 / 命中缓存几个 /
+    预算被拒几次 / 是否被 stop 掐断）。这个函数以前在拿不到预算时静默返回空表，
+    导致"主题名被占位名覆盖"这类缺陷在生产上无从定位（2026-09-25 lp-ff42d1f7
+    就是这样，事后只能靠轮次台账反推）。
+
+    为什么用模块级字典而不是新增参数：既有契约测试用
+    `patch(name_topics, side_effect=lambda _s,_p,b,*args:{...})` 打桩，
+    多一个关键字参数会让它直接 TypeError。
+    """
+    report = LAST_REPORT.setdefault(package_id, {})
+    report.clear()
+    report.update({'named': 0, 'cached': 0, 'refused': 0, 'stopped': False,
+                   'round': round_state.get('id')})
     from config import Config
     from services.model_dispatch import background_generation
     from services.model_output import extract_json_value
@@ -171,6 +189,10 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
 
     for lab, members in sorted(buckets.items()):
         if stop():
+            # 早退也是"没拿到名字"的一种，必须让调用方知道（原来是无条件 return names）
+            report['stopped'] = True
+            LOGGER.warning('theme naming stopped early package=%s round=%s deadline=%s 已完成 %d 簇',
+                           package_id, round_state.get('id'), round_state.get('deadline'), len(names))
             return names
         try:
             payload = _material(members, centroids, min(cfg['input'], input_limit))
@@ -186,6 +208,7 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
             if cached:
                 try:
                     names[lab] = _validate(json.loads(cached[0]), payload)
+                    report['cached'] = report.get('cached', 0) + 1
                     continue
                 except (ValueError, TypeError, KeyError):
                     pass
@@ -207,6 +230,24 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
             return [], False
         call_id = naming.reserve(store, package_id, round_state['id'], 'topics', reservation(items))
         if not call_id:
+            # **必须出声。** reserve() 只认 status=='active'，而 ensure_round('topics') 的
+            # 幂等保护会把 completed 等非 exhausted 终态轮次原样交出来 → 这里必然被拒。
+            # 以前这里是静默 return，于是"主题名一直起不来"在生产上查不出原因。
+            report['refused'] = report.get('refused', 0) + 1
+            _row = None
+            try:
+                with closing(store._connect()) as _c:
+                    _row = _c.execute('SELECT status,requests,max_requests,tokens,max_tokens '
+                                      'FROM lp_catalog_rounds WHERE package_id=? AND id=?',
+                                      (package_id, round_state['id'])).fetchone()
+            except Exception:
+                pass
+            LOGGER.warning('theme naming reservation refused package=%s round=%s status=%s '
+                           'requests=%s/%s tokens=%s/%s tokens_needed=%s —— 本次这些主题名将缺失',
+                           package_id, round_state.get('id'), (_row['status'] if _row else '?'),
+                           (_row['requests'] if _row else '?'), (_row['max_requests'] if _row else '?'),
+                           (_row['tokens'] if _row else '?'), (_row['max_tokens'] if _row else '?'),
+                           reservation(items))
             return items, False
         started, response, outcome = time.monotonic(), {}, 'failed'
         failed = list(items)
@@ -245,6 +286,8 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
                     if key in duplicate:
                         raise ValueError('Duplicate theme id')
                     name = _validate(lookup.get(key), item['payload'])
+                    if item['lab'] not in names:
+                        report['named'] = report.get('named', 0) + 1
                     names[item['lab']] = name
                     with closing(store._connect()) as c:
                         c.execute('INSERT OR REPLACE INTO lp_catalog_cache VALUES(?,?,?,?)',

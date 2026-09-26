@@ -8,7 +8,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import shutil
 import signal
 import sqlite3
 import sys
@@ -18,11 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import Config
 from services.large_qa_index import LargeQAIndex, enabled
+from services import large_qa_demand as demand
 from services.large_qa_extract import extract_document
 from services.large_qa_topics import refresh_maps, refine_one
+from services.large_qa_resources import DiskGuard, resource_code
 
 LOGGER = logging.getLogger('large_qa_worker')
 STOP = False
+RESOURCE_RETRY_SECONDS = 30
 
 
 class ReadOnlyStore:
@@ -67,9 +69,26 @@ def foreground_busy():
 def heartbeat(base, states, phase):
     target = base/'worker_status.json'
     tmp = target.with_suffix('.tmp')
-    tmp.write_text(json.dumps({'pid':os.getpid(),'at':time.time(),'phase':phase,'packages':states},ensure_ascii=False),encoding='utf-8')
-    os.chmod(tmp,0o600)
-    os.replace(tmp,target)
+    try:
+        tmp.write_text(json.dumps({'pid':os.getpid(),'at':time.time(),'phase':phase,'packages':states},ensure_ascii=False),encoding='utf-8')
+        os.chmod(tmp,0o600)
+        os.replace(tmp,target)
+    except OSError:
+        # A full state volume must not kill the only worker capable of resuming.
+        # Keep the last good status file (its stale timestamp remains visible).
+        LOGGER.exception('Unable to publish large QA heartbeat; will retry')
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def state_phase(states, default='running'):
+    if states and all(item.get('resource_pause') for item in states.values()):
+        return 'waiting_for_resources'
+    return default
 
 
 def snapshot(index):
@@ -94,41 +113,78 @@ def run(args):
     last_sync = {}
     last_refine = 0
     model = None
+    stamps = {}
+    retry_after = {}
+    disk = DiskGuard()
+    agent_db = str(getattr(Config,'DB_PATH',''))
     while not STOP and enabled():
         packages = store.packages()
         if args.package:
             packages = [p for p in packages if p['id']==args.package]
+        elif demand.demand_only():
+            # 按需：只做"最近被问答过 / 问答时点名要过原文 / 人工钉住"的包。
+            wanted = demand.demanded(agent_db, base, [p['id'] for p in packages])
+            packages = [p for p in packages if p['id'] in wanted]
+            if not packages:
+                states = {}
+                last_sync.clear()
+                stamps.clear()
+                retry_after.clear()
+                heartbeat(base, states, 'idle')
+                if args.once:
+                    break
+                time.sleep(demand.idle_sleep())
+                continue
         active = {p['id'] for p in packages}
         states = {k:v for k,v in states.items() if k in active}
+        last_sync = {k:v for k,v in last_sync.items() if k in active}
+        stamps = {k:v for k,v in stamps.items() if k in active}
+        retry_after = {k:v for k,v in retry_after.items() if k in active}
         did_work = False
+        extracted = 0
+        budget = demand.extract_budget()
+        pause = demand.extract_pause()
         for package in packages:
             if STOP:
                 break
             package_id = package['id']
-            index = LargeQAIndex(package_id,base,create=True)
+            if time.monotonic() < retry_after.get(package_id, 0):
+                continue
             try:
-                if shutil.disk_usage(base).free < 1024**3:
-                    raise RuntimeError('Less than 1 GiB free; extraction paused')
-                if time.monotonic()-last_sync.get(package_id,0)>120:
+                # Check capacity before constructor migrations or any package writes.
+                disk.check([('问答索引磁盘', base)])
+                index = LargeQAIndex(package_id,base,create=True)
+                stamp = demand.package_stamp(package)
+                if demand.should_sync(time.monotonic(),last_sync.get(package_id),
+                                      stamps.get(package_id),stamp):
                     heartbeat(base,states,'syncing_summaries')
                     changed = index.sync_store(store)
                     if changed or package_id not in last_sync:
                         refresh_maps(index)
                     last_sync[package_id] = time.monotonic()
+                    stamps[package_id] = stamp
                     states[package_id] = snapshot(index)
                     LOGGER.info('summary sync package=%s changed=%s files=%s',package_id,changed,states[package_id]['files'])
                     did_work |= bool(changed)
-                if not args.summaries_only:
+                if not args.summaries_only and extracted<budget and not foreground_busy():
                     doc = index.next_parse()
                     if doc:
+                        disk.check([('问答索引磁盘', base),
+                                    ('原文解析结果磁盘', Config.DATA_DIR/'large_qa'/'parse_artifacts'),
+                                    ('解析临时磁盘', os.getenv('SJFX_PARSE_TEMP_DIR', str(Config.PARSE_TEMP_DIR)))])
                         heartbeat(base,states,'indexing_originals')
                         try:
                             records,complete,note = extract_document(package['root_path'],doc)
                         except Exception as exc:
+                            if resource_code(exc):
+                                raise
                             records,complete,note = [],False,str(exc)
                         index.put_original(doc['path'],doc['source_version'],records,complete,note)
                         did_work = True
+                        extracted += 1
                         states[package_id] = snapshot(index)
+                        if pause:
+                            time.sleep(pause)
                 if (not args.summaries_only and not STOP and getattr(Config,'LARGE_QA_REFINE_TOPICS',False)
                         and time.monotonic()-last_refine>60 and not foreground_busy()):
                     heartbeat(base,states,'refining_topic')
@@ -143,21 +199,37 @@ def run(args):
                         refresh_maps(index)
                         did_work = True
                     last_refine = time.monotonic()
-                states[package_id].pop('error',None)
+                states.setdefault(package_id,{})
+                for key in ('error', 'resource_pause', 'retry_at'):
+                    states[package_id].pop(key, None)
+                retry_after.pop(package_id, None)
             except Exception as exc:
-                LOGGER.exception('large QA package=%s failed',package_id)
-                states.setdefault(package_id,{})['error'] = str(exc)[:300]
-            heartbeat(base,states,'running')
+                state = states.setdefault(package_id,{})
+                code = resource_code(exc)
+                if code:
+                    state['error'] = '资源暂不可用，任务保留，稍后自动重试：' + str(exc)[:260]
+                    state['resource_pause'] = {'code': code, 'details': getattr(exc, 'details', [])}
+                    state['retry_at'] = time.time() + RESOURCE_RETRY_SECONDS
+                    retry_after[package_id] = time.monotonic() + RESOURCE_RETRY_SECONDS
+                    LOGGER.warning('large QA package=%s paused resource=%s: %s', package_id, code, exc)
+                else:
+                    LOGGER.exception('large QA package=%s failed',package_id)
+                    state['error'] = str(exc)[:300]
+                    state.pop('resource_pause', None)
+                    state.pop('retry_at', None)
+                    retry_after.pop(package_id, None)
+            heartbeat(base,states,state_phase(states))
+        heartbeat(base,states,state_phase(states))
         if args.once:
             break
         for _ in range(1 if did_work else 15):
             if STOP:
                 break
             time.sleep(1)
-    heartbeat(base,states,'stopped' if STOP else 'idle')
+    heartbeat_ok = heartbeat(base,states,'stopped' if STOP else state_phase(states, 'idle'))
     print(json.dumps(states,ensure_ascii=False),flush=True)
     lock.close()
-    if args.once and any(x.get('error') for x in states.values()):
+    if args.once and (not heartbeat_ok or any(x.get('error') for x in states.values())):
         raise SystemExit(1)
 
 

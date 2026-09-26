@@ -15,6 +15,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from .threat_rules import inspect_payload
+
 
 class Links(HTMLParser):
     def __init__(self):
@@ -37,7 +39,7 @@ class Links(HTMLParser):
 
 
 def stable_hash(path):
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0) | getattr(os, 'O_NONBLOCK', 0)
     fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as stream:
         before = os.fstat(stream.fileno())
@@ -96,7 +98,7 @@ def _clamd_scan(path, address):
 
 
 def bounded_read(path, max_bytes=20*1024*1024, expected_sha256=None):
-    fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0))
+    fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)|getattr(os,'O_NONBLOCK',0))
     with os.fdopen(fd,'rb') as stream:
         import stat
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
@@ -117,23 +119,35 @@ def inspect_file(path, *, max_bytes=20 * 1024 * 1024, clam=None, yara=None, yara
     if size > max_bytes:
         return {"risk": "unchecked", "findings": [{"rule": "size_limit", "detail": "超过静态检查大小限制"}],
                 "engines": {"static": "skipped_size_limit"}}
-    if path.suffix.lower() in {".eml", ".msg", ".docm", ".xlsm", ".pptm", ".exe", ".js", ".lnk", ".hta"}:
-        engines["static"] = "completed"
+    raw = bounded_read(path, max_bytes)
+    findings.extend(inspect_payload(raw, path.name))
+    engines["static"] = "completed"
+    if path.suffix.lower() == '.msg':
+        findings.append({'rule': 'msg_requires_mail_engine', 'severity': 'review',
+                         'detail': 'MSG 容器不能按 EML 完整检查，需专用引擎复核'})
     if path.suffix.lower() == ".eml":
-        raw = bounded_read(path,max_bytes)
         message = email.message_from_bytes(raw, policy=email.policy.default)
+        mail_budget = {'bytes': 8 * 1024 * 1024, 'members': 200}
         for index, part in enumerate(message.walk()):
             if index > 200:
                 engines["static"] = "partial_part_limit"
                 break
             filename = part.get_filename() or ""
+            if not part.is_multipart():
+                findings.extend(inspect_payload(part.get_payload(decode=True) or b'', filename,
+                    content_type=part.get_content_type(), budget=mail_budget))
             if Path(filename).suffix.lower() in {".exe", ".js", ".vbs", ".lnk", ".hta", ".scr", ".bat", ".cmd", ".ps1"}:
                 findings.append({"rule": "executable_attachment", "severity": "review", "detail": filename[:500]})
             if part.get_content_type() != "text/html":
                 continue
             data = part.get_payload(decode=True) or b""
             parser = Links()
-            parser.feed(data[:2 * 1024 * 1024].decode(part.get_content_charset() or "utf-8", "replace"))
+            try:
+                text = data[:2 * 1024 * 1024].decode(part.get_content_charset() or 'utf-8', 'replace')
+            except LookupError:
+                text = data[:2 * 1024 * 1024].decode('utf-8', 'replace')
+                engines['static'] = 'partial_charset'
+            parser.feed(text)
             for target, shown in parser.links[:500]:
                 try:
                     actual, visible = urlsplit(target.strip()), urlsplit(shown.strip())
@@ -187,7 +201,7 @@ def inspect_file(path, *, max_bytes=20 * 1024 * 1024, clam=None, yara=None, yara
     elif engines.get("clamav") == "completed":
         risk = "no_detection"
     if risk!='dangerous' and (engines.get('clamav') in {'error','unavailable'} or any(
-            v in {'error','partial_part_limit'} for v in engines.values())):
+            v in {'error','partial_part_limit','partial_charset'} for v in engines.values())):
         risk='unchecked'
     return {"risk": risk, "findings": findings[:200], "engines": engines}
 
@@ -206,7 +220,10 @@ def safe_mail_preview(path, expected_sha256=None):
             attachments.append(part.get_filename())
         elif part.get_content_type() == "text/plain":
             data = part.get_payload(decode=True) or b""
-            bodies.append(data[:100000].decode(part.get_content_charset() or 'utf-8', 'replace'))
+            try:
+                bodies.append(data[:100000].decode(part.get_content_charset() or 'utf-8', 'replace'))
+            except LookupError:
+                bodies.append(data[:100000].decode('utf-8', 'replace'))
     return {"subject": str(message.get("Subject", "")), "from": str(message.get("From", "")),
             "to": str(message.get("To", "")), "text": "\n".join(bodies)[:200000],
             "attachments": attachments, "html_rendered": False}

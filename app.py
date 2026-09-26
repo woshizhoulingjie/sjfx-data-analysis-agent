@@ -4593,7 +4593,8 @@ def _run_claimed_analysis_job(job):
     )
     deep_batch_id = str(options.get("deep_batch_id") or "")
     workflow_source = str(options.get("workflow_source") or "")
-    selected_file_parse = workflow_source == "selected_file_parse"
+    # Historical bridge jobs must enter the same preliminary pipeline too.
+    selected_file_parse = workflow_source in {"selected_file_parse", "large_catalog_selection"}
     if not preprocess_stage and not selected_file_parse:
         requested_paths = [str(path) for path in (options.get("target_paths") or []) if str(path)]
         if not deep_batch_id and requested_paths:
@@ -4651,7 +4652,7 @@ def _run_claimed_analysis_job(job):
             "auto" if selected_file_parse and str(options.get("parse_mode") or "").lower() == "accurate"
             else options.get("parse_mode")
         ),
-        workflow_source=options.get("workflow_source"),
+        workflow_source="selected_file_parse" if selected_file_parse else options.get("workflow_source"),
         analysis_translation=(
             lambda **kwargs: _prepare_import_translations(
                 scan_id, job_id=job_id, **kwargs
@@ -4693,7 +4694,7 @@ def _run_claimed_analysis_job(job):
         summary_source = "candidate_preview_model_summary"
     elif large_selection:
         summary_source = "large_selection_model_summary"
-    elif workflow_source in {"manual_selection", "selected_file_parse"}:
+    elif selected_file_parse or workflow_source == "manual_selection":
         # The first model pass after selection is a bounded preliminary
         # summary. Full deep summaries are scheduled only after the preliminary
         # file and node layers settle.
@@ -12753,6 +12754,64 @@ def export_large_package(package_id):
                         "source_file_count": len(selection["paths"])}) , 202
     except ValueError as exc:
         return api_error(str(exc), 400)
+@app.route("/api/large-packages/<package_id>/catalog/imports", methods=["GET"])
+def large_package_catalog_imports(package_id):
+    """审计：该大数据包产生的全部普通导入记录（只读，不触发任何任务）。"""
+    try:
+        _large_package_owned(package_id)
+    except Exception as exc:                       # noqa: BLE001
+        return api_error(str(exc), 404)
+    from services.large_package_catalog_import import list_imports
+    rows = list_imports(storage, package_id)
+    return jsonify({"ok": True, "package_id": str(package_id),
+                    "count": len(rows), "imports": rows})
+
+
+@app.route("/api/large-packages/<package_id>/catalog/import", methods=["POST"])
+def import_large_package_catalog(package_id):
+    """把智能目录里勾选的节点导入普通数据包流程（设计文档 §5.1）。
+
+    服务端重新展开选择（不信任前端路径），在一个事务里创建普通 scan 与解析任务；
+    后续解析/摘要/检索/问答全部复用普通导入状态机与 Worker。
+    **本接口不执行任何模型调用。**
+    """
+    payload = request.get_json(silent=True) or {}
+    try:
+        package = _large_package_owned(package_id)
+        from services import large_package_catalog_import as bridge
+        params = bridge.validate_request(payload, package)
+        # §11 精确失败码：节点不存在 → 404（要求刷新目录）；文件已消失 → 409 且附文件列表。
+        # 这两项必须在 export_selection 之前判定，否则只会得到一个笼统的 400。
+        if bridge.missing_nodes(large_package_store, package_id, params["node_ids"]):
+            return api_error("智能目录节点不存在，请刷新目录后重试", 404)
+        gone = bridge.missing_paths(large_package_store, package_id, params["paths"])
+        if gone:
+            return api_error("部分文件已不属于该大数据包：" + "、".join(gone[:5]), 409)
+        # 服务端重新计算最终文件集合（文档 §3 原则 1、2）
+        selection = large_package_store.export_selection(
+            package_id, node_ids=params["node_ids"], paths=params["paths"],
+            exclude_paths=params["exclude_paths"], exclude_node_ids=params["exclude_node_ids"],
+        )
+        result = storage.create_scan_from_large_selection(
+            package, selection, name=params["name"], parse_mode=params["parse_mode"],
+            owner_id=_effective_owner(), request_key=params["request_key"],
+            request_payload=params, large_store=large_package_store,
+        )
+        return jsonify({
+            "ok": True, "accepted": True,
+            "scan_id": result["scan_id"], "job_id": result["job_id"],
+            "selected_file_count": result["selected_file_count"],
+            "selected_bytes": result["selected_bytes"],
+            "source_large_package_id": str(package_id),
+            "reused": bool(result.get("reused")),
+            "status_url": "/api/jobs/{}".format(result["job_id"]),
+            "scan_url": "/api/scan/{}".format(result["scan_id"]),
+        }), (200 if result.get("reused") else 202)
+    except ValueError as exc:
+        _status = getattr(exc, "status", 400)
+        return api_error(str(exc), int(_status))
+
+
 @app.route("/api/large-packages/<package_id>/files")
 def list_large_package_files(package_id):
     try:

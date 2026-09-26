@@ -240,6 +240,25 @@ def _write_lock_metadata(handle):
     handle.flush()
 
 
+def _mark_source_changes_once(job):
+    """§9.2 接线：普通解析前检查来自大数据包的源文件是否变过。
+
+    全部逻辑在桥接层（可单测）；这里只负责取到 storage / 大包库，并且
+    **任何异常都不影响解析**。
+    """
+    scan_id = str(job.get("scan_id") or "")
+    if not scan_id:
+        return
+    try:
+        from app import storage as _storage, large_package_store as _large_store
+        from services.large_package_catalog_import import apply_source_change_check
+
+        apply_source_change_check(_storage, _large_store, scan_id,
+                                  job.get("id") or job.get("job_id") or "")
+    except Exception:                              # noqa: BLE001
+        logger.exception('source change check failed scan=%s', scan_id)
+
+
 def execute(job):
     task_type = job.get("task_type")
     if task_type in {"mail_import", "mail_extract", "mail_ocr", "mail_research", "mail_export", "mail_embed", "mail_factextract"}:
@@ -263,6 +282,7 @@ def execute(job):
     if task_type == "scan_and_analyze":
         return _run_claimed_scan_and_analyze_job(job)
     if task_type == "analyze_package":
+        _mark_source_changes_once(job)
         return _run_claimed_analysis_job(job)
     if task_type == "homogeneous_analysis":
         return _run_claimed_homogeneous_analysis_job(job)

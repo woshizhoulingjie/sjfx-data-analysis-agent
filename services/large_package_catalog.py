@@ -173,10 +173,33 @@ def get_file(store, package_id, path):
     return store._row(row) if row else None
 
 
-def _save(store, package_id, path, digest, result=None, error=""):
-    """Apply only navigation fields, with a content fingerprint concurrency check."""
+def _save(store, package_id, path, digest, result=None, error="", token=None):
+    """Apply only navigation fields, with a content fingerprint concurrency check.
+
+    P0（文档 §3B）：除内容 digest 外，还要**先验证本次调用仍持有该队列项的租约**。
+    原实现只比 digest，然后按 (package_id,path,stage) 无条件更新队列 —— 一个晚到的
+    `_save` 会覆盖别人正在进行的工作（旧 token 晚到、输入更新、取消后结果晚到）。
+    现在：**先验所有权，再改任何状态**，不满足就整事务回滚、什么都不写。
+    token=None 仅为兼容旧调用点；生产两条路径（embed 暂存、name_batch）都传真实 token。
+    """
     with store._lock, closing(store._connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        # ① 所有权/新鲜度闸门：必须先于任何写入。
+        if token is not None:
+            owner = conn.execute(
+                "SELECT status,lease_token FROM queue "
+                "WHERE package_id=? AND path=? AND stage='catalog'",
+                (package_id, path)).fetchone()
+            if not owner:
+                conn.rollback()
+                return False
+            if str(owner["lease_token"] or '') != str(token):
+                # 别人已经重领（或本项已收尾）：放弃，绝不覆盖。
+                conn.rollback()
+                return False
+            if str(owner["status"] or '') not in ('running',):
+                conn.rollback()
+                return False
         raw = conn.execute("SELECT * FROM files WHERE package_id=? AND path=?", (package_id, path)).fetchone()
         if not raw:
             conn.execute("DELETE FROM queue WHERE package_id=? AND path=? AND stage='catalog'", (package_id, path))
@@ -215,9 +238,17 @@ def _save(store, package_id, path, digest, result=None, error=""):
             queue_status = "queued"
         else:
             queue_status = "failed"
-        conn.execute("UPDATE queue SET status=?,error=?,leased_at=NULL,lease_token=NULL,updated_at=? "
-                     "WHERE package_id=? AND path=? AND stage='catalog'",
-                     (queue_status, _text(error, 240) or None, time.time(), package_id, path))
+        # P0：收尾也带 token 条件 —— 拿不到该行说明所有权已变，本次不落任何结论。
+        changed = conn.execute("UPDATE queue SET status=?,error=?,leased_at=NULL,lease_token=NULL,updated_at=? "
+                               "WHERE package_id=? AND path=? AND stage='catalog' "
+                               + ("AND lease_token=?" if token is not None else ""),
+                               ((queue_status, _text(error, 240) or None, time.time(), package_id, path,
+                                 str(token)) if token is not None
+                                else (queue_status, _text(error, 240) or None, time.time(), package_id, path))
+                               ).rowcount
+        if not changed:
+            conn.rollback()
+            return False
         if result:
             # 目录阶段已经给出**确定的识别结论**（recognition_status=identified），
             # 补充识别队列里这一项的目的就达到了，同一个事务里收掉它。

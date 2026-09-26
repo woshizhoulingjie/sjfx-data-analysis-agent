@@ -11,12 +11,8 @@ def build_task_spec(question, package_id, source_revision, index_epoch, *, scope
     text = str(question or "").strip()
     if not text:
         raise ValueError("请输入邮件研究目标")
-    if any(word in text for word in _EXHAUSTIVE):
-        mode = "exhaustive"
-    elif any(word in text for word in _RESEARCH):
-        mode = "research"
-    else:
-        mode = "lookup"
+    from .multilingual import intent_mode
+    mode = intent_mode(text)
     questions = ["匹配邮件与附件"]
     if mode == "research":
         questions.extend(["支持证据", "后续修改、撤回或反证", "资料覆盖缺口"])

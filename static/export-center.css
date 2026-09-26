@@ -389,3 +389,119 @@
   .export-record-actions button { flex: 1; }
   .export-cart-actions .primary { margin-left: 0; width: 100%; }
 }
+
+/* ---------------------------- 大数据包智能目录 → 普通数据包导入（设计文档 §7） */
+/* 入口按钮与确认弹窗由 export-center.js 注入；这里只新增下面两个 class，
+   不改动上面的任何既有规则，颜色沿用 precision-ui.css 的 --p-* 令牌。 */
+.export-catalog-import { white-space: nowrap; }
+
+.export-import-totals {
+  color: var(--p-subtle, #76839d);
+  font: 11px var(--p-mono, monospace);
+  line-height: 1.6;
+}
+
+.export-import-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1150;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(3, 8, 19, .74);
+  backdrop-filter: blur(8px);
+}
+
+.export-import-modal[hidden] { display: none; }
+
+.export-import-panel {
+  width: min(560px, 100%);
+  max-height: 86vh;
+  overflow: auto;
+  padding: 18px 20px;
+  border: 1px solid var(--p-line-strong, #394158);
+  border-radius: 14px;
+  background: var(--p-raised, #171c2a);
+  box-shadow: 0 24px 100px rgba(0, 0, 0, .6);
+}
+
+.export-import-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.export-import-head h3 { margin: 4px 0 0; color: var(--p-text, #edf0f8); font-size: 17px; }
+
+.export-import-hint {
+  margin: 0 0 14px;
+  color: var(--p-muted, #9aa4ba);
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.export-import-panel .field-label { margin-bottom: 12px; }
+.export-import-panel .field-label input,
+.export-import-panel .field-label select { width: 100%; margin-top: 6px; }
+
+.export-import-summary {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 11px 13px;
+  border: 1px dashed var(--p-line-strong, #394158);
+  border-radius: 9px;
+  background: var(--p-line-soft, #1e2433);
+}
+
+.export-import-summary > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.export-import-summary dt { color: var(--p-subtle, #76839d); }
+.export-import-summary dd { margin: 0; color: var(--p-text, #edf0f8); text-align: right; }
+
+.export-import-state {
+  min-height: 18px;
+  margin: 0 0 12px;
+  color: var(--p-muted, #9aa4ba);
+  font-size: 12px;
+  line-height: 1.75;
+}
+.export-import-state.is-error { color: var(--p-red, #f48d9e); }
+.export-import-state.is-done {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid #3f6f5a;
+  border-left: 4px solid var(--p-green, #62d6b3);
+  border-radius: 10px;
+  background: linear-gradient(145deg, #14261f, #131c2b);
+}
+.export-import-state.is-done strong { color: var(--p-green, #62d6b3); font-size: 14px; }
+.export-import-state.is-done span { color: var(--p-muted, #9aa4ba); overflow-wrap: anywhere; }
+.export-import-state.is-done b { color: var(--p-text, #edf0f8); font-weight: 500; }
+
+.export-import-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  align-items: center;
+  justify-content: flex-end;
+}
+.export-import-state.is-done .export-import-actions { justify-content: flex-start; margin-top: 4px; }
+.export-import-actions .primary { margin-left: 0; }
+
+@media (max-width: 760px) {
+  .export-import-modal { padding: 0; }
+  .export-import-panel { width: 100%; max-height: 100vh; border-radius: 0; }
+  .export-import-actions button { flex: 1; }
+}

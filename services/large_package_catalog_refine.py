@@ -3,6 +3,7 @@ import hashlib
 import json
 import time
 from contextlib import closing
+from services.large_package_resources import pressure, resource_code
 
 
 def source_key(row):
@@ -54,11 +55,12 @@ def process_one(worker):
     claimed=store.claim('catalog_refine',1)
     if not claimed:return False
     package_id,path,token=claimed[0]
-    row=store.get_file(package_id,path);package=store.get(package_id)
-    with closing(store._connect()) as c:
-        job=c.execute('SELECT source FROM lp_catalog_refine WHERE package_id=? AND path=?',(package_id,path)).fetchone()
+    worker._resource_package_id=package_id
     outcome='failed';finished=False
     try:
+        row=store.get_file(package_id,path);package=store.get(package_id)
+        with closing(store._connect()) as c:
+            job=c.execute('SELECT source FROM lp_catalog_refine WHERE package_id=? AND path=?',(package_id,path)).fetchone()
         if not row or not package or not job or source_key(row)!=job[0]:
             outcome='stale';return True
         from services.large_package_preview_runner import PreviewCancelled
@@ -78,6 +80,12 @@ def process_one(worker):
                 c.commit();outcome='completed';finished=True
             else:c.rollback();outcome='stale'
     except Exception as exc:
+        if resource_code(exc):
+            # Keep the existing bounded reservation; only refund this lease
+            # attempt. Even if the database is full, never finalize as failed.
+            finished=True
+            worker._defer_resource(package_id,path,'catalog_refine',token,exc)
+            raise pressure(exc) from exc
         import logging
         logging.getLogger(__name__).info('bounded catalog refinement ended: %s/%s: %s',package_id,path,type(exc).__name__)
     finally:

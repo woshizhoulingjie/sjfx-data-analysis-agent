@@ -6,6 +6,8 @@ import os
 import time
 from pathlib import Path
 
+from services.large_qa_resources import ResourcePressure, resource_code
+
 
 def _extract(path, relative, max_chars):
     path=Path(path)
@@ -63,7 +65,11 @@ def _child(connection,path,relative,max_chars):
     try:
         connection.send(('ok',_extract(path,relative,max_chars)))
     except BaseException as exc:
-        connection.send(('error',str(exc)[:400]))
+        code = resource_code(exc)
+        if code:
+            connection.send(('resource_pressure', {'code': code, 'message': str(exc)[:400]}))
+        else:
+            connection.send(('error',str(exc)[:400]))
     finally:
         connection.close()
 
@@ -81,12 +87,15 @@ def extract_document(root,doc,timeout=90,memory_mb=1536,max_chars=2_000_000):
     ctx=mp.get_context('spawn')
     parent,child=ctx.Pipe()
     process=ctx.Process(target=_child,args=(child,str(path),doc['path'],max_chars),daemon=True)
-    process.start(); child.close()
-    start=time.monotonic()
+    started = False
     try:
+        process.start(); started = True; child.close()
+        start=time.monotonic()
         while time.monotonic()-start<timeout:
             if parent.poll(.15):
                 status,value=parent.recv()
+                if status=='resource_pressure':
+                    raise ResourcePressure(value['message'], value['code'])
                 if status!='ok':
                     raise ValueError(value)
                 after=path.stat()
@@ -104,8 +113,10 @@ def extract_document(root,doc,timeout=90,memory_mb=1536,max_chars=2_000_000):
         raise TimeoutError('解析达到单文件时间预算')
     finally:
         parent.close()
-        if process.is_alive():
-            process.terminate()
-        process.join(2)
-        if process.is_alive():
-            process.kill(); process.join(2)
+        child.close()
+        if started:
+            if process.is_alive():
+                process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill(); process.join(2)

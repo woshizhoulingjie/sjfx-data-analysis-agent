@@ -347,6 +347,8 @@
     await refresh();
   }
   document.addEventListener('DOMContentLoaded', () => {
+    // 放在最前面：不与下面 `if (!btn) return`（#scanBtn 缺失时的提前返回）耦合。
+    ensureExportCenterEntry();
     document.querySelectorAll('input[name="workflowMode"]').forEach((input) => input.addEventListener('change', setModeText));
     setModeText();
     const btn = $('scanBtn');
@@ -373,6 +375,48 @@
     $('largePackageOpenCatalog')?.addEventListener('click', () => window.SJFXLargeResult?.activate(packageId, 'catalog'));
     $('largePackageOpenOverview')?.addEventListener('click', () => window.SJFXLargeResult?.activate(packageId, 'overview'));
   });
+  // 大数据包 → 导出中心。复用既有约定：
+  //  1) 切屏用 window.SJFXShell.activate('exports')（product-shell.js 的 viewFor
+  //     已经把 exports 映射到导出中心这一屏）；
+  //  2) "要看哪个大包"用 window.sjfxLargeResultId，export-center.js 的
+  //     loadSources() 优先读它来选来源，其次读 localStorage 的
+  //     sjfx_large_package_id —— 这里把两个都登记上。
+  // 不新造路由，也不重复实现导出中心的数据源加载。
+  function openExportCenter() {
+    if (!packageId) {
+      window.toast?.('请先选择或创建大数据包，再进入导出中心。', true);
+      return;
+    }
+    window.sjfxLargeResultId = packageId;
+    try {
+      window.localStorage.setItem('sjfx_large_package_id', packageId);
+    } catch (_) {
+      // 浏览器禁用存储时只影响"下次进入导出中心仍记得这个大包"。
+    }
+    // 顺序不能反：导出中心若已经加载过数据源，activate('exports') 不会再读一次，
+    // 下拉框会停在上一个大包上。先让它按这个大包重读（并切回大数据包这一栏）。
+    const center = window.SJFXExportCenter;
+    if (center && typeof center.openForLargePackage === 'function') center.openForLargePackage(packageId);
+    else if (center && typeof center.reload === 'function') center.reload(); // 旧缓存版本的兜底
+    window.SJFXShell?.activate('exports');
+  }
+
+  function ensureExportCenterEntry() {
+    const existing = $('largePackageToExportCenter');
+    if (existing) return existing;
+    const anchor = $('largePackageSwitchBtn');
+    if (!anchor || !anchor.parentElement) return null;
+    const button = document.createElement('button');
+    button.id = 'largePackageToExportCenter';
+    button.type = 'button';
+    button.className = 'ghost';
+    button.textContent = '导出中心';
+    button.title = '在导出中心勾选这个大数据包的智能目录，交付压缩包或转入普通数据包';
+    button.addEventListener('click', openExportCenter);
+    anchor.insertAdjacentElement('afterend', button);
+    return button;
+  }
+
   window.SJFXLargePackage = { setStage };
   document.addEventListener('click', event => {
     const node = event.target.closest('#largePackageSmartCatalog [data-large-node-type], #largePackageSelectCatalogTree [data-large-node-type]');

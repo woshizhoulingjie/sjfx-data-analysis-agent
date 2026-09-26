@@ -34,7 +34,48 @@
     if (catalog) catalog.disabled = currentStage === 'catalog';
     const overview = $('largeResultToOverview');
     if (overview) overview.disabled = currentStage === 'overview';
+    const exportEntry = ensureExportCenterEntry();
+    if (exportEntry) exportEntry.disabled = !packageId;
     renderSelection();
+  }
+
+  // 大数据包成果 → 导出中心。复用页面已有的两个约定，不新造路由：
+  //  1) 切屏用 window.SJFXShell.activate('exports')（product-shell.js 的
+  //     viewFor 已经把 exports 映射到导出中心这一屏）；
+  //  2) "要看哪个大包"用 window.sjfxLargeResultId —— export-center.js 的
+  //     loadSources() 本来就优先读它来选来源，其次读 localStorage 的
+  //     sjfx_large_package_id，所以这里把两个都登记上。
+  function openExportCenter() {
+    if (packageId) {
+      window.sjfxLargeResultId = packageId;
+      try {
+        window.localStorage.setItem('sjfx_large_package_id', packageId);
+      } catch (_) {
+        // 浏览器禁用存储时只影响"下次进入导出中心仍记得这个大包"。
+      }
+    }
+    // 顺序不能反：导出中心若已经加载过数据源，activate('exports') 不会再读一次，
+    // 下拉框会停在上一个大包上。先让它按这个大包重读（并切回大数据包这一栏）。
+    const center = window.SJFXExportCenter;
+    if (center && typeof center.openForLargePackage === 'function') center.openForLargePackage(packageId);
+    else if (center && typeof center.reload === 'function') center.reload(); // 旧缓存版本的兜底
+    window.SJFXShell?.activate('exports');
+  }
+
+  function ensureExportCenterEntry() {
+    const existing = $('largeResultToExportCenter');
+    if (existing) return existing;
+    const anchor = $('largeResultToOverview') || $('largeResultToCatalog');
+    if (!anchor || !anchor.parentElement) return null;
+    const button = document.createElement('button');
+    button.id = 'largeResultToExportCenter';
+    button.type = 'button';
+    button.className = 'secondary';
+    button.textContent = '导出中心';
+    button.title = '在导出中心勾选这个大数据包的智能目录，交付压缩包或转入普通数据包';
+    button.addEventListener('click', openExportCenter);
+    anchor.insertAdjacentElement('afterend', button);
+    return button;
   }
   // Browsing state belongs only to this isolated large-package module.
   const newBrowseState = () => ({ node: { type: 'all', value: '', label: '整个数据包' }, query: '', draft: '', category: '', offset: 0, expanded: new Set(['topics']), scroll: 0, listScroll: 0, file: null });
@@ -403,6 +444,7 @@
   }
 
   function resetBrowser() {
+    window.SJFXIntelligenceOverview?.clear('largeIntelligenceBoard');
     selectedForSummary.clear();
     browseMode = 'physical'; browseStates = { physical: newBrowseState(), smart: newBrowseState() };
     latestCatalog = null; files = []; nodeInfo = new Map();
@@ -472,6 +514,8 @@
 
   function renderResearchBrief(report) {
     const brief = report.research_brief || {};
+    const intelligence = window.SJFXIntelligenceOverview;
+    if (intelligence) intelligence.mount('largeIntelligenceBoard', $('largeResultOverviewStatus')?.closest('.large-result-overview'), intelligence.model('large', report, brief));
     const direction = brief.recommended_research_direction || {};
     const list = (values, empty) => {
       const rows = Array.isArray(values) ? values.filter(Boolean) : [];

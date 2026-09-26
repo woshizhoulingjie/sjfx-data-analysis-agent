@@ -226,15 +226,64 @@ class NextStageTests(unittest.TestCase):
         from services import large_package_catalog_tree as tree
         for i in range(3):self.add('g%d'%i,[1,.01*i])
         rnd=naming.ensure_round(self.store,self.pid)
-        with patch('services.large_package_catalog_topics.name_topics',return_value={}):
-            self.assertTrue(tree.build(self.store,self.pid,rnd,model_client=Mock()))
+        with patch.object(tree,'TOPIC_REGENERATION_ATTEMPTS',3), patch('services.large_package_catalog_topics.name_topics',return_value={}) as names:
+            for attempt in range(1,4):
+                self.assertTrue(tree.build(self.store,self.pid,rnd,model_client=Mock()))
+                with closing(self.store._connect()) as c:
+                    saved=json.loads(c.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',(self.pid,)).fetchone()[0])
+                self.assertEqual(saved['topic_regeneration_attempts'],attempt)
+                self.assertEqual(saved['attempted_round'],rnd['id'])
             self.assertFalse(tree.build(self.store,self.pid,rnd,model_client=Mock()))
+            self.assertEqual(names.call_count,3)
         with patch('services.large_package_catalog_topics.name_topics',side_effect=lambda _s,_p,b,*a:{k:'工业设备健康管理' for k in b}):
             self.assertTrue(tree.build(self.store,self.pid,dict(rnd,id='next-round'),model_client=Mock()))
         with closing(self.store._connect()) as c:
             payload=json.loads(c.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',(self.pid,)).fetchone()[0])
         self.assertEqual(payload['nodes'][0]['name'],'工业设备健康管理')
         self.assertFalse(payload['pending_names'])
+
+    def test_worker_retries_pending_parent_in_same_round_without_resetting_budget(self):
+        from large_package_worker import LargePackageWorker
+        from services import large_package_catalog_tree as tree
+        for i in range(3):self.add('g%d'%i,[1,.01*i])
+        worker=LargePackageWorker(store=self.store)
+        for runner in worker._preview_runners:self.addCleanup(runner.close)
+        rnd=naming.ensure_round(self.store,self.pid,'topics',min_seconds=480)
+        calls=[]
+        def names(_store,_pid,buckets,*args,**kwargs):
+            calls.append(1)
+            return {} if len(calls)<3 else {k:'工业设备健康管理' for k in buckets}
+        with patch.object(Config,'LP_TOPIC_MERGE',True), patch.object(tree,'TOPIC_REGENERATION_ATTEMPTS',3), patch.object(naming,'ensure_round',return_value=rnd) as ensure, patch('services.large_package_catalog_topics.name_topics',side_effect=names), patch('services.large_package_catalog_merge.consolidate',return_value=0):
+            for attempt in range(1,4):
+                self.assertTrue(worker._merge_topics_once(self.pid))
+                with closing(self.store._connect()) as c:
+                    self.assertEqual(tree.stale(c,self.pid),attempt<3)
+                    payload=json.loads(c.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',(self.pid,)).fetchone()[0])
+                self.assertEqual(payload['attempted_round'],rnd['id'])
+                self.assertEqual(payload['topic_regeneration_attempts'],attempt)
+            self.assertFalse(worker._merge_topics_once(self.pid))
+            self.assertEqual(ensure.call_count,3)
+            self.assertEqual([call.args[2] for call in ensure.call_args_list],['topics']*3)
+        self.assertEqual(len(calls),3)
+        self.assertFalse(payload['pending_names'])
+        self.assertEqual(payload['nodes'][0]['name'],'工业设备健康管理')
+
+    def test_worker_stops_same_round_parent_retries_at_persisted_limit(self):
+        from large_package_worker import LargePackageWorker
+        from services import large_package_catalog_tree as tree
+        for i in range(3):self.add('g%d'%i,[1,.01*i])
+        worker=LargePackageWorker(store=self.store)
+        for runner in worker._preview_runners:self.addCleanup(runner.close)
+        with patch.object(Config,'LP_TOPIC_MERGE',True), patch.object(tree,'TOPIC_REGENERATION_ATTEMPTS',2), patch('services.large_package_catalog_topics.name_topics',return_value={}) as names, patch('services.large_package_catalog_merge.consolidate',return_value=0):
+            self.assertTrue(worker._merge_topics_once(self.pid))
+            self.assertTrue(worker._merge_topics_once(self.pid))
+            for _ in range(4):self.assertFalse(worker._merge_topics_once(self.pid))
+            with closing(self.store._connect()) as c:
+                self.assertFalse(tree.stale(c,self.pid))
+                payload=json.loads(c.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',(self.pid,)).fetchone()[0])
+            self.assertEqual(names.call_count,2)
+            self.assertEqual(payload['topic_regeneration_attempts'],2)
+            self.assertTrue(payload['pending_names'])
 
     def test_worker_rebuilds_parent_after_manual_rename_even_when_counts_unchanged(self):
         from large_package_worker import LargePackageWorker

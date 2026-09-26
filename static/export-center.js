@@ -25,6 +25,21 @@
   const FILE_PAGE = 500;
   const ORDINARY_SELECTION_LIMIT = 200; // 服务端 _combined_export_context 的上限
 
+  // 大数据包智能目录 → 普通数据包导入（设计文档 §7）。上限与
+  // services/large_package_catalog_import.py 的 MAX_NODES / MAX_FILES /
+  // MAX_EXCLUSIONS 保持一致：本地先拦一次，不把必然 413 的请求发出去。
+  const IMPORT_MAX_NODES = 2000;
+  const IMPORT_MAX_FILES = 50000;
+  const IMPORT_MAX_EXCLUSIONS = 50000;
+  const IMPORT_PARSE_MODES = ["auto", "fast", "accurate"];
+  // 失败提示按文档 §7 补齐可操作的下一步；HTTP 状态码本身照实展示。
+  const IMPORT_ERROR_HINTS = {
+    400: "",
+    404: "（目录节点可能已变化，请点「刷新目录」后重试）",
+    409: "（节点尚未完成、大包不可用，或该请求号此前提交过别的选择；请点「刷新目录」后重新选择）",
+    413: "（选择的数量或容量超限，建议拆分后再导入）",
+  };
+
   const state = {
     loadedSources: false,
     mode: "large",
@@ -43,6 +58,7 @@
     poll: null,
     busy: false,
     treeRequest: 0,
+    importBusy: false, // 「进入普通数据包导入」正在提交（与导出的 busy 互不影响）
   };
 
   const domIndex = new Map();
@@ -556,6 +572,355 @@
     const topic = String($("exportTaskTopic")?.value || "").trim();
     const submit = $("exportSubmitBtn");
     if (submit) submit.disabled = state.busy || !state.sourceId || (!folders && !picked) || !topic;
+
+    // 「进入普通数据包导入」的可用性与已选数字共用同一次渲染：勾选、排除、
+    // 切换数据包、提交在途都会经 renderCart()，不需要第二套刷新路径。
+    renderImportEntry();
+  }
+
+  /* -------------------------------------- 大数据包智能目录 → 普通数据包导入 */
+  // 提交同一份选择；与导出（export）是两条互不影响的路径，导出按钮的
+  // 禁用条件、参数与提示文案都没有改动。
+  function importSourceItem() {
+    return state.sources.find((item) => String(item.scan_id || item.large_package_id || item.id || "") === state.sourceId) || null;
+  }
+
+  // 服务端 validate_request 只拦 cancelled / paused，这里对齐同一个口径。
+  function importSourceUnavailable() {
+    const item = importSourceItem();
+    if (!item) return false;
+    const status = String(item.status || item.phase || "").toLowerCase();
+    return status === "cancelled" || status === "paused";
+  }
+
+  function importExcludedCount() {
+    return state.excluded.size + state.excludedNodes.size;
+  }
+
+  /* 请求号只由「当前大包 + 当前选择」决定，与名称、解析模式无关：同一份选择
+   * 反复点击必须拿到同一个 request_key，否则每点一次就多建一个数据包。
+   * 服务端按 (large_package_id, request_key) 幂等，命中即返回第一次的任务。 */
+  function importSelectionMaterial() {
+    return JSON.stringify({
+      n: [...state.nodes].sort(),
+      p: [...state.picked].sort(),
+      xn: [...state.excludedNodes].sort(),
+      xp: [...state.excluded].sort(),
+    });
+  }
+
+  // FNV-1a 双通道：既短（远低于服务端 200 字符的请求号上限）又不易撞。
+  function importDigest(text) {
+    const fnv = (seed) => {
+      let value = seed >>> 0;
+      for (let index = 0; index < text.length; index += 1) {
+        value ^= text.charCodeAt(index);
+        value = Math.imul(value, 0x01000193) >>> 0;
+      }
+      return value.toString(16).padStart(8, "0");
+    };
+    return fnv(0x811c9dc5) + fnv(0x7fed2b17);
+  }
+
+  function importRequestKey() {
+    const packageId = String(state.sourceId || "").replace(/[^\w.-]/g, "");
+    return `lp-import-${packageId}-${importDigest(importSelectionMaterial())}`;
+  }
+
+  /* 容量只能从已经加载到页面上的节点算：大包树的目录节点不带体积，未展开的
+   * 目录无法估计，所以标记 unknown，提示里如实说"实际可能更多"，不假装精确。 */
+  function parseHumanSize(text) {
+    const match = /^\s*([\d.]+)\s*([KMGT]?B)\s*$/i.exec(String(text || ""));
+    if (!match) return 0;
+    const scale = { B: 1, KB: 1024, MB: 1048576, GB: 1073741824, TB: 1099511627776 }[match[2].toUpperCase()] || 0;
+    const value = Number(match[1]) * scale;
+    return Number.isFinite(value) ? Math.round(value) : 0;
+  }
+
+  function estimateBytes(node, ancestors) {
+    if (node.kind === "file") {
+      if (!fileEffective(node.path, ancestors)) return { bytes: 0, unknown: false };
+      const raw = String(node.sizeHuman || "").trim();
+      if (!raw) return { bytes: 0, unknown: true };
+      return { bytes: parseHumanSize(raw), unknown: false };
+    }
+    const chain = node.nodeId ? ancestors.concat([node]) : ancestors;
+    if (!state.loaded.has(node.key) || !node.children.length) {
+      return { bytes: 0, unknown: folderEffective(node, ancestors) };
+    }
+    let bytes = 0;
+    let unknown = false;
+    node.children.forEach((child) => {
+      const part = estimateBytes(child, chain);
+      bytes += part.bytes;
+      unknown = unknown || part.unknown;
+    });
+    return { bytes, unknown };
+  }
+
+  // 节点数 / 文件数 / 已排除项数 / 预计容量：前三个直接复用 renderCart 与
+  // estimateFiles 已经算出来的口径，容量用页面上已有的 size_human 累加。
+  function importSelectionSummary() {
+    const folders = state.nodes.size;
+    const picked = state.picked.size;
+    let files = 0;
+    let bytes = 0;
+    let unknown = false;
+    state.roots.forEach((root) => {
+      files += estimateFiles(root, []);
+      const part = estimateBytes(root, []);
+      bytes += part.bytes;
+      unknown = unknown || part.unknown;
+    });
+    return { folders, picked, nodes: folders + picked, excluded: importExcludedCount(), files, bytes, unknown };
+  }
+
+  function importCapacityText(info) {
+    if (!info.unknown) return humanSize(info.bytes);
+    if (!info.bytes) return "未展开，暂时无法估计";
+    return `至少 ${humanSize(info.bytes)}`;
+  }
+
+  /* 文档 §7 的禁用条件，任一满足就置灰并给出原因（按钮 title + 提交前复检）。 */
+  function importBlockReason() {
+    if (state.mode !== "large") return "该入口只用于「大数据包」这一栏的智能目录";
+    if (state.busy || state.importBusy) return "正在提交，请稍候…";
+    if (!state.sourceId) return "请先选择大数据包";
+    if (importSourceUnavailable()) return "当前大数据包已停止或暂停，无法进入普通导入";
+    if (state.loadError) return state.loadError;
+    if (!state.roots.length) return "智能目录仍在生成，请稍后再试";
+    if (!state.nodes.size && !state.picked.size) return "请先勾选要导入的主题、子目录或单个文件";
+    if (state.nodes.size > IMPORT_MAX_NODES) {
+      return `一次最多选择 ${IMPORT_MAX_NODES} 个目录节点；当前 ${state.nodes.size} 个，请改选上级目录。`;
+    }
+    if (state.picked.size > IMPORT_MAX_FILES) {
+      return `一次最多选择 ${IMPORT_MAX_FILES.toLocaleString()} 个文件；当前 ${state.picked.size.toLocaleString()} 个。`;
+    }
+    if (importExcludedCount() > IMPORT_MAX_EXCLUSIONS) {
+      return `排除项 ${importExcludedCount().toLocaleString()} 项超出上限，建议拆分后再导入。`;
+    }
+    return "";
+  }
+
+  function renderImportEntry() {
+    const button = $("exportCatalogImportBtn");
+    if (!button) return;
+    button.hidden = state.mode !== "large";
+    const reason = importBlockReason();
+    button.disabled = Boolean(reason);
+    button.title = reason || "把当前勾选的智能目录建成一个普通数据包";
+
+    // 选中汇总：节点数 / 选中文件数 / 总容量。数字与确认弹窗、导出侧共用
+    // 同一套 estimateFiles 口径，不额外发请求。
+    const totals = $("exportImportTotals");
+    if (!totals) return;
+    const info = importSelectionSummary();
+    const show = state.mode === "large" && info.nodes > 0;
+    totals.hidden = !show;
+    totals.textContent = show
+      ? `节点 ${info.nodes.toLocaleString()} · 文件 ${info.files.toLocaleString()}`
+        + ` · ${importCapacityText(info)}${info.unknown ? "（含未展开目录）" : ""}`
+      : "";
+  }
+
+  // 按钮由脚本注入到导出提交按钮旁边：index.html 不在本次改动范围内，
+  // 这样新入口随 export-center.js 一起生效，不必另外改模板。
+  function ensureImportButton() {
+    if ($("exportCatalogImportBtn")) return;
+    const actions = document.querySelector(".export-cart-actions");
+    if (!actions) return;
+    const button = document.createElement("button");
+    button.id = "exportCatalogImportBtn";
+    button.type = "button";
+    button.className = "secondary export-catalog-import";
+    button.textContent = "进入普通数据包导入";
+    const submitBtn = $("exportSubmitBtn");
+    if (submitBtn && submitBtn.parentElement === actions) submitBtn.insertAdjacentElement("afterend", button);
+    else actions.appendChild(button);
+    const totals = document.createElement("span");
+    totals.id = "exportImportTotals";
+    totals.className = "export-import-totals";
+    totals.hidden = true;
+    button.insertAdjacentElement("afterend", totals);
+    button.addEventListener("click", openImportDialog);
+    renderImportEntry();
+  }
+
+  /* ------------------------------------------------------------ 确认弹窗 */
+  function selectedSourceName() {
+    return state.nameById.get(state.sourceId) || state.sourceId;
+  }
+
+  function defaultImportName() {
+    const label = String(selectedSourceName() || "").trim() || "大数据包";
+    return `${label} · 智能目录选择`.slice(0, 120);
+  }
+
+  function setImportState(message, error) {
+    const el = $("exportImportState");
+    if (!el) return;
+    el.className = "export-import-state" + (error ? " is-error" : "");
+    el.textContent = message || "";
+  }
+
+  function renderImportSummary() {
+    const host = $("exportImportSummary");
+    if (!host) return;
+    const info = importSelectionSummary();
+    const note = info.unknown ? "（含未展开目录，实际可能更多）" : "";
+    host.innerHTML = `<div><dt>节点数</dt><dd>${info.folders.toLocaleString()} 个目录`
+      + `${info.picked ? ` · ${info.picked.toLocaleString()} 个单文件` : ""}</dd></div>`
+      + `<div><dt>文件数</dt><dd>预计约 ${info.files.toLocaleString()} 个</dd></div>`
+      + `<div><dt>已排除项数</dt><dd>${info.excluded.toLocaleString()} 项</dd></div>`
+      + `<div><dt>预计容量</dt><dd>${esc(importCapacityText(info))}${note}</dd></div>`;
+  }
+
+  function ensureImportDialog() {
+    const existing = $("exportCatalogImportDialog");
+    if (existing) return existing;
+    const host = document.createElement("div");
+    host.id = "exportCatalogImportDialog";
+    host.className = "export-import-modal";
+    host.hidden = true;
+    host.setAttribute("role", "dialog");
+    host.setAttribute("aria-modal", "true");
+    host.setAttribute("aria-label", "进入普通数据包导入");
+    host.innerHTML = `<div class="export-import-panel">`
+      + `<header class="export-import-head"><div><span class="section-kicker">HANDOFF / ORDINARY PACKAGE</span><h3>进入普通数据包导入</h3></div>`
+      + `<button id="exportImportClose" class="ghost" type="button">取消</button></header>`
+      + `<p class="export-import-hint">把当前勾选的智能目录内容建成一个普通数据包，之后的解析、摘要、检索与问答都走普通流程。`
+      + `服务端会重新展开这份选择；同一份选择重复提交不会重复建包。</p>`
+      + `<label class="field-label">普通数据包名称<input id="exportImportName" type="text" maxlength="120" placeholder="例如：政策法规专项资料"></label>`
+      + `<label class="field-label">解析模式<select id="exportImportParseMode">`
+      + `<option value="accurate">accurate · 精确解析（默认）</option>`
+      + `<option value="fast">fast · 快速解析</option>`
+      + `<option value="auto">auto · 自动（服务端按精确处理）</option>`
+      + `</select></label>`
+      + `<dl id="exportImportSummary" class="export-import-summary"></dl>`
+      + `<p id="exportImportState" class="export-import-state" aria-live="polite"></p>`
+      + `<div class="export-import-actions"><button id="exportImportCancel" class="secondary" type="button">取消</button>`
+      + `<button id="exportImportConfirm" class="primary" type="button">确认导入</button></div>`
+      + `</div>`;
+    document.body.appendChild(host);
+    $("exportImportClose")?.addEventListener("click", closeImportDialog);
+    $("exportImportCancel")?.addEventListener("click", closeImportDialog);
+    $("exportImportConfirm")?.addEventListener("click", () => submitCatalogImport());
+    host.addEventListener("click", (event) => {
+      if (event.target === host) { closeImportDialog(); return; }
+      const jump = event.target.closest("[data-import-open-package]");
+      if (jump) openOrdinaryPackage(jump.dataset.importOpenPackage || "");
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !host.hidden) closeImportDialog();
+    });
+    return host;
+  }
+
+  function openImportDialog() {
+    const reason = importBlockReason();
+    if (reason) { notify(reason, true); return; }
+    const host = ensureImportDialog();
+    const input = $("exportImportName");
+    if (input) input.value = defaultImportName();
+    const mode = $("exportImportParseMode");
+    if (mode) mode.value = "accurate";
+    const confirm = $("exportImportConfirm");
+    if (confirm) { confirm.disabled = false; confirm.textContent = "确认导入"; }
+    renderImportSummary();
+    setImportState(`将提交 ${[...state.nodes].length} 个目录节点、${[...state.picked].length} 个单文件`
+      + `${importExcludedCount() ? `，并排除 ${importExcludedCount()} 项` : ""}。`, false);
+    host.hidden = false;
+    input?.focus();
+    input?.select?.();
+  }
+
+  function closeImportDialog() {
+    const host = $("exportCatalogImportDialog");
+    if (host) host.hidden = true;
+  }
+
+  function showImportResult(data, requestKey, name) {
+    const el = $("exportImportState");
+    if (!el) return;
+    const files = Number(data.selected_file_count || 0);
+    const bytes = Number(data.selected_bytes || 0);
+    const scanId = String(data.scan_id || "");
+    const sourceId = String(data.source_large_package_id || state.sourceId || "");
+    el.className = "export-import-state is-done";
+    el.innerHTML = `<strong>${data.reused ? "已复用之前的导入任务" : "已进入普通数据包导入"}</strong>`
+      + `<span>普通数据包：<b>${esc(name)}</b>`
+      + `${scanId ? `（${esc(scanId)}）` : ""}</span>`
+      + `<span>本次导入 <b>${files.toLocaleString()}</b> 个文件${bytes ? ` · ${esc(humanSize(bytes))}` : ""}`
+      + `${data.reused ? "，未重复建包" : ""}</span>`
+      + `<span>来源大数据包：<b>${esc(sourceId)}</b></span>`
+      + `<span>请求号：<b>${esc(requestKey)}</b></span>`
+      + `<div class="export-import-actions"><button class="primary" type="button"`
+      + ` data-import-open-package="${esc(scanId)}" data-import-scan-url="${esc(String(data.scan_url || ""))}">`
+      + `前往普通数据包</button></div>`;
+  }
+
+  /* 复用页面已有的"打开普通数据包"出口：SJFXDataSources.open('standard') 是
+   * app.js 给模块级"切换数据包"提供的公共入口，这里不新造路由。 */
+  function openOrdinaryPackage(scanId) {
+    const id = String(scanId || "").replace(/^\/api\/scan\//, "").trim();
+    if (id) {
+      // app.js 的 rememberCurrentScan()（app.js:540）就是"当前数据包"的既有约定：
+      // 写同一个键并广播同一个事件，让数据包页面落在这个新包上。
+      try {
+        window.localStorage.setItem("sjfx_current_scan_id_v1", id);
+        window.dispatchEvent(new CustomEvent("sjfx-scan-changed", { detail: { scanId: id } }));
+      } catch (_) {
+        // 浏览器禁用本地存储时仍然可以跳转，只是不会自动聚焦到这个数据包。
+      }
+    }
+    if (typeof window.SJFXDataSources?.open === "function") window.SJFXDataSources.open("standard");
+    else window.SJFXShell?.activate("packages");
+  }
+
+  async function submitCatalogImport() {
+    const reason = importBlockReason();
+    if (reason) { setImportState(reason, true); notify(reason, true); return; }
+    const input = $("exportImportName");
+    const name = String(input?.value || "").trim();
+    if (!name) { setImportState("请输入普通数据包名称", true); input?.focus(); return; }
+    if (name.length > 120) { setImportState("名称不能超过 120 个字符", true); input?.focus(); return; }
+    const chosen = String($("exportImportParseMode")?.value || "accurate");
+    const parseMode = IMPORT_PARSE_MODES.includes(chosen) ? chosen : "accurate";
+    const requestKey = importRequestKey();
+
+    state.importBusy = true;
+    const button = $("exportImportConfirm");
+    if (button) { button.disabled = true; button.textContent = "正在创建…"; }
+    setImportState("正在创建普通数据包…", false);
+    renderCart();
+    try {
+      const data = await api(`/api/large-packages/${encodeURIComponent(state.sourceId)}/catalog/import`, {
+        method: "POST",
+        body: JSON.stringify({
+          node_ids: [...state.nodes],
+          paths: [...state.picked],
+          exclude_node_ids: [...state.excludedNodes],
+          exclude_paths: [...state.excluded],
+          name,
+          parse_mode: parseMode,
+          request_key: requestKey,
+        }),
+      });
+      showImportResult(data, requestKey, name);
+      notify(data.reused
+        ? "已复用之前的导入任务"
+        : `已开始导入 ${Number(data.selected_file_count || 0).toLocaleString()} 个文件`);
+    } catch (error) {
+      const status = Number(error.status || 0);
+      const message = `导入失败（HTTP ${status || "—"}）：${error.message || "请求失败"}${IMPORT_ERROR_HINTS[status] || ""}`;
+      setImportState(message, true);
+      notify(error.message || "导入失败", true);
+    } finally {
+      state.importBusy = false;
+      const restore = $("exportImportConfirm");
+      if (restore) { restore.disabled = false; restore.textContent = "确认导入"; }
+      renderCart();
+    }
   }
 
   /* ---------------------------------------------------------------- 提交 */
@@ -815,6 +1180,7 @@
     $("exportCollapseAllBtn")?.addEventListener("click", collapseAll);
     $("exportClearSelectionBtn")?.addEventListener("click", () => { clearSelection(); syncChecks(); });
     $("exportSubmitBtn")?.addEventListener("click", submit);
+    ensureImportButton();
     $("exportTaskTopic")?.addEventListener("input", renderCart);
     $("exportRecordsRefreshBtn")?.addEventListener("click", () => {
       const host = $("exportRecords");
@@ -840,7 +1206,32 @@
     loadRecords();
   }
 
-  window.SJFXExportCenter = { activate, reload: () => loadSources() };
+  window.SJFXExportCenter = {
+    activate,
+    reload: () => loadSources(),
+    // 大数据包结果页的入口：登记要选中的大包，切回「大数据包」这一栏并按该
+    // 大包重读目录。setMode() 是既有的切页逻辑（重置选择树 + 重读数据源），
+    // 这里只复用，不加第二条加载路径。
+    openForLargePackage: (packageId) => {
+      const id = String(packageId || "").trim();
+      if (id) {
+        window.sjfxLargeResultId = id;
+        try {
+          window.localStorage.setItem("sjfx_large_package_id", id);
+        } catch (_) {
+          // 存储不可用时只影响"下次进入导出中心仍记得这个大包"。
+        }
+      }
+      if (state.mode === "large" && state.loadedSources && state.sourceId === id && state.roots.length) {
+        // 已经停在这个大包上：保留用户当前的选择，只把页面切过去。
+        return;
+      }
+      // 这次由本函数读数据源；标记一下，避免紧随其后的 activate('exports')
+      // 再把数据包列表读一遍。
+      state.loadedSources = true;
+      setMode("large");
+    },
+  };
   document.addEventListener("DOMContentLoaded", () => {
     bind();
     if (window.SJFXShell?.route === "exports") activate("exports");

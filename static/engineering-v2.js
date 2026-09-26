@@ -115,6 +115,7 @@
   }
 
   function resetOverviewView(scanId) {
+    window.SJFXIntelligenceOverview?.clear('packageIntelligenceBoard');
     OVERVIEW_MOUNT_IDS.forEach((id) => { if ($(id)) $(id).innerHTML = ''; });
     const reportButton = $('packageOverviewReportBtn');
     if (reportButton) {
@@ -460,6 +461,8 @@
 
   function renderOverview(overview) {
     const pkg = overview.package || {};
+    const intelligence = window.SJFXIntelligenceOverview;
+    if (intelligence) intelligence.mount('packageIntelligenceBoard', $('packageOverviewMetrics')?.closest('.v2-overview-hero'), intelligence.model('ordinary', overview, state.researchBrief));
     const languages = itemsOf(overview.languages);
     const mainLanguage = languages.length ? (languages[0].label || languages[0].language || '待识别') : '待识别';
     const metrics = [
@@ -2171,6 +2174,7 @@
   }
 
   function resetTranslationView(scanId) {
+    window.SJFXTranslationReader?.reset();
     state.translationSelectedPaths.clear();
     state.translationSubmitting = false;
     state.translationActiveJob = '';
@@ -2228,7 +2232,9 @@
     if ($('translationCancelBtn')) $('translationCancelBtn').disabled = !state.translationActiveJob;
     ['translatePriorityBtn', 'translateBackfillBtn'].forEach((id) => { if ($(id)) $(id).disabled = !translationScanId() || busy; });
     const page = state.translationPage || {};
-    const ready = String(page.provider_id || '').startsWith('vllm:') && page.full_translation && page.status === 'completed';
+    const ready = String(page.provider_id || '').startsWith('vllm:') && (window.SJFXTranslationReader
+      ? window.SJFXTranslationReader.completeTranslation(page)
+      : page.full_translation && ['completed', 'not_required'].includes(page.status));
     if ($('translateDocumentBtn')) $('translateDocumentBtn').disabled = !translationScanId() || !state.translationPath || busy || ready;
   }
 
@@ -2347,6 +2353,20 @@
     if (page.performance && page.performance.paragraph_batching) details.push('短段落已合并加速');
     $('translationDocumentState').textContent = details.join(' · ') || (page.plan && page.plan.translation_required ? `需要翻译，共 ${integer(page.plan.required_unit_count)} 个外文段` : '文档已打开');
     $('translationDocumentState').className = 'v2-inline-state' + (page.status === 'failed' ? ' is-error' : ' is-ready');
+    if (window.SJFXTranslationReader && page.reader_complete) {
+      const ready = window.SJFXTranslationReader.completeTranslation(page);
+      if (page.full_translation && !ready) {
+        $('translationDocumentState').textContent = '仍有未通过校验的段落，请重新翻译当前文件；已保留可读内容。';
+      }
+      $('translationDocumentState').className = 'v2-inline-state' + (ready ? ' is-ready' : page.status === 'failed' ? ' is-error' : '');
+      window.SJFXTranslationReader.render({ page, view: state.translationView, title });
+      const total = Math.max(0, ...[page.original, page.translated, page.working].filter(Boolean).map((item) => numeric(item.total_characters)));
+      $('translationPageInfo').textContent = total ? '正文已全部载入 · 连续阅读' : '暂无正文';
+      $('translationPrevBtn').hidden = true;
+      $('translationNextBtn').hidden = true;
+      renderTranslationList();
+      return;
+    }
     const original = page.original && page.original.text;
     const translated = page.translated && page.translated.text;
     // A partially translated document still has usable content: show the
@@ -2389,26 +2409,51 @@
 
   async function loadTranslation(path, offset) {
     path = String(path || '').trim();
-    if (!translationScanId() || !path || state.translationLoading) return;
+    if (!translationScanId() || !path) return;
+    if (state.translationLoading && state.translationPath === path && state.translationLoadingView === state.translationView) return;
     const requestedScanId = translationScanId();
+    const requestedView = state.translationView;
+    const newDocument = state.translationPath !== path;
     const requestSeq = ++state.translationRequestSeq;
+    const isCurrent = () => translationScanId() === requestedScanId && state.translationRequestSeq === requestSeq && state.translationView === requestedView;
     state.translationLoading = true;
+    state.translationLoadingView = requestedView;
     state.translationPath = path;
-    state.translationOffset = Math.max(0, numeric(offset));
+    state.translationOffset = window.SJFXTranslationReader ? 0 : Math.max(0, numeric(offset));
+    if (newDocument) {
+      state.translationPage = null;
+      $('translationDocumentTitle').textContent = basename(path);
+      $('translationDocumentMeta').textContent = path;
+      $('translationDocumentContent').innerHTML = emptyMarkup('正在载入全文', '会按文档顺序连续呈现，不截断长文。');
+      renderTranslationSelection();
+    }
     $('translationPath').value = path;
     rememberTranslationPath(path);
-    $('translationDocumentState').textContent = '正在读取文档页面…';
+    $('translationDocumentState').textContent = '正在读取完整文档…';
     $('translationDocumentState').className = 'v2-inline-state';
     $('translationOpenBtn').disabled = true;
     try {
       const query = new URLSearchParams({ path, view: state.translationView, offset: String(state.translationOffset), limit: String(PAGE_SIZE) });
-      const response = await api(`/api/translation/${encodeURIComponent(requestedScanId)}?${query.toString()}`);
-      if (translationScanId() === requestedScanId && state.translationRequestSeq === requestSeq) renderTranslationDocument(response);
+      const response = window.SJFXTranslationReader
+        ? await window.SJFXTranslationReader.readComplete({
+          scanId: requestedScanId, path, api, isCurrent,
+          onProgress: (loaded, total) => {
+            if (isCurrent()) $('translationDocumentState').textContent = `正在载入完整正文：${integer(loaded)} / ${integer(total)} 字符`;
+          }
+        })
+        : await api(`/api/translation/${encodeURIComponent(requestedScanId)}?${query.toString()}`);
+      if (isCurrent()) renderTranslationDocument(response);
     } catch (error) {
-      if (translationScanId() === requestedScanId && state.translationRequestSeq === requestSeq) {
+      if (isCurrent() && error.name !== 'AbortError') {
         $('translationDocumentState').textContent = error.message || '无法打开文档';
         $('translationDocumentState').className = 'v2-inline-state is-error';
-        $('translationDocumentContent').innerHTML = emptyMarkup('文档未能打开', error.message || '请检查文件路径和解析状态。');
+        if (!$('translationDocumentContent').querySelector('.tr-reader')) {
+          $('translationDocumentContent').innerHTML = emptyMarkup('全文暂未载入', error.message || '请检查文件路径和解析状态。');
+        }
+        const retry = document.createElement('button');
+        retry.type = 'button'; retry.className = 'text-button'; retry.textContent = '重新载入全文';
+        retry.addEventListener('click', () => loadTranslation(path, 0));
+        $('translationDocumentState').appendChild(retry);
         $('translateDocumentBtn').disabled = !translationScanId() || !state.translationPath;
       }
     } finally {

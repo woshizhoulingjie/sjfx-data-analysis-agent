@@ -441,7 +441,10 @@ def meta_templates(profiles, background):
     # small group must not be removed merely because it is common locally.
     background = background or {}
     files = int(background.get('files') or 0)
-    if files < 10:
+    # 修补 10：原来写死 10，而本模块早已定义 META_BACKGROUND_MIN_FILES=20
+    # （规格也承诺"背景样本 <20 份时不判，保守保留"）。改用该常量，
+    # 小组不再被误判模板 —— 方向上是更保守，不影响任何命名规则。
+    if files < META_BACKGROUND_MIN_FILES:
         return []
     meta_df = background.get('meta_df') or background.get('df') or {}
     minimum = max(3, int(math.ceil(files * TEMPLATE_MIN_SHARE)))
@@ -634,7 +637,12 @@ def _merge_supported(candidates, texts, support):
 def group_profile(store, package_id, group_id, revision):
     feature_store.ensure_package(store, package_id)
     epoch = feature_store.snapshot_key(store, package_id)
-    key = ('profile', str(store.db_path), str(package_id), str(group_id), int(revision or 0), epoch, POLICY_VERSION)
+    # 修补 8：缓存键补上分词器版本。命名 bundle 的键里本来就有它，画像这边漏了 ——
+    # 分词口径变化时 bundle 会重建，而它内部调用的 group_profile 命中旧键、把旧 terms
+    # 塞进新 payload。规格 L2.3 要求的键就是"组 ID+成员修订号+抽样策略版本+分词器版本"。
+    from services.large_package_catalog_naming import _tokenizer_version as _tok_ver
+    key = ('profile', str(store.db_path), str(package_id), str(group_id), int(revision or 0),
+           epoch, POLICY_VERSION, _tok_ver())
     cached = _cache_get(key)
     if cached is not None:
         return cached

@@ -7496,6 +7496,20 @@ class Storage:
             )
         return job_id, True
 
+    def create_scan_from_large_selection(self, large_package, selection, name, parse_mode,
+                                         owner_id, request_key, request_payload=None,
+                                         large_store=None):
+        """把大数据包智能目录的一次选择变成一个普通数据包（文档 §4.4）。
+
+        实现全部在 `services/large_package_catalog_import.py` —— 这里只是文档点名的
+        入口，做成薄委托，避免把桥接逻辑塞进这个既有的大模块。**不改变任何现有行为。**
+        """
+        from services.large_package_catalog_import import create_scan_from_large_selection
+        return create_scan_from_large_selection(
+            self, large_package, selection, name, parse_mode, owner_id, request_key,
+            request_payload=request_payload, large_store=large_store,
+        )
+
     def create_scan_job(self, root_path, max_files, parse_mode, max_depth, owner_id="legacy"):
         """Create a scan-and-analyze workflow without touching the filesystem yet."""
         job_id = uuid.uuid4().hex[:12]

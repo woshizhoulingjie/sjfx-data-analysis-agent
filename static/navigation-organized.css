@@ -1,0 +1,48 @@
+/* Scoped presentation layer; feature panels are unchanged. */
+#primaryNav .organized-nav {padding:0 1px 14px!important;overflow-x:hidden;scrollbar-gutter:stable}
+#primaryNav .workspace-switcher {margin-bottom:13px!important}
+#primaryNav .organized-home {margin:0 3px 14px;padding-bottom:12px;border-bottom:1px solid var(--p-line-soft)}
+#primaryNav .organized-home .nav-item {min-height:42px!important;font-weight:600!important}
+#primaryNav .organized-group {margin:0 0 8px;border:1px solid transparent;border-radius:11px;background:transparent}
+#primaryNav .organized-group[open] {background:#111622;border-color:var(--p-line-soft)}
+#primaryNav .organized-group:not([open])>.organized-items {display:none}
+#primaryNav .organized-heading {display:flex;align-items:center;gap:9px;min-height:62px;margin:0;padding:11px 9px;list-style:none;color:var(--p-text);cursor:pointer;border-radius:10px;user-select:none}
+#primaryNav .organized-heading::-webkit-details-marker {display:none}
+#primaryNav .organized-heading::marker {content:''}
+#primaryNav .organized-heading:hover {background:#1b2232}
+#primaryNav .organized-category-icon {display:grid;place-items:center;flex:0 0 29px;height:31px;border:1px solid #7794ff24;border-radius:8px;color:#9bafff;background:#7794ff0d}
+#primaryNav .organized-category-icon .nav-icon {color:inherit!important;background:none!important;border:0!important;margin:0!important;width:17px!important;height:17px!important}
+#primaryNav .organized-category-icon .ui-icon {width:17px;height:17px}
+#primaryNav [data-nav-category='large'] .organized-category-icon {color:#b5a6ff;background:#a293ff12;border-color:#a293ff24}
+#primaryNav [data-nav-category='research'] .organized-category-icon {color:#78d7bd;background:#62d6b30d;border-color:#62d6b324}
+#primaryNav [data-nav-category='delivery'] .organized-category-icon {color:#e7c394;background:#eabb760d;border-color:#eabb7624}
+#primaryNav .organized-heading-text {flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+#primaryNav .organized-title {color:#e0e6f3;font-size:13px;font-weight:600;line-height:1.4;letter-spacing:.02em}
+#primaryNav .organized-hint {color:#95a2ba;font-size:10px;font-weight:400;line-height:1.5;white-space:normal}
+#primaryNav .organized-count {color:#9ba9c3;font:10px/1.6 var(--p-mono);flex:none}
+#primaryNav .organized-chevron {width:5px;height:5px;margin:0 3px 0 0;border-right:1.5px solid #93a1bc;border-bottom:1.5px solid #93a1bc;transform:rotate(-45deg);flex:none;transition:transform .15s}
+#primaryNav .organized-group[open]>.organized-heading .organized-chevron {transform:rotate(45deg)}
+#primaryNav .organized-group.has-current>.organized-heading .organized-title {color:#bdcbff}
+#primaryNav .organized-items {position:relative;margin:0 7px 8px;padding:0 0 0 8px;border-left:1px solid #2b354c}
+#primaryNav .organized-items .nav-item {gap:9px!important;min-height:36px!important;margin:2px 0!important;padding:7px 9px!important;font-size:13px!important;text-decoration:none}
+#primaryNav .organized-items .nav-icon {flex:0 0 17px;width:17px}
+#primaryNav .organized-items .nav-icon .ui-icon {width:16px;height:16px}
+#primaryNav .organized-items .nav-item.active {background:linear-gradient(90deg,#7794ff24,#7794ff0c)!important;border-color:#7794ff30!important}
+#primaryNav .organized-items .nav-item.active::before {left:-10px;width:2px;top:9px;bottom:9px}
+#primaryNav .organized-heading:focus-visible,#primaryNav .organized-nav .nav-item:focus-visible {outline:2px solid var(--p-blue)!important;outline-offset:-2px!important}
+#primaryNav .sidebar-version {font-size:9px!important;letter-spacing:.06em}
+@media(min-width:761px){
+ body.nav-collapsed #primaryNav .organized-heading {display:none}
+ body.nav-collapsed #primaryNav .organized-group {margin:0 0 8px;padding:0 0 8px;background:transparent;border:0;border-bottom:1px solid var(--p-line-soft);border-radius:0}
+ body.nav-collapsed #primaryNav .organized-home {margin:0 0 8px;padding-bottom:8px}
+ body.nav-collapsed #primaryNav .organized-items {margin:0;padding:0;border:0}
+ body.nav-collapsed #primaryNav .organized-items .nav-item {justify-content:center;gap:0!important;padding:8px 0!important}
+ body.nav-collapsed #primaryNav .organized-nav {padding:0 0 8px!important;scrollbar-gutter:auto}
+ body.nav-collapsed #primaryNav .organized-items .nav-item.active::before {left:0}
+}
+@media(max-width:760px){
+ #primaryNav .organized-heading {min-height:65px}
+ #primaryNav .organized-items .nav-item {min-height:44px!important}
+ #primaryNav .organized-hint {font-size:11px}
+}
+@media(prefers-reduced-motion:reduce){#primaryNav .organized-chevron{transition:none}}

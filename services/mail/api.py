@@ -29,6 +29,11 @@ def _error(message, status=400):
 def _owner(services):
     resolver = services.owner_resolver
     value = resolver() if resolver else "legacy"
+    # Only the trusted server resolver returns None for an admin default view.
+    # Mail reads and writes both require a concrete workspace, never no filter.
+    # Explicit user/view-as owners and the no-resolver fallback stay unchanged.
+    if resolver is not None and value is None:
+        value = Config.OWNER_ID
     return str(value or "legacy")
 
 
@@ -137,6 +142,8 @@ def _mail_endpoint(handler):
 
 def register_mail_routes(app, services):
     """Register routes once the application runtime has assembled services."""
+    from .people_api import register_people_routes
+    register_people_routes(app, services)
 
     @app.route("/mail-research")
     @_mail_endpoint

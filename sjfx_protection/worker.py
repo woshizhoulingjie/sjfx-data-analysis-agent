@@ -62,8 +62,8 @@ def inventory(store, collection, allowed_roots, max_files=200000, deadline=7200)
                     result={'risk':'unchecked','findings':[{'rule':'size_limit','detail':'超过静态检查大小限制'}],
                             'engines':{'static':'skipped_size_limit'}}
                 # Invalidate a verdict if the underlying file changed during inspection.
-                st = path.stat()
-                if st.st_size != identity["size"] or st.st_mtime_ns != identity["mtime_ns"]:
+                after = stable_hash(path)
+                if after != identity:
                     raise ValueError("检测期间文件发生变化：" + name)
                 with store.db(True) as db:
                     db.execute("UPDATE files SET risk=?,findings=?,scan_status=? WHERE id=?",
@@ -71,8 +71,10 @@ def inventory(store, collection, allowed_roots, max_files=200000, deadline=7200)
                     store._event(db,row["owner"],"file.inspected",file_id=fid,
                                  payload={"sha256":identity["sha256"],**result})
         with store.db(True) as db:
-            db.execute("UPDATE collections SET state='ready',updated=? WHERE id=? AND state='running'",
-                       (time.time(),collection))
+            ready = db.execute("UPDATE collections SET state='ready',updated=? WHERE id=? AND state='running'",
+                               (time.time(),collection))
+            if ready.rowcount != 1:
+                return
             db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", ('verified:'+collection,str(time.time())))
             store._event(db,row["owner"],"collection.ready",payload={"collection_id":collection,"count":count})
     except Exception as exc:
@@ -93,6 +95,11 @@ def verify_inventory(store, collection):
         root=Path(row['root'])
         if root.is_symlink() or not root.is_dir():raise ValueError('资料目录已改变')
         seen=set()
+        changes=[]
+        renamed=set()
+        by_identity = {}
+        for original in records.values():
+            by_identity.setdefault(original['identity'], []).append(original)
         def fail(error):raise error
         for directory,dirs,files in os.walk(root,followlinks=False,onerror=fail):
             for name in dirs+files:
@@ -100,18 +107,47 @@ def verify_inventory(store, collection):
             for name in files:
                 path=str(Path(directory)/name)
                 previous=records.get(path)
-                if not previous:raise ValueError('服务器目录新增文件，请重新登记')
                 current=stable_hash(path)
-                if current['sha256']!=previous['sha256'] or current['identity']!=previous['identity']:
-                    raise ValueError('服务器文件版本已变化，请重新登记')
+                if not previous:
+                    candidates = [p for p in by_identity.get(current['identity'], [])
+                                  if p['sha256'] == current['sha256'] and not Path(p['path']).exists()]
+                    if len(candidates) == 1:
+                        previous = candidates[0]
+                        renamed.add(previous['path'])
+                        changes.append(('server.file.renamed', previous['id'],
+                                        {'path': path, 'old_path': previous['path'], 'sha256': current['sha256']}))
+                    else:
+                        changes.append(('server.file.created', '', {'path': path, 'sha256': current['sha256']}))
+                elif current['sha256']!=previous['sha256'] or current['identity']!=previous['identity']:
+                    action = 'server.file.replaced' if current['identity'] != previous['identity'] else 'server.file.modified'
+                    changes.append((action, previous['id'], {'path': path, 'old_sha256': previous['sha256'],
+                                    'sha256': current['sha256'], 'identity': current['identity']}))
                 seen.add(path)
-        if seen!=set(records):raise ValueError('服务器目录有文件删除或移动，请重新登记')
+        for path in set(records) - seen - renamed:
+            changes.append(('server.file.deleted', records[path]['id'], {'path': path, 'sha256': records[path]['sha256']}))
         with store.db(True) as db:
+            # Concurrent cancellation/re-registration must never get a fresh verification timestamp.
+            active = db.execute("SELECT 1 FROM collections WHERE id=? AND state='ready'", (collection,)).fetchone()
+            if not active:
+                return
+            if changes:
+                for action, file_id, payload in changes:
+                    store._event(db, row['owner'], action, file_id=file_id,
+                                 payload={'collection_id': collection, 'server_root': row['root'], **payload})
+                    if file_id:
+                        db.execute('DELETE FROM risk_reviews WHERE file_id=?', (file_id,))
+                db.execute("UPDATE collections SET state='failed',error=?,updated=? WHERE id=?",
+                           ('服务器文件发生变化，旧清单已失效；请重新登记', time.time(), collection))
+                db.execute('DELETE FROM settings WHERE key=?', ('verified:'+collection,))
+                store._event(db, row['owner'], 'collection.changed',
+                             payload={'collection_id': collection, 'change_count': len(changes)})
+                return
             db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',('verified:'+collection,str(time.time())))
     except Exception as exc:
         with store.db(True) as db:
             db.execute("UPDATE collections SET state='failed',error=?,updated=? WHERE id=? AND state='ready'",
                        (str(exc)[:1000],time.time(),collection))
+            db.execute('DELETE FROM settings WHERE key=?', ('verified:'+collection,))
             if row:store._event(db,row['owner'],'collection.changed',payload={'collection_id':collection,'error':str(exc)[:1000]})
 
 

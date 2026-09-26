@@ -4,6 +4,8 @@ import multiprocessing
 import os
 import time
 
+from services.large_package_resources import ResourcePressure, resource_code
+
 
 class PreviewCancelled(Exception):
     pass
@@ -23,7 +25,9 @@ def _serve(connection):
             try:
                 connection.send({"result": preview_file(**request)})
             except Exception as exc:
-                connection.send({"error": "{}: {}".format(type(exc).__name__, str(exc)[:300])})
+                code = resource_code(exc)
+                connection.send({"error": "{}: {}".format(type(exc).__name__, str(exc)[:300]),
+                                 "resource_code": code})
     except (EOFError, BrokenPipeError):
         pass
     finally:
@@ -56,8 +60,14 @@ class PreviewRunner:
             self.close()
             context = multiprocessing.get_context("spawn")
             parent, child = context.Pipe()
-            self.process = context.Process(target=_serve, args=(child,), daemon=True)
-            self.process.start()
+            try:
+                self.process = context.Process(target=_serve, args=(child,), daemon=True)
+                self.process.start()
+            except BaseException:
+                parent.close()
+                child.close()
+                self.process = None
+                raise
             child.close()
             self.connection = parent
         self.calls += 1
@@ -74,6 +84,9 @@ class PreviewRunner:
                     response = self.connection.recv()
                     if "result" in response:
                         return response["result"]
+                    if response.get('resource_code'):
+                        self.close()
+                        raise ResourcePressure('预览资源暂不可用，文件保留等待重试。', response['resource_code'])
                     error = response.get("error", "轻量解析失败")
                     break
                 if not self.process.is_alive():
@@ -93,6 +106,9 @@ class PreviewRunner:
                 except (OSError, ValueError, IndexError, AttributeError):
                     pass
         except (EOFError, BrokenPipeError, OSError) as exc:
+            if resource_code(exc):
+                self.close()
+                raise
             error = "轻量解析中断：" + str(exc)[:160]
             self.close()
         info = portrait(item, [], [], [], refine, [error])

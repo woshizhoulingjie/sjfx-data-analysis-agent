@@ -223,6 +223,8 @@ _ALLOWED_RANGES = (
     (0x0020, 0x007E),   # ASCII
     (0x00A0, 0x017F),   # Latin-1 + Latin Extended-A (European documents)
     (0x0370, 0x03FF),   # Greek
+    (0x0E01, 0x0E3A),   # Assigned Thai letters, vowels and combining marks
+    (0x0E3F, 0x0E5B),   # Thai currency, vowels, tone marks, digits, punctuation
     (0x2000, 0x206F),   # general punctuation
     (0x20A0, 0x20BF),   # currency
     (0x2100, 0x214F),   # letterlike symbols (№, ℃)
@@ -307,6 +309,16 @@ def _mark_unusable(store, package_id, path, reason, token):
     try:
         with store._lock, closing(store._connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
+            # P0（文档 §3B）：原实现先改 files 画像，再按 token 更新队列却**不看命中行数** ——
+            # token 未命中时文件已被改动、队列却不动，等于半写。现在先验所有权：
+            # 不属于本次租约就整事务回滚，一个字节都不写。
+            owned = conn.execute(
+                "SELECT 1 FROM queue WHERE package_id=? AND path=? AND stage='catalog' "
+                "AND lease_token=? AND status='running'",
+                (package_id, path, str(token or ''))).fetchone()
+            if not owned:
+                conn.rollback()
+                return False
             raw = conn.execute('SELECT local_summary FROM files WHERE package_id=? AND path=?',
                                (package_id, path)).fetchone()
             if raw:
@@ -319,9 +331,13 @@ def _mark_unusable(store, package_id, path, reason, token):
                 info['catalog_quality_note'] = QUALITY_NOTE.get(reason, '正文不可用于语义归纳')
                 conn.execute('UPDATE files SET local_summary=? WHERE package_id=? AND path=?',
                              (json.dumps(local, ensure_ascii=False), package_id, path))
-            conn.execute("UPDATE queue SET status='completed',error=NULL,updated_at=?,lease_token=NULL "
-                         "WHERE package_id=? AND path=? AND stage='catalog' AND lease_token=?",
-                         (time.time(), package_id, path, str(token or '')))
+            changed = conn.execute(
+                "UPDATE queue SET status='completed',error=NULL,updated_at=?,lease_token=NULL "
+                "WHERE package_id=? AND path=? AND stage='catalog' AND lease_token=?",
+                (time.time(), package_id, path, str(token or ''))).rowcount
+            if not changed:
+                conn.rollback()
+                return False
             conn.commit()
     except Exception:
         LOGGER.exception('mark unusable failed: %s/%s', package_id, path)
@@ -684,7 +700,7 @@ def _group(store, package_id, path, digest, vector, model, calibration=None, lea
         _complete_catalog_queue(conn, package_id, path, lease)
         conn.commit()
     if result:
-        _apply_member(store, package_id, path, digest, result, score)
+        _apply_member(store, package_id, path, digest, result, score, lease=lease)
     store._catalog_cache.pop(package_id, None)
 
 
@@ -935,7 +951,7 @@ def split_oversized(store, package_id, max_size=None, max_rounds=6):
     return created
 
 
-def _apply_member(store, package_id, path, digest, result, score=1.0):
+def _apply_member(store, package_id, path, digest, result, score=1.0, lease=None):
     row = catalog.get_file(store, package_id, path)
     source = catalog.material(row) if row else None
     if not source or source[1] != digest:
@@ -945,7 +961,10 @@ def _apply_member(store, package_id, path, digest, result, score=1.0):
     result = {**result, 'quotes': [{'source': 'deep_summary' if value['deep_summary'] else 'content',
                                   'text': (value['deep_summary'] or value['text'] or ' / '.join(value['fields']))[:900]}],
               'reason': '依据文件内容语义归组；目录名提取自组内代表标题/短语，文件证据见下方'}
-    catalog._save(store, package_id, path, digest, result)
+    # P0：把本次领取的租约一并带入，_save 才能验证所有权。
+    # P0：把本次领取的租约一并带入（只有 _group 路径有值；name_batch 传 None，
+    # 沿用旧式无租约收尾，不改变那条路径的行为）。
+    catalog._save(store, package_id, path, digest, result, token=lease)
 
 
 _embedding_tokenizer = None
@@ -1329,35 +1348,130 @@ def material_pending_count(store, package_id):
     只处理一半时就执行了；兜底分组又把"还没解析"误当成"没有素材"，把 530 个文件
     永久写进无向量的桶。
 
-    先做一次便宜的计数，只有确实存在"无向量文件"时才逐个判定素材，避免在
-    大包上每次都解析全部 JSON。
+    用已有的 (package_id, path) 主键检查向量，只流式读取无向量文件所需字段。
+    不再先 COUNT 再 SELECT *，避免重复扫描和整包 fetchall；素材判定仍完全
+    交给 catalog.material，不缓存结果、不截断文件，也不降低收尾质量要求。
     """
-    with closing(store._connect()) as conn:
-        pending = conn.execute(
-            'SELECT COUNT(*) FROM files WHERE package_id=? AND sensitive=0 '
-            'AND path NOT IN (SELECT path FROM large_catalog_members '
-            '                 WHERE package_id=? AND LENGTH(vector)>0)',
-            (package_id, package_id)).fetchone()[0]
-        if not int(pending or 0):
-            return 0
-        rows = conn.execute(
-            'SELECT * FROM files WHERE package_id=? AND sensitive=0 '
-            'AND path NOT IN (SELECT path FROM large_catalog_members '
-            '                 WHERE package_id=? AND LENGTH(vector)>0)',
-            (package_id, package_id)).fetchall()
     total = 0
-    for raw in rows:
-        row = store._row(raw)
-        # 已判定"正文不可用于语义归纳"的文件不再计入待办：它们永远不会拿到向量，
-        # 若仍计入，本判据永远不为 0，全局聚类将再也不会触发。
-        if ((row.get('local_summary') or {}).get('portrait') or {}).get('catalog_quality'):
-            continue
-        try:
-            if catalog.material(row):
+    with closing(store._connect()) as conn:
+        # Both path columns are NOT NULL in the authoritative schema, so this
+        # indexed anti-join preserves NOT IN semantics, including empty vectors.
+        # These four columns cover material() and its row_parts() dependency.
+        rows = conn.execute(
+            'SELECT f.local_summary,f.deep_summary,f.deep_status,f.sensitive '
+            'FROM files f WHERE f.package_id=? AND f.sensitive=0 '
+            'AND NOT EXISTS (SELECT 1 FROM large_catalog_members m '
+            '                WHERE m.package_id=? AND m.path=f.path '
+            '                AND LENGTH(m.vector)>0)',
+            (package_id, package_id))
+        for raw in rows:
+            row = store._row(raw)
+            # 已判定"正文不可用于语义归纳"的文件不再计入待办：它们永远不会拿到向量，
+            # 若仍计入，本判据永远不为 0，全局聚类将再也不会触发。
+            if ((row.get('local_summary') or {}).get('portrait') or {}).get('catalog_quality'):
+                continue
+            try:
+                if catalog.material(row):
+                    total += 1
+            except Exception:
                 total += 1
-        except Exception:
-            total += 1
     return total
+
+
+def solo_group_candidates(package_id, conn, limit=500):
+    """方案A：列出"有可读特征卡、却没有任何成员组"的文件。只读。
+
+    这些文件落在两条管道的缝里：catalog.material() 认为正文够（>=20 字），而
+    evidence_quality() 要求去空白后 >=40 字才允许嵌入 —— 于是它们拿不到向量，
+    任何分组路径都不会碰，界面上只能退回显示原始线索（"内容线索：..."）。
+    实测某包 195 个（表格型 docx，抽出的正文只有 26~36 字）。
+    """
+    try:
+        from services.large_package_evidence import FEATURE_VERSION
+        rows = conn.execute(
+            "SELECT f.path FROM files f "
+            "JOIN lp_naming_features e ON e.package_id=f.package_id AND e.path=f.path "
+            "AND e.version=? "
+            "WHERE f.package_id=? AND f.sensitive=0 AND f.quick_status='completed' "
+            "AND json_extract(e.card,'$.readable')=1 "
+            "AND NOT EXISTS(SELECT 1 FROM large_catalog_members m "
+            "               WHERE m.package_id=f.package_id AND m.path=f.path) "
+            "AND NOT EXISTS(SELECT 1 FROM queue q WHERE q.package_id=f.package_id "
+            "               AND q.path=f.path AND q.stage='catalog' "
+            "               AND q.status IN ('queued','retry','running')) "
+            "ORDER BY f.path LIMIT ?",
+            (FEATURE_VERSION, package_id, int(limit))).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        LOGGER.exception('solo candidate scan failed: %s', package_id)
+        return []
+
+
+def assign_solo_groups(store, package_id, limit=500):
+    """把候选各自落成一个单文件条目，交给现有命名链路（queue_groups→命名）起名。
+
+    与 kmeans_recluster 完全分开：**只新增**（只处理"没有任何组"的文件），
+    绝不删除或移动任何已有成员 —— 因此不会被下一次重聚类清掉，也不改变现有分组。
+    开关与批次1 同源：SJFX_LP_SOLO_GROUP_NAMING=0 关闭。
+    """
+    if not SOLO_GROUP_NAMING:
+        return 0
+    with closing(store._connect()) as conn:
+        candidates = solo_group_candidates(package_id, conn, limit)
+    if not candidates:
+        return 0
+    now = time.time()
+    prefix = 'km-solo-' + hashlib.sha256(package_id.encode()).hexdigest()[:8]
+    created = 0
+    try:
+        model = _km_model_name(store, package_id)
+        with store._lock, closing(store._connect()) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            package = conn.execute('SELECT status FROM packages WHERE id=?',
+                                   (package_id,)).fetchone()
+            if not package or package[0] in {'paused', 'cancelled'}:
+                conn.rollback()
+                return 0
+            taken = {r[0] for r in conn.execute(
+                'SELECT id FROM large_catalog_groups WHERE package_id=?', (package_id,))}
+            seq = 0
+            for path in candidates:
+                while ('%s-%05d' % (prefix, seq)) in taken:
+                    seq += 1
+                gid = '%s-%05d' % (prefix, seq)
+                taken.add(gid)
+                seq += 1
+                # 空质心：单文件组没有语义质心；给它算质心反而会被邻居的名字带偏。
+                conn.execute(
+                    'INSERT INTO large_catalog_groups(package_id,id,model,anchor,representative,'
+                    'result,status,updated_at,member_count) VALUES(?,?,?,?,?,?,?,?,0) '
+                    'ON CONFLICT(package_id,id) DO UPDATE SET '
+                    'representative=excluded.representative,updated_at=excluded.updated_at',
+                    (package_id, gid, model, b'', path, '{}', 'queued', now))
+                conn.execute(_MEMBER_UPSERT, (package_id, path, gid, '', b''))
+                created += 1
+            conn.commit()
+    except Exception:
+        LOGGER.exception('solo group assign failed: %s', package_id)
+        return 0
+    if created:
+        LOGGER.info('solo groups assigned package=%s created=%d (ungrouped-but-readable)',
+                    package_id, created)
+        store._catalog_cache.pop(package_id, None)
+    return created
+
+
+def maintain_ungrouped(store, package_ids, limit=500):
+    """给若干包补做单文件条目；返回 {package_id: created}。只新增，不动已有分组。"""
+    out = {}
+    for package_id in package_ids:
+        try:
+            n = assign_solo_groups(store, str(package_id), limit)
+            if n:
+                out[str(package_id)] = n
+        except Exception:
+            LOGGER.exception('maintain_ungrouped failed: %s', package_id)
+    return out
 
 
 def kmeans_recluster(store, package_id, force=False):
@@ -1689,24 +1803,49 @@ def embed_many(client, texts, factory=None):
     size = max(1, int(getattr(client, 'max_batch_size', 8) or 8))
     chunks = [values[i:i + size] for i in range(0, len(values), size)]
     width = max(1, min(int(embed_concurrency()), len(chunks)))
+    def checked_embed(instance, chunk):
+        result = list(instance.embed(chunk))
+        if len(result) != len(chunk):
+            raise ValueError('语义向量数量不一致')
+        return result
     # 没有工厂函数就**如实退回串行**：同一个客户端实例内部是
     # `BoundedSemaphore(1)`（vllm.py），多线程发只会撞它自己的互斥并抛"忙碌"，
     # 起线程池纯属白费——第一版就是这样把嵌入打成失败的。
     if factory is None:
-        return list(client.embed(values))
+        return checked_embed(client, values)
     if width == 1 or len(chunks) == 1:
-        return list(client.embed(values))
+        return checked_embed(client, values)
     clients = []
     for _ in range(width):
         try:
             made = factory()
         except Exception:
             made = None
-        clients.append(made or client)
+        # A missing/aliased client cannot provide an independent request lane.
+        # Fall back once, before dispatch; never share its internal semaphore.
+        if made is None or any(made is other for other in clients):
+            return checked_embed(client, values)
+        expected_model = getattr(client, 'model', None)
+        actual_model = getattr(made, 'model', None)
+        if expected_model is not None and actual_model != expected_model:
+            return checked_embed(client, values)
+        clients.append(made)
     from concurrent.futures import ThreadPoolExecutor
+    from queue import SimpleQueue
+    available = SimpleQueue()
+    for instance in clients:
+        available.put(instance)
+    def run_chunk(chunk):
+        # Executor workers take the next queued task as soon as they finish.
+        # Task ordinal modulo width does NOT identify an idle client: a slow
+        # first chunk can still own that client when the third chunk starts.
+        instance = available.get()
+        try:
+            return checked_embed(instance, chunk)
+        finally:
+            available.put(instance)
     with ThreadPoolExecutor(max_workers=width, thread_name_prefix='sjfx-lp-embed') as pool:
-        parts = list(pool.map(lambda pair: clients[pair[0] % len(clients)].embed(pair[1]),
-                              list(enumerate(chunks))))
+        parts = list(pool.map(run_chunk, chunks))
     result = []
     for part in parts:
         result.extend(part)
@@ -1742,8 +1881,9 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
     from services.large_package_evidence import row_parts
     policy = representation(store,package_id)
     rows = []
+    source_rows = store.get_files(package_id, [path for _, path, _ in claimed], decorate=False)
     for _, path, _lease in claimed:
-        row = catalog.get_file(store, package_id, path)
+        row = source_rows.get(path)
         source = catalog.material(row) if row else None
         if source:
             value,digest=source
@@ -1791,7 +1931,15 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
                 raise ValueError('语义向量数量不一致')
             fresh = {key:_vector(vector) for key,vector in zip(keys,encoded)}
             with closing(store._connect()) as conn:
-                conn.executemany('INSERT OR REPLACE INTO large_catalog_embeddings VALUES(?,?,?)', [(model,k,fresh[k].tobytes()) for k in keys])
+                # _connect uses autocommit; an explicit transaction amortizes
+                # WAL work across the batch without changing any cache key.
+                conn.execute('BEGIN IMMEDIATE')
+                try:
+                    conn.executemany('INSERT OR REPLACE INTO large_catalog_embeddings VALUES(?,?,?)', [(model,k,fresh[k].tobytes()) for k in keys])
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
             for digest,key in cache_keys.items():
                 if key in fresh:
                     vectors[digest] = fresh[key]
@@ -1856,7 +2004,8 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
                 LOGGER.exception('k-means staging failed: %s', package_id)
                 for path, value, digest in rows:
                     catalog._save(store, package_id, path, digest,
-                                  error='语义向量暂未入库，稍后重试')
+                                  error='语义向量暂未入库，稍后重试',
+                                    token=leases.get(path))
             return len(claimed)
         # One calibration per batch keeps the write lock out of the cosine math.
         try:
@@ -1867,7 +2016,9 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
             _group(store,package_id,path,digest,vectors[digest],model,calibration,leases.get(path))
     except Exception as exc:
         for path, value, digest in rows:
-            catalog._save(store,package_id,path,digest,error='语义分组暂未完成：'+str(exc)[:180])
+            catalog._save(store,package_id,path,digest,
+                          error='语义分组暂未完成：'+str(exc)[:180],
+                          token=leases.get(path))
     return len(claimed)
 
 

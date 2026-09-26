@@ -237,6 +237,11 @@ def _research(job, services):
     if not package or package.get("status")=="failed":
         services.repository.update_turn(turn_id,owner_id,status="failed",sufficiency="insufficient",error={"message":"邮件资料包尚未成功导入"})
         raise ValueError("邮件资料包尚未成功导入")
+    if turn.get('task_spec', {}).get('mode') == 'person_correspondence':
+        from .person_research import run_person_slice
+        _job_update(services, job, progress=10, stage='mail_person_analysis', message='逐批阅读该联系人的全部往来正文')
+        return run_person_slice(services.repository, turn_id, owner_id, services.model,
+                                cancelled=lambda: services.repository.cancelled(job['id']))
     _job_update(services, job, progress=8, stage="mail_research", message="正在检索邮件证据")
     runtime = MailResearchRuntime(
         services.repository,

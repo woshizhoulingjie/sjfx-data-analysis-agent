@@ -690,6 +690,9 @@ def preview_file(root, item, refine=False):
         else:
             warnings.append("该格式暂不支持轻量正文识别，保留文件清单")
     except (TimeoutError, ValueError, OSError, ImportError, zipfile.BadZipFile) as exc:
+        from services.large_package_resources import resource_code
+        if resource_code(exc):
+            raise
         warnings.append(str(exc)[:240])
     after = path.stat()
     if (stat.st_size, stat.st_mtime_ns, stat.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):

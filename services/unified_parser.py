@@ -91,7 +91,7 @@ SUPPORTED_EXTENSIONS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".doc", ".ppt", ".xls", ".rtf",
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
-    ".xml", ".html", ".htm", ".log", ".yaml", ".yml",
+    ".xml", ".html", ".htm", ".log", ".yaml", ".yml", ".eml",
     ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".rar", ".7z",
 }
 
@@ -785,6 +785,9 @@ class UnifiedDocumentParser:
         max_single_file_bytes = content_byte_limit("MAX_SINGLE_FILE_BYTES")
         max_archive_file_bytes = content_byte_limit("MAX_ARCHIVE_FILE_BYTES")
         effective_file_limit = max_archive_file_bytes if is_archive else max_single_file_bytes
+        if ext == ".eml":
+            from services.mail.policy import MailPolicy
+            effective_file_limit = min(effective_file_limit, MailPolicy.from_config(Config).max_message_bytes)
         relative_path = str(relative_path or path.name).replace("\\", "/")
         requested_mode = str(mode or "accurate").strip().lower()
         if requested_mode not in {"fast", "accurate", "auto"}:
@@ -861,6 +864,10 @@ class UnifiedDocumentParser:
             })
             base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
             return base
+
+        if ext == ".eml":
+            from services.mail_document import project_eml
+            return project_eml(path, base, self.max_chars)
 
         if ext in {".csv", ".tsv"}:
             profile = profile_path(path)

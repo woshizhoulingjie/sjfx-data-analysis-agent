@@ -1,0 +1,46 @@
+/* Scoped to the explicit file translation view; never changes other screens. */
+/* The host theme uses !important on generic headings, paragraphs and tables.
+   Keep its dark shell, but give the reading paper an explicit accessible palette. */
+[data-view="translation"] .tr-reader { background: #f3f5f8 !important; color: #253247 !important; }
+[data-view="translation"] .tr-paper, [data-view="translation"] .tr-prose, [data-view="translation"] .tr-prose p { color: #253247 !important; background-color: #ffffff !important; }
+[data-view="translation"] .tr-prose h2, [data-view="translation"] .tr-prose h3, [data-view="translation"] .tr-prose h4, [data-view="translation"] .tr-prose h5, [data-view="translation"] .tr-prose h6 { color: #243f60 !important; background-color: transparent !important; }
+[data-view="translation"] .tr-prose th { color: #253247 !important; background-color: #edf2f7 !important; }
+[data-view="translation"] .tr-prose td { color: #253247 !important; background-color: #ffffff !important; }
+[data-view="translation"] .v2-translation-layout { grid-template-columns: minmax(260px, 310px) minmax(0, 1fr); align-items: start; }
+[data-view="translation"] .v2-translation-sidebar { min-height: 0; position: sticky; top: 18px; }
+[data-view="translation"] .v2-translation-list { max-height: 62vh; }
+[data-view="translation"] .v2-translation-item strong { font-size: 13px; }
+[data-view="translation"] .v2-translation-item span { font-size: 11px; line-height: 1.6; }
+[data-view="translation"] .v2-document-panel { min-width: 0; }
+[data-view="translation"] .v2-document-content { max-height: none; overflow: visible; background: #f3f5f8; border-color: #dce3ec; }
+[data-view="translation"] .v2-document-header h2 { line-height: 1.5; overflow-wrap: anywhere; word-break: normal; }
+[data-view="translation"] .v2-document-header small { line-height: 1.7; overflow-wrap: anywhere; }
+[data-view="translation"] .tr-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #dce3ec; background: #f8fafc; border-radius: 6px 6px 0 0; }
+[data-view="translation"] .tr-toolbar > span { margin-right: auto; font-size: 13px; color: #52647b; }
+[data-view="translation"] .tr-toolbar button { min-height: 34px; padding: 5px 12px; font-size: 12px; }
+[data-view="translation"] .tr-notice, [data-view="translation"] .tr-hint, [data-view="translation"] .tr-errors, [data-view="translation"] .tr-warnings { margin: 14px 20px; padding: 10px 14px; border-radius: 5px; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
+[data-view="translation"] .tr-ready { background: #eaf4ef; color: #276347; }
+[data-view="translation"] .tr-pending { background: #fff5dd; color: #78530d; border-left: 3px solid #d6a041; }
+[data-view="translation"] .tr-errors { background: #fff0ed; color: #8c352c; }
+[data-view="translation"] .tr-hint, [data-view="translation"] .tr-warnings { color: #536174; background: #eaf0f6; }
+[data-view="translation"] .tr-warnings summary { cursor: pointer; }
+[data-view="translation"] .tr-action-state { padding: 0 20px; color: #345b84; font-size: 13px; }
+[data-view="translation"] .tr-action-state:empty { display: none; }
+[data-view="translation"] .tr-paper { min-width: 0; max-width: 920px; margin: 20px auto; padding: 30px clamp(20px, 4vw, 56px) 24px; background: #fff; color: #253247; border: 1px solid #e0e5eb; box-shadow: 0 3px 14px #20355008; }
+[data-view="translation"] .tr-paper-label { padding-bottom: 16px; border-bottom: 1px solid #e5eaf0; color: #68788b; font-size: 12px; letter-spacing: .06em; }
+[data-view="translation"] .tr-prose { font: var(--tr-font-size, 17px)/1.95 "Microsoft YaHei", "PingFang SC", sans-serif; overflow-wrap: anywhere; word-break: normal; text-align: start; }
+[data-view="translation"] .tr-prose p { margin: 1.1em 0; white-space: pre-wrap; font: inherit; color: inherit; max-height: none; overflow: visible; }
+[data-view="translation"] .tr-prose h2, [data-view="translation"] .tr-prose h3, [data-view="translation"] .tr-prose h4, [data-view="translation"] .tr-prose h5, [data-view="translation"] .tr-prose h6 { position: static; margin: 1.6em 0 .7em; padding: 0; background: none; color: #243f60; font-weight: 650; font-size: 1.2em; line-height: 1.65; border: 0; }
+[data-view="translation"] .tr-prose h2 { font-size: 1.45em; }
+[data-view="translation"] .tr-table-scroll { max-width: 100%; overflow-x: auto; margin: 1.2em 0; }
+[data-view="translation"] .tr-prose table { width: 100%; border-collapse: collapse; font: inherit; font-size: .88em; }
+[data-view="translation"] .tr-prose th, [data-view="translation"] .tr-prose td { padding: 9px 12px; border: 1px solid #dce3ea; vertical-align: top; white-space: pre-wrap; min-width: 80px; }
+[data-view="translation"] .tr-prose th { background: #edf2f7; text-align: start; }
+[data-view="translation"] .tr-end { margin-top: 30px; padding-top: 18px; border-top: 1px solid #e6ebf0; color: #7a8798; font-size: 12px; text-align: center; }
+[data-view="translation"] .tr-empty { padding: 40px 0; color: #718096; text-align: center; }
+[data-view="translation"] .tr-bilingual { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 12px; padding: 0 12px; }
+[data-view="translation"] .tr-bilingual .tr-paper { width: 100%; padding: 24px; box-sizing: border-box; }
+[data-view="translation"].tr-focus .v2-translation-sidebar, [data-view="translation"].tr-focus .v2-translation-summary { display: none; }
+[data-view="translation"].tr-focus .v2-translation-layout { grid-template-columns: minmax(0, 1fr); }
+@media (max-width: 1080px) { [data-view="translation"] .v2-translation-layout { grid-template-columns: minmax(0, 1fr); } [data-view="translation"] .v2-translation-sidebar { position: static; } [data-view="translation"] .v2-translation-list { max-height: 300px; } }
+@media (max-width: 700px) { [data-view="translation"] .tr-bilingual { grid-template-columns: minmax(0, 1fr); } [data-view="translation"] .tr-paper { margin: 12px 0; padding: 22px 18px; } [data-view="translation"] .tr-notice, [data-view="translation"] .tr-hint, [data-view="translation"] .tr-errors, [data-view="translation"] .tr-warnings { margin: 12px; } }

@@ -612,7 +612,7 @@ class TranslationCoreTests(unittest.TestCase):
 
         service = build_file_translation_service(FakeClient(), None)
         self.assertTrue(service.policy.preserve_figure_blocks)
-        self.assertTrue(service.policy.preserve_untranslated_tail)
+        self.assertFalse(service.policy.preserve_untranslated_tail)
 
 
 

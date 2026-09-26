@@ -15,6 +15,7 @@
 它们应当被参数化（两种模式各跑一遍），这件事记在遗留清单里，不在这里用跳过掩盖。
 """
 import os
+import struct
 import tempfile
 import unittest
 from contextlib import closing
@@ -186,6 +187,13 @@ class CatalogModeContractTests(unittest.TestCase):
         """
         specs = [("g-%02d" % i, ["f-%02d.txt" % i]) for i in range(20)]
         self._seed_groups(specs, label_name="法律法规与司法案例汇编")
+        # Identical labels are insufficient: every group needs compatible content.
+        with closing(self.store._connect()) as c:
+            c.execute("UPDATE large_catalog_members SET vector=? WHERE package_id=?",
+                      (struct.pack('ff', 1, 0), self.pid))
+            c.execute("UPDATE lp_catalog_labels SET revision=(SELECT content_revision FROM large_catalog_groups g "
+                      "WHERE g.package_id=lp_catalog_labels.package_id AND g.id=lp_catalog_labels.group_id) "
+                      "WHERE package_id=?", (self.pid,))
         self.assertEqual(self._group_count(), 20)
         naming.normalize_leaves(self.store, self.pid)
         self.assertEqual(self._group_count(), 1,
@@ -200,6 +208,12 @@ class CatalogModeContractTests(unittest.TestCase):
             row = c.execute("SELECT name FROM lp_catalog_labels WHERE package_id=?",
                             (self.pid,)).fetchone()
         self.assertEqual(row[0], "法律法规与司法案例汇编")
+
+    def test_same_named_leaves_without_content_evidence_must_not_merge(self):
+        self._seed_groups([('a',['a.txt']),('b',['b.txt'])],label_name='法律法规与司法案例汇编')
+        stats=naming.normalize_leaves(self.store,self.pid)
+        self.assertEqual(stats['merged_groups'],0)
+        self.assertEqual(self._group_count(),2)
 
     def test_leaf_count_converges_over_twenty_rounds(self):
         """验收②：连续 20 轮目录构建 → 叶组数**收敛**，不是 170→412 那种单调增长。
@@ -317,7 +331,7 @@ class CatalogModeContractTests(unittest.TestCase):
 
         calls = []
         fake_round = {'id': 'round-test', 'deadline': _time.time() + 3600}
-        with _patch.object(_naming, 'merge_topics',
+        with _patch.object(Config, 'LP_TOPIC_MERGE', True), _patch.object(_naming, 'merge_topics',
                            side_effect=lambda *a, **k: (calls.append(1), True)[1]), \
              _patch.object(_naming, 'ensure_round', return_value=fake_round):
             worker = LargePackageWorker(self.store)
@@ -381,7 +395,7 @@ class CatalogModeContractTests(unittest.TestCase):
 
         calls = []
         fake_round = {'id': 'round-test', 'deadline': _time.time() + 3600}
-        with _patch.object(_naming, 'merge_topics',
+        with _patch.object(Config, 'LP_TOPIC_MERGE', True), _patch.object(_naming, 'merge_topics',
                            side_effect=lambda *a, **k: (calls.append(1), True)[1]), \
              _patch.object(_naming, 'ensure_round', return_value=fake_round):
             worker = LargePackageWorker(self.store)

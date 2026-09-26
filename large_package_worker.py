@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import threading
+import tempfile
 import time
 from contextlib import closing
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -14,8 +15,26 @@ from pathlib import Path
 
 from config import Config
 from services.large_package_isolated import LargePackageStore, iter_inventory, quick_preview
+from services.large_package_resources import (AdmissionGuard, ResourcePressure,
+    defer_lease, pressure, resource_code, show_wait, sqlite_temp_directory)
 
 LOGGER = logging.getLogger("sjfx.large_package_worker")
+
+# `_solo_catchup` 的欠账判据。提为模块级常量是为了让测试直接复用同一段 SQL，
+# 避免"测试里另写一份、与生产漂移"。语义见 SOLO_CATCHUP_STALE_SQL 上方的注释。
+SOLO_CATCHUP_STALE_SQL = (
+    "SELECT DISTINCT g.package_id FROM large_catalog_groups g "
+    "JOIN packages p ON p.id=g.package_id "
+    "LEFT JOIN lp_catalog_labels l ON l.package_id=g.package_id "
+    "  AND l.group_id=g.id "
+    "WHERE g.id LIKE 'km-solo-%' AND p.status IN "
+    "('waiting_for_selection','completed','running') "
+    "AND (l.group_id IS NULL "
+    "     OR (l.revision!=g.content_revision AND l.locked=0)) "
+    "AND NOT EXISTS(SELECT 1 FROM lp_catalog_jobs j "
+    "  WHERE j.package_id=g.package_id AND j.group_id=g.id) "
+    "LIMIT 40")
+
 
 # 深度解析并行时，每个线程必须持有自己的解析器实例：
 # UnifiedDocumentParser 内部有可变状态（缓存/句柄），跨线程共享不安全。
@@ -107,6 +126,9 @@ class LargePackageWorker:
         # 让 Worker 回到正常轮询节奏。首次调用的时间戳是 0.0，所以第一次
         # run_once() 照旧会尝试 —— 契约测试因此仍然通过。
         self._stall_scan_at = 0.0
+        # 方案A：单文件条目补做的节流时间戳（0.0 = 首次 run_once 就会尝试）。
+        self._solo_catchup_at = 0.0
+        self._stage_report_at = 0.0
         self._stall_retry_seconds = max(
             30.0, float(getattr(Config, 'LP_STALL_RETRY_SECONDS', 300.0) or 300.0))
         self.stop_requested = False
@@ -114,7 +136,15 @@ class LargePackageWorker:
         self.preview_runner = PreviewRunner()
         self._preview_runners = [self.preview_runner]+[PreviewRunner() for _ in range(max(1,Config.LP_PREVIEW_CONCURRENCY)-1)]
         self._naming_executor = None
-        self._naming_future = None
+        # C（文档 §3C.2/§3C.4）：**有界的两路在途**，键是 package_id —— 一条车道只
+        # 服务一个包，两个不同的包才可能同时在途。`SJFX_LP_NAMING_PARALLEL` 默认关闭，
+        # 关闭时 lanes=1，行为与改动前逐字一致。
+        # `_naming_future` 保留为兼容属性（见 _naming_future 的 property）：老代码与
+        # 两个既有测试把它当作"唯一在途的那一路"来设置和读取。
+        self._naming_futures = {}
+        self._naming_order = []
+        self._naming_orphan_future = None
+        self._naming_parallel_logged = False
         # 已做过主题归并的包 → 当时的叶组签名。仅进程内有效；
         # 存签名而不是布尔值，是为了让叶组集合变化后能重算一次
         # （全局聚类可能在主题归并之后又跑了一次，把叶组从 66 个变成 69 个）。
@@ -169,6 +199,33 @@ class LargePackageWorker:
         # 已完成 k-means 全局分组的包；仅进程内有效（重启后按占位分组重建）。
         self._km_finalized = set()
 
+    def _check_resources(self):
+        if getattr(self, '_admission', None) is None:
+            self._admission = AdmissionGuard(
+                lambda: [('大包索引', Path(self.store.db_path).parent),
+                 ('解析临时目录', Config.PARSE_TEMP_DIR),
+                 ('系统临时目录', tempfile.gettempdir()),
+                 ('SQLite临时目录', sqlite_temp_directory())],
+                reserve_bytes=max(1024 ** 3, Config.PARSE_TEMP_DISK_RESERVE_BYTES))
+        self._admission.check()
+
+    def _defer_resource(self, package_id, path, stage, token, exc):
+        if not resource_code(exc):
+            return False
+        # Close admission immediately, before touching a possibly-full database.
+        self._check_guard_defer(exc)
+        defer_lease(self.store, package_id, path, stage, token, exc)
+        show_wait(self.store, package_id, exc)
+        return True
+
+    def _check_guard_defer(self, exc):
+        if getattr(self, '_admission', None) is None:
+            try:
+                self._check_resources()
+            except ResourcePressure:
+                pass
+        return self._admission.defer(exc)
+
     def _interrupted(self, package_id):
         current = self.store.get(package_id)
         return self.stop_requested or not current or current["status"] in {"paused", "cancelled"}
@@ -194,15 +251,19 @@ class LargePackageWorker:
                 extension = item.get("extension") or "[无扩展名]"
                 type_counts[extension] = type_counts.get(extension, 0) + 1
                 if len(batch) >= 100:
+                    self._check_resources()
                     self.store.upsert_files(package_id, batch)
                     batch = []
                     self.store.update_package(package_id, progress=min(19, 1 + discovered // 1000), message="已盘点 {} 个文件；目录持续更新".format(discovered), counts={"discovered_files": discovered, "total_bytes": total_bytes, "type_counts": type_counts})
             if batch:
+                self._check_resources()
                 self.store.upsert_files(package_id, batch)
             if not self._interrupted(package_id):
                 self.store.update_package(package_id, status="running", phase="quick_parse", progress=20, message="盘点有 {} 处无法读取，继续识别已发现文件".format(inventory_error_count) if inventory_error_count else "盘点完成，按格式识别文件内容", counts={"discovered_files": discovered, "total_bytes": total_bytes, "total_size_human": _human(total_bytes), "type_counts": type_counts, "inventory_complete": inventory_error_count == 0, "inventory_error_count": inventory_error_count, "inventory_errors": inventory_errors})
             return True
         except Exception as exc:
+            if resource_code(exc):
+                raise
             LOGGER.exception("large inventory failed: %s", package_id)
             self.store.update_package(package_id, status="failed", phase="inventory", error=str(exc), message="目录盘点失败")
             return False
@@ -276,6 +337,39 @@ class LargePackageWorker:
 
     def _catalog_incremental(self, package_id):
         from services.large_package_semantic import embed_batch, name_batch
+        # §4.1：这一趟内部的四段以前只记一个总耗时，而历史样本里"同样 claimed=32"
+        # 既有 0.5 秒也有 27.7 秒 —— 必须拆开才知道尾部在哪。只加计时，
+        # **不改变任何调用顺序与返回值**（顺带修掉 claimed 在异常分支可能未定义）。
+        _t0 = time.monotonic()
+        claimed = 0
+        _stage = {}
+        try:
+            cancelled = lambda: self._interrupted(package_id)
+            _s = time.monotonic()
+            claimed = embed_batch(self.store, package_id, cancelled=cancelled)
+            _stage['embed_batch'] = time.monotonic() - _s
+            if not cancelled():
+                from services.large_package_feature_delta import ensure_package
+                _s = time.monotonic()
+                ensure_package(self.store,package_id,max_batches=2)
+                _stage['ensure_package'] = time.monotonic() - _s
+            _s = time.monotonic()
+            self._ensure_km_finalized(package_id, claimed=claimed)
+            _stage['km_finalize'] = time.monotonic() - _s
+            _s = time.monotonic()
+            name_batch(self.store, package_id, cancelled=cancelled)
+            _stage['name_batch'] = time.monotonic() - _s
+        except Exception:
+            LOGGER.exception("large semantic catalog deferred: %s", package_id)
+        else:
+            _dt = time.monotonic() - _t0
+            for _name, _sec in _stage.items():
+                stage_record('catalog.' + _name, _sec, package=package_id[:12], claimed=claimed)
+            stage_record('catalog.lane_total', _dt, package=package_id[:12], claimed=claimed)
+            if int(getattr(Config, 'LP_CATALOG_LANE_LOG_MS', 200) or 0) <= _dt * 1000:
+                LOGGER.info("catalog incremental lane package=%s seconds=%.2f claimed=%s stages=%s",
+                            package_id, _dt, claimed,
+                            {k: round(v, 3) for k, v in _stage.items()})
         # **纯诊断**：这一趟是后台车道，但它写库时要拿进程级 `store._lock`，
         # 而预览主线程的 get_file / claim / commit_stage_result 抢的是同一把锁。
         # 车道当初就是为"挪出预览关键路径"才建的，如果这一趟很慢，预览车道就会
@@ -621,9 +715,12 @@ class LargePackageWorker:
                     # 一个慢文件会把同批里已经跑完的车道一起挂住——实测一个 4 秒
                     # 超时文件能让其余 3 个空闲车道白等（预览预算是 4 秒/文件）。
                     if free_runners and time.monotonic() < slice_deadline:
+                        self._check_resources()
                         _t=time.monotonic()
                         claimed=self.store.claim('quick',len(free_runners),package_id=package_id)
                         _lap('claim',_t)
+                        # §4.1：submit 段此前只被打印、没有真正 _lap —— 补上。
+                        _lap('submit', _t)
                         _t=time.monotonic()
                         items=self.store.preview_files(package_id,[p for _,p,_ in claimed])
                         _lap('getfile',_t)
@@ -647,7 +744,7 @@ class LargePackageWorker:
                     _prof['n_wait'] = _prof.get('n_wait', 0) + 1
                     _prof['n_batch'] = _prof.get('n_batch', 0) + len(finished)
                     _t = time.monotonic()
-                    commits=[];followups=[]
+                    commits=[];followups=[];resource_failure=None
                     prior=self.store.preview_files(package_id,[inflight[f][0] for f in finished])
                     for future in finished:
                         path,runner,lease=inflight.pop(future);free_runners.append(runner)
@@ -660,14 +757,26 @@ class LargePackageWorker:
                         except PreviewCancelled:
                             self.store.requeue(package_id,path,'quick',token=lease)
                         except Exception as exc:
+                            if self._defer_resource(package_id,path,'quick',lease,exc):
+                                resource_failure=pressure(exc)
+                                continue
                             commits.append(dict(package_id=package_id,path=path,stage='quick',token=lease,ok=False,
                                 error=str(exc)[:500],file_fields={'quick_status':'failed','error':str(exc)[:500]}))
                             followups.append((path,False))
                         done+=1
                     if commits:
-                        outcomes=self.store.commit_stage_batch(commits)
+                        try:
+                            outcomes=self.store.commit_stage_batch(commits)
+                        except Exception as exc:
+                            if resource_code(exc):
+                                self._check_guard_defer(exc)
+                                for item in commits:
+                                    self._defer_resource(package_id,item['path'],'quick',item['token'],exc)
+                            raise
                         for (ok,reason),(path,refine) in zip(outcomes,followups):
                             if ok and refine:self.store.enqueue_recognition(package_id,path)
+                    if resource_failure is not None:
+                        raise resource_failure
                     _lap('collect', _t)
                     # 目录增量改为异步后台车道：节奏仍是每 32 个文件一次，
                     # 但不再占用预览主线程（详情见 _schedule_catalog_incremental）。
@@ -691,6 +800,8 @@ class LargePackageWorker:
                 except PreviewCancelled:
                     self.store.requeue(package_id, path, 'quick', token=lease)
                 except Exception as exc:
+                    if self._defer_resource(package_id,path,'quick',lease,exc):
+                        continue
                     self.store.commit_stage_result(
                         package_id, path, 'quick', lease, ok=False, error=str(exc)[:500],
                         file_fields={'quick_status': 'failed', 'error': str(exc)[:500]})
@@ -775,6 +886,7 @@ class LargePackageWorker:
         end = time.monotonic() + slice_seconds
         processed = 0
         while processed < max_files and time.monotonic() < end and not self._interrupted(package_id):
+            self._check_resources()
             claimed = self.store.claim("recognize", 1, package_id=package_id)
             if not claimed:
                 break
@@ -787,6 +899,8 @@ class LargePackageWorker:
                 self.store.requeue(package_id, path, "recognize", token=lease)
                 break
             except Exception as exc:
+                if self._defer_resource(package_id,path,'recognize',lease,exc):
+                    raise pressure(exc) from exc
                 self.store.commit_stage_result(
                     package_id, path, "recognize", lease, ok=False,
                     error=str(exc)[:300],
@@ -842,20 +956,100 @@ class LargePackageWorker:
                                   progress=70, message=note)
         return True
 
-    def _submit_naming(self, package_id):
-        from services.large_package_catalog_batch import process_batch
-        if self._naming_future is not None and not self._naming_future.done():
+    # ---- C：有界双路命名的车道管理（文档 §3C）----------------------------
+    @property
+    def _naming_future(self):
+        """兼容旧接口：返回**最近提交**的那一路 future。
+
+        单路（开关关闭）时它就是唯一在途的那一路，因此
+        `worker._naming_future = Future()` 与 `worker._naming_future.result()`
+        这两个既有用法都继续成立。
+        """
+        for pid in reversed(self._naming_order):
+            future = self._naming_futures.get(pid)
+            if future is not None:
+                return future
+        return self._naming_orphan_future
+
+    @_naming_future.setter
+    def _naming_future(self, value):
+        # 旧接口写入：当作"外部塞进来的一路在途"参与占位计算。
+        self._naming_orphan_future = value
+
+    def _naming_lanes(self):
+        """本次允许的在途命名路数。两个约束取小，并在夹紧时只记一次日志。
+
+        ① `SJFX_LP_NAMING_PARALLEL`（默认关）——不开就只有 1 路；
+        ② 准入闸门的后台名额 `max(1, SJFX_GENERATION_CONCURRENCY - 1)`。闸门跨进程
+           全局（共享 model_dispatch.db），后台请求只拿 N-1 个名额；实测 N=1/2 时后台
+           上限都是 1，此时第二路只会在 generation_slot 上排队 —— 按上限夹紧，
+           不制造"看起来在途 2、其实一跑一停"的假象。
+        """
+        enabled = str(os.getenv('SJFX_LP_NAMING_PARALLEL', '0')).strip().lower() in {
+            '1', 'true', 'yes', 'on'}
+        if not enabled:
+            return 1
+        try:
+            from services.model_dispatch import _concurrency_limit
+            gate = max(1, int(_concurrency_limit()) - 1)
+        except Exception:
+            gate = 1
+        try:
+            wanted = int(getattr(Config, 'LP_NAMING_PARALLEL_LANES', 2) or 2)
+        except Exception:
+            wanted = 2
+        try:
+            from services.large_package_catalog_naming import naming_concurrency
+            wanted = min(wanted, naming_concurrency())
+        except Exception:
+            pass
+        lanes = max(1, min(gate, wanted))
+        if not self._naming_parallel_logged:
+            self._naming_parallel_logged = True
+            LOGGER.info('naming parallel: wanted=%d gate_bg_slots=%d effective_lanes=%d '
+                        '(SJFX_LP_NAMING_PARALLEL=on)', wanted, gate, lanes)
+        return lanes
+
+    def _naming_inflight(self):
+        """在途（未完成）的命名包 id 列表。调度器据此避开已经占着车道的包。"""
+        return [pid for pid, future in self._naming_futures.items() if not future.done()]
+
+    def _naming_slot_free(self, package_id):
+        """还能不能再起一路（给这个包）。"""
+        if package_id in self._naming_inflight():
             return False
-        if self._naming_future is not None:
+        extra = 1 if (self._naming_orphan_future is not None
+                      and not self._naming_orphan_future.done()) else 0
+        return len(self._naming_inflight()) + extra < self._naming_lanes()
+
+    def _reap_naming(self):
+        """回收已结束的 future，并把异常如实记下来（旧实现只对"上一路"做这件事）。"""
+        for pid in list(self._naming_order):
+            future = self._naming_futures.get(pid)
+            if future is None or not future.done():
+                continue
             try:
-                self._naming_future.result()
+                future.result()
             except Exception:
                 LOGGER.exception('catalog naming task failed')
+            self._naming_futures.pop(pid, None)
+            try:
+                self._naming_order.remove(pid)
+            except ValueError:
+                pass
+
+    def _submit_naming(self, package_id):
+        from services.large_package_catalog_batch import process_batch
+        self._reap_naming()
+        if not self._naming_slot_free(package_id):
+            return False
         if self._naming_executor is None:
-            # 账②：命名车道并发路数由 LP_NAMING_CONCURRENCY 决定（默认 2）。
-            # vLLM 侧已开 --max-num-seqs 2，此前这里写死 1 路，二路批处理能力闲置。
+            # executor 的线程数按**实际允许的路数**开。原来固定开
+            # `naming_concurrency()`（默认 2）个线程，但闸门只放 1 路时第二个线程
+            # 永远闲置 —— 而且"配了 2 个 worker"会被误读成"两路在途"。
             from services.large_package_catalog_naming import naming_concurrency
-            self._naming_executor = ThreadPoolExecutor(max_workers=naming_concurrency())
+            self._naming_executor = ThreadPoolExecutor(
+                max_workers=max(1, min(self._naming_lanes(), naming_concurrency())))
         def interrupted():
             item = self.store.get(package_id)
             return self.stop_requested or not item or item['status'] not in {'waiting_for_selection', 'completed'}
@@ -870,7 +1064,10 @@ class LargePackageWorker:
             deadline = time.monotonic() + 120
             drained = False
             while time.monotonic() < deadline and not interrupted():
-                if not process_batch(self.store, package_id, interrupted):
+                from services.catalog_prefetch import scope as evidence_prefetch_scope
+                with evidence_prefetch_scope():
+                    progressed = process_batch(self.store, package_id, interrupted)
+                if not progressed:
                     drained = True
                     break
             if interrupted():
@@ -970,13 +1167,76 @@ class LargePackageWorker:
                 self.store.reconcile_recognition(package_id)
             except Exception:
                 LOGGER.exception('settle_round failed: %s', package_id)
-        self._naming_future = self._naming_executor.submit(run_slice)
+        self._naming_futures[package_id] = self._naming_executor.submit(run_slice)
+        if package_id in self._naming_order:
+            self._naming_order.remove(package_id)
+        self._naming_order.append(package_id)
         # **提交成功就是"这一轮有进展"**，必须返回 True。
         # run_once 的返回值决定 run_forever 要不要 sleep：返回 False 会被当成
         # "无事可做"，于是刚派出去的命名切片被白白等一个 poll 周期。
         # 契约测试 test_background_names_do_not_wait_for_busy_generation
         # 断言的正是这件事（原来的 False 让该用例失败）。
         return True
+
+    def _solo_catchup(self):
+        """方案A：给"有可读特征卡、却没有任何组"的文件补单文件条目。
+
+        独立于 k-means：只新增、不动已有分组，所以**冻结包也能修** ——
+        冻结保护的是"结构不被静默重排"，而这里不重排任何结构。
+        限频 120 秒，避免每轮都扫全库。
+        """
+        now = time.monotonic()
+        if now - self._solo_catchup_at < 120.0:
+            return 0
+        self._solo_catchup_at = now
+        try:
+            from services.large_package_semantic import maintain_ungrouped
+            with closing(self.store._connect()) as c:
+                rows = c.execute(
+                    "SELECT id FROM packages WHERE status IN "
+                    "('waiting_for_selection','completed','running') "
+                    "ORDER BY updated_at DESC LIMIT 40").fetchall()
+            made = maintain_ungrouped(self.store, [r[0] for r in rows])
+            # 与"本次是否新建"**解耦**：只要库里还有"有 solo 组、却没有命名任务"
+            # 的包，就给它排任务。第一版只在 made 非空时才排，而条目第一次运行就
+            # 建好了、之后 made 恒为空 —— 任务永远排不上（实测 6 分钟 0 条）。
+            try:
+                with closing(self.store._connect()) as c:
+                    # **收敛判据：只找 queue_groups 真正建得出任务的那些组。**
+                    #
+                    # 原判据只问"有没有 queued/running/deferred 任务"，而命名成功的
+                    # solo 组其任务状态是 `completed`（不在该集合里），于是这个包被
+                    # **永久**判为欠账：实测 lp-085e413e… 等 3 个包从 18:48 到 19:51
+                    # 每 120 秒重排一次，而 queue_groups 因标签已齐实际建 0 条任务
+                    # —— 纯空转 + 日志刷屏。
+                    #
+                    # 为什么必须收紧到"完全没有任务行"、而不是"没有现行标签"就够：
+                    # queue_groups 的 upsert 带
+                    # `WHERE lp_catalog_jobs.revision!=excluded.revision`，
+                    # 同一 revision 下**已存在的非待办任务行永远不会被复活**。所以
+                    # 任何"有任务行、同 revision、却无标签"的组一旦进了这个列表，
+                    # 下一轮必然再次满足判据 → 仍然无限空转。取"无任务行"既与
+                    # queue_groups 的可插入集合严格对齐（solo 组 id 不以 km-other-/
+                    # km-pending- 开头，故不受它那两条排除影响），也保证一轮即收敛。
+                    # 实测全库 429 个 solo 组无一处于"有任务行却没名字"的状态，
+                    # 因此该判据不会漏掉任何真正需要补做的组。
+                    stale = [r[0] for r in c.execute(SOLO_CATCHUP_STALE_SQL)]
+                if stale:
+                    from services.large_package_catalog_naming import queue_groups
+                    for package_id in stale:
+                        # 这些包大多停在 `catalog_ready`，该阶段不在
+                        # SCHEDULABLE_PHASES 里 —— 没有命名切片会轮到它们，
+                        # 所以必须在这里自己排。
+                        queue_groups(self.store, package_id)
+                    LOGGER.info('solo catchup queued naming for packages: %s', stale)
+            except Exception:
+                LOGGER.exception('solo queue_groups failed')
+            if made:
+                LOGGER.info('solo catchup created single-file groups: %s', made)
+            return sum(made.values())
+        except Exception:
+            LOGGER.exception('solo catchup failed')
+            return 0
 
     def _topic_catchup(self):
         """主动补做"主题层落后于叶组"的重建。
@@ -1037,7 +1297,13 @@ class LargePackageWorker:
             with closing(self.store._connect()) as c:
                 from services.large_package_catalog_tree import stale as tree_stale
                 tree_state=tree_stale(c,package_id)
-                if tree_state is not None:return tree_state
+                # **只有"确实陈旧"才提前返回。**
+                # `tree.stale()` 判的是叶组集合指纹（叶组数/成员总数/最大修订号）变没变，
+                # 而"指纹没变"**不等于**三级架构完整：旧代码建出来的树可能只覆盖了一部分
+                # 叶组（生产实测 lp-68848e2c 只覆盖 140/369），指纹却与现在完全一致。
+                # 原实现只要它有结论就 return，于是下面那段覆盖检查根本不执行 ——
+                # 这些树永远不会被重建，覆盖率修复和主题名补全都落不到存量数据上。
+                if tree_state:return True
                 # **必须与 merge_topics 的叶组口径一致**：只算"有成员、且标签
                 # 与 content_revision 对齐（或已锁定）"的真实叶组。
                 #
@@ -1045,11 +1311,16 @@ class LargePackageWorker:
                 # 叶组不足 / 还没命名的包永远判定为"落后"，补做路径每分钟空转一次
                 # （实测 lp-900900aa 反复触发 "topic merge not applicable
                 # (leaf groups 0 < minimum)"），还会挡住真正需要补做的包。
+                # **只把"有能力参与主题"的叶组算进覆盖要求。**
+                # 没有锚点（向量）的叶组无法按语义吸附 —— 生产实测 lp-ff42d1f7 的 266 个
+                # 无向量成员**全部**被管道自己的质量闸门拒掉（too_little_text / no_content）。
+                # 把它们也算作"未覆盖"，主题层就会被判永久陈旧、周期性反复重建。
                 rows = c.execute(
                     "SELECT g.id, g.content_revision FROM large_catalog_groups g "
                     "JOIN lp_catalog_labels l ON l.package_id=g.package_id "
                     "     AND l.group_id=g.id "
                     "WHERE g.package_id=? AND g.member_count>0 "
+                    "AND length(COALESCE(g.anchor,''))>0 "
                     "AND g.id NOT LIKE 'km-other-%' AND g.id NOT LIKE 'km-pending-%' "
                     "AND (l.revision=g.content_revision OR l.locked=1)",
                     (package_id,)).fetchall()
@@ -1058,17 +1329,23 @@ class LargePackageWorker:
                 from config import Config as _Cfg
                 if len(rows) < max(1, int(getattr(_Cfg, 'LP_TOPIC_MERGE_MIN_GROUPS', 12) or 12)):
                     return False
-                covered = {}
-                for branch in c.execute("SELECT revisions FROM lp_catalog_branches "
-                                        "WHERE package_id=?", (package_id,)):
+                # 覆盖判据必须用**整棵树**的 leaf_ids，不能用 `lp_catalog_branches.revisions`：
+                # branches 只写"最底层分支"（legacy 分区），而补全后的三级架构里有一部分
+                # 叶组是**直接挂在顶层主题下**的 —— 它们不在任何 bottom 节点里。
+                # 用 branches 判会永远判"落后"，形成无限重建。
+                covered = set()
+                tree_row = c.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',
+                                     (package_id,)).fetchone()
+                if tree_row:
                     try:
-                        covered.update(json.loads(branch[0] or '{}'))
+                        for _node in (json.loads(tree_row[0]) or {}).get('nodes') or []:
+                            covered.update(str(x) for x in (_node.get('leaf_ids') or []))
                     except (TypeError, ValueError):
                         pass
             for row in rows:
-                recorded = covered.get(str(row[0]))
-                if recorded is None or int(recorded) != int(row[1]):
+                if str(row[0]) not in covered:
                     return True
+            # 全部叶组都在某个主题下 —— 再做一次修订号一致性检查（覆盖通过但内容变过的情形）
             return False
         except Exception:
             LOGGER.exception("topic staleness check failed: %s", package_id)
@@ -1118,19 +1395,21 @@ class LargePackageWorker:
                     "WHERE l.package_id=? AND g.id NOT LIKE 'km-other-%' "
                     "AND (l.revision=g.content_revision OR l.locked=1)",
                     (package_id,)).fetchone()
-                from services.large_package_catalog_tree import fingerprint as tree_fingerprint
+                from services.large_package_catalog_tree import fingerprint as tree_fingerprint, retry_due
                 leaf_versions=[dict(r) for r in conn.execute('''SELECT g.id group_id,g.content_revision,l.version,l.name
                     FROM large_catalog_groups g JOIN lp_catalog_labels l ON l.package_id=g.package_id AND l.group_id=g.id
                     WHERE g.package_id=? AND g.member_count>0 AND (l.revision=g.content_revision OR l.locked=1)
                     AND g.id NOT LIKE 'km-other-%' AND g.id NOT LIKE 'km-pending-%' ''',(package_id,))]
                 tree_key=tree_fingerprint(leaf_versions)
                 tree_row=conn.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',(package_id,)).fetchone()
-                if tree_row and json.loads(tree_row[0]).get('pending_names'):
+                retry_pending=False
+                tree_payload=json.loads(tree_row[0]) if tree_row else {}
+                if tree_payload.get('pending_names'):
                     latest=conn.execute('SELECT id FROM lp_catalog_rounds WHERE package_id=? ORDER BY started DESC LIMIT 1',(package_id,)).fetchone()
-                    if latest:tree_key+=':'+latest[0]
+                    retry_pending=retry_due(tree_payload,latest[0] if latest else None)
             signature = tuple(int(x or 0) for x in (row or (0, 0, 0)))
             signature += (tree_key,)
-            if self._topics_merged.get(package_id) == signature:
+            if self._topics_merged.get(package_id) == signature and not retry_pending:
                 # 签名回到"已归并"的那个点上：没有欠账了，清掉去抖标记，
                 # 否则 _topic_rebuild_owed 会一直认为还欠一次重建而挡住定稿。
                 self._topics_pending.pop(package_id, None)
@@ -1148,7 +1427,9 @@ class LargePackageWorker:
             # 归并本身是幂等的（merge_topics 内部按叶组签名判重），
             # 所以延后重建不会丢结果，只是等叶组稳定后再花这笔模型预算。
             # 设为 0 可关闭去抖，回到"签名一变就重建"。
-            if self._topics_merged.get(package_id) is not None and self._topics_rebuild_debounce > 0:
+            # Same-content retries use the saved attempt cap and existing round
+            # budget. Only changed leaves need the rebuild debounce.
+            if self._topics_merged.get(package_id) not in (None, signature) and self._topics_rebuild_debounce > 0:
                 pending = self._topics_pending.get(package_id)
                 now_mono = time.monotonic()
                 if pending is None or pending[0] != signature:
@@ -1175,11 +1456,76 @@ class LargePackageWorker:
             # 退化成"主题N（N个内容目录）"的直接原因（实测：归并开始时轮次只剩
             # 几十秒，跑到一半到期，后半段全部变成兜底名）。
             merge_seconds = 30 * max(1, int(getattr(Config, 'LP_CATALOG_CALL_SECONDS', 16)))
+            # B1：这里原来传的是 `"topics-%d" % int(time.time())` —— **每一秒都是一个新
+            # key**，而 ensure_round 的语义是"没见过的 key 就新建一个满预算轮次"。
+            # 生产实测：31,567 个不同的 topics key 全部指向 106 个轮次，等于主题层每重建
+            # 一次就重置一次请求/token 预算，并把旧轮次标成 exhausted。
+            # 改成稳定 key 后，复用与否由**原本的 min_seconds 机制**决定：剩余时间够
+            # （≥ merge_seconds）就复用；不够就照常新建，行为回到原设计意图。
             round_row = ensure_round(self.store, package_id,
-                                     "topics-%d" % int(time.time()),
+                                     "topics",
                                      min_seconds=merge_seconds)
             if not round_row:
                 return False
+            # **轮次必须是 active。** ensure_round 的幂等保护对非 exhausted 的终态轮次
+            # （例如 completed）会原样返回，而 reserve() 只认 active —— 拿它去建主题层
+            # 必然一个名字都起不出来，却会把整棵树覆盖成「内容分组（N个子目录）」。
+            # 实测 lp-ff42d1f7：轮次转终态后 50 分钟内每次重建都如此，页面一直是占位名。
+            # 注意：只在**明确知道** status 存在且不是 active 时才走下面这条补救路径。
+            # 测试夹具用 `patch(ensure_round, return_value={"id":..,"deadline":..})`
+            # （没有 status 字段），把"缺失"当作"非 active"会把功能整条关掉。
+            _round_status = round_row.get('status')
+            if _round_status is not None and str(_round_status) != 'active':
+                # 绑定轮次已进终态（completed / exhausted）。**不能在这里放弃** ——
+                # 那正是生产上"主题层永远起不出名字"的原因：`ensure_round` 的
+                # request_key 幂等保护会把终态轮次原样交出来，而 `reserve()` 只认
+                # active，于是每次重建都静默失败、主题名一直停在
+                # 「内容分组（N个子目录）」（实测 lp-68848e2c / lp-085e413e：
+                # 全部轮次均终态、0 个 active）。
+                #
+                # **不改 naming 模块**（那是维护者精心设计的命名算法与预算语义）。
+                # 只换一个**由主题内容签名派生**的键再要一次：
+                #   · 新键没被幂等保护绑定 → ensure_round 走正常分支：先复用现有
+                #     active 轮次（不重置已用预算、不新建轮次），确实没有可用的才新建；
+                #   · 键随内容签名变化，内容不变就一直是同一个键 → 不会像早期那样
+                #     "每重建一次就换一个时间戳 key、不断开新轮次"。
+                # **键必须"此前没被绑定过"，才拿得到可用轮次。**
+                # `ensure_round` 的幂等保护会把 **completed** 的绑定轮次原样交出来
+                # （那是**用户请求键的重放语义**，契约测试锁定，不能改），而 reserve()
+                # 只认 active —— 所以换一个"已绑定过"的键是没用的（实测：我上一版换的
+                # `topics-<签名>` 其轮次已是 completed，于是每 60 秒空转一次）。
+                # 只有 exhausted 才会走到"原地续期"那条路。
+                #
+                # 但键也不能每轮重建都换（那正是早期"31,567 个 topics key → 106 个轮次、
+                # 每次重建都重置预算"的事故）。所以按"同一内容签名已经用掉几个轮次"
+                # 取下一位：只有当上一轮真的被用完（新建过轮次）时 n 才 +1；
+                # 只要还有可用的 active 轮次，ensure_round 会复用它，n 不变、不新建。
+                base = 'topics-%s' % '-'.join(str(x) for x in signature)
+                # 数**已绑定过的键**（`lp_catalog_round_keys`），不是"已创建的轮次"：
+                # 试过但没建成的键也要计入，否则计数不前进、又会生成回同一个死键
+                # （实测：`topics-…-2` 的轮次 completed 之后，计数仍是 1，于是又用回 `-2`，
+                #  每 60 秒空转一次）。
+                # **先看有没有"仍然可用"的派生键 → 有就直接复用它**（这样键会稳定下来，
+                # 不会每轮重建都换一个新键）；只有现存派生键都已失效时，才前进到下一个序号。
+                with closing(self.store._connect()) as _conn:
+                    _rows = _conn.execute(
+                        "SELECT k.request_key, r.status FROM lp_catalog_round_keys k "
+                        "JOIN lp_catalog_rounds r ON r.package_id=k.package_id AND r.id=k.round_id "
+                        "WHERE k.package_id=? AND k.request_key LIKE ? "
+                        "ORDER BY k.request_key", (package_id, base + '%')).fetchall()
+                _live = [row[0] for row in _rows if str(row[1]) == 'active']
+                alt_key = _live[-1] if _live else '%s-%d' % (base, len(_rows) + 1)
+                retry = ensure_round(self.store, package_id, alt_key, min_seconds=merge_seconds)
+                if retry and str(retry.get('status') or '') == 'active':
+                    LOGGER.info('topic rebuild rebound round %s(%s) -> %s key=%s package=%s',
+                                round_row.get('id'), _round_status, retry.get('id'),
+                                alt_key, package_id)
+                    round_row = retry
+                else:
+                    LOGGER.warning('topic rebuild skipped: no usable round '
+                                   '(bound=%s %s, alt=%s) package=%s',
+                                   round_row.get('id'), _round_status, alt_key, package_id)
+                    return False
             ok = merge_topics(
                 self.store, package_id,
                 {"id": round_row["id"], "deadline": round_row["deadline"]},
@@ -1346,6 +1692,7 @@ class LargePackageWorker:
             row = self.store.get_file(package_id, path)
             if not row:
                 raise FileNotFoundError(path)
+            self._check_resources()
             result = _normalize_unicode(self._deep_parse(root, row))
             if result.get("summary_type") == "local_deep_failed":
                 raise RuntimeError(result.get("error") or "深度解析未获得正文")
@@ -1374,6 +1721,8 @@ class LargePackageWorker:
             self._catalog_incremental(package_id)
             return path, True, ""
         except Exception as exc:
+            if self._defer_resource(package_id,path,'deep',lease,exc):
+                raise pressure(exc) from exc
             ok, why = self.store.commit_stage_result(
                 package_id, path, "deep", lease, ok=False, error=str(exc)[:500],
                 file_fields={"deep_status": "failed", "summary_quality": "failed",
@@ -1566,6 +1915,7 @@ class LargePackageWorker:
                 if current and str(current.get("status") or "").lower() in {"paused", "cancelled"}:
                     LOGGER.info("large package %s deep stage stopped at checkpoint: %s", package_id, current.get("status"))
                     return True
+                self._check_resources()
                 lease = self._claim_deep(package_id, 1)
                 if lease is None:
                     if self._deep_finish(package_id):
@@ -1595,6 +1945,7 @@ class LargePackageWorker:
                 if current and str(current.get("status") or "").lower() in {"paused", "cancelled"}:
                     LOGGER.info("large package %s deep stage stopped at checkpoint: %s", package_id, current.get("status"))
                     return True
+                self._check_resources()
                 leases = self._claim_deep(package_id, concurrency)
                 if not leases:
                     if self._deep_finish(package_id):
@@ -1602,7 +1953,9 @@ class LargePackageWorker:
                     return False
                 try:
                     list(pool.map(lambda item: self._deep_worker(package_id, root, item[0], item[1]), leases))
-                except Exception:
+                except Exception as exc:
+                    if resource_code(exc):
+                        raise
                     LOGGER.exception("large package %s deep batch failed", package_id)
                 if time.monotonic() >= slice_deadline:
                     self.store.update_package(package_id, message='深度摘要按检查点继续处理')
@@ -1678,6 +2031,8 @@ class LargePackageWorker:
                 raise SourceChangedError('源文件在摘要期间发生变化，已丢弃结果')
             return _normalize_unicode(summary)
         except Exception as exc:
+            if resource_code(exc):
+                raise
             return {"summary_type": "local_deep_failed", "source_path": row["path"],
                     "error": str(exc)[:500], "quality": "failed", "coverage": "none",
                     "source_changed": isinstance(exc, SourceChangedError)}
@@ -1728,18 +2083,44 @@ class LargePackageWorker:
                 payload["quality"] = "complete"
             return payload
         except Exception as exc:
+            if resource_code(exc):
+                raise
             # 模型不可用是**降级**，不是完整深度摘要。
             return {"summary_type": "local_deep", "model_status": "unavailable",
                     "model_error": str(exc)[:300], "quality": "degraded", "coverage": "sampled"}
 
     def run_once(self):
+        try:
+            self._check_resources()
+            self._resource_warning = None
+            return self._run_admitted_once()
+        except Exception as exc:
+            if not resource_code(exc):
+                raise
+            failure = self._check_guard_defer(exc)
+            package_id = getattr(self, '_resource_package_id', None)
+            if not package_id:
+                try:
+                    package_id = next(iter(self._packages()), {}).get('id')
+                except Exception:
+                    LOGGER.exception('Cannot read package while under resource pressure')
+            warning = (package_id, failure.code)
+            if getattr(self, '_resource_warning', None) != warning:
+                LOGGER.warning('Large-package intake deferred: %s [%s]', package_id, failure.code)
+                show_wait(self.store, package_id, failure)
+                self._resource_warning = warning
+            return False
+
+    def _run_admitted_once(self):
         self.store.stale_running_to_retry()
         package = None
         for candidate in self._packages():
             package = candidate
             break
         if not package:
+            self._resource_package_id = None
             return self._catalog_background()
+        self._resource_package_id = package['id']
         if package["phase"] == "inventory":
             return self._inventory_one(package)
         if package["phase"] == "quick_parse":
@@ -1782,6 +2163,19 @@ class LargePackageWorker:
         # 每分钟最多扫一次，不影响主流程。
         if self._topic_catchup():
             return True
+        # §4.1：每 10 分钟输出一次分阶段分位（只看日志，不影响任何调度）。
+        _now = time.monotonic()
+        if _now - self._stage_report_at >= 600:
+            self._stage_report_at = _now
+            stage_report(('catalog.embed_batch', 'catalog.ensure_package',
+                          'catalog.km_finalize', 'catalog.name_batch',
+                          'catalog.lane_total', 'naming.bundle'))
+        # 方案A：给"有可读内容却没进任何组"的文件补单文件条目。
+        # 放在这里而不是 k-means 收尾处：k-means 收尾在冻结包上会直接早退，
+        # 而这些漏掉的文件恰恰大多在已冻结的包里；而且本补做只新增、不重排。
+        if self._solo_catchup():
+            return True
+            return True
         # 目录降级可见化：从未聚类却已经定稿的包，明确打一条 WARNING。
         # 每个包每个进程只打一次，避免刷屏。
         if not pending and not naming:
@@ -1809,15 +2203,24 @@ class LargePackageWorker:
             # lp_catalog_labels 一条都写不出来。
             # 排序：先挑还有命名任务的包，其次挑还没生成主题层的包，最后才按时间。
             with closing(self.store._connect()) as conn:
-                task = conn.execute(
-                    "SELECT r.package_id FROM lp_catalog_rounds r "
-                    "JOIN packages p ON p.id=r.package_id "
-                    "WHERE r.status='active' AND p.status IN ('waiting_for_selection','completed') "
-                    "ORDER BY (SELECT COUNT(*) FROM lp_catalog_jobs j WHERE j.package_id=r.package_id "
-                    "          AND j.status IN ('queued','running','deferred'))>0 DESC, "
-                    "         (SELECT COUNT(*) FROM lp_catalog_branches b "
-                    "          WHERE b.package_id=r.package_id)>0 ASC, "
-                    "         r.started LIMIT 1").fetchone()
+                # C（文档 §3C.2）：**已经在途的包不再派给它**。排序第一项是"还有
+                # 排队任务"，所以最忙的那个包永远是第一名；不排除的话第二路会被
+                # 反复指给同一个包（`_naming_slot_free` 只会拒绝它），于是"两路在途"
+                # 在实践中永远不会发生 —— 车道数配了等于没配。
+                busy = self._naming_inflight()
+                sql = ("SELECT r.package_id FROM lp_catalog_rounds r "
+                       "JOIN packages p ON p.id=r.package_id "
+                       "WHERE r.status='active' AND p.status IN ('waiting_for_selection','completed') ")
+                params = []
+                if busy:
+                    sql += "AND r.package_id NOT IN (%s) " % ','.join('?' * len(busy))
+                    params.extend(busy)
+                sql += ("ORDER BY (SELECT COUNT(*) FROM lp_catalog_jobs j WHERE j.package_id=r.package_id "
+                        "          AND j.status IN ('queued','running','deferred'))>0 DESC, "
+                        "         (SELECT COUNT(*) FROM lp_catalog_branches b "
+                        "          WHERE b.package_id=r.package_id)>0 ASC, "
+                        "         r.started LIMIT 1")
+                task = conn.execute(sql, params).fetchone()
             if task:
                 return self._submit_naming(task['package_id'])
             # **目录流程没走完的包必须继续推进**，不能在这里直接返回 False。
@@ -1936,6 +2339,109 @@ class LargePackageWorker:
                 self._catalog_lane.shutdown(wait=True, cancel_futures=True)
             if self._naming_executor:
                 self._naming_executor.shutdown(wait=True,cancel_futures=True)
+            from services.catalog_prefetch import shutdown as shutdown_evidence_prefetch
+            shutdown_evidence_prefetch()
+
+
+# ---------------------------------------------------------------------------
+# §4.1 埋点：有界、进程内的分阶段计时。
+#
+# 目的：把"时间去哪了"量成一张账，而不是用 elapsed/总 token 推断瓶颈。
+# 约束：只测耗时/计数，不写原文/证据正文/凭据；内存有界；异常只记日志。
+# ---------------------------------------------------------------------------
+STAGE_SAMPLE_LIMIT = max(32, int(os.getenv('SJFX_LP_STAGE_SAMPLES', '512') or 512))
+_STAGE_LOCK = threading.Lock()
+_STAGE_SAMPLES = {}
+
+
+def stage_record(stage, seconds, **fields):
+    """记录一次阶段耗时；fields 只放计数/哈希类小值。"""
+    try:
+        with _STAGE_LOCK:
+            bucket = _STAGE_SAMPLES.setdefault(stage, [])
+            bucket.append((round(float(seconds), 4), fields))
+            if len(bucket) > STAGE_SAMPLE_LIMIT:
+                del bucket[:len(bucket) - STAGE_SAMPLE_LIMIT]
+    except Exception:
+        pass
+
+
+def stage_percentiles(stage):
+    """返回 (n, p50, p95, p99, sum)；样本不足 3 个时 p* 为 None。"""
+    with _STAGE_LOCK:
+        values = sorted(v for v, _f in _STAGE_SAMPLES.get(stage, ()))
+    if not values:
+        return (0, None, None, None, 0.0)
+
+    def pick(q):
+        if len(values) < 3:
+            return None
+        idx = min(len(values) - 1, int(round(q * (len(values) - 1))))
+        return values[idx]
+
+    return (len(values), pick(0.50), pick(0.95), pick(0.99), round(sum(values), 3))
+
+
+_CODE_VERSION = None
+
+
+def code_version():
+    """本次进程运行的**源码版本指纹**（文档 §4.1：所有指标带源码版本）。
+
+    取四个真正参与目录/命名执行的文件的内容哈希，而不是 `git HEAD`：生产是"带着未
+    提交改动在跑"，HEAD 无法区分"同一提交、工作树被改过"的两种情况，而事故复盘时
+    恰恰需要后者。只算一次；任何异常退化成 'unknown'，绝不影响主流程。
+    """
+    global _CODE_VERSION
+    if _CODE_VERSION is None:
+        try:
+            digest = hashlib.sha256()
+            base = Path(__file__).resolve().parent
+            for rel in ('large_package_worker.py',
+                        'services/large_package_catalog_naming.py',
+                        'services/large_package_catalog_batch.py',
+                        'services/large_package_semantic.py'):
+                try:
+                    digest.update(Path(base, rel).read_bytes())
+                except Exception:
+                    digest.update(rel.encode())
+            _CODE_VERSION = digest.hexdigest()[:12]
+        except Exception:
+            _CODE_VERSION = 'unknown'
+    return _CODE_VERSION
+
+
+def stage_report(stages=(), log=None):
+    """输出若干阶段的 n / p50 / p95 / p99 / sum。"""
+    sink = log or LOGGER.info
+    for stage in stages:
+        n, p50, p95, p99, total = stage_percentiles(stage)
+        if not n:
+            continue
+        sink('stage profile %s n=%d p50=%s p95=%s p99=%s sum=%.3fs ver=%s',
+             stage, n, p50, p95, p99, total, code_version())
+
+
+class StageTimer(object):
+    """with 块计时：stage_record(name, dt, **fields)。异常不改变语义。"""
+
+    __slots__ = ('_name', '_fields', '_t0')
+
+    def __init__(self, name, **fields):
+        self._name = name
+        self._fields = fields
+        self._t0 = time.monotonic()
+
+    def __enter__(self):
+        self._t0 = time.monotonic()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            stage_record(self._name, time.monotonic() - self._t0, **self._fields)
+        except Exception:
+            pass
+        return False
 
 
 def _human(value):

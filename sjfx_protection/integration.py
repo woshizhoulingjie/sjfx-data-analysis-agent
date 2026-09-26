@@ -15,10 +15,11 @@ from urllib.parse import urlsplit, parse_qs
 
 from fastapi import Request
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import HTMLResponse, JSONResponse, Response, FileResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, FileResponse, RedirectResponse
 
 from .scanner import safe_mail_preview
 from .store import ProtectionError, Store, digest
+from .access import authorize, management_owner, setup, enroll, revoke_self
 
 
 current = contextvars.ContextVar("sjfx_protection_context", default=None)
@@ -78,9 +79,12 @@ class Protection:
             try:
                 normalized=os.path.abspath(os.path.expanduser(root))
                 with self.store.db() as db:
-                    row=db.execute('SELECT id FROM collections WHERE owner=? AND root=? ORDER BY created DESC LIMIT 1',
+                    row=db.execute('SELECT id,state FROM collections WHERE owner=? AND root=? ORDER BY created DESC LIMIT 1',
                                    (ctx['owner'],normalized)).fetchone()
-                if row:ctx.update(collection_id=row[0],server_root=normalized)
+                if row:
+                    ctx.update(collection_id=row[0],server_root=normalized)
+                    if row['state'] == 'ready':
+                        self.schedule_verification(row['id'])
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception('文件保护关联查询失败，原业务继续运行')
@@ -100,6 +104,22 @@ class Protection:
             raise ProtectionError('正在核对服务器文件当前版本，请稍后重试；如有变化请重新登记',423,'version_check_pending')
         if self.store.blocked_file(collection):
             raise ProtectionError("资料含危险、待复核或未完成安全检查的文件，请先在文件保护页处理", 423, "dangerous_file")
+
+    def schedule_verification(self, collection):
+        """Audit mode observes registered roots without waiting on NAS reads or denying business work."""
+        with self.store.db() as db:
+            verified = db.execute('SELECT value FROM settings WHERE key=?', ('verified:' + collection,)).fetchone()
+        if verified and time.time() - float(verified[0]) <= 30:
+            return
+        with self.lock:
+            self.workers = {k: v for k, v in self.workers.items() if v.poll() is None}
+            if collection in self.workers or len(self.workers) >= 2:
+                return
+            with open(Path(self.state_dir) / (collection + '.log'), 'ab') as log:
+                self.workers[collection] = subprocess.Popen(
+                    [sys.executable, '-m', 'sjfx_protection.worker', '--state', self.state_dir,
+                     '--collection', collection, '--verify'],
+                    cwd=str(Path(__file__).resolve().parent.parent), stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def bind_download(self, filename, ticket, ttl):
         ctx=current.get()
@@ -169,6 +189,15 @@ class ProtectionMiddleware:
                     device = dev["id"]
         except ProtectionError as exc:
             if enforced:
+                if actor:
+                    try:
+                        await run_in_threadpool(self.p.store.event, actor['owner_id'], 'system.blocked',
+                            device=device, payload={'method': scope['method'], 'route': path,
+                                                    'status': exc.status, 'code': exc.code,
+                                                    'user_id': actor['user_id']})
+                    except Exception:
+                        import logging
+                        logging.getLogger(__name__).exception('文件保护拦截审计写入失败')
                 response = JSONResponse({"ok":False,"error":str(exc),"code":exc.code,"protection_url":"/protection"},status_code=exc.status)
                 return await response(scope,receive,send)
         status, request_parts, response_parts = [500], [], []
@@ -219,19 +248,32 @@ class ProtectionMiddleware:
                 try:
                     def record_request():
                         file_id=''
+                        supplied_file_id = payload.get('file_id')
+                        if supplied_file_id:
+                            with self.p.store.db() as db:
+                                registered = db.execute('SELECT id,path,collection FROM files WHERE id=? AND owner=?',
+                                                        (supplied_file_id, actor['owner_id'])).fetchone()
+                            if registered:
+                                file_id = registered['id']
+                                payload['server_path'] = registered['path']
+                                payload['collection_id'] = registered['collection']
                         candidate=payload.get('node_path') or payload.get('path')
-                        if candidate and payload.get('collection_id'):
+                        if candidate and payload.get('collection_id') and payload.get('server_root'):
                             candidate=os.path.abspath(os.path.join(payload['server_root'],candidate))
                             with self.p.store.db() as db:
                                 row=db.execute('SELECT id FROM files WHERE collection=? AND path=?',
                                                (payload['collection_id'],candidate)).fetchone()
                             if row:file_id=row[0]
+                        if status[0] == 423:
+                            self.p.store.event(actor['owner_id'], 'system.blocked', device=device, file_id=file_id, payload=payload)
                         self.p.store.event(actor['owner_id'],'system.request',device=device,file_id=file_id,payload=payload)
                     # Status polling is coalesced, while every mutation and file operation remains recorded.
                     key=(actor['owner_id'],path,status[0])
                     now=time.monotonic()
                     skip=False
-                    if scope['method']=='GET' and not any(x in path for x in ('download','export','file','document','content','preview')):
+                    polling = path.rstrip('/').rsplit('/', 1)[-1] in {'status', 'progress', 'heartbeat'}
+                    has_file_target = any(payload.get(k) for k in ('file_id', 'path', 'node_path', 'artifact_id'))
+                    if scope['method']=='GET' and polling and not has_file_target:
                         with self.p.lock:
                             skip=now-self.p.audit_reads.get(key,-100)<30
                             if not skip:
@@ -255,23 +297,30 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
             path = request.url.path
             if path == "/protection/bridge.js":
                 return Response((Path(__file__).parent/'web'/'bridge.js').read_text(encoding='utf-8'),media_type='application/javascript')
+            if not path.startswith('/agent/v2/'):
+                actor, session_tag = await run_in_threadpool(protection.user, request.headers)
+                authorize(actor, path, request.method)
+                request.state.protection_actor = (actor, session_tag)
             if path == '/protection/download':
                 package=Path(__file__).parent/'downloads'/'sjfx-assistant-windows.zip'
                 if not package.is_file():
                     raise ProtectionError('管理员尚未发布 Windows 助手安装包',503)
                 return FileResponse(package,filename='sjfx-assistant-windows.zip',media_type='application/zip')
-            if path == "/protection" and request.method == "GET":
-                return HTMLResponse((Path(__file__).parent/'web'/'index.html').read_text(encoding='utf-8'),
-                                    headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
+            if path in {'/protection', '/protection/setup', '/protection/admin'}:
+                page = 'admin.html' if actor.get('role') == 'admin' and path != '/protection/setup' else 'index.html'
+                return HTMLResponse((Path(__file__).parent/'web'/page).read_text(encoding='utf-8'),
+                                    headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff","Vary":"Cookie","X-Frame-Options":"DENY"})
             if path == "/protection/api/status":
                 mode=protection.mode
                 if mode=='audit':
                     try:
-                        actor,_=await run_in_threadpool(protection.user,request.headers)
                         if await run_in_threadpool(protection.enforced,actor['owner_id']):mode='enforce'
                     except ProtectionError:pass
-                return JSONResponse({"ok":True,"mode":mode,"global_mode":protection.mode,
+                if actor.get('role') != 'admin':
+                    return JSONResponse({'ok':True, 'mode':mode, 'access_version':1}, headers={'Cache-Control':'no-store'})
+                return JSONResponse({"ok":True,"mode":mode,"global_mode":protection.mode, 'access_version':1,
                     'enforcement_available':protection.allow_enforcement,
+                    'protection_version': '2.1', 'capabilities': {'file_trace': True, 'version_aware_actions': True},
                     "local_url":"http://127.0.0.1:18765"},headers={'Cache-Control':'no-store'})
             protection.require_on()
             # Prevent cross-site writes authenticated by browser cookies.
@@ -297,6 +346,8 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
             result=await run_in_threadpool(dispatch,request,raw,data)
             return JSONResponse({"ok":True,**result},headers={"Cache-Control":"no-store"})
         except ProtectionError as exc:
+            if exc.status == 401 and request.url.path in {'/protection', '/protection/setup', '/protection/admin'}:
+                return RedirectResponse('/login', status_code=303, headers={'Cache-Control':'no-store'})
             return JSONResponse({"ok":False,"error":str(exc),"code":exc.code},status_code=exc.status)
         except (ValueError,TypeError,KeyError):
             return JSONResponse({"ok":False,"error":"请求字段或格式无效"},status_code=400)
@@ -332,9 +383,11 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
                 return {'bindings':store.list_rows('bindings',device['owner'],device=device['id'],
                                                    limit=500,offset=int(data.get('offset',0)))}
             raise ProtectionError('接口不存在',404)
-        user,session_tag=protection.user(request.headers)
-        owner=user['owner_id']
+        user,session_tag=request.state.protection_actor
+        owner=management_owner(user)
         if path.endswith('/policy') and method=='POST':
+            if owner != user['owner_id']:
+                raise ProtectionError('请先切回本人空间再调整强制接入策略',403)
             if not protection.allow_enforcement:
                 raise ProtectionError('本次只开放监视与文件处置，强制接入功能暂未开放',503)
             if user.get('role')!='admin':raise ProtectionError('仅管理员可修改强制保护策略',403)
@@ -349,9 +402,15 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
                 store._event(db,owner,'policy.changed',payload={'enforced':enabled,'user_id':user['user_id']})
             return {'enforced':enabled}
         if path.endswith('/session'):
-            return {'session_tag':session_tag,'owner':owner,'name':user.get('display_name',''),'admin':user.get('role')=='admin'}
+            result = {'session_tag':session_tag,'name':user.get('display_name',''),'admin':user.get('role')=='admin'}
+            if user.get('role') == 'admin': result.update(owner=owner, device_owner=user['owner_id'])
+            return result
+        if path.endswith('/setup'):
+            return setup(store, user)
+        if path.endswith('/revoke-self'):
+            return revoke_self(store, user, data)
         if path.endswith('/enrollments') and method=='POST':
-            return {'token':store.enrollment(owner,user['user_id']),'expires_in':600}
+            return enroll(store, user, data)
         if path.endswith('/collections'):
             if method=='GET':
                 return {'collections':store.list_rows('collections',owner)}
@@ -383,6 +442,8 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
         if path.endswith('/events'):
             return {'events':store.list_rows('events',owner,file_id=request.query_params.get('file_id'),
                                              offset=int(request.query_params.get('offset',0)))}
+        if path.endswith('/trace') and method == 'GET':
+            return store.file_trace(owner, request.query_params.get('file_id', ''))
         if path.endswith('/actions'):
             if method=='GET':
                 return {'actions':store.list_rows('actions',owner)}
@@ -406,6 +467,6 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
             return store.verify_chain()
         raise ProtectionError('接口不存在',404)
 
-    for route in ('/protection','/protection/bridge.js','/protection/download','/protection/api/{operation}','/agent/v2/{operation}'):
+    for route in ('/protection','/protection/setup','/protection/admin','/protection/bridge.js','/protection/download','/protection/api/{operation}','/agent/v2/{operation}'):
         app.add_api_route(route,handle,methods=['GET','POST'],include_in_schema=False)
     return protection

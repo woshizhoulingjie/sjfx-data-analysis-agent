@@ -74,6 +74,10 @@ def _pieces(text, limit=700):
 def candidates(parts, max_candidates=MAX_CANDIDATES):
     """Stratify within each stored block before ranking across the document."""
     pool = []
+    # Repeated page headers and sampled windows often contain identical text.
+    # Reuse only pure text features, never source metadata or ranking results.
+    # Bound this per-call cache; nothing persists across documents or users.
+    text_features = {}
     for ordinal, part in enumerate((parts or [])[:64]):
         if not isinstance(part, dict) or part.get('kind') in {'attachment', 'member_names'}:
             continue
@@ -87,13 +91,19 @@ def candidates(parts, max_candidates=MAX_CANDIDATES):
         for index, (value, cut) in enumerate(pieces):
             kind = part.get('kind') or 'unknown'
             structure = 1.0 if kind in {'heading', 'title', 'fields', 'abstract'} else 0.0
-            intent = .5 if re.search(r'摘要|目的|结论|结果|提出|用于|abstract|objective|conclusion', value, re.I) else 0
-            score = quality(value) + structure + intent + min(len(_units(value)), 20)/40
-            if is_boilerplate(value) or kind in {'footer', 'navigation'}:
+            features = text_features.get(value)
+            if features is None:
+                intent = .5 if re.search(r'摘要|目的|结论|结果|提出|用于|abstract|objective|conclusion', value, re.I) else 0
+                features = (quality(value), intent, min(len(_units(value)), 20), is_boilerplate(value))
+                if len(text_features) < 256:
+                    text_features[value] = features
+            source_quality, intent, term_count, boilerplate = features
+            score = source_quality + structure + intent + term_count/40
+            if boilerplate or kind in {'footer', 'navigation'}:
                 score -= 3
             block = dict(part, text=value, raw_text=value, kind=kind,
                          truncated=bool(part.get('truncated') or cut or source_cut),
-                         block_index=ordinal, sentence_index=index, quality=round(quality(value), 3))
+                         block_index=ordinal, sentence_index=index, quality=round(source_quality, 3))
             block['id'] = part.get('id') or 'B' + hashlib.sha256(
                 (str(part.get('location', ''))+'\0'+value).encode()).hexdigest()[:12]
             ranked.append((score, index, block))
@@ -112,32 +122,33 @@ def select_blocks(parts, limit=8, chars=4000, terms=()):
     pool = candidates(parts)
     chosen, seen, used = [], set(), 0
     anchors = {str(t).casefold() for t in terms if str(t)}
-    # Tokenize each candidate once, rather than once for every greedy comparison.
+    # Keep the exact greedy score, but update maximum redundancy only against
+    # the newly selected block. Rechecking every earlier selection on each
+    # round repeats the same set operations O(candidates * limit**2) times.
+    # This state lives only within this call: no stale cross-document cache.
     prepared = []
     for block in pool:
         value = block['text']
         key = re.sub(r'\s+', ' ', value).casefold()
         structure = .7 if block['kind'] in {'title', 'heading', 'fields', 'abstract'} else 0
         penalty = 3 if is_boilerplate(value) or block['kind'] in {'footer', 'navigation'} else .6 if block['kind'] in {'header', 'quoted_history'} else .3 if block['kind'] == 'derived_summary' else 0
-        score = quality(value) + structure + min(4, sum(t in value.casefold() for t in anchors))*.12 - penalty
-        prepared.append((block, key, _units(value), score))
+        folded = value.casefold()
+        score = quality(value) + structure + min(4, sum(t in folded for t in anchors))*.12 - penalty
+        prepared.append([block, key, _units(value), score, 0, False])
     pool = prepared
-    selected_units = []
     while pool and len(chosen) < limit:
         best = None
-        for index, (block, key, units, base_score) in enumerate(pool):
+        for index, (block, key, units, base_score, overlap, same_location) in enumerate(pool):
             if key in seen:
                 continue
-            overlap = max((len(units & previous) / max(1, len(units | previous))
-                           for previous in selected_units), default=0)
-            new_location = .25 if all(p.get('location') != block.get('location') for p in chosen) else 0
+            new_location = 0 if same_location else .25
             score = base_score + new_location - overlap
             if best is None or score > best[0]:
                 best = (score, index, key)
         if best is None:
             break
         _, index, key = best
-        block, _, units, _ = pool.pop(index)
+        block, _, units, _, _, _ = pool.pop(index)
         room = chars - used
         if room < 40:
             break
@@ -147,9 +158,18 @@ def select_blocks(parts, limit=8, chars=4000, terms=()):
                 continue
             block = dict(block, text=block['text'][:room], truncated=True)
         chosen.append(block)
-        selected_units.append(units)
         seen.add(key)
         used += len(block['text']) + 1
+        if len(chosen) < limit and chars - used >= 40:
+            for candidate in pool:
+                if candidate[1] in seen:
+                    continue
+                other_units = candidate[2]
+                overlap = len(other_units & units) / max(1, len(other_units | units))
+                candidate[4] = max(candidate[4], overlap)
+                candidate[5] = candidate[5] or block.get('location') == candidate[0].get('location')
+        else:
+            break
     return chosen
 
 

@@ -92,3 +92,7 @@ backups/
 
 # Stray files created by a mis-quoted shell command
 /n' '---*
+
+# Local catalog/performance rollback snapshots, never source deliverables.
+/.catalog-repair*-backup-*/
+/.speedup-*-backup-*/

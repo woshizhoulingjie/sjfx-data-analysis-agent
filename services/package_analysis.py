@@ -1177,6 +1177,8 @@ def _parallel_parse_files(
     )
     future_map = {}
     results = [None] * len(candidates)
+    from services.performance_primitives import parse_order
+    submission_order = parse_order(candidates, getattr(Config, 'PARSE_LARGEST_FIRST', True))
     next_index = 0
     completed_count = 0
 
@@ -1210,7 +1212,7 @@ def _parallel_parse_files(
         # cancellation responsive and avoids holding a large batch of paths in
         # native parser state when a user stops the job.
         while next_index < len(candidates) and len(future_map) < workers * 2:
-            submit_one(next_index)
+            submit_one(submission_order[next_index])
             next_index += 1
         while future_map:
             if cancel_check is not None and cancel_check():
@@ -1235,7 +1237,7 @@ def _parallel_parse_files(
                 if on_complete is not None:
                     on_complete(index, file_node, document, error)
                 if next_index < len(candidates):
-                    submit_one(next_index)
+                    submit_one(submission_order[next_index])
                     next_index += 1
     finally:
         try:
@@ -3182,9 +3184,12 @@ def _semantic_document_clusters(
         path: cached[cache_keys[path]] for path in paths if cache_keys[path] in cached
     }
     missing_paths = [path for path in paths if path not in vectors_by_path]
+    from services.performance_primitives import unique_embedding_paths
+    request_paths, aliases = unique_embedding_paths(missing_paths, cache_keys)
+    batch_size = max(1, min(64, int(batch_size)))
 
-    for start in range(0, len(missing_paths), batch_size):
-        batch_paths = missing_paths[start:start + batch_size]
+    for start in range(0, len(request_paths), batch_size):
+        batch_paths = request_paths[start:start + batch_size]
         embedding_timeout = _bounded_timeout_seconds(
             os.getenv("SEMANTIC_EMBEDDING_TIMEOUT_SECONDS", "20"),
             20.0,
@@ -3203,14 +3208,15 @@ def _semantic_document_clusters(
             )
         newly_cached = {}
         for path, vector in zip(batch_paths, batch_vectors):
-            vectors_by_path[path] = vector
+            for alias in aliases[cache_keys[path]]:
+                vectors_by_path[alias] = vector
             newly_cached[cache_keys[path]] = vector
         if storage:
             storage.save_embeddings(model_name, newly_cached)
 
         if batch_progress:
             batch_progress(
-                min(len(cached) + start + len(batch_paths), len(paths)),
+                len(vectors_by_path),
                 len(paths),
             )
     if batch_progress and not missing_paths:
@@ -5866,7 +5872,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
                 _semantic_document_clusters(
                     canonical_documents,
                     embedding_client,
-                    batch_size=6,
+                    batch_size=getattr(Config, 'SEMANTIC_EMBEDDING_BATCH_SIZE', 24),
                     batch_progress=semantic_progress,
                     storage=storage,
                 )

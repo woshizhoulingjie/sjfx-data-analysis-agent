@@ -426,6 +426,8 @@ class Config:
         min(8, int(os.getenv("PARSE_MAX_CONCURRENCY", "4"))),
     )
     PARSE_MAX_CONCURRENCY = min(PARSE_MAX_CONCURRENCY, max(1, _cpu_count - 2))
+    PARSE_LARGEST_FIRST = os.getenv('PARSE_LARGEST_FIRST', '1').lower() not in {'0', 'false', 'off'}
+    SEMANTIC_EMBEDDING_BATCH_SIZE = max(1, min(64, int(os.getenv('SEMANTIC_EMBEDDING_BATCH_SIZE', '24'))))
     ENABLE_PARSE_PROCESS_ISOLATION = os.getenv("ENABLE_PARSE_PROCESS_ISOLATION", "1").strip().lower() in {
         "1", "true", "yes", "on",
     }
@@ -529,6 +531,9 @@ class Config:
     # 往返开销；而命名墙钟里**模型时间只占 15.2%**，瓶颈是"每次只装 4 组"。
     # 上限由 min(4,…) 提到 min(8,…)：设更大的值也仍然受这里的封顶。
     LP_CATALOG_BATCH_SIZE = min(8, _positive_int(os.getenv("SJFX_LP_CATALOG_BATCH_SIZE"), 8))
+    LP_CATALOG_PREPARE_LIMIT = max(1, min(24, _positive_int(os.getenv('SJFX_LP_CATALOG_PREPARE_LIMIT'), LP_CATALOG_BATCH_SIZE)))
+    LP_EVIDENCE_PREFETCH = os.getenv('SJFX_LP_EVIDENCE_PREFETCH', '1').lower() not in {'0', 'false', 'off'}
+    LP_EVIDENCE_PREFETCH_GROUPS = max(1, min(8, _positive_int(os.getenv('SJFX_LP_EVIDENCE_PREFETCH_GROUPS'), 4)))
     # 本进程服务的工作流版本上限。**预留的排他机制**：框架 §11 要求"新包写
     # workflow_version，新旧 Worker 按版本排他领取；旧进程不能继续消费新包"。
     # 实现方向是"只消费 <= 自己版本的包"：这样将来出现 v3 包时，v2 进程会
@@ -862,6 +867,15 @@ class Config:
     LARGE_QA_ENABLED = os.getenv("LARGE_QA_ENABLED", "1").lower() not in {"0", "false", "off"}
     LARGE_QA_INDEX_DIR = Path(os.getenv("LARGE_QA_INDEX_DIR", str(DATA_DIR / "large_qa")))
     LARGE_QA_REFINE_TOPICS = os.getenv("LARGE_QA_REFINE_TOPICS", "1").lower() not in {"0", "false", "off"}
+    # 按需 / 懒加载：只索引"有需求"的大包（最近被问答过、或问答时点名要过原文的）。
+    # 设 LARGE_QA_DEMAND_ONLY=0 可回到"遍历全部大包"的旧行为。
+    LARGE_QA_DEMAND_ONLY = os.getenv("LARGE_QA_DEMAND_ONLY", "1").lower() not in {"0", "false", "off"}
+    LARGE_QA_DEMAND_TTL = float(os.getenv("LARGE_QA_DEMAND_TTL", "604800"))      # 7 天
+    LARGE_QA_SYNC_INTERVAL = float(os.getenv("LARGE_QA_SYNC_INTERVAL", "120"))
+    LARGE_QA_SYNC_FORCE_AFTER = float(os.getenv("LARGE_QA_SYNC_FORCE_AFTER", "1800"))
+    LARGE_QA_BUDGET_FILES_PER_ROUND = int(os.getenv("LARGE_QA_BUDGET_FILES_PER_ROUND", "8"))
+    LARGE_QA_EXTRACT_PAUSE = float(os.getenv("LARGE_QA_EXTRACT_PAUSE", "1.5"))
+    LARGE_QA_IDLE_SLEEP = float(os.getenv("LARGE_QA_IDLE_SLEEP", "60"))
     CONVERSATION_QUALITY_ENABLED = os.getenv("CONVERSATION_QUALITY_ENABLED", "1").lower() not in {"0", "false", "off"}
     CONVERSATION_TOKENIZER_PATH = os.getenv("CONVERSATION_TOKENIZER_PATH", VLLM_MODEL_PATH)
     CONVERSATION_MAX_ANSWER_TOKENS = max(800, min(4096, int(os.getenv("CONVERSATION_MAX_ANSWER_TOKENS", "3000"))))

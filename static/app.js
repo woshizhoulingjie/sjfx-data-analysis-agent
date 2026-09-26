@@ -5278,3 +5278,61 @@ async function initializeApp() {
 }
 
 initializeApp().catch((error) => toast(error.message || '工作区恢复失败', true));
+
+/* ---------------------------------------------------------------------------
+ * 大数据包智能目录 → 普通数据包：来源标注（设计文档 §6 / §7）。
+ *
+ * **只追加**：不改 #scanStats 的既有渲染。那一块会被整体重绘
+ * （`$('scanStats').innerHTML = ...`），塞进去的内容会被冲掉；这里在它后面挂一个
+ * 兄弟节点，只更新自己。
+ *
+ * 数据来自 /api/scan/<id> 的 scan：storage._scan_overview_payload() 是"从
+ * payload 全量复制、只 pop 掉 tree/analysis"，所以 create_scan_from_large_selection
+ * 写进 scans.payload 的 source_kind / source_large_package_id / source_node_names
+ * 会原样出现在响应里，前端不需要新接口。
+ * ------------------------------------------------------------------------- */
+(function () {
+  const SOURCE_HOST_ID = 'largeCatalogImportSource';
+
+  function sourceHost() {
+    const existing = document.getElementById(SOURCE_HOST_ID);
+    if (existing) return existing;
+    const anchor = document.getElementById('scanStats');
+    if (!anchor || !anchor.parentElement) return null;
+    const host = document.createElement('div');
+    host.id = SOURCE_HOST_ID;
+    host.className = 'coverage-card large-catalog-import-source';
+    host.hidden = true;
+    anchor.insertAdjacentElement('afterend', host);
+    return host;
+  }
+
+  function renderLargeCatalogSource() {
+    const host = sourceHost();
+    if (!host) return;
+    const scan = (state && state.scan) || {};
+    const packageId = String(scan.source_large_package_id || '');
+    const fromCatalog = String(scan.source_kind || '') === 'large_catalog_selection' || Boolean(packageId);
+    if (!fromCatalog) {
+      host.hidden = true;
+      host.textContent = '';
+      return;
+    }
+    const names = Array.isArray(scan.source_node_names)
+      ? scan.source_node_names.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const shown = names.slice(0, 6);
+    const more = names.length > shown.length ? ` 等 ${names.length} 个节点` : '';
+    host.hidden = false;
+    host.innerHTML = '<strong>来源：大数据包智能目录</strong>'
+      + `<small>来源大数据包：${escapeHtml(packageId || '—')}</small>`
+      + `<small>来源节点：${names.length ? escapeHtml(shown.join('、')) + more : '整个智能目录'}</small>`
+      + `<small>来源类型：${escapeHtml(String(scan.source_kind || 'large_catalog_selection'))}</small>`
+      + (scan.scan_id ? `<small>普通数据包：${escapeHtml(String(scan.scan_id))}</small>` : '');
+  }
+
+  window.addEventListener('sjfx-scan-changed', renderLargeCatalogSource);
+  window.addEventListener('sjfx-shell-state', renderLargeCatalogSource);
+  document.addEventListener('DOMContentLoaded', renderLargeCatalogSource);
+  renderLargeCatalogSource();
+})();
