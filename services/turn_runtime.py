@@ -16,6 +16,7 @@ from services.analysis_tools import (
     merge_retrieval_results,
 )
 from services.claim_verifier import ClaimVerifier
+from services.answer_completion import complete_quantities
 from services import answer_quality as aq
 from services.answer_retention import (
     advance_evidence_state, capture_candidate, evidence_state, select_candidate,
@@ -726,6 +727,14 @@ class AnalysisTurnRuntime:
                     plan,
                     tool_results=tool_results,
                     batch_summary=batch_summary,
+                )
+                turn_result = apply_scope_guard(turn_result)
+
+            if verification_required:
+                turn_result, verification = complete_quantities(
+                    turn_result, verification, plan, self.verifier,
+                    tool_results=tool_results, batch_summary=batch_summary,
+                    checkpoint=self._checkpoint,
                 )
                 turn_result = apply_scope_guard(turn_result)
 
