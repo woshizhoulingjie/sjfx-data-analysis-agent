@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from services import answer_quality as aq
 
-_ROLES = r'实收|尚缺|实际收到|已收到|已到货|实际到货|仅到货'
+_ROLES = r'实收到货|实收|尚缺|实际收到|已收到|已到货|实际到货|仅到货'
 _QUANTITY = re.compile(
     r'(?P<prefix>.*?)(?P<role>' + _ROLES + r')\s*(?:为|是|共)?\s*'
     r'(?P<value>[+-]?\d+(?:\.\d+)?)\s*'
@@ -171,14 +171,58 @@ def _record_quantities(window):
     return observations
 
 
+def _comma_quantity_atoms(text):
+    """Recognize record lead-ins followed by explicit comma-separated counts.
+
+    This is not general sentence splitting: every non-quantity fragment must
+    be a neutral leading record context, and every quantity is still proved
+    in one source record window. Never discard an unrecognized assertion.
+    """
+    fragments = re.split(r'，|(?<!\d),|,(?!\d)', text)
+    if not 2 <= len(fragments) <= 8:
+        return None
+    keys = ('projects', 'identifiers', 'dates', 'organizations')
+    inherited = {key: set() for key in keys}
+    atoms = []
+    for fragment in fragments:
+        fragment = fragment.strip()
+        if not fragment:
+            return None
+        atom = _atom(fragment)
+        if atom is not None:
+            if atom['kind'] != 'quantity':
+                return None
+            for key in keys:
+                inherited[key].update(atom['context'][key])
+            atoms.append(atom)
+            continue
+        if atoms:
+            return None
+        if re.fullmatch(r'(?:根据|据)(?:资料|原文)(?:记载|记录)?', fragment):
+            continue
+        context = _context(fragment)
+        if context is None or not any(context[key] for key in keys):
+            return None
+        for key in keys:
+            inherited[key].update(context[key])
+    if not 2 <= len(atoms) <= 6 or not any(inherited.values()):
+        # Context-free quantity labels retain the existing local-field gate.
+        # This new proof only covers an explicitly identified/dated record.
+        return None
+    # All identity/date constraints must hold in one record, never a union.
+    for atom in atoms:
+        atom['context'] = {**atom['context'], **{key: set(inherited[key]) for key in keys}}
+    return atoms
+
+
 def compound_support(claim, evidence):
     """Return None for unknown grammar, else a full conjunctive proof result."""
     text = _plain(claim)
     fragments = _JOIN.split(text)
-    if not 2 <= len(fragments) <= 6:
-        return None
-    atoms = [_atom(fragment) for fragment in fragments]
-    if any(atom is None for atom in atoms) or not any(x['kind'] == 'quantity' for x in atoms):
+    atoms = [_atom(fragment) for fragment in fragments] if 2 <= len(fragments) <= 6 else []
+    if not atoms or any(atom is None for atom in atoms) or not any(x['kind'] == 'quantity' for x in atoms):
+        atoms = _comma_quantity_atoms(text)
+    if not atoms:
         return None
     inherited = atoms[0]['context']
     for atom in atoms[1:]:
