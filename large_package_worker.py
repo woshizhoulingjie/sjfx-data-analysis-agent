@@ -48,6 +48,9 @@ class SourceChangedError(RuntimeError):
 
 
 def _source_snapshot(root, row):
+    if row.get('source_kind') == 'archive_member':
+        from services.large_archive_members import source_identity
+        return source_identity(root, row)
     base = Path(root).resolve()
     path = (base / row['path']).resolve(strict=True)
     if base not in path.parents:
@@ -235,6 +238,7 @@ class LargePackageWorker:
         package_id = package["id"]
         self.store.update_package(package_id, status="running", phase="inventory", progress=1, message="正在流式盘点并建立内容画像")
         discovered, total_bytes, type_counts = 0, 0, {}
+        logical_members, logical_bytes = 0, 0
         batch = []
         inventory_errors=[]
         inventory_error_count=0
@@ -243,24 +247,29 @@ class LargePackageWorker:
             inventory_error_count+=1
             if len(inventory_errors)<20:inventory_errors.append({'path':path,'error':error[:200]})
         try:
+            self.store.invalidate_changed_archive_members(package_id)
             for item in iter_inventory(package["root_path"],on_error=inventory_error):
                 if discovered % 25 == 0 and self._interrupted(package_id):
                     return True
                 batch.append(item)
                 discovered += 1
-                total_bytes += int(item.get("size") or 0)
+                if item.get('source_kind') == 'archive_member':
+                    logical_members += 1
+                    logical_bytes += int(item.get('size') or 0)
+                else:
+                    total_bytes += int(item.get("size") or 0)
                 extension = item.get("extension") or "[无扩展名]"
                 type_counts[extension] = type_counts.get(extension, 0) + 1
                 if len(batch) >= 100:
                     self._check_resources()
                     self.store.upsert_files(package_id, batch)
                     batch = []
-                    self.store.update_package(package_id, progress=min(19, 1 + discovered // 1000), message="已盘点 {} 个文件；目录持续更新".format(discovered), counts={"discovered_files": discovered, "total_bytes": total_bytes, "type_counts": type_counts})
+                    self.store.update_package(package_id, progress=min(19, 1 + discovered // 1000), message="已盘点 {} 个文件；目录持续更新".format(discovered), counts={"discovered_files": discovered, "total_bytes": total_bytes, "type_counts": type_counts, "logical_member_count": logical_members, "logical_member_bytes": logical_bytes})
             if batch:
                 self._check_resources()
                 self.store.upsert_files(package_id, batch)
             if not self._interrupted(package_id):
-                self.store.update_package(package_id, status="running", phase="quick_parse", progress=20, message="盘点有 {} 处无法读取，继续识别已发现文件".format(inventory_error_count) if inventory_error_count else "盘点完成，按格式识别文件内容", counts={"discovered_files": discovered, "total_bytes": total_bytes, "total_size_human": _human(total_bytes), "type_counts": type_counts, "inventory_complete": inventory_error_count == 0, "inventory_error_count": inventory_error_count, "inventory_errors": inventory_errors})
+                self.store.update_package(package_id, status="running", phase="quick_parse", progress=20, message="盘点有 {} 处无法读取，继续识别已发现文件".format(inventory_error_count) if inventory_error_count else "盘点完成，按格式识别文件内容", counts={"discovered_files": discovered, "total_bytes": total_bytes, "total_size_human": _human(total_bytes), "type_counts": type_counts, "inventory_complete": inventory_error_count == 0, "inventory_error_count": inventory_error_count, "inventory_errors": inventory_errors, "logical_member_count": logical_members, "logical_member_bytes": logical_bytes})
             return True
         except Exception as exc:
             if resource_code(exc):
@@ -1985,7 +1994,14 @@ class LargePackageWorker:
                 if parser is None:
                     self._parser = UnifiedDocumentParser()
                     parser = self._parser
-            raw_document = parser.parse(path, relative_path=row["path"], mode="accurate")
+            if row.get('source_kind') == 'archive_member':
+                from services.large_archive_members import member_node, member_snapshot
+                from services.package_analysis import _restore_source_provenance
+                with member_snapshot(root, row) as member_path:
+                    raw_document = parser.parse(member_path, relative_path=row['path'], mode='accurate')
+                _restore_source_provenance(raw_document, root, member_node(row))
+            else:
+                raw_document = parser.parse(path, relative_path=row["path"], mode="accurate")
             after_path, after_source = _source_snapshot(root, row)
             if after_path != path or after_source != before_source:
                 raise SourceChangedError('源文件在解析期间发生变化，已丢弃结果')

@@ -54,7 +54,7 @@ def _extract(path, relative, max_chars):
     return records,complete,'；'.join(str(x) for x in result.get('warnings') or [])[:600]
 
 
-def _child(connection,path,relative,max_chars):
+def _child(connection,path,relative,max_chars,root=None,doc=None):
     os.environ['CUDA_VISIBLE_DEVICES']=''
     for name in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS'):
         os.environ[name]='1'
@@ -63,7 +63,13 @@ def _child(connection,path,relative,max_chars):
     except (AttributeError,OSError):
         pass
     try:
-        connection.send(('ok',_extract(path,relative,max_chars)))
+        if doc and doc.get('source_kind') == 'archive_member':
+            from services.large_archive_members import member_snapshot
+            with member_snapshot(root, doc) as member_path:
+                result = _extract(str(member_path), relative, max_chars)
+            connection.send(('ok', result))
+        else:
+            connection.send(('ok',_extract(path,relative,max_chars)))
     except BaseException as exc:
         code = resource_code(exc)
         if code:
@@ -76,17 +82,25 @@ def _child(connection,path,relative,max_chars):
 
 def extract_document(root,doc,timeout=90,memory_mb=1536,max_chars=2_000_000):
     root=Path(root).resolve()
-    path=(root/doc['path']).resolve()
+    logical = doc.get('source_kind') == 'archive_member'
+    if logical:
+        from services.large_archive_members import source_identity
+        path, initial_identity = source_identity(root, doc)
+    else:
+        path=(root/doc['path']).resolve()
     if root not in path.parents or doc.get('sensitive'):
         raise ValueError('文件不在允许范围内或只允许读取元数据')
     before=path.stat()
-    if before.st_size!=doc['size'] or before.st_mtime_ns!=doc['mtime']:
+    if not logical and (before.st_size!=doc['size'] or before.st_mtime_ns!=doc['mtime']):
         raise ValueError('文件已变化，等待清单更新后再提取')
-    if before.st_size>256*1024*1024:
+    if int(doc['size'])>256*1024*1024:
         raise ValueError('文件超过 256 MiB 的后台解析预算，需要专门处理')
     ctx=mp.get_context('spawn')
     parent,child=ctx.Pipe()
-    process=ctx.Process(target=_child,args=(child,str(path),doc['path'],max_chars),daemon=True)
+    args = (child,str(path),doc['path'],max_chars)
+    if logical:
+        args += (str(root), dict(doc))
+    process=ctx.Process(target=_child,args=args,daemon=True)
     started = False
     try:
         process.start(); started = True; child.close()
@@ -99,6 +113,8 @@ def extract_document(root,doc,timeout=90,memory_mb=1536,max_chars=2_000_000):
                 if status!='ok':
                     raise ValueError(value)
                 after=path.stat()
+                if logical and source_identity(root, doc)[1] != initial_identity:
+                    raise ValueError('归档在提取期间变化，已丢弃结果')
                 if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):
                     raise ValueError('提取过程中源文件变化，已丢弃结果')
                 return value

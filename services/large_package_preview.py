@@ -632,7 +632,7 @@ def portrait(item, parts, fields, headings, refine=False, warnings=None):
     }
 
 
-def preview_file(root, item, refine=False):
+def _preview_path(root, item, refine=False, logical_source=None):
     options = settings(refine)
     budget = Budget(options)
     base = Path(root).resolve()
@@ -697,7 +697,7 @@ def preview_file(root, item, refine=False):
     after = path.stat()
     if (stat.st_size, stat.st_mtime_ns, stat.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
         raise RuntimeError("文件在预览过程中发生变化，已丢弃本次样本")
-    info = portrait(item, parts, fields, headings, refine, warnings)
+    info = portrait(logical_source or item, parts, fields, headings, refine, warnings)
     info["format"] = ext
     info["parser_mode"] = "bounded_refinement" if refine else "bounded_native_preview"
     if ext not in TEXT | IMAGES | {".csv", ".tsv", ".json", ".jsonl", ".docx", ".pptx", ".xlsx", ".xlsm", ".doc", ".ppt", ".xls", ".rtf", ".eml", ".mbox", ".pdf", ".zip"}:
@@ -714,3 +714,32 @@ def preview_file(root, item, refine=False):
         "sample_sha256": hashlib.sha256(material).hexdigest(), "source_hash_kind": "pending",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "notice": "；".join(warnings),
     }, None
+
+
+def preview_file(root, item, refine=False):
+    if item.get('source_kind') != 'archive_member' or item.get('sensitive'):
+        return _preview_path(root, item, refine)
+    from services.large_archive_members import member_node, member_snapshot
+    node = member_node(item)
+    prefix_formats = TEXT | {'.csv', '.tsv', '.json', '.jsonl', '.eml', '.mbox'}
+    limit = settings(refine)['bytes'] if node['extension'] in prefix_formats else _int(
+        'SJFX_LP_MEMBER_PREVIEW_BYTES', 32 * 1024 * 1024, 65536, 256 * 1024 * 1024)
+    if node['size'] > limit and node['extension'] not in prefix_formats:
+        warning = '归档成员超过轻量快照预算；正文未读取，可选择深度分析或普通导入'
+        info = portrait(node, [], [], [], refine, [warning])
+        info.update(needs_refine=False, recognition_status='pending')
+        return {'schema_version': SCHEMA, 'summary_type': 'local', 'sample': '',
+                'notice': warning, 'complete': False, 'source_hash_kind': 'pending',
+                'portrait': info, 'coverage': {'complete': False, 'preview_only': True,
+                                             'member_snapshot_limit': limit}}, None
+    with member_snapshot(root, item, prefix_bytes=limit) as path:
+        st = path.stat()
+        physical = {**item, 'path': path.name, 'source_kind': 'physical_file',
+                    'size': st.st_size, 'modified_at_ns': st.st_mtime_ns}
+        summary, digest = _preview_path(path.parent, physical, refine, logical_source=node)
+        summary['size'] = node['size']
+        summary['source_path'] = node['path']
+        summary['coverage'].update(archive_member=True, container_path=node['container_path'],
+            member_name=node['member_name'], member_snapshot_bytes=st.st_size,
+            member_snapshot_truncated=st.st_size < node['size'])
+        return summary, digest

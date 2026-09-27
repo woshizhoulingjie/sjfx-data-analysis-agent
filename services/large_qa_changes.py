@@ -13,6 +13,16 @@ FIELDS = {
     'large_catalog_centers': ('package_id', 'model'),
     'lp_catalog_labels': ('package_id', 'group_id', 'name'),
 }
+OPTIONAL_FIELDS = {'files': ('source_kind', 'source_metadata', 'source_changed')}
+
+
+def _fields(conn=None):
+    fields = dict(FIELDS)
+    if conn is not None:
+        for table, optional in OPTIONAL_FIELDS.items():
+            columns = {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
+            fields[table] += tuple(k for k in optional if k in columns)
+    return fields
 
 
 def _bump(value, condition='1'):
@@ -21,9 +31,9 @@ def _bump(value, condition='1'):
             'DO UPDATE SET token=excluded.token;')
 
 
-def definitions():
+def definitions(conn=None):
     result = {}
-    for table, fields in FIELDS.items():
+    for table, fields in _fields(conn).items():
         key = 'id' if table == 'packages' else 'package_id'
         for event in ('INSERT', 'UPDATE', 'DELETE'):
             name = PREFIX + table + '_' + event.lower()
@@ -71,7 +81,7 @@ def install(conn):
     try:
         conn.execute(f'CREATE TABLE IF NOT EXISTS {EPOCH}(id INTEGER PRIMARY KEY CHECK(id=1),epoch TEXT NOT NULL)')
         conn.execute(f'CREATE TABLE IF NOT EXISTS {REVISIONS}(package_id TEXT PRIMARY KEY,token TEXT NOT NULL)')
-        expected, actual = definitions(), _actual(conn)
+        expected, actual = definitions(conn), _actual(conn)
         if actual != expected:
             for name in actual:
                 conn.execute('DROP TRIGGER "' + name.replace(chr(34), chr(34)*2) + '"')
@@ -93,7 +103,7 @@ def read_stamp(conn, package_id):
         raise ValueError('A source snapshot transaction is required')
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?)", (EPOCH, REVISIONS))}
-    if len(tables) != 2 or _actual(conn) != definitions() or not _safe_schema(conn):
+    if len(tables) != 2 or _actual(conn) != definitions(conn) or not _safe_schema(conn):
         return None
     epoch = conn.execute(f'SELECT epoch FROM {EPOCH} WHERE id=1').fetchone()
     if not epoch:

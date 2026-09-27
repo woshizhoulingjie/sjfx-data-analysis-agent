@@ -72,7 +72,7 @@ class PreviewRunner:
             self.connection = parent
         self.calls += 1
         options = settings(refine)
-        self.connection.send({"root": str(root), "item": {key: item[key] for key in ("path", "name", "size", "modified_at_ns", "sensitive", "extension") if key in item}, "refine": refine})
+        self.connection.send({"root": str(root), "item": {key: item[key] for key in ("path", "name", "size", "modified_at_ns", "sensitive", "extension", "source_kind", "source_metadata") if key in item}, "refine": refine})
         started = time.monotonic()
         error = ""
         try:

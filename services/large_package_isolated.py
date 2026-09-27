@@ -172,7 +172,7 @@ class LargePackageStore:
             conn.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
             for name, default in (("topic", ""), ("recognition_status", "legacy"), ("document_role", ""),
-                                  ("source_kind", "")):
+                                  ("source_kind", ""), ("source_metadata", "{}")):
                 if name not in columns:
                     conn.execute("ALTER TABLE files ADD COLUMN " + name + " TEXT NOT NULL DEFAULT '" + default + "'")
             queue_columns = {row[1] for row in conn.execute("PRAGMA table_info(queue)")}
@@ -338,7 +338,7 @@ class LargePackageStore:
         if not row:
             return None
         item = dict(row)
-        for key in ("counts", "local_summary", "deep_summary", "rule", "paths"):
+        for key in ("counts", "local_summary", "deep_summary", "rule", "paths", "source_metadata"):
             if key in item:
                 item[key] = _loads(item[key], [] if key == "paths" else {})
         item["sensitive"] = bool(item.get("sensitive"))
@@ -479,22 +479,125 @@ class LargePackageStore:
     def upsert_file(self, package_id, item):
         self.upsert_files(package_id, [item])
 
+    @staticmethod
+    def _invalidate_member_results(conn, package_id, path, now, *, requeue):
+        # Same transaction as the manifest update: old lease holders cannot
+        # publish results against a new member identity. Keep rows for audit.
+        conn.execute(
+            "UPDATE files SET sha256=NULL,local_summary='{}',deep_summary='{}',"
+            "quick_status=?,deep_status='idle',category='未分类',confidence=0,"
+            "topic='',document_role='',recognition_status='pending',"
+            "summary_quality='',summary_coverage='',source_changed=?,error=?,updated_at=? "
+            "WHERE package_id=? AND path=?",
+            ('queued' if requeue else 'failed', 0 if requeue else 1,
+             None if requeue else '归档来源已变化或无法核验，请重新盘点', now, package_id, path))
+        conn.execute(
+            "UPDATE queue SET status='failed',error='归档来源已变化',lease_token=NULL,"
+            "leased_at=NULL,lease_expires_at=NULL,updated_at=? WHERE package_id=? AND path=?",
+            (now, package_id, path))
+        conn.execute(
+            'UPDATE large_catalog_groups SET content_revision=content_revision+1 '
+            'WHERE package_id=? AND id IN (SELECT group_id FROM large_catalog_members '
+            'WHERE package_id=? AND path=?)', (package_id, package_id, path))
+        conn.execute('DELETE FROM large_catalog_members WHERE package_id=? AND path=?',
+                     (package_id, path))
+        conn.execute('DELETE FROM portrait_facets WHERE package_id=? AND path=?',
+                     (package_id, path))
+        if requeue:
+            conn.execute(
+                "INSERT INTO queue(package_id,path,stage,status,updated_at) VALUES(?,?,'quick','queued',?) "
+                "ON CONFLICT(package_id,path,stage) DO UPDATE SET status='queued',attempts=0,"
+                "error=NULL,updated_at=excluded.updated_at", (package_id, path, now))
+
+    def invalidate_changed_archive_members(self, package_id):
+        """Retire old evidence before a resumed inventory, including removed members.
+
+        Bounded pages and a small identity cache avoid per-member container opens.
+        Failed validation never silently retains an old successful analysis.
+        """
+        from functools import lru_cache
+        from services.large_archive_members import member_node, source_identity
+        from services.large_package_resources import resource_code
+        package = self.get(package_id)
+        if not package:
+            return 0
+        @lru_cache(maxsize=256)
+        def valid_container(metadata):
+            meta = json.loads(metadata)
+            probe = {'path': meta['container_path'] + '::' + meta['member_name'],
+                     'source_kind': 'archive_member', 'source_metadata': meta,
+                     'size': meta['member_size'], 'modified_at_ns': meta['container_modified_at_ns']}
+            try:
+                source_identity(package['root_path'], probe)
+                return True
+            except Exception as exc:
+                if resource_code(exc):
+                    raise
+                return False
+        cursor, retired = '', 0
+        while True:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    "SELECT * FROM files WHERE package_id=? AND source_kind='archive_member' "
+                    "AND path>? ORDER BY path LIMIT 128", (str(package_id), cursor)).fetchall()
+            if not rows:
+                return retired
+            invalid = []
+            for raw in rows:
+                row = self._row(raw)
+                try:
+                    node = member_node(row)
+                    meta = dict(node['source_metadata'])
+                    # Container identity is shared, independently of member names.
+                    meta.update(member_name='__identity_probe__.txt', member_size=0)
+                    meta.pop('compressed_size', None)
+                    if not valid_container(_json(meta)):
+                        invalid.append(raw)
+                except Exception as exc:
+                    if resource_code(exc):
+                        raise
+                    invalid.append(raw)
+            with self._lock, closing(self._connect()) as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                for raw in invalid:
+                    current = conn.execute(
+                        'SELECT source_metadata,source_changed FROM files WHERE package_id=? AND path=?',
+                        (str(package_id), raw['path'])).fetchone()
+                    if current and current['source_metadata'] == raw['source_metadata'] and not current['source_changed']:
+                        self._invalidate_member_results(conn, str(package_id), raw['path'], time.time(), requeue=False)
+                        retired += 1
+                conn.commit()
+            cursor = rows[-1]['path']
+
     def upsert_files(self, package_id, items):
         now = time.time()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             for item in items:
+                if item.get('source_kind') == 'archive_member':
+                    from services.large_archive_members import member_node, source_signature
+                    member_node(item)
+                    previous = conn.execute('SELECT * FROM files WHERE package_id=? AND path=?',
+                                            (str(package_id), item['path'])).fetchone()
+                    if previous:
+                        try:
+                            changed = source_signature(self._row(previous)) != source_signature(item)
+                        except ValueError:
+                            changed = True
+                        if changed or previous['source_changed']:
+                            self._invalidate_member_results(conn, str(package_id), item['path'], now, requeue=True)
                 values = (str(package_id), item["path"], item["name"], item.get("extension", ""),
                           int(item.get("size") or 0), int(item.get("modified_at_ns") or 0),
                           item.get("sha256"), 1 if item.get("sensitive") else 0,
                           item.get("file_type") or item.get("extension") or "", now,
-                          item.get("source_kind") if item.get("source_kind") in {"physical_file", "archive_member"} else "")
-                conn.execute("""INSERT INTO files(package_id,path,name,extension,size,modified_at_ns,sha256,sensitive,file_type,updated_at,source_kind)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(package_id,path) DO UPDATE SET
+                          item.get("source_kind") if item.get("source_kind") in {"physical_file", "archive_member"} else "",
+                          json.dumps(item.get('source_metadata') or {}, ensure_ascii=False))
+                conn.execute("""INSERT INTO files(package_id,path,name,extension,size,modified_at_ns,sha256,sensitive,file_type,updated_at,source_kind,source_metadata)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(package_id,path) DO UPDATE SET
                   name=excluded.name,extension=excluded.extension,size=excluded.size,
                   modified_at_ns=excluded.modified_at_ns,sensitive=excluded.sensitive,
                   file_type=excluded.file_type,updated_at=excluded.updated_at,
-                  source_kind=excluded.source_kind""", values)
+                  source_kind=excluded.source_kind,source_metadata=excluded.source_metadata""", values)
                 conn.execute("INSERT OR IGNORE INTO queue(package_id,path,stage,status,updated_at) VALUES(?,?,?,'queued',?)",
                              (str(package_id), item["path"], "quick", now))
             conn.commit()
@@ -1572,6 +1675,7 @@ class LargePackageStore:
                 inventory[path] = {
                     "kind": "file", "path": path, "name": item.get("name") or Path(path).name,
                     "source_kind": item.get("source_kind") or "",
+                    "source_metadata": item.get("source_metadata") or {},
                     "extension": item.get("extension") or Path(path).suffix.lower(),
                     "size": int(item.get("size") or 0),
                     "modified_at_ns": int(item.get("modified_at_ns") or 0),
@@ -1797,12 +1901,24 @@ def iter_inventory(root, on_error=None):
                 continue
             if not entry.is_file(follow_symlinks=False):
                 continue
-            yield {
+            item = {
                 "path": rel, "name": entry.name, "extension": path.suffix.lower(),
                 "source_kind": "physical_file",
                 "size": int(stat.st_size), "modified_at_ns": int(stat.st_mtime_ns),
+                "device": int(stat.st_dev), "inode": int(stat.st_ino),
                 "sensitive": is_sensitive_file(entry.name),
             }
+            yield item
+            from services.large_archive_members import discover_members
+            try:
+                yield from discover_members(root, item, on_error=on_error)
+            except Exception as exc:
+                if resource_code(exc):
+                    raise
+                if on_error:
+                    on_error(rel, str(exc))
+                else:
+                    raise
 
 
 def _category(path, text, extension):

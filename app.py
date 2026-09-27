@@ -12854,6 +12854,25 @@ def large_package_file(package_id):
         valid = set(large_package_store.existing_paths(package_id, [path]))
         if not path or path not in valid:
             return api_error("文件不属于当前大数据包", 404)
+        row = large_package_store.get_file(package_id, path)
+        if row and row.get('source_kind') == 'archive_member':
+            from fastapi.responses import FileResponse
+            from services.large_archive_members import member_snapshot
+            snapshot = member_snapshot(item['root_path'], row)
+            resolved = snapshot.__enter__()
+            try:
+                class MemberFileResponse(FileResponse):
+                    async def __call__(self, scope, receive, send):
+                        try:
+                            await super().__call__(scope, receive, send)
+                        finally:
+                            snapshot.__exit__(None, None, None)
+                response = MemberFileResponse(resolved, filename=resolved.name, content_disposition_type='attachment')
+                response.headers['X-Content-Type-Options'] = 'nosniff'
+                return response
+            except BaseException:
+                snapshot.__exit__(None, None, None)
+                raise
         return send_from_directory(item["root_path"], path, as_attachment=str(request.args.get("download") or "") in {"1", "true", "yes"})
     except ValueError as exc:
         return api_error(str(exc), 404)

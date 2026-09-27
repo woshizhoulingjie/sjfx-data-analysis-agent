@@ -830,12 +830,16 @@ def _validate_logical_member_size(file_node, declared_size, container_size, comp
 
 
 @contextmanager
-def _logical_source_snapshot(scan_root, file_node, cancel_check=None):
+def _logical_source_snapshot(scan_root, file_node, cancel_check=None, *, max_snapshot_bytes=None):
     """Materialise exactly one logical member/partition into private scratch."""
     if not file_node.get("logical_unit"):
         with _secure_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
             yield snapshot
         return
+    if max_snapshot_bytes is not None:
+        if (type(max_snapshot_bytes) is not int or max_snapshot_bytes <= 0
+                or file_node.get('logical_kind') != 'archive_member'):
+            raise ValueError('有界快照只适用于归档成员且预算必须为正整数')
     name = str(file_node.get("name") or "logical-unit.txt")
     if not strict_archive_member_name(name) or "/" in name:
         raise ValueError("逻辑快照文件名不安全")
@@ -975,10 +979,15 @@ def _logical_source_snapshot(scan_root, file_node, cancel_check=None):
                             raise ValueError("压缩包成员超过中央内容上限")
                         with source_stream as source, target.open("xb") as output:
                             copied = 0
+                            copy_limit = size if max_snapshot_bytes is None else min(size, max_snapshot_bytes)
                             while True:
                                 if cancel_check is not None and cancel_check():
                                     raise ParseIsolationCancelled("任务已取消，停止提取压缩包成员")
-                                chunk = source.read(4 * 1024 * 1024)
+                                if max_snapshot_bytes is not None and copied >= copy_limit:
+                                    break
+                                read_size = (4 * 1024 * 1024 if max_snapshot_bytes is None
+                                             else min(4 * 1024 * 1024, copy_limit - copied))
+                                chunk = source.read(read_size)
                                 if not chunk:
                                     break
                                 copied += len(chunk)
@@ -993,7 +1002,7 @@ def _logical_source_snapshot(scan_root, file_node, cancel_check=None):
                     except Exception:
                         pass
                 opened_after = os.fstat(container.fileno())
-            if not archive_name.endswith(".bz2") and copied != size:
+            if not archive_name.endswith(".bz2") and copied != copy_limit:
                 raise ValueError("压缩包成员提取长度与中央目录不一致")
             if (
                 int(opened_before.st_dev), int(opened_before.st_ino),

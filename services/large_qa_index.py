@@ -163,6 +163,7 @@ class LargeQAIndex:
                 CREATE TABLE IF NOT EXISTS events(at REAL,kind TEXT,payload TEXT);
                 ''')
                 self.set_meta(c, 'schema', SCHEMA)
+                self._ensure_member_columns(c)
                 if not self.meta(c).get('index_epoch'):
                     self.set_meta(c, 'index_epoch', digest(time.time_ns()))
                 thai.ensure(c)
@@ -170,6 +171,14 @@ class LargeQAIndex:
     @property
     def exists(self):
         return self.path.exists()
+
+    @staticmethod
+    def _ensure_member_columns(connection):
+        columns = {r[1] for r in connection.execute('PRAGMA table_info(documents)')}
+        for name, default in (('source_kind', ''), ('source_metadata', '{}')):
+            if name not in columns:
+                connection.execute("ALTER TABLE documents ADD COLUMN " + name +
+                                   " TEXT NOT NULL DEFAULT '" + default + "'")
 
     @contextmanager
     def connect(self, write=False):
@@ -227,13 +236,14 @@ class LargeQAIndex:
         # two complete Python dictionaries (including every vector/summary).
         # UPSERT retains first-seen order and last-value-wins duplicate semantics.
         fields = ('path', 'name', 'topic', 'topic_name', 'version', 'source_version',
-                  'summary', 'size', 'mtime', 'sensitive', 'vector')
+                  'summary', 'size', 'mtime', 'sensitive', 'vector', 'source_kind', 'source_metadata')
         with tempfile.TemporaryDirectory(prefix='sync-', dir=self.path.parent) as staging:
             snapshot = Path(staging) / 'incoming.db'
             with closing(sqlite3.connect(str(snapshot))) as src:
                 src.execute('''CREATE TABLE incoming(seq INTEGER PRIMARY KEY,path TEXT UNIQUE NOT NULL,
                   name TEXT,topic TEXT,topic_name TEXT,version TEXT,source_version TEXT,
-                  summary TEXT,size INTEGER,mtime INTEGER,sensitive INTEGER,vector BLOB)''')
+                  summary TEXT,size INTEGER,mtime INTEGER,sensitive INTEGER,vector BLOB,
+                  source_kind TEXT,source_metadata TEXT)''')
                 insert = ('INSERT INTO incoming('+','.join(fields)+') VALUES('+','.join('?' for _ in fields)+') '
                           'ON CONFLICT(path) DO UPDATE SET '+','.join(k+'=excluded.'+k for k in fields[1:]))
                 with src:
@@ -242,18 +252,24 @@ class LargeQAIndex:
                         summary = summary_text(row) if not row.get('sensitive') else ''
                         topic = str(row.get('group_id') or row.get('category') or 'unclassified')
                         topic_name = str(row.get('topic_name') or row.get('category') or '未分类')
-                        source_version = digest([row.get('size'), row.get('modified_at_ns'), row.get('sha256'), row.get('sensitive')])
+                        source_parts = [row.get('size'), row.get('modified_at_ns'), row.get('sha256'), row.get('sensitive')]
+                        if row.get('source_kind') == 'archive_member':
+                            from services.large_archive_members import source_signature
+                            source_parts.append(source_signature(row))
+                        source_version = digest(source_parts)
                         vector = row.get('vector')
                         version = digest([source_version, summary, topic, topic_name, digest(vector) if vector else None, model])
                         src.execute(insert, (row['path'], row.get('name') or Path(row['path']).name,
                             topic, topic_name, version, source_version, summary, row.get('size',0),
-                            row.get('modified_at_ns',0), int(bool(row.get('sensitive'))), vector))
+                            row.get('modified_at_ns',0), int(bool(row.get('sensitive'))), vector,
+                            row.get('source_kind') or '', json.dumps(loads(row.get('source_metadata') or '{}'), sort_keys=True)))
             return self._publish_snapshot(snapshot, package, model,
                 (_source_state or {}).get('signature'), (_source_state or {}).get('source_stamp'))
 
     def _publish_snapshot(self, snapshot, package, model, source_signature=None, source_stamp=None):
         changed = 0
         with self.connect(write=True) as c:
+            self._ensure_member_columns(c)
             c.execute('ATTACH DATABASE ? AS incoming_snapshot', (str(snapshot),))
             c.execute('BEGIN IMMEDIATE')
             thai.ensure(c)
@@ -303,13 +319,14 @@ class LargeQAIndex:
                         self._delete_chunks(c, path, 'original')
                 same_source = old and row['old_source_version'] == row['source_version']
                 c.execute('''INSERT OR REPLACE INTO documents
-                  (path,name,topic,topic_name,version,source_version,summary,size,mtime,sensitive,vector,parse_status,parse_complete,parse_note,attempted,priority)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                  (path,name,topic,topic_name,version,source_version,summary,size,mtime,sensitive,vector,parse_status,parse_complete,parse_note,attempted,priority,source_kind,source_metadata)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                   (path,row['name'],topic,row['topic_name'],version,row['source_version'],summary,
                    row['size'],row['mtime'],row['sensitive'],row['vector'],
                    row['old_parse_status'] if same_source else ('restricted' if row['sensitive'] else 'pending'),
                    row['old_parse_complete'] if same_source else 0,row['old_parse_note'] if same_source else '',
-                   row['old_attempted'] if same_source else 0, row['old_priority'] if same_source else 0))
+                   row['old_attempted'] if same_source else 0, row['old_priority'] if same_source else 0,
+                   row['source_kind'], row['source_metadata']))
                 for ordinal, (text, start, end) in enumerate(split_text(summary, 1800, 120)):
                     self._add_chunk(c,path,row['name'],ordinal,'summary',text,
                                     {'source':'file_summary','char_start':start,'char_end':end},version)
@@ -398,13 +415,18 @@ class LargeQAIndex:
                     'SELECT model FROM large_catalog_centers WHERE package_id=?', (self.package_id,))}
                 return dict(row), next(iter(models)) if len(models)==1 else '', read_stamp(src, self.package_id)
             package, model, stamp = source_context()
+            columns = {r[1] for r in src.execute('PRAGMA table_info(files)')}
+            origin = 'f.source_kind' if 'source_kind' in columns else "'' AS source_kind"
+            identity = 'f.source_metadata' if 'source_metadata' in columns else "'{}' AS source_metadata"
             query = '''SELECT f.path,f.name,f.category,f.size,f.modified_at_ns,f.sha256,
-              f.sensitive,f.local_summary,f.deep_summary,
+              f.sensitive,f.local_summary,f.deep_summary,''' + origin + ',' + identity + ''',
               CASE WHEN g.model=? THEN m.vector ELSE NULL END vector,m.group_id,l.name topic_name
               FROM files f LEFT JOIN large_catalog_members m ON m.package_id=f.package_id AND m.path=f.path
               LEFT JOIN large_catalog_groups g ON g.package_id=m.package_id AND g.id=m.group_id
               LEFT JOIN lp_catalog_labels l ON l.package_id=m.package_id AND l.group_id=m.group_id
               WHERE f.package_id=?'''
+            if {'source_kind', 'source_changed'}.issubset(columns):
+                query += " AND NOT (f.source_kind='archive_member' AND f.source_changed<>0)"
             with self.connect() as current:
                 previous = self._source_signature(current)
                 metadata = self.meta(current)

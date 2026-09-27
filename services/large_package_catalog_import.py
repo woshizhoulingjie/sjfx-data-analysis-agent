@@ -2,7 +2,7 @@
 """大数据包智能目录 → 普通数据包导入 的桥接层。
 
 设计依据：《SJFX 大数据包智能目录进入普通数据包导入设计文档》。
-首版交付边界（文档 §14）：**已完成智能目录的物理文件节点** → 节点勾选 →
+交付边界：**已完成智能目录的物理文件及已核验归档成员** → 节点勾选 →
 服务端展开与校验 → 创建普通 scan → 普通解析 → 普通摘要/检索/问答。
 
 本模块只做"把服务端算出来的文件集合变成一个普通数据包"，具体是：
@@ -59,6 +59,14 @@ def file_fingerprint(sha256, size, modified_at_ns):
     return ("sha256:" + digest) if digest else "meta:%d:%d" % (int(size or 0), int(modified_at_ns or 0))
 
 
+def _source_fingerprint(item):
+    value = file_fingerprint(item.get('sha256'), item.get('size'), item.get('modified_at_ns'))
+    if item.get('source_kind') == 'archive_member':
+        from services.large_archive_members import source_signature
+        value += ':archive:' + source_signature(item)
+    return value
+
+
 def load_file_fingerprints(large_store, package_id, paths, *, strict=False):
     """从**大包库**读取选中文件的 sha256/大小/修改时间（§9.2 快照要用）。"""
     if not large_store or not paths:
@@ -71,18 +79,20 @@ def load_file_fingerprints(large_store, package_id, paths, *, strict=False):
             # Older live stores may not yet have undergone the additive migration.
             columns = {row[1] for row in conn.execute('PRAGMA table_info(files)')}
             origin = 'source_kind' if 'source_kind' in columns else "'' AS source_kind"
+            metadata = 'source_metadata' if 'source_metadata' in columns else "'{}' AS source_metadata"
             for chunk_start in range(0, len(paths), 500):
                 chunk = list(paths[chunk_start:chunk_start + 500])
                 marks = ','.join('?' * len(chunk))
                 for row in conn.execute(
-                        "SELECT path,sha256,size,modified_at_ns,sensitive," + origin + " FROM files "
+                        "SELECT path,sha256,size,modified_at_ns,sensitive," + origin + "," + metadata + " FROM files "
                         "WHERE package_id=? AND path IN (%s)" % marks,
                         [str(package_id)] + chunk):
-                    out[str(row['path'])] = {'sha256': row['sha256'],
+                    out[str(row['path'])] = {'path': row['path'], 'sha256': row['sha256'],
                                              'size': row['size'],
                                              'modified_at_ns': row['modified_at_ns'],
                                              'sensitive': bool(row['sensitive']),
-                                             'source_kind': str(row['source_kind'] or '')}
+                                             'source_kind': str(row['source_kind'] or ''),
+                                             'source_metadata': json.loads(row['source_metadata'] or '{}')}
     except Exception:
         LOGGER.exception('load_file_fingerprints failed: %s', package_id)
         if strict:
@@ -123,7 +133,7 @@ def detect_source_changes(storage, large_store, scan_id):
         if now is None:
             changed.append({'path': path, 'reason': 'missing'})
             continue
-        if file_fingerprint(now.get('sha256'), now.get('size'), now.get('modified_at_ns')) != was:
+        if _source_fingerprint(now) != was:
             changed.append({'path': path, 'reason': 'changed'})
     payload['source_changed'] = bool(changed)
     payload['source_changed_files'] = changed[:200]
@@ -296,6 +306,9 @@ def _import_identity(records, root_path, owner_id, parse_mode):
         item = record['payload']
         version = [record['path'], str(item.get('sha256') or ''),
                    int(item.get('size') or 0), int(item.get('modified_at_ns') or 0)]
+        if item.get('source_kind') == 'archive_member':
+            from services.large_archive_members import source_signature
+            version.append(source_signature(item))
         digest.update(json.dumps(version, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
         digest.update(bytes([10]))
     return {'version': 1, 'owner_id': str(owner_id or 'legacy'),
@@ -621,7 +634,15 @@ def _inventory_records(selection, large_package, fingerprints=None):
         # Trust only the source database, never a caller-supplied inventory flag.
         # A real directory called reports.zip is not an archive container.
         source_kind = str(mark.get('source_kind') or '')
-        if source_kind == 'archive_member' or (source_kind != 'physical_file' and looks_like_archive_member(path)):
+        logical = {}
+        if source_kind == 'archive_member':
+            from services.large_archive_members import member_node
+            try:
+                logical = member_node({**item, **mark})
+            except ValueError:
+                excluded['archive_member'] += 1
+                continue
+        elif source_kind != 'physical_file' and looks_like_archive_member(path):
             excluded["archive_member"] += 1
             continue
         parent = path.rsplit("/", 1)[0] if "/" in path else "."
@@ -634,6 +655,7 @@ def _inventory_records(selection, large_package, fingerprints=None):
             "parent_path": parent,
             "position": len(records),
             "payload": {
+                **logical,
                 "kind": "file",
                 "source_kind": source_kind,
                 "path": path,
@@ -643,8 +665,7 @@ def _inventory_records(selection, large_package, fingerprints=None):
                 "modified_at_ns": int(item.get("modified_at_ns") or 0),
                 # §9.2 文件指纹（优先大包算好的 sha256）
                 "sha256": str(mark.get("sha256") or ""),
-                "fingerprint": file_fingerprint(mark.get("sha256"), item.get("size"),
-                                                item.get("modified_at_ns")),
+                "fingerprint": _source_fingerprint({**item, **mark}),
                 # 来源可追溯（文档 §6）
                 "source_large_package_id": package_id,
                 "source_path": path,
@@ -691,7 +712,7 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
         selection, large_package, fingerprints=marks)
     if not records:
         if excluded_counts['archive_member']:
-            raise SelectionError('压缩包内部成员暂不支持直接进入普通导入（首版限制）', 409)
+            raise SelectionError('压缩包成员缺少有效来源身份，请重新盘点后再导入', 409)
         if excluded_counts['sensitive']:
             raise SelectionError('选中的文件都被标记为敏感，不能进入普通导入')
         raise SelectionError('没有可导入的有效文件')
