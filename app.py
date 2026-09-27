@@ -41,6 +41,7 @@ from services.import_state_machine import summary_type as staged_summary_type
 from services.evidence import build_file_claims, embedding_mode, select_evidence, set_embedding_provider, verify_claim_evidence
 from services.exporter import create_report_docx, export_node, safe_name
 from services.folder_analysis import analyze_folder
+from services.formal_summary import project_node_claims
 from services.package_analysis import (
     analyze_package, checkpoint_fingerprint, refresh_package_coverage, _parse_with_limits,
     _restore_source_provenance, _logical_source_snapshot, _secure_source_snapshot,
@@ -12170,6 +12171,7 @@ def formal_directory(scan_id):
                     "coverage": coverage,
                     "confidence": "formal",
                     "evidence_status": "supported" if evidence else "deep_pending_validation",
+                    **project_node_claims(node),
                 })
 
         # Candidate nodes are content-derived and may not exist in the legacy
@@ -12243,6 +12245,7 @@ def formal_directory(scan_id):
                     "evidence_status": "supported" if selected_evidence else "deep_pending_validation",
                     "analysis_level": "deep",
                     "verification_status": "verified" if selected_evidence else "partial",
+                    **project_node_claims({**selected_summary, "coverage": selected_coverage}),
                 })
                 existing_node_ids.add(selected_node_id)
         for node in preview_directory.get("topics") or []:
@@ -12273,6 +12276,7 @@ def formal_directory(scan_id):
                 "evidence_status": "supported" if evidence else "deep_pending_validation",
                 "analysis_level": "deep",
                 "verification_status": "verified",
+                **project_node_claims(node),
             })
         # Strict imports persist node summaries in their own stage table. The
         # legacy analysis tree may still contain an older set of generated node
@@ -12321,8 +12325,10 @@ def formal_directory(scan_id):
                 "evidence_status": "supported" if formal_evidence else "deep_pending_validation",
                 "analysis_level": "deep",
                 "verification_status": "verified" if formal_evidence else "partial",
+                **project_node_claims(payload),
             })
             existing_node_ids.add(node_id)
+        evidence_count = sum(topic["evidence_count"] for topic in topics)
         counts = storage.file_workflow_counts(scan_id) or {}
         processing_counts = storage.package_processing_counts(scan_id) or {}
         selected_scope = [
