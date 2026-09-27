@@ -48,7 +48,7 @@ from services.large_package_runtime import explore_large_package
 from services.import_pipeline import parse_plan, build_preview_directory
 from services.processing_queue import estimated_work_units, ranked_pending_paths
 from services.unified_parser import compact_document
-from services.unified_parser import UnifiedDocumentParser
+from services.unified_parser import UnifiedDocumentParser, _zip_central_directory_preflight, strict_archive_member_name
 from services.logical_units import container_node_for
 from services.parse_isolation import (
     ParseIsolationCancelled,
@@ -797,6 +797,38 @@ def _secure_source_snapshot(scan_root, file_node, cancel_check=None):
         shutil.rmtree(str(scratch), ignore_errors=True)
 
 
+class _BoundedLogicalTarInfo(tarfile.TarInfo):
+    # Extension records are read before tarfile yields a member. Bound their
+    # allocation too; sparse files require a separate validated extent reader.
+    def _proc_pax(self, archive):
+        if self.size < 0 or self.size > min(1024 * 1024, Config.MAX_ARCHIVE_MEMBER_BYTES):
+            raise ValueError("TAR扩展元数据超过安全上限")
+        return super()._proc_pax(archive)
+
+    def _proc_gnulong(self, archive):
+        if self.size < 0 or self.size > min(1024 * 1024, Config.MAX_ARCHIVE_MEMBER_BYTES):
+            raise ValueError("TAR长名称元数据超过安全上限")
+        return super()._proc_gnulong(archive)
+
+    def _proc_sparse(self, archive):
+        raise ValueError("TAR稀疏成员不支持直接生成逻辑快照")
+
+
+def _logical_archive_size_limit(container_size):
+    return min(int(Config.MAX_CONTENT_BYTES), int(Config.MAX_ARCHIVE_MEMBER_BYTES),
+               int(Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES),
+               max(1, int(container_size * Config.MAX_ARCHIVE_COMPRESSION_RATIO)))
+
+
+def _validate_logical_member_size(file_node, declared_size, container_size, compressed_size=None):
+    if declared_size < 0 or declared_size > _logical_archive_size_limit(container_size):
+        raise ValueError("压缩包成员超过内容或解压安全上限")
+    if int(file_node.get("size") or 0) != declared_size:
+        raise SourceFileChangedError("压缩包成员大小与清点记录不一致")
+    if compressed_size is not None and declared_size > max(1, compressed_size) * Config.MAX_ARCHIVE_COMPRESSION_RATIO:
+        raise ValueError("压缩包成员压缩比超过安全上限")
+
+
 @contextmanager
 def _logical_source_snapshot(scan_root, file_node, cancel_check=None):
     """Materialise exactly one logical member/partition into private scratch."""
@@ -804,11 +836,16 @@ def _logical_source_snapshot(scan_root, file_node, cancel_check=None):
         with _secure_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
             yield snapshot
         return
+    name = str(file_node.get("name") or "logical-unit.txt")
+    if not strict_archive_member_name(name) or "/" in name:
+        raise ValueError("逻辑快照文件名不安全")
+    if file_node.get("logical_kind") == "archive_member" and not strict_archive_member_name(file_node.get("member_name")):
+        raise ValueError("压缩包成员路径不安全")
     Config.PARSE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(
         prefix="sjfx-logical-p{}-".format(os.getpid()), dir=str(Config.PARSE_TEMP_DIR)
     ))
-    target = scratch / str(file_node.get("name") or "logical-unit.txt")
+    target = scratch / name
     container_node = container_node_for(file_node)
     kind = str(file_node.get("logical_kind") or "")
     try:
@@ -849,17 +886,59 @@ def _logical_source_snapshot(scan_root, file_node, cancel_check=None):
                 member = str(file_node.get("member_name") or "")
                 archive_name = str(container_node.get("path") or "").lower()
                 if archive_name.endswith(".zip"):
+                    preflight = _zip_central_directory_preflight(container)
+                    if not preflight.get("safe"):
+                        raise ValueError("ZIP中央目录预检失败：{}".format(preflight.get("reason")))
                     archive = zipfile.ZipFile(container)
-                    info = archive.getinfo(member)
-                    encrypted = bool(info.flag_bits & 0x1)
-                    size = int(info.file_size or 0)
-                    source_stream = archive.open(info, "r")
+                    try:
+                        matches = [item for item in archive.filelist if item.filename == member]
+                        if len(matches) != 1:
+                            raise ValueError("ZIP成员缺失或名称重复，不能唯一定位")
+                        info = matches[0]
+                        mode_bits = (info.external_attr >> 16) & 0xFFFF
+                        if info.is_dir() or stat_module.S_IFMT(mode_bits) not in {0, stat_module.S_IFREG}:
+                            raise ValueError("ZIP链接或特殊成员不能作为普通文件读取")
+                        encrypted = bool(info.flag_bits & 0x1)
+                        if encrypted:
+                            raise ValueError("加密压缩包成员需要密码，不能读取")
+                        size = int(info.file_size or 0)
+                        _validate_logical_member_size(file_node, size, opened_before.st_size, info.compress_size)
+                        source_stream = archive.open(info, "r")
+                    except Exception:
+                        archive.close()
+                        raise
                 elif archive_name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
-                    archive = tarfile.open(fileobj=container, mode="r:*")
-                    info = archive.getmember(member)
-                    encrypted = False
-                    size = int(info.size or 0)
-                    source_stream = archive.extractfile(info)
+                    archive = tarfile.open(fileobj=container, mode="r:*", tarinfo=_BoundedLogicalTarInfo)
+                    try:
+                        info = None
+                        total_declared = 0
+                        for count, candidate in enumerate(archive, 1):
+                            if cancel_check is not None and cancel_check():
+                                raise ParseIsolationCancelled("任务已取消，停止核验归档目录")
+                            # Logical imports intentionally support more entries
+                            # than a whole-archive preview. Preserve that budget.
+                            if count > Config.MAX_LOGICAL_UNITS_PER_CONTAINER:
+                                raise ValueError("TAR成员数量超过安全上限")
+                            total_declared += max(0, int(candidate.size))
+                            if total_declared > min(Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+                                    max(1, int(opened_before.st_size * Config.MAX_ARCHIVE_COMPRESSION_RATIO))):
+                                raise ValueError("TAR解压总量或压缩比超过安全上限")
+                            if candidate.name == member:
+                                if info is not None:
+                                    raise ValueError("TAR成员名称重复，不能唯一定位")
+                                if not candidate.isfile() or candidate.issparse():
+                                    raise ValueError("TAR链接、稀疏或特殊成员不能作为普通文件读取")
+                                info = candidate
+                            archive.members.clear()
+                        if info is None:
+                            raise ValueError("TAR成员已不存在")
+                        encrypted = False
+                        size = int(info.size or 0)
+                        _validate_logical_member_size(file_node, size, opened_before.st_size)
+                        source_stream = archive.extractfile(info)
+                    except Exception:
+                        archive.close()
+                        raise
                 elif archive_name.endswith(".bz2"):
                     archive = None
                     source_stream = bz2.BZ2File(container, mode="rb")
@@ -903,8 +982,8 @@ def _logical_source_snapshot(scan_root, file_node, cancel_check=None):
                                 if not chunk:
                                     break
                                 copied += len(chunk)
-                                if copied > size:
-                                    raise ValueError("压缩包成员实际大小超过中央目录声明")
+                                if copied > min(size, _logical_archive_size_limit(opened_before.st_size)):
+                                    raise ValueError("压缩包成员实际大小超过声明或解压安全上限")
                                 output.write(chunk)
                             output.flush()
                             os.fsync(output.fileno())

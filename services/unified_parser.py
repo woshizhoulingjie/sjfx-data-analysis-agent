@@ -15,6 +15,7 @@ import shutil
 import struct
 import time
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree
@@ -160,12 +161,49 @@ def _unlink_quietly(path):
         pass
 
 
+@contextmanager
+def _zip_source_stream(source):
+    """Reuse an open source without reopening its pathname or closing it."""
+    if hasattr(source, "read") and hasattr(source, "seek"):
+        position = source.tell()
+        try:
+            yield source
+        finally:
+            source.seek(position)
+    else:
+        with Path(source).open("rb") as stream:
+            yield stream
+
+
+def _zip_source_size(source):
+    with _zip_source_stream(source) as stream:
+        stream.seek(0, os.SEEK_END)
+        return stream.tell()
+
+
+def strict_archive_member_name(value):
+    """Return an exact safe lookup name, never a rewritten unsafe name."""
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        return None
+    parts = value.split("/")
+    # tar commonly records './folder/file'; keep the exact lookup name.
+    checked_parts = parts[1:] if parts[0] == "." else parts
+    if not checked_parts or any(part in {"", ".", ".."} for part in checked_parts):
+        return None
+    if any("::" in part or (len(part) >= 2 and part[1] == ":") for part in checked_parts):
+        return None
+    if os.name == "nt" and any(":" in part for part in checked_parts):
+        return None
+    if len(parts) - 1 > Config.MAX_ARCHIVE_MEMBER_PATH_DEPTH:
+        return None
+    return value
+
+
 def _zip_eocd_metadata(path):
     """Read bounded EOCD/ZIP64 metadata without constructing ``ZipInfo`` objects."""
-    path = Path(path)
-    size = path.stat().st_size
+    size = _zip_source_size(path)
     tail_size = min(size, 65535 + 22 + 20)
-    with path.open("rb") as stream:
+    with _zip_source_stream(path) as stream:
         stream.seek(size - tail_size)
         tail = stream.read(tail_size)
         search_end = len(tail)
@@ -262,13 +300,13 @@ def _zip_central_directory_preflight(path):
     if directory_size < 0 or directory_size > ZIP_MAX_CENTRAL_DIRECTORY_BYTES:
         result["reason"] = "central_directory_byte_limit"
         return result
-    if directory_start < 0 or directory_end > Path(path).stat().st_size:
+    if directory_start < 0 or directory_end > _zip_source_size(path):
         result["reason"] = "central_directory_invalid"
         return result
 
     observed = 0
     try:
-        with Path(path).open("rb") as stream:
+        with _zip_source_stream(path) as stream:
             stream.seek(directory_start)
             cursor = directory_start
             while cursor < directory_end:

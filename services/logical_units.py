@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from services.unified_parser import _zip_central_directory_preflight
+from services.unified_parser import _zip_central_directory_preflight, strict_archive_member_name
 
 
 STRUCTURED_TEXT_EXTENSIONS = {".csv", ".tsv", ".jsonl"}
@@ -19,11 +19,7 @@ ARCHIVE_EXTENSIONS = {".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".
 
 
 def _safe_member_name(value):
-    name = str(value or "").replace("\\", "/").lstrip("/")
-    normalized = str(PurePosixPath(name))
-    if not normalized or normalized == "." or normalized.startswith("../") or "/../" in normalized:
-        return None
-    return normalized
+    return strict_archive_member_name(value)
 
 
 def _base_unit(container, logical_path, name, extension, size, kind, **extra):
