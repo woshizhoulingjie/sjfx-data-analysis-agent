@@ -3357,7 +3357,9 @@ def _semantic_document_clusters(
                 ]
             else:
                 representatives = member_paths[:3]
-                boundary_documents = member_paths[-2:] if len(member_paths) > 3 else []
+                boundary_documents = [
+                    path for path in member_paths[-2:] if path not in representatives
+                ]
             # mean_similarity is reported in the original embedding space so the
             # number stays comparable with earlier analyses and the report; only
             # the grouping decision uses the centred space.
@@ -3376,6 +3378,7 @@ def _semantic_document_clusters(
                 "members": member_paths,
                 "profile_fingerprint": member_profile_fingerprint,
                 "representative_documents": representatives,
+                "boundary_documents": boundary_documents,
                 "mean_similarity": round(sum(pair_scores) / len(pair_scores), 6) if pair_scores else None,
                 "keywords": [],
                 "name": None,
@@ -3541,6 +3544,10 @@ def _semantic_document_clusters(
         results.append({
             "members": member_paths,
             "representative_documents": representatives,
+            "boundary_documents": [
+                path for _score, path in sorted(centrality, key=lambda item: (item[0], item[1]))
+                if path not in representatives
+            ][:2],
             "mean_similarity": (
                 round(
                     sum(pair_scores) / len(pair_scores),
@@ -3686,9 +3693,10 @@ SEMANTIC_NAMING_BATCH_CLUSTERS = 8
 
 def _semantic_naming_cache_id(cluster):
     payload = {
-        "contract": "semantic-naming-cache-v3",
+        "contract": "semantic-naming-cache-v4-boundary",
         "members": sorted(str(path) for path in (cluster.get("members") or [])),
         "profile_fingerprint": str(cluster.get("profile_fingerprint") or ""),
+        "boundary_documents": list(cluster.get("boundary_documents") or [])[:2],
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -3783,6 +3791,9 @@ def _name_semantic_clusters(
             for path in cluster.get("boundary_documents", [])[:2]
             if path not in seen_samples
         )
+        # Keep the prior three-profile character budget even when boundary
+        # samples are present. The profile builder balances head/middle/tail.
+        profile_chars = min(850, (3 * 850) // max(1, len(samples)))
         for path, role in samples:
             doc = documents[path]
             headings = (
@@ -3808,7 +3819,7 @@ def _name_semantic_clusters(
             profile = _semantic_document_profile(
                 path,
                 doc,
-                max_chars=850,
+                max_chars=profile_chars,
             )
 
             line = "- {}文件：{}".format(role, path)
@@ -3925,16 +3936,21 @@ def _name_semantic_clusters(
                 )
 
             cluster["name"] = name
-            allowed_boundary_paths = set(cluster.get("boundary_documents") or [])
+            allowed_boundary_paths = set((cluster.get("boundary_documents") or [])[:2])
+            allowed_boundary_paths.intersection_update(cluster.get("members") or [])
             if "boundary_mismatches" in item:
                 raw_mismatches = item.get("boundary_mismatches")
+                review_valid = isinstance(raw_mismatches, list) and all(
+                    isinstance(path, str) and path.strip() in allowed_boundary_paths
+                    for path in raw_mismatches
+                )
                 mismatches = [
                     str(path).strip()
                     for path in (raw_mismatches if isinstance(raw_mismatches, list) else [])
-                    if str(path).strip() in allowed_boundary_paths
+                    if isinstance(path, str) and path.strip() in allowed_boundary_paths
                 ]
                 cluster["boundary_review"] = {
-                    "status": "flagged" if mismatches else "passed",
+                    "status": "flagged" if mismatches else ("passed" if review_valid else "unverified"),
                     "flagged_paths": list(dict.fromkeys(mismatches)),
                     "method": "batched_model_boundary_sample",
                 }
@@ -4229,7 +4245,8 @@ def _semantic_adaptive_tree(
             continue
         topic_name = str(cluster.get("name") or "未命名主题")
         for path in review.get("flagged_paths") or []:
-            if path in (cluster.get("boundary_documents") or []):
+            if (path in (cluster.get("boundary_documents") or [])[:2]
+                    and path in (cluster.get("members") or []) and path in documents):
                 boundary_review_sources.setdefault(str(path), []).append(topic_name)
 
     children = []
@@ -4321,6 +4338,43 @@ def _semantic_adaptive_tree(
                 file_leaf(path)
                 for path in member_paths
             ],
+        })
+
+    # A boundary rejection changes membership, never inventory coverage.
+    # Keep rejected samples selectable rather than dropping them or forcing
+    # them back into a topic that they do not support.
+    if boundary_review_sources:
+        reviewed_paths = sorted(boundary_review_sources)
+        review_size = sum(int((documents[path].get("source") or {}).get("size") or 0)
+                          for path in reviewed_paths)
+        for path in reviewed_paths:
+            documents[path].setdefault("classification", {}).update({
+                "primary_topic": "边界待复核",
+                "topic_memberships": [],
+                "confidence": None,
+                "confidence_kind": "unverified_boundary",
+                "classification_status": "needs_review",
+                "classification_reason": "边界抽样显示该文件可能不属于当前语义簇，已保留在待复核节点。",
+            })
+        children.append({
+            "kind": "group",
+            "node_id": _stable_group_node_id("边界待复核", "", reviewed_paths),
+            "dimension": "分类复核",
+            "topic_key": "边界待复核",
+            "name": "边界待复核",
+            "summary": "{} 个文件与原主题的关联尚待确认；文件未删除，可单独查看或选择分析。".format(len(reviewed_paths)),
+            "classification_status": "needs_review",
+            "member_paths": reviewed_paths,
+            "file_count": len(reviewed_paths),
+            "total_size": review_size,
+            "total_size_human": human_size(review_size),
+            "related_topics": sorted({topic for topics in boundary_review_sources.values() for topic in topics}),
+            "boundary_review": {
+                "status": "flagged",
+                "flagged_paths": reviewed_paths,
+                "source_topics": boundary_review_sources,
+            },
+            "children": [file_leaf(path) for path in reviewed_paths],
         })
 
     tree = {
