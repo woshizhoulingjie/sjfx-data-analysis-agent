@@ -15,9 +15,20 @@ import json
 import time
 from services import large_package_catalog_naming as naming
 
+BATCH_SUFFIX = ('本次groups包含多个独立组。各组事实和证据编号不得混用，'
+                '每组恰好返回一项，id原样返回。')
 BATCH_SYSTEM = (naming.NAMING_RULES + naming.NAMING_OUTPUT_RULES +
-    '本次groups包含多个独立组。各组事实和证据编号不得混用，每组恰好返回一项，id原样返回。'
-    '只输出JSON：{"groups":[{"id":"G1",' + naming.NAMING_RESULT_SCHEMA[1:] + ']}')
+    BATCH_SUFFIX + '只输出JSON：{"groups":[{"id":"G1",' + naming.NAMING_RESULT_SCHEMA[1:] + ']}')
+
+
+def batch_system():
+    """当前生效的批量提示词。
+
+    批次 3b：紧凑输出是**运行期开关**（默认关闭），做成常量就只能靠重启生效，
+    所以这里也走函数。`BATCH_SYSTEM` 常量保留给既有引用。
+    """
+    return (naming.NAMING_RULES + naming.naming_output_rules() + BATCH_SUFFIX +
+            '只输出JSON：{"groups":[{"id":"G1",' + naming.naming_result_schema()[1:] + ']}')
 
 
 def process_batch(store, package_id, cancelled=lambda: False, model_client=None, prefetch=False):
@@ -139,7 +150,7 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
                         store, package_id, job['group_id'], material['digest'], model_client.model)
                 item = {'id':'G'+str(len(pending)+1), **json.loads(material['user'])}
                 proposed = json.dumps({'groups':payload+[item]}, ensure_ascii=False,separators=(',',':'))
-                if naming.token_count(BATCH_SYSTEM+'\n'+proposed)+64 > getattr(Config,'LP_CATALOG_BATCH_INPUT_TOKENS',6500):
+                if naming.token_count(batch_system()+'\n'+proposed)+64 > getattr(Config,'LP_CATALOG_BATCH_INPUT_TOKENS',6500):
                     oversized = True
                     continue
                 batch_route=difficulty
@@ -162,7 +173,7 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
             user = json.dumps({'groups':payload},ensure_ascii=False,separators=(',',':'))
             from services.large_package_catalog_schema import output_budget
             output = sum(output_budget(cfg,m) for _,m,_ in pending)+32
-            reserved = naming.token_count(BATCH_SYSTEM+'\n'+user)+64+output
+            reserved = naming.token_count(batch_system()+'\n'+user)+64+output
             # A batch that cannot fit the remaining token budget must not exhaust
             # the round if an ordinary single-group request can still fit.
             if current['tokens'] + reserved > current['max_tokens']:
@@ -249,7 +260,7 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
                               stop, getattr(Config, 'LP_EVIDENCE_PREFETCH_GROUPS', 4))
         with background_generation(stop), naming.lease_renewal(
                 store, package_id, [job['group_id'] for job in claimed], stop):
-            response=model_client.chat(BATCH_SYSTEM,user,**kwargs)
+            response=model_client.chat(batch_system(),user,**kwargs)
         if response.get('finish_reason')=='length':
             raise ValueError('批量目录命名输出被截断，改为逐组重试')
         from services.model_output import extract_json_value

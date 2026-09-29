@@ -51,6 +51,58 @@ NAMING_RESULT_SCHEMA = ('{"name":"简短自然名称","description":"一句共�
                         '"purity":"same","subtopics":[]}')
 SYSTEM = NAMING_RULES + NAMING_OUTPUT_RULES + '只输出JSON：' + NAMING_RESULT_SCHEMA
 
+# ---- 批次 3b（方案 §7）：P2.1 压缩输出 --------------------------------------
+# 紧凑输出规则。**purity 必须保留**：解析端把缺失的 purity 当作 unsure，
+# 会强制 needs_review=True，于是 needs_review 的比例会失真（方案 §7 第 2 条）。
+# **evidence_ids 至少 2 个**（单成员组 1 个）：validate() 规定多成员组的不同证据
+# 少于 2 个就标 needs_review（§7 第 3 条）。
+NAMING_OUTPUT_RULES_COMPACT = (
+    '只输出约定JSON，不解释、不复述原文。evidence_ids必须引用本组有效编号，'
+    '多成员组至少给2个互不相同的编号，组内只有1个成员时给1个。'
+    'purity必须为same、mixed、unsure之一，**不得省略**；不确定填unsure并标needs_review。'
+    'description不超过30字。'
+    'outliers没有明显无关编号时省略该字段，不要输出空数组；'
+    'subtopics仅在本组明显混有互不相干内容、且能可靠分开时提供至少两项'
+    '（每项含name和members编号数组，本组每个证据编号恰好出现一次）；'
+    '其余情况省略subtopics字段。'
+    'needs_review为false时可以省略该字段。'
+    'purity不是mixed时不得出现subtopics。不得自行修改成员。')
+
+
+def compact_output_enabled():
+    """`SJFX_LP_NAMING_COMPACT_OUTPUT` 是否为真（默认关闭 = 旧提示词逐字不变）。"""
+    return str(os.getenv('SJFX_LP_NAMING_COMPACT_OUTPUT', '0') or '0').strip().lower() in {
+        '1', 'true', 'yes', 'on'}
+
+
+def prompt_variant():
+    """提示词变体标识：写进缓存键，保证 A/B 测试不被旧缓存污染（§7 第 4 条）。"""
+    return 'compact' if compact_output_enabled() else 'full'
+
+
+def naming_output_rules():
+    return NAMING_OUTPUT_RULES_COMPACT if compact_output_enabled() else NAMING_OUTPUT_RULES
+
+
+def naming_result_schema():
+    """紧凑模式下 JSON 骨架里也把"可省略"的字段去掉，进一步省输出 token。"""
+    if not compact_output_enabled():
+        return NAMING_RESULT_SCHEMA
+    return ('{"name":"简短自然名称","description":"一句共同范围",'
+            '"evidence_ids":["E1","E2"],"purity":"same"}')
+
+
+def system_prompt():
+    """当前生效的系统提示词。
+
+    为什么是函数而不是常量：`SYSTEM` 在 import 时求值，而"紧凑输出"是个运行期开关
+    （方案要求默认关闭、由运维显式打开），做成常量就只能靠重启生效、且 `system_prompt()`
+    与实际发送的内容会有隐式分叉。这里统一从函数取，两条命名路径都改用它。
+    `SYSTEM` 常量保留（既有代码与测试在引用），语义仍是"完整版提示词"。
+    """
+    return (NAMING_RULES + naming_output_rules()
+            + '只输出JSON：' + naming_result_schema())
+
 
 def settings():
     from config import Config
@@ -1538,6 +1590,22 @@ def desired_sample_count(coherence, low, high, baseline=None):
     return high
 
 
+def _sample_dedup_gap():
+    """近重复去重的"间隔"上限；开关关闭时返回 None（= 旧行为）。
+
+    `SJFX_LP_SAMPLE_DEDUP_COSINE`（默认 0 = 关闭，建议 0.97）是**余弦相似度**阈值，
+    而 `select_evidence` 内部用的是 `1 - 相似度` 的"间隔"，这里统一换算一次。
+    """
+    try:
+        cosine = float(os.getenv('SJFX_LP_SAMPLE_DEDUP_COSINE', '0') or 0)
+    except (TypeError, ValueError):
+        return None
+    if cosine <= 0:
+        return None
+    cosine = max(0.0, min(1.0, cosine))
+    return max(0.0, 1.0 - cosine)
+
+
 def select_evidence(matrix, relevance, want, lam, min_gap=0.10):
     """Center, distinct regions, boundary, then MMR; O(n*k*d), no n*n matrix."""
     import numpy as np
@@ -1566,7 +1634,26 @@ def select_evidence(matrix, relevance, want, lam, min_gap=0.10):
         if not mask[index]:
             add(int(index))
             break
+    # 批次 4（方案 §8 第 2 条）：补足份数这一步原先**不检查间隔**，会把与已选样本
+    # 高度重复的成员硬塞进来。开关打开时与已选样本的余弦相似度超过阈值就跳过 ——
+    # 宁可少给一份样本，也不给模型一份重复的证据。
+    #
+    # 阈值从**余弦相似度**换算：`redundant` 是已选样本与候选的最大余弦相似度
+    # （矩阵已按行归一化），`1-redundant` 是 MMR 主循环用的"间隔"。
+    # 所以"相似度 > 0.97"等价于"间隔 < 0.03"。
+    _dedup = _sample_dedup_gap()
     while len(selected)<want:
+        if _dedup is not None:
+            # `1-redundant` 是"候选与已选样本的最大余弦相似度"的补，也就是 MMR 用的
+            # "间隔"。要**跳过**的是相似度超过阈值的候选（间隔小于 `1-阈值`），
+            # 所以可用的候选是 `间隔 >= 1-阈值` 的那些。
+            # （第一版把它写成 `<`，等于专门挑近重复，实测被 regr 测抓到。）
+            valid=(~mask)&((1-redundant)>=_dedup)
+            if not np.any(valid):
+                break
+            scores=lam*relevance-(1-lam)*redundant
+            add(int(np.argmax(np.where(valid,scores,-np.inf))))
+            continue
         scores=lam*relevance-(1-lam)*redundant
         add(int(np.argmax(np.where(~mask,scores,-np.inf))))
     return selected
@@ -1785,7 +1872,10 @@ def bundle_key(package_id, group_id, revision, owner_id):
     邻组名只影响每次现取的上下文摘要。
     """
     parts = [EVIDENCE_POLICY_VERSION, VERSION, _tokenizer_version(),
-             str(owner_id or ''), str(package_id), str(group_id), str(int(revision or 0))]
+             str(owner_id or ''), str(package_id), str(group_id), str(int(revision or 0)),
+             # 批次 3b §7 第 4 条：提示词变体必须进键。此前只有 VERSION 参与，
+             # 只改提示词时旧缓存照样被命中，A/B 测试结果会被污染。
+             prompt_variant()]
     return hashlib.sha256('\0'.join(parts).encode('utf-8')).hexdigest()
 
 
@@ -1999,8 +2089,9 @@ def _bundle_core_impl(store, package_id, group_id):
         return json.dumps(payload,ensure_ascii=False,separators=(',',':'))
     cfg=settings()
     core_budget=max(400,int(cfg['input'])-NEIGHBOR_RESERVE)
+    _system=system_prompt()
     user=serialize()
-    while token_count(SYSTEM+'\n'+user)+64>core_budget:
+    while token_count(_system+'\n'+user)+64>core_budget:
         # Remove weak metadata before shortening source evidence.
         changed=False
         for key in ('keywords','headings','fields'):
@@ -2035,7 +2126,7 @@ def _bundle_core_impl(store, package_id, group_id):
     return {'route':difficulty,'payload':payload,'user':user,'evidence':evidence,'held_out':held_out,
             'profile':profile,'group':dict(group),'revision':revision,'owner_id':owner,
             'model':group['model'],'anchor':group['anchor'],'digest':digest,
-            'tokens':token_count(SYSTEM+'\n'+user)+64}
+            'tokens':token_count(_system+'\n'+user)+64}
 
 
 def bundle(store, package_id, group_id):
@@ -2055,7 +2146,10 @@ def bundle(store, package_id, group_id):
     revision=int(row[0])
     key=('bundle',str(store.db_path),str(package_id),str(group_id),revision,
          feature_revision(store,package_id),EVIDENCE_POLICY_VERSION,_tokenizer_version(),
-         int(cfg['input']),_sample_policy())
+         int(cfg['input']),_sample_policy(),
+         # 批次 3b：提示词变体也要进进程内组包缓存，否则开关切换后同一修订号
+         # 会命中上一个变体构建的载荷。
+         prompt_variant())
     core=_BUNDLE_CACHE.get(key)
     if core is None:
         core=_bundle_core(store,package_id,group_id)
@@ -2065,15 +2159,16 @@ def bundle(store, package_id, group_id):
     neighbors=_neighbor_context(store,package_id,group_id,core['anchor'],core['model'])
     payload=dict(core['payload'])
     payload['neighbor_names']=[x['name'] for x in neighbors]
+    _system=system_prompt()
     user=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
-    tokens=token_count(SYSTEM+'\n'+user)+64
+    tokens=token_count(_system+'\n'+user)+64
     if tokens>int(cfg['input']):
         payload['neighbor_names']=[]
         user=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
-        tokens=token_count(SYSTEM+'\n'+user)+64
+        tokens=token_count(_system+'\n'+user)+64
     context_digest=hashlib.sha256(
         json.dumps([x.get('name') for x in neighbors],ensure_ascii=False).encode()).hexdigest()
-    return {'system':SYSTEM,'user':user,'evidence':core['evidence'],
+    return {'system':system_prompt(),'user':user,'evidence':core['evidence'],
             # 留出成员与画像**只给校验用**：它们不出现在 user/payload 里
             # （payload 在上面已按 core['payload'] 复制，不含这两个键）。
             'held_out':core.get('held_out') or [],'profile':core.get('profile') or {},
