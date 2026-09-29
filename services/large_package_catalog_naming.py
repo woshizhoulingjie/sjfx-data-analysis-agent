@@ -455,6 +455,70 @@ def duplicate_name_groups(store, package_id):
     return dict((k, v) for k, v in buckets.items() if len(v) > 1)
 
 
+_ORDINALS = ("其二", "其三", "其四", "其五", "其六", "其七", "其八", "其九", "其十")
+
+
+def _disambiguate_incompatible(store, package_id, incompatible):
+    """给"同一主题内同名、但内容不相容无法合并"的叶组改一个可区分的名字。返回改名数。"""
+    renamed = 0
+    now = time.time()
+    try:
+        with store._lock, closing(store._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("SELECT l.group_id,l.name FROM lp_catalog_labels l "
+                                "JOIN large_catalog_groups g ON g.package_id=l.package_id "
+                                "AND g.id=l.group_id WHERE l.package_id=? AND "
+                                "(l.revision=g.content_revision OR l.locked=1)",
+                                (package_id,)).fetchall()
+            taken = {_normalize_name(r["name"]) for r in rows}
+            names = {str(r["group_id"]): str(r["name"] or "") for r in rows}
+            done = set()
+            for key, alive, sizes in incompatible:
+                if key in done:
+                    continue
+                done.add(key)
+                # 仍然同名才处理（期间可能已被改名/重命名）
+                current = [g for g in alive if _normalize_name(names.get(g, "")) == key]
+                if len(current) < 2:
+                    continue
+                ordered = sorted(current, key=lambda g: (-int(sizes.get(g, 0)), g))
+                base = names[ordered[0]]
+                slot = 0
+                for gid in ordered[1:]:
+                    locked = conn.execute("SELECT locked FROM lp_catalog_labels WHERE package_id=? "
+                                          "AND group_id=?", (package_id, gid)).fetchone()
+                    if locked and locked[0]:
+                        continue
+                    new = None
+                    while slot < len(_ORDINALS):
+                        candidate = "%s·%s" % (base, _ORDINALS[slot])
+                        slot += 1
+                        if _normalize_name(candidate) not in taken:
+                            new = candidate
+                            break
+                    if not new:
+                        break
+                    conn.execute("UPDATE lp_catalog_labels SET name=?,needs_review=1,updated=? "
+                                 "WHERE package_id=? AND group_id=?", (new, now, package_id, gid))
+                    taken.add(_normalize_name(new))
+                    names[gid] = new
+                    renamed += 1
+                    conn.execute("INSERT INTO lp_workflow_events(package_id,object,old_state,"
+                                 "new_state,reason,source,created) VALUES(?,?,?,?,?,?,?)",
+                                 (package_id, "catalog.leaf", base[:60], new[:60],
+                                  "同名叶组内容不相容、不能合并：改名消歧（%s）" % gid,
+                                  "normalize_leaves", now))
+            conn.commit()
+    except Exception:
+        LOGGER.exception("disambiguate incompatible duplicates failed: %s", package_id)
+        return 0
+    if renamed:
+        store._catalog_cache.pop(package_id, None)
+        LOGGER.info("normalize_leaves package=%s renamed %d incompatible duplicate leaves",
+                    package_id, renamed)
+    return renamed
+
+
 def normalize_leaves(store, package_id, max_rounds=6, cap=None):
     """叶层**唯一的收缩入口**：把同一主题内"归一化后同名"的叶子合并成一个。
 
@@ -519,6 +583,7 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
     # 本轮调用内**确定并不了的**键（容量装不下全部同名组）：记下来，后面几轮不再
     # 重复尝试，否则 max_rounds 会全部空转在同一个键上。
     skipped_over_cap = set()
+    incompatible = []
     for rnd in range(max(1, int(max_rounds))):
         dups = duplicate_name_groups(store, package_id)
         if not dups:
@@ -550,6 +615,8 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
                             conn.rollback(); continue
                         from services.large_package_catalog_quality import compatible_groups
                         if not compatible_groups(conn, package_id, alive):
+                            # 内容不相容 → 不能合并；记下来，循环结束后改名消歧（见下）。
+                            incompatible.append((key, list(alive), dict(sizes)))
                             conn.rollback();continue
                         # 批1 第 4 条：**host 选择必须看容量**。
                         #
@@ -669,6 +736,15 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
         if not progressed:
             break
 
+    # **同名但内容不相容的叶组：改名消歧，而不是永远挂着。**
+    # 质量门（compatible_groups）拒绝合并说明它们确实是不同的内容簇，只是模型给了
+    # 同一个泛化名字。原来这里直接 continue，于是同一主题下的重名永远存在，
+    # 发布校验 INV-3 每 30 秒阻断一次、目录永远不能定稿（生产实测 lp-ba9afc71）。
+    # 做法：成员最多的保留原名，其余按大小依次改为「原名·其二/其三…」并标
+    # needs_review；不调用模型、不改修订号（标签仍与内容同版本，不会重排命名任务）。
+    if incompatible:
+        stats["renamed_incompatible"] = _disambiguate_incompatible(store, package_id, incompatible)
+
     after = duplicate_name_groups(store, package_id)
     stats["duplicates_after"] = len(after)
 
@@ -753,11 +829,22 @@ def validate_catalog(store, package_id):
         # 那是**子串**匹配；同一函数下游解析同一个 children 字段用的是 json.loads。
         # 两个 id 互为子串时会误判"已覆盖"。改为按 JSON 数组成员判定（语义等价，
         # 在真实库上与旧写法结果一致，已用副本比对验证）。
+        # 另外两类按设计就不在任何主题下，不算"占位"：
+        #   * km-solo-*：单文件条目（assign_solo_groups 建的，空质心、刻意不参与主题聚类，
+        #     界面放在"待归并主题"里）；
+        #   * 没有向量的成员：主题树只收有向量的叶组，这些文件已经在 INV-2 里按
+        #     no_content/deferred 明确计数。
+        # 改动前它们一律算违规，于是任何出现过单文件条目的包都**永远**发布不了
+        # （生产实测 lp-ba9afc71：6 个文件，5 个 no_content + 1 个单文件条目）。
         placeholders = int(q("SELECT COUNT(*) FROM large_catalog_members m JOIN large_catalog_groups g "
                              "ON g.package_id=m.package_id AND g.id=m.group_id "
-                             "WHERE m.package_id=? AND g.id NOT LIKE 'km-other-%' AND NOT EXISTS ("
+                             "WHERE m.package_id=? AND g.id NOT LIKE 'km-other-%' "
+                             "AND g.id NOT LIKE 'km-solo-%' AND LENGTH(m.vector)>0 AND NOT EXISTS ("
                              "  SELECT 1 FROM lp_catalog_branches b, json_each(b.children) je "
                              "  WHERE b.package_id=g.package_id AND je.value=g.id)",
+                             (package_id,)) or 0)
+        solo_outside = int(q("SELECT COUNT(*) FROM large_catalog_members m "
+                             "WHERE m.package_id=? AND m.group_id LIKE 'km-solo-%'",
                              (package_id,)) or 0)
         system_bucket = int(q("SELECT COUNT(*) FROM large_catalog_members m JOIN large_catalog_groups g "
                               "ON g.package_id=m.package_id AND g.id=m.group_id "
@@ -768,7 +855,12 @@ def validate_catalog(store, package_id):
                       "WHERE m.package_id=g.package_id AND m.group_id=g.id)", (package_id,)) or 0)
         groups = int(q("SELECT COUNT(*) FROM large_catalog_groups WHERE package_id=?",
                        (package_id,)) or 0)
+        # 只数**有成员**的组：k-means 之后留下的空壳（例如 km-pending-<hash> 被清空后
+        # member_count=0）不出现在目录里，也不会再排命名任务 —— 原来把它算成
+        # "没名字也没任务"，于是 INV-7 永久阻断（生产实测 lp-ba9afc71）。
         unnamed = int(q("SELECT COUNT(*) FROM large_catalog_groups g WHERE g.package_id=? AND "
+                        "EXISTS(SELECT 1 FROM large_catalog_members m WHERE m.package_id=g.package_id "
+                        "AND m.group_id=g.id) AND "
                         "NOT EXISTS(SELECT 1 FROM lp_catalog_labels l WHERE l.package_id=g.package_id "
                         "AND l.group_id=g.id AND l.name<>'')", (package_id,)) or 0)
     try:
@@ -832,7 +924,8 @@ def validate_catalog(store, package_id):
         warnings.append("INV-4（警告）：叶组数 %d 高于增长上限 %d —— 同名归一会让叶子变大，"
                         "这是合并的正常结果" % (groups, growth))
     checks["INV5_placeholders"] = {"files_in_placeholder_groups": placeholders,
-                                   "files_in_system_bucket": system_bucket}
+                                   "files_in_system_bucket": system_bucket,
+                                   "files_in_single_file_entries": solo_outside}
     if placeholders:
         violations.append("INV-5：有 %d 个文件仍归属占位组，不得进入正式目录" % placeholders)
     if system_bucket:
@@ -847,6 +940,8 @@ def validate_catalog(store, package_id):
         try:
             awaiting = int(conn2.execute(
                 "SELECT COUNT(*) FROM large_catalog_groups g WHERE g.package_id=? AND "
+                "EXISTS(SELECT 1 FROM large_catalog_members m WHERE m.package_id=g.package_id "
+                "AND m.group_id=g.id) AND "
                 "NOT EXISTS(SELECT 1 FROM lp_catalog_labels l WHERE l.package_id=g.package_id "
                 "AND l.group_id=g.id AND l.name<>'') AND EXISTS("
                 "SELECT 1 FROM lp_catalog_jobs j WHERE j.package_id=g.package_id "
@@ -1200,6 +1295,38 @@ def state(store, package_id, settle=False):
                 'seconds_remaining':max(0,round(result.get('deadline',0)-time.time()))}
 
 
+def naming_work_pending(store, package_id):
+    """这个包**此刻**是否还有需要命名轮次的活（纯读）。
+
+    process_one / process_batch 入口原来是 `settle_round → ensure_round` 无条件连用：
+    settle_round 刚把"已经排空"的轮次标成 completed，ensure_round('initial') 立刻又把
+    "最新一轮"续期回 active。于是只要调度器还把车道派给这个包，轮次就**永远结束不了**：
+    界面一直显示"正在完善"，日志每 2 秒一条 `catalog round renewed`
+    （生产实测 lp-7132acbf 连续 7 个多小时）。
+    这里给出"是否真的需要轮次"的判据，与 state() 判定轮次排空时用的是同一口径：
+    queued/running 任务、还有重试额度的 deferred、以及仍需进行的层级命名。
+    还没有任何轮次的包视为需要（保持首次建轮次的原行为）。
+    """
+    from config import Config as _Cfg
+    max_attempts = max(1, int(getattr(_Cfg, 'LP_NAME_MAX_ATTEMPTS', 5) or 5))
+    with closing(store._connect()) as c:
+        latest = c.execute('SELECT * FROM lp_catalog_rounds WHERE package_id=? '
+                           'ORDER BY started DESC LIMIT 1', (package_id,)).fetchone()
+        if latest is None:
+            return True
+        if c.execute("SELECT 1 FROM lp_catalog_jobs WHERE package_id=? AND "
+                     "(status IN ('queued','running','retry') OR (status='deferred' AND attempts<?)) "
+                     "LIMIT 1", (package_id, max_attempts)).fetchone():
+            return True
+        try:
+            if latest['hierarchy_status'] in {'queued', 'running'}:
+                from services.large_package_catalog_hierarchy import needed
+                return bool(needed(c, package_id))
+        except Exception:
+            return False
+    return False
+
+
 def settle_round(store, package_id):
     """把轮次的有效状态**持久化**（唯一的写入点，由 Worker 调用）。
 
@@ -1503,7 +1630,13 @@ def representatives(store, package_id, group_id, limit=None):
     ranked = [usable[i] for i in chosen]
     picked = set(ranked)
     # 后备：选中的文件可能没有可读素材（解析失败等），按相关性顺序补位。
-    ranked += [i for i in sorted(usable, key=lambda i: -float(relevance[i])) if i not in picked]
+    # `relevance` 按 **usable 内的位置** 编号（M 是 usable 的子矩阵），而 ranked
+    # 里放的是 **paths 的原始下标**。原写法 `relevance[i]` 直接拿原始下标去索引，
+    # 只要有成员没向量/不可读（usable 不是 0..n-1），就会越界
+    # （生产实测 IndexError: index 22 is out of bounds for axis 0 with size 22，
+    # 该组命名任务 5 次耗尽、整个目录增量车道每次都在这里中断）或取错相关性。
+    ranked += [usable[j] for j in sorted(range(len(usable)), key=lambda j: -float(relevance[j]))
+               if usable[j] not in picked]
     from services.large_package_catalog import material
     rows = []
     # Read the first evidence window together, then fetch fallback windows
@@ -3296,7 +3429,9 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
     # 写入点从读路径搬到 Worker 处理路径的入口 —— 这里本来就是要写库的地方。
     settle_round(store,package_id)
     queue_groups(store,package_id)
-    ensure_round(store,package_id)
+    # 没有待办时不续期：否则刚结算为 completed 的轮次会被立刻复活（见 naming_work_pending）。
+    if naming_work_pending(store,package_id):
+        ensure_round(store,package_id)
     current=state(store,package_id)
     if not current['active']:return False
     with store._lock,closing(store._connect()) as c:

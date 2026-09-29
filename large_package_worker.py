@@ -532,6 +532,50 @@ class LargePackageWorker:
             LOGGER.exception("k-means finalize failed: %s", package_id)
             return False
 
+    CATALOG_REFINING_NOTE = '主题名称正在后台按证据完善'
+    CATALOG_REFINED_MESSAGE = '内容目录已完善，可选择深度摘要范围'
+
+    def _mark_catalog_refined(self, package_id):
+        """目录真的收尾后，把包消息从"正在后台完善"改成"已完善"。
+
+        `catalog_ready` 时写入的消息是固定文案"主题名称正在后台按证据完善"，
+        之后**没有任何代码**在命名结束时改回来，于是界面永远显示"正在完善"。
+        这里只在四件事同时成立时改写（纯改消息，不动 status/phase/progress）：
+          ① 命名轮次已不再 active（state() 的有效状态）；
+          ② 发布前不变量校验通过（validate_catalog 无阻断项）；
+          ③ catalog 队列没有待办（没有尚未收录进目录的文件）；
+          ④ 主题层不欠重建（叶组改名/分裂后的那一次去抖重建已经做完）。
+        只改写仍是"正在完善"文案的包，所以幂等、不会覆盖别的消息。
+        """
+        try:
+            item = self.store.get(package_id) or {}
+            if (item.get('status') != 'waiting_for_selection' or item.get('phase') != 'catalog_ready'
+                    or self.CATALOG_REFINING_NOTE not in str(item.get('message') or '')):
+                return False
+            from services.large_package_catalog_naming import state, validate_catalog
+            if (state(self.store, package_id) or {}).get('active'):
+                return False
+            # ④ 主题层没有欠账：叶组改名/分裂之后主题层要等去抖窗口再重建一次，
+            # 这期间主题名还会变 —— 不能提前宣布"已完善"（实测 lp-ba9afc71 提前了 4 分钟）。
+            if self._topic_rebuild_owed(package_id):
+                return False
+            from services.large_package_catalog_tree import stale as tree_stale
+            with closing(self.store._connect()) as conn:
+                if tree_stale(conn, package_id):
+                    return False
+            stage = self.store.stage_counts(package_id, 'catalog')
+            if any(int(stage.get(k) or 0) for k in ('queued', 'retry', 'running')):
+                return False
+            verdict = validate_catalog(self.store, package_id) or {}
+            if verdict.get('blocking'):
+                return False
+            self.store.update_package(package_id, message=self.CATALOG_REFINED_MESSAGE)
+            LOGGER.info('large package %s catalog refinement finished', package_id)
+            return True
+        except Exception:
+            LOGGER.exception('mark catalog refined failed: %s', package_id)
+            return False
+
     def _name_fallback(self, package_id):
         """给仍拿不到模型名称的叶组写一个确定性标签，保证目录不留空名。
 
@@ -1182,6 +1226,7 @@ class LargePackageWorker:
                 self.store.reconcile_recognition(package_id)
             except Exception:
                 LOGGER.exception('settle_round failed: %s', package_id)
+            self._mark_catalog_refined(package_id)
         self._naming_futures[package_id] = self._naming_executor.submit(run_slice)
         if package_id in self._naming_order:
             self._naming_order.remove(package_id)
@@ -1657,6 +1702,10 @@ class LargePackageWorker:
                     "ORDER BY updated_at DESC LIMIT 20").fetchall()
             for row in rows:
                 package_id = row["id"]
+                # 目录收尾时刻可能不在任何命名切片里（例如最后一批 catalog 队列由目录车道
+                # 做完），这里顺带补一次"已完善"判定；函数自身幂等、只改消息。
+                if row["status"] == "waiting_for_selection":
+                    self._mark_catalog_refined(package_id)
                 # Existing reports also need catch-up after async naming/splitting.
                 # The content signature gate avoids repeated writes/model calls,
                 # including deep reports which intentionally have no v1 file.
@@ -2174,10 +2223,18 @@ class LargePackageWorker:
             # name_batch 维护的，于是会出现"组状态停在 queued、其实没有任何命名任务"的
             # 包。这种包会让后台循环一直空转（实测 48 个假 queued 组把整个队列卡住，
             # 其它包的命名任务全部饿死）。legacy 的组状态路径仅在没有 jobs 表可用时兜底。
+            # **重试已耗尽的 deferred 不算待办**（与 process_one 的拾取条件
+            # `attempts<LP_NAME_MAX_ATTEMPTS` 同口径）。原来不看 attempts：一个耗尽的
+            # 任务 next_at 永远最早，于是每 2 秒都把车道派给它 → process_batch 拾不到
+            # 任何任务 → 续期轮次 → 再派给它。生产实测 lp-7132acbf 这样空转 7 个多小时，
+            # 其它包的目录队列（27 个文件）和命名任务全部饿死。
+            from config import Config as _CfgN
+            _max_att = max(1, int(getattr(_CfgN, 'LP_NAME_MAX_ATTEMPTS', 5) or 5))
             naming = conn.execute(
                 """SELECT j.package_id FROM lp_catalog_jobs j JOIN packages p ON p.id=j.package_id
-                   WHERE j.status IN ('queued','retry','deferred') AND p.status IN ('waiting_for_selection','completed')
-                   ORDER BY j.next_at, j.package_id LIMIT 1""").fetchone()
+                   WHERE (j.status IN ('queued','retry') OR (j.status='deferred' AND j.attempts<?))
+                     AND p.status IN ('waiting_for_selection','completed')
+                   ORDER BY j.next_at, j.package_id LIMIT 1""", (_max_att,)).fetchone()
         if self.stop_requested:return False
         # **主题层落后于叶组的补做。**
         #
@@ -2240,10 +2297,12 @@ class LargePackageWorker:
                     sql += "AND r.package_id NOT IN (%s) " % ','.join('?' * len(busy))
                     params.extend(busy)
                 sql += ("ORDER BY (SELECT COUNT(*) FROM lp_catalog_jobs j WHERE j.package_id=r.package_id "
-                        "          AND j.status IN ('queued','running','deferred'))>0 DESC, "
+                        "          AND (j.status IN ('queued','running') "
+                        "               OR (j.status='deferred' AND j.attempts<?)))>0 DESC, "
                         "         (SELECT COUNT(*) FROM lp_catalog_branches b "
                         "          WHERE b.package_id=r.package_id)>0 ASC, "
                         "         r.started LIMIT 1")
+                params.append(max(1, int(getattr(_CfgN, 'LP_NAME_MAX_ATTEMPTS', 5) or 5)))
                 task = conn.execute(sql, params).fetchone()
             if task:
                 return self._submit_naming(task['package_id'])
@@ -2300,9 +2359,11 @@ class LargePackageWorker:
             # 而模型命名循环正是按这个状态找任务的，于是任务全部卡在 queued、
             # 目录里一条模型标签都没有（实测 69 个 job 一直不执行）。
             from config import Config as _Cfg
+            # 下一轮让位给目录队列（有的话）。原来模型命名分支直接 return、从不置位，
+            # 于是只要还有任何命名任务，`name_first` 恒为 True，catalog 队列永远轮不到。
+            self._catalog_named_last = True
             if getattr(_Cfg, 'LP_CATALOG_MODEL_NAMING', False):
                 return self._submit_naming(package_id)
-            self._catalog_named_last = True
             return bool(name_batch(self.store, package_id, cancelled=interrupted))
         self._catalog_named_last = False
         ok = bool(embed_batch(self.store, package_id, cancelled=interrupted))

@@ -32,7 +32,10 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
     # "这个轮次已经超时/用尽"，否则它会按续期逻辑把截止时间刷新掉，截止时间失效。
     naming.settle_round(store, package_id)
     naming.queue_groups(store, package_id)
-    naming.ensure_round(store, package_id)
+    # 没有待办时不续期：否则刚结算为 completed 的轮次会被立刻复活，
+    # 界面永远显示"正在完善"（见 naming.naming_work_pending）。
+    if naming.naming_work_pending(store, package_id):
+        naming.ensure_round(store, package_id)
     current = naming.state(store, package_id)
     if not current['active']:
         return False
