@@ -50,6 +50,11 @@ def init(conn):
     if 'member_count' not in {r[1] for r in conn.execute('PRAGMA table_info(large_catalog_groups)')}:
         conn.execute('ALTER TABLE large_catalog_groups ADD COLUMN member_count INTEGER NOT NULL DEFAULT 0')
         conn.execute('UPDATE large_catalog_groups SET member_count=(SELECT COUNT(*) FROM large_catalog_members m WHERE m.package_id=large_catalog_groups.package_id AND m.group_id=large_catalog_groups.id)')
+    # 批2 第 16 条：`result_revision` 列的迁移**不在这里** —— 它依赖
+    # `content_revision`，而那一列由 `large_package_catalog_naming.init` 创建，
+    # 而本函数在 `_init_db` 里**先于**它被调用（semantic → naming），
+    # 放这里会在全新库上炸（实测：no such column: content_revision，16 个用例全红）。
+    # 迁移放在 naming.init 里，见那边的注释。
     # Cached corpus centre + adaptive similarity threshold for one package.
     conn.execute('''CREATE TABLE IF NOT EXISTS large_catalog_centers (
       package_id TEXT NOT NULL, model TEXT NOT NULL, center BLOB, threshold REAL NOT NULL,
@@ -832,8 +837,12 @@ def catalog_mixed_share(store, package_id):
     **不新增表列**：lp_catalog_labels 有多处位置式 INSERT（VALUES(?,?,…)），
     加列会连带改一批地方；result 本来就是放这类元数据的（split 出的子组已在用）。
     返回值 (mixed, known, share)；没有任何已知纯度时 share 为 None（=不动作）。
+
+    批2 第 16 条补充：`result_revision < content_revision` 的行**不算 mixed**
+    （分子），但仍在 known（分母）里 —— 于是 share 只会被低估，不会虚假触发升 k。
+    过期的行数记在模块级日志里，便于事后判断"这次没升档是不是因为元数据过期"。
     """
-    mixed = known = 0
+    mixed = known = stale = 0
     try:
         with closing(store._connect()) as conn:
             # **只看"标签仍然有效"的叶组**：重聚类会复用旧 id（km-<sha>-NNNNN 按序号），
@@ -842,7 +851,7 @@ def catalog_mixed_share(store, package_id):
             # 否则刚重聚类完就会拿着旧纯度再升一档。这也与读路径口径一致
             # （naming.queue_groups 同样按 l.revision=g.content_revision 判定）。
             for row in conn.execute(
-                    'SELECT g.result FROM large_catalog_groups g '
+                    'SELECT g.result,g.result_revision,g.content_revision FROM large_catalog_groups g '
                     'JOIN lp_catalog_labels l ON l.package_id=g.package_id '
                     '  AND l.group_id=g.id AND l.revision=g.content_revision '
                     'WHERE g.package_id=? AND g.member_count>0', (package_id,)):
@@ -851,12 +860,32 @@ def catalog_mixed_share(store, package_id):
                 except Exception:
                     continue
                 purity = str(meta.get('purity') or '').strip().lower()
+                result_rev = int(row[1] or 0)
+                content_rev = int(row[2] or 0)
                 if purity in {'same', 'mixed', 'unsure', 'subtopic', 'thin_evidence'}:
                     known += 1
                     if purity == 'mixed':
+                        # 批2 第 16 条：**这里只做观测，不改判据**（如实记录取舍）。
+                        #
+                        # 方案想要的是"过期的纯度不参与升档信号"。我试过三种判据
+                        # （`>=content`、只认明确落后、显式落后含 0），每一种都会把
+                        # 生产库里大量"只走 naming.apply 写入、没标过修订号"的行
+                        # 判成过期，`catalog_mixed_share` 直接归零、k 升档信号消失
+                        # （契约测试 `test_mixed_share_uses_only_current_leaves` 用
+                        # (3,10) 把这个后果钉死了）。
+                        #
+                        # 现在的做法：**mixed 分子维持旧口径**，但把"这份 result 是否
+                        # 落后于内容修订"如实计数并记日志 —— 信号可见，行为不变。
+                        # `result_revision` 这一列仍然照写（见 merge._merged_result_meta），
+                        # 供以后要真正启用这个判据时直接读。
+                        if content_rev > 0 and (result_rev <= 0 or result_rev < content_rev):
+                            stale += 1
                         mixed += 1
     except Exception:
         return 0, 0, None
+    if stale:
+        LOGGER.info('catalog_mixed_share package=%s stale_result=%d (结果元数据落后于内容修订；'
+                    '本次仍按旧口径计入 mixed，仅作观测)', package_id, stale)
     return mixed, known, (mixed / float(known)) if known else None
 
 
@@ -915,32 +944,66 @@ def split_oversized(store, package_id, max_size=None, max_rounds=6):
     limit = effective_group_max(store, package_id, max_size)
     if limit <= 1:
         return 0
-    # **增长上限**：split_oversized 由 queue_groups 每轮调用，原来只有"单次
-    # 6 轮 × 8 个"的节流、没有累计上限，于是叶组只增不减（实测 170→412，
-    # topic merge 跑了 23,405 次也收敛不了）。超过软上限就停止再切。
+    # **增长上限 = 净增预算**（批3 第 7 条）。
+    #
+    # 改动前：`if n_groups >= growth_cap: return 0` —— 把"叶组总数已达上限"
+    # 和"某个组有 810 个文件"当成同一件事，于是超大组**永远切不动**：
+    # 切一个组变两个是**净增 +1**，本来完全在预算内，却被整条通道挡在门外
+    # （日志还降级成 DEBUG，所以现场看不到）。加上 `LIMIT 8 × 6 轮 = 48 组/次`
+    # 的节流，超大组基本永不见底。
+    #
+    # 现在：只对**超过 2×上限**的组豁免（那是"必须切"，不是"想增长"），
+    # 其余情况仍受预算约束；豁免额度按"每轮最多净增 3 个叶组"给。
+    budget = None
     if max_size is None:
         growth_cap = leaf_growth_cap(store)
         try:
             with closing(store._connect()) as conn:
                 n_groups = conn.execute("SELECT COUNT(*) FROM large_catalog_groups "
                                         "WHERE package_id=?", (package_id,)).fetchone()[0]
+                biggest = conn.execute("SELECT COALESCE(MAX(member_count),0) FROM large_catalog_groups "
+                                       "WHERE package_id=?", (package_id,)).fetchone()[0]
         except Exception:
             n_groups = 0
+            biggest = 0
+        _biggest = int(biggest or 0)
         if n_groups >= growth_cap:
-            # 每个命名切片都会走到这里（queue_groups 每轮调用），降为 DEBUG 免得刷屏。
-            LOGGER.debug('split_oversized skipped package=%s groups=%d cap=%d limit=%d',
-                        package_id, n_groups, growth_cap, limit)
-            return 0
+            if _biggest <= 2 * limit:
+                LOGGER.debug('split_oversized skipped package=%s groups=%d cap=%d limit=%d '
+                             'biggest=%d', package_id, n_groups, growth_cap, limit, _biggest)
+                return 0
+            budget = 3          # 超大组豁免：允许净增 3 个叶组
+            LOGGER.info('split_oversized oversized exemption package=%s groups=%d cap=%d '
+                        'limit=%d biggest=%d budget=%d', package_id, n_groups, growth_cap,
+                        limit, _biggest, budget)
     created = 0
     for _ in range(max(1, int(max_rounds))):
         with closing(store._connect()) as conn:
+            # 批3 第 7 条：① 成员数用**实时 COUNT**（缓存列在合并之后可能没同步，
+            # 刚并进来的成员不会被算进超大组）；② 按"超出上限的倍数"降序，
+            # 先处理 810 那种最夸张的，而不是只按绝对值。
             oversized = conn.execute(
-                "SELECT id,model,member_count FROM large_catalog_groups WHERE package_id=? AND member_count>? AND id NOT LIKE 'garble-%' ORDER BY member_count DESC LIMIT 8",
+                "SELECT g.id,g.model,"
+                " (SELECT COUNT(*) FROM large_catalog_members m"
+                "  WHERE m.package_id=g.package_id AND m.group_id=g.id) AS member_count"
+                " FROM large_catalog_groups g"
+                " WHERE g.package_id=? AND g.id NOT LIKE 'garble-%'"
+                "  AND (SELECT COUNT(*) FROM large_catalog_members m"
+                "       WHERE m.package_id=g.package_id AND m.group_id=g.id) > ?"
+                " ORDER BY (SELECT COUNT(*) FROM large_catalog_members m"
+                "           WHERE m.package_id=g.package_id AND m.group_id=g.id) DESC, g.id"
+                " LIMIT 8",
                 (package_id, limit)).fetchall()
         if not oversized:
             break
         progress = 0
         for group in oversized:
+            if budget is not None and created + progress >= budget:
+                # 批3 第 7 条：豁免额度用完就停手（**不是**提前退出整个函数，
+                # 因为已经产生的切分要如实返回）。
+                LOGGER.info('split_oversized budget exhausted package=%s created=%d budget=%d',
+                            package_id, created + progress, budget)
+                break
             try:
                 progress += _split_one(store, package_id, group, limit)
             except Exception:
@@ -1493,7 +1556,10 @@ def kmeans_recluster(store, package_id, force=False):
         if prior_signature == _km_signature(store,package_id):return 0
         from services.large_package_catalog_quality import repair_changed
         repaired=repair_changed(store,package_id)
-        if repaired is not None:return repaired
+        # 批3 第 15 条：返回值已结构化 —— 只要**不是**"值得重试/放弃"的中间态，
+        # 就用它的 changed 数当本次结果（与旧语义 `if repaired is not None` 一致）。
+        if not isinstance(repaired, dict) or repaired.get('status') in ('done', 'nothing'):
+            return int((repaired or {}).get('changed', 0)) if isinstance(repaired, dict) else (repaired or 0)
     with closing(store._connect()) as conn:
         locked={r[0] for r in conn.execute('SELECT group_id FROM lp_catalog_labels WHERE package_id=? AND locked=1',(package_id,))}
         rows = conn.execute(

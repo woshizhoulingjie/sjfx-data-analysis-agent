@@ -168,8 +168,10 @@ class NextStageTests(unittest.TestCase):
         from services.large_package_catalog_hierarchy import visible
         from services.large_package_catalog_view import catalog_tree
         # 130 coherent leaves require more than one parent layer at the default fanout.
+        # 13 个子类分属 3 个大类（维 13/14/15），上级层来自真实的层次结构；
+        # 互不相关的子类不得被硬收进同一上级（见 test_catalog_flow_regression）。
         for i in range(130):
-            v=np.ones(16,dtype=np.float32);v[i//10]+=1.5
+            v=np.ones(16,dtype=np.float32);v[i//10]+=1.0;v[13+i//50]+=2.0
             self.add('g%03d'%i,v)
         rnd=naming.ensure_round(self.store,self.pid)
         with patch('services.large_package_catalog_topics.name_topics',side_effect=lambda _s,_p,b,*args:{k:'设备运行监测技术' for k in b}):
@@ -298,3 +300,4 @@ class NextStageTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+

@@ -11,8 +11,12 @@ from services import large_package_catalog_naming as naming
 def test_three_levels_below_old_twelve_branch_cutoff():
     case = hierarchy_fixture.NextStageTests(); case.setUp()
     try:
+        # 40 个叶组 = 2 个大类 × 2 个子类 × 10。
+        # 中间层必须来自**真实的层次结构**（同大类的两个子类共享上级），而不是把
+        # 四个互不相关的子类硬收进一个上级 —— 后者正是生产上"医学、政策、AI 被装进
+        # 同一个大主题"的缺陷（见 test_unrelated_topics_are_not_forced_under_one_parent）。
         for i in range(40):
-            v = np.ones(8, dtype=np.float32); v[i // 10] += 1.5
+            v = np.ones(8, dtype=np.float32); v[i // 10] += 1.0; v[4 + i // 20] += 2.0
             case.add('g%03d' % i, v)
         rnd = naming.ensure_round(case.store, case.pid)
         with patch('services.large_package_catalog_topics.name_topics', side_effect=lambda _s,_p,b,*a:{k:'设备运行监测技术' for k in b}):
@@ -37,6 +41,53 @@ def test_three_levels_below_old_twelve_branch_cutoff():
         assert len(found)==len(set(found))==40
         assert max(b.get('depth',0) for b in branches)==1
     finally: case.doCleanups()
+
+def test_unrelated_topics_are_not_forced_under_one_parent():
+    """回归：生产 lp-b09821d4 的 5 个主题（医学/政策/AI/气候/生物医学）被第 2 层兜底
+    收成一个覆盖全部 78 个叶组的上级。原始向量空间里无关主题余弦也 >0.65，门槛失效。
+    四个互不相关的子类必须保持四个平级主题，不得出现覆盖全部叶组的上级。"""
+    case = hierarchy_fixture.NextStageTests(); case.setUp()
+    try:
+        for i in range(40):
+            v = np.ones(8, dtype=np.float32); v[i // 10] += 1.5
+            case.add('g%03d' % i, v)
+        rnd = naming.ensure_round(case.store, case.pid)
+        with patch('services.large_package_catalog_topics.name_topics', side_effect=lambda _s,_p,b,*a:{k:'设备运行监测技术' for k in b}):
+            assert tree.build(case.store, case.pid, rnd, model_client=Mock())
+        with closing(case.store._connect()) as c:
+            branches = tree.visible(c, case.pid)
+        topics = [b for b in branches if str(b.get('node_id','')).startswith('topic:')]
+        assert topics, branches
+        assert all(len(b['children']) < 40 for b in topics), '不得出现覆盖全部叶组的上级主题'
+        assert max(b.get('depth', 0) for b in topics) == 0
+        assert sorted(len(b['children']) for b in topics if not b.get('parent_id')) == [10, 10, 10, 10]
+    finally: case.doCleanups()
+
+
+def test_group_topics_merges_only_related_topics():
+    """第 2 层合并判据的单元测试：去均值后相似的主题共享上级，其余保持平级，
+    且永不产生覆盖全部主题的上级。"""
+    rng = np.random.default_rng(0)
+    base = np.ones(16, dtype=np.float32) * 3.0
+    vectors, eligible = {}, []
+    # 两个"政策"主题共享方向 0，其余三个主题各自正交
+    dirs = [0, 0, 5, 9, 13]
+    for t, d in enumerate(dirs):
+        leaf_ids = []
+        for j in range(4):
+            v = base.copy(); v[d] += 2.0; v[(t * 3 + 1) % 16] += 0.3; v += rng.normal(0, .02, 16)
+            gid = 'L%d_%d' % (t, j); vectors[gid] = v / np.linalg.norm(v); leaf_ids.append(gid)
+        eligible.append({'group_id': 'topic:%d' % t, 'leaf_ids': leaf_ids})
+    leaf_mean = np.mean(list(vectors.values()), axis=0)
+    groups = tree._group_topics(eligible, vectors, leaf_mean, 0.5)
+    got = sorted(sorted(x['group_id'] for x in g) for g in groups.values())
+    assert got == [['topic:0', 'topic:1']]
+    # 门槛拉到 -1 也不许把 5 个主题收成 1 个上级
+    loose = tree._group_topics(eligible, vectors, leaf_mean, -1.0)
+    assert all(len(g) < len(eligible) for g in loose.values())
+    # 只有两个主题时不建上级（上级会覆盖全部）
+    assert tree._group_topics(eligible[:2], vectors, leaf_mean, 0.5) == {}
+
 
 @pytest.mark.parametrize('legacy', [False, True])
 def test_bridge_executes_ordinary_preliminary_pipeline(monkeypatch, legacy):

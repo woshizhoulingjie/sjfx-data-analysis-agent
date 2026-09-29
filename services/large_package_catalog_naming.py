@@ -73,6 +73,19 @@ def init(conn):
     columns = {r[1] for r in conn.execute('PRAGMA table_info(large_catalog_groups)')}
     if 'content_revision' not in columns:
         conn.execute('ALTER TABLE large_catalog_groups ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 1')
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(large_catalog_groups)')}
+    # 批2 第 16 条：`result` 元数据（purity/topic/representation）描述的是**写入那一刻
+    # 的成员集合**，合并/切分之后可能过期，而 `quality.repair_mixed` 与
+    # `semantic.catalog_mixed_share` 都在读它。这一列记录"判定依据的内容修订号"。
+    #
+    # **迁移必须放在这里**：`content_revision` 列由本函数创建，而
+    # `large_package_isolated._init_db` 的调用顺序是 semantic → naming，
+    # 放在 semantic.init 里会在**全新库**上炸（no such column: content_revision，
+    # 实测 16 个用例全红）。放在建列之后最稳。
+    if 'result_revision' not in columns:
+        conn.execute('ALTER TABLE large_catalog_groups ADD COLUMN result_revision INTEGER NOT NULL DEFAULT 0')
+        # 迁移：这之前没有别的写入者，result 就是命名当时写下的，与内容同代。
+        conn.execute('UPDATE large_catalog_groups SET result_revision=content_revision')
     conn.executescript('''
     CREATE TABLE IF NOT EXISTS lp_catalog_rounds(
       package_id TEXT NOT NULL, id TEXT NOT NULL, request_key TEXT NOT NULL,
@@ -429,9 +442,11 @@ def duplicate_name_groups(store, package_id):
             (package_id,)).fetchall()
     buckets = {}
     for r in rows:
-        # 规范状态名（内容主题不统一／证据不足／名称过于泛化）不是主题名：
-        # 它们天然"同名"，若参与同名归一，会把互不相关的组并成一个。
-        if is_status_name(r["name"]):
+        # 批1 第 5 条：判据统一到 `is_mergeable_name`（状态名 / 占位名 / 过短键
+        # 三个排除一次做完），与 merge.merge_identical_names 用的是同一个函数。
+        # 改动前这里只跳 `is_status_name`，于是 tree.py 生成的
+        # "内容分组（5个子目录）/（6个子目录）"在归一化后成了同名证据。
+        if not is_mergeable_name(r["name"]):
             continue
         key = _normalize_name(r["name"])
         if not key:
@@ -440,8 +455,15 @@ def duplicate_name_groups(store, package_id):
     return dict((k, v) for k, v in buckets.items() if len(v) > 1)
 
 
-def normalize_leaves(store, package_id, max_rounds=6):
+def normalize_leaves(store, package_id, max_rounds=6, cap=None):
     """叶层**唯一的收缩入口**：把同一主题内"归一化后同名"的叶子合并成一个。
+
+    批3 第 4 条：`cap` 现在是**显式参数**。改动前它在函数体内自取（只用于 `over_cap`
+    统计），而选择宿主时只看"谁成员最大"、完全不看"并进来会不会超过上限" ——
+    而 `merge.py` 的同名合并通道**有**容量检查：两条通道一把尺子两套口径，
+    生产上 810 个文件的巨型叶组就是这么来的。
+    现在：`cap` 为 None 时按原逻辑自取（`effective_group_max`，取不到退配置值），
+    传入时以调用方为准（便于单测与上层统一口径）。
 
     为什么必须有它（实测 cssj4，412 个叶子）：
       * **193 个（46.8%）** 的叶子与他人同名；
@@ -484,14 +506,19 @@ def normalize_leaves(store, package_id, max_rounds=6):
         except (ValueError, TypeError):
             continue
 
-    cap = 0
+    # 批3 第 4 条：调用方显式传入时以它为准（None 才自取）。
+    if cap is None:
+        cap = 0
     try:
         from services.large_package_semantic import effective_group_max
-        cap = int(effective_group_max(store, package_id) or 0)
+        cap = int(cap or effective_group_max(store, package_id) or 0)
     except Exception:
         cap = int(getattr(Config, 'LP_CATALOG_GROUP_MAX', 60) or 60)
 
     events = []
+    # 本轮调用内**确定并不了的**键（容量装不下全部同名组）：记下来，后面几轮不再
+    # 重复尝试，否则 max_rounds 会全部空转在同一个键上。
+    skipped_over_cap = set()
     for rnd in range(max(1, int(max_rounds))):
         dups = duplicate_name_groups(store, package_id)
         if not dups:
@@ -499,6 +526,8 @@ def normalize_leaves(store, package_id, max_rounds=6):
         stats["rounds"] = rnd + 1
         progressed = False
         for key in sorted(dups):
+            if key in skipped_over_cap:
+                continue
             by_topic = {}
             for gid in dups[key]:
                 by_topic.setdefault(topic_of.get(gid, ""), []).append(gid)
@@ -522,7 +551,46 @@ def normalize_leaves(store, package_id, max_rounds=6):
                         from services.large_package_catalog_quality import compatible_groups
                         if not compatible_groups(conn, package_id, alive):
                             conn.rollback();continue
-                        host = max(alive, key=lambda g: (sizes[g], g))
+                        # 批1 第 4 条：**host 选择必须看容量**。
+                        #
+                        # 改动前是 `max(alive, key=lambda g:(sizes[g], g))` —— 只挑
+                        # 成员最多的那个当宿主，完全不看"并进来会不会超过上限"。
+                        # 而 `cap` 在上面早就取到了，却**只用于 over_cap 统计**。
+                        # 对比 merge.py 的 `merge_identical_names` 有
+                        # `if cap>1 and running+row['member_count']>cap: continue`：
+                        # 两条合并通道，一条有容量检查、一条没有。生产上 810 个文件的
+                        # 巨型叶组就是这么来的。
+                        #
+                        # 现在的规则：**能装下全部 others 的最大组**当宿主；
+                        # 装不下就不并（本轮跳过），并让超限暴露出来（needs_review）。
+                        host = None
+                        for candidate in sorted(alive, key=lambda g: (-sizes[g], g)):
+                            others_total = sum(sizes[g] for g in alive if g != candidate)
+                            if cap <= 1 or sizes[candidate] + others_total <= cap:
+                                host = candidate
+                                break
+                        if host is None:
+                            # 没有任何宿主装得下整簇：**不合并**，但把超限如实记下来。
+                            # 交给类一第 7 条（split_oversized 的增长上限）去切，
+                            # 两条通道才不会互相抵消（docstring 第 5 条原本就写了
+                            # ">2×cap 才交给 split"，但那时容量根本没参与判断）。
+                            stats["over_cap"] += 1
+                            skipped_over_cap.add(key)
+                            conn.execute(
+                                "UPDATE lp_catalog_labels SET needs_review=1 "
+                                "WHERE package_id=? AND group_id=?",
+                                (package_id, max(alive, key=lambda g: (sizes[g], g))))
+                            conn.execute(
+                                "INSERT INTO lp_workflow_events(package_id,object,old_state,"
+                                "new_state,reason,source,created) VALUES(?,?,?,?,?,?,?)",
+                                (package_id, 'catalog.leaf', json.dumps(alive, ensure_ascii=False),
+                                 'skipped_over_cap',
+                                 json.dumps({'cap': cap, 'sizes': {g: sizes[g] for g in alive},
+                                             'note': '归一后同名叶组无宿主可容纳，留给 split_oversized'},
+                                            ensure_ascii=False),
+                                 'normalize_leaves', time.time()))
+                            conn.commit()
+                            continue
                         others = [g for g in alive if g != host]
                         # 合并前先记下各族**当前的原始名字**（下面会把 others 的标签删掉）。
                         #
@@ -796,6 +864,41 @@ def validate_catalog(store, package_id):
             "warnings": warnings, "blocking": bool(violations)}
 
 
+def _write_evidence_snapshot(conn, package_id, catalog_id, labels, branches, validation, leaves):
+    """批3 第 19 条：为刚生成的 catalog 版本写一条证据快照（幂等）。
+
+    `payload` 存的是**证据条目本身**（每个叶组的名字与它引用的证据条数），
+    而不只是一串计数 —— 这样 `evidence_id` 才有内容可指。
+    `status='available'` 与读取端的过滤口径一致；同一 catalog_id 重复写时
+    复用同一条（`evidence_id` 由 package_id+catalog_id 派生，天然幂等）。
+    """
+    try:
+        evidence_id = 'ev-' + hashlib.sha256(
+            ('evidence\0' + str(package_id) + '\0' + str(catalog_id)).encode()).hexdigest()[:20]
+        item_count = 0
+        payload = []
+        for row in labels:
+            gid, name = str(row[0]), str(row[2] or '')
+            if not name:
+                continue
+            item_count += 1
+            payload.append({'group_id': gid, 'name': name, 'revision': int(row[4] or 0)})
+        stats = json.dumps({'leaf_groups': int(leaves), 'named_groups': item_count,
+                            'topic_branches': len(branches),
+                            'violations': len(validation.get('violations') or []),
+                            'source': 'catalog-version'}, ensure_ascii=False)
+        conn.execute(
+            "INSERT INTO lp_evidence_snapshots(evidence_id,package_id,selection_id,catalog_id,"
+            "status,stats,payload,created) VALUES(?,?,'',?, 'available',?,?,?) "
+            "ON CONFLICT(evidence_id) DO UPDATE SET status='available',stats=excluded.stats,"
+            "payload=excluded.payload,catalog_id=excluded.catalog_id",
+            (evidence_id, str(package_id), str(catalog_id), stats,
+             json.dumps(payload, ensure_ascii=False), time.time()))
+    except Exception:
+        # 快照写不进去绝不能让发布失败 —— 但要留下痕迹。
+        LOGGER.exception('evidence snapshot write failed: %s/%s', package_id, catalog_id)
+
+
 def ensure_catalog_version(store, package_id, connection=None, allow_previous=True):
     """Record a content/revision-specific version using the caller's transaction."""
     from contextlib import nullcontext
@@ -841,6 +944,11 @@ def ensure_catalog_version(store, package_id, connection=None, allow_previous=Tr
                      "leaf_count,topic_count,created,published) VALUES(?,?,?,'catalog-content/2','available',?,?,?,?,?)",
                      (catalog_id, package_id, str(run[0]) if run else '',
                       json.dumps(validation, ensure_ascii=False), leaves, len(branches), time.time(), int(published)))
+        # 批3 第 19 条：**在版本生成处同步写一条证据快照。**
+        # 改动前唯一的写入者是 repair.py 的 R8（历史回填），新导入的包永远没有快照 →
+        # `reporting` 读不到 → `evidence_id=''` → 发布出来的 `view_id` 证据位是空的。
+        # 快照与 catalog 版本**同事务**写入，保证两者要么都有、要么都没有。
+        _write_evidence_snapshot(conn, package_id, catalog_id, labels, branches, validation, leaves)
         if own_transaction:
             conn.commit()
         return catalog_id
@@ -1841,6 +1949,75 @@ _GENERIC_WORD = re.compile(r'汇编|资料|条目|杂项|概览|简介|概况')
 def is_status_name(value):
     """规范状态名不是主题名：不能作为同名合并、相邻组比对或主题层的依据。"""
     return str(value or '').strip() in set(STATUS_NAMES.values())
+
+
+# ---------------------------------------------------------------------------
+# 批1 第 5 条：**"这个名字能不能当作合并依据"必须只有一个判据**
+#
+# 改动前同一个问题有三套口径，两个合并通道各用一套：
+#   · `duplicate_name_groups`（naming.py，同名归一的入口）只跳 `is_status_name`；
+#   · `merge_identical_names`（merge.py）跳 `is_status_name` + `_PLACEHOLDER_NAME`
+#     + `len(key)<4`。
+# 于是同一批叶子在"归一"通道里算同名、在"直接合并"通道里不算 —— 两条通道对
+# 同一份数据给出不同结论。最典型的是 tree.py:121 生成的兜底主题名
+# `内容分组（5个子目录）` / `内容分组（6个子目录）`：`_normalize_name` 会把括号
+# 连同数字一起抹掉，两者归一到同一个键 `内容分组`，于是"内容分组"这个**生成出来的
+# 占位名**反而成了最强的同名证据，把互不相关的组并在一起。
+#
+# 这是**生成器式占位名**（不是模型写的诊断状态名），所以单独一个正则，
+# 不要并进 `_PLACEHOLDER_NAME`（那个还用于校验模型输出，见 naming 的校验器）。
+# ---------------------------------------------------------------------------
+_PLACEHOLDER_STRUCT = re.compile(
+    r'^内容分组$|^内容分组[（(]|相关(?:目录|内容|文档|文件|条目|资料)$')
+
+
+def is_mergeable_name(name):
+    """这个**原始**名字能否作为"同义/同名"合并的依据。
+
+    三条排除，缺一不可：
+      1. 规范状态名（"证据不足（待补充内容）"×9 —— 它们同名是因为各自缺证据，
+         合并会毁掉目录）；
+      2. 诊断/占位措辞（`_PLACEHOLDER_NAME`）与生成器式占位名（`_PLACEHOLDER_STRUCT`）；
+      3. 归一化后短于 4 个字的名字（"其他""资料"这类没有信息量的键）。
+
+    **必须在归一化之前判**：`_normalize_name` 会抹掉括号与数字，
+    `内容分组（5个子目录）` 归一化后只剩 `内容分组`，那时再判就晚了。
+    """
+    raw = str(name or '').strip()
+    if not raw or is_status_name(raw):
+        return False
+    if _PLACEHOLDER_NAME.search(raw) or _PLACEHOLDER_STRUCT.search(raw):
+        return False
+    return len(_normalize_name(raw)) >= 4
+
+
+# ---------------------------------------------------------------------------
+# 批1 第 29 条：系统组（`km-other-*` / `km-pending-*`）的排除口径
+#
+# 改动前这两类系统组在 8 个文件里有 30 多处字面量 `NOT LIKE 'km-...-%'`，而且
+# 口径互相矛盾：`merge.py:296-297` 与 `tree.py:38-39` 同时排除 pending 与 other，
+# 而 `merge.py:397`（`consolidate`）只排除 other —— 暂存组于是能进合并通道。
+# 现在只有一个判据：**前缀常量 + 一个函数**，Python 侧与 SQL 侧都从它派生。
+# ---------------------------------------------------------------------------
+KM_OTHER_PREFIX = 'km-other-'
+KM_PENDING_PREFIX = 'km-pending-'
+KM_SYSTEM_PREFIXES = (KM_OTHER_PREFIX, KM_PENDING_PREFIX)
+
+
+def is_system_group(group_id):
+    """系统组（未能识别内容的桶 / 聚类前的暂存占位组）不是主题，必须排除。"""
+    value = str(group_id or '').strip()
+    if not value:
+        return True
+    return any(value.startswith(prefix) for prefix in KM_SYSTEM_PREFIXES)
+
+
+def system_group_sql(column, exclude=True):
+    """SQL 片段：`column` 不是（exclude=True）/ 是 系统组。单一来源，供各模块拼接。"""
+    op = 'NOT LIKE' if exclude else 'LIKE'
+    joiner = ' AND ' if exclude else ' OR '
+    return joiner.join("%s %s '%s%%'" % (column, op, prefix)
+                       for prefix in KM_SYSTEM_PREFIXES)
 
 
 _SUPPORT_CHARS = set('的是了和与及或在有为对以等这那之其一二三四五六七八九十'

@@ -867,6 +867,28 @@ def build_overview(store, item, milestone="catalog", note=""):
             report["report_id"] = published["report_id"]
             report["published"] = True
             if milestone == "catalog":
+                # 批1 第 23 条：**核对后不改，理由如下（如实记录）。**
+                #
+                # 方案写的是"`overview-v1.json` 永不更新（`if not snapshot.exists()`），
+                # 冻在第一次的内容"，并建议"删掉它"或"每次发布都覆盖写"。
+                # 但仓库里对这个文件有一条**显式契约**：
+                # `tests/test_overview_catalog_refresh.py::
+                #  test_catalog_change_refreshes_published_report_and_keeps_v1`
+                # 在目录改名并重新发布之后断言
+                # `(report_directory/'overview-v1.json').read_bytes() == original`
+                # —— 也就是说"第 1 版快照在第 2 版发布后**必须**逐字节不变"。
+                # 连带地，上面 `milestone != "catalog"` 分支里的
+                # `changes_since_v1 = _diff_overview(first, report)` 依赖的正是
+                # "first 永远是第一版"。若改成每次覆盖写，`changes_since_v1`
+                # 会退化成"和上一版对比"（字段名与语义不符），并直接打破该契约。
+                #
+                # 事实核查：这个文件**没有任何前端/接口消费者**
+                # （全仓 grep `overview-v1` 只有 reporting.py 自己的读/写两处 +
+                # docs/engineering-overview-catalog-consistency.md 的历史说明），
+                # 所以"前端读到第一版"这个后果不成立；页面读的是
+                # `published_report()`（按 `status='published'` 取最新正式版）。
+                #
+                # 因此第 23 条**保留原行为**，把它记为"待裁决"而不是"已改"。
                 snapshot = directory / "overview-v1.json"
                 if not snapshot.exists():
                     _atomic(snapshot, report)
@@ -876,19 +898,28 @@ def build_overview(store, item, milestone="catalog", note=""):
 
 
 def _publish_overview(store, item, report, milestone):
-    """把 report 落成不可变产物，并登记 overview 版本与发布视图指针。"""
+    """把 report 落成不可变产物，并登记 overview 版本与发布视图指针。
+
+    **批1 第 21 条：`report_id` 摘要必须含 `catalog_id`。**
+    改动前的摘要输入只有 `revision / milestone / DIRECTION_RULES_VERSION / version /
+    catalog_input_revision / partial / limitations`，**没有 catalog_id**。于是
+    "目录变了、上面这些没变"时 `report_id` 不变 →
+    `ON CONFLICT(report_id) DO UPDATE` **原地覆盖** `lp_overview_versions` 那一行
+    （连它的 catalog_id 一起改掉），而 `view_id = sha256(package_id|catalog_id|
+    report_id|evidence_id)` 却因为 catalog_id 变了而**产生新行** —— 两条链从此不一致：
+    旧 view 指向的那份产物文件已经被新内容覆盖，历史版本读出来是新版。
+    现在摘要里带上 catalog_id，`report_id → 文件名 → 内容` 与
+    `view_id → (catalog_id, report_id)` 一一对应。
+
+    代价（如实记录）：因为 digest 依赖 catalog_id，而 catalog_id 由
+    `ensure_catalog_version` 产生，所以**必须把它的调用提到算摘要之前**。它是纯读+
+    幂等插入（校验不通过时返回空串），在这个事务里先做是安全的。
+    """
     package_id = str(item["id"])
     directory = report_directory(store, package_id)
-    digest = hashlib.sha256(json.dumps(
-        [report.get("revision"), milestone, DIRECTION_RULES_VERSION, report.get("version"),
-         report.get("catalog_input_revision"), report.get("partial"),
-         (report.get("research_brief") or {}).get("limitations")],
-        ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:20]
-    report_id = "rep-" + digest
-    filename = "published-%s.json" % digest
-    catalog_id = ""
-    evidence_id = ""
     now = time.time()
+    filename = ""
+    written = False
     with store._lock, closing(store._connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         # A model call can outlive the catalog snapshot it read. Never attach
@@ -899,37 +930,152 @@ def _publish_overview(store, item, report, milestone):
             return None
         from services.large_package_catalog_naming import ensure_catalog_version
         catalog_id = ensure_catalog_version(
-            store, package_id, connection=conn, allow_previous=False) or ""
+            store, package_id, connection=conn, allow_previous=False)
+        # 批2 第 18 条：**校验不通过时不再发布。**
+        #
+        # 改动前这里是 `... allow_previous=False) or ""` —— 硬校验返回空串被 `or ""`
+        # 收下，然后照常原子写文件、插 `lp_overview_versions`、更新
+        # `packages.published_view_id`。所谓"硬校验"从未阻断过任何一次发布，
+        # 只是让发布出来的 view 带一个空 catalog_id（`view_id` 因此也算错）。
+        #
+        # 现在：catalog_id 为空 = 校验被拒（`ensure_catalog_version` 已经写了
+        # `lp_workflow_events(new_state='rejected')`）→ **回滚整个发布事务并返回 None**，
+        # 不写文件、不登记版本、不动发布指针。worker 侧据此把包标成
+        # `catalog_rejected`（见 large_package_worker._build_overview）。
+        if not catalog_id:
+            conn.rollback()
+            LOGGER.warning("overview publication BLOCKED by catalog validation: "
+                           "package=%s milestone=%s", package_id, milestone)
+            # **把拒绝事件写到回滚之外。**
+            #
+            # `ensure_catalog_version` 在 blocking 时会往 `lp_workflow_events` 写一条
+            # `rejected`，但它用的是**我们这个事务的连接** —— 我们紧接着 rollback，
+            # 那条事件跟着一起没了（实测：断言"事件表里有 rejected"拿到空列表）。
+            # 审计记录不能因为业务回滚而消失，所以在回滚之后**另起一个事务**补写。
+            try:
+                violations = []
+                try:
+                    from services.large_package_catalog_naming import validate_catalog
+                    violations = list((validate_catalog(store, package_id) or {}).get('violations') or [])
+                except Exception:
+                    violations = []
+                with store._lock, closing(store._connect()) as econn:
+                    econn.execute(
+                        "INSERT INTO lp_workflow_events(package_id,object,old_state,new_state,"
+                        "reason,source,created) VALUES(?,?,?,?,?,?,?)",
+                        (package_id, 'catalog', '', 'rejected',
+                         '发布被目录校验阻断：' + '；'.join(violations)[:300],
+                         'publish_overview', time.time()))
+                    econn.commit()
+            except Exception:
+                LOGGER.exception("rejected event write failed: %s", package_id)
+            return None
+        # 批1 第 21 条：摘要含 catalog_id。
+        # 批3 第 19 条：**按 catalog_id + status 精确取**，不再按 created 猜。
+        # 改动前是 `ORDER BY created DESC LIMIT 1`，会把别的 catalog 版本的证据
+        # 配到这一版上（`view_id` 里的 evidence 位因此可能是错的）。
         row = conn.execute("SELECT evidence_id FROM lp_evidence_snapshots WHERE package_id=? "
-                           "ORDER BY created DESC LIMIT 1", (package_id,)).fetchone()
+                           "AND catalog_id=? AND status='available' "
+                           "ORDER BY created DESC LIMIT 1", (package_id, catalog_id)).fetchone()
+        if row is None and catalog_id:
+            LOGGER.warning('no evidence snapshot for catalog version package=%s catalog=%s',
+                           package_id, catalog_id)
         evidence_id = str(row[0]) if row and row[0] else ""
-        _atomic(directory / filename, report)
-        conn.execute("INSERT INTO lp_overview_versions(report_id,package_id,milestone,catalog_id,"
-                     "evidence_id,rules_version,schema_version,status,payload,digest,created,published)"
-                     " VALUES(?,?,?,?,?,?,?,'published',?,?,?,1) "
-                     "ON CONFLICT(report_id) DO UPDATE SET status='published',published=1",
-                     (report_id, package_id, str(milestone), catalog_id, evidence_id,
-                      DIRECTION_RULES_VERSION, SCHEMA, filename, digest, now))
-        # 同一包的**旧正式版本降级为历史**，保证"当前正式版本"唯一
-        conn.execute("UPDATE lp_overview_versions SET published=0,status='superseded' "
-                     "WHERE package_id=? AND report_id<>? AND status='published'",
-                     (package_id, report_id))
-        view_id = "view-" + hashlib.sha256(
-            ("%s|%s|%s|%s" % (package_id, catalog_id, report_id, evidence_id)).encode()).hexdigest()[:20]
-        conn.execute("INSERT INTO lp_published_views(view_id,package_id,catalog_id,report_id,"
-                     "evidence_id,state_revision,created,reason) VALUES(?,?,?,?,?,?,?,?) "
-                     "ON CONFLICT(view_id) DO NOTHING",
-                     (view_id, package_id, catalog_id, report_id, evidence_id, 0, now,
-                      "milestone:" + str(milestone)))
-        conn.execute("UPDATE packages SET published_view_id=?,state_revision=COALESCE(state_revision,0)+1 "
-                     "WHERE id=?", (view_id, package_id))
-        conn.execute("INSERT INTO lp_workflow_events(package_id,object,old_state,new_state,reason,"
-                     "source,created) VALUES(?,?,?,?,?,?,?)",
-                     (package_id, "overview", "", report_id,
-                      "发布概览版本 milestone=%s schema=%s" % (milestone, SCHEMA),
-                      "build_overview", now))
-        conn.commit()
+        digest = hashlib.sha256(json.dumps(
+            [report.get("revision"), milestone, DIRECTION_RULES_VERSION, report.get("version"),
+             report.get("catalog_input_revision"), report.get("partial"),
+             (report.get("research_brief") or {}).get("limitations"), catalog_id],
+            ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:20]
+        report_id = "rep-" + digest
+        filename = "published-%s.json" % digest
+        report["catalog_id"] = catalog_id
+        report["report_id"] = report_id
+        # 批1 第 20 条：**先写文件、后提交事务，任何失败都把文件删掉。**
+        # 原来的顺序是 `_atomic(...)` → 后面一串 INSERT/UPDATE → `commit()`；
+        # 中间任何一步抛异常（磁盘、唯一约束、进程被杀）都会留下一个
+        # **没有任何版本行指向它的孤儿 `published-*.json`**。
+        # 现在整段包在 try 里，异常路径统一 `conn.rollback()` + 删文件。
+        try:
+            _atomic(directory / filename, report)
+            written = True
+            conn.execute("INSERT INTO lp_overview_versions(report_id,package_id,milestone,catalog_id,"
+                         "evidence_id,rules_version,schema_version,status,payload,digest,created,published)"
+                         " VALUES(?,?,?,?,?,?,?,'published',?,?,?,1) "
+                         "ON CONFLICT(report_id) DO UPDATE SET status='published',published=1",
+                         (report_id, package_id, str(milestone), catalog_id, evidence_id,
+                          DIRECTION_RULES_VERSION, SCHEMA, filename, digest, now))
+            # 同一包的**旧正式版本降级为历史**，保证"当前正式版本"唯一
+            conn.execute("UPDATE lp_overview_versions SET published=0,status='superseded' "
+                         "WHERE package_id=? AND report_id<>? AND status='published'",
+                         (package_id, report_id))
+            view_id = "view-" + hashlib.sha256(
+                ("%s|%s|%s|%s" % (package_id, catalog_id, report_id, evidence_id)).encode()).hexdigest()[:20]
+            conn.execute("INSERT INTO lp_published_views(view_id,package_id,catalog_id,report_id,"
+                         "evidence_id,state_revision,created,reason,superseded) VALUES(?,?,?,?,?,?,?,?,0) "
+                         "ON CONFLICT(view_id) DO UPDATE SET superseded=0",
+                         (view_id, package_id, catalog_id, report_id, evidence_id, 0, now,
+                          "milestone:" + str(milestone)))
+            # 批2 第 22 条：**旧 view 必须有 supersede 语义。**
+            #
+            # 改动前这张表**只有 INSERT**（`ON CONFLICT(view_id) DO NOTHING`，全仓
+            # 无 UPDATE/DELETE），旧 view 永远留在表里，读取端靠
+            # `ORDER BY created DESC LIMIT 1` 猜哪条是当前 —— 时钟回拨或同一秒写入
+            # 就会取错（实测 `lp_published_views` 里同包多行 `created` 完全相同）。
+            # 而 `packages.published_view_id` 明明就是正确的指针，却没人用。
+            # 现在：本次发布的 view 置 `superseded=0`，同包其余置 1。
+            conn.execute("UPDATE lp_published_views SET superseded=1 "
+                         "WHERE package_id=? AND view_id<>?", (package_id, view_id))
+            # 批1 第 24 条：**只有视图真的变了才 +1**。
+            #
+            # 改动前是无条件 `state_revision=COALESCE(state_revision,0)+1`，而上面那条
+            # INSERT 是 `ON CONFLICT(view_id) DO NOTHING` —— 视图内容完全没变的重复发布
+            # 也会把 state_revision 推高，前端按 state_revision 判缓存，于是每轮
+            # catchup（worker 每轮扫 20 个包）都被迫重取一次目录页。
+            # 现在先比指针：指针没变就不 +1。
+            previous = conn.execute("SELECT published_view_id FROM packages WHERE id=?",
+                                    (package_id,)).fetchone()
+            previous_id = str(previous[0]) if previous and previous[0] else ""
+            conn.execute("UPDATE packages SET published_view_id=? WHERE id=?", (view_id, package_id))
+            if previous_id != view_id:
+                conn.execute("UPDATE packages SET state_revision=COALESCE(state_revision,0)+1 "
+                             "WHERE id=?", (package_id,))
+            conn.execute("INSERT INTO lp_workflow_events(package_id,object,old_state,new_state,reason,"
+                         "source,created) VALUES(?,?,?,?,?,?,?)",
+                         (package_id, "overview", "", report_id,
+                          "发布概览版本 milestone=%s schema=%s catalog=%s"
+                          % (milestone, SCHEMA, catalog_id or "（校验未通过）"),
+                          "build_overview", now))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            if written:
+                try:
+                    (directory / filename).unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.exception("overview publication: orphan cleanup failed %s/%s",
+                                     package_id, filename)
+            # 批1 第 20 条（孤儿清理）：目录里凡是不被 `lp_overview_versions.payload`
+            # 引用的 `published-*.json` 都是历史失败留下的孤儿，删掉。只删这一种
+            # 文件名，`overview.json` / `overview-v1.json` / 下载产物不在此列。
+            # **异常路径也要扫**：commit 失败恰恰是最容易留下孤儿的那一次，
+            # 只在成功路径扫的话，"清理"永远等不到该清的时刻（实测如此）。
+            _sweep_orphans(directory, conn, package_id)
+            raise
+        _sweep_orphans(directory, conn, package_id)
     return {"report_id": report_id, "view_id": view_id, "filename": filename}
+
+
+def _sweep_orphans(directory, conn, package_id):
+    """删掉不被任何 `lp_overview_versions.payload` 引用的 `published-*.json`。"""
+    try:
+        published = {str(r[0]) for r in conn.execute(
+            "SELECT payload FROM lp_overview_versions WHERE package_id=?", (package_id,))}
+        for stale in directory.glob("published-*.json"):
+            if stale.name not in published:
+                stale.unlink(missing_ok=True)
+                LOGGER.info("removed orphan overview artefact %s/%s", package_id, stale.name)
+    except Exception:
+        LOGGER.exception("overview orphan sweep failed: %s", package_id)
 
 
 def published_report(store, item):

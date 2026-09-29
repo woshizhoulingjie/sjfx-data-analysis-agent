@@ -342,30 +342,59 @@ def r8_version_chain(store, apply=False):
         now = time.time()
         with closing(store._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("INSERT OR REPLACE INTO lp_catalog_versions"
-                         "(catalog_id,package_id,run_id,input_version,status,validation,"
-                         " leaf_count,topic_count,created,published) "
-                         "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                         (catalog_id, pid, run_id, "legacy-materialized/1", "available",
-                          json.dumps(validation, ensure_ascii=False),
-                          item["leaf_count"], item["topic_count"], now,
-                          1 if _scalar(conn, "SELECT COUNT(*) FROM lp_published_views WHERE package_id=?",
-                                       (pid,)) else 0))
-            conn.execute("INSERT OR REPLACE INTO lp_evidence_snapshots"
-                         "(evidence_id,package_id,selection_id,catalog_id,status,stats,created) "
-                         "VALUES(?,?,?,?,?,?,?)",
-                         (evidence_id, pid, item["selection_id"], catalog_id, "available",
-                          json.dumps({"deep_completed_files": item["deep_completed"],
-                                      "leaf_groups": item["leaf_count"],
-                                      "topic_branches": item["topic_count"],
-                                      "source": "legacy-materialized"}, ensure_ascii=False), now))
-            conn.execute("INSERT OR REPLACE INTO lp_runs"
-                         "(run_id,package_id,kind,input_version,scope_closed,status,result,"
-                         " started,finished,catalog_id,evidence_id) "
-                         "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                         (run_id, pid, "catalog", "legacy-materialized/1", 1, "completed",
-                          json.dumps({"materialized": True}, ensure_ascii=False),
-                          now, now, catalog_id, evidence_id))
+            # 批3 第 25 条：**幂等 upsert，绝不 REPLACE。**
+            #
+            # `INSERT OR REPLACE` 在唯一约束冲突时是"先 DELETE 再 INSERT"：
+            # `lp_runs` 上有 `UNIQUE(package_id, kind, input_version)`，而
+            # `input_version` 是常量 `'legacy-materialized/1'` —— 同一个包第二次跑 R8
+            # 就把旧行连 `catalog_id`/`evidence_id` 一起删掉，已发布的 view 引用随之悬空。
+            # 改成 `ON CONFLICT(...) DO UPDATE`：键与已发布引用保留，只刷新计数与时间戳。
+            previous_run = conn.execute(
+                "SELECT run_id,catalog_id,evidence_id FROM lp_runs "
+                "WHERE package_id=? AND kind='catalog' AND input_version='legacy-materialized/1'",
+                (pid,)).fetchone()
+            if previous_run is not None:
+                # 这一包已经物化过：**沿用旧的 run_id 与引用**，只刷新统计。
+                run_id = str(previous_run[0] or run_id)
+                catalog_id = str(previous_run[1] or catalog_id)
+                evidence_id = str(previous_run[2] or evidence_id)
+            conn.execute(
+                "INSERT INTO lp_catalog_versions"
+                "(catalog_id,package_id,run_id,input_version,status,validation,"
+                " leaf_count,topic_count,created,published) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(catalog_id) DO UPDATE SET "
+                "leaf_count=excluded.leaf_count,topic_count=excluded.topic_count,"
+                "validation=excluded.validation,status=excluded.status,published=excluded.published",
+                (catalog_id, pid, run_id, "legacy-materialized/1", "available",
+                 json.dumps(validation, ensure_ascii=False),
+                 item["leaf_count"], item["topic_count"], now,
+                 1 if _scalar(conn, "SELECT COUNT(*) FROM lp_published_views WHERE package_id=?",
+                              (pid,)) else 0))
+            conn.execute(
+                "INSERT INTO lp_evidence_snapshots"
+                "(evidence_id,package_id,selection_id,catalog_id,status,stats,created) "
+                "VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(evidence_id) DO UPDATE SET "
+                "selection_id=excluded.selection_id,catalog_id=excluded.catalog_id,"
+                "status=excluded.status,stats=excluded.stats,created=excluded.created",
+                (evidence_id, pid, item["selection_id"], catalog_id, "available",
+                 json.dumps({"deep_completed_files": item["deep_completed"],
+                             "leaf_groups": item["leaf_count"],
+                             "topic_branches": item["topic_count"],
+                             "source": "legacy-materialized"}, ensure_ascii=False), now))
+            conn.execute(
+                "INSERT INTO lp_runs"
+                "(run_id,package_id,kind,input_version,scope_closed,status,result,"
+                " started,finished,catalog_id,evidence_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(package_id,kind,input_version) DO UPDATE SET "
+                "scope_closed=excluded.scope_closed,status=excluded.status,result=excluded.result,"
+                "finished=excluded.finished,catalog_id=excluded.catalog_id,"
+                "evidence_id=excluded.evidence_id",
+                (run_id, pid, "catalog", "legacy-materialized/1", 1, "completed",
+                 json.dumps({"materialized": True}, ensure_ascii=False),
+                 now, now, catalog_id, evidence_id))
             conn.commit()
         written += 1
     return {"packages": written}

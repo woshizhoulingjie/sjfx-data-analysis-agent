@@ -757,10 +757,28 @@ class Config:
     # 这样不论导入 100 个还是 10 万个文件，顶层都落在可浏览的 [6, 24]。
     # 固定值在大规模下会崩：1,200 个叶组配固定 target=12/cap=20 会算出 72 个主题。
     LP_TOPIC_LEAVES_PER_TOPIC = max(3, min(100, _positive_int(os.getenv("SJFX_LP_TOPIC_LEAVES_PER_TOPIC"), 12)))
+    # 【形状常量】主题数的**下限 / 上限**。批2 第 1 条：上面那行注释描述的
+    # `clamp(叶组数/本值, 6, 24)` 在此之前**从未实现** —— `tree.py` 用的是写死的
+    # `ceil(len(X)/10)`，819 个叶组会算出 82 个顶层主题。现在这两个常量真正接线。
+    LP_TOPIC_MIN = max(2, min(50, _positive_int(os.getenv("SJFX_LP_TOPIC_MIN"), 6)))
+    LP_TOPIC_MAX = max(LP_TOPIC_MIN, min(200, _positive_int(os.getenv("SJFX_LP_TOPIC_MAX"), 24)))
+    # 【上级主题门槛】第 2 层（主题 → 上级主题）只把"去语料均值后平均余弦 >= 本值"的
+    # 主题收到同一个上级下，且绝不产生覆盖全部主题的上级。原始向量空间里无关主题的
+    # 余弦也有 0.87~0.98，门槛必须在去均值空间里判才有区分度。
+    # 实测 lp-b09821d4：两个政策主题 0.74，其余跨领域主题 <=0.26。
+    try:
+        LP_TOPIC_PARENT_MIN_SIM = max(0.0, min(0.95, float(os.getenv("SJFX_LP_TOPIC_PARENT_MIN_SIM", "0.5"))))
+    except ValueError:
+        LP_TOPIC_PARENT_MIN_SIM = 0.5
+    # 【主题聚类去均值】1=主题层与上级主题层都在去语料均值空间里分组（默认）；
+    # 0=整体回退到旧行为（原始向量 k-means + 整层兜底上级），仅用于紧急回滚。
+    LP_TOPIC_CENTERED = os.getenv("SJFX_LP_TOPIC_CENTERED", "1").strip().lower() not in {"0", "false", "off", "no"}
     # 【已废弃】主题数固定值与子组数固定上限。主题层改为按实际叶组数推导后不再读取。
     # 保留仅为兼容旧 .env，避免历史配置直接报错。
     LP_TOPIC_TARGET = max(3, min(50, _positive_int(os.getenv("SJFX_LP_TOPIC_TARGET"), 12)))
     # 主题层的下限仍然是形状常量：少于 3 个子组就不算一个主题。
+    # 批2 第 1 条把它们真正用起来：`LP_TOPIC_MIN_CHILDREN` 用于"子组数不足的主题
+    # 并入最近邻主题"，`LP_TOPIC_MAX_CHILDREN` 用于"过大的主题再切一刀"。
     LP_TOPIC_MIN_CHILDREN = max(2, min(50, _positive_int(os.getenv("SJFX_LP_TOPIC_MIN_CHILDREN"), 3)))
     LP_TOPIC_MAX_CHILDREN = max(LP_TOPIC_MIN_CHILDREN,
                                 min(200, _positive_int(os.getenv("SJFX_LP_TOPIC_MAX_CHILDREN"), 20)))

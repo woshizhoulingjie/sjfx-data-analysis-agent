@@ -471,12 +471,17 @@ class LargePackageWorker:
                         return False
                     from services.large_package_catalog_quality import repair_changed
                     repaired = repair_changed(self.store, package_id)
-                    if repaired is None:
-                        LOGGER.info("large package %s catalog change too large to repair while "
-                                    "frozen; explicit rebuild required", package_id)
+                    # 批3 第 15 条：结构化结果 —— 按 status 区分"放弃/重试"与"真的修了"，
+                    # 并把状态写进工作流事件（原来 None/0 都是假值，分不清）。
+                    status = repaired.get('status') if isinstance(repaired, dict) else 'done'
+                    changed = int(repaired.get('changed', 0)) if isinstance(repaired, dict) else int(repaired or 0)
+                    if status in ('skipped_dirty', 'retry'):
+                        LOGGER.info("large package %s repair status=%s (skipped/retry) dirty=%s",
+                                    package_id, status, (repaired or {}).get('dirty'))
                         return False
-                    LOGGER.info("large package %s repaired %s groups while frozen", package_id, repaired)
-                    return bool(repaired)
+                    LOGGER.info("large package %s repaired %s groups while frozen (status=%s)",
+                                package_id, changed, status)
+                    return bool(changed)
             # 收尾点 3/5：向唯一判定口取证（只记录，不改变本函数原有闸门 ——
             # 聚类必须等"所有有素材的文件都有向量"，那条件比 advance() 的 gates 更严）。
             try:

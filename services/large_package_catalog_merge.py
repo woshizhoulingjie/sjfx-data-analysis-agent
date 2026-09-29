@@ -31,9 +31,135 @@ def _words(text):
     return {text[i:i+2] for i in range(len(text)-1)}
 
 
-def candidates(rows, limit=24):
+# ---------------------------------------------------------------------------
+# 批1 第 9 条：**标识符判据只有一个实现，测试直接打它。**
+#
+# 抽成模块级函数而不是留在 `candidates()` 的闭包里，理由是这条判据原来既没有被
+# 单测覆盖、也没有第二处实现，改动前后都只能靠"读代码"确认 —— 这正是一个
+# "沉默地放行错误合并"的地方该有的反面。测试用同一个函数，就不会出现
+# "测试通过但生产走另一条分支"。
+# ---------------------------------------------------------------------------
+_IDENTIFIER_RE = re.compile(
+    r'(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9_-]*|(?:19|20)\d{2})(?![A-Za-z0-9])')
+
+
+def identifiers(text):
+    """名字里的显式技术标识符与年份（CNAS / ISO9001 / 2024 …）。"""
+    return set(_IDENTIFIER_RE.findall(str(text or '')))
+
+
+def _merged_scope_vector(c, package_id, group_ids):
+    """合并集合的质心（单位向量 bytes）；取不到返回 None。"""
+    marks = ','.join('?' for _ in group_ids)
+    total, center = 0, None
+    for r in c.execute('SELECT vector FROM large_catalog_members WHERE package_id=? '
+                       'AND group_id IN (' + marks + ')', [package_id] + list(group_ids)):
+        total += 1
+        v = np.frombuffer(r[0], dtype=np.float32)
+        norm = float(np.linalg.norm(v))
+        if norm > 1e-8 and np.isfinite(v).all():
+            if center is None:
+                center = v.astype(np.float64) / norm
+            elif center.shape == v.shape:
+                center += v / norm
+    if center is None:
+        return None
+    return (center / max(float(np.linalg.norm(center)), 1e-8)).astype(np.float32)
+
+
+def _policy_representation(c, package_id):
+    """只读当前 representation 策略（**不取 store._lock** —— 调用点已在事务里）。"""
+    try:
+        row = c.execute('SELECT representation FROM lp_catalog_policy WHERE package_id=?',
+                        (package_id,)).fetchone()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _merged_result_meta(c, package_id, host_id, result_revision, representation=None):
+    """批2 第 16 条：**合并后的 result 必须描述合并后的成员集合。**
+
+    改动前 `apply_merge` 只在宿主 `result` 的 JSON 里塞一个
+    `semantic_merge_revision`（`merge.py:196-199`），其余键（`purity` / `topic` /
+    `representation`）**原样保留旧宿主的**。而两处读取端都在读它：
+      · `quality.repair_mixed` 按 `json_extract(g.result,'$.purity')='mixed'` 过滤
+        —— 合并出来的混合组**永远不会被识别为 mixed**，永远轮不到被修；
+      · `semantic.catalog_mixed_share` 用它驱动 k 升级 —— 同样读过期数据。
+
+    这里回填：
+      · `topic`        = 宿主当前名字（合并后名字就是新 topic）；
+      · `representation` = 合并集合的 `lp_catalog_policy.representation`（众数即当前策略）；
+      · `purity`       = **保留宿主原有值**，不重新"造"一个。
+        理由（如实记录，这是对方案原文的一处偏离）：`purity` 是**模型给的判定**
+        （`naming.apply` 写入 `same|mixed|unsure`，见 `catalog_mixed_share` 的
+        docstring"数据来源：result 里的 purity（由 naming.apply 写入）"）。
+        几何上重算一个"纯度"再映射回模型词表，会把模型判定替换成我们的猜测，
+        而 k 升档信号恰恰依赖模型判定。折中做法是：**不伪造 purity，但把
+        "这份 result 是否已过期"显式记录下来**（`result_revision`），
+        让读取端能区分"模型说它纯"与"我们不知道"。
+    """
+    meta = {}
+    try:
+        meta = json.loads(c.execute('SELECT result FROM large_catalog_groups '
+                                    'WHERE package_id=? AND id=?', (package_id, host_id)).fetchone()[0] or '{}')
+    except Exception:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    name = c.execute('SELECT name FROM lp_catalog_labels WHERE package_id=? AND group_id=?',
+                     (package_id, host_id)).fetchone()
+    if name and str(name[0] or '').strip():
+        meta['topic'] = str(name[0]).strip()
+    if representation is None:
+        representation = _policy_representation(c, package_id)
+    if representation is not None:
+        meta['representation'] = int(representation)
+    meta['result_revision'] = int(result_revision or 0)
+    meta['semantic_merge_revision'] = int(result_revision or 0)
+    return meta
+
+
+def lexical_pair(name_a, name_b):
+    """两个名字的 2 元组词面相似度（与 `candidates` 内用的完全同一个算法）。"""
+    left, right = _words(name_a), _words(name_b)
+    return 2 * len(left & right) / max(1, len(left) + len(right))
+
+
+def identifier_penalty(name_a, name_b):
+    """标识符判据：返回 (是否硬否决, 罚分系数)。
+
+    对称不等（两个不同的标识符）→ **硬否决**：它们不可能同义。
+    单边持有（一方有、一方没有）→ **罚分**：改动前这种情况完全不加惩罚，
+    带年份/编号的组可以被并进通用主题，合并后标识符从名字里消失。
+    """
+    a, b = identifiers(name_a), identifiers(name_b)
+    if a and b and a != b:
+        return True, 0.0
+    if bool(a) != bool(b):
+        from config import Config
+        penalty = float(getattr(Config, 'LP_MERGE_IDENT_ASYMMETRY_PENALTY', 0.85) or 0.85)
+        return False, min(1.0, max(0.0, penalty))
+    return False, 1.0
+
+
+def compatible_score(name_a, name_b, similarity, scope_match):
+    """`candidates()` 用的成对判据（词面 + 向量 + 标识符）。返回 0 表示不可合并。
+
+    独立函数便于测试，语义与改动前完全一致 —— 只有标识符那一段从
+    "非对称时不惩罚" 改成 "非对称时罚分"。
+    """
+    lexical = lexical_pair(name_a, name_b)
+    if (lexical < .42 and not scope_match) or similarity < .90:
+        return 0
+    rejected, penalty = identifier_penalty(name_a, name_b)
+    if rejected:
+        return 0
+    return max(lexical, similarity if scope_match else 0) * penalty
+
+
+def candidates(rows, limit=24, max_block=0):
     rows = sorted(rows, key=lambda r: (-r['files'], r['group_id']))
-    words = [_words(r['name']) for r in rows]
     vectors = []
     for row in rows:
         v = row.get('_scope_vector')
@@ -46,28 +172,58 @@ def candidates(rows, limit=24):
         left, right = vectors[i], vectors[j]
         if left is None or right is None or left.shape != right.shape:
             return 0
-        lexical = 2*len(words[i] & words[j])/max(1, len(words[i])+len(words[j]))
         similarity = float(left @ right)
         scope_match = (rows[i].get('_scope_vector') is not None
                        and rows[j].get('_scope_vector') is not None and similarity >= .94)
-        if (lexical < .42 and not scope_match) or similarity < .90:
-            return 0
-        # Explicit technical identifiers and dates must not disappear in a merge.
-        identifiers = lambda s: set(re.findall(r'(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9_-]*|(?:19|20)\d{2})(?![A-Za-z0-9])', s))
-        a, b = identifiers(rows[i]['name']), identifiers(rows[j]['name'])
-        return 0 if a and b and a != b else max(lexical, similarity if scope_match else 0)
+        # 判据本体在模块级 `compatible_score`（批1 第 9 条：单边标识符改罚分），
+        # 这里只负责取向量/相似度。
+        return compatible_score(rows[i]['name'], rows[j]['name'], similarity, scope_match)
 
+    from config import Config
+    max_sources = max(2, int(getattr(Config, 'LP_MERGE_MAX_SOURCES', 12) or 12))
     used, result = set(), []
+    # 批1 第 10 条：**停止条件从"数量"改成"装不下 / 拉低相似度"**。
+    #
+    # 改动前写死 `len(selected) >= 6` —— 同一批同义组多于 7 个时，超出的永远留在
+    # 外面，用户看到同名叶子重复出现。数量上限本身是必要的（一次合并太多会拖长
+    # 事务、也更容易把范围不同的东西并到一起），但它不该是"6"这个拍脑袋的数，
+    # 而应当由**块容量**决定：能装下、且不拉低已选中集合的相似度下限，就继续吸。
+    #
+    # 取舍：`max_block`（块容量）由调用方传入 —— `candidates()` 是纯函数，
+    # 不持有 store，不该自己去查 `effective_group_max`；而调用方
+    # (`apply_merge`) 已经算好 `merge_size_ceiling`，本来就该用同一把尺子
+    # （见批1 第 11 条）。默认 0 = 不做容量约束（保持纯函数可测）。
     for i in range(len(rows)):
         if i in used:
             continue
         nearby = sorted(((compatible(i,j),j) for j in range(i+1,len(rows)) if j not in used), reverse=True)
         selected = [i]
-        for score,j in nearby:
-            if score <= 0 or len(selected) >= 6:
+        block_files = int(rows[i].get('files') or 0)
+        lowest = 1.0
+        for score, j in nearby:
+            if score <= 0 or len(selected) >= max_sources:
                 break
-            if all(compatible(k,j) for k in selected):
+            # `lowest` 是**本块已接受成员之间的最低成对分**（块自身的质量下限）。
+            # 候选分已经降到它之下 → 后面的都更差，停。
+            #
+            # 这里踩过一次坑（如实记录）：第一版把 `lowest` 更新成
+            # `min(lowest, min(compatible(k, j) for k in selected[:-1]))`，而
+            # `selected[:-1]` 在 `selected==[i, j]` 时是 `[i]` —— 于是"第 i 行与
+            # 第 j 行"这一对的分被算进块下限，块一旦只有 2 个成员就把自己的下限
+            # 压到自己的分上，第三行只要分数更低就永远进不来（实测一对
+            # 0.51 分的同义组直接消失）。正确做法是**只在对内新成对时**更新：
+            # 只把新成员 j 与既有的 k（不含 i 与 j）的分并进下限。
+            if lowest < 1.0 and score < lowest:
+                break
+            size = int(rows[j].get('files') or 0)
+            if max_block > 1 and block_files + size > max_block:
+                # 装不下：跳过它，但**不结束**整条候选 —— 后面可能有更小的组装得进。
+                continue
+            if all(compatible(k, j) for k in selected):
+                if len(selected) > 1:
+                    lowest = min([lowest] + [compatible(k, j) for k in selected[1:]])
                 selected.append(j)
+                block_files += size
         if len(selected) > 1:
             used.update(selected)
             result.append([rows[j] for j in selected])
@@ -193,10 +349,13 @@ def apply_merge(store, package_id, rows, result, model, cancelled=lambda:False):
             c.execute('DELETE FROM large_catalog_groups WHERE package_id=? AND id=?',(package_id,gid))
         revision = c.execute('SELECT content_revision FROM large_catalog_groups WHERE package_id=? AND id=?',(package_id,host)).fetchone()[0]
         center = (center/max(float(np.linalg.norm(center)),1e-8)).astype(np.float32)
-        metadata = json.loads(c.execute('SELECT result FROM large_catalog_groups WHERE package_id=? AND id=?',(package_id,host)).fetchone()[0] or '{}')
-        metadata['semantic_merge_revision'] = revision
-        c.execute("UPDATE large_catalog_groups SET anchor=?,member_count=?,result=?,status='named',updated_at=? WHERE package_id=? AND id=?",
-                  (center.tobytes(),total,json.dumps(metadata),time.time(),package_id,host))
+        # 批2 第 16 条：合并后回填 result（topic / representation / result_revision），
+        # 不再只塞一个 semantic_merge_revision 而把纯度过期的值留在里面。
+        metadata = _merged_result_meta(c, package_id, host, revision)
+        c.execute("UPDATE large_catalog_groups SET anchor=?,member_count=?,result=?,result_revision=?,"
+                  "status='named',updated_at=? WHERE package_id=? AND id=?",
+                  (center.tobytes(),total,json.dumps(metadata,ensure_ascii=False),int(revision or 0),
+                   time.time(),package_id,host))
         from services.large_package_semantic import _buckets
         c.execute('DELETE FROM large_catalog_buckets WHERE package_id=? AND group_id=?',(package_id,host))
         for band,bucket in enumerate(_buckets(center)):
@@ -225,15 +384,30 @@ def apply_merge(store, package_id, rows, result, model, cancelled=lambda:False):
 
 
 def merge_size_ceiling(store, package_id):
-    """同名合并允许的成员上限：比自动聚类的叶子上限更宽。
+    """同名/同义合并允许的成员上限：**永远不小于自适应叶子上限**。
 
     `effective_group_max` 的用途是"让一个真实主题留在一个叶子里"（见其 docstring），
     但实测包 48db486cf0a0：cap=102 把 6 组同名主题全部挡在门外（`联合国安理会决议文本
     及国际安全事务记录` 93+59+15=167、`全球村镇人口统计与行政区划概况` 92+78=170 …），
     只剩两组小到能塞进 102 的并掉了 —— 叶子上限反过来挡住了它自己该修的同名重复。
-    同名是"同一主题"最强的证据，所以这里放宽到
+    同名是"同一主题"最强的证据，所以这里允许放宽到
     max(叶子上限, ceil(N有向量 / LP_KM_TARGET_LEAVES × LP_CATALOG_GROUP_MERGE_RATIO))，
     同时保留上限，避免一个泛化名把整个包并成一坨。
+
+    **批1 第 11 条：把自相矛盾的分支统一掉。** 改动前是：
+
+        auto = ceil(n/target*ratio)
+        if cap > 1 and factor > 1: auto = min(auto, round(cap*factor))
+        return max(cap, auto)
+
+    两条分支下"上限"的语义不同，而且互相打架：
+      · `cap > 1`：先 `min` 到 cap×factor，再 `max(cap, ...)` —— 前面的钳制在
+        `auto < cap` 时被后面的 max 直接抬回 cap；
+      · `cap <= 1`（不限制大小）：`auto` 原样返回，完全没有相对钳制。
+    现在只有一条路径：**上限 = max(自适应 cap, 本地偏好 auto)**，
+    且本地偏好始终被 cap×factor 钳住（`LP_CATALOG_GROUP_MERGE_MAX_FACTOR`，
+    默认 3）。cap 取不到（异常）时退化为纯本地偏好，并留下异常日志 ——
+    绝不再静默吞掉。
     """
     from config import Config
     from services.large_package_semantic import effective_group_max
@@ -261,7 +435,13 @@ def merge_size_ceiling(store, package_id):
         # 级语料上 auto = N/120×4 会到几千（一个合并叶组覆盖全语料百分之几），
         # 名字必然失真——那正是本函数要防的事。
         auto = min(auto, int(round(cap * factor)))
-    return max(cap, auto)
+    ceiling = max(cap, auto)
+    if cap > 1 and ceiling < cap:
+        # 不可能发生，但"上限低于自适应 cap"是本缺陷的症状，真出现必须看得见。
+        LOGGER.warning('merge ceiling below effective cap package=%s ceiling=%d cap=%d',
+                       package_id, ceiling, cap)
+        ceiling = cap
+    return ceiling
 
 
 def merge_identical_names(store, package_id, cancelled=lambda: False):
@@ -273,9 +453,12 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
 
     安全边界：
       · **排除诊断状态名**（“证据不足（待补充内容）”×9 这类完全同名，但它们是不同组各自
-        缺证据，合并会毁掉目录）——判据用 naming.is_status_name 与 _PLACEHOLDER_NAME；
+        缺证据，合并会毁掉目录）——判据统一到 `naming.is_mergeable_name`（批1 第 5 条：
+        与 `naming.duplicate_name_groups` 用同一个函数，两条合并通道才不会再打架）；
       · 受 `merge_size_ceiling` 约束（比叶子上限宽，见该函数）：名字覆盖不了太多文件时
         宁可不并（这是既有教训：合并曾产出 810 文件的巨型叶组，名字必然失真）；
+      · 容量按**实时成员数**算，不再信 `large_catalog_groups.member_count` 这个缓存列
+        （批1 第 13 条：合并/切分之后它可能没同步，刚并进来的成员不算数）；
       · 合并后的名字标 needs_review=1（自动动作要让人看见）。
     """
     if cancelled():
@@ -288,13 +471,16 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
         if not package or package[0] in {'paused', 'cancelled'}:
             c.rollback()
             return 0
+        # 批1 第 29 条：pending / other 两类系统组用**同一个判据**排除。
+        # 改动前这里排除了两者，而 consolidate（同文件下方）只排除 km-other-：
+        # 两条合并通道对"暂存组能不能进合并"给出不同答案。
         rows = [dict(r) for r in c.execute(
             'SELECT l.group_id,l.name,l.description,g.member_count,g.content_revision '
             'FROM lp_catalog_labels l JOIN large_catalog_groups g '
             '  ON g.package_id=l.package_id AND g.id=l.group_id '
             'WHERE l.package_id=? AND l.revision=g.content_revision AND l.locked=0 '
-            "  AND g.member_count>0 AND g.id NOT LIKE 'km-other-%' "
-            "  AND g.id NOT LIKE 'km-pending-%'", (package_id,))]
+            '  AND g.member_count>0 AND ' + naming.system_group_sql('g.id'),
+            (package_id,))]
         if len(rows) < 2:
             c.rollback()
             return 0
@@ -302,29 +488,37 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
             cap = merge_size_ceiling(store, package_id)
         except Exception:
             cap = 0
+        # 批1 第 13 条：**实时成员数**。一次 GROUP BY 取全包的计数（naming.normalize_leaves
+        # 就是这么做的），后面的容量判断一律用它，不看缓存列。
+        try:
+            sizes = dict((str(r[0]), int(r[1] or 0)) for r in c.execute(
+                'SELECT group_id,COUNT(*) FROM large_catalog_members '
+                'WHERE package_id=? GROUP BY group_id', (package_id,)))
+        except Exception:
+            LOGGER.exception('identical-name merge: live sizes failed package=%s', package_id)
+            sizes = dict((str(r['group_id']), int(r['member_count'] or 0)) for r in rows)
         buckets = {}
         for row in rows:
-            name = str(row['name'] or '')
-            if naming.is_status_name(name) or naming._PLACEHOLDER_NAME.search(name):
-                continue          # 诊断状态名不是主题名，绝不能按名字合并
-            key = naming._normalize_name(name)
-            if len(key) < 4:
-                continue
+            # 批1 第 5 条：判据统一到 `is_mergeable_name`（状态名 / 占位名 / 过短键）。
+            if not naming.is_mergeable_name(row['name']):
+                continue          # 诊断状态名与生成器占位名不是主题名，绝不能按名字合并
+            key = naming._normalize_name(row['name'])
             buckets.setdefault(key, []).append(row)
         for key, items in sorted(buckets.items()):
             if len(items) < 2 or cancelled():
                 continue
-            items.sort(key=lambda r: (-r['member_count'], r['group_id']))
+            items.sort(key=lambda r: (-sizes.get(str(r['group_id']), 0), r['group_id']))
             host, keep = items[0], [items[0]]
-            running = items[0]['member_count']
+            running = sizes.get(str(host['group_id']), 0)
             for row in items[1:]:
-                if cap > 1 and running + row['member_count'] > cap:
+                size = sizes.get(str(row['group_id']), 0)
+                if cap > 1 and running + size > cap:
                     continue                 # 规模上限：宁可不并，也不产出名字必然失真的巨组
                 from services.large_package_catalog_quality import compatible_groups
                 if not compatible_groups(c, package_id, [r['group_id'] for r in keep]+[row['group_id']]):
                     continue
                 keep.append(row)
-                running += row['member_count']
+                running += size
             if len(keep) < 2:
                 continue
             host_id = host['group_id']
@@ -345,10 +539,18 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
             c.execute('DELETE FROM large_catalog_groups WHERE package_id=? AND id IN (%s)' % marks,
                       [package_id] + victims)
             anchor, representative = naming._group_geometry(c, package_id, host_id)
+            # 批2 第 16 条：合并后**必须回填 result**（见 apply_merge 的同一处说明）。
+            # `result_revision` 与 `content_revision` 对齐，读取端据此判断"这份 result
+            # 是否描述当前成员集合"。
+            result_revision = c.execute('SELECT content_revision FROM large_catalog_groups '
+                                        'WHERE package_id=? AND id=?', (package_id, host_id)).fetchone()[0]
+            result_meta = _merged_result_meta(c, package_id, host_id, result_revision)
             c.execute('UPDATE large_catalog_groups SET anchor=COALESCE(?,anchor),'
                       'representative=COALESCE(?,representative),'
+                      'result=?,result_revision=?,'
                       "status='named' WHERE package_id=? AND id=?",
-                      (anchor, representative, package_id, host_id))
+                      (anchor, representative, json.dumps(result_meta, ensure_ascii=False),
+                       int(result_revision or 0), package_id, host_id))
             if anchor:
                 from services.large_package_semantic import _buckets
                 centre = np.frombuffer(anchor, dtype=np.float32)
@@ -391,18 +593,28 @@ def consolidate(store, package_id, round_state, cancelled=lambda:False, model_cl
         # 候选**不再要求 needs_review=0**：needs_review 的意思是"这个名字要人看一眼"，
         # 不是"这个组的分组有问题"。实测它把 57% 的标签（含 6 组同名重复）挡在候选池外，
         # 于是最该合并的组永远合不了。合并后会把新标签标 needs_review=1，人工照样能看见。
+        # 批1 第 29 条：系统组判据统一 —— 改动前这里**只**排除 km-other-，
+        # 于是 km-pending- 暂存组能进模型合并车道（与 merge_identical_names /
+        # tree.py 的口径不一致）。
         rows = [dict(r) for r in c.execute('SELECT l.*,g.content_revision,g.anchor,g.member_count files FROM lp_catalog_labels l '
             'JOIN large_catalog_groups g ON g.package_id=l.package_id AND g.id=l.group_id '
             'WHERE l.package_id=? AND l.revision=g.content_revision AND l.locked=0 '
-            "AND g.member_count>0 AND g.id NOT LIKE 'km-other-%'",(package_id,))]
+            'AND g.member_count>0 AND ' + naming.system_group_sql('g.id'),(package_id,))]
         owner = c.execute('SELECT owner_id FROM packages WHERE id=?',(package_id,)).fetchone()[0]
-    rows = [r for r in rows if len(naming._normalize_name(r['name']))>=4 and json.loads(r['evidence'] or '[]')]
+    rows = [r for r in rows if naming.is_mergeable_name(r['name']) and json.loads(r['evidence'] or '[]')]
     if len(rows)>=4 and not cancelled():
         from services.large_package_catalog_topics import semantic_centroids
         scopes = semantic_centroids(store,package_id,rows,{},cancelled)
         for row in rows:
             row['_scope_vector'] = scopes.get(row['group_id'])
-    groups = candidates(rows, limit=max(24,len(rows)))
+    # 批1 第 10 条：把**块容量**交给 `candidates()`（与 apply_merge 用的是同一把
+    # 尺子 `merge_size_ceiling`）：能装下就继续吸，装不下才停。
+    try:
+        _max_block = int(merge_size_ceiling(store, package_id) or 0)
+    except Exception:
+        LOGGER.exception('merge candidates: ceiling failed package=%s', package_id)
+        _max_block = 0
+    groups = candidates(rows, limit=max(24,len(rows)), max_block=_max_block)
     if not groups or cancelled(): return 0
     model_client = model_client or naming.client()
     if not model_client: return 0

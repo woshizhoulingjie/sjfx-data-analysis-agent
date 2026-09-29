@@ -264,6 +264,8 @@ class LargePackageStore:
               catalog_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'building',
               stats TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS lp_evid_pkg ON lp_evidence_snapshots(package_id, selection_id);
+            -- 批3 第 19 条：读取端按 (package_id, catalog_id, created) 过滤，索引要跟上。
+            CREATE INDEX IF NOT EXISTS lp_evid_catalog ON lp_evidence_snapshots(package_id, catalog_id, created);
             CREATE TABLE IF NOT EXISTS lp_overview_versions(
               report_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, milestone TEXT NOT NULL DEFAULT '',
               catalog_id TEXT NOT NULL DEFAULT '', evidence_id TEXT NOT NULL DEFAULT '',
@@ -321,6 +323,19 @@ class LargePackageStore:
             conn.commit()
             from services.large_package_topics import init
             init(conn)
+            # 批3 第 19 条：证据快照要存**证据条目本身**，不只是计数。
+            if 'payload' not in {r[1] for r in conn.execute('PRAGMA table_info(lp_evidence_snapshots)')}:
+                conn.execute("ALTER TABLE lp_evidence_snapshots ADD COLUMN payload TEXT NOT NULL DEFAULT ''")
+            # 批2 第 22 条：`lp_published_views` 需要 supersede 语义（见 reporting
+            # `_publish_overview`）。列用 ALTER 迁移，历史行按 `packages.published_view_id`
+            # 把非当前行标成已废弃。
+            if 'superseded' not in {r[1] for r in conn.execute('PRAGMA table_info(lp_published_views)')}:
+                conn.execute('ALTER TABLE lp_published_views ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0')
+                conn.execute("UPDATE lp_published_views SET superseded=1 WHERE EXISTS("
+                             "SELECT 1 FROM packages p WHERE p.id=lp_published_views.package_id "
+                             "AND p.published_view_id IS NOT NULL AND p.published_view_id<>'' "
+                             "AND p.published_view_id<>lp_published_views.view_id)")
+            conn.commit()
             from services.large_package_semantic import init as init_semantic_catalog
             init_semantic_catalog(conn)
             from services.large_package_catalog_naming import init as init_naming
@@ -911,8 +926,30 @@ class LargePackageStore:
                       "ORDER BY created_at DESC LIMIT 1", (pid,))
             run = one("SELECT run_id,kind,status,scope_closed,started FROM lp_runs "
                       "WHERE package_id=? ORDER BY started DESC LIMIT 1", (pid,))
-            view = one("SELECT view_id,catalog_id,report_id,evidence_id FROM lp_published_views "
-                       "WHERE package_id=? ORDER BY created DESC LIMIT 1", (pid,))
+            # 批2 第 22 条：**"当前视图"按指针精确查，不再按 created 猜。**
+            # 改动前是 `ORDER BY created DESC LIMIT 1` —— 时钟回拨或同一秒写入
+            # （实测同包多行 created 完全相同）就会取错版本；而
+            # `packages.published_view_id` 一直都是正确的指针，只是没人用。
+            # 降级路径：指针为空（老库还没迁移到指针语义）时才退回按 created 取，
+            # 并记一条日志，避免"悄悄猜"。
+            view = None
+            pointer = str(pkg.get("published_view_id") or "")
+            if pointer:
+                view = one("SELECT view_id,catalog_id,report_id,evidence_id FROM lp_published_views "
+                           "WHERE package_id=? AND view_id=?", (pid, pointer))
+            if view is None:
+                view = one("SELECT view_id,catalog_id,report_id,evidence_id FROM lp_published_views "
+                           "WHERE package_id=? ORDER BY created DESC LIMIT 1", (pid,))
+                if view is not None:
+                    LOGGER.warning("published view pointer missing, fell back to created DESC "
+                                   "package=%s pointer=%r", pid, pointer)
+            # 批2 第 18 条：最近一次被拒绝的目录发布（比最近一次成功版本更晚才算数）。
+            # **必须在连接块内查** —— 放到块外就是 `Cannot operate on a closed database`。
+            latest_reject = one("SELECT reason,created FROM lp_workflow_events WHERE package_id=? "
+                                "AND object='catalog' AND new_state='rejected' "
+                                "ORDER BY created DESC LIMIT 1", (pid,))
+            latest_ok = one("SELECT created FROM lp_catalog_versions WHERE package_id=? "
+                            "ORDER BY created DESC LIMIT 1", (pid,))
             catv = one("SELECT catalog_id,status,validation,leaf_count,topic_count "
                        "FROM lp_catalog_versions WHERE package_id=? ORDER BY created DESC LIMIT 1",
                        (pid,))
@@ -950,6 +987,15 @@ class LargePackageStore:
                 validation = _json.loads(catv["validation"] or "{}")
             except Exception:
                 validation = {}
+        # 批2 第 18 条：把"概览发布被校验拦下"暴露成显式目录状态。
+        # **只有当这次拒绝比最近一次成功的目录版本更晚时才算数** —— 否则修好之后
+        # 状态会永远停在 rejected（历史事件不会消失）。
+        if catalog_state != 'building' and latest_reject is not None and (
+                latest_ok is None or float(latest_reject['created'] or 0) > float(latest_ok['created'] or 0)):
+            catalog_state = 'rejected'
+            validation = dict(validation or {})
+            validation.setdefault('blocked_reason', str(latest_reject['reason'] or ''))
+            validation['blocked_at'] = float(latest_reject['created'] or 0)
         allowed = {
             "pause": control == "active" and phase in self.SCHEDULABLE_PHASES
                      and status in ('queued','running','waiting_for_selection'),
@@ -1344,6 +1390,20 @@ class LargePackageStore:
                 where.append("recognition_status=? AND path NOT IN (SELECT path FROM large_catalog_members WHERE package_id=?)")
                 args.extend([node_id[7:], str(package_id)])
             else:
+                # 批1 第 27 条：**裸 group_id 命中不存在的组时，不能静默返回空列表。**
+                #
+                # 改动前这里直接拼 `path IN (SELECT ... WHERE group_id=?)` —— 组已经被
+                # 合并掉时子查询返回空集，前端显示"0 个文件"，用户以为这个目录空了；
+                # 而同一个节点走导出口（`export_selection`）却抛
+                # `ValueError("智能目录节点不存在，请刷新后重试")`。同一件事两种行为。
+                # 现在先确认组存在，不存在就抛与导出口**同款**错误（前端已按
+                # ValueError 处理成"刷新目录"提示）。
+                with closing(self._connect()) as c:
+                    known = c.execute("SELECT 1 FROM large_catalog_groups "
+                                      "WHERE package_id=? AND id=?",
+                                      (str(package_id), str(node_id))).fetchone()
+                if not known:
+                    raise ValueError("智能目录节点不存在，请刷新后重试")
                 where.append("path IN (SELECT path FROM large_catalog_members WHERE package_id=? AND group_id=?)")
                 args.extend([str(package_id), str(node_id)])
         if topic:
