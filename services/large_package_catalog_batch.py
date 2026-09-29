@@ -116,8 +116,18 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
                 difficulty=material.get('route','clear')
                 if len(pending)>=size or (batch_route is not None and difficulty!=batch_route):
                     continue
+                # 批次 3a §6.3：批量路径此前用**裸 digest** 读，与单组路径的
+                # `digest + '\0out:%d'` 不一致，两条路径的结果互相复用不了。
+                # 开关打开时按**每个组自己的** output_budget 算统一键，并保留
+                # "裸 digest 兜底一次"的行为，让老缓存继续可用。
                 with closing(store._connect()) as c:
-                    cached = c.execute('SELECT result FROM lp_catalog_cache WHERE owner_id=? AND model=? AND digest=?', (material['owner_id'],model_client.model,material['digest'])).fetchone()
+                    if naming.cache_key_unified():
+                        _budget = naming.output_budget_for(material)
+                        cached = c.execute('SELECT result FROM lp_catalog_cache WHERE owner_id=? AND model=? AND digest=?', (material['owner_id'],model_client.model,naming.cache_key(material,_budget))).fetchone()
+                        if not cached:
+                            cached = c.execute('SELECT result FROM lp_catalog_cache WHERE owner_id=? AND model=? AND digest=?', (material['owner_id'],model_client.model,naming.cache_key_legacy(material))).fetchone()
+                    else:
+                        cached = c.execute('SELECT result FROM lp_catalog_cache WHERE owner_id=? AND model=? AND digest=?', (material['owner_id'],model_client.model,material['digest'])).fetchone()
                 if cached:
                     cache_hits.append((job,material,cached))
                     continue

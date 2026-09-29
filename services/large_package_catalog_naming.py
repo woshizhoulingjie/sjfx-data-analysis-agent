@@ -116,6 +116,25 @@ def init(conn):
     CREATE TABLE IF NOT EXISTS lp_catalog_cache(
       owner_id TEXT NOT NULL, model TEXT NOT NULL, digest TEXT NOT NULL,
       result TEXT NOT NULL, PRIMARY KEY(owner_id,model,digest));
+    -- 批次 3a（方案 §6.1）：命名时的**成员指纹**。每发布一个模型名字写一行，
+    -- minhash 用 128 个哈希，大组也只有定长 1KB 左右。用途有二：
+    --   · 测量：统计 revision_changed 的组里新旧成员的估算 Jaccard 分布；
+    --   · 沿用判定：与"命名时指纹"比 Jaccard，达标就不重新命名（§6.2）。
+    CREATE TABLE IF NOT EXISTS lp_catalog_label_members(
+      package_id TEXT NOT NULL, group_id TEXT NOT NULL, revision INTEGER NOT NULL,
+      member_count INTEGER NOT NULL DEFAULT 0, minhash BLOB, named_at REAL NOT NULL,
+      PRIMARY KEY(package_id,group_id));
+    -- 重建触发源。`lp_catalog_rounds` 没有 detail 列，另建新表可以避免改动原有表结构。
+    -- trigger 取值：leaf_split / consolidate / km_finalize / recluster。
+    CREATE TABLE IF NOT EXISTS lp_catalog_rebuild_events(
+      package_id TEXT NOT NULL, trigger TEXT NOT NULL, groups_touched INTEGER NOT NULL DEFAULT 0,
+      at REAL NOT NULL);
+    -- 批次 3a §6.2 第 3 条：连续沿用次数。超过上限就强制重新命名，
+    -- 保证"每次都和最初指纹比"之外的累计漂移也不会被放过。
+    CREATE TABLE IF NOT EXISTS lp_catalog_label_inherit(
+      package_id TEXT NOT NULL, group_id TEXT NOT NULL, streak INTEGER NOT NULL DEFAULT 0,
+      updated REAL NOT NULL, PRIMARY KEY(package_id,group_id));
+    CREATE INDEX IF NOT EXISTS lp_rebuild_events_at ON lp_catalog_rebuild_events(package_id,at);
     CREATE TABLE IF NOT EXISTS lp_catalog_calls(
       id TEXT PRIMARY KEY, package_id TEXT NOT NULL, round_id TEXT NOT NULL,
       group_id TEXT NOT NULL, reserved INTEGER NOT NULL, actual INTEGER,
@@ -1215,6 +1234,8 @@ def queue_groups(store, package_id):
     而且本身是两条 set-based SQL，不随规模放大。
     """
     maintain_catalog(store, package_id)
+    # 批次 3a §6.2：在排任务**之前**先尝试沿用旧名。开关关闭时是零开销的空操作。
+    inherit_leaf_names(store, package_id)
     with closing(store._connect()) as c:
         # `km-pending-*` 是聚类完成前**暂存向量用的占位分组**，聚类收尾时会被删掉，
         # 名字再准也没有意义；它在极端情况下会以"零成员"的形态残留下来，而这样的组
@@ -1398,6 +1419,7 @@ def rebuild_catalog(store, package_id):
         n_before = c.execute('SELECT COUNT(*) FROM large_catalog_groups WHERE package_id=?',
                              (pid,)).fetchone()[0]
     changed = kmeans_recluster(store, pid, force=True)
+    record_rebuild_event(store, pid, 'recluster', n_before)
     with store._lock, closing(store._connect()) as c:
         c.execute('BEGIN IMMEDIATE')
         # 新叶组的命名任务按新分组重建；旧 group_id 的任务必须先清掉
@@ -2416,6 +2438,359 @@ FAILURE_UNKNOWN = 'unknown'
 FAILURE_RELEASED = 'released'              # 只是释放本次领取（没轮到处理），不算失败
 
 
+# ---- 批次 3a §6.3：统一缓存键 -------------------------------------------------
+def cache_key_unified():
+    """`SJFX_LP_CACHE_KEY_UNIFIED` 是否为真（默认关闭 = 旧行为逐字一致）。"""
+    return str(os.getenv('SJFX_LP_CACHE_KEY_UNIFIED', '0') or '0').strip().lower() in {
+        '1', 'true', 'yes', 'on'}
+
+
+def cache_key(material, output):
+    """缓存键：`digest + '\0out:%d'`。
+
+    单组路径与批量路径**读写都调它**，于是同一份内容在两条路径之间可以互相复用
+    （方案 §6.3 第 1 条）。`output` 是**这一组自己的**输出预算，
+    由 `services.large_package_catalog_schema.output_budget(cfg, material)` 算。
+    """
+    return str(material.get('digest') or '') + '\0out:%d' % int(output or 0)
+
+
+def cache_key_legacy(material):
+    """旧键（裸 digest）。开启统一键之后仍然用它兜一次老缓存。"""
+    return str(material.get('digest') or '')
+
+
+def output_budget_for(material):
+    """给一份 material 算它的输出预算（批量路径算统一键时要用）。
+
+    任何异常都退回 0 —— 与 `output_budget()` 内部对缺失字段的处理保持一致，
+    绝不让"算预算"这件事影响命名本身。
+    """
+    try:
+        from services.large_package_catalog_schema import output_budget
+        return output_budget(settings(), material)
+    except Exception:
+        LOGGER.exception('output_budget_for failed')
+        return 0
+
+
+# ---- 批次 3a（方案 §6.1）：成员指纹与重建事件 -------------------------------
+MINHASH_SIZE = max(32, int(os.getenv('SJFX_LP_MINHASH_SIZE', '128') or 128))
+_JACCARD_CACHE = {}
+_JACCARD_CACHE_LIMIT = 4096
+
+
+def _member_paths(store, package_id, group_id):
+    with closing(store._connect()) as c:
+        return [str(r[0]) for r in c.execute(
+            'SELECT path FROM large_catalog_members WHERE package_id=? AND group_id=?',
+            (package_id, group_id))]
+
+
+def _hash_bytes(value, seed):
+    """确定性散列：同一个 path 在任何进程、任何时刻都得到同一个 8 字节。"""
+    return hashlib.sha256(('%d\0%s' % (seed, value)).encode('utf-8')).digest()[:8]
+
+
+def minhash_bytes(paths, size=None):
+    """128 个哈希的 bottom-k 签名（定长 `size*8` 字节）。
+
+    为什么用 minhash 而不是直接存成员列表：`lp_catalog_label_members` 每行要能在
+    一个包里放上千组，成员列表会让它长成成员表的副本；minhash 是定长的，而 Jaccard
+    的估计误差与集合大小无关（标准误约 1/sqrt(128) ≈ 0.09，对 0.9 这种阈值足够）。
+
+    实现：把每个 path 先散列成一个 64 位整数，再做 `h = h*P + seed`（mod 2^64）的
+    多项式散列 —— 每个 seed 一次乘法，而不是每个 seed 一次 sha256，
+    128 × N 的签名在千级成员上也就毫秒级。
+    """
+    size = int(size or MINHASH_SIZE)
+    base = set()
+    for path in paths:
+        base.add(int.from_bytes(hashlib.sha256(str(path).encode('utf-8')).digest()[:8], 'big'))
+    if not base:
+        return b'\0' * (8 * size)
+    mask = (1 << 64) - 1
+    out = []
+    for seed in range(size):
+        low = None
+        odd = (2 * seed + 1) & mask
+        for value in base:
+            hashed = (value * odd + seed) & mask
+            if low is None or hashed < low:
+                low = hashed
+        out.append((low or 0).to_bytes(8, 'big'))
+    return b''.join(out)
+
+
+def estimate_jaccard(left, right):
+    """由两个 minhash 签名估算 Jaccard；任一为空返回 None。"""
+    if not left or not right:
+        return None
+    size = min(len(left), len(right)) // 8
+    if size <= 0:
+        return None
+    same = 0
+    for i in range(size):
+        a = left[i * 8:(i + 1) * 8]
+        b = right[i * 8:(i + 1) * 8]
+        if a == b:
+            same += 1
+    return same / float(size)
+
+
+def fingerprint_for_group(store, package_id, group_id, paths=None):
+    """取（带缓存的）成员指纹。缓存键含成员数，成员一变就自然失效。"""
+    if paths is None:
+        paths = _member_paths(store, package_id, group_id)
+    key = (str(package_id), str(group_id), len(paths))
+    cached = _JACCARD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    value = minhash_bytes(paths)
+    if len(_JACCARD_CACHE) >= _JACCARD_CACHE_LIMIT:
+        _JACCARD_CACHE.clear()
+    _JACCARD_CACHE[key] = value
+    return value
+
+
+def record_label_members(store, package_id, group_id, revision, paths=None):
+    """发布一个模型名字之后，把当时的成员指纹写一行（方案 §6.1 第 1 条）。
+
+    任何异常都只记录、不阻断命名 —— 这是纯测量设施。
+    """
+    try:
+        if paths is None:
+            paths = _member_paths(store, package_id, group_id)
+        blob = minhash_bytes(paths)
+        with store._lock, closing(store._connect()) as c:
+            c.execute('INSERT OR REPLACE INTO lp_catalog_label_members'
+                      '(package_id,group_id,revision,member_count,minhash,named_at) '
+                      'VALUES(?,?,?,?,?,?)',
+                      (package_id, group_id, int(revision or 0), len(paths), blob, time.time()))
+            c.commit()
+        _JACCARD_CACHE.pop((str(package_id), str(group_id), len(paths)), None)
+        return blob
+    except Exception:
+        LOGGER.exception('label member fingerprint write failed: %s/%s', package_id, group_id)
+        return None
+
+
+def record_rebuild_event(store, package_id, trigger, groups_touched=0):
+    """记一次"成员表被谁改了"（方案 §6.1 第 2 条）。只测量，不阻断。"""
+    try:
+        with store._lock, closing(store._connect()) as c:
+            c.execute('INSERT INTO lp_catalog_rebuild_events'
+                      '(package_id,trigger,groups_touched,at) VALUES(?,?,?,?)',
+                      (str(package_id), str(trigger), int(groups_touched or 0), time.time()))
+            c.commit()
+    except Exception:
+        LOGGER.exception('rebuild event write failed: %s/%s', package_id, trigger)
+
+
+def group_revision(store, package_id, group_id):
+    with closing(store._connect()) as c:
+        row = c.execute('SELECT content_revision FROM large_catalog_groups '
+                        'WHERE package_id=? AND id=?', (package_id, group_id)).fetchone()
+    return int(row[0]) if row else None
+
+
+# ---- 批次 3a §6.2：叶组名字继承（开关，默认关闭）-----------------------------
+def _leaf_inherit_threshold():
+    """`SJFX_LP_LEAF_NAME_INHERIT_JACCARD`，默认 0（= 关闭）。建议值 0.9。"""
+    try:
+        value = float(os.getenv('SJFX_LP_LEAF_NAME_INHERIT_JACCARD', '0') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
+def _leaf_inherit_max_drift():
+    """成员数允许的相对变化，默认 10%（方案 §6.2 第 2 条）。"""
+    try:
+        value = float(os.getenv('SJFX_LP_LEAF_NAME_INHERIT_MAX_DRIFT', '0.10') or 0.10)
+    except (TypeError, ValueError):
+        value = 0.10
+    return max(0.0, min(1.0, value))
+
+
+def _leaf_inherit_max_streak():
+    """连续沿用次数上限，默认 3（方案 §6.2 第 3 条）。"""
+    try:
+        value = int(os.getenv('SJFX_LP_LEAF_NAME_INHERIT_MAX_STREAK', '3') or 3)
+    except (TypeError, ValueError):
+        value = 3
+    return max(1, min(20, value))
+
+
+def _inherit_streak(store, package_id, group_id):
+    try:
+        with closing(store._connect()) as c:
+            row = c.execute('SELECT streak FROM lp_catalog_label_inherit '
+                            'WHERE package_id=? AND group_id=?',
+                            (package_id, group_id)).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _resolve_revisions(store, package_id, rows):
+    """把这一批组的真实修订号补上，并**完整保留**判定要用的 model/digest/locked。
+
+    为什么单独查一次而不用候选 SQL 直出修订号：那条 SQL 在**全新库**上可能因为
+    `result_revision` 列还没建而报错，补一次查询最稳，而且候选集本来就是被触发器
+    筛过的少量组。
+
+    **必须把 model 与 digest 带下去**：第一版这里只保留了 group_id / revision /
+    locked，于是 `inherit_leaf_names` 里"兜底名与人工名不沿用"那道判定读到的
+    model 恒为空串、永远为假 —— 兜底名与人工确认的名字都会被静默沿用。
+    是回归测试 test_fallback_names_are_never_inherited / 
+    test_manual_names_are_never_inherited 抓到的。
+    """
+    out = []
+    with closing(store._connect()) as c:
+        for row in rows:
+            gid = str(row['group_id'])
+            found = c.execute('SELECT content_revision FROM large_catalog_groups '
+                              'WHERE package_id=? AND id=?', (package_id, gid)).fetchone()
+            if not found:
+                continue
+            out.append({'group_id': gid, 'now_rev': int(found[0] or 0),
+                        'label_rev': int(row.get('revision') or 0),
+                        'model': str(row.get('model') or ''),
+                        'digest': str(row.get('digest') or ''),
+                        'locked': int(row.get('locked') or 0)})
+    return out
+
+
+def inherit_leaf_names(store, package_id):
+    """把"内容没怎么变、只是修订号变了"的叶组**直接沿用原名**，不排命名任务。
+
+    返回 (扫描的候选数, 真正沿用的组数)。开关关闭时立刻返回 (0, 0)。
+    """
+    threshold = _leaf_inherit_threshold()
+    if threshold <= 0:
+        return 0, 0
+    try:
+        with closing(store._connect()) as c:
+            rows = [dict(r) for r in c.execute(
+                "SELECT l.group_id,l.revision,l.model,l.digest,l.evidence,l.locked "
+                "FROM lp_catalog_labels l JOIN large_catalog_groups g "
+                "  ON g.package_id=l.package_id AND g.id=l.group_id "
+                "WHERE l.package_id=? AND l.revision!=g.content_revision AND l.locked=0",
+                (package_id,))]
+    except Exception:
+        LOGGER.exception('leaf name inheritance scan failed: %s', package_id)
+        return 0, 0
+    if not rows:
+        return 0, 0
+
+    max_drift = _leaf_inherit_max_drift()
+    max_streak = _leaf_inherit_max_streak()
+    inherited = 0
+    for row in _resolve_revisions(store, package_id, rows):
+        gid = row['group_id']
+        # 方案 §6.2 第 2 条：兜底名（deterministic / fallback-naming）与人工名不沿用。
+        model = str(row.get('model') or '')
+        digest = str(row.get('digest') or '')
+        if model in ('deterministic', 'fallback-naming', 'manual') or \
+                digest.startswith(('fallback-', 'manual-')):
+            continue
+        paths = _member_paths(store, package_id, gid)
+        if not paths:
+            continue
+        try:
+            with closing(store._connect()) as c:
+                old = c.execute('SELECT member_count,minhash FROM lp_catalog_label_members '
+                                'WHERE package_id=? AND group_id=?',
+                                (package_id, gid)).fetchone()
+        except Exception:
+            old = None
+        if not old or not old['minhash']:
+            # 没有指纹（第 1 部分上线之前命名的组）：无从判定，照旧重新命名。
+            continue
+        old_count = int(old['member_count'] or 0)
+        if old_count <= 0:
+            continue
+        if abs(len(paths) - old_count) > max(1, int(old_count * max_drift)):
+            continue
+        similarity = estimate_jaccard(old['minhash'], minhash_bytes(paths))
+        if similarity is None or similarity < threshold:
+            continue
+        streak = _inherit_streak(store, package_id, gid)
+        if streak >= max_streak:
+            # 累计漂移不再放过：强制重新命名一次（方案 §6.2 第 3 条）。
+            LOGGER.info('leaf name inheritance exhausted package=%s group=%s streak=%d',
+                        package_id, gid, streak)
+            continue
+        if _apply_inheritance(store, package_id, gid, row['now_rev'], row['label_rev'],
+                              similarity, streak):
+            inherited += 1
+    if inherited:
+        LOGGER.info('leaf name inheritance package=%s candidates=%d inherited=%d threshold=%.2f',
+                    package_id, len(rows), inherited, threshold)
+    return len(rows), inherited
+
+
+def _apply_inheritance(store, package_id, group_id, new_revision, old_revision,
+                       similarity, streak):
+    """只改标签行与继承计数：**不排命名任务**，也不动成员。
+
+    为什么要在同一个事务里再校验一次 revision：`queue_groups` 是并发调用的
+    （两条车道各自都会调），从中读出候选到写回之间内容可能又变了。
+    """
+    try:
+        with store._lock, closing(store._connect()) as c:
+            c.execute('BEGIN IMMEDIATE')
+            found = c.execute('SELECT content_revision FROM large_catalog_groups '
+                              'WHERE package_id=? AND id=?',
+                              (package_id, group_id)).fetchone()
+            if not found or int(found[0] or 0) != int(new_revision or 0):
+                c.rollback()
+                return False
+            label = c.execute('SELECT evidence FROM lp_catalog_labels '
+                              'WHERE package_id=? AND group_id=?',
+                              (package_id, group_id)).fetchone()
+            if not label:
+                c.rollback()
+                return False
+            try:
+                evidence = json.loads(label[0] or '[]')
+            except (TypeError, ValueError):
+                evidence = []
+            note = {'inherited_from_rev': int(old_revision or 0),
+                    'inherited_to_rev': int(new_revision or 0),
+                    'jaccard': round(float(similarity), 4),
+                    'streak': int(streak) + 1,
+                    'at': int(time.time())}
+            if isinstance(evidence, list):
+                # 有界：只留最近 8 条继承痕迹，避免 evidence 随继承次数无限增长。
+                evidence = ([e for e in evidence
+                             if not (isinstance(e, dict) and 'inherited_from_rev' in e)][-7:]
+                            + [note])
+            else:
+                evidence = [note]
+            c.execute('UPDATE lp_catalog_labels SET revision=?,evidence=?,updated=? '
+                      'WHERE package_id=? AND group_id=?',
+                      (int(new_revision or 0), json.dumps(evidence, ensure_ascii=False),
+                       time.time(), package_id, group_id))
+            c.execute('INSERT INTO lp_catalog_label_inherit(package_id,group_id,streak,updated) '
+                      'VALUES(?,?,?,?) ON CONFLICT(package_id,group_id) DO UPDATE SET '
+                      'streak=excluded.streak,updated=excluded.updated',
+                      (package_id, group_id, int(streak) + 1, time.time()))
+            # 这一组此刻不该再有待办任务：调用方随后会跳过它的排单。
+            c.execute("UPDATE lp_catalog_jobs SET status='completed',error='' "
+                      "WHERE package_id=? AND group_id=? AND status IN ('queued','running')",
+                      (package_id, group_id))
+            c.commit()
+        store._catalog_cache.pop(package_id, None)
+        return True
+    except Exception:
+        LOGGER.exception('leaf name inheritance failed: %s/%s', package_id, group_id)
+        return False
+
+
 # ---- 批次 2 §5.2.4：在途命名任务的租约续期 ---------------------------------
 def same_package_lanes_enabled():
     """同包多车道（以及随之必需的租约续期）是否打开。
@@ -3139,6 +3514,7 @@ def split_off_outliers(store, package_id, group_id, material, result):
         LOGGER.exception('leaf split failed: %s/%s', package_id, group_id)
         return False
     store._catalog_cache.pop(package_id, None)
+    record_rebuild_event(store, package_id, 'leaf_split', 1)
     # 记录**这次摘除是怎么处理的**（专家报告 §3 最后一条：保留预算，同时记录
     # 每次拆分被接受/拒绝的原因）。mode=holding 表示异类进了"待归并"桶而没成组。
     LOGGER.info('leaf split package=%s group=%s mode=%s n=%d -> parent=%d moved=%d check=%s '
@@ -3429,6 +3805,20 @@ def apply(store,package_id,group_id,material,result,model):
                  'model':model,'digest':material['digest'],'needs_review':int(result['needs_review']),'locked':0,'updated':time.time()}
         c.execute('INSERT OR REPLACE INTO lp_catalog_labels VALUES(:package_id,:group_id,:revision,:version,:name,:description,:evidence,:model,:digest,:needs_review,:locked,:updated)',payload)
         c.execute('INSERT INTO lp_catalog_label_history VALUES(?,?,?,?,?)',(package_id,group_id,version,json.dumps(payload,ensure_ascii=False),time.time()))
+        # 批次 3a（方案 §6.1 第 1 条）：**每发布一个模型名字就记一次当时的成员指纹**。
+        # 用同一事务里的连接写，保证"标签与指纹"要么都在、要么都不在；指纹是纯测量
+        # 设施，所以用嵌套 try 兜住，绝不让它影响命名落库。
+        try:
+            _paths = [str(r[0]) for r in c.execute(
+                'SELECT path FROM large_catalog_members WHERE package_id=? AND group_id=?',
+                (package_id, group_id))]
+            c.execute('INSERT OR REPLACE INTO lp_catalog_label_members'
+                      '(package_id,group_id,revision,member_count,minhash,named_at) '
+                      'VALUES(?,?,?,?,?,?)',
+                      (package_id, group_id, int(revision or 0), len(_paths),
+                       minhash_bytes(_paths), time.time()))
+        except Exception:
+            LOGGER.exception('fingerprint write failed: %s/%s', package_id, group_id)
         # k 自适应的反馈信号：把模型对**这一组**的纯度判定落进组的 result JSON。
         # 为什么不用新表列：`lp_catalog_labels` 有多处**位置式** INSERT（VALUES(?,?,…)），
         # 加列会连带改一批地方；result 本来就是放这类元数据的（拆分出的子组已在用）。
@@ -3642,10 +4032,18 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
         # （第一版就是这么写的，契约测试 test_cached_names_and_single_settlement 立刻抓到）。
         from services.large_package_catalog_schema import output_budget
         output=output_budget(cfg,material)
-        cache_digest=material['digest']+'\0out:%d'%int(output or 0)
+        # 批次 3a §6.3：统一走 cache_key()。默认（开关关闭）与原先逐字相同。
+        if cache_key_unified():
+            cache_digest=cache_key(material,output)
+        else:
+            cache_digest=material['digest']+'\0out:%d'%int(output or 0)
         material=dict(material,cache_digest=cache_digest)
         with closing(store._connect()) as c:
             cached=c.execute('SELECT result FROM lp_catalog_cache WHERE owner_id=? AND model=? AND digest=?',(material['owner_id'],model,cache_digest)).fetchone()
+            if not cached and cache_key_unified():
+                # 统一键未命中时用**旧的裸 digest** 再读一次：老缓存还能继续用，
+                # 否则开关一打开就等于把历史缓存全部作废（方案 §6.3 第 2 条）。
+                cached=c.execute('SELECT result FROM lp_catalog_cache WHERE owner_id=? AND model=? AND digest=?',(material['owner_id'],model,cache_key_legacy(material))).fetchone()
         if cached:
             result=validate(cached[0],material)
         else:

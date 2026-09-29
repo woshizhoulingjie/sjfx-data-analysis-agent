@@ -978,6 +978,12 @@ class LargePackageWorker:
             return True
         self._catalog_incremental(package_id)
         self._ensure_km_finalized(package_id)
+        # 批次 3a（方案 §6.1 第 2 条）：k-means 收尾会重排成员，记一次触发源。
+        try:
+            from services.large_package_catalog_naming import record_rebuild_event
+            record_rebuild_event(self.store, package_id, 'km_finalize', 0)
+        except Exception:
+            LOGGER.exception('km_finalize rebuild event failed: %s', package_id)
         if self._interrupted(package_id):
             return True
         stage = self.store.stage_counts(package_id, "recognize")
