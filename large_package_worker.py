@@ -145,10 +145,15 @@ class LargePackageWorker:
         # 关闭时 lanes=1，行为与改动前逐字一致。
         # `_naming_future` 保留为兼容属性（见 _naming_future 的 property）：老代码与
         # 两个既有测试把它当作"唯一在途的那一路"来设置和读取。
+        #
+        # 批次 2（方案 §5.2.2）起键是 `(package_id, lane)`，让同一个包可以占两路。
+        # 只要 SJFX_LP_NAMING_SAME_PACKAGE_LANES 保持默认 1，同一个包就仍然只会出现
+        # lane 0，语义与"键就是 pid"逐字等价。
         self._naming_futures = {}
         self._naming_order = []
         self._naming_orphan_future = None
         self._naming_parallel_logged = False
+        self._naming_same_package_logged = False
         # 已做过主题归并的包 → 当时的叶组签名。仅进程内有效；
         # 存签名而不是布尔值，是为了让叶组集合变化后能重算一次
         # （全局聚类可能在主题归并之后又跑了一次，把叶组从 66 个变成 69 个）。
@@ -1019,6 +1024,11 @@ class LargePackageWorker:
         return True
 
     # ---- C：有界双路命名的车道管理（文档 §3C）----------------------------
+    #
+    # 批次 2（方案 §5.2）把"一个包只能占一路"放宽为"一个包最多占
+    # SJFX_LP_NAMING_SAME_PACKAGE_LANES 路"。**默认值 1 让行为与改动前逐字一致**：
+    # 车道键仍然只会出现 lane 0，`_naming_slot_free` 的判据也退化成原来的
+    # "这个包不在途，且全局在途数小于 _naming_lanes()"。
     @property
     def _naming_future(self):
         """兼容旧接口：返回**最近提交**的那一路 future。
@@ -1028,7 +1038,7 @@ class LargePackageWorker:
         这两个既有用法都继续成立。
         """
         for pid in reversed(self._naming_order):
-            future = self._naming_futures.get(pid)
+            future = self._naming_future_for(pid)
             if future is not None:
                 return future
         return self._naming_orphan_future
@@ -1038,8 +1048,42 @@ class LargePackageWorker:
         # 旧接口写入：当作"外部塞进来的一路在途"参与占位计算。
         self._naming_orphan_future = value
 
+    @staticmethod
+    def _split_lane_key(key):
+        """车道键 -> (package_id, lane)。
+
+        批次 2 之前键是裸 package_id；这里同时接受两种形态，是为了让**外部直接
+        写 `_naming_futures[pid] = future` 的老代码/老测试**仍然被正确理解，
+        而不是被当成一个叫 `(pid, 0)` 的包。
+        """
+        if isinstance(key, tuple):
+            return str(key[0]), int(key[1])
+        return str(key), 0
+
+    def _live_lanes(self):
+        """[(package_id, lane, future)] —— 只看未完成的在途车道。"""
+        out = []
+        for key, future in self._naming_futures.items():
+            if future is None or future.done():
+                continue
+            pid, lane = self._split_lane_key(key)
+            out.append((pid, lane, future))
+        return out
+
+    def _naming_future_for(self, package_id):
+        """这个包**最近提交**的那一路 future（兼容单路语义时就是唯一那一路）。"""
+        found = None
+        for key in self._naming_futures:
+            pid, _lane = self._split_lane_key(key)
+            if pid == str(package_id):
+                found = self._naming_futures[key]
+        return found
+
+    def _package_lanes_inflight(self, package_id):
+        return sum(1 for pid, _lane, _f in self._live_lanes() if pid == str(package_id))
+
     def _naming_lanes(self):
-        """本次允许的在途命名路数。两个约束取小，并在夹紧时只记一次日志。
+        """本次允许的**全局**在途命名路数。两个约束取小，并在夹紧时只记一次日志。
 
         ① `SJFX_LP_NAMING_PARALLEL`（默认关）——不开就只有 1 路；
         ② 准入闸门的后台名额 `max(1, SJFX_GENERATION_CONCURRENCY - 1)`。闸门跨进程
@@ -1072,50 +1116,167 @@ class LargePackageWorker:
                         '(SJFX_LP_NAMING_PARALLEL=on)', wanted, gate, lanes)
         return lanes
 
+    def _same_package_lanes(self):
+        """同一个包最多允许的在途车道数（方案 §5.2.1）。
+
+        `SJFX_LP_NAMING_SAME_PACKAGE_LANES` 默认 1 = 旧行为：同一个包不得占两路。
+        总车道开关没打开时恒为 1 —— 否则会变成"一个包独占两路"，把别的包饿死，
+        而这不是批次 2 想要的（方案要的是**同包并行**与**多包并行**都受
+        闸门名额约束）。
+        """
+        if self._naming_lanes() <= 1:
+            return 1
+        raw = str(os.getenv('SJFX_LP_NAMING_SAME_PACKAGE_LANES', '1') or '1').strip()
+        try:
+            value = int(raw or 1)
+        except (TypeError, ValueError):
+            value = 1
+        value = max(1, min(4, value))
+        if value > 1 and not self._naming_same_package_logged:
+            self._naming_same_package_logged = True
+            LOGGER.info('naming same-package lanes: %d (SJFX_LP_NAMING_SAME_PACKAGE_LANES)', value)
+        return value
+
+    def _free_lane(self, package_id):
+        """这个包还能起的下一个车道号；没有空位返回 None。
+
+        判据有两层，缺一不可：
+          · 本包在途车道数 < `_same_package_lanes()`；
+          · 全局在途车道数（含旧接口塞进来的那一路）< `_naming_lanes()`。
+        第二层是原来就有的；第一层是批次 2 新加的，默认值 1 时与"包 id 不得重复"
+        完全等价。
+        """
+        live = self._live_lanes()
+        used = {lane for pid, lane, _f in live if pid == str(package_id)}
+        if len(used) >= self._same_package_lanes():
+            return None
+        extra = 1 if (self._naming_orphan_future is not None
+                      and not self._naming_orphan_future.done()) else 0
+        if len(live) + extra >= self._naming_lanes():
+            return None
+        lane = 0
+        while lane in used:
+            lane += 1
+        return lane
+
     def _naming_inflight(self):
         """在途（未完成）的命名包 id 列表。调度器据此避开已经占着车道的包。"""
-        return [pid for pid, future in self._naming_futures.items() if not future.done()]
+        seen = []
+        for pid, _lane, _f in self._live_lanes():
+            if pid not in seen:
+                seen.append(pid)
+        return seen
 
     def _naming_slot_free(self, package_id):
         """还能不能再起一路（给这个包）。"""
-        if package_id in self._naming_inflight():
-            return False
-        extra = 1 if (self._naming_orphan_future is not None
-                      and not self._naming_orphan_future.done()) else 0
-        return len(self._naming_inflight()) + extra < self._naming_lanes()
+        return self._free_lane(package_id) is not None
 
     def _reap_naming(self):
         """回收已结束的 future，并把异常如实记下来（旧实现只对"上一路"做这件事）。"""
-        for pid in list(self._naming_order):
-            future = self._naming_futures.get(pid)
+        for key in list(self._naming_futures):
+            future = self._naming_futures.get(key)
             if future is None or not future.done():
                 continue
             try:
                 future.result()
             except Exception:
                 LOGGER.exception('catalog naming task failed')
-            self._naming_futures.pop(pid, None)
-            try:
+            self._naming_futures.pop(key, None)
+            pid, _lane = self._split_lane_key(key)
+            # 只有这个包**所有**车道都收干净了才从轮转顺序里摘掉：双车道下
+            # 先结束的那一路不该让这个包失去"最近提交"的位置。
+            if not self._package_lanes_inflight(pid) and pid in self._naming_order:
                 self._naming_order.remove(pid)
-            except ValueError:
-                pass
+
+    # ---- 批次 2 §5.2.4：在途命名任务的租约续期 ---------------------------
+    def _renew_naming_lease(self, package_id, group_id):
+        """把这一次调用的租约往后推，返回是否确实还是本次领取的那一行。
+
+        为什么必须做（方案 §5.2.4）：`leased` 是在**排闸门之前**写下的，而闸门等待
+        上限最长 300 秒、一次批量调用本身约 24 秒，合计可能超过 120 秒的回收阈值。
+        两条车道都会执行 `UPDATE ... SET status='queued' WHERE status='running'
+        AND leased<now-120`（batch.py §阶段1 与 naming.process_one 的同一段），
+        于是**正在跑的任务会被另一条车道抢回队列**，同一个组被命名两次。
+
+        只在开关打开时调用（方案 §5.2.4 的选项一：每 30 秒续一次）；默认关闭时
+        一行都不会执行，旧行为逐字保留。
+        """
+        now = time.time()
+        try:
+            with self.store._lock, closing(self.store._connect()) as c:
+                cur = c.execute(
+                    "UPDATE lp_catalog_jobs SET leased=? WHERE package_id=? AND group_id=? "
+                    "AND status='running'", (now, package_id, group_id))
+                c.commit()
+                return cur.rowcount == 1
+        except Exception:
+            LOGGER.exception('naming lease renewal failed: %s/%s', package_id, group_id)
+            return True
+
+    def _naming_lease_guard(self, package_id, group_id, stop=None):
+        """`background_generation` 期间每 30 秒续一次租约的上下文管理器。
+
+        续期线程是守护线程，随上下文退出而结束。它**只写 leased 一列**，不动
+        status/attempts/next_at，因此不会与 release_job / apply 的收口逻辑打架。
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def guard():
+            if self._same_package_lanes() <= 1:
+                # 默认（同包单车道）：完全维持改动前的行为，不装心跳线程。
+                yield
+                return
+            stopped = threading.Event()
+
+            def heartbeat():
+                while not stopped.wait(30.0):
+                    if stop is not None:
+                        try:
+                            if stop():
+                                return
+                        except Exception:
+                            return
+                    if not self._renew_naming_lease(package_id, group_id):
+                        return
+
+            thread = threading.Thread(target=heartbeat, daemon=True)
+            thread.start()
+            try:
+                yield
+            finally:
+                stopped.set()
+                thread.join(timeout=0.5)
+
+        return guard()
 
     def _submit_naming(self, package_id):
         from services.large_package_catalog_batch import process_batch
         self._reap_naming()
-        if not self._naming_slot_free(package_id):
+        lane = self._free_lane(package_id)
+        if lane is None:
             return False
         if self._naming_executor is None:
             # executor 的线程数按**实际允许的路数**开。原来固定开
             # `naming_concurrency()`（默认 2）个线程，但闸门只放 1 路时第二个线程
             # 永远闲置 —— 而且"配了 2 个 worker"会被误读成"两路在途"。
             from services.large_package_catalog_naming import naming_concurrency
+            # 线程数要够"全局车道"用。同包双车道下两条在途可能是同一个包，
+            # 所以这里的宽度只看全局车道数，不看包数。
             self._naming_executor = ThreadPoolExecutor(
                 max_workers=max(1, min(self._naming_lanes(), naming_concurrency())))
         def interrupted():
             item = self.store.get(package_id)
             return self.stop_requested or not item or item['status'] not in {'waiting_for_selection', 'completed'}
-        def run_slice():
+        def run_lane():
+            """一条命名车道。lane 0 兼做收尾，lane>=1 只跑 process_batch。
+
+            **这是批次 2 的核心（方案 §5.2.3）**：排空队列之后的收尾工作
+            （兜底命名、主题归并、定稿、情报概览、轮次结算）会读写
+            `_topics_merged` / `_catalog_settled` / `_overview_state` 等**进程内
+            字典**，并发执行不安全，所以只能由一条车道做。lane 0 的代码路径与
+            改动前逐字相同；lane>=1 排空或超时后直接返回，不碰任何共享状态。
+            """
             # Continue ready batches without a poll sleep after every group;
             # bound package occupancy so other packages can get a turn.
             # W-2a：单个命名切片 30s → 120s。
@@ -1132,6 +1293,9 @@ class LargePackageWorker:
                 if not progressed:
                     drained = True
                     break
+            if lane != 0:
+                # lane>=1 的职责到此为止：不做兜底、不归并主题、不定稿、不出概览。
+                return
             if interrupted():
                 return
             # 兜底命名只在**确实排空**后才做：否则会抢在模型命名之前，
@@ -1230,7 +1394,7 @@ class LargePackageWorker:
             except Exception:
                 LOGGER.exception('settle_round failed: %s', package_id)
             self._mark_catalog_refined(package_id)
-        self._naming_futures[package_id] = self._naming_executor.submit(run_slice)
+        self._naming_futures[(package_id, lane)] = self._naming_executor.submit(run_lane)
         if package_id in self._naming_order:
             self._naming_order.remove(package_id)
         self._naming_order.append(package_id)

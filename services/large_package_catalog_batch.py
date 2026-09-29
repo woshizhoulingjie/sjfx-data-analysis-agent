@@ -237,7 +237,8 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
             prefetch_evidence(store, package_id,
                               [job['group_id'] for job in candidates if job['group_id'] not in claimed_ids],
                               stop, getattr(Config, 'LP_EVIDENCE_PREFETCH_GROUPS', 4))
-        with background_generation(stop):
+        with background_generation(stop), naming.lease_renewal(
+                store, package_id, [job['group_id'] for job in claimed], stop):
             response=model_client.chat(BATCH_SYSTEM,user,**kwargs)
         if response.get('finish_reason')=='length':
             raise ValueError('批量目录命名输出被截断，改为逐组重试')
@@ -295,6 +296,8 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
                                detail={'mode':'batch','published':published,'failed':failed,
                                        'reserved_groups':len(pending),
                                        'finish_reason':response.get('finish_reason'),
+                                       # 批次 1 测量补点：同一口径，见 naming.process_one。
+                                       'output_chars':len(response.get('content') or ''),
                                        'cache_miss':{gid: miss_reasons[gid] for gid in
                                                      (j['group_id'] for j,_m,_k in pending)
                                                      if gid in miss_reasons}})

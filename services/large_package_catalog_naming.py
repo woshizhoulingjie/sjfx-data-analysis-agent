@@ -2416,6 +2416,99 @@ FAILURE_UNKNOWN = 'unknown'
 FAILURE_RELEASED = 'released'              # 只是释放本次领取（没轮到处理），不算失败
 
 
+# ---- 批次 2 §5.2.4：在途命名任务的租约续期 ---------------------------------
+def same_package_lanes_enabled():
+    """同包多车道（以及随之必需的租约续期）是否打开。
+
+    与 `large_package_worker.LargePackageWorker._same_package_lanes()` 用**同一个
+    环境变量**。这里只判断"是否 >1"，不判断全局车道数 —— 续期只在"同一个包真的能
+    同时占两路"时才需要，而那个前提由 worker 侧的 SJFX_LP_NAMING_PARALLEL 与闸门
+    名额共同决定。
+
+    默认关闭：`SJFX_LP_NAMING_SAME_PACKAGE_LANES` 不设或为 1 时返回 False，
+    于是本模块**不装任何心跳线程**，行为与改动前逐字一致。
+    """
+    raw = str(os.getenv('SJFX_LP_NAMING_SAME_PACKAGE_LANES', '1') or '1').strip()
+    try:
+        return int(raw or 1) > 1
+    except (TypeError, ValueError):
+        return False
+
+
+def lease_renewal(store, package_id, group_ids, stop=None, interval=30.0):
+    """`background_generation` 期间每 `interval` 秒把**本次领取**的租约往后推一次。
+
+    `group_ids` 是本次调用真正领取到的组（单组路径一个 id，批量路径一批）。
+    只写 `lp_catalog_jobs.leased` 一列，且带 `status='running'` 保护：任务一旦被
+    发布（completed）或被 release_job 放回队列，续期就不会再碰它 —— 绝不会把
+    别人的任务重新"认领"回来。
+
+    `stop` 支持两种形态（调用方两种都在用，第一版只认第一种，结果是心跳每跳一次就
+    被 `TypeError: 'Event' object is not callable` 静默掐断 —— 实测抓到的正是这个）：
+      · 可调用对象（函数/闭包）：每次心跳调一次，返回真值就停止；
+      · `threading.Event` / 任何有 `is_set()` 的对象：`is_set()` 为真就停止。
+
+    关闭时返回一个什么都不做的上下文管理器（零开销、零线程）。
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def noop():
+        yield
+
+    if not same_package_lanes_enabled():
+        return noop()
+    wanted = [str(g) for g in (group_ids if isinstance(group_ids, (list, tuple, set))
+                               else [group_ids]) if g]
+    if not wanted:
+        return noop()
+
+    def cancelled():
+        """本次调用是否已经该收手。两种 stop 形态统一到这里。"""
+        if stop is None:
+            return False
+        is_set = getattr(stop, 'is_set', None)
+        if callable(is_set):
+            return bool(is_set())
+        return bool(stop())
+
+    @contextmanager
+    def guard():
+        import threading
+
+        stopped = threading.Event()
+        placeholders = ','.join('?' * len(wanted))
+
+        def beat():
+            while not stopped.wait(float(interval)):
+                try:
+                    if cancelled():
+                        return
+                except Exception:
+                    # 判据本身出错不该让续期线程静默死掉：按"继续续期"处理更安全，
+                    # 因为续期多做一次只是写一列，漏做则会让任务被另一条车道抢回。
+                    LOGGER.exception('naming lease renewal stop-check failed: %s', package_id)
+                try:
+                    with store._lock, closing(store._connect()) as c:
+                        c.execute(
+                            "UPDATE lp_catalog_jobs SET leased=? WHERE package_id=? "
+                            "AND status='running' AND group_id IN (%s)" % placeholders,
+                            tuple([time.time(), package_id] + wanted))
+                        c.commit()
+                except Exception:
+                    LOGGER.exception('naming lease renewal failed: %s', package_id)
+
+        thread = threading.Thread(target=beat, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            thread.join(timeout=0.5)
+
+    return guard()
+
+
 def classify_failure(exc):
     """把异常归到统一类别。批次、单组、主题命名、合并校验共用这一份判据。"""
     if _is_infrastructure_error(exc):
@@ -3561,7 +3654,7 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
             _miss=cache_miss_reason(store,package_id,gid,material['digest'],model)
             call_id=reserve(store,package_id,current['id'],gid,material['tokens']+output)
             if not call_id:raise ValueError('本轮命名预算已用尽')
-            with background_generation(stop):
+            with background_generation(stop), lease_renewal(store, package_id, [gid], stop):
                 kwargs={'temperature':.1,'max_tokens':output,'retries':0,'timeout':min(cfg['timeout'],max(1,int(current['deadline']-time.time())))}
                 if getattr(model_client,'supports_json_response_format',False):
                     from services.large_package_catalog_schema import response as schema_response
@@ -3590,6 +3683,9 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
                                 'failed':([] if status=='completed'
                                           else [{'group':gid,'category':_category if status=='failed' else FAILURE_STALE}]),
                                 'finish_reason':response.get('finish_reason'),
+                                # 批次 1 测量补点：响应字符数。线上 vLLM 不返回 usage，
+                                # 只有这个口径能横向比"输出体积降了多少"（方案 §4/§7 的验收指标）。
+                                'output_chars':len(response.get('content') or ''),
                                 'cache_miss':{gid:_miss} if _miss else {}})
             if _infra:
                 refund_call(store,call_id)          # 没调成的那次不该占额度
