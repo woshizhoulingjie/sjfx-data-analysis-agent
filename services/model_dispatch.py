@@ -209,6 +209,51 @@ def _concurrency_limit():
     return max(1, min(8, value))
 
 
+def _borrow_idle_seconds():
+    """方案 §5.1 方案 B：`SJFX_GENERATION_BG_BORROW_IDLE_SECONDS`，默认 0 = 关闭。
+
+    打开后（例如 120），若最近这么多秒内闸门上**没有出现过前台请求**
+    （priority≥100，无论在等还是在跑），后台就可以用满 N 个名额，而不是 N-1 个。
+    只在拿不到 vLLM 重启窗口、又想先让命名两路并发时才用：它不需要改
+    `--max-num-seqs`，也不需要重启 app.py。
+
+    代价（必须知情）：前台请求到来时如果两个名额都被后台占着，它会排在闸门最前面，
+    但要等其中一个后台请求结束（单组约 7 秒，批量约 24 秒）才能进场。
+    后台一旦在闸门上看见前台请求，就立即退回 N-1，不会再借。
+    """
+    try:
+        value = float(os.getenv('SJFX_GENERATION_BG_BORROW_IDLE_SECONDS', '0') or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    return max(0.0, min(3600.0, value))
+
+
+def _background_limit(c, endpoint, slot_limit):
+    """后台此刻可用的名额数。必须在 `_claim` 的同一个事务里调用。
+
+    默认（借用关闭）恒为 `max(1, N-1)`，与改动前逐字一致，而且一条 SQL 都不多执行。
+    借用打开时：闸门上只要还有前台票（在等或在跑）就不借；否则看最近一次
+    "看见前台"的时刻，距今超过空闲阈值才借。"看见前台"由后台自己在轮询时记下，
+    所以前台进程（app.py）不需要任何改动、也不需要重启。
+    """
+    base = max(1, slot_limit - 1)
+    idle = _borrow_idle_seconds()
+    if idle <= 0 or slot_limit <= 1:
+        return base
+    c.execute('CREATE TABLE IF NOT EXISTS admission_frontend_seen('
+              'endpoint TEXT PRIMARY KEY, seen_at REAL NOT NULL)')
+    now = time.time()
+    if c.execute('SELECT 1 FROM admission WHERE endpoint=? AND priority>=100 LIMIT 1',
+                 (endpoint,)).fetchone():
+        c.execute('INSERT OR REPLACE INTO admission_frontend_seen VALUES(?,?)', (endpoint, now))
+        return base
+    row = c.execute('SELECT seen_at FROM admission_frontend_seen WHERE endpoint=?',
+                    (endpoint,)).fetchone()
+    if row and now - float(row[0] or 0) < idle:
+        return base
+    return slot_limit
+
+
 def _admission_wait_limit(requested_timeout):
     """抢占名额时最长等待多久。
 
@@ -277,12 +322,14 @@ def generation_slot(endpoint, timeout=15):
             if not _alive(pid) or beat < time.time()-120:
                 c.execute('DELETE FROM admission WHERE id=?', (old,))
         active_count = c.execute('SELECT COUNT(*) FROM admission WHERE endpoint=? AND active=1',(endpoint,)).fetchone()[0]
+        # 方案 §5.1 方案 B：后台名额按"此刻"算（借用关闭时就是上面算好的 N-1）。
+        claim_limit = limit if priority >= 100 else _background_limit(c, endpoint, slot_limit)
         first = c.execute('SELECT id FROM admission WHERE endpoint=? AND active=0 ORDER BY priority DESC,created,id LIMIT 1',(endpoint,)).fetchone()
         cooldown=c.execute('SELECT until_at FROM admission_cooldown WHERE endpoint=?',(endpoint,)).fetchone()
         # A client timeout may leave server work finishing. Only optional
         # background requests observe the quarantine; frontend stays usable.
         quarantined=priority<100 and cooldown and cooldown[0]>time.time()
-        allowed = active_count < limit and not quarantined and first and first[0] == ticket
+        allowed = active_count < claim_limit and not quarantined and first and first[0] == ticket
         if allowed:
             c.execute('UPDATE admission SET active=1 WHERE id=?',(ticket,))
         c.commit()

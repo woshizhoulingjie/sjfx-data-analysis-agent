@@ -313,13 +313,6 @@ class LeaseRenewalTests(_Base):
         self.assertAlmostEqual(done, old, places=3,
                                msg='completed 的行不该被续期（否则会把别人的任务"认领"回来）')
 
-    def test_worker_lease_guard_is_noop_when_switch_off(self):
-        """worker 侧的租约网关在默认关闭时同样不做事。"""
-        self.set_env(same_package=None)
-        with self.worker._naming_lease_guard('lp-a', 'g1'):
-            pass
-        self.assertTrue(True)
-
 
 if __name__ == '__main__':
     unittest.main()

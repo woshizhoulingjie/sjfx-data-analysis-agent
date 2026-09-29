@@ -1872,10 +1872,13 @@ def bundle_key(package_id, group_id, revision, owner_id):
     邻组名只影响每次现取的上下文摘要。
     """
     parts = [EVIDENCE_POLICY_VERSION, VERSION, _tokenizer_version(),
-             str(owner_id or ''), str(package_id), str(group_id), str(int(revision or 0)),
-             # 批次 3b §7 第 4 条：提示词变体必须进键。此前只有 VERSION 参与，
-             # 只改提示词时旧缓存照样被命中，A/B 测试结果会被污染。
-             prompt_variant()]
+             str(owner_id or ''), str(package_id), str(group_id), str(int(revision or 0))]
+    # 批次 3b §7 第 4 条：提示词变体必须进键，否则只改提示词时旧缓存照样被命中。
+    # **只在非默认变体时追加**：默认（full）下键与改动前逐字相同，重启后既有缓存
+    # 仍可命中；若无条件追加，所有 digest 都会变，重启后第一轮会全量重新调用模型。
+    variant = prompt_variant()
+    if variant != 'full':
+        parts.append(variant)
     return hashlib.sha256('\0'.join(parts).encode('utf-8')).hexdigest()
 
 
@@ -3912,6 +3915,10 @@ def apply(store,package_id,group_id,material,result,model):
                       'VALUES(?,?,?,?,?,?)',
                       (package_id, group_id, int(revision or 0), len(_paths),
                        minhash_bytes(_paths), time.time()))
+            # 模型刚给出新名字、指纹也换成了当前成员：连续沿用次数必须清零。
+            # 不清零的话，一个组被沿用满 3 次后即使重新命名过，也永远不能再沿用。
+            c.execute('DELETE FROM lp_catalog_label_inherit WHERE package_id=? AND group_id=?',
+                      (package_id, group_id))
         except Exception:
             LOGGER.exception('fingerprint write failed: %s/%s', package_id, group_id)
         # k 自适应的反馈信号：把模型对**这一组**的纯度判定落进组的 result JSON。
@@ -4111,12 +4118,13 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
                   "WHERE id=lp_catalog_jobs.package_id),0) "
                   "WHERE package_id=? AND group_id=?",(time.time(),package_id,gid))
         c.commit()
-    call_id=None;started=time.monotonic();response={};_infra=False;_category=None;_miss=None
+    call_id=None;started=time.monotonic();response={};_infra=False;_category=None;_miss=None;_route=None
     def stop():
         item=store.get(package_id)
         return cancelled() or not item or item['status'] in {'paused','cancelled'} or time.time()>=current['deadline']
     try:
         material=bundle(store,package_id,gid)
+        _route=material.get('route')
         model_client=model_client or client()
         if model_client is None:raise ValueError('本机命名模型未启用')
         model=model_client.model
@@ -4179,6 +4187,8 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
                                 # 批次 1 测量补点：响应字符数。线上 vLLM 不返回 usage，
                                 # 只有这个口径能横向比"输出体积降了多少"（方案 §4/§7 的验收指标）。
                                 'output_chars':len(response.get('content') or ''),
+                                # 方案 §4：按 route 统计截断率要用（clear/boundary…）。
+                                'route':_route,
                                 'cache_miss':{gid:_miss} if _miss else {}})
             if _infra:
                 refund_call(store,call_id)          # 没调成的那次不该占额度

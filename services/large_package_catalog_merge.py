@@ -380,6 +380,8 @@ def apply_merge(store, package_id, rows, result, model, cancelled=lambda:False):
             c.rollback();return 0
         c.commit()
     store._catalog_cache.pop(package_id,None)
+    # 方案 §6.1 第 2 条：语义合并改了成员，记一次触发源（纯测量，不阻断）。
+    naming.record_rebuild_event(store, package_id, 'consolidate', len(rows))
     return len(rows)-1
 
 
@@ -567,6 +569,8 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
         c.commit()
     if merged_groups:
         store._catalog_cache.pop(package_id, None)
+        # 方案 §6.1 第 2 条：同名合并同样改成员，归到 consolidate 触发源。
+        naming.record_rebuild_event(store, package_id, 'consolidate', merged_groups)
     return merged_groups
 
 

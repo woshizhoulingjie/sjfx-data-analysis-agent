@@ -411,6 +411,20 @@ class LargePackageWorker:
                 LOGGER.info("catalog incremental lane package=%s seconds=%.2f claimed=%s",
                             package_id, _dt, claimed)
 
+    def _record_rebuild(self, package_id, trigger, changed):
+        """方案 §6.1 第 2 条：只在成员真的被改动时记一次触发源。
+
+        原先在每个识别切片末尾无条件记 `km_finalize`，而 `_ensure_km_finalized`
+        绝大多数时候是"指纹未变 → 直接返回"，于是事件表会被空事件灌满，
+        按触发源统计 revision_changed 时完全失真。
+        """
+        try:
+            from services.large_package_catalog_naming import record_rebuild_event
+            touched = int(changed) if not isinstance(changed, bool) else int(bool(changed))
+            record_rebuild_event(self.store, package_id, trigger, touched)
+        except Exception:
+            LOGGER.exception('rebuild event failed: %s/%s', package_id, trigger)
+
     def _ensure_km_finalized(self, package_id, claimed=None, force=False):
         """等**所有有素材的文件都拿到向量**之后，做一次全局 k-means 分组。
 
@@ -489,6 +503,8 @@ class LargePackageWorker:
                         return False
                     LOGGER.info("large package %s repaired %s groups while frozen (status=%s)",
                                 package_id, changed, status)
+                    if changed:
+                        self._record_rebuild(package_id, 'km_repair', changed)
                     return bool(changed)
             # 收尾点 3/5：向唯一判定口取证（只记录，不改变本函数原有闸门 ——
             # 聚类必须等"所有有素材的文件都有向量"，那条件比 advance() 的 gates 更严）。
@@ -515,6 +531,8 @@ class LargePackageWorker:
                 return False
             changed = kmeans_recluster(self.store, package_id, force=force)
             LOGGER.info("large package %s k-means finalized changed=%s", package_id, changed)
+            if changed:
+                self._record_rebuild(package_id, 'km_finalize', changed)
             # 叶组变了，让命名队列按新分组重建。
             # 这里必须无条件执行：占位分组阶段可能已经给部分 group_id 写入过
             # naming job（含 deferred），不清空会出现"新叶组沿用旧任务状态、
@@ -978,12 +996,6 @@ class LargePackageWorker:
             return True
         self._catalog_incremental(package_id)
         self._ensure_km_finalized(package_id)
-        # 批次 3a（方案 §6.1 第 2 条）：k-means 收尾会重排成员，记一次触发源。
-        try:
-            from services.large_package_catalog_naming import record_rebuild_event
-            record_rebuild_event(self.store, package_id, 'km_finalize', 0)
-        except Exception:
-            LOGGER.exception('km_finalize rebuild event failed: %s', package_id)
         if self._interrupted(package_id):
             return True
         stage = self.store.stage_counts(package_id, "recognize")
@@ -1104,6 +1116,14 @@ class LargePackageWorker:
         try:
             from services.model_dispatch import _concurrency_limit
             gate = max(1, int(_concurrency_limit()) - 1)
+            # 方案 §5.1 方案 B：打开空闲借用时，后台最多能用满 N 个名额；是否真的借到
+            # 由闸门在每次抢占时按前台是否空闲决定，这里只放开车道上限。
+            try:
+                from services.model_dispatch import _borrow_idle_seconds
+                if _borrow_idle_seconds() > 0:
+                    gate = max(1, int(_concurrency_limit()))
+            except Exception:
+                pass
         except Exception:
             gate = 1
         try:
@@ -1193,68 +1213,6 @@ class LargePackageWorker:
             # 先结束的那一路不该让这个包失去"最近提交"的位置。
             if not self._package_lanes_inflight(pid) and pid in self._naming_order:
                 self._naming_order.remove(pid)
-
-    # ---- 批次 2 §5.2.4：在途命名任务的租约续期 ---------------------------
-    def _renew_naming_lease(self, package_id, group_id):
-        """把这一次调用的租约往后推，返回是否确实还是本次领取的那一行。
-
-        为什么必须做（方案 §5.2.4）：`leased` 是在**排闸门之前**写下的，而闸门等待
-        上限最长 300 秒、一次批量调用本身约 24 秒，合计可能超过 120 秒的回收阈值。
-        两条车道都会执行 `UPDATE ... SET status='queued' WHERE status='running'
-        AND leased<now-120`（batch.py §阶段1 与 naming.process_one 的同一段），
-        于是**正在跑的任务会被另一条车道抢回队列**，同一个组被命名两次。
-
-        只在开关打开时调用（方案 §5.2.4 的选项一：每 30 秒续一次）；默认关闭时
-        一行都不会执行，旧行为逐字保留。
-        """
-        now = time.time()
-        try:
-            with self.store._lock, closing(self.store._connect()) as c:
-                cur = c.execute(
-                    "UPDATE lp_catalog_jobs SET leased=? WHERE package_id=? AND group_id=? "
-                    "AND status='running'", (now, package_id, group_id))
-                c.commit()
-                return cur.rowcount == 1
-        except Exception:
-            LOGGER.exception('naming lease renewal failed: %s/%s', package_id, group_id)
-            return True
-
-    def _naming_lease_guard(self, package_id, group_id, stop=None):
-        """`background_generation` 期间每 30 秒续一次租约的上下文管理器。
-
-        续期线程是守护线程，随上下文退出而结束。它**只写 leased 一列**，不动
-        status/attempts/next_at，因此不会与 release_job / apply 的收口逻辑打架。
-        """
-        from contextlib import contextmanager
-
-        @contextmanager
-        def guard():
-            if self._same_package_lanes() <= 1:
-                # 默认（同包单车道）：完全维持改动前的行为，不装心跳线程。
-                yield
-                return
-            stopped = threading.Event()
-
-            def heartbeat():
-                while not stopped.wait(30.0):
-                    if stop is not None:
-                        try:
-                            if stop():
-                                return
-                        except Exception:
-                            return
-                    if not self._renew_naming_lease(package_id, group_id):
-                        return
-
-            thread = threading.Thread(target=heartbeat, daemon=True)
-            thread.start()
-            try:
-                yield
-            finally:
-                stopped.set()
-                thread.join(timeout=0.5)
-
-        return guard()
 
     def _submit_naming(self, package_id):
         from services.large_package_catalog_batch import process_batch

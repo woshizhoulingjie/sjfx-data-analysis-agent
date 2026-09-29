@@ -85,6 +85,7 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
     pre_claim_failed = []      # (job, exc)：领取之前就失败，任务**仍是 queued**
     oversized = False
     call_id = None
+    batch_route = None
     response = {}
     started = time.monotonic()
     outcome = 'failed'
@@ -319,6 +320,8 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
                                        'finish_reason':response.get('finish_reason'),
                                        # 批次 1 测量补点：同一口径，见 naming.process_one。
                                        'output_chars':len(response.get('content') or ''),
+                                       # 方案 §4：按 route 统计截断率。一批只含同一 route。
+                                       'route':batch_route,
                                        'cache_miss':{gid: miss_reasons[gid] for gid in
                                                      (j['group_id'] for j,_m,_k in pending)
                                                      if gid in miss_reasons}})
