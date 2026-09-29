@@ -788,6 +788,13 @@ class Config:
     # 两版只差"证据层级"（快速预览 → 深度摘要）与研究方向的重估，
     # **不改变目录结构**。生成失败绝不影响主流程。
     LP_OVERVIEW_EAGER = os.getenv("SJFX_LP_OVERVIEW_EAGER", "1").strip().lower() in {"1", "true", "yes", "on"}
+    # 提速方案 v2 §P5-1：情报概览发布被目录校验驳回后，同一份目录按 2 s 起指数退避，
+    # 最长等这么多秒再重试；目录内容一变就立即重试。设为 0 关闭退避（旧行为：每轮都重试）。
+    try:
+        LP_OVERVIEW_BLOCKED_BACKOFF_MAX = max(0, min(3600, int(
+            os.getenv("SJFX_LP_OVERVIEW_BLOCKED_BACKOFF_MAX", "300").strip() or 300)))
+    except ValueError:
+        LP_OVERVIEW_BLOCKED_BACKOFF_MAX = 300
     # 目录结构在 catalog_ready 之后冻结：深度摘要会改写正文并触发重新嵌入，
     # 若继续重算聚类，group id 会全部变化，已生成的目录名与第一版情报概览同时作废。
     # 需要恢复"深度摘要后重算目录"时设为 0。

@@ -70,6 +70,7 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
 
     pending, payload = [], []
     cache_hits = []            # (job, material, cached_row)：命中缓存，不需要模型槽
+    miss_reasons = {}          # group_id -> 未命中缓存的原因（只用于记账）
     pre_claim_failed = []      # (job, exc)：领取之前就失败，任务**仍是 queued**
     oversized = False
     call_id = None
@@ -120,6 +121,12 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
                 if cached:
                     cache_hits.append((job,material,cached))
                     continue
+                # 提速方案 v2 §P4-1 测量：记下未命中缓存的原因（只读，失败返回 unknown）。
+                # 用 getattr 取：Web 进程可能还缓存着没有这个函数的旧 naming 模块。
+                _reason_of = getattr(naming, 'cache_miss_reason', None)
+                if _reason_of is not None:
+                    miss_reasons[job['group_id']] = _reason_of(
+                        store, package_id, job['group_id'], material['digest'], model_client.model)
                 item = {'id':'G'+str(len(pending)+1), **json.loads(material['user'])}
                 proposed = json.dumps({'groups':payload+[item]}, ensure_ascii=False,separators=(',',':'))
                 if naming.token_count(BATCH_SYSTEM+'\n'+proposed)+64 > getattr(Config,'LP_CATALOG_BATCH_INPUT_TOKENS',6500):
@@ -286,7 +293,11 @@ def process_batch(store, package_id, cancelled=lambda: False, model_client=None,
         if call_id:
             naming.finish_call(store,call_id,response.get('usage'),time.monotonic()-started,outcome,
                                detail={'mode':'batch','published':published,'failed':failed,
-                                       'reserved_groups':len(pending)})
+                                       'reserved_groups':len(pending),
+                                       'finish_reason':response.get('finish_reason'),
+                                       'cache_miss':{gid: miss_reasons[gid] for gid in
+                                                     (j['group_id'] for j,_m,_k in pending)
+                                                     if gid in miss_reasons}})
             if category == naming.FAILURE_UNAVAILABLE:
                 # 依赖不可用＝根本没调成：退回轮次请求额度（与单组路径一致）。
                 naming.refund_call(store, call_id)

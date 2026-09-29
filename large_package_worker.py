@@ -196,6 +196,9 @@ class LargePackageWorker:
         # 情报概览第一版的"目录稳定性"观测：package_id → (签名, 稳定起点, 首次观测)。
         # 仅进程内有效——它只是决定"现在是否可以出第一版"的启发式闸门。
         self._overview_state = {}
+        # 提速方案 v2 §P5-1：发布被目录校验驳回后的退避状态。
+        # package_id -> (目录内容签名, 下次允许尝试的时刻, 当前退避秒数)
+        self._overview_blocked = {}
         self._overview_stable = 90.0        # 目录连续多少秒不变即视为定稿
         self._overview_max_wait = 900.0     # 最长等多久（之后用部分快照出第一版）
         self._overview_last_sweep = 0.0     # 上次扫描"该出第一版"的包的时刻
@@ -1617,6 +1620,15 @@ class LargePackageWorker:
             item = self.store.get(package_id)
             if not item:
                 return False
+            # 提速方案 v2 §P5-1：上一次发布被驳回、目录内容又没变 → 在退避窗口内不再重做。
+            # 每次重试都要完整跑一遍 build_report 并重写 overview.json（实测 lp-7132acbf
+            # 一天被驳回 1.6 万次）。只有**上次没发布成功**的包才会进这里多算一次签名。
+            blocked = self._overview_blocked.get(package_id)
+            if blocked is not None:
+                if self._overview_content_key(package_id) != blocked[0]:
+                    self._overview_blocked.pop(package_id, None)    # 目录变了，立即重试
+                elif time.time() < blocked[1]:
+                    return False
             note = ""
             previous_report = None
             if milestone == "catalog":
@@ -1675,12 +1687,43 @@ class LargePackageWorker:
                 milestone = "deep"
             result = build_overview(self.store, item, milestone=milestone, note=note)
             if not result.get("published"):
+                self._note_overview_blocked(package_id)
                 return False
+            self._overview_blocked.pop(package_id, None)
             LOGGER.info("large package %s overview built milestone=%s", package_id, milestone)
             return True
         except Exception:
             LOGGER.exception("overview build failed: %s/%s", package_id, milestone)
             return False
+
+    def _overview_content_key(self, package_id):
+        """退避用的目录内容签名：与发布事务比对的是同一个 catalog_input_revision。"""
+        try:
+            from services.large_package_reporting import catalog_input_revision
+            with closing(self.store._connect()) as conn:
+                return catalog_input_revision(conn, package_id)
+        except Exception:
+            return None
+
+    def _note_overview_blocked(self, package_id):
+        """发布没成功：按指数退避推迟下一次尝试（2 s → 上限 LP_OVERVIEW_BLOCKED_BACKOFF_MAX）。
+
+        上限为 0 时关闭退避，回到"每轮都重试"的旧行为。目录内容一变（签名不同）
+        就立即重试，所以退避只作用于"同一份目录被反复驳回"，不会推迟正常发布。
+        """
+        from config import Config
+        cap = float(getattr(Config, 'LP_OVERVIEW_BLOCKED_BACKOFF_MAX', 300.0) or 0.0)
+        if cap <= 0:
+            return
+        key = self._overview_content_key(package_id)
+        if key is None:
+            return
+        prev = self._overview_blocked.get(package_id)
+        delay = 2.0 if prev is None or prev[0] != key else min(cap, prev[2] * 2.0)
+        self._overview_blocked[package_id] = (key, time.time() + delay, delay)
+        if prev is None or prev[2] != delay:
+            LOGGER.info("overview publication not accepted: package=%s next retry in %.0fs "
+                        "unless the catalog changes", package_id, delay)
 
     def _overview_catchup(self):
         """给"目录已定稿但还没生成情报概览"的包补一次触发。

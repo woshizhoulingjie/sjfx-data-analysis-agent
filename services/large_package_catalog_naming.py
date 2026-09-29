@@ -2651,6 +2651,51 @@ def release_job(store, package_id, group_id, revision, attempts=0, error='', cat
     return status
 
 
+def cache_miss_reason(store, package_id, group_id, digest, model):
+    """缓存没命中时，说明**为什么**要重新调用模型（提速方案 v2 §P4-1，只测量）。
+
+    返回 {'reason': ..., 'from_rev': 旧标签修订号, 'to_rev': 当前修订号}；
+    reason 取值：
+      first_naming       该组从没有过标签；
+      replacing_fallback 现有标签是兜底/确定性名字，不是模型给这一组起的；
+      inherited_label    现有标签继承自同名合并/子主题拆分（名字来自别的组的调用）；
+      model_changed      现有标签出自另一个命名模型；
+      revision_changed   组的内容修订号变了（成员增减/重聚类都会走到这里）；
+      content_changed    修订号没变，但证据包内容变了（特征卡/取样策略变化）；
+      cache_key_absent   标签的 digest 与本次一致，但缓存表里没有这个键
+                         （例如输出预算后缀不同、或缓存行被清理）。
+    任何异常都返回 {'reason':'unknown'}，绝不影响命名本身。
+    """
+    try:
+        with closing(store._connect()) as c:
+            row = c.execute('SELECT l.revision,l.digest,l.model,g.content_revision '
+                            'FROM large_catalog_groups g LEFT JOIN lp_catalog_labels l '
+                            'ON l.package_id=g.package_id AND l.group_id=g.id '
+                            'WHERE g.package_id=? AND g.id=?', (package_id, group_id)).fetchone()
+        if not row:
+            return {'reason': 'unknown'}
+        old_rev, old_digest, old_model, now_rev = row[0], row[1], row[2], row[3]
+        out = {'from_rev': old_rev, 'to_rev': now_rev}
+        if old_rev is None:
+            out['reason'] = 'first_naming'
+        elif (str(old_model or '') in ('deterministic', 'fallback-naming', 'manual')
+              or str(old_digest or '').startswith(('fallback-', 'manual-'))):
+            out['reason'] = 'replacing_fallback'
+        elif str(old_model or '') in ('merge-identical', 'model-subtopic'):
+            out['reason'] = 'inherited_label'
+        elif str(old_model or '') != str(model or ''):
+            out['reason'] = 'model_changed'
+        elif int(old_rev) != int(now_rev or 0):
+            out['reason'] = 'revision_changed'
+        elif str(old_digest or '') != str(digest or ''):
+            out['reason'] = 'content_changed'
+        else:
+            out['reason'] = 'cache_key_absent'
+        return out
+    except Exception:
+        return {'reason': 'unknown'}
+
+
 def finish_call(store,call_id,usage,elapsed,status,detail=None):
     """结算一次调用，并把**逐组结果与用量口径**记进台账（专家报告 §13.3）。
 
@@ -2661,6 +2706,14 @@ def finish_call(store,call_id,usage,elapsed,status,detail=None):
     actual=int((usage or {}).get('total_tokens') or ((usage or {}).get('prompt_tokens',0)+(usage or {}).get('completion_tokens',0)))
     payload=dict(detail or {})
     payload['usage_state']='measured' if actual>0 else 'estimated'
+    # 提速方案 v2 §四-1 测量补点：输入/输出分开记，才能判断时间花在 prefill 还是 decode。
+    # 只往 detail JSON 里加键，不改表结构、不改结算口径（actual 仍按 total 计）。
+    if usage:
+        for _k in ('prompt_tokens','completion_tokens'):
+            try:
+                payload[_k]=int(usage.get(_k) or 0)
+            except (TypeError,ValueError):
+                pass
     with store._lock,closing(store._connect()) as c:
         c.execute('BEGIN IMMEDIATE')
         row=c.execute('SELECT * FROM lp_catalog_calls WHERE id=?',(call_id,)).fetchone()
@@ -3480,7 +3533,7 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
                   "WHERE id=lp_catalog_jobs.package_id),0) "
                   "WHERE package_id=? AND group_id=?",(time.time(),package_id,gid))
         c.commit()
-    call_id=None;started=time.monotonic();response={};_infra=False;_category=None
+    call_id=None;started=time.monotonic();response={};_infra=False;_category=None;_miss=None
     def stop():
         item=store.get(package_id)
         return cancelled() or not item or item['status'] in {'paused','cancelled'} or time.time()>=current['deadline']
@@ -3505,6 +3558,7 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
         else:
             from services.model_dispatch import background_generation
             if stop():raise ValueError('目录命名已暂停或达到预算')
+            _miss=cache_miss_reason(store,package_id,gid,material['digest'],model)
             call_id=reserve(store,package_id,current['id'],gid,material['tokens']+output)
             if not call_id:raise ValueError('本轮命名预算已用尽')
             with background_generation(stop):
@@ -3534,7 +3588,9 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
             finish_call(store,call_id,response.get('usage'),time.monotonic()-started,status,
                         detail={'mode':'single','published':[gid] if status=='completed' else [],
                                 'failed':([] if status=='completed'
-                                          else [{'group':gid,'category':_category if status=='failed' else FAILURE_STALE}])})
+                                          else [{'group':gid,'category':_category if status=='failed' else FAILURE_STALE}]),
+                                'finish_reason':response.get('finish_reason'),
+                                'cache_miss':{gid:_miss} if _miss else {}})
             if _infra:
                 refund_call(store,call_id)          # 没调成的那次不该占额度
         store._catalog_cache.pop(package_id,None)

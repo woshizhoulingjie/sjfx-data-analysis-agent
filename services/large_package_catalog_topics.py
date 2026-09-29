@@ -298,7 +298,8 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
         except Exception as exc:
             LOGGER.warning('theme naming failed package=%s: %s', package_id, exc)
         finally:
-            naming.finish_call(store, call_id, response.get('usage'), time.monotonic()-started, outcome)
+            naming.finish_call(store, call_id, response.get('usage'), time.monotonic()-started, outcome,
+                               detail={'mode': 'topics', 'finish_reason': response.get('finish_reason')})
         return failed, True
 
     offset = 0

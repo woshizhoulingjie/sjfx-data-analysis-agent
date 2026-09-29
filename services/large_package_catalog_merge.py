@@ -733,5 +733,6 @@ def consolidate(store, package_id, round_state, cancelled=lambda:False, model_cl
         except Exception as exc:
             LOGGER.warning('leaf consolidation skipped package=%s: %s',package_id,exc)
         finally:
-            naming.finish_call(store,call_id,response.get('usage'),time.monotonic()-started,outcome)
+            naming.finish_call(store,call_id,response.get('usage'),time.monotonic()-started,outcome,
+                               detail={'mode':'leaf-merge','finish_reason':response.get('finish_reason')})
     return merged
