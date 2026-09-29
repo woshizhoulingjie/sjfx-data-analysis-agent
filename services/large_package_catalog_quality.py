@@ -316,9 +316,20 @@ def repair_changed(store, package_id):
     locked = {g['id'] for g in groups if g['locked']}
     centers = np.vstack([v for _,v in valid])
     updates, affected = [], set(removed)
+    unembeddable = 0
     for row in rows:
+        if not row['vector']:
+            # `assign_solo_groups` 有意给"正文太短、永远拿不到向量"的文件建 km-solo
+            # 单文件组（成员行 vector=b''），其 INSERT 会触发 lp_catalog_changed_insert。
+            # 这类行没有可比的向量，也没有可搬的去处：跳过、保留成员行与所属组。
+            # 改动前这里会落到下面的维度判定并 return retry，一行 changes 都不删，
+            # 指纹也不存 —— 每轮完全重演（实测 lp-085e413e 195 行，从 09-26 起空转）。
+            unembeddable += 1
+            continue
         v = np.frombuffer(row['vector'],dtype=np.float32)
         if v.shape != centers.shape[1:]:
+            # 维度不符（换过嵌入模型）保持 retry：跳过它会让 _group_geometry 在同组里
+            # 混合维度而报错；这种情况只能走整体重建。
             return {'status': 'retry', 'changed': 0, 'dirty': len(dirty)}
         old = row['group_id']; target = old
         scores = centers @ unit(v); order = np.argsort(-scores)
@@ -366,7 +377,15 @@ def repair_changed(store, package_id):
         except Exception:
             c.rollback();raise
     store._catalog_cache.pop(package_id,None)
-    return {'status': 'done', 'changed': len(rows), 'dirty': len(dirty)}
+    if unembeddable:
+        _repair_event(store, package_id, 'rows_skipped',
+                      {'unembeddable': unembeddable,
+                       'dirty': len(dirty), 'note': 'members kept; changes cleared'})
+        LOGGER.info('repair skipped unembeddable rows package=%s unembeddable=%d dirty=%d',
+                    package_id, unembeddable, len(dirty))
+    # `changed` 只计真正参与判定的行（旧写法 len(rows)；在没有跳过行时两者相等）。
+    return {'status': 'done', 'changed': len(updates), 'dirty': len(dirty),
+            'unembeddable': unembeddable}
 
 
 def vector_signature(c,package_id):

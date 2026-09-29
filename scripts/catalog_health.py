@@ -98,6 +98,8 @@ def main():
         _default_min = 12
     ap.add_argument('--min-leaves', type=int, default=_default_min,
                     help='叶组少于该数的包不参与判定（默认取 LP_TOPIC_MERGE_MIN_GROUPS）')
+    ap.add_argument('--include-cancelled', action='store_true',
+                    help='连同已取消的包一起体检（默认跳过：取消的包不会再推进，报它"有问题"是误报）')
     args = ap.parse_args()
 
     store = LargePackageStore()
@@ -106,7 +108,11 @@ def main():
             "SELECT id, root_path, status, phase FROM packages ORDER BY updated_at DESC")]
 
     rows, bad = [], 0
+    skipped_cancelled = 0
     for p in packages:
+        if not args.include_cancelled and str(p.get('status') or '') == 'cancelled':
+            skipped_cancelled += 1
+            continue
         try:
             m = audit(store, p['id'])
         except Exception as exc:                     # 单包坏掉不该让整次体检失败
@@ -148,7 +154,9 @@ def main():
                     m['pending_pct'], m['unnamed_pct'], m['stuck'], ', '.join(m['problems'])))
 
     print()
-    print("结论: %d / %d 个包有目录问题" % (bad, len(rows)))
+    print("结论: %d / %d 个包有目录问题" % (bad, len(rows))
+          + ("（已跳过 %d 个已取消的包，--include-cancelled 可纳入）" % skipped_cancelled
+             if skipped_cancelled else ''))
     return 1 if bad else 0
 
 
