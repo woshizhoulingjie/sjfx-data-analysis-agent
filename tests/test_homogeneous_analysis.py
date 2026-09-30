@@ -164,7 +164,11 @@ class HomogeneousDocumentAnalysisTests(unittest.TestCase):
         template = (project / "templates" / "index.html").read_text(encoding="utf-8")
         shell = (project / "static" / "product-shell.js").read_text(encoding="utf-8")
         client = (project / "static" / "homogeneous-analysis.js").read_text(encoding="utf-8")
-        self.assertIn('data-route="homogeneous"', template)
+        polish = (project / "static" / "ui-polish.js").read_text(encoding="utf-8")
+        # 8a2f524（2026-09-13）起侧栏"邮件分析"改为独立工作台 /mail-research，
+        # 同构分析不再占侧栏按钮，但仍须可达：快速导航与"查看文件关联"都路由到它。
+        self.assertIn('href="/mail-research"', template)
+        self.assertIn("['homogeneous', '同构文件关联'", polish)
         self.assertIn('data-view="homogeneous"', template)
         self.assertIn("homogeneous: 'homogeneous'", shell)
         self.assertIn("/api/homogeneous-analysis/", client)

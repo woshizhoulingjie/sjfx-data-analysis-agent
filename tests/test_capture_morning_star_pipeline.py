@@ -12,11 +12,15 @@ capture = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(capture)
 
 
+MATERIALS = ROOT / "benchmark_capture" / "morning_star_documents"
+
+
 class CaptureMorningStarPipelineTest(unittest.TestCase):
+    # benchmark_capture/ 在 .gitignore 里，只存在于部署目录；干净检出/工作树里没有素材时跳过，
+    # 而不是报"用例失败"（素材在的地方照常断言）。
+    @unittest.skipUnless(MATERIALS.is_dir(), "benchmark_capture 素材不在本检出（已 gitignore）")
     def test_materials_cover_required_analysis(self):
-        documents = capture.load_documents(
-            ROOT / "benchmark_capture" / "morning_star_documents"
-        )
+        documents = capture.load_documents(MATERIALS)
         joined = "\n".join(item["content"] for item in documents)
         self.assertEqual(12, len(documents))
         for expected in (

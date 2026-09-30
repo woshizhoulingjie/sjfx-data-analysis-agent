@@ -612,6 +612,26 @@ class Config:
     LP_DIRECTION_REQUESTS_PER_DAY = max(1, min(500, _positive_int(
         os.getenv("SJFX_LP_DIRECTION_REQUESTS_PER_DAY"), 20)))
     LP_DIRECTION_CATEGORIES = max(3, min(40, _positive_int(os.getenv("SJFX_LP_DIRECTION_CATEGORIES"), 14)))
+    # 全包综合研究方向（2026-09-30）：把完整智能目录（全部主题/叶组/文件数/描述）交给模型，
+    # 先写全包画像与主线，再推出贯穿多个主题的研究方向；本地按主题覆盖面把关首选方向。
+    # 默认关闭＝沿用旧算法（每主题 2 个片段）。
+    LP_DIRECTION_HOLISTIC = os.getenv("SJFX_LP_DIRECTION_HOLISTIC", "0").strip().lower() in {"1", "true", "yes", "on"}
+    LP_DIRECTION_HOLISTIC_CHARS = max(4000, min(40000, _positive_int(os.getenv("SJFX_LP_DIRECTION_HOLISTIC_CHARS"), 14000)))
+    LP_DIRECTION_HOLISTIC_MAX_TOKENS = max(800, min(6000, _positive_int(os.getenv("SJFX_LP_DIRECTION_HOLISTIC_MAX_TOKENS"), 2600)))
+    LP_DIRECTION_HOLISTIC_TIMEOUT = max(60, min(900, _positive_int(os.getenv("SJFX_LP_DIRECTION_HOLISTIC_TIMEOUT"), 300)))
+    try:
+        LP_DIRECTION_HOLISTIC_MIN_SHARE = max(0.05, min(0.9, float(os.getenv("SJFX_LP_DIRECTION_HOLISTIC_MIN_SHARE", "0.3").strip() or 0.3)))
+    except ValueError:
+        LP_DIRECTION_HOLISTIC_MIN_SHARE = 0.3
+    # 目录发布校验口径修正（INV-2 单文件条目/系统桶无向量成员计入覆盖；INV-3 单文件条目同名只提示；
+    # INV-5 已命名的 km-pending 暂存组只提示）。默认关闭＝原口径。
+    LP_CATALOG_VALIDATE_FIX = os.getenv("SJFX_LP_CATALOG_VALIDATE_FIX", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # 同一主题内"归一后同名、内容相容、但合并会超过容量上限"的叶组：开启后改名消歧（「原名·其二」），
+    # 与内容不相容的同名组走同一条改名通道；默认关闭＝旧行为（只标 needs_review 并跳过，重名保留）。
+    LP_DEDUP_OVERCAP_RENAME = os.getenv("SJFX_LP_DEDUP_OVERCAP_RENAME", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # 概览发布被 INV-3（同一主题下同名叶组）拦下时：在发布事务之外跑一次 normalize_leaves，
+    # 重建并重试发布**一次**。默认关闭＝旧行为（直接阻断，保留上一版）。
+    LP_PUBLISH_DEDUP_RETRY = os.getenv("SJFX_LP_PUBLISH_DEDUP_RETRY", "0").strip().lower() in {"1", "true", "yes", "on"}
     LP_CATALOG_ADAPTIVE_PERCENTILE = max(5, min(90, _positive_int(os.getenv("SJFX_LP_CATALOG_ADAPTIVE_PERCENTILE"), 40)))
     try:
         _lp_similarity = float(os.getenv("SJFX_LP_CATALOG_SIMILARITY", "0") or 0)
@@ -1048,6 +1068,25 @@ class Config:
         int(os.getenv("JOB_DOCUMENT_SUMMARY_TIMEOUT_SECONDS", "1800")),
     )
     JOB_REPORT_TIMEOUT_SECONDS = max(60, int(os.getenv("JOB_REPORT_TIMEOUT_SECONDS", "900")))
+    # 情报概览改修（普通导入与情报概览改修方案 §5）。默认全部等于旧行为，逐项打开。
+    # O1：证据目录按候选对齐、模型按候选编号选择、推论按语义相关核验、关键发现取已核验内容。
+    OVERVIEW_EVIDENCE_ALIGN = os.getenv("SJFX_OVERVIEW_EVIDENCE_ALIGN", "0").strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        OVERVIEW_INFERENCE_SEMANTIC_THRESHOLD = max(0.5, min(0.99, float(
+            os.getenv("SJFX_OVERVIEW_INFERENCE_SEMANTIC_THRESHOLD", "0.86").strip() or 0.86)))
+    except ValueError:
+        OVERVIEW_INFERENCE_SEMANTIC_THRESHOLD = 0.86
+    # O2：自动触发的概览模型调用按后台优先级进入生成闸门；用户手动触发仍按前台。
+    OVERVIEW_BACKGROUND_PRIORITY = os.getenv("SJFX_OVERVIEW_BACKGROUND_PRIORITY", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # O3：旧流程（非严格选择）深度报告按深度摘要指纹去重，深度队列排空后再生成。
+    DEEP_REPORT_DEBOUNCE = os.getenv("SJFX_DEEP_REPORT_DEBOUNCE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # O4：非严格"更新深度结果"改为排队生成并返回 202，结果保存为 deep_report。
+    OVERVIEW_DEEP_REFRESH_ASYNC = os.getenv("SJFX_OVERVIEW_DEEP_REFRESH_ASYNC", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # O5：深度摘要按两种类型统一读取；local-fallback 摘要只计覆盖，不作内容证据。
+    OVERVIEW_EXCLUDE_FALLBACK = os.getenv("SJFX_OVERVIEW_EXCLUDE_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # P1/P2：大包报告缓存键用 status/phase 代替 updated_at，页面轮询不调方向模型，
+    # 方向模型调用移到 _lock 与读事务之外；下载走已发布报告。
+    LP_REPORT_CACHE_FIX = os.getenv("SJFX_LP_REPORT_CACHE_FIX", "0").strip().lower() in {"1", "true", "yes", "on"}
     JOB_CONVERSATION_TURN_TIMEOUT_SECONDS = max(
         60, int(os.getenv("JOB_CONVERSATION_TURN_TIMEOUT_SECONDS", "900"))
     )

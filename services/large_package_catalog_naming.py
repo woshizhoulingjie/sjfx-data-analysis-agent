@@ -529,8 +529,13 @@ def duplicate_name_groups(store, package_id):
 _ORDINALS = ("其二", "其三", "其四", "其五", "其六", "其七", "其八", "其九", "其十")
 
 
-def _disambiguate_incompatible(store, package_id, incompatible):
-    """给"同一主题内同名、但内容不相容无法合并"的叶组改一个可区分的名字。返回改名数。"""
+def _disambiguate_incompatible(store, package_id, incompatible,
+                               reason="同名叶组内容不相容、不能合并：改名消歧（%s）"):
+    """给"同一主题内同名、但内容不相容无法合并"的叶组改一个可区分的名字。返回改名数。
+
+    `reason` 是写进 lp_workflow_events 的说明模板（`%s` 填组 id）；超上限的同名兼容组
+    （SJFX_LP_DEDUP_OVERCAP_RENAME）也走这里，只是说明文字不同。
+    """
     renamed = 0
     now = time.time()
     try:
@@ -577,7 +582,7 @@ def _disambiguate_incompatible(store, package_id, incompatible):
                     conn.execute("INSERT INTO lp_workflow_events(package_id,object,old_state,"
                                  "new_state,reason,source,created) VALUES(?,?,?,?,?,?,?)",
                                  (package_id, "catalog.leaf", base[:60], new[:60],
-                                  "同名叶组内容不相容、不能合并：改名消歧（%s）" % gid,
+                                  reason % gid,
                                   "normalize_leaves", now))
             conn.commit()
     except Exception:
@@ -655,6 +660,9 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
     # 重复尝试，否则 max_rounds 会全部空转在同一个键上。
     skipped_over_cap = set()
     incompatible = []
+    # SJFX_LP_DEDUP_OVERCAP_RENAME：超上限、无法合并的同名兼容组也改名消歧（见循环后）。
+    overcap_rename = bool(getattr(Config, 'LP_DEDUP_OVERCAP_RENAME', False))
+    overcap = []
     for rnd in range(max(1, int(max_rounds))):
         dups = duplicate_name_groups(store, package_id)
         if not dups:
@@ -728,6 +736,8 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
                                             ensure_ascii=False),
                                  'normalize_leaves', time.time()))
                             conn.commit()
+                            if overcap_rename:
+                                overcap.append((key, list(alive), dict(sizes)))
                             continue
                         others = [g for g in alive if g != host]
                         # 合并前先记下各族**当前的原始名字**（下面会把 others 的标签删掉）。
@@ -816,6 +826,20 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
     if incompatible:
         stats["renamed_incompatible"] = _disambiguate_incompatible(store, package_id, incompatible)
 
+    # **超上限的同名兼容组：同样改名消歧（开关控制，默认关闭）。**
+    # 上面 `host is None` 分支只标 needs_review 并跳过 —— 合并会超过容量上限，所以不并；
+    # 但重名一直留着，发布校验 INV-3 就一直拦着。开启 SJFX_LP_DEDUP_OVERCAP_RENAME 后，
+    # 这些组与内容不相容的同名组走同一条改名通道（「原名·其二」…，标 needs_review），
+    # 不调用模型、不改修订号。每组单独调用：同一个 key 可能在两个主题下各有一簇，
+    # `_disambiguate_incompatible` 按 key 去重，合在一次调用里会漏掉第二个主题。
+    if overcap:
+        renamed_overcap = 0
+        for entry in overcap:
+            renamed_overcap += _disambiguate_incompatible(
+                store, package_id, [entry],
+                reason="同名叶组内容相容但合并会超过容量上限：改名消歧（%s）")
+        stats["renamed_over_cap"] = renamed_overcap
+
     after = duplicate_name_groups(store, package_id)
     stats["duplicates_after"] = len(after)
 
@@ -850,6 +874,15 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
                 stats["merged_groups"], stats["merged_members"], stats["duplicates_before"],
                 stats["duplicates_after"], stats["over_cap"], cap)
     return stats
+
+
+def _validate_fix_enabled():
+    """SJFX_LP_CATALOG_VALIDATE_FIX：目录发布校验的三处口径修正（默认关闭＝原口径）。"""
+    try:
+        from config import Config
+        return bool(getattr(Config, 'LP_CATALOG_VALIDATE_FIX', False))
+    except Exception:
+        return False
 
 
 def validate_catalog(store, package_id):
@@ -934,16 +967,51 @@ def validate_catalog(store, package_id):
                         "AND m.group_id=g.id) AND "
                         "NOT EXISTS(SELECT 1 FROM lp_catalog_labels l WHERE l.package_id=g.package_id "
                         "AND l.group_id=g.id AND l.name<>'')", (package_id,)) or 0)
+        fix = _validate_fix_enabled()
+        solo_unvectored = named_staging = 0
+        if fix:
+            # 修正 A（INV-2）：单文件条目 / 系统桶里**没有向量**的成员也是"明确归属"——
+            # assign_solo_groups 建条目时写的就是空向量（semantic.py），界面在"待归并主题"
+            # 与"未能识别内容"里正常列出。原口径只数带向量的成员，于是这些文件被算成
+            # "既不在目录、也没有原因"（生产实测 085e413e 等 4 个包 165~194 个，全是这类）。
+            # 只**补计**：已经按带向量成员或 no_content/deferred 计过的文件不重复计。
+            solo_unvectored = int(q(
+                "SELECT COUNT(*) FROM files f WHERE f.package_id=? "
+                "AND COALESCE(json_extract(f.local_summary,'$.portrait.catalog_status'),'') "
+                "    NOT IN ('no_content','deferred') "
+                "AND NOT EXISTS(SELECT 1 FROM large_catalog_members m WHERE m.package_id=f.package_id "
+                "    AND m.path=f.path AND LENGTH(m.vector)>0) "
+                "AND EXISTS(SELECT 1 FROM large_catalog_members m WHERE m.package_id=f.package_id "
+                "    AND m.path=f.path AND (m.group_id LIKE 'km-solo-%' OR m.group_id LIKE 'km-other-%'))",
+                (package_id,)) or 0)
+            # 修正 C（INV-5）：已拿到**当前名字**的 km-pending-* 组不是占位组。主题层按
+            # is_system_group 把 km-pending 前缀整体排除（tree.py/merge.py），所以它永远
+            # 进不了任何主题；目录页照常把它列在"待归并主题"里，isolated.py 也把它当已归类。
+            # 原口径要求它"必须在主题下"，与主题层的排除规则互相矛盾 → 永久阻断
+            # （生产实测 9b8edcc6：65 个文件）。没有当前名字的 km-pending 仍是真占位，照旧阻断。
+            named_staging = int(q(
+                "SELECT COUNT(*) FROM large_catalog_members m JOIN large_catalog_groups g "
+                "ON g.package_id=m.package_id AND g.id=m.group_id "
+                "WHERE m.package_id=? AND g.id LIKE 'km-pending-%' AND LENGTH(m.vector)>0 "
+                "AND EXISTS(SELECT 1 FROM lp_catalog_labels l WHERE l.package_id=g.package_id "
+                "    AND l.group_id=g.id AND l.name<>'' "
+                "    AND (l.revision=g.content_revision OR l.locked=1)) "
+                "AND NOT EXISTS (SELECT 1 FROM lp_catalog_branches b, json_each(b.children) je "
+                "    WHERE b.package_id=g.package_id AND je.value=g.id)",
+                (package_id,)) or 0)
+            placeholders = max(0, placeholders - named_staging)
     try:
         from services.large_package_semantic import leaf_growth_cap
         growth = int(leaf_growth_cap(store))
     except Exception:
         growth = 240
     dups = duplicate_name_groups(store, package_id)
-    covered = members + no_content + deferred
+    covered = members + no_content + deferred + solo_unvectored
     checks["INV2_covered"] = {"files": total_files, "members": members,
                               "no_content": no_content, "deferred": deferred,
                               "uncovered": max(0, total_files - covered)}
+    if fix:
+        checks["INV2_covered"]["single_or_system_without_vector"] = solo_unvectored
     if total_files and covered < total_files:
         violations.append("INV-2：有 %d 个已发现文件既不在正式目录、也没有明确的未分类原因"
                           % (total_files - covered))
@@ -966,24 +1034,43 @@ def validate_catalog(store, package_id):
         except Exception:
             topic_of = {}
     same_topic_keys = {}
+    solo_dup_keys = {}
     for key, gids in dups.items():
         per = {}
+        solos = []
         for gid in gids:
+            # 修正 B（INV-3）：km-solo-* 是单文件条目，没有主题（不进主题层），
+            # 原口径把它们和其它无主题叶组一起放进 "" 桶，于是"同一文件在不同目录里的
+            # 几份副本"各自成了单文件条目、同名 → 被当成"同一主题下重名"永久阻断
+            # （生产实测 085e413e 8 组、ff42d1f7 10 组全是这类）。它们不参与同主题判定，
+            # 改为提示；真正同一主题下的同名叶组照旧阻断。
+            if fix and str(gid).startswith('km-solo-'):
+                solos.append(gid)
+                continue
             per.setdefault(topic_of.get(gid, ""), []).append(gid)
         if any(len(v) > 1 for v in per.values()):
             same_topic_keys[key] = gids
+        elif solos:
+            solo_dup_keys[key] = gids
     checks["INV3_duplicate_names"] = {"duplicate_keys": len(dups),
                                       "groups_involved": sum(len(v) for v in dups.values()),
                                       "same_topic_keys": len(same_topic_keys),
-                                      "cross_topic_keys": len(dups) - len(same_topic_keys),
+                                      "cross_topic_keys": len(dups) - len(same_topic_keys)
+                                                          - len(solo_dup_keys),
                                       "sample": list(sorted(dups))[:5]}
+    if fix:
+        checks["INV3_duplicate_names"]["single_file_entry_keys"] = len(solo_dup_keys)
     if same_topic_keys:
         violations.append("INV-3：同一主题下有 %d 组归一化同名的叶组（涉及 %d 个组）"
                           % (len(same_topic_keys),
                              sum(len(v) for v in same_topic_keys.values())))
-    elif dups:
+    elif len(dups) > len(solo_dup_keys):
         warnings.append("INV-3（提示）：另有 %d 组同名叶子分布在**不同主题**下；"
-                        "两级目录里跨主题同名不影响浏览，不阻断发布" % len(dups))
+                        "两级目录里跨主题同名不影响浏览，不阻断发布"
+                        % (len(dups) - len(solo_dup_keys)))
+    if solo_dup_keys:
+        warnings.append("INV-3（提示）：待归并主题中有 %d 组同名的单文件条目（多为同一文件的"
+                        "不同副本），不阻断发布" % len(solo_dup_keys))
     # INV-4 与 INV-7 是**警告级**，不是阻断：
     #   * INV-4：同名归一会让叶子变大，叶组数**高于**增长上限是合并的正常结果；
     #     再切小恰恰会重新制造同名（切碎 → 每片单独命名 → 同名）。切分侧的增长
@@ -997,6 +1084,11 @@ def validate_catalog(store, package_id):
     checks["INV5_placeholders"] = {"files_in_placeholder_groups": placeholders,
                                    "files_in_system_bucket": system_bucket,
                                    "files_in_single_file_entries": solo_outside}
+    if fix:
+        checks["INV5_placeholders"]["files_in_named_staging_groups"] = named_staging
+    if named_staging:
+        warnings.append("INV-5（提示）：有 %d 个文件在已命名的聚类前暂存组里（主题层按设计不收"
+                        "这类组，界面列在待归并主题下），不阻断发布" % named_staging)
     if placeholders:
         violations.append("INV-5：有 %d 个文件仍归属占位组，不得进入正式目录" % placeholders)
     if system_bucket:

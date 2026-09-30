@@ -1744,7 +1744,8 @@ class LargePackageWorker:
             if not getattr(Config, "LP_OVERVIEW_EAGER", True):
                 return False
             from services.large_package_reporting import (
-                build_overview, published_report, catalog_input_revision)
+                build_overview, published_report, catalog_input_revision,
+                direction_rules_current)
             item = self.store.get(package_id)
             if not item:
                 return False
@@ -1764,8 +1765,10 @@ class LargePackageWorker:
                 with closing(self.store._connect()) as conn:
                     conn.execute("BEGIN")
                     revision = catalog_input_revision(conn, package_id)
+                    # 全包综合开关切换后规则版本变化：目录未变也要重建一次
                     if (previous_report and
-                            previous_report.get("catalog_input_revision") == revision):
+                            previous_report.get("catalog_input_revision") == revision and
+                            direction_rules_current(previous_report)):
                         return False
                     leaves = int(conn.execute(
                         "SELECT COUNT(*) FROM large_catalog_groups WHERE package_id=? "
@@ -1884,6 +1887,22 @@ class LargePackageWorker:
                 # 已经跑完深度摘要的包：直接出**第二版**（它没有"目录就绪"这个
                 # 中间态可等，硬出一版 catalog 会把它标成第一版，语义上不对）。
                 milestone = "deep" if row["status"] == "completed" and not existing else "catalog"
+                # P3：深度排空时被推迟的第二版，等命名轮次排空（或等满上限）再生成。
+                pending_since = 0.0
+                if row["status"] == "completed":
+                    current = self.store.get(package_id) or {}
+                    try:
+                        pending_since = float((current.get("counts") or {}).get("deep_overview_pending_since") or 0)
+                    except (TypeError, ValueError):
+                        pending_since = 0.0
+                if pending_since:
+                    if (self._naming_jobs_pending(package_id)
+                            and time.time() - pending_since < self._overview_max_wait):
+                        continue
+                    if self._build_overview(package_id, "deep"):
+                        self.store.update_package(package_id, counts={"deep_overview_pending_since": 0})
+                        return True
+                    continue
                 if self._build_overview(package_id, milestone):
                     return True
             return False
@@ -2133,8 +2152,27 @@ class LargePackageWorker:
                                   counts=counts)
         # 里程碑 2：深度摘要已排空 → 依据深度摘要内容把情报概览更新为第二版。
         # 结构不变（方案 A），只升级证据层级并重估研究方向。
-        self._build_overview(package_id, "deep")
+        # P3：上面刚排了 deep 命名轮次；命名任务一跑，catalog_input_revision 就会
+        # 变，此刻生成的里程碑会在发布时被推迟，之后 catchup 再算一遍。所以命名
+        # 轮次还有待办时只记下"待生成深度版"，由 _overview_catchup 在命名排空后
+        # （或等满 _overview_max_wait）再生成。
+        if self._naming_jobs_pending(package_id):
+            self.store.update_package(package_id, counts={"deep_overview_pending_since": time.time()})
+            LOGGER.info("large package %s deep overview deferred until naming round drains", package_id)
+        else:
+            self._build_overview(package_id, "deep")
         return True
+
+    def _naming_jobs_pending(self, package_id):
+        """P3：命名/目录任务是否还有待办（与 _build_overview 的稳定性判据同口径）。"""
+        try:
+            with closing(self.store._connect()) as conn:
+                return int(conn.execute(
+                    "SELECT COUNT(*) FROM lp_catalog_jobs WHERE package_id=? "
+                    "AND status IN ('queued','running','retry','deferred')",
+                    (package_id,)).fetchone()[0] or 0)
+        except Exception:
+            return 0
 
     def _deep_one(self, package):
         package_id = package["id"]

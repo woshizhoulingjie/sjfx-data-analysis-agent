@@ -44,6 +44,15 @@ class _MockModel(object):
     model = 'mock-model'
 
 
+def _name_every_bucket(store, package_id, buckets, *a, **k):
+    """桩：像真实 name_topics 一样给**每个**待命名簇返回名字（label 0 为 '紧密簇主题'）。
+
+    原桩只返回 {0: ...}；2026-09-29 起层级聚类给 k 加了下限（db04530），同一层会有
+    多个被接受的簇，只给 label 0 起名会让其余簇落到占位名 —— 那是桩的缺口，不是被测行为。
+    """
+    return {lab: ('紧密簇主题' if lab == 0 else '紧密簇主题%d' % lab) for lab in buckets}
+
+
 class ThemeCoverageTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix='coverage-')
@@ -111,7 +120,7 @@ class ThemeCoverageTests(unittest.TestCase):
           · 1 个正交叶组（余弦 < 0.65）→ **不得**被塞进那个主题；
           · 整个 terminal 里没有"被硬塞进不相关主题"的。
         """
-        topics.name_topics = lambda *a, **k: {0: '紧密簇主题'}
+        topics.name_topics = _name_every_bucket
         self.assertTrue(tree.build(self.store, self.pid,
                                   {'id': 'r1', 'deadline': time.time() + 3600},
                                   lambda: False, _MockModel()))
@@ -127,7 +136,7 @@ class ThemeCoverageTests(unittest.TestCase):
 
     def test_rejected_cluster_keeps_its_existing_name(self):
         """被拒的簇**不配新名字**，沿用 frontier 上已有的名字（命名门槛不放松）。"""
-        topics.name_topics = lambda *a, **k: {0: '紧密簇主题'}
+        topics.name_topics = _name_every_bucket
         tree.build(self.store, self.pid, {'id': 'r1', 'deadline': time.time() + 3600},
                    lambda: False, _MockModel())
         payload = self._payload()
@@ -156,7 +165,7 @@ class ThemeCoverageTests(unittest.TestCase):
                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                       (self.pid, gid, 1, 1, '正文过少的通知', '说明', '[]', 'm', 'thin', 0, 0, now))
             c.commit()
-        topics.name_topics = lambda *a, **k: {0: '紧密簇主题'}
+        topics.name_topics = _name_every_bucket
         tree.build(self.store, self.pid, {'id': 'r1', 'deadline': time.time() + 3600},
                    lambda: False, _MockModel())
         payload = self._payload()

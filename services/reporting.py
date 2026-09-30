@@ -5,7 +5,13 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from services.evidence import evidence_quality, select_evidence, verify_claim_evidence
+from services.evidence import (
+    claim_semantic_scores,
+    evidence_quality,
+    select_evidence,
+    verify_claim_evidence,
+    verify_inference_evidence,
+)
 
 
 DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx", ".md", ".txt", ".png", ".jpg", ".jpeg"}
@@ -477,8 +483,53 @@ def _research_direction(_scan, _summaries, analysis):
     }
 
 
-def build_report_analysis_prompt(scan, summaries, analysis, local_report, evidence_limit=8, excerpt_limit=650):
-    """Build a bounded, traceable input for the report-planning model."""
+def candidates_have_evidence(local_report):
+    """True when at least one local direction candidate carries body evidence."""
+    return any(
+        (item.get("evidence_chain") or item.get("evidence_ids"))
+        for item in (local_report.get("direction_candidates") or [])
+    )
+
+
+def _aligned_evidence_catalog(analysis, local_report, categories, limit=16, per_candidate=3, candidates=5):
+    """Evidence catalog aligned with the candidates the model must choose from.
+
+    The first slots hold each top candidate's own verified evidence, so every
+    candidate the model may pick has citable ids in the catalog.  Remaining
+    slots are filled from the global pool for key findings.
+    """
+    output, seen = [], set()
+
+    def add(item):
+        evidence_id = str((item or {}).get("evidence_id") or "").strip()
+        if not evidence_id or evidence_id in seen or len(output) >= limit:
+            return False
+        seen.add(evidence_id)
+        output.append(item)
+        return True
+
+    for candidate in list(local_report.get("direction_candidates") or [])[:candidates]:
+        taken = 0
+        for item in candidate.get("evidence_chain") or []:
+            if taken >= per_candidate:
+                break
+            if add(item):
+                taken += 1
+    for item in _analysis_evidence(analysis, limit, categories=categories):
+        if len(output) >= limit:
+            break
+        add(item)
+    return output
+
+
+def build_report_analysis_prompt(scan, summaries, analysis, local_report, evidence_limit=8, excerpt_limit=650,
+                                 aligned=False):
+    """Build a bounded, traceable input for the report-planning model.
+
+    ``aligned`` (SJFX_OVERVIEW_EVIDENCE_ALIGN) builds the catalog from the
+    candidates' own evidence and asks for ``candidate_rank`` instead of a free
+    title; the default keeps the previous prompt byte-for-byte.
+    """
     categories = [{
         "name": item.get("name"),
         "dimension": item.get("dimension"),
@@ -486,6 +537,8 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
         "topics": item.get("topics", [])[:8],
         "representative_documents": item.get("representative_documents", [])[:4],
     } for item in local_report.get("global_categories", [])]
+    if aligned:
+        return _build_aligned_report_prompt(scan, summaries, analysis, local_report, categories)
 
     catalog = []
     for item in _analysis_evidence(analysis, evidence_limit, categories=categories):
@@ -567,6 +620,101 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
         } for item in local_report.get("direction_candidates", [])[:5]], ensure_ascii=False),
         summaries=json.dumps(summaries_context, ensure_ascii=False),
         evidence=json.dumps(catalog, ensure_ascii=False),
+    )
+    return prompt, catalog
+
+
+def _build_aligned_report_prompt(scan, summaries, analysis, local_report, categories,
+                                 evidence_limit=16, excerpt_limit=420):
+    raw_catalog = _aligned_evidence_catalog(analysis, local_report, categories, limit=evidence_limit)
+    catalog = []
+    for item in raw_catalog:
+        catalog.append(dict(item, text=" ".join(str(item.get("text") or "").split())))
+    catalog_ids = {str(item.get("evidence_id")) for item in catalog}
+    prompt_catalog = [{
+        "evidence_id": str(item.get("evidence_id")),
+        "source_path": item.get("source_path"),
+        "page": item.get("page"),
+        "section": item.get("section"),
+        "text": str(item.get("text") or "")[:excerpt_limit],
+    } for item in catalog]
+
+    summaries_context = []
+    for item in _balanced_report_summaries(summaries, categories, limit=6):
+        payload = item.get("payload", {})
+        summaries_context.append({
+            "path": item.get("path"),
+            "title": payload.get("title"),
+            "summary": (payload.get("summary") or payload.get("core_summary") or "")[:600],
+            "topics": payload.get("topics", [])[:8],
+        })
+
+    candidates = []
+    for item in list(local_report.get("direction_candidates") or [])[:5]:
+        breakdown = item.get("score_breakdown") or {}
+        candidates.append({
+            "candidate_rank": item.get("rank"),
+            "title": item.get("title"),
+            "score": item.get("score"),
+            "priority": item.get("priority"),
+            "confidence": item.get("confidence"),
+            "document_count": breakdown.get("document_count"),
+            "independent_source_count": item.get("independent_source_count"),
+            "dimensions": breakdown.get("dimensions"),
+            "evidence_ids": [value for value in (item.get("evidence_ids") or []) if str(value) in catalog_ids],
+        })
+
+    prompt = """你正在为一个未知数据包撰写《数据包情况概览报告》的研究规划部分。请基于证据目录和本地候选做实质性分析，而不是按关键词套用固定题目。
+
+硬约束：
+1. 只能使用给定证据目录中的 evidence_id；不得编造文件、时间、结论、数字或领域事实。
+2. 首选方向只能从“本地评分候选”中选择，用 candidate_rank 指明是哪一个；不得改写候选标题、不得另造主题。你可以根据证据的独立来源、跨主题独特性、影响、时效、矛盾与证据缺口改变先后，不必选第 1 名。
+3. 首选方向与深入方向都是推论，evidence_ids 必须取自所选候选列出的 evidence_ids；证据不足时明确写出不足，不得强行给高置信度。
+4. 文件数量只说明材料规模，不等于研究价值；不因某类文件最多就自动优先。
+5. 研究问题写明“研究哪个对象、比较什么维度、如何用原文验证”；只在证据明确提供时写机构、指标、时间区间或版本。不要仅写“趋势分析”“进一步研究”。
+6. 研究方法使用“具体动作 → 预期产物”的表达；产物是研究计划，不得把尚未执行的分析写成既成发现。
+7. key_findings 只写原文可直接核验的事实，每条必须带 1-2 个 evidence_id，数字必须与原文一致；没有把握就少写或不写。
+
+输出一个合法 JSON 对象：
+{{
+  "key_findings":[{{"statement":"一条可由原文直接核验的发现","evidence_ids":["E-..."]}}],
+  "recommended_research_direction":{{
+    "candidate_rank":1,
+    "rationale":"结合证据说明为何优先研究该候选",
+    "research_questions":["2-4 个可验证问题"],
+    "methods":["2-4 个可执行方法"],
+    "priority":"高/中/低",
+    "confidence":"高/中/低",
+    "evidence_ids":["E-..."]
+  }},
+  "directions":[{{
+    "candidate_rank":2,
+    "direction":"可选深入方向（基于该候选的具体切入点）",
+    "confidence":"高/中/低",
+    "basis":"判断依据",
+    "confidence_note":"置信度说明",
+    "evidence_ids":["E-..."]
+  }}]
+}}
+key_findings 不超过 3 条，directions 不超过 3 条。
+
+扫描统计：{scan}
+本地内容分类：{categories}
+本地评分候选：{candidates}
+已有节点摘要：{summaries}
+证据目录：{evidence}""".format(
+        scan=json.dumps({
+            "file_count": scan.get("file_count", 0),
+            "directory_count": scan.get("directory_count", 0),
+            "total_size": scan.get("total_size_human"),
+            "type_counts": scan.get("type_counts", {}),
+            "truncated": scan.get("truncated", False),
+            "read_errors": len(scan.get("errors", [])),
+        }, ensure_ascii=False),
+        categories=json.dumps(categories, ensure_ascii=False),
+        candidates=json.dumps(candidates, ensure_ascii=False),
+        summaries=json.dumps(summaries_context, ensure_ascii=False),
+        evidence=json.dumps(prompt_catalog, ensure_ascii=False),
     )
     return prompt, catalog
 
@@ -810,7 +958,140 @@ def _global_categories(scan, analysis):
     return _physical_directory_categories(scan, analysis), "root_inventory_fallback"
 
 
-def build_local_report(scan, summaries, analysis=None):
+KEY_FINDINGS_PLACEHOLDER = "尚未形成已核验的内容发现：文件与节点摘要中还没有通过原文核验的结论，完成初步或深度摘要后会在此列出。"
+
+
+def is_fallback_summary(payload):
+    """Local fallback summaries (raw text preview) count for coverage only, never as content evidence."""
+    return "fallback" in str((payload or {}).get("generated_by") or "").lower()
+
+
+def content_key_findings(summaries, limit=5):
+    """Content findings from already-verified file claims and node summary claims.
+
+    File claims are used only when ``build_file_claims`` marked them verified.
+    Node claims marked supported are used as-is; a node claim still in
+    ``candidate`` state is verified here against the node's own evidence.
+    """
+    file_rows, node_rows = [], []
+    for row in summaries or []:
+        if not isinstance(row, dict):
+            continue
+        payload = row.get("payload") or {}
+        if not isinstance(payload, dict) or is_fallback_summary(payload):
+            continue
+        path = str(row.get("path") or payload.get("node_path") or "")
+        for claim in payload.get("file_conclusions") or []:
+            if not isinstance(claim, dict) or claim.get("status") != "verified":
+                continue
+            text = " ".join(str(claim.get("text") or "").split())
+            ids = [
+                str(item.get("evidence_id")) for item in (claim.get("supports") or [])
+                if isinstance(item, dict) and item.get("evidence_id")
+            ]
+            if text and ids:
+                file_rows.append((float(claim.get("confidence") or 0), path, text, list(dict.fromkeys(ids))))
+        if not path.startswith("node:"):
+            continue
+        evidence_by_id = {
+            str(item.get("evidence_id")): item
+            for item in list(payload.get("evidence") or []) + list(payload.get("evidence_chain") or [])
+            if isinstance(item, dict) and item.get("evidence_id")
+        }
+        for claim in payload.get("claims") or []:
+            if not isinstance(claim, dict):
+                continue
+            text = " ".join(str(claim.get("statement") or "").split())
+            ids = [str(value) for value in (claim.get("evidence_ids") or []) if str(value)]
+            if not text or not ids:
+                continue
+            if claim.get("support_status") != "supported":
+                ids = [
+                    value for value in ids
+                    if value in evidence_by_id
+                    and verify_claim_evidence(text, evidence_by_id[value]).get("support_status") == "supported"
+                ]
+                if not ids:
+                    continue
+            node_rows.append((path, str(payload.get("title") or ""), text, ids))
+            break  # one finding per node keeps themes diverse
+    file_rows.sort(key=lambda row: -row[0])
+    files_seen = set()
+    file_items = []
+    for confidence, path, text, ids in file_rows:
+        if path in files_seen:
+            continue
+        files_seen.add(path)
+        file_items.append({
+            "statement": text, "source_type": "file_claim", "source_path": path,
+            "evidence_ids": ids, "support_status": "supported", "confidence": round(confidence, 3),
+        })
+    node_items = [{
+        "statement": text, "source_type": "node_claim", "source_path": path,
+        "node_title": title, "evidence_ids": ids, "support_status": "supported",
+    } for path, title, text, ids in node_rows]
+    output, seen = [], set()
+    for index in range(max(len(file_items), len(node_items))):
+        for pool in (node_items, file_items):
+            if index >= len(pool) or len(output) >= limit:
+                continue
+            key = re.sub(r"\s+", "", pool[index]["statement"]).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(pool[index])
+    return output[:limit]
+
+
+def _finding_text(item):
+    statement = str(item.get("statement") or "").strip()
+    if item.get("source_type") == "file_claim" and item.get("source_path"):
+        return "{}（文件：{}）".format(statement, Path(str(item["source_path"])).name)
+    if item.get("source_type") == "node_claim" and item.get("node_title"):
+        return "{}（主题：{}）".format(statement, item["node_title"])
+    if item.get("evidence_ids"):
+        return "{}（引证 {}）".format(statement, "、".join(str(value) for value in item["evidence_ids"][:2]))
+    return statement
+
+
+def compose_key_findings(report, model_findings=None, limit=5):
+    """Model findings that passed factual verification first, then content findings."""
+    rows, seen = [], set()
+    for item in list(model_findings or [])[:3] + list(report.get("content_key_findings") or []):
+        key = re.sub(r"\s+", "", str(item.get("statement") or "")).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append(item)
+        if len(rows) >= limit:
+            break
+    report["key_findings_detail"] = rows
+    report["key_findings"] = [_finding_text(item) for item in rows] or [KEY_FINDINGS_PLACEHOLDER]
+    return report
+
+
+def _direction_entry(candidate):
+    return {
+        "direction": candidate["title"],
+        "type": "推论",
+        "question": (candidate.get("research_questions") or [None])[0],
+        "value": candidate.get("rationale"),
+        "answer": candidate.get("rationale"),
+        "confidence": candidate["confidence"],
+        "priority": candidate.get("priority"),
+        "score": candidate.get("score"),
+        "representative_documents": candidate.get("representative_documents", []),
+        "evidence_ids": candidate.get("evidence_ids", []),
+        "evidence_chain": candidate["evidence_chain"],
+        "basis": candidate.get("basis") or candidate["rationale"],
+        "limitations": candidate.get("limitations", []),
+        "confidence_note": "置信度由跨文档主题覆盖与可引用证据数量决定；建议在正式研究前复核代表文档原文。",
+    }
+
+
+def build_local_report(scan, summaries, analysis=None, content_findings=False):
+    """``content_findings`` (SJFX_OVERVIEW_EVIDENCE_ALIGN) moves pipeline counters to
+    基本情况, quality notices to limitations, and fills 关键发现 with verified content."""
     analysis = analysis or {}
     stats = analysis.get("statistics", {})
     coverage = analysis.get("coverage") or {}
@@ -931,6 +1212,8 @@ def build_local_report(scan, summaries, analysis=None):
     elif semantic_clusters == 0 and int(stats.get("parsed_files") or 0) > 1:
         findings.append("本次未产生语义主题簇，目录按词法主题生成，分组精度低于语义模式，请人工复核。")
 
+    # The first four lines are pipeline counters, the rest are quality notices.
+    pipeline_statistics, quality_notices = findings[:4], findings[4:]
     direction_candidates = _direction_candidates(scan, analysis)
     direction = direction_candidates[0] if direction_candidates else _research_direction(scan, summaries, analysis)
     dimensions = analysis.get("classification_dimensions", [])
@@ -961,7 +1244,7 @@ def build_local_report(scan, summaries, analysis=None):
             "newly_processed_files": stats.get("newly_processed_files", stats.get("parsed_files", 0)),
         },
     }
-    return {
+    report = {
         "schema_version": 5,
         "title": "数据包情况概览报告",
         "basic_information": [
@@ -996,22 +1279,7 @@ def build_local_report(scan, summaries, analysis=None):
         "classification_coverage": classification_coverage,
         "key_findings": findings,
         "recommended_research_direction": direction,
-        "directions": [{
-            "direction": candidate["title"],
-            "type": "推论",
-            "question": (candidate.get("research_questions") or [None])[0],
-            "value": candidate.get("rationale"),
-            "answer": candidate.get("rationale"),
-            "confidence": candidate["confidence"],
-            "priority": candidate.get("priority"),
-            "score": candidate.get("score"),
-            "representative_documents": candidate.get("representative_documents", []),
-            "evidence_ids": candidate.get("evidence_ids", []),
-            "evidence_chain": candidate["evidence_chain"],
-            "basis": candidate.get("basis") or candidate["rationale"],
-            "limitations": candidate.get("limitations", []),
-            "confidence_note": "置信度由跨文档主题覆盖与可引用证据数量决定；建议在正式研究前复核代表文档原文。",
-        } for candidate in direction_candidates[1:5]],
+        "directions": [_direction_entry(candidate) for candidate in direction_candidates[1:5]],
         "direction_candidates": direction_candidates,
         "analysis_method": {
             "parse": "Docling 统一文档模型；图片和扫描 PDF 使用 RapidOCR；失败项显式降级",
@@ -1023,6 +1291,21 @@ def build_local_report(scan, summaries, analysis=None):
         },
         "generation_mode": "local_complete",
     }
+    if not content_findings:
+        return report
+    report["basic_information"].append("处理统计：{}".format(
+        "；".join(str(item).rstrip("。") for item in pipeline_statistics)
+    ))
+    report["quality_notices"] = list(quality_notices)
+    report["limitations"] = list(quality_notices)
+    value_judgment = dict(report.get("value_judgment") or {})
+    value_judgment["limitations"] = list(dict.fromkeys(
+        list(value_judgment.get("limitations") or []) + list(quality_notices)
+    ))
+    report["value_judgment"] = value_judgment
+    report["content_key_findings"] = content_key_findings(summaries)
+    report["key_findings_source"] = "verified_content"
+    return compose_key_findings(report)
 
 
 def _model_evidence_chain(evidence_catalog, evidence_ids, fallback, claim=None):
@@ -1043,6 +1326,215 @@ def _model_evidence_chain(evidence_catalog, evidence_ids, fallback, claim=None):
                 item.update(verification)
             selected.append(item)
     return selected
+
+
+_CONFIDENCE_ORDER = {"低": 0, "中": 1, "高": 2}
+
+
+def _inference_chain(evidence_catalog, allowed_ids, claim, semantic_threshold):
+    """Evidence (restricted to ``allowed_ids``) relevant to one inference claim."""
+    pool = [
+        item for item in evidence_catalog
+        if str(item.get("evidence_id") or "") in allowed_ids and evidence_quality(item).get("eligible")
+    ]
+    if not pool:
+        return []
+    scores, mode = claim_semantic_scores(claim, pool)
+    output = []
+    for index, item in enumerate(pool):
+        verification = verify_inference_evidence(
+            claim, item,
+            semantic_score=scores[index] if index < len(scores) else 0.0,
+            relevance_mode=mode, semantic_threshold=semantic_threshold,
+        )
+        if verification.get("support_status") == "supported":
+            output.append(dict(item, **verification))
+    return output
+
+
+def _match_candidate(value, by_rank, by_title):
+    if not isinstance(value, dict):
+        return None, None
+    try:
+        rank = int(value.get("candidate_rank"))
+    except (TypeError, ValueError):
+        rank = None
+    if rank is not None and rank in by_rank:
+        return by_rank[rank], "candidate_rank"
+    title = re.sub(r"\s+", "", str(value.get("title") or value.get("direction") or "")).casefold()
+    if title and title in by_title:
+        return by_title[title], "exact_title"
+    return None, None
+
+
+def _resolve_inference(evidence_catalog, candidate, cited_ids, claim, semantic_threshold):
+    """Verify against the model's citations first, then the candidate's own evidence."""
+    catalog_ids = {str(item.get("evidence_id")) for item in evidence_catalog if item.get("evidence_id")}
+    candidate_ids = {str(value) for value in (candidate.get("evidence_ids") or []) if value} & catalog_ids
+    cited = {str(value) for value in (cited_ids or []) if value} & candidate_ids
+    if cited:
+        chain = _inference_chain(evidence_catalog, cited, claim, semantic_threshold)
+        if chain:
+            return chain, "model_cited"
+    chain = _inference_chain(evidence_catalog, candidate_ids, claim, semantic_threshold)
+    return chain, ("candidate_evidence" if chain else "none")
+
+
+def merge_model_report_aligned(local_report, model_report, evidence_catalog=None, semantic_threshold=0.86):
+    """SJFX_OVERVIEW_EVIDENCE_ALIGN merge: rank-based choice, inference relevance check,
+    fact-checked key findings.  The local candidate's scope, score, priority and
+    evidence boundary stay fixed; the model contributes choice and wording."""
+    merged = dict(local_report)
+    evidence_catalog = list(evidence_catalog or [])
+    model_report = model_report if isinstance(model_report, dict) else {}
+    candidates = list(local_report.get("direction_candidates") or [])
+    by_rank = {int(item["rank"]): item for item in candidates if isinstance(item.get("rank"), int)}
+    by_title = {
+        re.sub(r"\s+", "", str(item.get("title") or "")).casefold(): item
+        for item in candidates if item.get("title")
+    }
+    adoption = {
+        "recommendation": "absent", "matched_by": None, "evidence_source": None,
+        "directions_offered": 0, "directions_adopted": 0,
+        "key_findings_offered": 0, "key_findings_adopted": 0,
+    }
+
+    chosen_rank = None
+    recommendation = model_report.get("recommended_research_direction")
+    if isinstance(recommendation, dict):
+        candidate, matched_by = _match_candidate(recommendation, by_rank, by_title)
+        adoption["matched_by"] = matched_by
+        if candidate is None:
+            adoption["recommendation"] = "invalid_candidate"
+            merged["rejected_model_recommendation"] = dict(
+                recommendation, evidence_status="insufficient",
+                rejection_reason="模型未指明有效的本地候选编号。",
+            )
+        else:
+            rationale = " ".join(str(recommendation.get("rationale") or "").split())
+            claim = "{} {}".format(candidate.get("title") or "", rationale).strip()
+            chain, source = _resolve_inference(
+                evidence_catalog, candidate, recommendation.get("evidence_ids"), claim, semantic_threshold,
+            )
+            adoption["evidence_source"] = source
+            record = dict(candidate)
+            record.update({
+                "type": "推论",
+                "model_candidate_rank": candidate.get("rank"),
+                "model_matched_by": matched_by,
+                "local_rationale": candidate.get("rationale"),
+                "evidence_selection": source,
+            })
+            if rationale:
+                record["rationale"] = rationale
+            for key in ("research_questions", "methods"):
+                values = [str(value).strip() for value in (recommendation.get(key) or []) if str(value).strip()]
+                if values:
+                    record[key] = values[:4]
+            model_confidence = str(recommendation.get("confidence") or "").strip()
+            local_confidence = str(candidate.get("confidence") or "中")
+            if model_confidence in _CONFIDENCE_ORDER and local_confidence in _CONFIDENCE_ORDER:
+                # The model may lower, never raise, the locally computed confidence.
+                record["confidence"] = min(model_confidence, local_confidence, key=_CONFIDENCE_ORDER.get)
+            record["evidence_chain"] = chain
+            record["evidence_ids"] = [item.get("evidence_id") for item in chain if item.get("evidence_id")]
+            record["supports_evidence_ids"] = list(record["evidence_ids"])
+            record["evidence_status"] = "supported" if chain else "insufficient"
+            record["claims"] = [{
+                "statement": record.get("rationale") or record.get("title"),
+                "type": "inference",
+                "evidence_ids": list(record["evidence_ids"]),
+                "support_status": record["evidence_status"],
+                "verification_contract": "inference-relevance/1.0",
+            }]
+            if chain:
+                adoption["recommendation"] = "adopted"
+                chosen_rank = candidate.get("rank")
+                merged["recommended_research_direction"] = record
+            else:
+                adoption["recommendation"] = "rejected_no_relevant_evidence"
+                record["rationale"] = "证据不足，当前不能形成可靠推荐。"
+                record.setdefault("limitations", [])
+                record["limitations"] = list(record["limitations"]) + ["模型推荐理由与该候选的正文证据不相关，未采纳。"]
+                merged["rejected_model_recommendation"] = record
+    if chosen_rank is not None:
+        merged["directions"] = [
+            _direction_entry(item) for item in candidates[:5] if item.get("rank") != chosen_rank
+        ][:4]
+
+    validated = []
+    for direction in (model_report.get("directions") or [])[:5]:
+        if not isinstance(direction, dict):
+            continue
+        adoption["directions_offered"] += 1
+        candidate, matched_by = _match_candidate(direction, by_rank, by_title)
+        if candidate is None:
+            continue
+        basis = " ".join(str(direction.get("basis") or "").split())
+        text = " ".join(str(direction.get("direction") or "").split()) or candidate.get("title")
+        claim = "{} {} {}".format(candidate.get("title") or "", text, basis).strip()
+        chain, source = _resolve_inference(
+            evidence_catalog, candidate, direction.get("evidence_ids"), claim, semantic_threshold,
+        )
+        if not chain:
+            continue
+        confidence = str(direction.get("confidence") or "中")
+        local_confidence = str(candidate.get("confidence") or "中")
+        if confidence in _CONFIDENCE_ORDER and local_confidence in _CONFIDENCE_ORDER:
+            confidence = min(confidence, local_confidence, key=_CONFIDENCE_ORDER.get)
+        ids = [item.get("evidence_id") for item in chain if item.get("evidence_id")]
+        validated.append({
+            "direction": text,
+            "type": "推论",
+            "candidate_rank": candidate.get("rank"),
+            "candidate_title": candidate.get("title"),
+            "matched_by": matched_by,
+            "basis": basis or candidate.get("basis"),
+            "confidence": confidence,
+            "confidence_note": direction.get("confidence_note"),
+            "evidence_chain": chain,
+            "supports_evidence_ids": ids,
+            "evidence_selection": source,
+            "evidence_status": "supported",
+            "claims": [{
+                "statement": basis or text, "type": "inference", "evidence_ids": ids,
+                "support_status": "supported", "verification_contract": "inference-relevance/1.0",
+            }],
+        })
+    adoption["directions_adopted"] = len(validated)
+    if validated:
+        merged["model_suggested_directions"] = validated
+
+    by_id = {
+        str(item.get("evidence_id")): item
+        for item in evidence_catalog
+        if item.get("evidence_id") and evidence_quality(item).get("eligible")
+    }
+    model_findings = []
+    for finding in (model_report.get("key_findings") or [])[:5]:
+        if not isinstance(finding, dict):
+            continue  # free text without evidence ids is never adopted
+        adoption["key_findings_offered"] += 1
+        statement = " ".join(str(finding.get("statement") or "").split())[:300]
+        ids = []
+        for value in (finding.get("evidence_ids") or [])[:3]:
+            item = by_id.get(str(value))
+            if item and verify_claim_evidence(statement, item).get("support_status") == "supported":
+                ids.append(str(value))
+        if statement and ids:
+            model_findings.append({
+                "statement": statement, "source_type": "model_verified",
+                "evidence_ids": ids, "support_status": "supported",
+            })
+    adoption["key_findings_adopted"] = len(model_findings)
+    merged["model_key_findings"] = model_findings
+    if "content_key_findings" in merged:
+        compose_key_findings(merged, model_findings)
+
+    adopted = adoption["recommendation"] == "adopted" or validated or model_findings
+    merged["model_adoption"] = adoption
+    merged["generation_mode"] = "model_analyzed" if adopted else local_report.get("generation_mode", "local_complete")
+    return merged
 
 
 def merge_model_report(local_report, model_report, evidence_catalog=None):

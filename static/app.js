@@ -2704,7 +2704,14 @@ async function refreshScan(scanId = state.scan?.scan_id, isCurrent = () => true)
   try {
     const importState = await api(`/api/import-tasks/${scanId}`);
     if (!isCurrent()) return;
+    const previousTaskStatus = String(state.importTask?.status || '').toLowerCase();
     state.importTask = importState.import_task || null;
+    const currentTaskStatus = String(state.importTask?.status || '').toLowerCase();
+    if (previousTaskStatus && previousTaskStatus !== currentTaskStatus && ['completed', 'partial'].includes(currentTaskStatus)) {
+      // A deep update finished: reload the overview panel instead of keeping
+      // the brief loaded before the update.
+      window.SJFXEngineering?.refreshOverview?.();
+    }
     if (state.importTask) state.processing = { ...(state.processing || {}), import_task: state.importTask, preview_queue: state.importTask.preview_queue || {} };
     if (['candidate_importing', 'candidate_analyzing', 'waiting_for_deep_selection'].includes(String(state.importTask?.status || '').toLowerCase())) {
       await loadPreliminaryDirectory(scanId, isCurrent);
@@ -3780,6 +3787,7 @@ async function refreshDeepResults(button) {
       await pollJob(data.job_id);
     }
     await refreshScan(state.scan.scan_id);
+    window.SJFXEngineering?.refreshOverview?.();
     state.summaries.clear();
     toast(data.message || '深度证据更新已完成。');
     if (state.selected) {

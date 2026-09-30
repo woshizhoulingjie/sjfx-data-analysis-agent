@@ -1010,7 +1010,7 @@ def run_forever():
                             )
                         if source not in {"preliminary_model_summary", "preliminary_node_summary"}:
                             storage.reconcile_import_task_after_summary(job.get("scan_id"))
-                        if source in {"deep_parse_model_summary", "deep_node_rebuild"}:
+                        if source in {"deep_parse_model_summary", "deep_node_rebuild"} and not Config.DEEP_REPORT_DEBOUNCE:
                             task_state = storage.get_import_task(job.get("scan_id")) or {}
                             strict_import = bool((task_state.get("checkpoint") or {}).get("selected_paths")) and not (task_state.get("checkpoint") or {}).get("large_selection")
                             if not strict_import and str(task_state.get("status") or "") in {"completed", "partial"}:
@@ -1028,6 +1028,23 @@ def run_forever():
                         if source in {"deep_parse_model_summary", "idle_deep_model_summary", "deep_node_rebuild"}:
                             _queue_idle_deep_backfill(job.get("scan_id"), job.get("owner_id"))
                             _mark_deep_update_available(job.get("scan_id"))
+                        if source in {"deep_parse_model_summary", "idle_deep_model_summary", "deep_node_rebuild"} and Config.DEEP_REPORT_DEBOUNCE:
+                            # O3 (SJFX_DEEP_REPORT_DEBOUNCE): runs after the
+                            # follow-up deep jobs above were queued, so "deep
+                            # queue drained" is accurate; one report per
+                            # distinct set of deep summaries.
+                            task_state = storage.get_import_task(job.get("scan_id")) or {}
+                            checkpoint_state = task_state.get("checkpoint") or {}
+                            strict_import = bool(checkpoint_state.get("selected_paths")) and not checkpoint_state.get("large_selection")
+                            if not strict_import and str(task_state.get("status") or "") in {"completed", "partial"}:
+                                from app import _queue_legacy_deep_report
+                                _queued, reason = _queue_legacy_deep_report(
+                                    job.get("scan_id"), job.get("owner_id")
+                                )
+                                logger.info(
+                                    "Legacy deep report trigger scan_id=%s source=%s result=%s",
+                                    job.get("scan_id"), source, reason,
+                                )
                     except Exception:
                         logger.warning(
                             "深度摘要完成后同步导入任务状态失败 scan_id=%s",

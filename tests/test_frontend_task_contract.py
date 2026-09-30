@@ -108,7 +108,9 @@ class FrontendTaskContractTests(unittest.TestCase):
         polish = (PROJECT_ROOT / "static" / "ui-polish.js").read_text(encoding="utf-8")
         style = (PROJECT_ROOT / "static" / "ui-polish.css").read_text(encoding="utf-8")
         self.assertIn('/static/ui-polish.css?v=6', html)
-        self.assertIn('/static/ui-polish.js?v=4', html)
+        # 版本号是缓存戳，随发布递增（v=4 → v=5&ordinary=…），这里只守住"外壳确实加载了
+        # ui-polish.js 且带缓存戳"，不钉死具体版本。
+        self.assertRegex(html, r'/static/ui-polish\.js\?v=\d+')
         for contract in (
             'quickNavigatorBtn', 'quickNavigatorDialog', 'quickNavigatorInput',
             'handleQuickNavigatorKeys', 'selectQuickRoute', 'syncNavigationDrawer',

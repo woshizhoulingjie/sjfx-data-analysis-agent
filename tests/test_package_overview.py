@@ -54,7 +54,9 @@ def projected_documents():
                 "source": {"path": "letters/a.eml", "extension": ".eml", "size": 100},
                 "classification": {"document_role": "信件", "primary_topic": "项目交付"},
                 "language": "en",
-                "entities": {"people": ["Alice", "Bob"], "organizations": ["Acme"]},
+                # 单个拉丁词不算人名（_credible_person_label 用来挡 "Affected" 之类的预览误识别），
+                # 所以这里用全名。
+                "entities": {"people": ["Alice Smith", "Bob Jones"], "organizations": ["Acme"]},
                 "temporal": {"document_date": "2022-12-31"},
             },
         },
@@ -65,7 +67,7 @@ def projected_documents():
                 "classification": {"document_role": "信件", "primary_topic": "项目交付"},
                 "languages": ["English", "zh-CN"],
                 "named_entities": [
-                    {"type": "person", "name": "Alice"},
+                    {"type": "person", "name": "Alice Smith"},
                     {"type": "organization", "name": "Beta Org"},
                 ],
                 "document_date": "2023-01-03",
@@ -142,7 +144,7 @@ class PackageOverviewTests(unittest.TestCase):
 
         people = {item["name"]: item["file_count"] for item in result["entities"]["people"]["items"]}
         organizations = {item["name"]: item["file_count"] for item in result["entities"]["organizations"]["items"]}
-        self.assertEqual(people, {"Alice": 2, "Bob": 1})
+        self.assertEqual(people, {"Alice Smith": 2, "Bob Jones": 1})
         self.assertEqual(organizations, {"Acme": 1, "Beta Org": 1})
 
         modified = {item["period"]: item["file_count"] for item in result["timeline"]["file_modified"]["items"]}
@@ -251,7 +253,7 @@ class PackageOverviewTests(unittest.TestCase):
                 "source": {"path": "letters/a.txt", "extension": ".txt", "size": 20},
                 "preview": {
                     "dates": ["2025-04-03"],
-                    "entities": {"people": ["Alice"], "organizations": ["Acme"]},
+                    "entities": {"people": ["Alice Smith"], "organizations": ["Acme"]},
                 },
             },
         }])
@@ -265,7 +267,7 @@ class PackageOverviewTests(unittest.TestCase):
 
         years = result["timeline"]["document_dates"]["items"]
         self.assertEqual(years[0]["period"], "2025")
-        self.assertEqual(result["entities"]["people"]["items"][0]["name"], "Alice")
+        self.assertEqual(result["entities"]["people"]["items"][0]["name"], "Alice Smith")
         candidates = result["duplicates"]["sample_candidate_groups"]
         self.assertEqual(candidates["group_count"], 1)
         self.assertEqual(candidates["candidate_duplicate_file_count"], 1)

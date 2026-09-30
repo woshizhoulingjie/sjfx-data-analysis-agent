@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -56,9 +56,14 @@ from services.processing_queue import (
 from services.reporting import (
     build_local_report,
     build_report_analysis_prompt,
+    candidates_have_evidence,
     compact_summary_context,
+    is_fallback_summary,
+    KEY_FINDINGS_PLACEHOLDER,
     merge_model_report,
+    merge_model_report_aligned,
 )
+from services.model_dispatch import background_generation
 from services.retrieval import evidence_corpus, retrieve_evidence
 from services import large_package_recall
 from services.scanner import (
@@ -180,7 +185,9 @@ for _handler in logging.getLogger().handlers:
 logging.getLogger("docling").setLevel(logging.WARNING)
 logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 app.config["JSON_AS_ASCII"] = False
-large_package_store = LargePackageStore()
+# 延迟初始化：`import app` 不得建状态目录/开库（启动契约），真实 Web 启动在
+# `_initialize_runtime_state()` 里显式初始化。
+large_package_store = LazyStorage(LargePackageStore)
 storage = LazyStorage(
     lambda: Storage(
         Config.DB_PATH,
@@ -221,13 +228,8 @@ except Exception as _multiuser_import_error:  # pragma: no cover
 
 _multi_user_store = None
 if _MULTIUSER_AVAILABLE:
-    try:
-        _multi_user_store = _MultiUserStore(str(Config.DB_PATH))
-    except Exception as _multiuser_init_error:  # pragma: no cover
-        _multiuser_available_backup = _MULTIUSER_AVAILABLE
-        _MULTIUSER_AVAILABLE = False
-        _multi_user_store = None
-        logger.error("多用户用户表初始化失败，退回单用户模式：%r", _multiuser_init_error)
+    # 延迟初始化（同上）；真正建表在 `_initialize_runtime_state()`，失败则退回单用户。
+    _multi_user_store = LazyStorage(lambda: _MultiUserStore(str(Config.DB_PATH)))
 
 
 def _bootstrap_multiuser_admin():
@@ -438,8 +440,17 @@ def _configure_file_logging():
 
 def _initialize_runtime_state():
     """Perform filesystem and database mutations only for a real Web startup."""
+    global _MULTIUSER_AVAILABLE, _multi_user_store
     ensure_runtime_directories()
     runtime_storage = storage.initialize()
+    large_package_store.initialize()
+    if _MULTIUSER_AVAILABLE and _multi_user_store is not None:
+        try:
+            _multi_user_store.initialize()
+        except Exception as _multiuser_init_error:  # pragma: no cover
+            _MULTIUSER_AVAILABLE = False
+            _multi_user_store = None
+            logger.error("多用户用户表初始化失败，退回单用户模式：%r", _multiuser_init_error)
     runtime_storage.migrate_legacy_ownership(
         _configured_owner_id,
         aliases=["legacy", "default", _token_owner_alias],
@@ -1922,33 +1933,56 @@ def _local_document_fallback(document, node_path, reason):
     }
 
 
-def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
-    """Use the configured model for research judgment, preserving local evidence."""
+def _analyze_report_with_model(scan_result, summaries, analysis, report_data, background=False):
+    """Use the configured model for research judgment, preserving local evidence.
+
+    ``background``: an automatically triggered overview (O2) enters the shared
+    generation gate at background priority so interactive requests go first.
+    """
     if not (llm_generation_enabled and llm.configured):
         return report_data, None, {}, "模型分析未启用；报告保留待模型分析的研究方向。"
 
+    aligned = bool(Config.OVERVIEW_EVIDENCE_ALIGN)
+    if aligned and not candidates_have_evidence(report_data):
+        # O1: with no evidence-backed candidate the model output can only be
+        # rejected, so the ~30 s call is skipped and the local version is kept.
+        report_data["model_analysis"] = {
+            "status": "skipped", "reason": "no_candidate_evidence", "elapsed_ms": 0.0,
+        }
+        return report_data, None, {}, "没有候选方向具备合格正文证据，已跳过模型研究方向分析，保留本地版概览。"
+
     prompt, evidence_catalog = build_report_analysis_prompt(
-        scan_result, summaries, analysis, report_data
+        scan_result, summaries, analysis, report_data, aligned=aligned,
     )
     model_started = time.perf_counter()
+    gate = background_generation() if (background and Config.OVERVIEW_BACKGROUND_PRIORITY) else nullcontext()
     try:
-        result = llm.chat_json(
-            "你是严谨的数据包分析与研究规划助手。你必须从证据中归纳，不得使用固定领域模板。"
-            "事实与推论严格分开；研究建议必须可验证、可回溯。",
-            prompt,
-            max_tokens=1800,
-            strict=True,
-            retries=0,
-            timeout=300,
-            required_fields=("recommended_research_direction",),
-            output_context="报告研究方向分析",
-        )
-        merged = merge_model_report(report_data, result["json"], evidence_catalog)
+        with gate:
+            result = llm.chat_json(
+                "你是严谨的数据包分析与研究规划助手。你必须从证据中归纳，不得使用固定领域模板。"
+                "事实与推论严格分开；研究建议必须可验证、可回溯。",
+                prompt,
+                max_tokens=1800,
+                strict=True,
+                retries=0,
+                timeout=300,
+                required_fields=("recommended_research_direction",),
+                output_context="报告研究方向分析",
+            )
+        if aligned:
+            merged = merge_model_report_aligned(
+                report_data, result["json"], evidence_catalog,
+                semantic_threshold=Config.OVERVIEW_INFERENCE_SEMANTIC_THRESHOLD,
+            )
+        else:
+            merged = merge_model_report(report_data, result["json"], evidence_catalog)
         merged["model_analysis"] = {
             "status": "completed",
             "model": result.get("model"),
             "evidence_catalog_size": len(evidence_catalog),
             "elapsed_ms": round((time.perf_counter() - model_started) * 1000, 2),
+            "evidence_align": aligned,
+            "gate_priority": "background" if (background and Config.OVERVIEW_BACKGROUND_PRIORITY) else "foreground",
         }
         return (
             merged,
@@ -1964,8 +1998,23 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data):
         return report_data, None, {}, "模型研究方向分析失败：{}。报告未使用关键词规则替代。".format(exc)
 
 
+_OVERVIEW_VOLATILE_KEYS = (
+    "pipeline_timing_ms", "model_analysis", "report_fingerprint", "generated_at",
+    "docx_file_name", "docx_reused",
+)
+
+
+def _overview_report_fingerprint(report_data):
+    """Content fingerprint of an overview, ignoring timing-only fields (O6)."""
+    stable = {key: value for key, value in (report_data or {}).items() if key not in _OVERVIEW_VOLATILE_KEYS}
+    return hashlib.sha256(
+        json.dumps(stable, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=None,
-                          source_fingerprint=None):
+                          source_fingerprint=None, background=False,
+                          report_type=None, deep_source_fingerprint=None):
     overview_started = time.perf_counter()
     if summary_stage == "preliminary" and source_fingerprint:
         current_fingerprint = _preliminary_overview_source_fingerprint(scan_id)
@@ -2034,8 +2083,17 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
                 changed = True
         if changed:
             storage.save_analysis(scan_id, analysis)
+    # O5: local-fallback summaries (raw text preview) stay in coverage counts
+    # (``summary_quality`` below) but are never used as content evidence.
+    content_summaries = (
+        [item for item in summaries if not is_fallback_summary(item.get("payload"))]
+        if Config.OVERVIEW_EXCLUDE_FALLBACK else summaries
+    )
     aggregation_started = time.perf_counter()
-    report_data = build_local_report(scan_result, summaries, analysis)
+    report_data = build_local_report(
+        scan_result, content_summaries, analysis,
+        content_findings=bool(Config.OVERVIEW_EVIDENCE_ALIGN),
+    )
     if summary_stage == "preliminary" and source_fingerprint:
         report_data["source_fingerprint"] = source_fingerprint
     report_data.setdefault("pipeline_timing_ms", {})["local_overview_aggregation"] = round(
@@ -2047,11 +2105,18 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         report_data["summary_quality"] = {"stage":summary_stage,"file_summaries":len(stage_files),"node_summaries":len(stage_nodes),
             "degraded_file_summaries":sum(bool((s.get("parser_info") or {}).get("degraded")) for s in stage_files),
             "degraded_node_summaries":sum(bool((s.get("parser_info") or {}).get("degraded")) for s in stage_nodes)}
+        if Config.OVERVIEW_EXCLUDE_FALLBACK:
+            report_data["summary_quality"]["fallback_file_summaries"] = sum(is_fallback_summary(s) for s in stage_files)
+            report_data["summary_quality"]["fallback_node_summaries"] = sum(is_fallback_summary(s) for s in stage_nodes)
     if summary_stage == "parsed":
         report_data["summary_stage"] = "parsed"
         model_name, model_usage, warning = None, {}, "解析版概览仅使用已解析内容与证据，不调用摘要模型。"
     else:
-        report_data, model_name, model_usage, warning = _analyze_report_with_model(scan_result, summaries, analysis, report_data)
+        report_data, model_name, model_usage, warning = _analyze_report_with_model(
+            scan_result, content_summaries, analysis, report_data, background=background,
+        )
+    # O7: the brief exposes the stage even for the legacy (non-selected) flow.
+    report_data.setdefault("summary_stage", summary_stage or "legacy")
     if selected_paths:
         # The report is a selected-scope projection.  ``build_local_report``
         # also exposes package-wide metrics for legacy flows; leaving those in
@@ -2080,7 +2145,7 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
             if direction:
                 report_data["recommended_research_direction"] = direction
             facts = list(statistics.get("key_facts") or [])
-            report_data["key_findings"] = facts[:5] + list(statistics.get("conclusions") or []) + facts[5:] + [x for x in (report_data.get("key_findings") or []) if "抽样/首轮概览" not in str(x)]
+            report_data["key_findings"] = facts[:5] + list(statistics.get("conclusions") or []) + facts[5:] + [x for x in (report_data.get("key_findings") or []) if "抽样/首轮概览" not in str(x) and x != KEY_FINDINGS_PLACEHOLDER]
             report_data.setdefault("limitations", []).extend(statistics.get("uncertainties") or [])
         stage_type = (
             staged_summary_type(summary_stage, "file")
@@ -2215,11 +2280,37 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         current_fingerprint = _preliminary_overview_source_fingerprint(scan_id)
         if current_fingerprint != source_fingerprint:
             raise ValueError("初步摘要在概览生成期间发生变化，拒绝保存过期情报概览")
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    name = "情况概览报告_{}_{}_自动.docx".format(safe_name(Path(scan_result["root"]).name), stamp)
-    create_report_docx(report_data, scan_result, _output_path_for_write(name, owner_id))
-    storage.save_artifact(name, owner_id, scan_id=scan_id, job_id=job_id, kind="overview_report")
-    storage.save_summary(scan_id, ".", "{}_report".format(summary_stage) if summary_stage else "report", report_data)
+    report_summary_type = report_type or ("{}_report".format(summary_stage) if summary_stage else "report")
+    if report_type == "deep_report" and report_data.get("summary_stage") == "legacy":
+        report_data["summary_stage"] = "deep"
+    if deep_source_fingerprint:
+        # O3: the debounced legacy deep report records which deep summaries
+        # it was built from so an identical trigger can be skipped.
+        report_data["source_fingerprint"] = deep_source_fingerprint
+    # O6: an overview whose content did not change reuses the DOCX already
+    # written for it instead of adding another timestamped copy.
+    report_fingerprint = _overview_report_fingerprint(report_data)
+    report_data["report_fingerprint"] = report_fingerprint
+    previous = storage.get_summary(scan_id, ".", report_summary_type) or {}
+    reuse_name = str(previous.get("docx_file_name") or "")
+    effective_owner = owner_id or _effective_owner()
+    if not (
+        reuse_name
+        and previous.get("report_fingerprint") == report_fingerprint
+        and storage.artifact_owner(reuse_name) == effective_owner
+        and _resolve_output_file(reuse_name, effective_owner) is not None
+    ):
+        reuse_name = ""
+    if reuse_name:
+        name = reuse_name
+        report_data["docx_reused"] = True
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = "情况概览报告_{}_{}_自动.docx".format(safe_name(Path(scan_result["root"]).name), stamp)
+        create_report_docx(report_data, scan_result, _output_path_for_write(name, owner_id))
+        storage.save_artifact(name, owner_id, scan_id=scan_id, job_id=job_id, kind="overview_report")
+    report_data["docx_file_name"] = name
+    storage.save_summary(scan_id, ".", report_summary_type, report_data)
     return {
         "file_name": name,
         "download_url": "/outputs/{}".format(name),
@@ -3415,6 +3506,89 @@ def _is_persisted_deep_file_summary(summary):
     return bool(level == "deep" or depth in {"deep", "deep_document"} or generated_by == "model-deep-analysis")
 
 
+def _legacy_deep_summary(scan_id, path, kind="file"):
+    """O5: read a legacy (non-selected) deep summary by its saved type.
+
+    Legacy deep jobs save ``deep_file_summary`` / ``deep_node_summary`` (see
+    the summary endpoint), while older readers looked at ``file`` / ``folder``.
+    With SJFX_OVERVIEW_EXCLUDE_FALLBACK on, the staged type is read first and
+    the old type remains a fallback; with the switch off the old read is kept.
+    """
+    legacy_type = "file" if kind == "file" else "folder"
+    if not Config.OVERVIEW_EXCLUDE_FALLBACK:
+        return storage.get_summary(scan_id, path, legacy_type) or {}
+    return (
+        storage.get_summary(scan_id, path, staged_summary_type("deep", kind)) or {}
+    ) or (storage.get_summary(scan_id, path, legacy_type) or {})
+
+
+_LEGACY_DEEP_ACTIVE_SOURCES = (
+    "deep_parse_model_summary", "idle_deep_model_summary", "deep_node_rebuild",
+)
+
+
+def _legacy_deep_report_fingerprint(scan_id):
+    """O3: stable identity of every persisted deep file/node summary."""
+    import hashlib
+    with storage._connect() as conn:
+        rows = conn.execute(
+            "SELECT node_path,summary_type,"
+            "json_extract(payload,'$.generated_at') AS generated_at,"
+            "json_extract(payload,'$.generated_by') AS generated_by "
+            "FROM summaries WHERE scan_id=? AND (summary_type IN (?,?) OR "
+            "(summary_type IN ('file','folder') AND json_extract(payload,'$.deep_analysis')))"
+            " ORDER BY node_path,summary_type",
+            (str(scan_id), staged_summary_type("deep", "file"), staged_summary_type("deep", "node")),
+        ).fetchall()
+    material = [
+        [row["node_path"], row["summary_type"], row["generated_at"], row["generated_by"]]
+        for row in rows
+    ]
+    return hashlib.sha256(
+        json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _queue_legacy_deep_report(scan_id, owner_id=None):
+    """O3: queue one legacy deep report only after the deep queue drained.
+
+    Returns ``(job_id, reason)``; ``job_id`` is None when the trigger is
+    skipped because deep work is still active, a report is already queued,
+    or the deep summaries did not change since the last deep_report.
+    """
+    with storage._connect() as conn:
+        report_active = conn.execute(
+            "SELECT 1 FROM analysis_jobs WHERE scan_id=? AND task_type='generate_report' "
+            "AND status IN ('queued','running','cancelling') LIMIT 1",
+            (str(scan_id),),
+        ).fetchone()
+        if report_active:
+            return None, "report_active"
+        deep_active = conn.execute(
+            "SELECT 1 FROM analysis_jobs WHERE scan_id=? AND task_type='generate_summary' "
+            "AND status IN ('queued','running','cancelling') AND "
+            "json_extract(options,'$.workflow_source') IN ({}) LIMIT 1".format(
+                ",".join("?" for _ in _LEGACY_DEEP_ACTIVE_SOURCES)
+            ),
+            (str(scan_id), *_LEGACY_DEEP_ACTIVE_SOURCES),
+        ).fetchone()
+    if deep_active:
+        return None, "deep_queue_active"
+    fingerprint = _legacy_deep_report_fingerprint(scan_id)
+    previous = storage.get_summary(scan_id, ".", "deep_report") or {}
+    if previous.get("source_fingerprint") == fingerprint:
+        return None, "unchanged"
+    job_id, _created = storage.create_or_get_typed_job(
+        scan_id, "generate_report",
+        options={
+            "workflow_source": "deep_results_report",
+            "deep_source_fingerprint": fingerprint,
+        },
+        owner_id=owner_id or "legacy",
+    )
+    return job_id, "queued"
+
+
 def _queue_deep_node_rebuilds(
     scan_id, owner_id=None, batch_id=None, scope_paths=None, full_inventory=False
 ):
@@ -3424,6 +3598,17 @@ def _queue_deep_node_rebuilds(
     strict_selected = bool(checkpoint.get("selected_paths"))
     deep_file_type = staged_summary_type("deep", "file") if strict_selected else "file"
     deep_node_type = staged_summary_type("deep", "node") if strict_selected else "folder"
+
+    def _deep_file(path):
+        if strict_selected:
+            return storage.get_summary(scan_id, path, deep_file_type) or {}
+        return _legacy_deep_summary(scan_id, path, "file")
+
+    def _deep_node(node_path):
+        if strict_selected:
+            return storage.get_summary(scan_id, node_path, deep_node_type) or {}
+        return _legacy_deep_summary(scan_id, node_path, "node")
+
     batch_id = "" if full_inventory else str(batch_id or checkpoint.get("deep_batch_id") or "")
     selected = [str(path) for path in (scope_paths or []) if str(path)]
     if full_inventory:
@@ -3439,7 +3624,7 @@ def _queue_deep_node_rebuilds(
     if strict_selected and task.get("status") not in {"deep_summarizing_files", "deep_summarizing_nodes", "deep_update_available"}:
         return []
     all_files_ready = bool(paths) and all(
-        _is_persisted_deep_file_summary(storage.get_summary(scan_id, path, deep_file_type) or {})
+        _is_persisted_deep_file_summary(_deep_file(path))
         for path in paths
     )
     if not paths or (not strict_selected and not all_files_ready):
@@ -3468,15 +3653,13 @@ def _queue_deep_node_rebuilds(
         # A node is eligible independently when all of its own selected files
         # have deep summaries; unrelated selected files must not hold it back.
         if any(
-            not _is_persisted_deep_file_summary(
-                storage.get_summary(scan_id, path, deep_file_type) or {}
-            )
+            not _is_persisted_deep_file_summary(_deep_file(path))
             for path in members
         ):
             continue
         node_id = str(node.get("node_id") or "")
         node_path = "node:{}".format(node_id)
-        existing = storage.get_summary(scan_id, node_path, deep_node_type) or {}
+        existing = _deep_node(node_path)
         existing_members = {str(path) for path in (existing.get("member_paths") or []) if str(path)}
         if str(existing.get("analysis_depth") or "") == "deep_folder" and bool(existing.get("deep_analysis")) and existing_members == members:
             continue
@@ -3646,12 +3829,31 @@ def _run_claimed_report_job(job):
     scan_id = job["scan_id"]
     storage.update_job(job_id, progress=5, stage="generating_report", message="正在整理情况概览报告", heartbeat=True)
     _ensure_job_active(job_id)
-    workflow_source = str((job.get("options") or {}).get("workflow_source") or "")
+    options = job.get("options") or {}
+    workflow_source = str(options.get("workflow_source") or "")
     summary_stage = "preliminary" if workflow_source == "preliminary_results_report" else ("deep" if workflow_source == "deep_results_report" else None)
+    report_type = None
+    if options.get("legacy_refresh"):
+        # O4: the legacy (non-selected) "update deep results" action now runs
+        # here instead of inside the HTTP request.  It keeps the legacy
+        # aggregation over every summary type (summary_stage=None) and is
+        # saved as deep_report so it is no longer shadowed by an older one.
+        summary_stage = None
+        report_type = "deep_report"
+    # O2: automatically triggered overviews yield model slots to foreground
+    # work; a user-clicked refresh (trigger=user) or /api/report stays
+    # foreground.
+    background = (
+        workflow_source in {"preliminary_results_report", "deep_results_report"}
+        and str(options.get("trigger") or "") != "user"
+    )
     report = _write_local_overview(
         scan_id, owner_id=job.get("owner_id"), job_id=job_id,
         summary_stage=summary_stage,
-        source_fingerprint=(job.get("options") or {}).get("source_fingerprint"),
+        source_fingerprint=options.get("source_fingerprint"),
+        background=background,
+        report_type=report_type,
+        deep_source_fingerprint=options.get("deep_source_fingerprint"),
     )
     _ensure_job_active(job_id)
     return {"scan_id": scan_id, "overview": report}
@@ -9477,10 +9679,19 @@ def package_overview(scan_id):
             "direction_candidates": list(report.get("direction_candidates") or [])[:6],
             "limitations": list((report.get("value_judgment") or {}).get("limitations") or [])[:10],
             "available": bool(report),
+            # O7: lets the page label parsed / preliminary / deep / legacy.
+            "summary_stage": report.get("summary_stage") or ("legacy" if report else None),
         }
-        artifact = storage.latest_artifact(
-            scan_id, _effective_owner(), kind="overview_report"
-        )
+        artifact = None
+        report_docx = str(report.get("docx_file_name") or "")
+        if report_docx and storage.artifact_owner(report_docx) == _effective_owner():
+            # O6: a reused DOCX is older than later artifacts; link the one
+            # that belongs to the report actually shown.
+            artifact = {"filename": report_docx, "scan_id": scan_id, "kind": "overview_report"}
+        if artifact is None:
+            artifact = storage.latest_artifact(
+                scan_id, _effective_owner(), kind="overview_report"
+            )
         return jsonify({
             "ok": True, "overview": overview,
             "research_brief": brief, "report_artifact": artifact,
@@ -9612,7 +9823,8 @@ def refresh_deep_results(scan_id):
             )
             report_id, _created = storage.create_or_get_typed_job(
                 scan_id, "generate_report",
-                options={"workflow_source": "deep_results_report", "selection_version": checkpoint.get("selection_version"), "resume_state": task_status},
+                options={"workflow_source": "deep_results_report", "selection_version": checkpoint.get("selection_version"), "resume_state": task_status,
+                         **({"trigger": "user"} if Config.OVERVIEW_BACKGROUND_PRIORITY else {})},
                 owner_id=_effective_owner(),
             )
             checkpoint["deep_overview_job_id"] = report_id
@@ -9682,7 +9894,7 @@ def refresh_deep_results(scan_id):
             )
         model_deep_completed = 0
         for path in required_model_paths:
-            summary = storage.get_summary(scan_id, path, "file") or {}
+            summary = _legacy_deep_summary(scan_id, path, "file")
             if (
                 bool(summary.get("deep_analysis"))
                 and (
@@ -9718,6 +9930,21 @@ def refresh_deep_results(scan_id):
             "selection_plan": selection_plan if large_selection else None,
                 },
             )
+        if Config.OVERVIEW_DEEP_REFRESH_ASYNC:
+            # O4: queue the overview instead of generating it (and calling the
+            # report model) inside this HTTP request.  The result is saved as
+            # deep_report by _run_claimed_report_job (legacy_refresh).
+            report_id, _created = storage.create_or_get_typed_job(
+                scan_id, "generate_report",
+                options={"workflow_source": "deep_results_report", "trigger": "user", "legacy_refresh": True},
+                owner_id=_effective_owner(),
+            )
+            return jsonify({
+                "ok": True, "accepted": True, "updated": False,
+                "scan_id": scan_id, "job_id": report_id,
+                "status_url": "/api/jobs/{}".format(report_id),
+                "message": "已排队按深度摘要更新情报概览，完成后自动刷新。",
+            }), 202
         report = _write_local_overview(
             scan_id, owner_id=_request_owner_id(), job_id=None
         )
@@ -13056,13 +13283,47 @@ def large_package_report(package_id):
         item = _large_package_owned(package_id)
         published = published_report(large_package_store, item)
         if published is not None:
+            snapshot = large_package_store.workflow_snapshot(package_id)
+            # 概览页横幅：最近一次目录校验拒绝比当前正式版更新时，给出原因与时间
+            # （None = 当前显示的就是最新目录，不提示）。
             return jsonify({"ok": True, "published": True,
                             "report": published,
-                            "snapshot": large_package_store.workflow_snapshot(package_id)})
-        report = build_report(large_package_store, item)
+                            "catalog_rejection": (snapshot or {}).get("catalog_rejection"),
+                            "snapshot": snapshot})
+        # P1: the page polls this preview every few seconds; it never calls
+        # the direction model when SJFX_LP_REPORT_CACHE_FIX is on.
+        report = (
+            build_report(large_package_store, item, model_directions=False)
+            if Config.LP_REPORT_CACHE_FIX else build_report(large_package_store, item)
+        )
         return jsonify({"ok": True, "published": False, "preview": True,
                         "report": report,
                         "snapshot": large_package_store.workflow_snapshot(package_id)})
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+
+
+@app.route("/api/large-packages/<package_id>/report/rebuild", methods=["GET", "POST"])
+def rebuild_large_package_report(package_id):
+    """P5: the "生成情报概览" button asks the large-package worker to regenerate
+    the published overview.  Nothing is computed inside this request; the
+    worker's overview catch-up picks the marker up (see _overview_catchup).
+    GET reports whether a requested regeneration is still pending."""
+    try:
+        item = _large_package_owned(package_id)
+        if request.method == "GET":
+            stored = large_package_store.get(package_id) or {}
+            pending = bool(float((stored.get("counts") or {}).get("deep_overview_pending_since") or 0))
+            return jsonify({"ok": True, "package_id": package_id, "pending": pending})
+        status = str(item.get("status") or "")
+        if status != "completed" or not getattr(Config, "LP_OVERVIEW_EAGER", True):
+            return api_error("深度摘要完成后才能重新生成情报概览；目录阶段的概览会自动生成。", 409,
+                             {"status": status})
+        large_package_store.update_package(
+            package_id, counts={"deep_overview_pending_since": time.time()}
+        )
+        return jsonify({"ok": True, "accepted": True, "package_id": package_id,
+                        "message": "已排队重新生成情报概览，完成后页面自动刷新。"}), 202
     except ValueError as exc:
         return api_error(str(exc), 404)
 

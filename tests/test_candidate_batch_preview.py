@@ -35,7 +35,9 @@ def test_candidate_batch_uses_short_budget(monkeypatch):
             return super().chat_json(*args, **kwargs)
     docs = [{"path": "a.txt", "document": {"text": "x" * 20000, "source": {"name": "a.txt"}}}]
     analyze_document_previews_batch(BudgetLLM(), docs, max_chars=3200, output_tokens_per_file=180)
-    assert seen["max_tokens"] == 180
+    # 预算固定为已验证的 960：480 时代表性批次会被 length 截断（见 document_analysis），
+    # 老的“按 output_tokens_per_file 钳制”契约已废弃。这里守住“预算即 960、输入仍被截短”。
+    assert seen["max_tokens"] == 960
     assert seen["prompt_chars"] < 5000
 
 

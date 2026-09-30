@@ -950,6 +950,9 @@ class LargePackageStore:
                                 "ORDER BY created DESC LIMIT 1", (pid,))
             latest_ok = one("SELECT created FROM lp_catalog_versions WHERE package_id=? "
                             "ORDER BY created DESC LIMIT 1", (pid,))
+            # 概览页横幅用：当前**已发布**的概览是什么时候登记的。
+            published_ov = one("SELECT created FROM lp_overview_versions WHERE package_id=? "
+                               "AND status='published' ORDER BY created DESC LIMIT 1", (pid,))
             catv = one("SELECT catalog_id,status,validation,leaf_count,topic_count "
                        "FROM lp_catalog_versions WHERE package_id=? ORDER BY created DESC LIMIT 1",
                        (pid,))
@@ -996,6 +999,13 @@ class LargePackageStore:
             validation = dict(validation or {})
             validation.setdefault('blocked_reason', str(latest_reject['reason'] or ''))
             validation['blocked_at'] = float(latest_reject['created'] or 0)
+        # 概览页横幅「目录校验未通过，当前显示上一版」：最近一次 catalog/rejected 事件
+        # **比当前已发布的概览更新**、且确实有上一版可显示时才给出（复用上面的 latest_reject）。
+        catalog_rejection = None
+        if (latest_reject is not None and published_ov is not None
+                and float(latest_reject['created'] or 0) > float(published_ov['created'] or 0)):
+            catalog_rejection = {"reason": str(latest_reject['reason'] or ''),
+                                 "created": float(latest_reject['created'] or 0)}
         allowed = {
             "pause": control == "active" and phase in self.SCHEDULABLE_PHASES
                      and status in ('queued','running','waiting_for_selection'),
@@ -1070,6 +1080,7 @@ class LargePackageStore:
             "deep_status": deep,
             "failed_by_stage": fails,
             "allowed_actions": allowed,
+            "catalog_rejection": catalog_rejection,
         }
 
     def pending_by_stage(self, package_id, stage):

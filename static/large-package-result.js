@@ -512,6 +512,25 @@
     });
   }
 
+  // 「目录校验未通过，当前显示上一版」横幅。概览阶段由情报阅读面板渲染同一条提示，这里只在
+  // 面板不可用（或目录阶段）时显示，避免同一页出现两条。
+  function renderCatalogRejection(rejection) {
+    let banner = $('largeResultCatalogRejection');
+    if (!rejection) { if (banner) banner.hidden = true; return; }
+    const anchor = $('largeResultStatus');
+    if (!banner && anchor) {
+      banner = document.createElement('p'); banner.id = 'largeResultCatalogRejection';
+      banner.className = 'large-result-catalog-rejection'; banner.setAttribute('role', 'status');
+      banner.setAttribute('aria-live', 'polite'); anchor.after(banner);
+    }
+    if (!banner) return;
+    const seconds = Number(rejection.created || 0);
+    const when = seconds > 0 ? new Date(seconds * 1000).toLocaleString('zh-CN', { hour12: false }) : '';
+    const detail = [rejection.reason ? `原因：${rejection.reason}` : '', when ? `时间：${when}` : ''].filter(Boolean).join('；');
+    banner.textContent = `⚠ 目录校验未通过，当前显示上一版${detail ? `（${detail}）` : ''}`;
+    banner.hidden = false;
+  }
+
   function renderResearchBrief(report) {
     const brief = report.research_brief || {};
     const intelligence = window.SJFXIntelligenceOverview;
@@ -528,7 +547,7 @@
     const directionHost = $('largeResultDirection');
     const preliminary = Boolean(brief.preliminary || (brief.available && !brief.ready));
     if (directionHost) directionHost.innerHTML = direction.title
-      ? `<h4>${esc(direction.title)}</h4>${preliminary ? '<p class="lp-brief-stage">初步研究方向：完成深度摘要后将自动更新。</p>' : ''}<p>${esc(direction.rationale || '该方向仍需结合代表性资料继续验证。')}</p>${list(direction.research_questions, '暂无建议问题')}`
+      ? `<h4>${esc(direction.title)}</h4>${preliminary ? '<p class="lp-brief-stage">初步研究方向：完成深度摘要后将自动更新。</p>' : ''}${direction.coverage_note ? `<p class="lp-brief-stage">${esc(direction.coverage_note)}</p>` : ''}<p>${esc(direction.rationale || '该方向仍需结合代表性资料继续验证。')}</p>${direction.package_profile ? `<p>${esc(direction.package_profile)}</p>` : ''}${list(direction.research_questions, '暂无建议问题')}`
       : `<p>${esc(brief.empty_direction_reason || '当前尚未形成首选研究方向。')}</p>`;
     const details = $('largeResultResearchDetails');
     if (details) {
@@ -647,13 +666,18 @@
     const reportPayload = currentStage === 'catalog' ? {report:{coverage:{inventory_files:c.total_files,quick_completed:c.quick?.completed,deep_completed:c.deep?.completed},categories:c.categories || {}}} : await api()(`/api/large-packages/${encodeURIComponent(packageId)}/report`);
     if (!isCurrent()) return;
     const report = reportPayload.report || {};
+    // 目录校验拒绝了新目录、仍显示上一版时的提示：报告接口顶层字段优先，其次取 workflow 快照。
+    const catalogRejection = reportPayload.catalog_rejection || (snap && snap.catalog_rejection) || null;
+    if (stage === 'overview') report.catalog_rejection = catalogRejection;
+    renderCatalogRejection(stage === 'overview' && window.SJFXIntelligenceOverview ? null : catalogRejection);
     if (stage === 'overview') renderResearchBrief(report);
     const coverage = report.coverage || {};
     setText('largeResultInventory', coverage.inventory_files || 0);
     setText('largeResultQuick', coverage.quick_completed || 0);
     setText('largeResultDeep', coverage.deep_completed || 0);
     setText('largeResultModel', coverage.model_summaries || 0);
-    setText('largeResultFailure', (report.failures || []).length);
+    const failuresTotal = Number((report.research_brief || {}).failures_total ?? coverage.failed_files_total ?? (report.failures || []).length) || 0;
+    setText('largeResultFailure', failuresTotal);
     const overviewReady = snap ? Boolean(snap.published_view || snap.overview_state === 'published' || item.status === 'completed') : item.status === 'completed';
     setText('largeResultOverviewStatus', overviewReady ? 'REPORT READY' : (item.phase || 'PROCESSING'));
     const remaining = Math.max(0, Number(coverage.quick_completed || 0) - Number(coverage.deep_completed || 0));
@@ -663,7 +687,7 @@
     const categoryTotal = Math.max(1, Number(coverage.inventory_files || 0));
     if ($('largeResultCategorySummary')) $('largeResultCategorySummary').innerHTML = categoryEntries.map(([category, count]) => `<div class="large-result-category-row"><span>${esc(category)}</span><i><b style="width:${Math.min(100, Number(count) / categoryTotal * 100)}%"></b></i><em>${count}</em></div>`).join('') || '<div class="large-empty">暂无分类统计。</div>';
     const failures = report.failures || [];
-    if ($('largeResultWarnings')) $('largeResultWarnings').innerHTML = failures.length ? `<p>有 ${failures.length} 个文件需要复核或重新处理。</p><ul>${failures.slice(0, 8).map((failure) => `<li>${esc(failure.path || '')}${failure.error ? `：${esc(failure.error)}` : ''}</li>`).join('')}</ul>` : '<p>当前没有快速解析失败项。</p><p>未进入深度解析的文件仍然只保留本地摘要。</p>';
+    if ($('largeResultWarnings')) $('largeResultWarnings').innerHTML = failures.length ? `<p>有 ${Math.max(failuresTotal, failures.length)} 个文件需要复核或重新处理${failuresTotal > failures.length ? `（下方列出前 ${failures.length} 条）` : ''}。</p><ul>${failures.slice(0, 8).map((failure) => `<li>${esc(failure.path || '')}${failure.error ? `：${esc(failure.error)}` : ''}</li>`).join('')}</ul>` : '<p>当前没有快速解析失败项。</p><p>未进入深度解析的文件仍然只保留本地摘要。</p>';
     const retry = $('largeResultRetryFailed');
     if (retry) retry.hidden = !failures.length || !['completed', 'waiting_for_selection'].includes(item.status);
     const select = $('largeResultCategory');
@@ -792,10 +816,29 @@
       if (!packageId) return;
       const button = $('largeResultBuildBrief');
       if (button) { button.disabled = true; button.textContent = '正在生成…'; }
+      const targetId = packageId;
       try {
-        await api()(`/api/large-packages/${encodeURIComponent(packageId)}/report`);
-        await activate(packageId, 'overview');
-        if (window.toast) window.toast('情报概览已生成（基于已完成的深度摘要）');
+        let queued = false;
+        try {
+          await api()(`/api/large-packages/${encodeURIComponent(targetId)}/report/rebuild`, { method: 'POST' });
+          queued = true;
+        } catch (error) {
+          // 409：包尚未完成深度摘要，概览由目录里程碑自动生成；只刷新当前版本。
+          if (!/深度摘要完成后/.test(String(error.message || ''))) throw error;
+        }
+        if (queued) {
+          if (button) button.textContent = '正在重新生成…';
+          for (let attempt = 0; attempt < 40 && targetId === packageId; attempt += 1) {
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            const state = await api()(`/api/large-packages/${encodeURIComponent(targetId)}/report/rebuild`);
+            if (!state.pending) break;
+          }
+        } else {
+          await api()(`/api/large-packages/${encodeURIComponent(targetId)}/report`);
+        }
+        if (targetId !== packageId) return;
+        await activate(targetId, 'overview');
+        if (window.toast) window.toast(queued ? '情报概览已重新生成（基于已完成的深度摘要）' : '情报概览已刷新');
       } catch (error) { setText('largeResultStatus', error.message || '情报概览生成失败'); }
       finally { if (button) { button.disabled = false; button.textContent = '生成情报概览'; } }
     });

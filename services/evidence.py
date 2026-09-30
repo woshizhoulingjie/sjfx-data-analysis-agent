@@ -509,6 +509,81 @@ def verify_claim_evidence(claim, item, semantic_score=0.0, relevance_mode="lexic
     })
 
 
+def claim_semantic_scores(claim, items):
+    """Cosine relevance of ``claim`` against each item; empty when embeddings are unavailable.
+
+    Uses the same provider and cache as ``select_evidence``.  Callers must treat a
+    missing score as "no semantic signal", never as support.
+    """
+    claim_text = " ".join(str(claim or "").split())
+    texts = [
+        "{} {}".format((item or {}).get("section") or "", _semantic_evidence_text(item))[:1800]
+        for item in (items or [])
+    ]
+    if not claim_text or not texts:
+        return [], "lexical-fallback"
+    scores, mode = _embedding_scores(claim_text, texts, _EMBEDDING_PROVIDER)
+    return [float(scores.get(index, 0.0) or 0.0) for index in range(len(texts))], mode
+
+
+def verify_inference_evidence(claim, item, semantic_score=0.0, relevance_mode="lexical-fallback",
+                              semantic_threshold=0.85):
+    """Check that an eligible source unit is *relevant* to a research inference.
+
+    A research-direction rationale ("优先研究 X，因为多个来源…") is an inference, not
+    a sentence that can appear verbatim in a source.  ``verify_claim_evidence`` tests
+    literal support and rejects such statements almost always (numbers such as
+    "3 个来源" never occur in the source, relation frames never match).  Here the
+    same quality and preview gates apply, but support means topical relevance:
+    a direct/indirect lexical match on the claim, or a semantic score above the
+    threshold.  Factual claims must keep using ``verify_claim_evidence``.
+    """
+    def result(payload):
+        payload["verification_contract"] = "inference-relevance/1.0"
+        payload["relevance_mode"] = relevance_mode
+        payload["semantic_score"] = round(float(semantic_score or 0.0), 6)
+        return payload
+
+    item = item if isinstance(item, dict) else {}
+    if bool(item.get("preview_only")) or str((item.get("coverage") or {}).get("level") or "").lower() == "preview":
+        return result({
+            "support_status": "insufficient", "support_score": 0.0,
+            "support_reason": "轻量预览只能用于候选检索，不能作为正式证据",
+        })
+    claim_text = " ".join(str(claim or "").split())
+    if not claim_text:
+        return result({
+            "support_status": "insufficient", "support_score": 0.0,
+            "support_reason": "推论为空，无法验证证据相关性",
+        })
+    quality = evidence_quality(item)
+    if not quality.get("eligible"):
+        return result({
+            "support_status": "insufficient", "support_score": 0.0,
+            "support_reason": quality.get("reason") or "证据质量不合格",
+        })
+    semantic = float(semantic_score or 0.0)
+    match = _claim_match(item, [claim_text], semantic_score=semantic)
+    if match.get("support_type") in {"直接证据", "间接证据"}:
+        return result({
+            "support_status": "supported",
+            "support_score": round(min(1.0, 0.6 + 0.3 * semantic), 3),
+            "support_relation": "inference_lexical",
+            "support_reason": "推论与原文主题相关：{}".format(match.get("support_reason") or ""),
+        })
+    if semantic >= float(semantic_threshold):
+        return result({
+            "support_status": "supported",
+            "support_score": round(min(0.9, semantic), 3),
+            "support_relation": "inference_semantic",
+            "support_reason": "推论与原文语义相关（相似度 {:.3f}），属推论依据，不代表原文直接陈述。".format(semantic),
+        })
+    return result({
+        "support_status": "insufficient", "support_score": 0.0,
+        "support_reason": "原文与该推论既无关键概念重合，语义相关度也未达到阈值",
+    })
+
+
 def select_evidence(
     items, topics=None, max_items=48, per_source=4, max_chars=1800,
     use_embeddings=True,

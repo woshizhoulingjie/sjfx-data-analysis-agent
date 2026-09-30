@@ -417,7 +417,8 @@
   function renderResearchBrief(brief, artifact) {
     brief = brief || {};
     const direction = brief.recommended_research_direction || {};
-    $('packageOverviewBriefTitle').textContent = brief.title || '数据包研究简报';
+    const stageLabel = { parsed: '解析版', preliminary: '初步摘要版', deep: '深度证据版' }[brief.summary_stage] || '';
+    $('packageOverviewBriefTitle').textContent = (brief.title || '数据包研究简报') + (brief.available && stageLabel ? ` · ${stageLabel}` : '');
     $('packageOverviewBriefSummary').innerHTML = brief.available
       ? briefList(brief.basic_information, '暂无总体信息')
       : emptyMarkup('研究简报尚未生成', '完成数据包分析后，这里会形成可阅读和下载的情况概览。');

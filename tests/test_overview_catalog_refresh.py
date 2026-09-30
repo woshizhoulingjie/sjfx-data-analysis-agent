@@ -139,13 +139,27 @@ def test_invalid_new_catalog_does_not_borrow_previous_version(scenario):
     first = publish(scenario)
     assert first['provenance']['catalog_id']
     with closing(store._connect()) as conn:
+        # INV-7 只数**有成员**的组（空壳组不出现在目录里，见 validate_catalog），
+        # 所以先让 group-one 真有一个成员，再删名字 —— 这才是"新目录无效"。
+        conn.execute("INSERT INTO large_catalog_members(package_id,path,group_id,input_hash,vector) "
+                     "VALUES(?,'a.txt','group-one','h',zeroblob(0))", (pid,))
+        conn.execute("UPDATE large_catalog_groups SET member_count=1 WHERE package_id=? AND id='group-one'", (pid,))
         conn.execute("DELETE FROM lp_catalog_labels WHERE package_id=?", (pid,))
         conn.commit()
     from services.large_package_catalog_naming import ensure_catalog_version
     # Existing callers retain their historical fallback contract.
     assert ensure_catalog_version(store, pid) == first['provenance']['catalog_id']
-    current = publish(scenario)
-    assert current['provenance']['catalog_id'] == ''
+    # 新契约：发布路径用 allow_previous=False，新目录无效时阻断发布、保留上一版，
+    # 并写一条 catalog/rejected 事件供概览页提示（不再发布 catalog_id 为空的报告）。
+    reports.build_overview(store, store.get(pid), milestone='catalog')
+    current = reports.published_report(store, store.get(pid))
+    assert current['report_id'] == first['report_id']
+    assert current['provenance']['catalog_id'] == first['provenance']['catalog_id']
+    with closing(store._connect()) as conn:
+        rows = conn.execute(
+            "SELECT reason FROM lp_workflow_events WHERE package_id=? AND object='catalog' "
+            "AND new_state='rejected'", (pid,)).fetchall()
+    assert rows and '目录校验' in rows[-1][0]
 
 
 def test_unchanged_deep_overview_without_v1_does_not_loop(scenario):

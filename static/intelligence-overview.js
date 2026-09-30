@@ -27,13 +27,27 @@
       ['解析覆盖', ratio == null ? null : Math.min(100, ratio <= 1 ? ratio * 100 : ratio), '按当前简报的统计口径', '%']
     ];
     return {kind, title: brief.title || (large ? '大数据包情报概览' : '资料情报概览'),
-      ready: Boolean(brief.available || brief.ready), preliminary: Boolean(brief.preliminary || (large && brief.available && !brief.ready)),
+      ready: Boolean(brief.available || brief.ready), preliminary: Boolean(brief.preliminary || (large && brief.available && !brief.ready) || (!large && brief.available && brief.summary_stage === 'preliminary')),
+      stage: large ? '' : String(brief.summary_stage || ''),
       basics: list(brief.basic_information), findings: list(brief.key_findings),
       limitations: list(brief.limitations), direction, total, metrics,
       categories: large ? Object.entries(source.categories || {}).sort((a,b) => Number(b[1]) - Number(a[1])).slice(0,6).map(([label, value]) => ({label,value:number(value)})) : items(source.topics).slice(0,6).map(item => ({label:text(item.topic),value:number(item.file_count)})),
       failures: Array.isArray(source.failures) ? source.failures.length : null,
       root: large ? '' : (source.package || {}).root || '',
-      parsed: large ? number(coverage.deep_completed) : null};
+      parsed: large ? number(coverage.deep_completed) : null,
+      catalogRejection: large && source.catalog_rejection && typeof source.catalog_rejection === 'object' ? source.catalog_rejection : null};
+  }
+  // 目录校验拒绝了新目录、页面仍显示上一版正式概览时的提示横幅（后端只在拒绝比当前正式版更新时给出）。
+  function rejectionTime(created) {
+    const seconds = number(created);
+    return seconds ? new Date(seconds * 1000).toLocaleString('zh-CN', {hour12: false}) : '';
+  }
+  function rejectionNotice(rejection) {
+    if (!rejection) return '';
+    const reason = text(rejection.reason);
+    const when = rejectionTime(rejection.created);
+    const detail = [reason ? `原因：${reason}` : '', when ? `时间：${when}` : ''].filter(Boolean).join('；');
+    return `<section class="io-card io-catalog-rejection" role="status" aria-live="polite"><p class="io-warning"><strong>目录校验未通过，当前显示上一版</strong>${detail ? `（${esc(detail)}）` : ''}</p></section>`;
   }
   function researchFocus(vm) {
     const direction = vm.direction || {};
@@ -42,15 +56,23 @@
     const methods = list(direction.methods);
     const evidence = Array.isArray(direction.evidence_chain) ? direction.evidence_chain.filter(item => item && typeof item === 'object') : [];
     const detailId = vm.kind === 'large' ? 'largeResultResearchDetails' : 'packageOverviewResearchDetails';
-    const pills = [direction.priority ? `优先级 · ${text(direction.priority)}` : '', direction.confidence ? `简报置信度 · ${text(direction.confidence)}` : ''].filter(Boolean);
-    return `<section class="io-focus${direction.title ? '' : ' is-waiting'}" aria-label="推荐研究方向"><div class="io-focus-main"><div class="io-focus-kicker"><span class="io-focus-mark" aria-hidden="true">↗</span><span>RECOMMENDED RESEARCH<br><b>推荐研究方向</b></span><span class="io-focus-stage">${vm.preliminary ? '初步建议' : direction.title ? '当前首选方向' : '等待资料解析'}</span></div><h3>${esc(direction.title || '让下一步研究，从有据可查的问题开始')}</h3><div class="io-focus-rule"></div><h4>为什么值得研究</h4><p class="io-focus-rationale">${esc(direction.rationale || '完成资料解析后，这里将给出有证据支撑的研究主题与推荐理由，不以文件名猜测结论。')}</p>${pills.length ? `<div class="io-focus-pills">${pills.map(pill=>`<span>${esc(pill)}</span>`).join('')}</div>` : ''}<div class="io-focus-footer"><span>${files.length ? `${files.length} 份代表资料` : '代表资料待形成'}${evidence.length ? ` · ${evidence.length} 条支撑原文` : ''}</span><a href="#${detailId}">查看研究详情 <span aria-hidden="true">↗</span></a></div></div><aside class="io-focus-plan"><span class="io-eyebrow">YOUR NEXT MOVE</span><h4>把方向变成研究路径</h4>${questions.length ? `<ol>${questions.map((question,index)=>`<li><span>${String(index+1).padStart(2,'0')}</span><p>${esc(question)}</p></li>`).join('')}</ol>` : '<p class="io-focus-empty">研究问题将在简报形成后出现。你仍可使用下方资料图表，自行选择问答范围。</p>'}${methods.length ? `<details><summary>建议研究方法 · ${methods.length}</summary><ul>${methods.map(method=>`<li>${esc(method)}</li>`).join('')}</ul></details>` : ''}${files.length ? `<div class="io-focus-sources"><h5>代表资料</h5>${files.slice(0,3).map(file=>vm.kind==='ordinary' ? `<button type="button" data-brief-file="${esc(file)}" title="${esc(file)}"><span aria-hidden="true">▤</span>${esc(file.split(/[\/]/).pop())}</button>` : `<span class="io-source-label" title="${esc(file)}"><span aria-hidden="true">▤</span>${esc(file.split(/[\/]/).pop())}</span>`).join('')}${files.length>3 ? `<a href="#${detailId}">查看全部 ${files.length} 份资料 →</a>` : ''}</div>` : ''}<p class="io-focus-disclaimer">推荐基于当前已解析资料，是研究起点，不是已证实的最终结论。</p></aside></section>`;
+    const pills = [direction.priority ? `优先级 · ${text(direction.priority)}` : '', direction.confidence ? `简报置信度 · ${text(direction.confidence)}` : '', direction.coverage_note ? text(direction.coverage_note) : ''].filter(Boolean);
+    return `<section class="io-focus${direction.title ? '' : ' is-waiting'}" aria-label="推荐研究方向"><div class="io-focus-main"><div class="io-focus-kicker"><span class="io-focus-mark" aria-hidden="true">↗</span><span>RECOMMENDED RESEARCH<br><b>推荐研究方向</b></span><span class="io-focus-stage">${vm.preliminary ? '初步建议' : direction.title ? '当前首选方向' : '等待资料解析'}</span></div><h3>${esc(direction.title || '让下一步研究，从有据可查的问题开始')}</h3><div class="io-focus-rule"></div><h4>为什么值得研究</h4><p class="io-focus-rationale">${esc(direction.rationale || '完成资料解析后，这里将给出有证据支撑的研究主题与推荐理由，不以文件名猜测结论。')}</p>${direction.package_profile ? `<h4>全包画像</h4><p class="io-focus-rationale">${esc(direction.package_profile)}</p>` : ''}${pills.length ? `<div class="io-focus-pills">${pills.map(pill=>`<span>${esc(pill)}</span>`).join('')}</div>` : ''}<div class="io-focus-footer"><span>${files.length ? `${files.length} 份代表资料` : '代表资料待形成'}${evidence.length ? ` · ${evidence.length} 条支撑原文` : ''}</span><a href="#${detailId}">查看研究详情 <span aria-hidden="true">↗</span></a></div></div><aside class="io-focus-plan"><span class="io-eyebrow">YOUR NEXT MOVE</span><h4>把方向变成研究路径</h4>${questions.length ? `<ol>${questions.map((question,index)=>`<li><span>${String(index+1).padStart(2,'0')}</span><p>${esc(question)}</p></li>`).join('')}</ol>` : '<p class="io-focus-empty">研究问题将在简报形成后出现。你仍可使用下方资料图表，自行选择问答范围。</p>'}${methods.length ? `<details><summary>建议研究方法 · ${methods.length}</summary><ul>${methods.map(method=>`<li>${esc(method)}</li>`).join('')}</ul></details>` : ''}${files.length ? `<div class="io-focus-sources"><h5>代表资料</h5>${files.slice(0,3).map(file=>vm.kind==='ordinary' ? `<button type="button" data-brief-file="${esc(file)}" title="${esc(file)}"><span aria-hidden="true">▤</span>${esc(file.split(/[\/]/).pop())}</button>` : `<span class="io-source-label" title="${esc(file)}"><span aria-hidden="true">▤</span>${esc(file.split(/[\/]/).pop())}</span>`).join('')}${files.length>3 ? `<a href="#${detailId}">查看全部 ${files.length} 份资料 →</a>` : ''}</div>` : ''}<p class="io-focus-disclaimer">推荐基于当前已解析资料，是研究起点，不是已证实的最终结论。</p></aside></section>`;
+  }
+  // Ordinary packages expose summary_stage in the brief (parsed / preliminary /
+  // deep / legacy); large packages keep their existing preliminary flag.
+  const STAGE_LABELS = {parsed: '解析版简报 · 待摘要', preliminary: '初步简报 · 待深化', deep: '深度证据版简报'};
+  function statusLabel(vm) {
+    if (vm.ready && STAGE_LABELS[vm.stage]) return STAGE_LABELS[vm.stage];
+    return vm.preliminary ? '初步简报 · 待深化' : vm.ready ? '研究简报已生成' : '待生成简报';
   }
   function render(vm) {
     const direction = vm.direction || {};
     const findings = vm.findings.length ? vm.findings : [vm.ready ? '当前简报尚未形成稳定发现，请结合下方原文继续核验。' : '等待解析和研究简报，结果生成后将展示关键发现。'];
     const meter = vm.total > 0 && vm.parsed != null ? Math.min(100, vm.parsed / vm.total * 100) : null;
     const points = values => `<ul>${values.map(item => `<li>${esc(item)}</li>`).join('')}</ul>`;
-    return `<header class="io-header"><div><span class="io-eyebrow">INTELLIGENCE / ${vm.kind === 'large' ? 'LARGE PACKAGE' : 'PACKAGE'}</span><h2>${esc(vm.title)}</h2><p>${esc(vm.root || '从资料构成到关键发现，让每个研究方向都有据可查。')}</p></div><span class="io-status${vm.preliminary ? ' is-preliminary' : ''}">${vm.preliminary ? '初步简报 · 待深化' : vm.ready ? '研究简报已生成' : '待生成简报'}</span></header>
+    return `<header class="io-header"><div><span class="io-eyebrow">INTELLIGENCE / ${vm.kind === 'large' ? 'LARGE PACKAGE' : 'PACKAGE'}</span><h2>${esc(vm.title)}</h2><p>${esc(vm.root || '从资料构成到关键发现，让每个研究方向都有据可查。')}</p></div><span class="io-status${vm.preliminary ? ' is-preliminary' : ''}">${esc(statusLabel(vm))}</span></header>
+      ${rejectionNotice(vm.catalogRejection)}
       <div class="io-metrics">${vm.metrics.map(([label,value,note,unit]) => `<div class="io-metric"><span>${esc(label)}</span><strong>${unit && value != null ? Math.round(value) + esc(unit) : count(value)}</strong><small>${esc(note)}</small></div>`).join('')}</div>
       ${researchFocus(vm)}
       <section class="io-card io-findings"><div class="io-section-title"><span>02 / BRIEFING</span><h3>关键发现与资料简报</h3></div>${vm.basics.length ? `<div class="io-lead">${points(vm.basics)}</div>` : ''}<ol class="io-finding-list">${findings.map((item,i) => `<li><span class="io-index">${String(i+1).padStart(2,'0')}</span><p>${esc(item)}</p></li>`).join('')}</ol></section>
@@ -126,7 +148,7 @@
     }
     return true;
   }
-  const api = {model,render,mount,clear};
+  const api = {model,render,mount,clear,rejectionNotice};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.SJFXIntelligenceOverview = api;
 })(typeof window === 'undefined' ? globalThis : window);
