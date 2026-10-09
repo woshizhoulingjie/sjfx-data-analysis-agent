@@ -1,0 +1,37 @@
+[Unit]
+Description=SJFX isolated mail semantic embedding service (CPU E5)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nas511/zhoulingjie/sjfx
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=CUDA_VISIBLE_DEVICES=
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=TOKENIZERS_PARALLELISM=false
+Environment=SJFX_EMBED_MODEL_PATH=/home/zhoulingjie/models/multilingual-e5-small
+Environment=SJFX_EMBED_MODEL_NAME=multilingual-e5-small
+Environment=SJFX_EMBED_MAX_BATCH=8
+Environment=SJFX_EMBED_MAX_LENGTH=512
+Environment=PORT=18083
+ExecStart=/home/nas511/zhoulingjie/sjfx/.venv/bin/python -B -m services.mail.embedding_server
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+Nice=15
+CPUQuota=100%
+MemoryMax=4G
+TasksMax=128
+UMask=0077
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

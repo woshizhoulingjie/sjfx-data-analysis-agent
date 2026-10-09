@@ -70,6 +70,7 @@ class ChineseMailTests(unittest.TestCase):
             final=MailResearchRuntime(self.repo,model=Model()).run(turn['turn_id'],'owner')
         self.assertEqual(len(final['findings']),1);self.assertIn('2,500',final['answer']);self.assertNotIn('9,999',final['answer'])
         restored=self.repo.get_result_set(final['result_set_id'],'owner');self.assertEqual(restored['final']['answer'],final['answer'])
+        self.assertEqual(restored['source_turn_id'],turn['turn_id'])
         self.assertIsNone(self.repo.get_result_set(final['result_set_id'],'other'))
 
     def test_thai_calendar_conversion_is_allowed_but_invented_date_is_not(self):

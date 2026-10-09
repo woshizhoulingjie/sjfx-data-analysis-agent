@@ -19,7 +19,7 @@ def rebuild(repository,package_id,owner_id):
     if not repository.get_package(package_id,owner_id):raise ValueError('邮件资料包不存在')
     if not Config.MAIL_ENABLE_ATTACHMENT_VERSIONS:return
     with repository._connection() as c:
-        rows=[dict(r) for r in c.execute('SELECT DISTINCT p.message_key,p.mime_path,p.filename_raw,p.payload_sha256,m.sent_at_utc FROM mail_parts p JOIN mail_occurrences o ON o.message_key=p.message_key JOIN mail_messages m ON m.message_key=p.message_key WHERE o.package_id=? AND p.is_explicit_attachment=1 ORDER BY m.sent_at_utc,p.message_key,p.mime_path',(package_id,))]
+        rows=[dict(r) for r in c.execute('SELECT DISTINCT p.message_key,p.mime_path,p.filename_raw,p.payload_sha256,m.sent_at_utc FROM mail_parts p JOIN mail_visible_occurrences o ON o.message_key=p.message_key JOIN mail_messages m ON m.message_key=p.message_key WHERE o.package_id=? AND p.is_explicit_attachment=1 ORDER BY m.sent_at_utc,p.message_key,p.mime_path',(package_id,))]
         c.execute('DELETE FROM mail_attachment_version_links WHERE package_id=?',(package_id,));c.execute('DELETE FROM mail_attachment_versions WHERE package_id=?',(package_id,))
         chains=collections.defaultdict(lambda:collections.defaultdict(list))
         for r in rows:chains[filename_family(r['filename_raw']) or r['payload_sha256']][r['payload_sha256']].append(r)

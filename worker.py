@@ -261,7 +261,7 @@ def _mark_source_changes_once(job):
 
 def execute(job):
     task_type = job.get("task_type")
-    if task_type in {"mail_import", "mail_extract", "mail_ocr", "mail_research", "mail_export", "mail_embed", "mail_factextract"}:
+    if task_type in {"mail_foundation", "mail_import", "mail_extract", "mail_ocr", "mail_research", "mail_export", "mail_embed", "mail_factextract"}:
         from services.mail.jobs import run_claimed_mail_job
         return run_claimed_mail_job(job)
     # Import the web/application module only when a real job is claimed. A
@@ -357,6 +357,7 @@ def _task_runtime_limit(job):
         "export_package": Config.JOB_EXPORT_TIMEOUT_SECONDS,
         "translate_document": Config.JOB_TRANSLATION_TIMEOUT_SECONDS,
         "translate_package": Config.JOB_TRANSLATION_PACKAGE_TIMEOUT_SECONDS,
+        "mail_foundation": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
         "mail_import": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
         "mail_extract": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
         "mail_ocr": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
@@ -366,6 +367,13 @@ def _task_runtime_limit(job):
         "mail_factextract": Config.JOB_ANALYSIS_TIMEOUT_SECONDS,
     }
     limit = limits.get(job.get("task_type"), Config.JOB_DEFAULT_TIMEOUT_SECONDS)
+    if job.get("task_type") == "mail_research":
+        seconds=(job.get("options") or {}).get("research_timeout_seconds",limit)
+        # API-validated jobs carry their selected time. Old jobs use the new
+        # default; invalid persisted values cannot disable the hard boundary.
+        if isinstance(seconds,bool) or not isinstance(seconds,int) or seconds<1:
+            seconds=limit
+        limit=min(seconds,Config.MAIL_RESEARCH_TIMEOUT_LIMIT_SECONDS)+Config.MAIL_RESEARCH_WORKER_GRACE_SECONDS
     if job.get("task_type") == "generate_summary":
         options = job.get("options") or {}
         if not options.get("node_id") and options.get("kind", "file") not in {"directory", "group"}:
@@ -804,6 +812,9 @@ def run_forever():
     # Entries contain model output only; queued jobs and their state-machine
     # records remain untouched until each job is claimed normally.
     preliminary_prefetch_cache = {}
+    # A successful cooperative slice yields one claim to other ready work.
+    # Failed claims retain this preference; retries/timeouts do not create it.
+    yielded_job_id = None
     try:
         while True:
             now = time.monotonic()
@@ -869,7 +880,9 @@ def run_forever():
             except Exception:
                 logger.warning("到期文件重试唤醒失败，将在下一轮重试", exc_info=True)
             try:
-                job = storage.claim_next_job(WORKER_ID)
+                job = (storage.claim_next_job(WORKER_ID, exclude_job_id=yielded_job_id)
+                       if yielded_job_id is not None else storage.claim_next_job(WORKER_ID))
+                yielded_job_id = None
             except Exception as exc:  # noqa: BLE001
                 # 一次瞬时 SQLITE_BUSY 不能打死 Worker：记日志、退避、继续。
                 logger.warning("领取任务失败，将在下一轮重试: %r", exc, exc_info=True)
@@ -907,6 +920,7 @@ def run_forever():
                     )
                     if storage.requeue_job_slice(job_id, message):
                         logger.info("Worker yielded checkpointed slice id=%s", job_id)
+                        yielded_job_id = job_id
                         continue
                 if not (isinstance(result, dict) and result.pop("_preliminary_committed", False)):
                     storage.finalize_job(job_id, result=result)

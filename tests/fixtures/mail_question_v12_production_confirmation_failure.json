@@ -1,0 +1,1384 @@
+{
+  "provenance": "Exact persisted production candidate audits plus read-only original DB source export; transient provider payload and review graph were not saved",
+  "turn_id": "mrt_6f406ae331a14385ba61467b961708bb",
+  "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+  "candidate_audit_steps": [
+    {
+      "step_id": "mrs_fbb31b49779d42a7bb6857271b4c9dff",
+      "turn_id": "mrt_6f406ae331a14385ba61467b961708bb",
+      "sequence": 155,
+      "tool_name": "answer_candidate_audit",
+      "input_json": "{\"attempt\": 1, \"stage\": \"prejudge_proposals\"}",
+      "output_ref": "{\"answer_generation_raw\": {\"claims\": [{\"claim_text\": \"蓝湾项目约定计划交付日期为2026年10月15日。\", \"evidence_ids\": [\"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\"], \"source_quote\": \"双方约定计划交付日期为：2026 年 10 月 15 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。\"], \"time_basis\": \"2026-09-20\"}, {\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}, {\"claim_text\": \"蓝湾项目状态为未交付、未验收。\", \"evidence_ids\": [\"mev_679a3529d8e5426b87a0a7f2de51f223\"], \"source_quote\": \"截至目前，蓝湾项目状态为：未交付、未验收。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备\", \"只有双方签署《验收报告》之日方视为交付完成日\"], \"time_basis\": \"2026-10-21\"}], \"unanswered_subquestions\": [\"actual_completion_date\", \"acceptance\"]}, \"answer_content_precheck\": {\"status\": \"repair_required\", \"failures\": [{\"atom_index\": 1, \"errors\": [\"temporal_scope_or_full_history_unproven\"]}], \"remaining_atom_indexes\": [1]}, \"attempt\": 1}",
+      "status": "completed",
+      "started_at": "2026-10-08 20:34:49",
+      "finished_at": "2026-10-08 20:34:49",
+      "error_json": null
+    },
+    {
+      "step_id": "mrs_2b5144c81fb246a1a86d2ba166a1db6f",
+      "turn_id": "mrt_6f406ae331a14385ba61467b961708bb",
+      "sequence": 156,
+      "tool_name": "answer_candidate_audit",
+      "input_json": "{\"attempt\": 1, \"stage\": \"bounded_repair_started\"}",
+      "output_ref": "{\"answer_generation_raw\": {\"claims\": [{\"claim_text\": \"蓝湾项目约定计划交付日期为2026年10月15日。\", \"evidence_ids\": [\"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\"], \"source_quote\": \"双方约定计划交付日期为：2026 年 10 月 15 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。\"], \"time_basis\": \"2026-09-20\"}, {\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}, {\"claim_text\": \"蓝湾项目状态为未交付、未验收。\", \"evidence_ids\": [\"mev_679a3529d8e5426b87a0a7f2de51f223\"], \"source_quote\": \"截至目前，蓝湾项目状态为：未交付、未验收。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备\", \"只有双方签署《验收报告》之日方视为交付完成日\"], \"time_basis\": \"2026-10-21\"}], \"unanswered_subquestions\": [\"actual_completion_date\", \"acceptance\"]}, \"answer_format_repair\": {\"status\": \"attempted\", \"atom_indexes\": [1], \"original_atoms\": [{\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"repairs\": {\"type\": \"array\", \"maxItems\": 1, \"items\": {\"type\": \"object\", \"properties\": {\"atom_index\": {\"type\": \"integer\", \"enum\": [1]}, \"claim_text\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 240}, \"evidence_ids\": {\"type\": \"array\", \"minItems\": 1, \"maxItems\": 18, \"items\": {\"type\": \"string\", \"enum\": [\"mev_176ca9f1c9c24525b7e9c00421b8364d\", \"mev_223c30e0b7834251ae572564e0b3971c\", \"mev_2ae5bcf6ca364399ae0cfbeb473fb002\", \"mev_341ac75dcfe347fcb511c4d6b7530662\", \"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_679a3529d8e5426b87a0a7f2de51f223\", \"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_6f4927bf1f4e4416a08f54fc5641a9cb\", \"mev_76bb082f675246c6aad5386d4fd2d787\", \"mev_b9476508a50e44878208297b2ec19c54\", \"mev_cbfccdbea1d44aba86996cad9e18d8a2\", \"mev_cf2c0bbd2dd94472a17ea1bea4233f7d\", \"mev_d3bca523cffa47f8878ca072aed174c3\", \"mev_e1b9d151bb50486eac6b27c5e2bf5009\", \"mev_e47712112855414298a345e711dde67a\", \"mev_e4c8bb0c710443a0b36a237b2d4c93b3\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\", \"mev_f6dbb637a1924110a86dba37635e6b02\"]}}, \"source_quote\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 400}, \"actor\": {\"type\": \"string\", \"enum\": [\"li.qiang@shengyuan-zn.cn\", \"zhang.wei@lanwan-group.com\", \"\"]}, \"object_ref\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 80}}, \"required\": [\"atom_index\", \"claim_text\", \"evidence_ids\", \"source_quote\", \"actor\", \"object_ref\"], \"additionalProperties\": false}}}, \"required\": [\"repairs\"], \"additionalProperties\": false}}, \"answer_content_precheck\": {\"status\": \"repair_required\", \"failures\": [{\"atom_index\": 1, \"errors\": [\"temporal_scope_or_full_history_unproven\"]}], \"remaining_atom_indexes\": [1]}, \"attempt\": 1}",
+      "status": "completed",
+      "started_at": "2026-10-08 20:34:49",
+      "finished_at": "2026-10-08 20:34:49",
+      "error_json": null
+    },
+    {
+      "step_id": "mrs_5d69d0f1f00b47a6b72dbc4348a663d5",
+      "turn_id": "mrt_6f406ae331a14385ba61467b961708bb",
+      "sequence": 161,
+      "tool_name": "answer_candidate_audit",
+      "input_json": "{\"attempt\": 1, \"stage\": \"stopped\"}",
+      "output_ref": "{\"answer_generation_raw\": {\"claims\": [{\"claim_text\": \"蓝湾项目约定计划交付日期为2026年10月15日。\", \"evidence_ids\": [\"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\"], \"source_quote\": \"双方约定计划交付日期为：2026 年 10 月 15 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。\"], \"time_basis\": \"2026-09-20\"}, {\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}, {\"claim_text\": \"蓝湾项目状态为未交付、未验收。\", \"evidence_ids\": [\"mev_679a3529d8e5426b87a0a7f2de51f223\"], \"source_quote\": \"截至目前，蓝湾项目状态为：未交付、未验收。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备\", \"只有双方签署《验收报告》之日方视为交付完成日\"], \"time_basis\": \"2026-10-21\"}], \"unanswered_subquestions\": [\"actual_completion_date\", \"acceptance\"]}, \"answer_format_repair\": {\"status\": \"rejected\", \"atom_indexes\": [1], \"original_atoms\": [{\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"repairs\": {\"type\": \"array\", \"maxItems\": 1, \"items\": {\"type\": \"object\", \"properties\": {\"atom_index\": {\"type\": \"integer\", \"enum\": [1]}, \"claim_text\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 240}, \"evidence_ids\": {\"type\": \"array\", \"minItems\": 1, \"maxItems\": 18, \"items\": {\"type\": \"string\", \"enum\": [\"mev_176ca9f1c9c24525b7e9c00421b8364d\", \"mev_223c30e0b7834251ae572564e0b3971c\", \"mev_2ae5bcf6ca364399ae0cfbeb473fb002\", \"mev_341ac75dcfe347fcb511c4d6b7530662\", \"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_679a3529d8e5426b87a0a7f2de51f223\", \"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_6f4927bf1f4e4416a08f54fc5641a9cb\", \"mev_76bb082f675246c6aad5386d4fd2d787\", \"mev_b9476508a50e44878208297b2ec19c54\", \"mev_cbfccdbea1d44aba86996cad9e18d8a2\", \"mev_cf2c0bbd2dd94472a17ea1bea4233f7d\", \"mev_d3bca523cffa47f8878ca072aed174c3\", \"mev_e1b9d151bb50486eac6b27c5e2bf5009\", \"mev_e47712112855414298a345e711dde67a\", \"mev_e4c8bb0c710443a0b36a237b2d4c93b3\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\", \"mev_f6dbb637a1924110a86dba37635e6b02\"]}}, \"source_quote\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 400}, \"actor\": {\"type\": \"string\", \"enum\": [\"li.qiang@shengyuan-zn.cn\", \"zhang.wei@lanwan-group.com\", \"\"]}, \"object_ref\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 80}}, \"required\": [\"atom_index\", \"claim_text\", \"evidence_ids\", \"source_quote\", \"actor\", \"object_ref\"], \"additionalProperties\": false}}}, \"required\": [\"repairs\"], \"additionalProperties\": false}, \"proposal\": {\"repairs\": [{\"atom_index\": 1, \"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"object_ref\": \"蓝湾项目\"}]}}, \"answer_content_precheck\": {\"status\": \"rejected\", \"failures\": [{\"atom_index\": 1, \"errors\": [\"temporal_scope_or_full_history_unproven\"]}], \"remaining_atom_indexes\": [1], \"proposal_failures\": [{\"atom_index\": 1, \"errors\": [\"temporal_scope_or_full_history_unproven\"]}]}, \"attempt\": 1}",
+      "status": "completed",
+      "started_at": "2026-10-08 20:35:04",
+      "finished_at": "2026-10-08 20:35:04",
+      "error_json": null
+    }
+  ],
+  "generation": {
+    "claims": [
+      {
+        "claim_text": "蓝湾项目约定计划交付日期为2026年10月15日。",
+        "evidence_ids": [
+          "mev_5c17e72258ce4d888a1c52808381ab47",
+          "mev_ea485e98dfe744f59d67a907adb9d4d9"
+        ],
+        "source_quote": "双方约定计划交付日期为：2026 年 10 月 15 日。",
+        "object_ref": "蓝湾项目",
+        "actor": "zhang.wei@lanwan-group.com",
+        "conditions": [
+          "后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。"
+        ],
+        "time_basis": "2026-09-20"
+      },
+      {
+        "claim_text": "蓝湾项目最终交付日期确认为2026年10月18日。",
+        "evidence_ids": [
+          "mev_6bce8ae4d6a34eb2b45bd16da3be878a",
+          "mev_341ac75dcfe347fcb511c4d6b7530662"
+        ],
+        "source_quote": "双方最终确认的交付日期为：2026 年 10 月 18 日。",
+        "object_ref": "蓝湾项目",
+        "actor": "li.qiang@shengyuan-zn.cn",
+        "conditions": [
+          "原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。",
+          "交付完成以双方签署《验收报告》之日为准。"
+        ],
+        "time_basis": "2026-10-09"
+      },
+      {
+        "claim_text": "蓝湾项目状态为未交付、未验收。",
+        "evidence_ids": [
+          "mev_679a3529d8e5426b87a0a7f2de51f223"
+        ],
+        "source_quote": "截至目前，蓝湾项目状态为：未交付、未验收。",
+        "object_ref": "蓝湾项目",
+        "actor": "zhang.wei@lanwan-group.com",
+        "conditions": [
+          "截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备",
+          "只有双方签署《验收报告》之日方视为交付完成日"
+        ],
+        "time_basis": "2026-10-21"
+      }
+    ],
+    "unanswered_subquestions": [
+      "actual_completion_date",
+      "acceptance"
+    ]
+  },
+  "rejected_repair": {
+    "status": "rejected",
+    "atom_indexes": [
+      1
+    ],
+    "original_atoms": [
+      {
+        "claim_text": "蓝湾项目最终交付日期确认为2026年10月18日。",
+        "evidence_ids": [
+          "mev_6bce8ae4d6a34eb2b45bd16da3be878a",
+          "mev_341ac75dcfe347fcb511c4d6b7530662"
+        ],
+        "source_quote": "双方最终确认的交付日期为：2026 年 10 月 18 日。",
+        "object_ref": "蓝湾项目",
+        "actor": "li.qiang@shengyuan-zn.cn",
+        "conditions": [
+          "原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。",
+          "交付完成以双方签署《验收报告》之日为准。"
+        ],
+        "time_basis": "2026-10-09"
+      }
+    ],
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "repairs": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "properties": {
+              "atom_index": {
+                "type": "integer",
+                "enum": [
+                  1
+                ]
+              },
+              "claim_text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240
+              },
+              "evidence_ids": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 18,
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "mev_176ca9f1c9c24525b7e9c00421b8364d",
+                    "mev_223c30e0b7834251ae572564e0b3971c",
+                    "mev_2ae5bcf6ca364399ae0cfbeb473fb002",
+                    "mev_341ac75dcfe347fcb511c4d6b7530662",
+                    "mev_5c17e72258ce4d888a1c52808381ab47",
+                    "mev_679a3529d8e5426b87a0a7f2de51f223",
+                    "mev_6bce8ae4d6a34eb2b45bd16da3be878a",
+                    "mev_6f4927bf1f4e4416a08f54fc5641a9cb",
+                    "mev_76bb082f675246c6aad5386d4fd2d787",
+                    "mev_b9476508a50e44878208297b2ec19c54",
+                    "mev_cbfccdbea1d44aba86996cad9e18d8a2",
+                    "mev_cf2c0bbd2dd94472a17ea1bea4233f7d",
+                    "mev_d3bca523cffa47f8878ca072aed174c3",
+                    "mev_e1b9d151bb50486eac6b27c5e2bf5009",
+                    "mev_e47712112855414298a345e711dde67a",
+                    "mev_e4c8bb0c710443a0b36a237b2d4c93b3",
+                    "mev_ea485e98dfe744f59d67a907adb9d4d9",
+                    "mev_f6dbb637a1924110a86dba37635e6b02"
+                  ]
+                }
+              },
+              "source_quote": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 400
+              },
+              "actor": {
+                "type": "string",
+                "enum": [
+                  "li.qiang@shengyuan-zn.cn",
+                  "zhang.wei@lanwan-group.com",
+                  ""
+                ]
+              },
+              "object_ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              }
+            },
+            "required": [
+              "atom_index",
+              "claim_text",
+              "evidence_ids",
+              "source_quote",
+              "actor",
+              "object_ref"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "repairs"
+      ],
+      "additionalProperties": false
+    },
+    "proposal": {
+      "repairs": [
+        {
+          "atom_index": 1,
+          "claim_text": "蓝湾项目最终交付日期确认为2026年10月18日。",
+          "evidence_ids": [
+            "mev_6bce8ae4d6a34eb2b45bd16da3be878a"
+          ],
+          "source_quote": "双方最终确认的交付日期为：2026 年 10 月 18 日。",
+          "actor": "li.qiang@shengyuan-zn.cn",
+          "object_ref": "蓝湾项目"
+        }
+      ]
+    }
+  },
+  "production_source_export": {
+    "turn_id": "mrt_6f406ae331a14385ba61467b961708bb",
+    "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+    "sources": [
+      {
+        "evidence_id": "mev_679a3529d8e5426b87a0a7f2de51f223",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_05e275e4aee0418f87358e71c081e95e",
+        "occurrence_id": "mo_803e8a3da5a94387bc40abe663ffd8e9",
+        "mime_path": "1",
+        "segment_id": "mseg_b1ea04db81919994be327807e4e60dabbe826252833088395f939a4b0e4e801f",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 536,
+        "quote_text": "李工：\n\n就贵司 10 月 18 日所称的“完成交付”，我司正式答复如下。\n\n一、事实情况\n1. 截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备；\n2. 物流单号 SF-8823-1097-4421 查询结果显示仅“已揽收”，无后续流转记录，承运方客服亦未能给出货物实际位置；\n3. 我司未签署《到货签收单》，未开箱，未进行安装调试。\n\n二、我方对“交付”的认定\n贵司所称“完成交付”不成立。按照《蓝湾项目交付方案-v2.docx》第六章约定：\n1. 设备发运、物流签收均不构成交付完成；\n2. 只有双方签署《验收报告》之日方视为交付完成日；\n3. 贵司单方面声明的“已交付”“已发货”不产生交付完成的效果。\n\n三、我方要求\n1. 请贵司于 2026 年 10 月 22 日 12:00 前书面提供货物实际位置、预计到达时间及承运方联系人；\n2. 到货后按交付方案第四章、第五章组织验收，验收合格并签署《验收报告》后方视为交付完成；\n3. 因 2026 年 10 月 18 日未能完成交付，我方保留按合同第七条追究逾期违约责任的权利。\n\n截至目前，蓝湾项目状态为：未交付、未验收。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "98564024570c5a026519f30fd5f1c1460768e73a1096aa20a71e768611c24e37",
+        "created_at": "2026-10-08 20:29:22",
+        "cell_range": null,
+        "payload_sha256": "3e86cc5d29ec95382fb88d370fead1bac5bb345688ef9e7257d18cbcd7d81431",
+        "text_sha256": "3e86cc5d29ec95382fb88d370fead1bac5bb345688ef9e7257d18cbcd7d81431",
+        "source_kind": "body",
+        "ordinal": 0,
+        "text": "李工：\n\n就贵司 10 月 18 日所称的“完成交付”，我司正式答复如下。\n\n一、事实情况\n1. 截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备；\n2. 物流单号 SF-8823-1097-4421 查询结果显示仅“已揽收”，无后续流转记录，承运方客服亦未能给出货物实际位置；\n3. 我司未签署《到货签收单》，未开箱，未进行安装调试。\n\n二、我方对“交付”的认定\n贵司所称“完成交付”不成立。按照《蓝湾项目交付方案-v2.docx》第六章约定：\n1. 设备发运、物流签收均不构成交付完成；\n2. 只有双方签署《验收报告》之日方视为交付完成日；\n3. 贵司单方面声明的“已交付”“已发货”不产生交付完成的效果。\n\n三、我方要求\n1. 请贵司于 2026 年 10 月 22 日 12:00 前书面提供货物实际位置、预计到达时间及承运方联系人；\n2. 到货后按交付方案第四章、第五章组织验收，验收合格并签署《验收报告》后方视为交付完成；\n3. 因 2026 年 10 月 18 日未能完成交付，我方保留按合同第七条追究逾期违约责任的权利。\n\n截至目前，蓝湾项目状态为：未交付、未验收。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "sent_at_utc": "2026-10-21T01:25:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [
+          {
+            "mime_path": "1",
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 536,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "role": "counter"
+      },
+      {
+        "evidence_id": "mev_f6dbb637a1924110a86dba37635e6b02",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_5a790d478ff747819946fec86c458061",
+        "occurrence_id": "mo_0c42a01f1e7c4f8eb4685db6dcdf68f4",
+        "mime_path": "1",
+        "segment_id": "mseg_96b2e6ae9b6c6b78c08257eff7a55c730470a8070496a88548640720016eba7c",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 440,
+        "quote_text": "李工：\n\n今天是 2026 年 10 月 16 日，距双方确认的交付日期 10 月 18 日仅剩 2 天。截至此时，我司现场尚未收到贵司任何设备，也未收到通电调试完成证明与联调测试报告。\n\n请贵司于今日下班前（18:30）提供以下材料：\n1. 分拣线通电调试完成证明；\n2. WMS 接口联调测试报告；\n3. 10 月 18 日到场交付的书面承诺函。\n\n另需正式说明一件事：贵司此前的两项日期承诺，我方不再予以认可。\n1. 2026 年 9 月 29 日进度反馈中所称“可于 2026 年 10 月 15 日交付”；\n2. 2026 年 10 月 8 日延期申请中所称“2026 年 10 月 20 日完成交付”。\n\n上述两项承诺所涉及的交付日期自本函发出之日起作废。双方之间唯一有效的约定交付日期为 2026 年 10 月 18 日（依据 10 月 9 日双方书面确认）。若 10 月 18 日仍未交付，我方将按合同第七条主张违约金。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "5c6785ef43db4b6e51f0c7b459f21c8ab70ea3e1b99b16e584e4eaebaa360202",
+        "created_at": "2026-10-08 20:29:22",
+        "cell_range": null,
+        "payload_sha256": "0314c53ae1d1274eb481caae3323f94124b982055455288958579ba80571e023",
+        "text_sha256": "0314c53ae1d1274eb481caae3323f94124b982055455288958579ba80571e023",
+        "source_kind": "body",
+        "ordinal": 0,
+        "text": "李工：\n\n今天是 2026 年 10 月 16 日，距双方确认的交付日期 10 月 18 日仅剩 2 天。截至此时，我司现场尚未收到贵司任何设备，也未收到通电调试完成证明与联调测试报告。\n\n请贵司于今日下班前（18:30）提供以下材料：\n1. 分拣线通电调试完成证明；\n2. WMS 接口联调测试报告；\n3. 10 月 18 日到场交付的书面承诺函。\n\n另需正式说明一件事：贵司此前的两项日期承诺，我方不再予以认可。\n1. 2026 年 9 月 29 日进度反馈中所称“可于 2026 年 10 月 15 日交付”；\n2. 2026 年 10 月 8 日延期申请中所称“2026 年 10 月 20 日完成交付”。\n\n上述两项承诺所涉及的交付日期自本函发出之日起作废。双方之间唯一有效的约定交付日期为 2026 年 10 月 18 日（依据 10 月 9 日双方书面确认）。若 10 月 18 日仍未交付，我方将按合同第七条主张违约金。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "sent_at_utc": "2026-10-16T09:45:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [
+          {
+            "mime_path": "1",
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 440,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "role": "counter"
+      },
+      {
+        "evidence_id": "mev_6f4927bf1f4e4416a08f54fc5641a9cb",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_9a598dca3d604d4bba7398cc0c0520ff",
+        "occurrence_id": "mo_b49f85c132e24748b79a565c08404f13",
+        "mime_path": "1",
+        "segment_id": "mseg_5a28b7cf55730c3af9b688bb93eccbcdf117d85b1e34aab2b893b92159b48d24",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 417,
+        "quote_text": "李工：\n\n来函收悉，但我方不同意将蓝湾项目交付日期调整为 2026 年 10 月 20 日。\n\n理由如下：\n1. 蓝湾项目 2026 年 10 月 22 日须与业主方联合验收，若 10 月 20 日才交付，我方只剩 2 天整改窗口，无法覆盖联调残留问题；\n2. 贵司所述 PLC 供货延迟属于贵司与其上游供应商之间的履约风险，按合同不应转由我方承担；\n3. 9 月 29 日贵司进度反馈中明确“可以按 10 月 15 日完成交付”，我方据此安排了后续工作，现在变更会连带影响我方对业主方的承诺。\n\n我方的要求：\n1. 交付日期最晚不得晚于 2026 年 10 月 18 日；\n2. WMS 接口联调必须在 2026 年 10 月 17 日前完成并提交测试报告；\n3. 请贵司于 2026 年 10 月 9 日 17:00 前书面反馈。若无法满足，我方将启动合同违约条款评估，并保留索赔权利。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "6cbb0b1afa66e8ba5ceb5da16cc69c499ebc948e39f3e61f5cea179faddf32c4",
+        "created_at": "2026-10-08 20:29:22",
+        "cell_range": null,
+        "payload_sha256": "f9ba5eae7e01c516fd78a0268f8fec29f41c7b942d89066cd80dbca429fe3f24",
+        "text_sha256": "f9ba5eae7e01c516fd78a0268f8fec29f41c7b942d89066cd80dbca429fe3f24",
+        "source_kind": "body",
+        "ordinal": 0,
+        "text": "李工：\n\n来函收悉，但我方不同意将蓝湾项目交付日期调整为 2026 年 10 月 20 日。\n\n理由如下：\n1. 蓝湾项目 2026 年 10 月 22 日须与业主方联合验收，若 10 月 20 日才交付，我方只剩 2 天整改窗口，无法覆盖联调残留问题；\n2. 贵司所述 PLC 供货延迟属于贵司与其上游供应商之间的履约风险，按合同不应转由我方承担；\n3. 9 月 29 日贵司进度反馈中明确“可以按 10 月 15 日完成交付”，我方据此安排了后续工作，现在变更会连带影响我方对业主方的承诺。\n\n我方的要求：\n1. 交付日期最晚不得晚于 2026 年 10 月 18 日；\n2. WMS 接口联调必须在 2026 年 10 月 17 日前完成并提交测试报告；\n3. 请贵司于 2026 年 10 月 9 日 17:00 前书面反馈。若无法满足，我方将启动合同违约条款评估，并保留索赔权利。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "sent_at_utc": "2026-10-08T06:10:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [
+          {
+            "mime_path": "1",
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 417,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "role": "counter"
+      },
+      {
+        "evidence_id": "mev_6bce8ae4d6a34eb2b45bd16da3be878a",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_0378417ed9e84665a6ad0f5c204906cf",
+        "occurrence_id": "mo_bbd174fa2d484228910d379a28542f7d",
+        "mime_path": "1",
+        "segment_id": "mseg_66cf3f47e37e90cf8766816bdac9eab6aaee7300d24137cf0e31be03adadd9e9",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 403,
+        "quote_text": "张经理：\n\n来函收悉。我司内部已紧急评估，现答复如下。\n\n一、我司接受贵方要求\n1. 蓝湾项目最终交付日期确定为：2026 年 10 月 18 日；\n2. WMS 接口联调于 2026 年 10 月 17 日前完成并提交测试报告；\n3. 原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\n\n二、书面确认件\n本确认已加盖我司公章，扫描件见附件《蓝湾项目交付确认单-盖章扫描件.pdf》，纸质原件今日以顺丰寄出（单号 SF-1055-8877-3201），请贵司查收。\n\n三、我司承诺\n1. 按 2026 年 10 月 18 日完成交付；\n2. 交付前提交分拣线通电调试完成证明与 WMS 联调测试报告；\n3. 若再次逾期，我司接受按合同第七条约定的违约金计算方式承担责任。\n\n双方最终确认的交付日期为：2026 年 10 月 18 日。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "e16d2f41ddc200639563cad7acadf6e4057edba0bd9c2fff28dd8e4577bffceb",
+        "created_at": "2026-10-08 20:29:22",
+        "cell_range": null,
+        "payload_sha256": "fefea541d1763b661797ab48c2fbc03cd2f65621591ce8be664e3634aeda8ab2",
+        "text_sha256": "fefea541d1763b661797ab48c2fbc03cd2f65621591ce8be664e3634aeda8ab2",
+        "source_kind": "body",
+        "ordinal": 0,
+        "text": "张经理：\n\n来函收悉。我司内部已紧急评估，现答复如下。\n\n一、我司接受贵方要求\n1. 蓝湾项目最终交付日期确定为：2026 年 10 月 18 日；\n2. WMS 接口联调于 2026 年 10 月 17 日前完成并提交测试报告；\n3. 原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\n\n二、书面确认件\n本确认已加盖我司公章，扫描件见附件《蓝湾项目交付确认单-盖章扫描件.pdf》，纸质原件今日以顺丰寄出（单号 SF-1055-8877-3201），请贵司查收。\n\n三、我司承诺\n1. 按 2026 年 10 月 18 日完成交付；\n2. 交付前提交分拣线通电调试完成证明与 WMS 联调测试报告；\n3. 若再次逾期，我司接受按合同第七条约定的违约金计算方式承担责任。\n\n双方最终确认的交付日期为：2026 年 10 月 18 日。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "sent_at_utc": "2026-10-09T01:20:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [
+          {
+            "mime_path": "1",
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 403,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "role": "condition"
+      },
+      {
+        "evidence_id": "mev_341ac75dcfe347fcb511c4d6b7530662",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_0378417ed9e84665a6ad0f5c204906cf",
+        "occurrence_id": "mo_bbd174fa2d484228910d379a28542f7d",
+        "mime_path": "2",
+        "segment_id": "mseg_e0754eea74e448bc5a8421f5c8b1b3d31cf56cedb1db39caed66f989d1fa4893",
+        "page_number": 1,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 268,
+        "quote_text": "蓝湾项目智能仓储分拣系统\n交付确认单\n委托方：蓝湾实业集团蓝湾项目组\n承建方：晟远智能装备有限公司\n一、经双方于2026年10月8日至10月9日协商一致，本项目最终交付日期确认为\n2026年10月18日\n二、WMS接口联调须于2026年10月17日前完成并提交测试报告。\n三、原计划交付日期2026年10月15日、承建方申请日期2026年10月20日，\n双方均不再采用。\n四、交付完成以双方签署《验收报告》之日为准。\n委托方（签章）：张伟\n承建方（签章）：李强\n日期：2026年10月9日\n日期：2026年10月9日\n晟远智能\n装备有限",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "e16d2f41ddc200639563cad7acadf6e4057edba0bd9c2fff28dd8e4577bffceb",
+        "created_at": "2026-10-08 20:29:22",
+        "cell_range": null,
+        "payload_sha256": "4cada349dcc280afa6a21b720e82b4ab09474ea7f48b386898788f7b246e2b07",
+        "text_sha256": "fda8813d155b76889731f235e5508159dbc006cf1ae3f5fa716418978bacf4b5",
+        "source_kind": "attachment",
+        "ordinal": 0,
+        "text": "蓝湾项目智能仓储分拣系统\n交付确认单\n委托方：蓝湾实业集团蓝湾项目组\n承建方：晟远智能装备有限公司\n一、经双方于2026年10月8日至10月9日协商一致，本项目最终交付日期确认为\n2026年10月18日\n二、WMS接口联调须于2026年10月17日前完成并提交测试报告。\n三、原计划交付日期2026年10月15日、承建方申请日期2026年10月20日，\n双方均不再采用。\n四、交付完成以双方签署《验收报告》之日为准。\n委托方（签章）：张伟\n承建方（签章）：李强\n日期：2026年10月9日\n日期：2026年10月9日\n晟远智能\n装备有限",
+        "sent_at_utc": "2026-10-09T01:20:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_cbfccdbea1d44aba86996cad9e18d8a2",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_05e275e4aee0418f87358e71c081e95e",
+        "occurrence_id": "mo_803e8a3da5a94387bc40abe663ffd8e9",
+        "mime_path": "headers.subject",
+        "segment_id": "mseg_5c5502c1c5aee8fa35c78283bac3d24833322aade63f9d36e834a4b20f0a455d",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 48,
+        "quote_text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "98564024570c5a026519f30fd5f1c1460768e73a1096aa20a71e768611c24e37",
+        "created_at": "2026-10-08 20:30:47",
+        "cell_range": null,
+        "payload_sha256": null,
+        "text_sha256": "790fdb4713d3274b27716d9854c80168db2abf6d62124f3119127bbfb528a8d7",
+        "source_kind": "header",
+        "ordinal": 0,
+        "text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "sent_at_utc": "2026-10-21T01:25:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_cf2c0bbd2dd94472a17ea1bea4233f7d",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_5a790d478ff747819946fec86c458061",
+        "occurrence_id": "mo_0c42a01f1e7c4f8eb4685db6dcdf68f4",
+        "mime_path": "headers.subject",
+        "segment_id": "mseg_6e43b6718b17b46541a8dfbe3d57d3fb2141339782b9a9cebf5093f212ab4682",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 48,
+        "quote_text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "5c6785ef43db4b6e51f0c7b459f21c8ab70ea3e1b99b16e584e4eaebaa360202",
+        "created_at": "2026-10-08 20:30:47",
+        "cell_range": null,
+        "payload_sha256": null,
+        "text_sha256": "790fdb4713d3274b27716d9854c80168db2abf6d62124f3119127bbfb528a8d7",
+        "source_kind": "header",
+        "ordinal": 0,
+        "text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "sent_at_utc": "2026-10-16T09:45:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_2ae5bcf6ca364399ae0cfbeb473fb002",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_0378417ed9e84665a6ad0f5c204906cf",
+        "occurrence_id": "mo_bbd174fa2d484228910d379a28542f7d",
+        "mime_path": "headers.subject",
+        "segment_id": "mseg_9960fa771708dd915f28aae2bbfe1e6e32d9c29f7f5a7243d06f3fff14c29308",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 48,
+        "quote_text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "e16d2f41ddc200639563cad7acadf6e4057edba0bd9c2fff28dd8e4577bffceb",
+        "created_at": "2026-10-08 20:30:47",
+        "cell_range": null,
+        "payload_sha256": null,
+        "text_sha256": "790fdb4713d3274b27716d9854c80168db2abf6d62124f3119127bbfb528a8d7",
+        "source_kind": "header",
+        "ordinal": 0,
+        "text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "sent_at_utc": "2026-10-09T01:20:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_76bb082f675246c6aad5386d4fd2d787",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_214b562907ec496bb2ed7cf5057d02fb",
+        "occurrence_id": "mo_1d672d41a7554e98a3368cb08d449ba9",
+        "mime_path": "1",
+        "segment_id": "mseg_eb7d67c369aabc5f35e96e57875ec8342bfa8e5e55916bfda3ec936168dd6bd3",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 322,
+        "quote_text": "张经理：\n\n您好。向贵司报告：我司已于 2026 年 10 月 18 日 09:30 完成蓝湾项目全部设备发运。\n\n一、发运信息\n1. 发运时间：2026 年 10 月 18 日 09:30\n2. 承运方：顺丰供应链\n3. 物流单号：SF-8823-1097-4421\n4. 预计送达：2026 年 10 月 18 日 18:00 前送达贵司蓝湾项目现场\n\n二、联调情况\nWMS 接口联调已于 2026 年 10 月 17 日 22:40 全部通过，测试报告随货送达。\n\n三、我司意见\n我司已按双方确认的 2026 年 10 月 18 日节点完成交付，请贵司安排人员到货签收，并按交付方案推进后续验收。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "f2921b0fafda8fb22469f2e1ce04af21d263e8976adf51fc28e856c9976b3110",
+        "created_at": "2026-10-08 20:29:22",
+        "cell_range": null,
+        "payload_sha256": "a26f1cb450ce722456c1b1e26349d65495ffb5b6d4f98f378c3f0393280927c0",
+        "text_sha256": "a26f1cb450ce722456c1b1e26349d65495ffb5b6d4f98f378c3f0393280927c0",
+        "source_kind": "body",
+        "ordinal": 0,
+        "text": "张经理：\n\n您好。向贵司报告：我司已于 2026 年 10 月 18 日 09:30 完成蓝湾项目全部设备发运。\n\n一、发运信息\n1. 发运时间：2026 年 10 月 18 日 09:30\n2. 承运方：顺丰供应链\n3. 物流单号：SF-8823-1097-4421\n4. 预计送达：2026 年 10 月 18 日 18:00 前送达贵司蓝湾项目现场\n\n二、联调情况\nWMS 接口联调已于 2026 年 10 月 17 日 22:40 全部通过，测试报告随货送达。\n\n三、我司意见\n我司已按双方确认的 2026 年 10 月 18 日节点完成交付，请贵司安排人员到货签收，并按交付方案推进后续验收。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "sent_at_utc": "2026-10-18T03:05:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [
+          {
+            "mime_path": "1",
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 322,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_223c30e0b7834251ae572564e0b3971c",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_5acaf877f75947ae96a0e39479af5505",
+        "occurrence_id": "mo_96d7b3cd42664d59a2a2fc0576c3148c",
+        "mime_path": "headers.subject",
+        "segment_id": "mseg_f37c7572cb6386fbbf279ca77a554b06b1ac1055367f373b6f94a61796d81143",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 48,
+        "quote_text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "a6030c76b8ca4d2c843c957bfdb11e99c83fbefc76456bd7d86d0d8aad93caaf",
+        "created_at": "2026-10-08 20:30:48",
+        "cell_range": null,
+        "payload_sha256": null,
+        "text_sha256": "790fdb4713d3274b27716d9854c80168db2abf6d62124f3119127bbfb528a8d7",
+        "source_kind": "header",
+        "ordinal": 0,
+        "text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "sent_at_utc": "2026-10-08T01:40:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_e47712112855414298a345e711dde67a",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_9a598dca3d604d4bba7398cc0c0520ff",
+        "occurrence_id": "mo_b49f85c132e24748b79a565c08404f13",
+        "mime_path": "headers.subject",
+        "segment_id": "mseg_0634c578236e36470dab63ba1d810b14405df8357e856b2e36ca5963c3a290ae",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 48,
+        "quote_text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "6cbb0b1afa66e8ba5ceb5da16cc69c499ebc948e39f3e61f5cea179faddf32c4",
+        "created_at": "2026-10-08 20:30:47",
+        "cell_range": null,
+        "payload_sha256": null,
+        "text_sha256": "790fdb4713d3274b27716d9854c80168db2abf6d62124f3119127bbfb528a8d7",
+        "source_kind": "header",
+        "ordinal": 0,
+        "text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "sent_at_utc": "2026-10-08T06:10:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_5c17e72258ce4d888a1c52808381ab47",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_a241799a34aa4b79b9f1dcba13fa730a",
+        "occurrence_id": "mo_1be717f76cab4ac4a947c8ff20613fbf",
+        "mime_path": "2",
+        "segment_id": "mseg_83166a4d6b5029c3681381688725288fd14d6d53a4b6e24f705e048aae1c0df8",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 905,
+        "quote_text": "蓝湾项目  智能仓储分拣系统  交付方案 v2.0\n委托方：蓝湾实业集团  蓝湾项目组\n承建方：晟远智能装备有限公司\n版本：v2.0    定稿日期：2026 年 9 月 20 日\n第一章  项目范围\n1.1 分拣线 4 条（含输送段、扫码识别段、分拣执行段、收集段）。\n1.2 WMS 接口联调：与蓝湾实业现有 WMS 系统对接，覆盖入库、移库、出库三类单据。\n1.3 现场培训 2 场，每场 4 学时。\n第二章  责任人\n承建方交付负责人：李强（晟远智能装备有限公司）\n委托方项目经理：张伟（蓝湾实业集团）\n第三章  计划交付日期\n双方约定计划交付日期为：2026 年 10 月 15 日。\n（注：后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。）\n第四章  验收标准（本章即验收标准章节）\n4.1 分拣线连续运行 72 小时无故障停机。\n4.2 分拣准确率不低于 99.5%，误分率不高于 0.3%。\n4.3 WMS 接口联调测试全部用例通过，单据同步延迟不超过 2 秒。\n4.4 现场培训完成，双方签署《培训记录表》。\n4.5 交付物清单齐全：设备本体、备件包、操作手册、接口文档、测试报告。\n第五章  验收流程\n第一步  到货签收：委托方现场清点数量、核对装箱单，签署《到货签收单》。\n第二步  开箱检查：检查外观、铭牌、随机附件，记录开箱结果。\n第三步  安装调试：承建方完成机械与电气安装、单机调试。\n第四步  联调测试：完成 WMS 接口联调，提交测试报告。\n第五步  连续运行：按第 4.1 条进行 72 小时连续运行考核。\n第六步  签署《验收报告》：双方签字盖章，至此交付完成。\n第六章  交付完成的判定\n6.1 设备发运、物流签收均不构成交付完成。\n6.2 只有双方签署《验收报告》之日，方视为交付完成日。\n6.3 承建方单方面声明的“已交付”“已发货”不产生交付完成的法律效果。\n第七章  违约金\n承建方逾期交付的，每逾期一日按合同总价 0.5% 计付违约金。\n承建方：晟远智能装备有限公司（盖章）   委托方：蓝湾实业集团（盖章）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "15e4151c0ea95f3ce7fd83968a1888a81ccbf3ef45652840fd97984bd881e378",
+        "created_at": "2026-10-08 20:30:48",
+        "cell_range": null,
+        "payload_sha256": "4b79ed20c3f32b406d99f5e0db98d3c560a32a7002aa316ec8cb75064455ab58",
+        "text_sha256": "592cbb6fca8bb176b24695f9bc29cc754408c07965f8c6ce722e9857502a0de8",
+        "source_kind": "attachment",
+        "ordinal": 0,
+        "text": "蓝湾项目  智能仓储分拣系统  交付方案 v2.0\n委托方：蓝湾实业集团  蓝湾项目组\n承建方：晟远智能装备有限公司\n版本：v2.0    定稿日期：2026 年 9 月 20 日\n第一章  项目范围\n1.1 分拣线 4 条（含输送段、扫码识别段、分拣执行段、收集段）。\n1.2 WMS 接口联调：与蓝湾实业现有 WMS 系统对接，覆盖入库、移库、出库三类单据。\n1.3 现场培训 2 场，每场 4 学时。\n第二章  责任人\n承建方交付负责人：李强（晟远智能装备有限公司）\n委托方项目经理：张伟（蓝湾实业集团）\n第三章  计划交付日期\n双方约定计划交付日期为：2026 年 10 月 15 日。\n（注：后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。）\n第四章  验收标准（本章即验收标准章节）\n4.1 分拣线连续运行 72 小时无故障停机。\n4.2 分拣准确率不低于 99.5%，误分率不高于 0.3%。\n4.3 WMS 接口联调测试全部用例通过，单据同步延迟不超过 2 秒。\n4.4 现场培训完成，双方签署《培训记录表》。\n4.5 交付物清单齐全：设备本体、备件包、操作手册、接口文档、测试报告。\n第五章  验收流程\n第一步  到货签收：委托方现场清点数量、核对装箱单，签署《到货签收单》。\n第二步  开箱检查：检查外观、铭牌、随机附件，记录开箱结果。\n第三步  安装调试：承建方完成机械与电气安装、单机调试。\n第四步  联调测试：完成 WMS 接口联调，提交测试报告。\n第五步  连续运行：按第 4.1 条进行 72 小时连续运行考核。\n第六步  签署《验收报告》：双方签字盖章，至此交付完成。\n第六章  交付完成的判定\n6.1 设备发运、物流签收均不构成交付完成。\n6.2 只有双方签署《验收报告》之日，方视为交付完成日。\n6.3 承建方单方面声明的“已交付”“已发货”不产生交付完成的法律效果。\n第七章  违约金\n承建方逾期交付的，每逾期一日按合同总价 0.5% 计付违约金。\n承建方：晟远智能装备有限公司（盖章）   委托方：蓝湾实业集团（盖章）",
+        "sent_at_utc": "2026-09-20T02:00:00+00:00",
+        "subject_raw": "蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_e1b9d151bb50486eac6b27c5e2bf5009",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_c7a5fe119bfe49b0bddfd323e763c1b4",
+        "occurrence_id": "mo_c29bf39d349845b7af0099a5f02dbbe3",
+        "mime_path": "headers.subject",
+        "segment_id": "mseg_5de8f8425a6ebc66bc6764c14d9de41f70dadfcd102e6dde38c341739564d8be",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 48,
+        "quote_text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "4c79995d7b035dd05b7ae6a2094a746937ea13d07f00ccea604c6dd7ffc3d703",
+        "created_at": "2026-10-08 20:30:48",
+        "cell_range": null,
+        "payload_sha256": null,
+        "text_sha256": "790fdb4713d3274b27716d9854c80168db2abf6d62124f3119127bbfb528a8d7",
+        "source_kind": "header",
+        "ordinal": 0,
+        "text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "sent_at_utc": "2026-09-29T07:30:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_176ca9f1c9c24525b7e9c00421b8364d",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_214b562907ec496bb2ed7cf5057d02fb",
+        "occurrence_id": "mo_1d672d41a7554e98a3368cb08d449ba9",
+        "mime_path": "headers.subject",
+        "segment_id": "mseg_4bbb7173c1915beeab23e5dcdc3536348a1e350845bfa2445fbf2c44c670d944",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 48,
+        "quote_text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "f2921b0fafda8fb22469f2e1ce04af21d263e8976adf51fc28e856c9976b3110",
+        "created_at": "2026-10-08 20:30:47",
+        "cell_range": null,
+        "payload_sha256": null,
+        "text_sha256": "790fdb4713d3274b27716d9854c80168db2abf6d62124f3119127bbfb528a8d7",
+        "source_kind": "header",
+        "ordinal": 0,
+        "text": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "sent_at_utc": "2026-10-18T03:05:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_e4c8bb0c710443a0b36a237b2d4c93b3",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_5acaf877f75947ae96a0e39479af5505",
+        "occurrence_id": "mo_96d7b3cd42664d59a2a2fc0576c3148c",
+        "mime_path": "1",
+        "segment_id": "mseg_fc258f006999c3cb0efa07a4637ac27379c0ca02b3294dd7d6ce5dd388b53bb8",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 377,
+        "quote_text": "张经理：\n\n您好。有一个需要向贵司报告的事项，我司须正式提出延期申请。\n\n一、延期原因\n蓝湾项目分拣线核心控制器（PLC）的原定到货时间为 2026 年 9 月 25 日，供应商实际于 2026 年 10 月 3 日才发货，比原计划晚了 8 天，直接压缩了后续联调与联机调试的时间。\n\n二、申请事项\n申请将蓝湾项目交付日期由 2026 年 10 月 15 日延期至 2026 年 10 月 20 日。\n\n三、我司的补救措施\n1. 延期期间加派 4 名工程师驻场，实行两班倒；\n2. 保证 WMS 接口联调在交付前 1 日完成并通过内部测试；\n3. 承诺 2026 年 10 月 20 日完成交付，不再二次延期。\n\n因 PLC 供货属于上游原因，我方对由此给贵司造成的被动深表歉意，恳请贵司予以谅解并批准本次延期。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "a6030c76b8ca4d2c843c957bfdb11e99c83fbefc76456bd7d86d0d8aad93caaf",
+        "created_at": "2026-10-08 20:30:48",
+        "cell_range": null,
+        "payload_sha256": "3fb20e4bc30779d816e3c0ad54ac21c3e1c8560f228b62f048415074db07b902",
+        "text_sha256": "3fb20e4bc30779d816e3c0ad54ac21c3e1c8560f228b62f048415074db07b902",
+        "source_kind": "body",
+        "ordinal": 0,
+        "text": "张经理：\n\n您好。有一个需要向贵司报告的事项，我司须正式提出延期申请。\n\n一、延期原因\n蓝湾项目分拣线核心控制器（PLC）的原定到货时间为 2026 年 9 月 25 日，供应商实际于 2026 年 10 月 3 日才发货，比原计划晚了 8 天，直接压缩了后续联调与联机调试的时间。\n\n二、申请事项\n申请将蓝湾项目交付日期由 2026 年 10 月 15 日延期至 2026 年 10 月 20 日。\n\n三、我司的补救措施\n1. 延期期间加派 4 名工程师驻场，实行两班倒；\n2. 保证 WMS 接口联调在交付前 1 日完成并通过内部测试；\n3. 承诺 2026 年 10 月 20 日完成交付，不再二次延期。\n\n因 PLC 供货属于上游原因，我方对由此给贵司造成的被动深表歉意，恳请贵司予以谅解并批准本次延期。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "sent_at_utc": "2026-10-08T01:40:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [
+          {
+            "mime_path": "1",
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 377,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_b9476508a50e44878208297b2ec19c54",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_a241799a34aa4b79b9f1dcba13fa730a",
+        "occurrence_id": "mo_1be717f76cab4ac4a947c8ff20613fbf",
+        "mime_path": "headers.subject",
+        "segment_id": "mseg_07e4223b4a5d94697cd316ccb19d7f2a3f5afa654825bd4c869b73cd464938a3",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 45,
+        "quote_text": "蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "15e4151c0ea95f3ce7fd83968a1888a81ccbf3ef45652840fd97984bd881e378",
+        "created_at": "2026-10-08 20:30:48",
+        "cell_range": null,
+        "payload_sha256": null,
+        "text_sha256": "165295de1199ba3c363fea76d4cacb5bb751e661bbead630e0eca9443c68eff8",
+        "source_kind": "header",
+        "ordinal": 0,
+        "text": "蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "sent_at_utc": "2026-09-20T02:00:00+00:00",
+        "subject_raw": "蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_d3bca523cffa47f8878ca072aed174c3",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_c7a5fe119bfe49b0bddfd323e763c1b4",
+        "occurrence_id": "mo_c29bf39d349845b7af0099a5f02dbbe3",
+        "mime_path": "1",
+        "segment_id": "mseg_78a375ce3898a38689c88f7e08f8427dcc3b83495f1342fa48b3c601f0961b1d",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 301,
+        "quote_text": "张经理：\n\n您好。现将蓝湾项目截至 2026 年 9 月 29 日的进度反馈如下：\n\n一、分拣线\n1. 机械安装：4 条线体完成 100%\n2. 电气接线：完成 80%\n3. 单机调试：完成 40%\n\n二、WMS 接口联调\n1. 接口文档评审：已完成\n2. 联调测试：完成 60%，剩余为异常单据与并发场景\n\n三、培训与文档\n1. 培训教材：已定稿\n2. 操作手册：初稿完成\n\n四、总体判断\n总体进度约 70%，目前未发现影响节点的风险。我司判断可以按约定日期 2026 年 10 月 15 日完成交付。\n\n李强\n晟远智能装备有限公司 项目交付部\n邮箱：li.qiang@shengyuan-zn.cn",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "4c79995d7b035dd05b7ae6a2094a746937ea13d07f00ccea604c6dd7ffc3d703",
+        "created_at": "2026-10-08 20:30:48",
+        "cell_range": null,
+        "payload_sha256": "ffc97fb4770ef4bc173382904c3e8f72c2ebf0f2c489138fe074ccd57eb66df9",
+        "text_sha256": "ffc97fb4770ef4bc173382904c3e8f72c2ebf0f2c489138fe074ccd57eb66df9",
+        "source_kind": "body",
+        "ordinal": 0,
+        "text": "张经理：\n\n您好。现将蓝湾项目截至 2026 年 9 月 29 日的进度反馈如下：\n\n一、分拣线\n1. 机械安装：4 条线体完成 100%\n2. 电气接线：完成 80%\n3. 单机调试：完成 40%\n\n二、WMS 接口联调\n1. 接口文档评审：已完成\n2. 联调测试：完成 60%，剩余为异常单据与并发场景\n\n三、培训与文档\n1. 培训教材：已定稿\n2. 操作手册：初稿完成\n\n四、总体判断\n总体进度约 70%，目前未发现影响节点的风险。我司判断可以按约定日期 2026 年 10 月 15 日完成交付。\n\n李强\n晟远智能装备有限公司 项目交付部\n邮箱：li.qiang@shengyuan-zn.cn",
+        "sent_at_utc": "2026-09-29T07:30:00+00:00",
+        "subject_raw": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          },
+          {
+            "role": "to",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          }
+        ],
+        "body_fragments": [
+          {
+            "mime_path": "1",
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 301,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "role": "support"
+      },
+      {
+        "evidence_id": "mev_ea485e98dfe744f59d67a907adb9d4d9",
+        "package_id": "mp_aa45ca398e3543909f412d9d5a7f2b79",
+        "message_key": "mm_a241799a34aa4b79b9f1dcba13fa730a",
+        "occurrence_id": "mo_1be717f76cab4ac4a947c8ff20613fbf",
+        "mime_path": "1",
+        "segment_id": "mseg_f58768fdc1d7dc011f6ec19ad719a7cc3a732628dfbb3a79571729bb8b0f8b46",
+        "page_number": null,
+        "sheet_name": null,
+        "char_start": 0,
+        "char_end": 401,
+        "quote_text": "李工：\n\n您好。承接 9 月 18 日双方现场会议结论，现将蓝湾项目交付安排书面固化如下，请贵司回复确认。\n\n一、项目信息\n1. 项目名称：蓝湾项目 智能仓储分拣系统\n2. 承建方：晟远智能装备有限公司\n3. 委托方：蓝湾实业集团 蓝湾项目组\n\n二、交付安排\n1. 交付日期：2026 年 10 月 15 日\n2. 交付内容：分拣线 4 条、WMS 接口联调、现场培训 2 场\n3. 责任人：贵司李强（交付负责人）、我方张伟（项目经理）\n4. 验收标准：以附件《蓝湾项目交付方案-v2.docx》第四章为准\n\n三、说明\n本项目 10 月 22 日需与业主方联合验收，因此 10 月 15 日这个节点对我方非常关键，请贵司务必以此为准安排排产与人力。\n\n请回复确认。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理\n电话：021-6789 3312\n邮箱：zhang.wei@lanwan-group.com",
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "source_sha256": "15e4151c0ea95f3ce7fd83968a1888a81ccbf3ef45652840fd97984bd881e378",
+        "created_at": "2026-10-08 20:30:48",
+        "cell_range": null,
+        "payload_sha256": "5971af4018ad66b7937854e4fa190434c10d8539442daa1bdbc38ad7bed92710",
+        "text_sha256": "5971af4018ad66b7937854e4fa190434c10d8539442daa1bdbc38ad7bed92710",
+        "source_kind": "body",
+        "ordinal": 0,
+        "text": "李工：\n\n您好。承接 9 月 18 日双方现场会议结论，现将蓝湾项目交付安排书面固化如下，请贵司回复确认。\n\n一、项目信息\n1. 项目名称：蓝湾项目 智能仓储分拣系统\n2. 承建方：晟远智能装备有限公司\n3. 委托方：蓝湾实业集团 蓝湾项目组\n\n二、交付安排\n1. 交付日期：2026 年 10 月 15 日\n2. 交付内容：分拣线 4 条、WMS 接口联调、现场培训 2 场\n3. 责任人：贵司李强（交付负责人）、我方张伟（项目经理）\n4. 验收标准：以附件《蓝湾项目交付方案-v2.docx》第四章为准\n\n三、说明\n本项目 10 月 22 日需与业主方联合验收，因此 10 月 15 日这个节点对我方非常关键，请贵司务必以此为准安排排产与人力。\n\n请回复确认。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理\n电话：021-6789 3312\n邮箱：zhang.wei@lanwan-group.com",
+        "sent_at_utc": "2026-09-20T02:00:00+00:00",
+        "subject_raw": "蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "participants": [
+          {
+            "role": "cc",
+            "normalized_address": "zhou.ning@lanwan-group.com",
+            "display_name_sample": "周宁"
+          },
+          {
+            "role": "cc",
+            "normalized_address": "chen.li@shengyuan-zn.cn",
+            "display_name_sample": "陈立"
+          },
+          {
+            "role": "from",
+            "normalized_address": "zhang.wei@lanwan-group.com",
+            "display_name_sample": "张伟"
+          },
+          {
+            "role": "to",
+            "normalized_address": "li.qiang@shengyuan-zn.cn",
+            "display_name_sample": "李强"
+          }
+        ],
+        "body_fragments": [
+          {
+            "mime_path": "1",
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 401,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "role": "support"
+      }
+    ],
+    "packing": {
+      "version": "mail-evidence-packing-v1-bounded-batches",
+      "source_total": 18,
+      "included": 18,
+      "batch_count": 3,
+      "batch_evidence_ids": [
+        [
+          "mev_679a3529d8e5426b87a0a7f2de51f223",
+          "mev_f6dbb637a1924110a86dba37635e6b02",
+          "mev_6f4927bf1f4e4416a08f54fc5641a9cb",
+          "mev_6bce8ae4d6a34eb2b45bd16da3be878a",
+          "mev_341ac75dcfe347fcb511c4d6b7530662",
+          "mev_cbfccdbea1d44aba86996cad9e18d8a2",
+          "mev_cf2c0bbd2dd94472a17ea1bea4233f7d"
+        ],
+        [
+          "mev_2ae5bcf6ca364399ae0cfbeb473fb002",
+          "mev_76bb082f675246c6aad5386d4fd2d787",
+          "mev_223c30e0b7834251ae572564e0b3971c",
+          "mev_e47712112855414298a345e711dde67a",
+          "mev_5c17e72258ce4d888a1c52808381ab47",
+          "mev_e1b9d151bb50486eac6b27c5e2bf5009",
+          "mev_176ca9f1c9c24525b7e9c00421b8364d",
+          "mev_e4c8bb0c710443a0b36a237b2d4c93b3"
+        ],
+        [
+          "mev_b9476508a50e44878208297b2ec19c54",
+          "mev_d3bca523cffa47f8878ca072aed174c3",
+          "mev_ea485e98dfe744f59d67a907adb9d4d9"
+        ]
+      ],
+      "omitted": [],
+      "allocations": [
+        {
+          "evidence_id": "mev_679a3529d8e5426b87a0a7f2de51f223",
+          "issue_id": "mm_05e275e4aee0418f87358e71c081e95e",
+          "actor": "unknown",
+          "role": "counter",
+          "estimated_tokens": 808
+        },
+        {
+          "evidence_id": "mev_f6dbb637a1924110a86dba37635e6b02",
+          "issue_id": "mm_5a790d478ff747819946fec86c458061",
+          "actor": "unknown",
+          "role": "counter",
+          "estimated_tokens": 702
+        },
+        {
+          "evidence_id": "mev_6f4927bf1f4e4416a08f54fc5641a9cb",
+          "issue_id": "mm_9a598dca3d604d4bba7398cc0c0520ff",
+          "actor": "unknown",
+          "role": "counter",
+          "estimated_tokens": 684
+        },
+        {
+          "evidence_id": "mev_6bce8ae4d6a34eb2b45bd16da3be878a",
+          "issue_id": "mm_0378417ed9e84665a6ad0f5c204906cf",
+          "actor": "unknown",
+          "role": "condition",
+          "estimated_tokens": 675
+        },
+        {
+          "evidence_id": "mev_341ac75dcfe347fcb511c4d6b7530662",
+          "issue_id": "mm_0378417ed9e84665a6ad0f5c204906cf",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 706
+        },
+        {
+          "evidence_id": "mev_cbfccdbea1d44aba86996cad9e18d8a2",
+          "issue_id": "mm_05e275e4aee0418f87358e71c081e95e",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 338
+        },
+        {
+          "evidence_id": "mev_cf2c0bbd2dd94472a17ea1bea4233f7d",
+          "issue_id": "mm_5a790d478ff747819946fec86c458061",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 338
+        },
+        {
+          "evidence_id": "mev_2ae5bcf6ca364399ae0cfbeb473fb002",
+          "issue_id": "mm_0378417ed9e84665a6ad0f5c204906cf",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 338
+        },
+        {
+          "evidence_id": "mev_76bb082f675246c6aad5386d4fd2d787",
+          "issue_id": "mm_214b562907ec496bb2ed7cf5057d02fb",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 589
+        },
+        {
+          "evidence_id": "mev_223c30e0b7834251ae572564e0b3971c",
+          "issue_id": "mm_5acaf877f75947ae96a0e39479af5505",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 338
+        },
+        {
+          "evidence_id": "mev_e47712112855414298a345e711dde67a",
+          "issue_id": "mm_9a598dca3d604d4bba7398cc0c0520ff",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 338
+        },
+        {
+          "evidence_id": "mev_5c17e72258ce4d888a1c52808381ab47",
+          "issue_id": "mm_a241799a34aa4b79b9f1dcba13fa730a",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 1083
+        },
+        {
+          "evidence_id": "mev_e1b9d151bb50486eac6b27c5e2bf5009",
+          "issue_id": "mm_c7a5fe119bfe49b0bddfd323e763c1b4",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 338
+        },
+        {
+          "evidence_id": "mev_176ca9f1c9c24525b7e9c00421b8364d",
+          "issue_id": "mm_214b562907ec496bb2ed7cf5057d02fb",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 338
+        },
+        {
+          "evidence_id": "mev_e4c8bb0c710443a0b36a237b2d4c93b3",
+          "issue_id": "mm_5acaf877f75947ae96a0e39479af5505",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 663
+        },
+        {
+          "evidence_id": "mev_b9476508a50e44878208297b2ec19c54",
+          "issue_id": "mm_a241799a34aa4b79b9f1dcba13fa730a",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 335
+        },
+        {
+          "evidence_id": "mev_d3bca523cffa47f8878ca072aed174c3",
+          "issue_id": "mm_c7a5fe119bfe49b0bddfd323e763c1b4",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 586
+        },
+        {
+          "evidence_id": "mev_ea485e98dfe744f59d67a907adb9d4d9",
+          "issue_id": "mm_a241799a34aa4b79b9f1dcba13fa730a",
+          "actor": "unknown",
+          "role": "support",
+          "estimated_tokens": 674
+        }
+      ],
+      "ledger_complete": true,
+      "synthesis_complete": true,
+      "max_tokens": 12000
+    },
+    "candidate_audit_steps": [
+      {
+        "step_id": "mrs_fbb31b49779d42a7bb6857271b4c9dff",
+        "turn_id": "mrt_6f406ae331a14385ba61467b961708bb",
+        "sequence": 155,
+        "tool_name": "answer_candidate_audit",
+        "input_json": "{\"attempt\": 1, \"stage\": \"prejudge_proposals\"}",
+        "output_ref": "{\"answer_generation_raw\": {\"claims\": [{\"claim_text\": \"蓝湾项目约定计划交付日期为2026年10月15日。\", \"evidence_ids\": [\"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\"], \"source_quote\": \"双方约定计划交付日期为：2026 年 10 月 15 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。\"], \"time_basis\": \"2026-09-20\"}, {\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}, {\"claim_text\": \"蓝湾项目状态为未交付、未验收。\", \"evidence_ids\": [\"mev_679a3529d8e5426b87a0a7f2de51f223\"], \"source_quote\": \"截至目前，蓝湾项目状态为：未交付、未验收。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备\", \"只有双方签署《验收报告》之日方视为交付完成日\"], \"time_basis\": \"2026-10-21\"}], \"unanswered_subquestions\": [\"actual_completion_date\", \"acceptance\"]}, \"answer_content_precheck\": {\"status\": \"repair_required\", \"failures\": [{\"atom_index\": 1, \"errors\": [\"temporal_scope_or_full_history_unproven\"]}], \"remaining_atom_indexes\": [1]}, \"attempt\": 1}",
+        "status": "completed",
+        "started_at": "2026-10-08 20:34:49",
+        "finished_at": "2026-10-08 20:34:49",
+        "error_json": null
+      },
+      {
+        "step_id": "mrs_2b5144c81fb246a1a86d2ba166a1db6f",
+        "turn_id": "mrt_6f406ae331a14385ba61467b961708bb",
+        "sequence": 156,
+        "tool_name": "answer_candidate_audit",
+        "input_json": "{\"attempt\": 1, \"stage\": \"bounded_repair_started\"}",
+        "output_ref": "{\"answer_generation_raw\": {\"claims\": [{\"claim_text\": \"蓝湾项目约定计划交付日期为2026年10月15日。\", \"evidence_ids\": [\"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\"], \"source_quote\": \"双方约定计划交付日期为：2026 年 10 月 15 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。\"], \"time_basis\": \"2026-09-20\"}, {\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}, {\"claim_text\": \"蓝湾项目状态为未交付、未验收。\", \"evidence_ids\": [\"mev_679a3529d8e5426b87a0a7f2de51f223\"], \"source_quote\": \"截至目前，蓝湾项目状态为：未交付、未验收。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备\", \"只有双方签署《验收报告》之日方视为交付完成日\"], \"time_basis\": \"2026-10-21\"}], \"unanswered_subquestions\": [\"actual_completion_date\", \"acceptance\"]}, \"answer_format_repair\": {\"status\": \"attempted\", \"atom_indexes\": [1], \"original_atoms\": [{\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"repairs\": {\"type\": \"array\", \"maxItems\": 1, \"items\": {\"type\": \"object\", \"properties\": {\"atom_index\": {\"type\": \"integer\", \"enum\": [1]}, \"claim_text\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 240}, \"evidence_ids\": {\"type\": \"array\", \"minItems\": 1, \"maxItems\": 18, \"items\": {\"type\": \"string\", \"enum\": [\"mev_176ca9f1c9c24525b7e9c00421b8364d\", \"mev_223c30e0b7834251ae572564e0b3971c\", \"mev_2ae5bcf6ca364399ae0cfbeb473fb002\", \"mev_341ac75dcfe347fcb511c4d6b7530662\", \"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_679a3529d8e5426b87a0a7f2de51f223\", \"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_6f4927bf1f4e4416a08f54fc5641a9cb\", \"mev_76bb082f675246c6aad5386d4fd2d787\", \"mev_b9476508a50e44878208297b2ec19c54\", \"mev_cbfccdbea1d44aba86996cad9e18d8a2\", \"mev_cf2c0bbd2dd94472a17ea1bea4233f7d\", \"mev_d3bca523cffa47f8878ca072aed174c3\", \"mev_e1b9d151bb50486eac6b27c5e2bf5009\", \"mev_e47712112855414298a345e711dde67a\", \"mev_e4c8bb0c710443a0b36a237b2d4c93b3\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\", \"mev_f6dbb637a1924110a86dba37635e6b02\"]}}, \"source_quote\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 400}, \"actor\": {\"type\": \"string\", \"enum\": [\"li.qiang@shengyuan-zn.cn\", \"zhang.wei@lanwan-group.com\", \"\"]}, \"object_ref\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 80}}, \"required\": [\"atom_index\", \"claim_text\", \"evidence_ids\", \"source_quote\", \"actor\", \"object_ref\"], \"additionalProperties\": false}}}, \"required\": [\"repairs\"], \"additionalProperties\": false}}, \"answer_content_precheck\": {\"status\": \"repair_required\", \"failures\": [{\"atom_index\": 1, \"errors\": [\"temporal_scope_or_full_history_unproven\"]}], \"remaining_atom_indexes\": [1]}, \"attempt\": 1}",
+        "status": "completed",
+        "started_at": "2026-10-08 20:34:49",
+        "finished_at": "2026-10-08 20:34:49",
+        "error_json": null
+      },
+      {
+        "step_id": "mrs_5d69d0f1f00b47a6b72dbc4348a663d5",
+        "turn_id": "mrt_6f406ae331a14385ba61467b961708bb",
+        "sequence": 161,
+        "tool_name": "answer_candidate_audit",
+        "input_json": "{\"attempt\": 1, \"stage\": \"stopped\"}",
+        "output_ref": "{\"answer_generation_raw\": {\"claims\": [{\"claim_text\": \"蓝湾项目约定计划交付日期为2026年10月15日。\", \"evidence_ids\": [\"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\"], \"source_quote\": \"双方约定计划交付日期为：2026 年 10 月 15 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"后续因 PLC 供货延迟提出延期申请，该日期经双方书面往来调整，以双方最终确认的《交付确认单》为准。\"], \"time_basis\": \"2026-09-20\"}, {\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}, {\"claim_text\": \"蓝湾项目状态为未交付、未验收。\", \"evidence_ids\": [\"mev_679a3529d8e5426b87a0a7f2de51f223\"], \"source_quote\": \"截至目前，蓝湾项目状态为：未交付、未验收。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"zhang.wei@lanwan-group.com\", \"conditions\": [\"截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备\", \"只有双方签署《验收报告》之日方视为交付完成日\"], \"time_basis\": \"2026-10-21\"}], \"unanswered_subquestions\": [\"actual_completion_date\", \"acceptance\"]}, \"answer_format_repair\": {\"status\": \"rejected\", \"atom_indexes\": [1], \"original_atoms\": [{\"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_341ac75dcfe347fcb511c4d6b7530662\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"object_ref\": \"蓝湾项目\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"conditions\": [\"原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\", \"交付完成以双方签署《验收报告》之日为准。\"], \"time_basis\": \"2026-10-09\"}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"repairs\": {\"type\": \"array\", \"maxItems\": 1, \"items\": {\"type\": \"object\", \"properties\": {\"atom_index\": {\"type\": \"integer\", \"enum\": [1]}, \"claim_text\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 240}, \"evidence_ids\": {\"type\": \"array\", \"minItems\": 1, \"maxItems\": 18, \"items\": {\"type\": \"string\", \"enum\": [\"mev_176ca9f1c9c24525b7e9c00421b8364d\", \"mev_223c30e0b7834251ae572564e0b3971c\", \"mev_2ae5bcf6ca364399ae0cfbeb473fb002\", \"mev_341ac75dcfe347fcb511c4d6b7530662\", \"mev_5c17e72258ce4d888a1c52808381ab47\", \"mev_679a3529d8e5426b87a0a7f2de51f223\", \"mev_6bce8ae4d6a34eb2b45bd16da3be878a\", \"mev_6f4927bf1f4e4416a08f54fc5641a9cb\", \"mev_76bb082f675246c6aad5386d4fd2d787\", \"mev_b9476508a50e44878208297b2ec19c54\", \"mev_cbfccdbea1d44aba86996cad9e18d8a2\", \"mev_cf2c0bbd2dd94472a17ea1bea4233f7d\", \"mev_d3bca523cffa47f8878ca072aed174c3\", \"mev_e1b9d151bb50486eac6b27c5e2bf5009\", \"mev_e47712112855414298a345e711dde67a\", \"mev_e4c8bb0c710443a0b36a237b2d4c93b3\", \"mev_ea485e98dfe744f59d67a907adb9d4d9\", \"mev_f6dbb637a1924110a86dba37635e6b02\"]}}, \"source_quote\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 400}, \"actor\": {\"type\": \"string\", \"enum\": [\"li.qiang@shengyuan-zn.cn\", \"zhang.wei@lanwan-group.com\", \"\"]}, \"object_ref\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 80}}, \"required\": [\"atom_index\", \"claim_text\", \"evidence_ids\", \"source_quote\", \"actor\", \"object_ref\"], \"additionalProperties\": false}}}, \"required\": [\"repairs\"], \"additionalProperties\": false}, \"proposal\": {\"repairs\": [{\"atom_index\": 1, \"claim_text\": \"蓝湾项目最终交付日期确认为2026年10月18日。\", \"evidence_ids\": [\"mev_6bce8ae4d6a34eb2b45bd16da3be878a\"], \"source_quote\": \"双方最终确认的交付日期为：2026 年 10 月 18 日。\", \"actor\": \"li.qiang@shengyuan-zn.cn\", \"object_ref\": \"蓝湾项目\"}]}}, \"answer_content_precheck\": {\"status\": \"rejected\", \"failures\": [{\"atom_index\": 1, \"errors\": [\"temporal_scope_or_full_history_unproven\"]}], \"remaining_atom_indexes\": [1], \"proposal_failures\": [{\"atom_index\": 1, \"errors\": [\"temporal_scope_or_full_history_unproven\"]}]}, \"attempt\": 1}",
+        "status": "completed",
+        "started_at": "2026-10-08 20:35:04",
+        "finished_at": "2026-10-08 20:35:04",
+        "error_json": null
+      }
+    ],
+    "read_only": true,
+    "source_kind": "persisted_original_DB_evidence_and_allocation",
+    "exact_original_quote_offset_binding": true,
+    "exact_transient_model_payload_replay": false,
+    "limitations": [
+      "Original provider payload was not saved in production. Transient context_anchor, context_role, attribution, ledger act/conditions fields may be absent. This export is source binding evidence, not a complete in-memory replay."
+    ]
+  }
+}

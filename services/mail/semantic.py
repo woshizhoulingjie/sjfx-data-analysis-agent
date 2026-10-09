@@ -1,6 +1,7 @@
 """Package-scoped E5 encoding, adapted from large_package_semantic without modifying it."""
 from __future__ import annotations
 import hashlib
+import json
 import time
 import numpy as np
 from config import Config
@@ -89,7 +90,7 @@ def ensure_header_segments(repository,package_id,owner_id):
     package=repository.get_package(package_id,owner_id)
     if not package:raise ValueError('邮件资料包不存在')
     with repository._connection() as c:
-        rows=c.execute("SELECT DISTINCT m.message_key,m.subject_raw FROM mail_messages m JOIN mail_occurrences o ON o.message_key=m.message_key WHERE o.package_id=? AND COALESCE(m.subject_raw,'')<>'' AND NOT EXISTS (SELECT 1 FROM mail_text_segments s WHERE s.package_id=o.package_id AND s.message_key=m.message_key AND s.source_kind='header')",(package_id,)).fetchall()
+        rows=c.execute("SELECT DISTINCT m.message_key,m.subject_raw FROM mail_messages m JOIN mail_visible_occurrences o ON o.message_key=m.message_key WHERE o.package_id=? AND COALESCE(m.subject_raw,'')<>'' AND NOT EXISTS (SELECT 1 FROM mail_text_segments s WHERE s.package_id=o.package_id AND s.message_key=m.message_key AND s.source_kind='header')",(package_id,)).fetchall()
         for row in rows:
             text=row['subject_raw'];sid='mheader_'+hashlib.sha256((package_id+'\0'+row['message_key']).encode()).hexdigest()[:32]
             digest=hashlib.sha256(text.encode()).hexdigest();language=repository._language(text)
@@ -133,26 +134,38 @@ def embed_segments_batch(repository,package_id,owner_id,client=None,cancelled=la
     return {**status,'processed':len(rows),'encoded':len(pending)}
 
 
-def vector_search(repository,package_id,owner_id,question,*,limit=200,attachment_only=False,client=None):
+def vector_search(repository,package_id,owner_id,question,*,limit=200,attachment_only=False,client=None,allowed_keys=None,include_attachments=True):
     if not repository.get_package(package_id,owner_id):raise ValueError('邮件资料包不存在')
     client=client or embedding_client()
     if not client:return [],{'status':'disabled'}
     key=model_key(client);status=index_status(repository,package_id,owner_id,key)
     if not status['ready']:return [],status
+    if allowed_keys is not None:
+        allowed_keys=sorted(set(allowed_keys))
+        if not allowed_keys:return [],{**status,'scope_applied_before_limit':True,'scoped_ready':0}
     query=normalize_vector(client.embed([query_text(question)])[0])
     # Scan moderate mail packages exactly; LSH is approximate only above 20k valid segments.
     with repository._connection() as c:
         ids=None
-        if status['ready']>20000:
+        scope_sql="";scope_args=[]
+        if allowed_keys is not None:
+            from .research.scope import scope_clause
+            scope_sql=scope_clause(c,allowed_keys,'s.message_key')
+        if not include_attachments:scope_sql+=" AND s.source_kind!='attachment'"
+        if attachment_only:scope_sql+=" AND s.source_kind='attachment'"
+        scoped_ready=c.execute('SELECT COUNT(*) FROM mail_embeddings e JOIN mail_text_segments s ON s.package_id=e.package_id AND s.segment_id=e.segment_id AND s.text_sha256=e.text_sha256 WHERE e.package_id=? AND e.model=?'+scope_sql,[package_id,key,*scope_args]).fetchone()[0]
+        status.update(scope_applied_before_limit=True,scoped_ready=scoped_ready)
+        if scoped_ready>20000:
             counts={}
             for band,bucket in enumerate(lsh_buckets(query)):
                 neighbors=[bucket]+[bucket^(1<<i) for i in range(10)]
-                for r in c.execute('SELECT segment_id FROM mail_embedding_buckets WHERE package_id=? AND model=? AND band=? AND bucket IN ('+','.join('?' for _ in neighbors)+') LIMIT 4096',[package_id,key,band]+neighbors):counts[r[0]]=counts.get(r[0],0)+1
+                for r in c.execute('SELECT b.segment_id FROM mail_embedding_buckets b JOIN mail_text_segments s ON s.package_id=b.package_id AND s.segment_id=b.segment_id WHERE b.package_id=? AND b.model=? AND b.band=? AND b.bucket IN ('+','.join('?' for _ in neighbors)+')'+scope_sql+' LIMIT 4096',[package_id,key,band,*neighbors,*scope_args]):counts[r[0]]=counts.get(r[0],0)+1
             ids=sorted(counts,key=counts.get,reverse=True)[:4096]
             status['approximate']=True
             if not ids:return [],status
         sql='SELECT s.*,m.subject_raw,m.sent_at_utc,e.vector FROM mail_embeddings e JOIN mail_text_segments s ON s.package_id=e.package_id AND s.segment_id=e.segment_id AND s.text_sha256=e.text_sha256 JOIN mail_messages m ON m.message_key=s.message_key WHERE e.package_id=? AND e.model=? AND e.dim=?'
-        args=[package_id,key,len(query)]
+        args=[package_id,key,len(query),*scope_args]
+        sql+=scope_sql
         if attachment_only:sql+=" AND s.source_kind='attachment'"
         if ids:sql+=' AND s.segment_id IN ('+','.join('?' for _ in ids)+')';args+=ids
         scored=[]

@@ -15,10 +15,19 @@ from services.mail.jobs import _research
 from services.mail.people import corpus_state
 from sjfx_multiuser.ownership import resolve_owner
 
+from test_person_context_upgrade import decode_person_source_payload,PersonModel
+
 class EvidenceModel:
     def __init__(self):self.calls=[]
     def chat_json(self,system,prompt,**kwargs):
-        payload=json.loads(prompt);self.calls.append(payload)
+        payload=decode_person_source_payload(json.loads(prompt));self.calls.append(payload)
+        if 'claims' in payload:return PersonModel().chat_json(system,prompt,**kwargs)
+        if 'context_chunks' in payload:
+            return {'json':{'reviews':[{'finding_id':f['finding_id'],'status':'supported',
+                'rationale':'已核查当前上下文，仍需按完整会话审阅',
+                'conditions':[],'contradictions':[],'unresolved_questions':[],
+                'citations':[],'counterevidence':[],'later_replies':[]}
+                for f in payload['provisional_findings']]}}
         if 'chunks' in payload:
             return {'json':{'findings':[{'kind':'goal' if c['authored'] else 'received','statement':'核实条件后推进合作','uncertainty':'需结合原文核实','citations':[{'chunk_id':c['chunk_id'],'quote':c['text'][:40]}]} for c in payload['chunks']]}}
         return {'json':{'themes':[{'title':'核实条件再推进','statement':'以明确条件作为后续行动前提','uncertainty':'收到的信息不等于本人认同','finding_ids':[f['finding_id'] for f in payload['evidence'][:6]]}]}}
@@ -44,7 +53,7 @@ def test_selected_correspondent_runs_through_real_mail_queue(tmp_path,monkeypatc
         assert response.status_code==202,response.text
         tid=response.json()['turn_id'];job=storage.get_job(response.json()['job_id'],owner)
         assert job and job['task_type']=='mail_research' and job['owner_id']==owner
-        for _ in range(10):
+        for _ in range(30):
             result=_research(job,services)
             if not result.get('_requeue_slice'):break
         else:raise AssertionError('Person analysis did not finish')
@@ -53,7 +62,19 @@ def test_selected_correspondent_runs_through_real_mail_queue(tmp_path,monkeypatc
         assert result['progress']['characters_read']==corpus_state(repo,pid,owner,'alice@example.com')['characters']
         assert result['progress']['synthesis']['themes']
         findings=result['items'];assert {f['kind'] for f in findings}=={'goal','received'}
-        assert any('chunks' in c for c in model.calls) and any('evidence' in c for c in model.calls)
+        assert any('chunks' in c for c in model.calls) and any('claims' in c for c in model.calls)
+        assert result['progress']['synthesis']['method']=='source_bound_extractive'
+        if role=='user':
+            from services.mail.person_research import PERSON_EXECUTION_ENGINE
+            original=repo.get_turn(tid,owner)['task_spec']
+            assert original['execution_engine']==PERSON_EXECUTION_ENGINE
+            # Even a copied matching cache key must not revive a completed
+            # analysis from an older execution workflow.
+            legacy={k:v for k,v in original.items() if k!='execution_engine'}
+            with repo._connection() as c:
+                c.execute('UPDATE mail_research_turns SET task_spec_json=? WHERE turn_id=?',(json.dumps(legacy),tid))
+            response=client.post('/api/mail/packages/'+pid+'/person/analyses',json={'address':'alice@example.com','question':'他表达了哪些目标和条件？'})
+            assert response.status_code==202 and response.json()['turn_id']!=tid and not response.json().get('cached')
         identity.update(role='user',owner_id='intruder')
         assert client.get('/api/mail/person-analyses/'+tid).status_code==404
         assert client.get('/api/mail/packages/'+pid+'/person/messages?address=alice@example.com').status_code==404

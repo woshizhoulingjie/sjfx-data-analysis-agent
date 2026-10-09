@@ -17,7 +17,7 @@ from .research.runtime import MailResearchRuntime
 from .source import AdapterRegistry
 
 
-MAIL_TASK_TYPES = {"mail_import", "mail_extract", "mail_ocr", "mail_research", "mail_export"}
+MAIL_TASK_TYPES = {"mail_import", "mail_extract", "mail_ocr", "mail_research", "mail_export", "mail_foundation"}
 if Config.MAIL_ENABLE_VECTOR_INDEX:
     MAIL_TASK_TYPES.add("mail_embed")
 if Config.MAIL_ENABLE_FACT_EXTRACTION:
@@ -25,7 +25,7 @@ if Config.MAIL_ENABLE_FACT_EXTRACTION:
 
 
 def _ingest_nested(services,package,source_record,member,parsed,depth=0):
-    if not Config.MAIL_ENABLE_NESTED_MESSAGES or depth>=services.policy.max_nested_message_depth:return 0
+    if not package.get("config",{}).get("include_nested_messages",False) or not Config.MAIL_ENABLE_NESTED_MESSAGES or depth>=services.policy.max_nested_message_depth:return 0
     count=0
     for part in parsed.parts:
         if part.part_role!="nested_message" or not part.raw_payload:continue
@@ -68,10 +68,26 @@ def _active(services, job_id):
 
 
 def _job_update(services, job, *, progress, stage, message):
-    services.storage.update_job(
+    return services.storage.update_job(
         job["id"], progress=progress, stage=stage, message=message,
         heartbeat=True, current_stage=stage,
     )
+
+
+def _queue_derivatives(services,package,*,attachments=False,ocr=False):
+    factory=getattr(services.storage,'create_or_get_typed_job',None)
+    if factory is None:return []
+    tasks=[]
+    if attachments:tasks.append(('mail_extract',40))
+    if ocr:tasks.append(('mail_ocr',10))
+    if Config.MAIL_ENABLE_VECTOR_INDEX:tasks.append(('mail_embed',5))
+    result=[]
+    for task,priority in tasks:
+        jid,created=factory(package['package_id'],task,options={'package_id':package['package_id'],'workflow_source':'mail_foundation_derived'},owner_id=package['owner_id'])
+        if created:
+            with services.repository._connection() as c:c.execute('UPDATE analysis_jobs SET priority=? WHERE id=?',(priority,jid))
+        result.append({'job_id':jid,'task_type':task,'created':created})
+    return result
 
 
 def _source(package):
@@ -82,108 +98,115 @@ def _source(package):
 
 
 def _import(job, services):
-    package = _package(services, job)
-    owner_id = _owner(job)
-    source = _source(package)
-    adapter = AdapterRegistry().resolve(source)
-    members = list(adapter.inventory(source, services.policy))
-    progress = services.repository.progress(job["id"])
-    cursor = int((progress.get("cursor") or {}).get("next_ordinal", 0))
-    counts = dict(progress.get("counts") or {})
-    processed_bytes = 0
-    processed = 0
-    max_messages = max(1, int(Config.MAIL_IMPORT_SLICE_MESSAGES))
-    max_bytes = max(1, int(Config.MAIL_IMPORT_SLICE_BYTES))
-    services.repository.update_package(package["package_id"], owner_id, status="importing")
-    source_record = {
-        "locator_type": source.kind,
-        "root_path": str(Path(source.path).parent if Path(source.path).is_file() else Path(source.path)),
-        "container_path": str(source.path) if Path(source.path).is_file() else None,
-        "container_sha256": source.source_revision,
-        "source_revision": source.source_revision,
-    }
-    for member in members[cursor:]:
-        _active(services, job["id"])
-        if processed and (processed >= max_messages or processed_bytes + member.byte_size > max_bytes):
-            break
-        with adapter.open_message(source, member) as stream:
-            raw = stream.read()
-        services.policy.validate_size(len(raw), limit=services.policy.max_message_bytes, label="邮件")
-        parsed = parse_eml(
-            raw,
-            max_parts=services.policy.max_mime_parts,
-            max_nested_message_depth=services.policy.max_nested_message_depth,
-        )
-        row = services.repository.upsert_ingested_message(
-            package_id=package["package_id"], source=source_record,
-            member=member, raw=raw, parsed=parsed,
-        )
-        counts["nested_occurrences"] = int(counts.get("nested_occurrences", 0)) + _ingest_nested(services,package,source_record,member,parsed)
-        counts["occurrences"] = int(counts.get("occurrences", 0)) + 1
-        counts["logical_messages"] = int(counts.get("logical_messages", 0)) + int(row["new_message"])
-        processed += 1
-        processed_bytes += len(raw)
-        next_ordinal = member.ordinal + 1
-        if processed == 1 or processed % 5 == 0:
-            services.repository.save_progress(job["id"], "importing", {"next_ordinal": next_ordinal}, counts)
-            _job_update(services, job, progress=min(94, int(next_ordinal * 95 / max(1, len(members)))), stage="mail_import", message="正在导入邮件 {}/{}".format(next_ordinal, len(members)))
-    next_ordinal = cursor + processed
-    services.repository.save_progress(job["id"], "importing", {"next_ordinal": next_ordinal}, counts)
-    if next_ordinal < len(members):
-        return {"_requeue_slice": True, "_requeue_message": "邮件导入检查点已保存，继续下一批。", "package_id": package["package_id"], "processed": processed}
-    if not members:
-        services.repository.update_package(package["package_id"],owner_id,status="failed",error={"code":"empty_source","message":"未在来源中发现 EML 邮件"})
-        raise ValueError("未在来源中发现 EML 邮件")
-    services.repository.finish_import(package["package_id"], owner_id)
-    services.repository.save_progress(job["id"], "completed", {"next_ordinal": len(members)}, counts)
-    _job_update(services, job, progress=99, stage="mail_import_complete", message="邮件基础索引已完成")
-    return {"package_id": package["package_id"], "occurrences": len(members), "counts": services.repository.overview(package["package_id"], owner_id)["counts"]}
+    from .foundation import source_inventory,inventory_entry,set_state
+    package=_package(services,job); owner_id=_owner(job); source=_source(package)
+    try:
+        adapter=AdapterRegistry().resolve(source)
+        entries=list(source_inventory(source,services.policy,adapter))
+    except Exception as exc:
+        set_state(services.repository,package['package_id'],'inventory','terminal_failed',error={'message':str(exc)[:500]})
+        services.repository.update_package(package['package_id'],owner_id,status='failed',error={'message':str(exc)[:500]})
+        raise
+    progress=services.repository.progress(job['id']); cursor=0 if progress.get('phase')=='failed' else int((progress.get('cursor') or {}).get('next_ordinal',0))
+    counts=dict(progress.get('counts') or {}); processed=0; processed_bytes=0; next_index=cursor
+    max_messages=max(1,int(Config.MAIL_IMPORT_SLICE_MESSAGES));max_bytes=max(1,int(Config.MAIL_IMPORT_SLICE_BYTES))
+    services.repository.update_package(package['package_id'],owner_id,status='importing',error=None)
+    set_state(services.repository,package['package_id'],'mail_parse','running',cursor={'next_ordinal':cursor,'total':len(entries)})
+    source_record={'locator_type':source.kind,'root_path':str(Path(source.path).parent if Path(source.path).is_file() else Path(source.path)), 'container_path':str(source.path) if Path(source.path).is_file() else None,'container_sha256':source.source_revision,'source_revision':source.source_revision}
+    # Fill the complete inventory once; slice checkpoints never overwrite completed rows.
+    with services.repository._connection() as c:
+        from .foundation import dumps
+        c.executemany("INSERT OR IGNORE INTO mail_import_entries(package_id,member_name,member_ordinal,byte_size,status,error_json,locator_json) VALUES (?,?,?,?,?,?,?)",[(package['package_id'],m.name,m.ordinal,m.byte_size,status,dumps({'message':error}) if error else None,dumps(m.locator)) for m,status,error in entries])
+    set_state(services.repository,package['package_id'],'inventory','ready',cursor={'total':len(entries)},fingerprint=source.source_revision)
+    for index,(member,status,error) in enumerate(entries[cursor:],cursor):
+        _active(services,job['id'])
+        if processed and (processed>=max_messages or processed_bytes+member.byte_size>max_bytes):break
+        if status=='pending':
+            try:
+                with adapter.open_message(source,member) as stream:raw=stream.read(services.policy.max_message_bytes+1)
+                services.policy.validate_size(len(raw),limit=services.policy.max_message_bytes,label='邮件')
+                parsed=parse_eml(raw,max_parts=services.policy.max_mime_parts,max_nested_message_depth=services.policy.max_nested_message_depth)
+                row=services.repository.upsert_ingested_message(package_id=package['package_id'],source=source_record,member=member,raw=raw,parsed=parsed)
+                _ingest_nested(services,package,source_record,member,parsed)
+                processed_bytes+=len(raw)
+            except Exception as exc:
+                inventory_entry(services.repository,package['package_id'],member,'terminal_failed',error={'type':type(exc).__name__,'message':str(exc)[:500]})
+        next_index=index+1;processed+=1
+        services.repository.save_progress(job['id'],'importing',{'next_ordinal':next_index},counts)
+    set_state(services.repository,package['package_id'],'mail_parse','running',cursor={'next_ordinal':next_index,'total':len(entries)})
+    _job_update(services,job,progress=min(94,int(next_index*95/max(1,len(entries)))),stage='mail_import',message='正在处理来源条目 {}/{}'.format(next_index,len(entries)))
+    if next_index<len(entries):return {'_requeue_slice':True,'_requeue_message':'邮件导入检查点已保存，继续下一批。','package_id':package['package_id']}
+    with services.repository._connection() as c:
+        statuses={r[0]:r[1] for r in c.execute('SELECT status,COUNT(*) FROM mail_import_entries WHERE package_id=? GROUP BY status',(package['package_id'],))}
+        logical=c.execute('SELECT COUNT(DISTINCT message_key) FROM mail_visible_occurrences WHERE package_id=?',(package['package_id'],)).fetchone()[0]
+    if not logical:
+        message='来源中没有成功解析的 EML 邮件；详见导入清单'
+        if source.kind=='directory' and any(m.name.casefold().endswith('.zip') for m,_,_ in entries):
+            message+='。目录内的 ZIP 不会自动展开，请选择其中的 ZIP 文件分别导入'
+        services.repository.update_package(package['package_id'],owner_id,status='failed',error={'message':message,'inventory':statuses})
+        set_state(services.repository,package['package_id'],'mail_parse','terminal_failed',error={'inventory':statuses})
+        services.repository.save_progress(job['id'],'failed',{'next_ordinal':next_index},statuses)
+        raise ValueError(message)
+    services.repository.finish_import(package['package_id'],owner_id)
+    set_state(services.repository,package['package_id'],'mail_parse','partial' if statuses.get('terminal_failed') or statuses.get('restricted') else 'ready',cursor={'next_ordinal':next_index,'total':len(entries)})
+    services.repository.save_progress(job['id'],'completed',{'next_ordinal':next_index},statuses)
+    _queue_derivatives(services,package,attachments=True)
+    return {'package_id':package['package_id'],'counts':services.repository.overview(package['package_id'],owner_id)['counts'],'inventory':statuses}
 
 
 def _extract(job, services):
-    package = _package(services, job)
-    owner_id = _owner(job)
-    batch_size = max(1, min(100, int(Config.MAIL_IMPORT_SLICE_MESSAGES)))
-    pending = services.repository.pending_attachments(package["package_id"], owner_id, limit=batch_size)
-    done = 0
+    package=_package(services,job);owner_id=_owner(job);pid=package['package_id']
+    services.repository.schedule_attachment_upgrade(pid,owner_id)
+    batch_size=max(1,min(100,int(Config.MAIL_IMPORT_SLICE_MESSAGES)))
+    pending=services.repository.pending_attachments(pid,owner_id,limit=batch_size)
     for item in pending:
-        _active(services, job["id"])
-        part, _raw = read_part(services.repository, item["message_key"], owner_id, package["package_id"], item["mime_path"])
-        services.policy.validate_size(part.byte_size, limit=services.policy.max_attachment_bytes, label="附件")
-        result = extract_attachment(part)
-        services.repository.update_processing(
-            item["message_key"], item["mime_path"], "basic_text", result["status"],
-            parser_name=result.get("parser"), text=result.get("text"),
-            warnings=result.get("warnings"), error=result.get("error"),
-            coverage_ratio=1.0 if result.get("status") == "ready" else 0.0,
-        )
-        if result.get("text"):
-            services.repository.replace_attachment_segments(
-                package["package_id"], owner_id, item["message_key"], item["mime_path"], result["text"]
-            )
-        done += 1
-        _job_update(services, job, progress=min(94, 5 + done * 85 // max(1, len(pending))), stage="mail_extract", message="正在抽取附件 {}/{}".format(done, len(pending)))
-    coverage = services.repository.coverage(package["package_id"], owner_id)
-    services.repository.save_progress(job["id"], "extracting", {"last_batch": done}, coverage)
-    if len(pending) == batch_size:
-        return {"_requeue_slice": True, "_requeue_message": "附件解析检查点已保存，继续下一批。", "package_id": package["package_id"]}
-    services.repository.update_package(package["package_id"], owner_id, status="attachment_index_ready")
-    return {"package_id": package["package_id"], "processed": done, "coverage": coverage}
+        _active(services,job['id'])
+        try:
+            part,_=read_part(services.repository,item['message_key'],owner_id,pid,item['mime_path'])
+            services.policy.validate_size(part.byte_size,limit=services.policy.max_attachment_bytes,label='附件')
+            result=extract_attachment(part)
+        except Exception as exc:
+            result={'status':'failed','parser':'mail-source','error':{'type':type(exc).__name__,'message':str(exc)[:500]}}
+        services.repository.store_extraction(pid,owner_id,item['message_key'],item['mime_path'],result)
+    coverage=services.repository.coverage(pid,owner_id)
+    services.repository.save_progress(job['id'],'extracting',{'last_batch':len(pending)},coverage)
+    if services.repository.pending_attachments(pid,owner_id,limit=1):
+        return {'_requeue_slice':True,'_requeue_message':'附件解析检查点已保存，继续下一批。','package_id':pid}
+    with services.repository._connection() as c:
+        waiting=c.execute("SELECT MIN(x.next_retry_at) FROM mail_part_processing x JOIN mail_visible_occurrences o ON o.message_key=x.message_key WHERE o.package_id=? AND x.stage='basic_text' AND x.status='waiting_retry'",(pid,)).fetchone()[0]
+    if waiting:return {'_defer_slice':True,'_defer_seconds':30,'_defer_message':'附件失败已记录，等待有限重试','package_id':pid}
+    services.repository.update_package(pid,owner_id,status='attachment_index_ready')
+    _queue_derivatives(services,package,ocr=True)
+    return {'package_id':pid,'processed':len(pending),'coverage':coverage}
 
 
 def _ocr(job, services):
     from .extraction import extract_ocr
-    package=_package(services,job);owner_id=_owner(job)
+    package=_package(services,job);owner_id=_owner(job);pid=package['package_id']
     with services.repository._connection() as c:
-        rows=[dict(r) for r in c.execute("SELECT DISTINCT p.message_key,p.mime_path FROM mail_parts p JOIN mail_occurrences o ON o.message_key=p.message_key JOIN mail_part_processing x ON x.message_key=p.message_key AND x.mime_path=p.mime_path AND x.stage='basic_text' WHERE o.package_id=? AND x.status='ocr_pending' LIMIT 5",(package["package_id"],))]
+        rows=[dict(r) for r in c.execute("SELECT DISTINCT p.message_key,p.mime_path FROM mail_parts p JOIN mail_visible_occurrences o ON o.message_key=p.message_key JOIN mail_part_processing x ON x.message_key=p.message_key AND x.mime_path=p.mime_path AND x.stage='basic_text' LEFT JOIN mail_part_processing ox ON ox.message_key=p.message_key AND ox.mime_path=p.mime_path AND ox.stage='ocr' WHERE o.package_id=? AND x.status='ocr_pending' AND (ox.status IS NULL OR ox.status='pending' OR (ox.status IN ('waiting_retry','failed') AND ox.retry_count<3 AND (ox.next_retry_at IS NULL OR ox.next_retry_at<=CURRENT_TIMESTAMP))) LIMIT 5",(pid,))]
     for item in rows:
-        _active(services,job["id"])
-        part,_=read_part(services.repository,item["message_key"],owner_id,package["package_id"],item["mime_path"])
-        result=extract_ocr(part,services.parser,lambda:services.repository.cancelled(job["id"]))
-        for stage in ("ocr","basic_text"):
-            services.repository.update_processing(item["message_key"],item["mime_path"],stage,result["status"],parser_name=result["parser"],text=result.get("text"),warnings=result.get("warnings"),error=result.get("error"))
-        if result.get("text"):services.repository.replace_attachment_segments(package["package_id"],owner_id,item["message_key"],item["mime_path"],result["text"])
-    return {"package_id":package["package_id"],"processed":len(rows),"coverage":services.repository.coverage(package["package_id"],owner_id),"_requeue_slice":len(rows)==5 and services.parser is not None}
+        _active(services,job['id'])
+        try:
+            part,_=read_part(services.repository,item['message_key'],owner_id,pid,item['mime_path'])
+            result=extract_ocr(part,services.parser,lambda:services.repository.cancelled(job['id']))
+        except Exception as exc:
+            _active(services,job['id'])
+            result={'status':'failed','parser':'mail-source','error':{'message':str(exc)[:500]}}
+        services.repository.store_extraction(pid,owner_id,item['message_key'],item['mime_path'],result,stage='ocr')
+    if len(rows)==5:return {'package_id':pid,'_requeue_slice':True,'_requeue_message':'OCR 检查点已保存'}
+    with services.repository._connection() as c:
+        waiting=c.execute("SELECT COUNT(*) FROM mail_part_processing x JOIN mail_visible_occurrences o ON o.message_key=x.message_key WHERE o.package_id=? AND x.stage='ocr' AND x.status='waiting_retry'",(pid,)).fetchone()[0]
+    if waiting:return {'package_id':pid,'_defer_slice':True,'_defer_seconds':30,'_defer_message':'OCR 等待有限重试'}
+    return {'package_id':pid,'processed':len(rows),'coverage':services.repository.coverage(pid,owner_id)}
+
+
+def _foundation(job,services):
+    from .foundation import backfill_slice
+    package=_package(services,job)
+    result=backfill_slice(services.repository,package['package_id'],_owner(job),job_id=job['id'],cancelled=lambda:services.repository.cancelled(job['id']))
+    if not result.get('_requeue_slice') and result.get('status')!='skipped':_queue_derivatives(services,package,attachments=True)
+    return result
 
 
 def _embed(job, services):
@@ -237,9 +260,22 @@ def _research(job, services):
     if not package or package.get("status")=="failed":
         services.repository.update_turn(turn_id,owner_id,status="failed",sufficiency="insufficient",error={"message":"邮件资料包尚未成功导入"})
         raise ValueError("邮件资料包尚未成功导入")
+    if turn.get('task_spec', {}).get('mode') in {'message_dossier','pair_dossier','intent_screen'}:
+        from .analysis import run_slice
+        try:
+            return run_slice(services.repository,turn_id,owner_id,services.model,
+                cancelled=lambda:services.repository.cancelled(job['id']))
+        except Exception as exc:
+            current=services.repository.get_turn(turn_id,owner_id)
+            if current and current['status'] not in {'cancelled','cancelling','completed'}:
+                services.repository.update_turn(turn_id,owner_id,status='failed',sufficiency='partial',error={'message':str(exc)[:500]})
+            raise
     if turn.get('task_spec', {}).get('mode') == 'person_correspondence':
         from .person_research import run_person_slice
-        _job_update(services, job, progress=10, stage='mail_person_analysis', message='逐批阅读该联系人的全部往来正文')
+        v3=turn.get('task_spec',{}).get('analysis_version')==3
+        deep=v3 and turn.get('task_spec',{}).get('purpose')=='deep_analysis'
+        _job_update(services, job, progress=10, stage='mail_person_analysis', message='基于已完成事实报告分析目标，核对条件与反证' if deep else
+                    '逐批扫描整个资料包，生成事实报告或目标深度分析' if v3 else '逐批阅读该联系人的全部往来正文')
         return run_person_slice(services.repository, turn_id, owner_id, services.model,
                                 cancelled=lambda: services.repository.cancelled(job['id']))
     _job_update(services, job, progress=8, stage="mail_research", message="正在检索邮件证据")
@@ -248,6 +284,7 @@ def _research(job, services):
         model=services.model,
         context_limit=Config.MAIL_TOOL_CONTEXT_MAX_CHARS,
         cancel_check=lambda: services.repository.cancelled(job["id"]),
+        progress_callback=lambda **progress: _job_update(services,job,**progress),
     )
     result = runtime.run(turn_id, owner_id)
     _active(services, job["id"])
@@ -275,7 +312,7 @@ def run_claimed_mail_job(job):
         raise ValueError("未知邮件任务类型：{}".format(task_type))
     services = _services()
     handlers = {
-        "mail_import": _import, "mail_extract": _extract, "mail_ocr": _ocr,
+        "mail_foundation": _foundation, "mail_import": _import, "mail_extract": _extract, "mail_ocr": _ocr,
         "mail_research": _research, "mail_export": _export, "mail_embed": _embed, "mail_factextract": _factextract,
     }
     return handlers[task_type](job, services)

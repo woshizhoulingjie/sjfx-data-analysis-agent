@@ -7749,16 +7749,28 @@ class Storage:
             ).fetchone()
         return bool(row)
 
-    def claim_next_job(self, worker_id):
-        """Atomically claim the oldest queued job for one independent worker."""
+    def claim_next_job(self, worker_id, exclude_job_id=None):
+        """Claim by priority/FIFO, optionally letting a yielded slice wait once.
+
+        The exclusion is soft: an otherwise idle worker resumes the slice.
+        Both selections and the claim share one transaction.
+        """
         with self.lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             now = time.time()
-            row = conn.execute(
-                "SELECT id FROM analysis_jobs WHERE status='queued' AND cancel_requested=0 "
-                "AND available_at<=? ORDER BY priority DESC, rowid LIMIT 1",
-                (now,),
-            ).fetchone()
+            row = None
+            if exclude_job_id is not None:
+                row = conn.execute(
+                    "SELECT id FROM analysis_jobs WHERE status='queued' AND cancel_requested=0 "
+                    "AND available_at<=? AND id<>? ORDER BY priority DESC, rowid LIMIT 1",
+                    (now, str(exclude_job_id)),
+                ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT id FROM analysis_jobs WHERE status='queued' AND cancel_requested=0 "
+                    "AND available_at<=? ORDER BY priority DESC, rowid LIMIT 1",
+                    (now,),
+                ).fetchone()
             if not row:
                 return None
             cursor = conn.execute(

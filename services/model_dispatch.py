@@ -15,14 +15,29 @@ import time
 import uuid
 
 _background = ContextVar('sjfx_background_generation', default=None)
+_generation_priority = ContextVar('sjfx_generation_priority', default=None)
+_generation_status = ContextVar('sjfx_generation_status', default=None)
 
 
 @contextmanager
-def background_generation(cancelled=lambda: False):
+def background_generation(cancelled=lambda: False, priority=10, on_status=None):
+    """Cancelable admission; user-requested durable work may opt into FIFO.
+
+    Optional catalog work keeps its existing lower priority. Status callbacks
+    report actual admission transitions, never an estimated inference state.
+    """
+    if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 100:
+        raise ValueError('Generation priority must be an integer between 0 and 100')
+    if on_status is not None and not callable(on_status):
+        raise TypeError('Generation status callback must be callable')
     token = _background.set(cancelled)
+    priority_token = _generation_priority.set(priority)
+    status_token = _generation_status.set(on_status)
     try:
         yield
     finally:
+        _generation_status.reset(status_token)
+        _generation_priority.reset(priority_token)
         _background.reset(token)
 
 
@@ -282,11 +297,14 @@ def _admission_wait_limit(requested_timeout):
 @contextmanager
 def generation_slot(endpoint, timeout=15):
     from services.ollama import LocalModelError
+    status = _generation_status.get()
     if os.getenv('SJFX_SHARED_GENERATION_GATE', '1').lower() in {'0','false','off'}:
+        if status is not None:status('running')
         yield
         return
     cancel = _background.get()
-    priority = 10 if cancel is not None else 100
+    priority = _generation_priority.get() if cancel is not None else 100
+    if priority is None:priority = 10
     # 前台保留名额：后台（可选/可取消的目录命名等）最多占用 N-1 个，
     # 交互式请求可用满 N 个。这样放开并发后，用户提问仍然不会被
     # 后台批量摘要排在后面。N=1 时前后台名额都是 1，行为与改动前一致。
@@ -341,6 +359,7 @@ def generation_slot(endpoint, timeout=15):
     thread = threading.Thread(target=heartbeat, daemon=True)
     thread.start()
     try:
+        if status is not None:status('waiting_for_model')
         while True:
             if cancel is not None and cancel():
                 raise LocalModelError('目录命名已暂停或达到预算')
@@ -349,6 +368,7 @@ def generation_slot(endpoint, timeout=15):
             if time.monotonic()-start >= timeout:
                 raise LocalModelError('模型正在处理其他请求，请稍后重试')
             time.sleep(.05)
+        if status is not None:status('running')
         try:
             yield
         except Exception as exc:
@@ -368,5 +388,4 @@ def serialized_generation(func):
         with generation_slot(self.base_url, _admission_wait_limit(requested)):
             return func(self,*args,**kwargs)
     return call
-
 

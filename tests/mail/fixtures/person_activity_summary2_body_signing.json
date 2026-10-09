@@ -1,0 +1,429 @@
+{
+  "origin_turn": "mrt_e3aaf600b5d4420d9df0b2ee6e9db79f",
+  "summary_level": 2,
+  "section": {
+    "kind": "expressed_attitude",
+    "title": "面对延误时的补救意愿与妥协态度",
+    "statement": "当PLC供货延迟导致工期压缩时，李强首先表现出强烈的补救意愿，承诺加派4名工程师驻场实行两班倒，并申请将交付日期延期至10月20日，同时保证WMS接口联调在交付前1日完成。在客户拒绝延期并设定更严格的10月18日交付节点后，李强迅速调整态度，接受该节点，签署盖章确认单，并承诺若再次逾期愿承担违约金责任。",
+    "uncertainty": "低。李强在邮件中明确表达了上述承诺和态度转变。",
+    "alternative_explanations": [],
+    "conditions": [
+      "PLC供货延迟8天",
+      "客户拒绝延期并设定10月18日为最终交付日",
+      "面临合同违约风险"
+    ],
+    "contradictions": [],
+    "unresolved_questions": [],
+    "source_ids": [
+      "summary:1:8:0",
+      "summary:1:8:2"
+    ],
+    "source_timeline": [
+      {
+        "finding_id": "mrt_f23569a4e95a4a02a6ff32a8237f18f6_activity_1:3",
+        "communication_time": "2026-10-08T01:40:00+00:00",
+        "event_time": null,
+        "completion": "not_established",
+        "kind": "request_by_person"
+      },
+      {
+        "finding_id": "mrt_f23569a4e95a4a02a6ff32a8237f18f6_activity_1:5",
+        "communication_time": "2026-10-09T01:20:00+00:00",
+        "event_time": null,
+        "completion": "self_reported",
+        "kind": "response_by_person"
+      },
+      {
+        "finding_id": "mrt_f23569a4e95a4a02a6ff32a8237f18f6_activity_1:7",
+        "communication_time": "2026-10-18T03:05:00+00:00",
+        "event_time": null,
+        "completion": "self_reported",
+        "kind": "action_statement"
+      },
+      {
+        "finding_id": "mrt_f23569a4e95a4a02a6ff32a8237f18f6_activity_1:8",
+        "communication_time": "2026-10-21T01:25:00+00:00",
+        "event_time": null,
+        "completion": "not_established",
+        "kind": "request_to_person"
+      },
+      {
+        "finding_id": "mrt_f23569a4e95a4a02a6ff32a8237f18f6_activity_1:4",
+        "communication_time": "2026-10-08T06:10:00+00:00",
+        "event_time": null,
+        "completion": "not_established",
+        "kind": "request_to_person"
+      },
+      {
+        "finding_id": "mrt_f23569a4e95a4a02a6ff32a8237f18f6_activity_1:6",
+        "communication_time": "2026-10-16T09:45:00+00:00",
+        "event_time": null,
+        "completion": "not_established",
+        "kind": "request_to_person"
+      }
+    ],
+    "citations": [
+      {
+        "chunk_id": "mseg_c5128b16725e61d08952cce94148a6d6c4b97d01498a20d8488250a9175fc04b:0",
+        "message_key": "mm_89235077699b49839f6c59251a5f6f4d",
+        "segment_id": "mseg_c5128b16725e61d08952cce94148a6d6c4b97d01498a20d8488250a9175fc04b",
+        "mime_path": "1",
+        "quote": "张经理：\n\n您好。有一个需要向贵司报告的事项，我司须正式提出延期申请。\n\n一、延期原因\n蓝湾项目分拣线核心控制器（PLC）的原定到货时间为 2026 年 9 月 25 日，供应商实际于 2026 年 10 月 3 日才发货，比原计划晚了 8 天，直接压缩了后续联调与联机调试的时间。\n\n二、申请事项\n申请将蓝湾项目交付日期由 2026 年 10 月 15 日延期至 2026 年 10 月 20 日。\n\n三、我司的补救措施\n1. 延期期间加派 4 名工程师驻场，实行两班倒；\n2. 保证 WMS 接口联调在交付前 1 日完成并通过内部测试；\n3. 承诺 2026 年 10 月 20 日完成交付，不再二次延期。\n\n因 PLC 供货属于上游原因，我方对由此给贵司造成的被动深表歉意，恳请贵司予以谅解并批准本次延期。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "char_start": 0,
+        "char_end": 377,
+        "sent_at": "2026-10-08T01:40:00+00:00",
+        "subject": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "authored": true,
+        "quotation_warning": false,
+        "evidence_id": "q4",
+        "source_kind": "body",
+        "page_number": null,
+        "sheet_name": null,
+        "cell_range": null,
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "text_sha256": "3fb20e4bc30779d816e3c0ad54ac21c3e1c8560f228b62f048415074db07b902",
+        "selected_roles": [
+          "from"
+        ],
+        "conversations": [
+          {
+            "conversation_id": "62667b16ab215d004d1a3fab7c772224",
+            "merge_basis": "exact_chain"
+          }
+        ],
+        "context_only": false,
+        "reply_source_keys": null,
+        "participants": [
+          {
+            "role": "cc",
+            "address": "chen.li@shengyuan-zn.cn"
+          },
+          {
+            "role": "cc",
+            "address": "zhou.ning@lanwan-group.com"
+          },
+          {
+            "role": "from",
+            "address": "li.qiang@shengyuan-zn.cn"
+          },
+          {
+            "role": "to",
+            "address": "zhang.wei@lanwan-group.com"
+          }
+        ],
+        "body_fragments": [
+          {
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 377,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "date_raw": "Thu, 08 Oct 2026 09:40:00 +0800"
+      },
+      {
+        "chunk_id": "mseg_8de7d4d0c289868229b82ea69271c2a0b783a763e422cd3ff20aea50e4baa6b2:0",
+        "message_key": "mm_c792e02dd5f94bad81baf1e8475b8c9c",
+        "segment_id": "mseg_8de7d4d0c289868229b82ea69271c2a0b783a763e422cd3ff20aea50e4baa6b2",
+        "mime_path": "1",
+        "quote": "张经理：\n\n来函收悉。我司内部已紧急评估，现答复如下。\n\n一、我司接受贵方要求\n1. 蓝湾项目最终交付日期确定为：2026 年 10 月 18 日；\n2. WMS 接口联调于 2026 年 10 月 17 日前完成并提交测试报告；\n3. 原计划日期 10 月 15 日、我司申请日期 10 月 20 日，均不再采用。\n\n二、书面确认件\n本确认已加盖我司公章，扫描件见附件《蓝湾项目交付确认单-盖章扫描件.pdf》，纸质原件今日以顺丰寄出（单号 SF-1055-8877-3201），请贵司查收。\n\n三、我司承诺\n1. 按 2026 年 10 月 18 日完成交付；\n2. 交付前提交分拣线通电调试完成证明与 WMS 联调测试报告；\n3. 若再次逾期，我司接受按合同第七条约定的违约金计算方式承担责任。\n\n双方最终确认的交付日期为：2026 年 10 月 18 日。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "char_start": 0,
+        "char_end": 403,
+        "sent_at": "2026-10-09T01:20:00+00:00",
+        "subject": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "authored": true,
+        "quotation_warning": false,
+        "evidence_id": "q6",
+        "source_kind": "body",
+        "page_number": null,
+        "sheet_name": null,
+        "cell_range": null,
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "text_sha256": "fefea541d1763b661797ab48c2fbc03cd2f65621591ce8be664e3634aeda8ab2",
+        "selected_roles": [
+          "from"
+        ],
+        "conversations": [
+          {
+            "conversation_id": "62667b16ab215d004d1a3fab7c772224",
+            "merge_basis": "exact_chain"
+          }
+        ],
+        "context_only": false,
+        "reply_source_keys": null,
+        "participants": [
+          {
+            "role": "cc",
+            "address": "chen.li@shengyuan-zn.cn"
+          },
+          {
+            "role": "cc",
+            "address": "zhou.ning@lanwan-group.com"
+          },
+          {
+            "role": "from",
+            "address": "li.qiang@shengyuan-zn.cn"
+          },
+          {
+            "role": "to",
+            "address": "zhang.wei@lanwan-group.com"
+          }
+        ],
+        "body_fragments": [
+          {
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 403,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "date_raw": "Fri, 09 Oct 2026 09:20:00 +0800"
+      },
+      {
+        "chunk_id": "mseg_d662d712a622f6e1950ac5d2c4c24e44d840bf25a013b62bf9a1cb0881b457c0:0",
+        "message_key": "mm_4e395d394b6a486b891ac454b52a0710",
+        "segment_id": "mseg_d662d712a622f6e1950ac5d2c4c24e44d840bf25a013b62bf9a1cb0881b457c0",
+        "mime_path": "1",
+        "quote": "张经理：\n\n您好。向贵司报告：我司已于 2026 年 10 月 18 日 09:30 完成蓝湾项目全部设备发运。\n\n一、发运信息\n1. 发运时间：2026 年 10 月 18 日 09:30\n2. 承运方：顺丰供应链\n3. 物流单号：SF-8823-1097-4421\n4. 预计送达：2026 年 10 月 18 日 18:00 前送达贵司蓝湾项目现场\n\n二、联调情况\nWMS 接口联调已于 2026 年 10 月 17 日 22:40 全部通过，测试报告随货送达。\n\n三、我司意见\n我司已按双方确认的 2026 年 10 月 18 日节点完成交付，请贵司安排人员到货签收，并按交付方案推进后续验收。\n\n李强\n晟远智能装备有限公司 项目交付部",
+        "char_start": 0,
+        "char_end": 322,
+        "sent_at": "2026-10-18T03:05:00+00:00",
+        "subject": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "authored": true,
+        "quotation_warning": false,
+        "evidence_id": "q8",
+        "source_kind": "body",
+        "page_number": null,
+        "sheet_name": null,
+        "cell_range": null,
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "text_sha256": "a26f1cb450ce722456c1b1e26349d65495ffb5b6d4f98f378c3f0393280927c0",
+        "selected_roles": [
+          "from"
+        ],
+        "conversations": [
+          {
+            "conversation_id": "62667b16ab215d004d1a3fab7c772224",
+            "merge_basis": "exact_chain"
+          }
+        ],
+        "context_only": false,
+        "reply_source_keys": null,
+        "participants": [
+          {
+            "role": "cc",
+            "address": "chen.li@shengyuan-zn.cn"
+          },
+          {
+            "role": "cc",
+            "address": "zhou.ning@lanwan-group.com"
+          },
+          {
+            "role": "from",
+            "address": "li.qiang@shengyuan-zn.cn"
+          },
+          {
+            "role": "to",
+            "address": "zhang.wei@lanwan-group.com"
+          }
+        ],
+        "body_fragments": [
+          {
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 322,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "date_raw": "Sun, 18 Oct 2026 11:05:00 +0800"
+      },
+      {
+        "chunk_id": "mseg_5beffe3ea835ced4ab9eee27a625d9b4c864e25d2124c434dcce0b96c82dc96f:0",
+        "message_key": "mm_21b12ca8dfd64488b20ca20363a39acf",
+        "segment_id": "mseg_5beffe3ea835ced4ab9eee27a625d9b4c864e25d2124c434dcce0b96c82dc96f",
+        "mime_path": "1",
+        "quote": "李工：\n\n就贵司 10 月 18 日所称的“完成交付”，我司正式答复如下。\n\n一、事实情况\n1. 截至 2026 年 10 月 21 日 09:00，我司蓝湾项目现场尚未收到贵司发出的任何设备；\n2. 物流单号 SF-8823-1097-4421 查询结果显示仅“已揽收”，无后续流转记录，承运方客服亦未能给出货物实际位置；\n3. 我司未签署《到货签收单》，未开箱，未进行安装调试。\n\n二、我方对“交付”的认定\n贵司所称“完成交付”不成立。按照《蓝湾项目交付方案-v2.docx》第六章约定：\n1. 设备发运、物流签收均不构成交付完成；\n2. 只有双方签署《验收报告》之日方视为交付完成日；\n3. 贵司单方面声明的“已交付”“已发货”不产生交付完成的效果。\n\n三、我方要求\n1. 请贵司于 2026 年 10 月 22 日 12:00 前书面提供货物实际位置、预计到达时间及承运方联系人；\n2. 到货后按交付方案第四章、第五章组织验收，验收合格并签署《验收报告》后方视为交付完成；\n3. 因 2026 年 10 月 18 日未能完成交付，我方保留按合同第七条追究逾期违约责任的权利。\n\n截至目前，蓝湾项目状态为：未交付、未验收。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "char_start": 0,
+        "char_end": 536,
+        "sent_at": "2026-10-21T01:25:00+00:00",
+        "subject": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "authored": false,
+        "quotation_warning": false,
+        "evidence_id": "q9",
+        "source_kind": "body",
+        "page_number": null,
+        "sheet_name": null,
+        "cell_range": null,
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "text_sha256": "3e86cc5d29ec95382fb88d370fead1bac5bb345688ef9e7257d18cbcd7d81431",
+        "selected_roles": [
+          "to"
+        ],
+        "conversations": [
+          {
+            "conversation_id": "62667b16ab215d004d1a3fab7c772224",
+            "merge_basis": "exact_chain"
+          }
+        ],
+        "context_only": false,
+        "reply_source_keys": null,
+        "participants": [
+          {
+            "role": "cc",
+            "address": "zhou.ning@lanwan-group.com"
+          },
+          {
+            "role": "cc",
+            "address": "chen.li@shengyuan-zn.cn"
+          },
+          {
+            "role": "from",
+            "address": "zhang.wei@lanwan-group.com"
+          },
+          {
+            "role": "to",
+            "address": "li.qiang@shengyuan-zn.cn"
+          }
+        ],
+        "body_fragments": [
+          {
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 536,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "date_raw": "Wed, 21 Oct 2026 09:25:00 +0800"
+      },
+      {
+        "chunk_id": "mseg_adf17fb343048dfb6da9037e3b5ba60e09482332df4b0b27943f4ef27dcb7db8:0",
+        "message_key": "mm_d2b04ecb32984cd7aa23054749f09685",
+        "segment_id": "mseg_adf17fb343048dfb6da9037e3b5ba60e09482332df4b0b27943f4ef27dcb7db8",
+        "mime_path": "1",
+        "quote": "李工：\n\n来函收悉，但我方不同意将蓝湾项目交付日期调整为 2026 年 10 月 20 日。\n\n理由如下：\n1. 蓝湾项目 2026 年 10 月 22 日须与业主方联合验收，若 10 月 20 日才交付，我方只剩 2 天整改窗口，无法覆盖联调残留问题；\n2. 贵司所述 PLC 供货延迟属于贵司与其上游供应商之间的履约风险，按合同不应转由我方承担；\n3. 9 月 29 日贵司进度反馈中明确“可以按 10 月 15 日完成交付”，我方据此安排了后续工作，现在变更会连带影响我方对业主方的承诺。\n\n我方的要求：\n1. 交付日期最晚不得晚于 2026 年 10 月 18 日；\n2. WMS 接口联调必须在 2026 年 10 月 17 日前完成并提交测试报告；\n3. 请贵司于 2026 年 10 月 9 日 17:00 前书面反馈。若无法满足，我方将启动合同违约条款评估，并保留索赔权利。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "char_start": 0,
+        "char_end": 417,
+        "sent_at": "2026-10-08T06:10:00+00:00",
+        "subject": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "authored": false,
+        "quotation_warning": false,
+        "evidence_id": "q5",
+        "source_kind": "body",
+        "page_number": null,
+        "sheet_name": null,
+        "cell_range": null,
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "text_sha256": "f9ba5eae7e01c516fd78a0268f8fec29f41c7b942d89066cd80dbca429fe3f24",
+        "selected_roles": [
+          "to"
+        ],
+        "conversations": [
+          {
+            "conversation_id": "62667b16ab215d004d1a3fab7c772224",
+            "merge_basis": "exact_chain"
+          }
+        ],
+        "context_only": false,
+        "reply_source_keys": null,
+        "participants": [
+          {
+            "role": "cc",
+            "address": "zhou.ning@lanwan-group.com"
+          },
+          {
+            "role": "cc",
+            "address": "chen.li@shengyuan-zn.cn"
+          },
+          {
+            "role": "from",
+            "address": "zhang.wei@lanwan-group.com"
+          },
+          {
+            "role": "to",
+            "address": "li.qiang@shengyuan-zn.cn"
+          }
+        ],
+        "body_fragments": [
+          {
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 417,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "date_raw": "Thu, 08 Oct 2026 14:10:00 +0800"
+      },
+      {
+        "chunk_id": "mseg_24d0ad2aa2c83be29c7724ea3baf949094a00d905c20e00debc3419ed1eb2f48:0",
+        "message_key": "mm_7b321f9947c84ca7ac75a27c50439fa5",
+        "segment_id": "mseg_24d0ad2aa2c83be29c7724ea3baf949094a00d905c20e00debc3419ed1eb2f48",
+        "mime_path": "1",
+        "quote": "李工：\n\n今天是 2026 年 10 月 16 日，距双方确认的交付日期 10 月 18 日仅剩 2 天。截至此时，我司现场尚未收到贵司任何设备，也未收到通电调试完成证明与联调测试报告。\n\n请贵司于今日下班前（18:30）提供以下材料：\n1. 分拣线通电调试完成证明；\n2. WMS 接口联调测试报告；\n3. 10 月 18 日到场交付的书面承诺函。\n\n另需正式说明一件事：贵司此前的两项日期承诺，我方不再予以认可。\n1. 2026 年 9 月 29 日进度反馈中所称“可于 2026 年 10 月 15 日交付”；\n2. 2026 年 10 月 8 日延期申请中所称“2026 年 10 月 20 日完成交付”。\n\n上述两项承诺所涉及的交付日期自本函发出之日起作废。双方之间唯一有效的约定交付日期为 2026 年 10 月 18 日（依据 10 月 9 日双方书面确认）。若 10 月 18 日仍未交付，我方将按合同第七条主张违约金。\n\n张伟\n蓝湾实业集团 蓝湾项目组 项目经理",
+        "char_start": 0,
+        "char_end": 440,
+        "sent_at": "2026-10-16T09:45:00+00:00",
+        "subject": "回复：蓝湾项目 智能仓储分拣系统 交付计划确认（原定交付日期 2026 年 10 月 15 日）",
+        "authored": false,
+        "quotation_warning": false,
+        "evidence_id": "q7",
+        "source_kind": "body",
+        "page_number": null,
+        "sheet_name": null,
+        "cell_range": null,
+        "source_revision": "sha256:3b9b6af5a857303c11da243d16a6d92f9b5888dfa2e44a0a75af3d7cc784badb",
+        "index_epoch": 0,
+        "text_sha256": "0314c53ae1d1274eb481caae3323f94124b982055455288958579ba80571e023",
+        "selected_roles": [
+          "to"
+        ],
+        "conversations": [
+          {
+            "conversation_id": "62667b16ab215d004d1a3fab7c772224",
+            "merge_basis": "exact_chain"
+          }
+        ],
+        "context_only": false,
+        "reply_source_keys": null,
+        "participants": [
+          {
+            "role": "cc",
+            "address": "zhou.ning@lanwan-group.com"
+          },
+          {
+            "role": "cc",
+            "address": "chen.li@shengyuan-zn.cn"
+          },
+          {
+            "role": "from",
+            "address": "zhang.wei@lanwan-group.com"
+          },
+          {
+            "role": "to",
+            "address": "li.qiang@shengyuan-zn.cn"
+          }
+        ],
+        "body_fragments": [
+          {
+            "fragment_kind": "authored",
+            "char_start": 0,
+            "char_end": 440,
+            "method": "line_boundary",
+            "confidence": "uncertain"
+          }
+        ],
+        "date_raw": "Fri, 16 Oct 2026 17:45:00 +0800"
+      }
+    ],
+    "finding_id": "summary:2:0:1"
+  }
+}

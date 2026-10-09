@@ -85,10 +85,15 @@ class MiningTests(unittest.TestCase):
         self.assertEqual(self.r.get_package(self.pid,'owner')['status'],'failed')
     def test_dynamic_schema_and_conflicting_status(self):
         spec=build_task_spec('提取价格和报名日期',self.pid,'v',0);self.assertIn('金额',spec['output_schema']);self.assertIn('日期',spec['output_schema']);self.assertEqual(MailResearchRuntime(self.r)._sufficiency([{}],{}, {},[{}]),'conflicting')
-    def test_nested_email_is_separate_occurrence_and_can_be_read(self):
+    def test_nested_email_is_preserved_without_default_count_inflation(self):
         outer=EmailMessage();outer['Subject']='Outer';outer.set_content('outer');inner=EmailMessage();inner['Subject']='Inner';inner.set_content('nested body');outer.add_attachment(inner)
         (self.root/'nested.eml').write_bytes(outer.as_bytes());services=build_mail_services(self.storage);result=_import({'id':'nested','owner_id':'owner','options':{'package_id':self.pid}},services)
-        self.assertEqual(self.r.overview(self.pid,'owner')['counts']['logical_messages'],2)
+        self.assertEqual(self.r.overview(self.pid,'owner')['counts']['logical_messages'],1)
+        from services.mail.foundation import content
+        key=self.r.list_messages(self.pid,'owner')['items'][0]['message_key']
+        nested=[p for p in content(self.r,key,'owner',self.pid)['parts'] if p['part_role']=='nested_message']
+        self.assertEqual(len(nested),1)
+        self.assertIn('nested body',nested[0]['nested']['parts'][0]['text'])
     def test_vector_batch_cached_and_owner_isolated(self):
         from services.mail.semantic import embed_segments_batch,vector_search
         self.ingest(raw_mail(body='semantic content'))

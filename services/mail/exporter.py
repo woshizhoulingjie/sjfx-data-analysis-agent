@@ -106,5 +106,34 @@ def export_result_set(repository, result_set_id, owner_id, output_dir, format_na
         ) for item in messages
     )
     rows += "".join("<tr><td colspan='4'>{}</td></tr>".format(html.escape(json.dumps(f,ensure_ascii=False))) for f in fields)
-    target.write_text("<!doctype html><meta charset='utf-8'><table><thead><tr><th>邮件</th><th>状态</th><th>时间</th><th>主题</th></tr></thead><tbody>{}</tbody></table>".format(rows), encoding="utf-8")
+    final = result_set.get("final") or {}
+    escape = lambda value: html.escape(str(value if value is not None else ""))
+    answer = final.get("answer") or "此结果集暂无研究结论"
+    question = (result_set.get("definition") or {}).get("question") or "未记录研究目标"
+    findings = "".join(
+        "<li><pre>{}</pre></li>".format(escape(json.dumps(finding, ensure_ascii=False)))
+        for finding in final.get("findings", [])
+    )
+    limitations = "".join("<li>{}</li>".format(escape(item)) for item in final.get("limitations", []))
+    coverage = json.dumps({
+        "result_set": result_set.get("coverage"),
+        "research": final.get("coverage"),
+        "complete": final.get("complete"),
+    }, ensure_ascii=False, indent=2)
+    target.write_text(
+        "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+        "<title>邮件研究结果</title><style>body{{font:16px/1.7 sans-serif;max-width:1100px;margin:32px auto;padding:0 20px}}"
+        "pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}}table{{border-collapse:collapse;width:100%}}"
+        "th,td{{border:1px solid #ccd6df;padding:8px;text-align:left;overflow-wrap:anywhere}}</style></head><body>"
+        "<h1>邮件研究结果</h1><section><h2>研究目标</h2><pre>{question}</pre></section>"
+        "<section><h2>中文研究结论</h2><pre>{answer}</pre></section>"
+        "<section><h2>发现与证据</h2><ul>{findings}</ul></section>"
+        "<section><h2>限制与资料缺口</h2><ul>{limitations}</ul></section>"
+        "<section><h2>邮件记录与提取字段</h2><table><thead><tr><th>邮件</th><th>状态</th><th>时间</th><th>主题</th>"
+        "</tr></thead><tbody>{rows}</tbody></table></section>"
+        "<section><h2>覆盖说明</h2><pre>{coverage}</pre></section></body></html>".format(
+            question=escape(question), answer=escape(answer), findings=findings,
+            limitations=limitations, rows=rows, coverage=escape(coverage),
+        ), encoding="utf-8",
+    )
     return target

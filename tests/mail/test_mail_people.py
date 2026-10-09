@@ -133,7 +133,8 @@ def test_long_segment_fills_batch_without_losing_characters(corpus):
         chunks,cursor=next_chunks(repo,pid,'owner','alice@example.com',cursor)
         if not chunks:break
         sizes.append(sum(len(c['text']) for c in chunks))
-    assert sizes==[9000,9000,1000]
+    # MIME text includes the final newline; reading must preserve it.
+    assert sizes==[9000,9000,1001]
 
 def test_bad_model_does_not_advance_checkpoint(corpus):
     repo,pid,add=corpus;add('We intend to complete this agreement next week.')

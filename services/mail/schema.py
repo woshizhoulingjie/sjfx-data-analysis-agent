@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 DDL = r"""
 CREATE TABLE IF NOT EXISTS mail_schema_migrations (
@@ -244,9 +244,143 @@ CREATE TABLE IF NOT EXISTS mail_attachment_version_links (
 """
 
 
+# Append migrations; never alter the historical v2/v3 source hashed above.
+DDL_V4 = r"""
+CREATE TABLE IF NOT EXISTS mail_raw_store (
+ raw_sha256 TEXT PRIMARY KEY,raw_bytes BLOB NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS mail_body_fragments (
+ message_key TEXT NOT NULL,mime_path TEXT NOT NULL,ordinal INTEGER NOT NULL,fragment_kind TEXT NOT NULL,
+ char_start INTEGER NOT NULL,char_end INTEGER NOT NULL,text TEXT NOT NULL,method TEXT NOT NULL,confidence TEXT NOT NULL,
+ PRIMARY KEY(message_key,mime_path,ordinal));
+CREATE TABLE IF NOT EXISTS mail_import_entries (
+ package_id TEXT NOT NULL,member_name TEXT NOT NULL,member_ordinal INTEGER NOT NULL,byte_size INTEGER,
+ status TEXT NOT NULL,message_key TEXT,error_json TEXT,locator_json TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+ PRIMARY KEY(package_id,member_name,member_ordinal));
+CREATE TABLE IF NOT EXISTS mail_foundation_state (
+ package_id TEXT NOT NULL,stage TEXT NOT NULL,version TEXT,fingerprint TEXT,status TEXT NOT NULL,
+ cursor_json TEXT DEFAULT '{}',error_json TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(package_id,stage));
+CREATE TABLE IF NOT EXISTS mail_entity_audit (
+ audit_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,entity_id TEXT NOT NULL,actor_id TEXT NOT NULL,
+ action TEXT NOT NULL,payload_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_mail_entity_audit_scope ON mail_entity_audit(package_id,entity_id,created_at);
+CREATE TABLE IF NOT EXISTS mail_relation_generations (
+ generation_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,stage TEXT NOT NULL,fingerprint TEXT NOT NULL,
+ algorithm_version TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_mail_relation_generations_scope ON mail_relation_generations(package_id,stage,created_at);
+CREATE TABLE IF NOT EXISTS mail_thread_nodes (
+ package_id TEXT NOT NULL,generation_id TEXT NOT NULL,node_id TEXT NOT NULL,message_key TEXT,
+ message_id_normalized TEXT,node_kind TEXT NOT NULL,PRIMARY KEY(generation_id,node_id));
+CREATE TABLE IF NOT EXISTS mail_thread_edge_history (
+ generation_id TEXT NOT NULL,edge_id TEXT NOT NULL,package_id TEXT NOT NULL,source_message_key TEXT NOT NULL,
+ target_message_key TEXT,target_node_id TEXT,relation_type TEXT NOT NULL,source_header TEXT NOT NULL,
+ target_message_id_raw TEXT,status TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',
+ PRIMARY KEY(generation_id,edge_id));
+CREATE TABLE IF NOT EXISTS mail_thread_anomalies (
+ generation_id TEXT NOT NULL,anomaly_id TEXT NOT NULL,package_id TEXT NOT NULL,message_key TEXT,
+ anomaly_type TEXT NOT NULL,payload_json TEXT NOT NULL DEFAULT '{}',PRIMARY KEY(generation_id,anomaly_id));
+CREATE TABLE IF NOT EXISTS mail_conversation_history (
+ generation_id TEXT NOT NULL,conversation_id TEXT NOT NULL,package_id TEXT NOT NULL,root_message_key TEXT,
+ subject_normalized TEXT,started_at TEXT,last_at TEXT,message_count INTEGER NOT NULL,participant_count INTEGER NOT NULL,
+ has_attachment INTEGER NOT NULL,dominant_language TEXT,merge_basis TEXT NOT NULL,PRIMARY KEY(generation_id,conversation_id));
+CREATE TABLE IF NOT EXISTS mail_conversation_member_history (
+ generation_id TEXT NOT NULL,conversation_id TEXT NOT NULL,message_key TEXT NOT NULL,depth INTEGER NOT NULL,
+ is_root INTEGER NOT NULL,PRIMARY KEY(generation_id,conversation_id,message_key));
+CREATE TABLE IF NOT EXISTS mail_conversation_corrections (
+ correction_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,actor_id TEXT NOT NULL,action TEXT NOT NULL,
+ payload_json TEXT NOT NULL,fingerprint TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_mail_conversation_corrections_scope ON mail_conversation_corrections(package_id,created_at);
+"""
+DDL_V4_COLUMNS = r"""
+ALTER TABLE mail_text_segments ADD COLUMN cell_range TEXT;
+ALTER TABLE mail_part_processing ADD COLUMN next_retry_at TEXT;
+ALTER TABLE mail_evidence ADD COLUMN cell_range TEXT;
+ALTER TABLE mail_evidence ADD COLUMN payload_sha256 TEXT;
+ALTER TABLE mail_evidence ADD COLUMN text_sha256 TEXT;
+"""
+
+
+def _apply_v4(connection):
+    # execute() keeps SQLite DDL inside the caller's savepoint; executescript()
+    # would commit pending work before applying the new schema.
+    for statement in DDL_V4.split(';'):
+        if statement.strip():
+            connection.execute(statement)
+    for table, column in (("mail_text_segments", "cell_range"), ("mail_part_processing", "next_retry_at"),
+                          ("mail_evidence", "cell_range"), ("mail_evidence", "payload_sha256"), ("mail_evidence", "text_sha256")):
+        columns = {row[1] for row in connection.execute("PRAGMA table_info({})".format(table))}
+        if column not in columns:
+            connection.execute("ALTER TABLE {} ADD COLUMN {} TEXT".format(table, column))
+
+
+DDL_V5 = r"""
+ALTER TABLE mail_occurrences ADD COLUMN is_countable INTEGER NOT NULL DEFAULT 1;
+CREATE VIEW IF NOT EXISTS mail_visible_occurrences AS SELECT * FROM mail_occurrences WHERE is_countable=1;
+"""
+
+
+def _apply_v5(connection):
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(mail_occurrences)")}
+    if "is_countable" not in columns:
+        connection.execute("ALTER TABLE mail_occurrences ADD COLUMN is_countable INTEGER NOT NULL DEFAULT 1")
+    connection.execute("CREATE VIEW IF NOT EXISTS mail_visible_occurrences AS SELECT * FROM mail_occurrences WHERE is_countable=1")
+
+
+DDL_V6 = r"""
+CREATE TABLE IF NOT EXISTS mail_semantic_generations (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, generation_id TEXT NOT NULL UNIQUE,
+ package_id TEXT NOT NULL, owner_id TEXT NOT NULL, slot_key TEXT NOT NULL,
+ scope_fingerprint TEXT NOT NULL, source_fingerprint TEXT NOT NULL,
+ algorithm_version TEXT NOT NULL, status TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_mail_semantic_generation_scope ON mail_semantic_generations(package_id,slot_key,status,sequence);
+CREATE TABLE IF NOT EXISTS mail_communication_acts (
+ generation_id TEXT NOT NULL, act_id TEXT NOT NULL, package_id TEXT NOT NULL,
+ message_key TEXT NOT NULL, actor TEXT NOT NULL, act_type TEXT NOT NULL,
+ object_identity TEXT NOT NULL, object_version TEXT NOT NULL, source_hash TEXT NOT NULL,
+ asserted_at TEXT, effective_at TEXT, review_status TEXT NOT NULL, payload_json TEXT NOT NULL,
+ PRIMARY KEY(generation_id,act_id));
+CREATE INDEX IF NOT EXISTS idx_mail_acts_scope ON mail_communication_acts(package_id,message_key,actor,act_id);
+CREATE TABLE IF NOT EXISTS mail_issues (
+ issue_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, title TEXT NOT NULL,
+ anchor_key TEXT NOT NULL, link_status TEXT NOT NULL, payload_json TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_mail_issues_scope ON mail_issues(package_id,anchor_key);
+CREATE TABLE IF NOT EXISTS mail_issue_memberships (
+ generation_id TEXT NOT NULL, package_id TEXT NOT NULL, act_id TEXT NOT NULL,
+ issue_id TEXT NOT NULL, event_ref_id TEXT, method TEXT NOT NULL,
+ review_status TEXT NOT NULL, decision_json TEXT NOT NULL,
+ PRIMARY KEY(generation_id,act_id));
+CREATE INDEX IF NOT EXISTS idx_mail_membership_scope ON mail_issue_memberships(package_id,issue_id,act_id);
+CREATE TABLE IF NOT EXISTS mail_assertion_links (
+ generation_id TEXT NOT NULL, link_id TEXT NOT NULL, package_id TEXT NOT NULL,
+ source_act_id TEXT NOT NULL, target_act_id TEXT, relation_type TEXT NOT NULL,
+ review_status TEXT NOT NULL, payload_json TEXT NOT NULL,
+ PRIMARY KEY(generation_id,link_id));
+CREATE TABLE IF NOT EXISTS mail_issue_states (
+ state_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, issue_id TEXT NOT NULL,
+ scope_fingerprint TEXT NOT NULL, dependency_fingerprint TEXT NOT NULL,
+ as_of TEXT NOT NULL, engine_version TEXT NOT NULL, payload_json TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS mail_act_extraction_cache (
+ cache_key TEXT PRIMARY KEY, package_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+ message_key TEXT NOT NULL, source_hash TEXT NOT NULL, scope_fingerprint TEXT NOT NULL,
+ slice_json TEXT NOT NULL, extraction_version TEXT NOT NULL, model_version TEXT NOT NULL,
+ attribution_fingerprint TEXT NOT NULL, payload_json TEXT NOT NULL,
+ completion TEXT NOT NULL DEFAULT 'slice_only', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_mail_act_cache_scope ON mail_act_extraction_cache(package_id,message_key,extraction_version,source_hash);
+"""
+
+
+def _apply_v6(connection):
+    for statement in DDL_V6.split(';'):
+        if statement.strip():
+            connection.execute(statement)
+
+
 def migrate(connection):
     connection.execute("CREATE TABLE IF NOT EXISTS mail_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, checksum TEXT NOT NULL)")
-    migrations = [(2, DDL, DDL + FTS_DDL + FTS_FALLBACK_DDL), (3, DDL_V3, DDL_V3)]
+    migrations = [(2, DDL, DDL + FTS_DDL + FTS_FALLBACK_DDL), (3, DDL_V3, DDL_V3),
+                  (4, DDL_V4, DDL_V4 + DDL_V4_COLUMNS), (5, DDL_V5, DDL_V5), (6, DDL_V6, DDL_V6)]
     changed = False
     for version, ddl, source in migrations:
         checksum = hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -254,6 +388,19 @@ def migrate(connection):
         if row:
             if row[0] != checksum:
                 raise RuntimeError("邮件数据库迁移校验和不一致：版本 {}".format(version))
+            continue
+        if version in (4, 5, 6):
+            savepoint = "mail_schema_v{}".format(version)
+            connection.execute("SAVEPOINT " + savepoint)
+            try:
+                {4: _apply_v4, 5: _apply_v5, 6: _apply_v6}[version](connection)
+                connection.execute("INSERT INTO mail_schema_migrations(version,checksum) VALUES (?,?)", (version,checksum))
+                connection.execute("RELEASE " + savepoint)
+            except Exception:
+                connection.execute("ROLLBACK TO " + savepoint)
+                connection.execute("RELEASE " + savepoint)
+                raise
+            changed = True
             continue
         connection.executescript(ddl)
         if version == 2:

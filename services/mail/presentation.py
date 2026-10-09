@@ -90,6 +90,9 @@ def source_bundle(services, owner_id, payload):
         chunk = source[offset:end]
         entries["body"] = chunk
         metadata = {"total_chars": len(source), "offset": offset, "next_offset": offset + len(chunk) if offset + len(chunk) < len(source) else None, "source_text": chunk, "mime_path": mime_path}
+        if kind=='attachment':
+            metadata['text_origin']=part.get('text_origin','unknown')
+            if part.get('source_text_notice'):metadata['notice']=part['source_text_notice']
         if not source:
             metadata["notice"] = "该部件尚无可翻译文本，请先完成附件解析或 OCR"
     elif kind == "evidence":
@@ -100,6 +103,8 @@ def source_bundle(services, owner_id, payload):
         message = r.get_message(evidence["message_key"], owner_id, package_id) or {}
         contexts["body"] = {"subject": str(message.get("subject_raw") or "")[:400]}
         metadata = {"source_text": entries["body"], "mime_path": evidence.get("mime_path"), "next_offset": None}
+        metadata['text_origin']=evidence.get('text_origin','unknown')
+        if evidence.get('source_text_notice'):metadata['notice']=evidence['source_text_notice']
     elif kind == "result":
         result = r.get_result_set(str(payload.get("result_set_id") or ""), owner_id)
         if not result or result["package_id"] != package_id:

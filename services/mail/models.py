@@ -38,6 +38,10 @@ class ParsedMimePart:
     is_inline_resource: bool
     text: str | None = None
     raw_payload: bytes | None = None
+    html_raw: str | None = None
+    charset: str | None = None
+    content_complete: bool = True
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -54,6 +58,7 @@ class ParsedMailMessage:
     warnings: list[str] = field(default_factory=list)
     participants: list[tuple[str, str, int, str | None]] = field(default_factory=list)
     parts: list[ParsedMimePart] = field(default_factory=list)
+    content_complete: bool = True
 
 
 class MailContainerAdapter:

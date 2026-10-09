@@ -72,7 +72,7 @@ def _normalise_required_fields(required_fields):
     return tuple(fields)
 
 
-def _vllm_structured_response_format(required_fields):
+def _vllm_structured_response_format(required_fields, output_schema=None):
     """Build a permissive object schema with a strict top-level contract.
 
     Individual workflows have many optional fields, so they remain unrestricted.
@@ -80,6 +80,15 @@ def _vllm_structured_response_format(required_fields):
     vLLM's guided JSON decoder before any text is generated.
     """
     fields = _normalise_required_fields(required_fields)
+    if output_schema is not None:
+        if not isinstance(output_schema,dict) or output_schema.get('type')!='object':
+            raise ValueError('Structured output schema must describe an object')
+        if not set(fields).issubset(output_schema.get('required',[])):
+            raise ValueError('Structured output schema must require every requested top-level field')
+        # This schema comes from application code, never a document/model.
+        # A copy avoids shared nested state and validates JSON serializability.
+        schema=json.loads(json.dumps(output_schema))
+        return {'type':'json_schema','json_schema':{'name':'sjfx_structured_output','strict':True,'schema':schema}}
     return {
         "type": "json_schema",
         "json_schema": {
@@ -138,6 +147,7 @@ class PydanticAgentRuntime:
         # Schema that enforces the application contract before generation; the
         # native Ollama transport continues to receive only supported arguments.
         required_fields = _normalise_required_fields(required_fields)
+        output_schema=kwargs.pop('output_schema',None)
         try:
             requested_max_tokens = max(1, int(kwargs.get("max_tokens", 2400)))
         except (TypeError, ValueError):
@@ -181,7 +191,7 @@ class PydanticAgentRuntime:
         }
         if use_vllm_json:
             chat_kwargs["response_format"] = _vllm_structured_response_format(
-                required_fields
+                required_fields, output_schema
             )
         compact_contract = ""
         if use_vllm_json and not long_output:

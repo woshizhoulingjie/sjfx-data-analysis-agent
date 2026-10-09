@@ -40,5 +40,5 @@ def balanced_queries(objective, values, corpus_languages, limit=6):
 def intent_mode(text):
     folded=unicodedata.normalize('NFC',text).casefold()
     if any(x in folded for x in ('所有','全部','逐封','不能遗漏','完整清单','全量','ทั้งหมด','ทุกฉบับ','ครบถ้วน')) or re.search(r'\b(all|every|exhaustive|complete list)\b',folded):return 'exhaustive'
-    if any(x in folded for x in ('原因','过程','对比','确认','风险','梳理','分析','最早','最终','撤回','变更','วิเคราะห์','เหตุผล','เปรียบเทียบ','ความเสี่ยง','เปลี่ยนแปลง')) or re.search(r'\b(analy[sz]e|compare|why|reason|changes?|risk|confirm|intent)\b',folded):return 'research'
+    if any(x in folded for x in ('原因','过程','对比','确认','风险','梳理','分析','最早','最终','撤回','变更','意图','想法','立场','目的','วิเคราะห์','เหตุผล','เปรียบเทียบ','ความเสี่ยง','เปลี่ยนแปลง')) or re.search(r'\b(analy[sz]e|compare|why|reason|changes?|risk|confirm|intent)\b',folded):return 'research'
     return 'lookup'

@@ -41,19 +41,23 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
 
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok", "model": MODEL_NAME, "device": "cpu"}
 
 
 @app.get("/v1/models")
-def models():
+async def models():
     return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "sjfx"}]}
 
 
 @app.post("/v1/embeddings")
 def embeddings(request: EmbeddingRequest):
-    with _admission:
+    if not _admission.acquire(timeout=5.0):
+        raise HTTPException(status_code=503, detail="mail embedding service is busy", headers={"Retry-After": "1"})
+    try:
         return _encode(request)
+    finally:
+        _admission.release()
 
 def _encode(request: EmbeddingRequest):
     values = [request.input] if isinstance(request.input, str) else request.input

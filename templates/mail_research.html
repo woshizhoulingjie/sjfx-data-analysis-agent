@@ -3,92 +3,122 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>邮件分析 | SJFX</title>
-  <link rel="stylesheet" href="/static/mail-research.css?v=11">
+  <title>邮件资料与分析 | SJFX</title>
+  <link rel="stylesheet" href="/static/mail-research.css?v=20261009-answer-first-v1">
   <script src="/protection/bridge.js"></script>
 </head>
 <body>
   <main class="mail-shell">
     <header class="mail-header">
-      <a class="back-link" href="/">SJFX</a>
-      <h1>邮件分析</h1>
-      <p id="mail-status" role="status">选择邮件资料包后开始研究</p>
-      <button id="mail-token" class="mail-token" type="button" title="设置访问 Token">Token</button>
+      <a class="back-link" href="/">返回工作台</a>
+      <h1>邮件研究工作台</h1>
+      <p id="mail-status" role="status">读邮件、看往来、查清问题，每个结论都能回到原文。</p>
+      <button id="mail-reader-open" class="mail-token" type="button" aria-controls="mail-reader-panel" aria-expanded="false">打开阅读栏</button>
+      <button id="mail-token" class="mail-token" type="button" title="设置邮件服务访问凭证">连接设置</button>
     </header>
 
     <section class="mail-workspace" aria-label="邮件研究工作台">
 
       <aside class="mail-sidebar" aria-label="功能模块与资料范围">
 
-        <nav class="mail-module-nav" aria-label="邮件分析功能模块">
-          <div class="mail-module-nav-title">功能模块</div>
-          <button type="button" class="mail-module-link" data-mail-module-link="package">资料包</button>
-          <button type="button" class="mail-module-link" data-mail-module-link="research">研究提问</button>
-          <button type="button" class="mail-module-link" data-mail-module-link="answer">研究结论</button>
-          <button type="button" class="mail-module-link" data-mail-module-link="results">历史结果集</button>
-          <button type="button" class="mail-module-link" data-mail-module-link="messages">邮件浏览</button>
-          <button type="button" class="mail-module-link" data-mail-module-link="structure">会话与附件</button>
-          <button type="button" class="mail-module-link" data-mail-module-link="network">通信网络</button>
-          <button type="button" class="mail-module-link" data-mail-module-link="relations">邮件关系</button>
-        </nav>
-
-        <div class="mail-control-group">
-          <label for="mail-package">资料包</label>
+        <div class="mail-control-group mail-package-picker">
+          <label for="mail-package"><span class="mail-step-number">1</span> 选择邮件资料包</label>
           <select id="mail-package"><option value="">载入资料包...</option></select>
-          <button id="mail-refresh" type="button" title="刷新邮件资料包">刷新</button>
+          <button id="mail-refresh" type="button" title="刷新邮件资料包">刷新资料包</button>
         </div>
+        <details class="mail-navigation" open>
+        <summary>切换功能</summary>
+        <nav class="mail-module-nav" aria-label="邮件分析功能模块">
+          <div class="mail-module-nav-title">准备资料</div>
+          <button type="button" class="mail-module-link" data-mail-module-link="package">开始使用与资料进度</button>
+          <div class="mail-module-nav-title">浏览与分析</div>
+          <button type="button" class="mail-module-link" data-mail-module-link="messages">邮件正文与意图</button>
+          <button type="button" class="mail-module-link" data-mail-module-link="network">人物与双方往来</button>
+          <button type="button" class="mail-module-link" data-mail-module-link="structure">会话与附件</button>
+          <button type="button" class="mail-module-link" data-mail-module-link="research">提问与逐封筛查</button>
+          <button type="button" class="mail-module-link" data-mail-module-link="relations">关系核查</button>
+          <div class="mail-module-nav-title">查看结果</div>
+          <button type="button" class="mail-module-link" data-mail-module-link="answer">结论与原文证据</button>
+          <button type="button" class="mail-module-link" data-mail-module-link="results">历史研究结果</button>
+        </nav>
+        </details>
 
-        <fieldset class="mail-filters">
-          <legend>筛选范围</legend>
+        <p id="mail-current-scope" class="mail-scope-note">当前范围：先选择资料包。下方筛选用于邮件浏览；开始分析前还可确认分析范围。</p>
+        <details class="mail-sidebar-filter" open><summary>筛选邮件范围</summary><fieldset class="mail-filters">
+          <legend>缩小查看范围</legend>
           <label>关键词 <input id="mail-query" type="search" placeholder="主题、正文或附件"></label>
           <label>参与方 <input id="mail-participant" type="email" placeholder="name@example.com"></label>
+          <label>开始日期 <input id="mail-date-from" type="date"></label>
+          <label>结束日期 <input id="mail-date-to" type="date"></label>
           <label><input id="mail-with-attachment" type="checkbox"> 仅含显式附件</label>
           <button id="mail-apply-filter" type="button">应用筛选</button>
-        </fieldset>
+        </fieldset></details>
 
       </aside>
 
       <section class="mail-main" aria-label="研究结果">
 
-        <section class="mail-module" data-mail-module="package" hidden>
+        <section class="mail-module" data-mail-module="package">
           <header class="mail-module-head">
-            <h2>资料包</h2>
-            <p>查看当前资料包的邮件规模与覆盖情况，或从服务器路径导入新的邮件资料包。</p>
+            <p class="mail-eyebrow">从资料到证据</p>
+            <h2>你想从邮件中查清什么？</h2>
+            <p id="mail-package-summary">选择资料包后，直接挑一个任务开始。新资料也可以在下方导入。</p>
+            <button id="mail-import-shortcut" class="mail-import-shortcut" type="button">没有资料包？导入新邮件包 ↓</button>
           </header>
+          <ol class="mail-quick-steps" aria-label="使用步骤">
+            <li><span>1</span> 选择资料包</li><li><span>2</span> 选择任务、确认范围</li><li><span>3</span> 阅读结果、回查原文</li>
+          </ol>
+          <p id="mail-workspace-readiness" class="mail-readiness" role="status">正在检查分析服务…</p>
+          <section class="mail-start-guide" aria-label="选择邮件研究任务">
+            <div class="mail-guide-heading"><span>从一个具体任务开始</span><p>点击入口先准备任务，分析由你确认开始。</p></div>
+            <div class="mail-start-grid">
+              <button type="button" data-mail-go="messages"><span class="mail-task-icon" aria-hidden="true">01</span><strong>读一封邮件</strong><span>选择邮件 → 正文、中文译文与附件</span><em>浏览邮件 ↗</em></button>
+              <button type="button" data-mail-task="intent"><span class="mail-task-icon" aria-hidden="true">02</span><strong>读懂表达意图</strong><span>选择一封邮件 → 诉求、条件与原文依据</span><em>先选邮件 ↗</em></button>
+              <button type="button" data-mail-task="people"><span class="mail-task-icon" aria-hidden="true">03</span><strong>看两个人的往来</strong><span>选择双方 → 收发邮件与回应脉络</span><em>选择联系人 ↗</em></button>
+              <button type="button" data-mail-task="event"><span class="mail-task-icon" aria-hidden="true">04</span><strong>查清一件事</strong><span>输入问题 → 相关邮件、变化与证据</span><em>准备提问 ↗</em></button>
+              <button type="button" data-mail-task="screen"><span class="mail-task-icon" aria-hidden="true">05</span><strong>逐封筛查邮件</strong><span>设定目标与范围 → 逐封核查和符合项</span><em>设置筛查目标 ↗</em></button>
+              <button type="button" data-mail-go="answer"><span class="mail-task-icon" aria-hidden="true">06</span><strong>查看研究结论</strong><span>已有研究 → 结论、条件与原文证据</span><em>打开结果 ↗</em></button>
+            </div>
+          </section>
           <div id="mail-overview" class="mail-overview" aria-live="polite"></div>
+          <section class="mail-results mail-processing" aria-label="邮件包基础处理"><div class="mail-results-title"><h3>资料处理进度</h3><button id="mail-foundation-refresh" type="button">刷新处理状态</button></div><p id="mail-processing-summary" class="mail-hint">导入后自动整理邮件与回复关系，再排队提取附件文字、识别扫描件并建立检索索引。</p><div id="mail-foundation-status" aria-live="polite"></div><p class="mail-hint">原始邮件保存与附件文字处理分别统计。未提取的附件、缺失邮件和失败条目会明确显示。</p><details class="mail-history-upgrade"><summary>补齐历史资料包的原文与关系</summary><p>用于旧邮件包的基础数据升级。已保存邮件继续保留，后台处理可从检查点继续。</p><button id="mail-foundation-backfill" type="button">升级历史邮件包基础数据</button><p id="mail-foundation-job" role="status"></p></details><details class="mail-inventory-wrap"><summary>逐项核对导入清单</summary><p class="mail-hint">查看成功、重复、失败及不支持的文件；成功条目可直接打开邮件。</p><ul id="mail-foundation-inventory"></ul><div class="mail-pagination"><button id="mail-inventory-prev" type="button" disabled>上一页</button><span id="mail-inventory-page"></span><button id="mail-inventory-next" type="button" disabled>下一页</button></div></details></section>
+          <details class="mail-help-panel">
+            <summary>第一次使用？查看操作说明与支持的文件格式</summary>
+            <div class="mail-help-content"><p><strong>浏览资料：</strong>选好资料包，打开邮件即可阅读；外语邮件可查看中文译文。点击证据会打开右侧阅读栏，按 Esc 可收起。</p><p><strong>开始分析：</strong>先选择任务、填写问题或选择邮件范围，再点击开始。事实、推断和资料缺口需结合原文核对。</p><p><strong>范围提醒：</strong>左侧筛选用于邮件浏览。单封、双方往来和逐封筛查会在开始前展示各自范围；每次研究以所选资料包为准。</p><div id="mail-workspace-capabilities" role="status">正在读取支持的文件格式与处理能力…</div></div>
+          </details>
           <form id="mail-import-form" class="mail-control-group">
-            <label for="mail-source-path">服务器邮件来源</label>
+            <h3>导入新的邮件包</h3>
+            <p class="mail-hint">这里填写运行邮件服务的服务器上的文件路径。先将资料放入服务器允许导入的目录；支持格式与解析能力见上方说明。</p>
+            <label for="mail-source-path">服务器上的邮件文件或文件夹路径</label>
             <input id="mail-source-path" name="path" type="text" autocomplete="off" placeholder="/受控目录/邮件.zip">
+            <label for="mail-package-name">为资料包起个名称（可选）</label>
             <input id="mail-package-name" name="display_name" type="text" autocomplete="off" placeholder="资料包名称">
             <button type="submit">导入邮件资料包</button>
           </form>
         </section>
 
-        <section class="mail-module" data-mail-module="research">
+        <section class="mail-module" data-mail-module="research" hidden>
           <header class="mail-module-head">
-            <h2>研究提问</h2>
-            <p>用中文提出研究目标，提交后在此查看任务进度；索引与导出任务的状态同样显示在这里。</p>
+            <h2>带着问题，查清事实和变化</h2>
+            <p>输入要查的事项。系统会检索邮件与附件，核查前后回复，区分原文事实、条件和仍待确认的问题。</p>
           </header>
           <div class="mail-control-group">
-            <label for="mail-session">研究会话</label>
+            <label for="mail-session">选择已有研究，或开始新的研究</label>
             <select id="mail-session"><option value="">新建会话...</option></select>
             <button id="mail-new-session" type="button">新建研究会话</button>
           </div>
           <form id="mail-question-form" class="mail-question-form">
-            <label for="mail-question">告诉 Agent，你想从这批邮件中得到什么</label>
+            <label for="mail-question">你想从这批邮件中查清什么？</label>
             <p class="mail-hint">直接用中文提问。系统检索邮件和附件，给出中文发现、提取字段与可回查证据。</p>
-            <div class="mail-examples"><button type="button" data-mail-example="查找与奖学金有关的邮件，提取级别、金额、名额和截止日期">查找并提取</button><button type="button" data-mail-example="分析这批邮件中的重要变更，列出事项、变更前后、确认人和证据">比较重要变更</button><button type="button" data-mail-example="梳理涉及截止日期的事项，提取时间、责任人、条件和原文证据">整理待办与期限</button></div>
+            <div class="mail-examples"><button type="button" data-mail-example="找出与交付日期有关的邮件和附件，列出相关内容和原文证据">找相关邮件</button><button type="button" data-mail-example="梳理交付日期变更的事情经过，按时间列出提出、回应与后续变化，并附原文证据">梳理事情经过</button><button type="button" data-mail-example="核对交付日期最后确认的安排，列出确认人、时间、条件和原文证据；如有矛盾请明确说明">核对最后确认</button></div>
             <textarea id="mail-question" rows="3" placeholder="例如：找出与交付日期变更有关的邮件和附件，并说明最早提出、原因、最终确认和后续变化。"></textarea>
             <div class="mail-command-row">
               <button id="mail-start" type="submit">开始研究</button>
               <label><input id="mail-followup" type="checkbox" checked> 在上一结果中继续</label>
               <button id="mail-cancel" type="button" disabled>取消研究</button>
-              <button id="mail-index" type="button">建立附件索引</button>
-              <button id="mail-embed" type="button">建立语义索引</button>
-              <button id="mail-factextract" type="button">提取全部字段</button>
-              <button id="mail-ocr" type="button">处理 OCR</button>
               <button id="mail-export" type="button" disabled>导出当前结果</button>
             </div>
+            <details class="mail-tools"><summary>资料补处理与批量提取</summary><p class="mail-hint">新导入会自动排队处理附件和检索索引。这里可手动补处理；“批量提取金额、日期等字段”需点击启动。</p><div class="mail-command-row"><button id="mail-index" type="button">提取附件文字</button><button id="mail-embed" type="button">更新按含义检索</button><button id="mail-ocr" type="button">识别扫描件文字</button><button id="mail-factextract" type="button">批量提取金额、日期等字段</button></div></details>
           </form>
           <section class="mail-progress" aria-label="任务进度">
             <strong>任务状态</strong><span id="mail-progress">尚无任务</span>
@@ -97,20 +127,32 @@
 
         <section class="mail-module" data-mail-module="answer" hidden>
           <header class="mail-module-head">
-            <h2>研究结论</h2>
-            <p>当前研究的中文结论、逐项发现、提取字段与引用证据。点击证据可在右侧核对原文。</p>
+            <h2>研究回答</h2>
+            <p>结合所选邮件资料回答你的问题，原文依据附在回答后。</p>
           </header>
-          <section class="mail-results" aria-label="研究答案与提取字段">
-            <h2>中文研究结论</h2><div id="mail-answer-meta" class="mail-hint"></div><div id="mail-answer" class="mail-answer">输入你要查找、比较或提取的内容。</div>
-            <ul id="mail-findings"></ul><div id="mail-conflicts" role="status"></div><div id="mail-limitations" class="mail-coverage-note"></div><div class="mail-language-row"><p id="mail-result-language" class="mail-hint">原文证据保留，可展开核对。</p><button id="mail-retry-result" type="button">重试未完成译文</button></div>
-            <div class="mail-table-wrap"><table><thead><tr><th>事项</th><th>字段</th><th>中文内容</th><th>规范值</th><th>状态</th><th>证据</th></tr></thead><tbody id="mail-fields"></tbody></table></div>
-            <h3>引用证据</h3><ol id="mail-evidence-list"></ol>
+          <section class="mail-progress" aria-label="研究处理进度"><strong>当前进度</strong><span id="mail-answer-progress" role="status">尚未开始研究；在“提问与逐封筛查”输入问题并提交。</span><button type="button" data-mail-go="research">返回提问与任务操作</button></section>
+          <section class="mail-results mail-answer-result" aria-label="研究回答与证据附录">
+            <p id="mail-answer-question" class="mail-answer-question" hidden></p>
+            <h2>对你的问题的回答</h2>
+            <div id="mail-answer" class="mail-answer">输入你要查找、比较或提取的内容。</div>
+            <div id="mail-limitations" class="mail-answer-boundary" hidden></div>
+            <div id="mail-answer-meta" class="mail-answer-meta mail-hint"></div>
+            <details id="mail-evidence-appendix" class="mail-answer-appendix" hidden>
+              <summary id="mail-evidence-summary">证据附录</summary>
+              <details id="mail-recorded-answer-section" class="mail-answer-records" hidden><summary>邮件记录与引用说明</summary><div id="mail-recorded-answer"></div></details>
+              <section id="mail-findings-section" hidden><h3>关键邮件记录</h3><ul id="mail-findings" class="mail-answer-timeline"></ul></section>
+              <div id="mail-conflicts" class="mail-answer-conflicts" hidden></div>
+              <details id="mail-fields-section" class="mail-answer-fields" hidden><summary>提取的字段</summary><div class="mail-table-wrap"><table><thead><tr><th>事项</th><th>字段</th><th>中文内容</th><th>规范值</th><th>状态</th><th>证据</th></tr></thead><tbody id="mail-fields"></tbody></table></div></details>
+              <h3>原文依据</h3><ol id="mail-evidence-list" class="mail-answer-sources"></ol>
+              <div class="mail-language-row"><p id="mail-result-language" class="mail-hint">原文证据保留，可展开核对。</p><button id="mail-retry-result" type="button">重试未完成译文</button></div>
+            </details>
+            <details id="mail-research-details" class="mail-answer-details" hidden><summary>研究详情</summary><div id="mail-research-details-body" class="mail-hint"></div></details>
           </section>
         </section>
 
         <section class="mail-module" data-mail-module="results" hidden>
           <header class="mail-module-head">
-            <h2>历史结果集</h2>
+            <h2>回看以前的研究结果</h2>
             <p>切换查看本资料包历次研究留下的结果集，或把当前结果过滤成只保留带附件的记录。</p>
           </header>
           <section class="mail-results" aria-label="历史结果集">
@@ -121,15 +163,15 @@
 
         <section class="mail-module" data-mail-module="messages" hidden>
           <header class="mail-module-head">
-            <h2>邮件浏览</h2>
-            <p>按左侧筛选范围翻页浏览邮件与时间线；点击任意一封，在右侧阅读中文译文与原文。</p>
+            <h2>查邮件：读内容，核对收发和来源</h2>
+            <p>按主题、参与人、日期或附件筛选。点击一封打开阅读栏，查看完整正文、中文译文、原文下载与前后回复。</p>
           </header>
           <section class="mail-results" aria-label="邮件列表">
             <div class="mail-results-title"><h2>邮件与证据</h2><span id="mail-count"></span></div>
             <div class="mail-table-wrap">
               <table>
-                <thead><tr><th>时间</th><th>发件人</th><th>主题</th><th>附件</th></tr></thead>
-                <tbody id="mail-list"><tr><td colspan="4">尚未选择资料包</td></tr></tbody>
+                <thead><tr><th>时间</th><th>发件人</th><th>主题</th><th>附件</th><th>处理状态</th></tr></thead>
+                <tbody id="mail-list"><tr><td colspan="5">尚未选择资料包</td></tr></tbody>
               </table>
             </div>
           </section>
@@ -142,24 +184,24 @@
 
         <section class="mail-module" data-mail-module="structure" hidden>
           <header class="mail-module-head">
-            <h2>会话与附件</h2>
-            <p>按会话聚合的邮件脉络，以及同名附件的传递与版本关系。点击条目在右侧查看内容。</p>
+            <h2>看完整往来：时间顺序、回复分支与附件</h2>
+            <p>点击会话可切换时间线和回复树。缺失邮件和候选关系会明确标记；附件同名仅表示可能有关，内容相同另有核对依据。</p>
           </header>
           <details class="mail-results" open><summary>会话与候选关联</summary><ul id="mail-conversations"></ul><div class="mail-pagination"><button id="mail-conversations-prev" type="button" disabled>上一页</button><span id="mail-conversations-page"></span><button id="mail-conversations-next" type="button" disabled>下一页</button></div><div id="mail-conversation-detail"></div></details>
-          <details class="mail-results" open><summary>附件传递与版本</summary><p>同名文件仅为候选版本关系；内容哈希相同表示完全相同。</p><ul id="mail-versions"></ul><div class="mail-pagination"><button id="mail-versions-prev" type="button" disabled>上一页</button><span id="mail-versions-page"></span><button id="mail-versions-next" type="button" disabled>下一页</button></div></details>
+          <details class="mail-results" open><summary>附件传递与版本（全邮件包）</summary><p>同名文件仅为候选版本关系；内容哈希相同表示完全相同。</p><ul id="mail-versions"></ul><div class="mail-pagination"><button id="mail-versions-prev" type="button" disabled>上一页</button><span id="mail-versions-page"></span><button id="mail-versions-next" type="button" disabled>下一页</button></div></details>
         </section>
 
         <section class="mail-module" data-mail-module="network" hidden>
           <header class="mail-module-head">
-            <h2>通信网络</h2>
-            <p>邮箱之间的通信关系图，可人工确认多个邮箱属于同一实体。</p>
+            <h2>查人物：他收到什么，又如何回应？</h2>
+            <p>先选联系人查看收发数量和具体邮件，再点往来对象查双方通信。多个邮箱属于同一人，需要人工确认；人物分析可另行启动。</p>
           </header>
-          <details class="mail-results" open><summary>通信网络</summary><div id="mail-network"></div><form id="mail-entity-form"><label>确认的实体名称 <input id="mail-entity-name" required></label><label>归属邮箱（用逗号分隔）<textarea id="mail-entity-addresses" rows="2" required></textarea></label><button type="submit">确认这些邮箱属于同一实体</button></form></details>
+          <details class="mail-results"><summary>邮箱通信图与多邮箱归并</summary><div id="mail-network"></div><form id="mail-entity-form"><p class="mail-hint">仅在确认邮箱属于同一人或机构时归并。同名和共享邮箱不能直接视为同一个人。</p><label>人物或机构名称 <input id="mail-entity-name" required></label><label>确认归属的邮箱（用逗号分隔）<textarea id="mail-entity-addresses" rows="2" required></textarea></label><button type="submit">确认邮箱归属</button></form></details>
         </section>
 
         <section class="mail-module" data-mail-module="relations" hidden>
           <header class="mail-module-head">
-            <h2>邮件关系</h2>
+            <h2>核对通信事实与回复依据</h2>
             <p>通信关系、精确回复链，以及经证据核验的业务事项关系。点击左栏关系会把参与方填入左侧筛选范围。</p>
           </header>
           <section class="mail-relationship-grid" aria-label="邮件关系">
@@ -174,12 +216,15 @@
 
       </section>
 
-      <aside class="mail-inspector" aria-label="邮件原文与证据">
+      <aside id="mail-reader-panel" class="mail-inspector" aria-label="邮件原文与证据" hidden>
 
-        <div class="mail-inspector-header"><h2>中文阅读</h2><button id="mail-translate" type="button" disabled>重新翻译</button></div>
+        <div class="mail-inspector-header"><h2>邮件阅读与原文核对</h2><button id="mail-reader-close" type="button" aria-label="收起邮件阅读栏">收起</button></div>
+        <p class="mail-hint">下面是完整原文、附件和回复入口。外语邮件可继续查看中文译文。</p>
 
         <div id="mail-detail" class="mail-detail">从中间列表选择一封邮件。</div>
 
+        <article id="mail-foundation-reader" class="mail-foundation-reader" aria-live="polite"></article>
+        <div class="mail-inspector-header"><h3>中文译文</h3><button id="mail-translate" type="button" disabled>重新翻译</button></div>
         <label class="mail-compare-toggle"><input type="checkbox" id="mail-bilingual"> 中外文逐段对照</label>
 
         <p id="mail-translation-status" class="mail-hint">选择邮件或证据后自动显示中文。</p>
@@ -192,7 +237,7 @@
 
         <div id="mail-coverage" class="mail-coverage"></div>
 
-        <details open><summary>尚未处理的资料</summary><ul id="mail-coverage-gaps"></ul></details>
+        <details><summary>本资料包尚未处理的附件</summary><ul id="mail-coverage-gaps"></ul></details>
 
       </aside>
 
@@ -202,16 +247,23 @@
   <dialog id="mail-token-dialog" aria-labelledby="mail-token-title">
     <form id="mail-token-form">
       <h2 id="mail-token-title">连接邮件服务</h2>
-      <p>使用 SJFX 工作台相同的 API Token，仅保存于本次浏览器会话。</p>
-      <label for="mail-token-input">API Token</label>
+      <p>使用 SJFX 工作台相同的访问凭证，仅保存于本次浏览器会话。</p>
+      <label for="mail-token-input">访问凭证</label>
       <input id="mail-token-input" type="password" autocomplete="off" spellcheck="false" required>
       <p id="mail-token-error" class="mail-error" role="alert"></p>
       <div class="mail-command-row"><button type="submit">连接服务</button><button id="mail-token-cancel" type="button">取消</button></div>
     </form>
   </dialog>
 
-  <script src="/static/mail-research.js?v=8" defer></script>
-  <script src="/static/mail-modules.js?v=1" defer></script>
-  <script src="/static/mail-people.js?v=1" defer></script>
+  <link rel="stylesheet" href="/static/mail-analysis.css?v=20261006phase2">
+  <script src="/static/mail-analysis.js?v=20261008-final-capacity" defer></script>
+  <link rel="stylesheet" href="/static/mail-graph.css?v=20261006phase2">
+  <script src="/static/mail-graph.js?v=20261006phase2" defer></script>
+  <script src="/static/mail-ui.js?v=20261003-foundation-v3" defer></script>
+  <script src="/static/mail-foundation.js?v=20261008-progress-ocr-repair" defer></script>
+  <script src="/static/mail-research.js?v=20261009-answer-first-v1" defer></script>
+  <script src="/static/mail-modules.js?v=20261007-usability-v1" defer></script>
+  <script src="/static/mail-people.js?v=20261008-person-report-v35" defer></script>
 </body>
 </html>
+

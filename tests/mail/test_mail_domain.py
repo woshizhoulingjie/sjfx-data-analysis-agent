@@ -117,8 +117,16 @@ class MailDomainTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual([row["text"] for row in body_parts], ["abcdefgh", "ijklmnop"])
 
+        # Attachment indexing must use a real MIME attachment in the package.
+        from email.message import EmailMessage
+        attachment_mail=EmailMessage();attachment_mail['From']='alice@example.com';attachment_mail['To']='bob@example.com'
+        attachment_mail.set_content('attachment owner')
+        attachment_mail.add_attachment(b'0123456789abcdef',maintype='application',subtype='octet-stream',filename='test.txt')
+        message=self._ingest(package,attachment_mail.as_bytes())
+        mime_path=next(p['mime_path'] for p in self.repository.get_message(message['message_key'],'alice',package['package_id'])['parts'] if p['is_explicit_attachment'])
+
         self.repository.replace_attachment_segments(
-            package["package_id"], "alice", message["message_key"], "1.2", "0123456789abcdef"
+            package["package_id"], "alice", message["message_key"], mime_path, "0123456789abcdef"
         )
         with self.repository._connection() as connection:
             attachment_parts = connection.execute(
@@ -127,7 +135,7 @@ class MailDomainTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual([row["text"] for row in attachment_parts], ["01234567", "89abcdef"])
         preview_segments = self.repository.attachment_segments(
-            package["package_id"], "alice", message["message_key"], "1.2"
+            package["package_id"], "alice", message["message_key"], mime_path
         )
         self.assertEqual([item["text"] for item in preview_segments], ["01234567", "89abcdef"])
 

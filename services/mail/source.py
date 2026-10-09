@@ -92,10 +92,7 @@ class ZipAdapter(MailContainerAdapter):
                 ordinal += 1
 
     def open_message(self, source, member):
-        archive = zipfile.ZipFile(member.locator["path"])
-        raw = archive.read(member.locator["member"])
-        archive.close()
-        return io.BytesIO(raw)
+        return open_locator(member.locator)
 
 
 class MboxAdapter(MailContainerAdapter):
@@ -209,7 +206,11 @@ def open_locator(locator):
         return Path(locator["path"]).open("rb")
     if kind == "zip":
         with zipfile.ZipFile(locator["path"]) as archive:
-            return io.BytesIO(archive.read(locator["member"]))
+            member=locator['member']
+            if 'header_offset' in locator:
+                member=next((info for info in archive.infolist() if info.header_offset==locator['header_offset'] and info.filename==locator['member']),None)
+                if member is None:raise MailPolicyError('压缩包来源条目已变化')
+            return io.BytesIO(archive.read(member))
     if kind == "mbox":
         box = mailbox.mbox(locator["path"], create=False)
         try:

@@ -56,11 +56,35 @@ def normalize_amount(raw,currency_hint=None):
 
 
 THAI_MONTHS={'มกราคม':1,'กุมภาพันธ์':2,'มีนาคม':3,'เมษายน':4,'พฤษภาคม':5,'มิถุนายน':6,'กรกฎาคม':7,'สิงหาคม':8,'กันยายน':9,'ตุลาคม':10,'พฤศจิกายน':11,'ธันวาคม':12,'ม.ค.':1,'ก.พ.':2,'มี.ค.':3,'เม.ย.':4,'พ.ค.':5,'มิ.ย.':6,'ก.ค.':7,'ส.ค.':8,'ก.ย.':9,'ต.ค.':10,'พ.ย.':11,'ธ.ค.':12}
+DATE_SPACE=r'[ \t\u00a0\u3000]*'
+NUMERIC_DATE=re.compile(r'(?<!\d)(\d{4})'+DATE_SPACE+r'[-/年]'+DATE_SPACE+r'(\d{1,2})'+DATE_SPACE+r'[-/月]'+DATE_SPACE+r'(\d{1,2})(?!\d)')
+
+
+def date_mentions(raw):
+    """Complete calendar mentions only; retain invalid dates as None.
+
+    Separators cannot consume punctuation or newlines, so components from
+    separate sentences/sources cannot be recombined into a date.
+    """
+    import calendar
+    text=ascii_digits(raw);matches=list(NUMERIC_DATE.finditer(text))
+    space=r'[ \t\u00a0\u3000]+'
+    for month in THAI_MONTHS:
+        matches.extend(re.finditer(r'(?<!\d)\d{1,2}'+DATE_SPACE+re.escape(month)+DATE_SPACE+r'(?:พ\.ศ\.'+DATE_SPACE+r')?\d{4}(?!\d)',text))
+    names=[name for name in list(calendar.month_name)+list(calendar.month_abbr) if name]
+    for name in names:
+        matches.extend(re.finditer(r'\b'+name+space+r'\d{1,2},?'+space+r'\d{4}\b',text,re.I))
+        matches.extend(re.finditer(r'(?<!\d)\d{1,2}'+space+name+space+r'\d{4}\b',text,re.I))
+    seen=set();result=[]
+    for match in sorted(matches,key=lambda m:m.start()):
+        if match.span() in seen:continue
+        seen.add(match.span());result.append(normalize_date(match.group()))
+    return result
 
 
 def normalize_date(raw,message_sent_at=None):
     text=ascii_digits(raw).strip();parts=None
-    match=re.search(r'(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})',text)
+    match=NUMERIC_DATE.search(text)
     if match:parts=tuple(map(int,match.groups()))
     if parts is None:
         for month,num in THAI_MONTHS.items():
@@ -164,7 +188,7 @@ def save_facts(repository,package_id,owner_id,facts,method='agent_quoted'):
 def detect_conflicts(repository,package_id,owner_id):
     if not repository.get_package(package_id,owner_id):raise ValueError('邮件资料包不存在')
     with repository._connection() as c:
-        rows=[dict(r) for r in c.execute('SELECT * FROM mail_facts WHERE package_id=? AND value_normalized IS NOT NULL',(package_id,))]
+        rows=[dict(r) for r in c.execute('SELECT * FROM mail_facts f WHERE package_id=? AND value_normalized IS NOT NULL AND EXISTS(SELECT 1 FROM mail_visible_occurrences o WHERE o.package_id=f.package_id AND o.message_key=f.message_key)',(package_id,))]
         groups=defaultdict(list)
         for r in rows:
             # Never call prices/dates in unrelated messages a conflict merely because field names match.
@@ -179,7 +203,7 @@ def detect_conflicts(repository,package_id,owner_id):
 
 def list_facts(repository,package_id,owner_id,*,message_keys=None,fact_types=None,limit=500):
     if not repository.get_package(package_id,owner_id):raise ValueError('邮件资料包不存在')
-    sql='SELECT f.*,m.sent_at_utc,m.subject_raw FROM mail_facts f JOIN mail_messages m ON m.message_key=f.message_key WHERE f.package_id=?';args=[package_id]
+    sql='SELECT f.*,m.sent_at_utc,m.subject_raw FROM mail_facts f JOIN mail_messages m ON m.message_key=f.message_key WHERE f.package_id=? AND EXISTS(SELECT 1 FROM mail_visible_occurrences o WHERE o.package_id=f.package_id AND o.message_key=f.message_key)';args=[package_id]
     if message_keys is not None:
         if not message_keys:return []
         sql+=' AND f.message_key IN ('+','.join('?' for _ in message_keys)+')';args+=list(message_keys)
@@ -191,7 +215,7 @@ def list_facts(repository,package_id,owner_id,*,message_keys=None,fact_types=Non
 
 def temporal_fact(repository,package_id,owner_id,fact_type,fact_key,subject_ref,*,final=False,message_keys=None):
     if not repository.get_package(package_id,owner_id):raise ValueError('邮件资料包不存在')
-    sql='SELECT f.*,m.sent_at_utc,m.subject_raw FROM mail_facts f JOIN mail_messages m ON m.message_key=f.message_key WHERE f.package_id=? AND f.fact_type=? AND f.fact_key=? AND f.subject_ref=?'
+    sql='SELECT f.*,m.sent_at_utc,m.subject_raw FROM mail_facts f JOIN mail_messages m ON m.message_key=f.message_key WHERE f.package_id=? AND f.fact_type=? AND f.fact_key=? AND f.subject_ref=? AND EXISTS(SELECT 1 FROM mail_visible_occurrences o WHERE o.package_id=f.package_id AND o.message_key=f.message_key)'
     args=[package_id,fact_type,fact_key,subject_ref]
     if message_keys is not None:
         sql+=' AND f.message_key IN ('+','.join('?' for _ in message_keys)+')' if message_keys else ' AND 0'
@@ -267,7 +291,7 @@ def factextract_batch(repository,package_id,owner_id,model,*,types=None,cancelle
     if not repository.get_package(package_id,owner_id):raise ValueError('邮件资料包不存在')
     types=sorted(set(types or COLUMN_HINTS));schema=stable_id('fields-v1',types)
     with repository._connection() as c:
-        messages=[r[0] for r in c.execute('SELECT DISTINCT message_key FROM mail_occurrences WHERE package_id=? ORDER BY message_key',(package_id,))]
+        messages=[r[0] for r in c.execute('SELECT DISTINCT message_key FROM mail_visible_occurrences WHERE package_id=? ORDER BY message_key',(package_id,))]
         processed={r['message_key']:dict(r) for r in c.execute('SELECT * FROM mail_fact_processing WHERE package_id=? AND schema_key=?',(package_id,schema))}
     pending=[]
     for key in messages:

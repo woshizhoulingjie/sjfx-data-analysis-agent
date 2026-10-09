@@ -61,7 +61,10 @@ def _mount_filesystem(path):
         right_fields = right.split()
         if len(fields) < 5 or not right_fields:
             continue
-        mount_point = Path(fields[4].replace("\\040", " ")).resolve()
+        # mountinfo contains absolute kernel mount paths. Resolving every mount
+        # touches unrelated filesystems: an unavailable hard NFS mount can block
+        # all application startup even when the requested path is local.
+        mount_point = Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4]))
         try:
             candidate.relative_to(mount_point)
         except ValueError:
@@ -1021,9 +1024,28 @@ class Config:
     MAIL_MAX_ATTACHMENT_BYTES = max(1024 * 1024, min(TEN_GIB_BYTES, int(os.getenv("MAIL_MAX_ATTACHMENT_BYTES", "536870912"))))
     MAIL_TEXT_SEGMENT_CHARS = max(256, min(16000, int(os.getenv("MAIL_TEXT_SEGMENT_CHARS", "1800"))))
     MAIL_TOOL_CONTEXT_MAX_CHARS = max(1000, min(200000, int(os.getenv("MAIL_TOOL_CONTEXT_MAX_CHARS", "24000"))))
-    MAIL_RESEARCH_MAX_TOOL_CALLS = max(1, min(100, int(os.getenv("MAIL_RESEARCH_MAX_TOOL_CALLS", "18"))))
-    MAIL_RESEARCH_MAX_MODEL_CALLS = max(0, min(20, int(os.getenv("MAIL_RESEARCH_MAX_MODEL_CALLS", "7"))))
-    MAIL_RESEARCH_TIMEOUT_SECONDS = max(60, min(3600, int(os.getenv("MAIL_RESEARCH_TIMEOUT_SECONDS", "600"))))
+    MAIL_PHASE2_ENABLED = os.getenv("MAIL_PHASE2_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+    # Whole-task allowances are generous and independently adjustable. They do
+    # not raise the serving model's hard per-request context/output boundaries.
+    # Finite ceilings retain cancellation, checkpoints and queue recovery.
+    MAIL_RESEARCH_TOKEN_LIMIT = 100000000
+    MAIL_RESEARCH_MODEL_CALL_LIMIT = 32768
+    MAIL_RESEARCH_TOOL_CALL_LIMIT = 100000
+    MAIL_RESEARCH_TIMEOUT_LIMIT_SECONDS = 604800
+    MAIL_RESEARCH_GAP_ROUNDS_LIMIT = 12
+    MAIL_RESEARCH_GAP_CANDIDATES_LIMIT = 2000
+    MAIL_RESEARCH_MAX_TOKENS = max(1000, min(MAIL_RESEARCH_TOKEN_LIMIT, int(os.getenv("MAIL_RESEARCH_MAX_TOKENS", "5000000"))))
+    MAIL_RESEARCH_CONTEXT_TOKENS = max(1000, min(100000, int(os.getenv("MAIL_RESEARCH_CONTEXT_TOKENS", "12000"))))
+    MAIL_RESEARCH_GAP_ROUNDS = max(0, min(MAIL_RESEARCH_GAP_ROUNDS_LIMIT, int(os.getenv("MAIL_RESEARCH_GAP_ROUNDS", "4"))))
+    MAIL_RESEARCH_GAP_CANDIDATES = max(1, min(MAIL_RESEARCH_GAP_CANDIDATES_LIMIT, int(os.getenv("MAIL_RESEARCH_GAP_CANDIDATES", "200"))))
+    MAIL_RESEARCH_MAX_TOOL_CALLS = max(1, min(MAIL_RESEARCH_TOOL_CALL_LIMIT, int(os.getenv("MAIL_RESEARCH_MAX_TOOL_CALLS", "2000"))))
+    MAIL_RESEARCH_MAX_MODEL_CALLS = max(0, min(MAIL_RESEARCH_MODEL_CALL_LIMIT, int(os.getenv("MAIL_RESEARCH_MAX_MODEL_CALLS", "512"))))
+    MAIL_RESEARCH_TIMEOUT_SECONDS = max(60, min(MAIL_RESEARCH_TIMEOUT_LIMIT_SECONDS, int(os.getenv("MAIL_RESEARCH_TIMEOUT_SECONDS", "86400"))))
+    MAIL_ANALYSIS_MAX_MODEL_CALLS = max(1, min(MAIL_RESEARCH_MODEL_CALL_LIMIT, int(os.getenv("MAIL_ANALYSIS_MAX_MODEL_CALLS", "4096"))))
+    MAIL_PERSON_MAX_MODEL_CALLS = max(1, min(MAIL_RESEARCH_MODEL_CALL_LIMIT, int(os.getenv("MAIL_PERSON_MAX_MODEL_CALLS", "4096"))))
+    # Let cooperative research finish its final verification/checkpoint before
+    # the parent process enforces the hard task boundary.
+    MAIL_RESEARCH_WORKER_GRACE_SECONDS = max(30, min(600, int(os.getenv("MAIL_RESEARCH_WORKER_GRACE_SECONDS", "180"))))
     MAIL_OCR_MAX_CONCURRENCY = max(1, min(8, int(os.getenv("MAIL_OCR_MAX_CONCURRENCY", "1"))))
     MAIL_ENABLE_VECTOR_INDEX = os.getenv("MAIL_ENABLE_VECTOR_INDEX", "0").strip().lower() in {"1", "true", "yes", "on"}
     # Mail-only additions. Disable each independently; no global model settings change.
@@ -1046,6 +1068,9 @@ class Config:
     MAIL_FACTEXTRACT_SLICE_MESSAGES = max(1, min(20, int(os.getenv("MAIL_FACTEXTRACT_SLICE_MESSAGES", "5"))))
     MAIL_SUBJECT_CANDIDATE_WINDOW_DAYS = max(1, int(os.getenv("MAIL_SUBJECT_CANDIDATE_WINDOW_DAYS", "90")))
     MAIL_PARSE_TIMEOUT_SECONDS = max(5, int(os.getenv("MAIL_PARSE_TIMEOUT_SECONDS", "60")))
+    # CPU server recognition is materially slower than native text parsing;
+    # give OCR a separate finite budget without extending other parsers.
+    MAIL_OCR_TIMEOUT_SECONDS = max(5, int(os.getenv("MAIL_OCR_TIMEOUT_SECONDS", "120")))
     MAIL_PARSE_MEMORY_MB = max(256, int(os.getenv("MAIL_PARSE_MEMORY_MB", "2048")))
     MAIL_HTML_REMOTE_RESOURCES = os.getenv("MAIL_HTML_REMOTE_RESOURCES", "0").strip().lower() in {"1", "true", "yes", "on"}
     MAX_STRUCTURED_PROFILE_ROWS = max(100, int(os.getenv("MAX_STRUCTURED_PROFILE_ROWS", "100000")))
