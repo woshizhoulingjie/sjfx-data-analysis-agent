@@ -24,11 +24,8 @@ def protect_private_path(path):
     """Restrict an installation-owned path to its current OS user."""
     path=Path(path)
     if os.name=='nt':
-        script="$ErrorActionPreference='Stop'; $p=$env:SJFX_PRIVATE_PATH; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $dir=[IO.Directory]::Exists($p); if($dir){$a=[IO.Directory]::GetAccessControl($p)}else{$a=[IO.File]::GetAccessControl($p)}; $a.SetAccessRuleProtection($true,$false); foreach($r in @($a.Access)){$a.RemoveAccessRuleSpecific($r)}; if($dir){$r=[Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')}else{$r=[Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')}; $a.AddAccessRule($r); if($dir){[IO.Directory]::SetAccessControl($p,$a)}else{[IO.File]::SetAccessControl($p,$a)}"
-        env={**os.environ,'SJFX_PRIVATE_PATH':str(path)}
-        encoded=base64.b64encode(script.encode('utf-16le')).decode('ascii')
-        result=subprocess.run([windows_powershell(),'-NoProfile','-NonInteractive','-EncodedCommand',encoded],env=env,capture_output=True,text=True,errors='replace',timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
-        if result.returncode: raise RuntimeError('Cannot restrict installation credentials to current Windows user')
+        from .windows_private_acl import protect_private_path as protect_windows_path
+        protect_windows_path(path)
     else:
         if path.stat().st_uid!=os.getuid(): raise RuntimeError('Installation state belongs to another OS user')
         os.chmod(path,0o700 if path.is_dir() else 0o600)
