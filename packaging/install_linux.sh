@@ -42,6 +42,22 @@ verify="$package_dir/app/packaging/verify_bundle.py"
 # Stop an existing instance before moving its live code tree. A first install
 # has no old configuration and simply continues.
 old_env="$data_dir/config/sjfx.env"
+# Apply the Linux delivery default only to a genuinely new instance. Existing
+# configuration, receipts, or populated state retain their current behavior.
+fresh_instance=0
+if [ ! -e "$old_env" ] && [ ! -L "$old_env" ] && \
+        [ ! -e "$data_dir/install-receipt.json" ] && [ ! -L "$data_dir/install-receipt.json" ] && \
+        [ ! -e "$data_dir/config/install-root.txt" ] && [ ! -L "$data_dir/config/install-root.txt" ]; then
+    if [ ! -e "$data_dir/state" ] && [ ! -L "$data_dir/state" ]; then
+        fresh_instance=1
+    elif [ -d "$data_dir/state" ] && [ ! -L "$data_dir/state" ]; then
+        # A failed enumeration can also produce no output. Preserve existing
+        # behavior unless emptiness was positively established.
+        if state_entry=$(find "$data_dir/state" -mindepth 1 -maxdepth 1 -print -quit); then
+            [ -n "$state_entry" ] || fresh_instance=1
+        fi
+    fi
+fi
 old_install_root=''
 [ -f "$data_dir/config/install-root.txt" ] && old_install_root=$(cat "$data_dir/config/install-root.txt" 2>/dev/null || true)
 old_stop_root="$install_dir"
@@ -113,6 +129,11 @@ clam_database="$data_dir/models/protection/clamav"
 clam_stage=''
 clam_database_initializing=0
 new_install_active=0
+linux_policy_initializing=0
+linux_policy_profile='preserved'
+linux_policy_dir="$data_dir/state/file_protection"
+linux_policy_dir_absent=0
+[ -e "$linux_policy_dir" ] || [ -L "$linux_policy_dir" ] || linux_policy_dir_absent=1
 cleanup_staging() {
     rm -rf -- "$stage" 2>/dev/null || true
     if [ -n "$metadata_backup" ]; then
@@ -155,6 +176,8 @@ snapshot_file "$data_dir/config/sjfx.env" env
 snapshot_file "$data_dir/config/install-root.txt" install-root
 snapshot_file "$data_dir/install-receipt.json" install-receipt
 snapshot_file "$model_settings_path" model-settings
+snapshot_file "$linux_policy_dir/package-policy.json" linux-policy
+snapshot_file "$linux_policy_dir/package-policy-history.jsonl" linux-policy-history
 rollback() {
     status=$?
     trap - EXIT HUP INT TERM
@@ -172,6 +195,13 @@ rollback() {
         restore_metadata "$data_dir/config/install-root.txt" install-root || true
         restore_metadata "$data_dir/install-receipt.json" install-receipt || true
         restore_metadata "$model_settings_path" model-settings || true
+        if [ "$linux_policy_initializing" -ne 0 ]; then
+            restore_metadata "$linux_policy_dir/package-policy.json" linux-policy || true
+            restore_metadata "$linux_policy_dir/package-policy-history.jsonl" linux-policy-history || true
+            if [ "$linux_policy_dir_absent" -ne 0 ]; then
+                rmdir -- "$linux_policy_dir" 2>/dev/null || true
+            fi
+        fi
         if [ "$clam_database_initializing" -ne 0 ] && [ -n "$clam_stage" ] && [ ! -e "$clam_stage" ]; then
             make_removable "$clam_database"
             rm -rf -- "$clam_database" 2>/dev/null || true
@@ -223,6 +253,7 @@ find "$install_dir" -type f -exec chmod a-w {} +
 find "$install_dir" -type d -exec chmod a-w {} +
 
 env_file="$data_dir/config/sjfx.env"
+created_env=0
 if [ ! -f "$env_file" ]; then
     "$install_dir/runtime/bin/python3" -B - "$install_dir/config/sjfx.env.template" "$env_file" "$data_dir" "$install_dir" <<'PY'
 import pathlib, secrets, sys
@@ -233,6 +264,7 @@ text += "SJFX_API_ACCESS_TOKEN=" + secrets.token_urlsafe(48) + "\n"
 target.write_text(text, encoding="utf-8")
 target.chmod(0o600)
 PY
+    created_env=1
 elif [ -n "$old_install_root" ] && [ "$old_install_root" != "$install_dir" ]; then
     "$install_dir/runtime/bin/python3" -B - "$env_file" "$old_stop_root" "$install_dir" "$model_settings_path" <<'PY'
 import json, pathlib, sys
@@ -314,6 +346,29 @@ if missing:
     target.write_text(text + ("" if text.endswith("\n") or not text else "\n")
                       + "\n".join(missing) + "\n", encoding="utf-8")
 PY
+# Persist the supported switch before the first launcher start. The shared
+# desktop launcher preserves an existing policy; Windows defaults are untouched.
+if [ "$fresh_instance" -eq 1 ] && [ "$created_env" -eq 1 ]; then
+    linux_policy_initializing=1
+    linux_policy_profile=$("$install_dir/runtime/bin/python3" -B - "$install_dir/app" "$linux_policy_dir" <<'PY'
+import pathlib, sys
+app, core = map(pathlib.Path, sys.argv[1:])
+sys.path.insert(0, str(app))
+from sjfx_protection.policy import policy_path, write_policy
+policy = policy_path(core)
+history = core / "package-policy-history.jsonl"
+if core.is_symlink() or policy.exists() or policy.is_symlink() or history.exists() or history.is_symlink():
+    print("preserved")
+else:
+    write_policy(core, "linux-installer", True, {"enabled": False},
+                 "Fresh Linux installation: protection disabled by delivery default")
+    print("disabled")
+PY
+)
+    if [ "$linux_policy_profile" = 'preserved' ]; then
+        linux_policy_initializing=0
+    fi
+fi
 printf '%s' "$install_dir" > "$data_dir/config/install-root.txt"
 chmod 700 "$data_dir" "$data_dir/config" "$data_dir/state" "$data_dir/outputs" "$data_dir/parse_temp" "$data_dir/logs" || true
 "$install_dir/runtime/bin/python3" -B - "$data_dir/install-receipt.json" "$install_dir" "$data_dir" "$backup" <<'PY'
@@ -324,6 +379,12 @@ target.write_text(json.dumps({"install_dir": str(install_dir), "data_dir": str(d
 target.chmod(0o600)
 PY
 echo "SJFX installed. Configuration: $env_file"
+if [ "$linux_policy_profile" = 'disabled' ]; then
+    echo "File protection is disabled by default for this new Linux instance; malware admission and protection approvals are inactive."
+    echo "Login, owner isolation, and configured scan path restrictions remain enabled. An administrator can enable file protection in its settings."
+else
+    echo "Existing instance configuration and file protection policy have been preserved."
+fi
 echo "For a new instance, initialize the administrator: \"$install_dir/runtime/bin/python3\" -B -X utf8 \"$install_dir/app/sjfxctl.py\" --env-file \"$env_file\" init-admin"
 echo "Start with: $install_dir/start_sjfx.sh --env-file $env_file"
 rm -rf -- "$metadata_backup" 2>/dev/null || true
