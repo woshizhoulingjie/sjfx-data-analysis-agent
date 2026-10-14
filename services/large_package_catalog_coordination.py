@@ -127,13 +127,19 @@ def topic_window(store, package_id, round_state, cancelled=lambda: False):
         return cancelled() or time.time() >= deadline
     context['stop'] = stop
     ready = False
+    # A drained naming-batch can call the topic builder before its outer
+    # leaf_batch exits. That same thread cannot mutate leaves concurrently;
+    # waiting for its heartbeat-backed lease would deadlock the promotion.
+    # Exempt only this exact store/package lease, retaining every other lease
+    # and the independent running-job drain below.
+    own_leaf_token = getattr(_local, 'leaves', {}).get((id(store), package_id), '')
     try:
         drain_deadline = min(deadline, now+wait)
         while not stop():
             with closing(store._connect()) as c:
                 package = c.execute('SELECT status,control_state FROM packages WHERE id=?', (package_id,)).fetchone()
-                mutations = c.execute('SELECT 1 FROM lp_catalog_mutations WHERE package_id=? AND expires>? LIMIT 1',
-                                      (package_id, time.time())).fetchone()
+                mutations = c.execute('SELECT 1 FROM lp_catalog_mutations WHERE package_id=? AND expires>? AND token<>? LIMIT 1',
+                                      (package_id, time.time(), own_leaf_token)).fetchone()
                 jobs = c.execute("SELECT 1 FROM lp_catalog_jobs WHERE package_id=? AND status='running' LIMIT 1",
                                  (package_id,)).fetchone()
             if not package or any(v in {'paused', 'cancelled'} for v in package):
