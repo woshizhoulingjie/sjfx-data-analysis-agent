@@ -179,6 +179,25 @@ class ArchiveOnlyTests(unittest.TestCase):
         self.assertEqual(rows[unreviewed][1], 0o666)
         self.assertEqual(manifest_modes[unreviewed], 0o666)
 
+    def test_native_import_failure_retains_mixed_encoding_child_diagnostics(self):
+        # Native DLL loaders can emit locale bytes even in a UTF-8 Python
+        # process. Exercise real subprocess decoding, including stderr merge.
+        real_run = BUILDER.subprocess.run
+        diagnostic = b"native loader failed: \xce\n" + "权限不足\n".encode("utf-8")
+        def failing_probe(command, **kwargs):
+            script = "import sys; sys.stderr.buffer.write(" + repr(diagnostic) + "); sys.exit(1)"
+            return real_run([BUILDER.sys.executable, "-I", "-X", "utf8", "-c", script],
+                            **kwargs)
+        native_target = "windows-x64" if BUILDER.os.name == "nt" else "linux-x64"
+        with mock.patch.object(BUILDER, "RUNTIME_IMPORTS", ()), \
+             mock.patch.object(BUILDER.subprocess, "run", side_effect=failing_probe):
+            with self.assertRaises(RuntimeError) as caught:
+                BUILDER._runtime_dependency_preflight(self.runtime, native_target,
+                                                      Path(BUILDER.sys.executable))
+        self.assertIn("native loader failed: \\xce", str(caught.exception))
+        self.assertIn("权限不足", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, BUILDER.subprocess.CalledProcessError)
+
     def test_copy_failure_cleans_owned_stage_and_preserves_all_prior_outputs(self):
         for target in ("windows-x64", "linux-x64"):
             with self.subTest(target=target):

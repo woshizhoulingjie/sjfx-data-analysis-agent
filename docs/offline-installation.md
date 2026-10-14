@@ -27,6 +27,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install_windows.ps1 -I
 
 命令中的临时执行策略只作用于该 PowerShell 进程。安装到 Program Files 等受保护目录时，需具有该目录的写入权限。
 
+解压目录和程序目录应使用较短的本机路径，避免多层时间戳或嵌套目录。实测部分 Windows 原生 DLL 在深路径中会报“文件名或扩展名太长”；上面的 LocalAppData 默认位置和较短的 `C:\Apps\SJFX` 位置可避免这种路径长度限制。
+
 ## Linux
 
 用 `tar` 解压以保留执行权限。在解压包根目录运行：

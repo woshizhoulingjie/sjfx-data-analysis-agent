@@ -337,12 +337,14 @@ def _runtime_executable(runtime: Path, target: str, *, allow_synthetic: bool = F
     if native_target:
         try:
             subprocess.run(
-                [str(candidate), "-I", "--version"],
+                [str(candidate), "-I", "-X", "utf8", "--version"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 check=True,
                 timeout=10,
                 text=True,
+                encoding="utf-8",
+                errors="backslashreplace",
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError(f"bundled runtime failed its --version probe: {candidate}: {exc}") from exc
@@ -404,12 +406,14 @@ def _runtime_dependency_preflight(runtime: Path, target: str, candidate: Path,
     )
     try:
         subprocess.run(
-            [str(candidate), "-I", "-B", "-c", script],
+            [str(candidate), "-I", "-B", "-X", "utf8", "-c", script],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=True,
             timeout=120,
             text=True,
+            encoding="utf-8",
+            errors="backslashreplace",
         )
     except subprocess.CalledProcessError as exc:
         detail = (exc.stdout or "").strip()
