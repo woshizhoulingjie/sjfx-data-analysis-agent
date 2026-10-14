@@ -553,7 +553,7 @@ def safe_sentence_prototype(record, quote, kind):
         content = re.sub(r'^\s*(?:\d+(?:\.\d+)*[.、]|[一二三四五六七八九十]+、)\s*', '', content).strip().rstrip('。；;.')
         content = content.replace('截至目前，', '').replace('我司' + str(record.get('object_ref') or ''), str(record.get('object_ref') or ''))
         content = content.replace('我司', '发件方').replace('贵司', '对方')
-        prefix = '邮件记载，' if kind == 'core' or '发件方' in content or '截至' in content else ''
+        prefix = '邮件记载，' if '发件方' in content or '截至' in content else ''
         text = prefix + content + '。'
     if (_requires_full_history(text) or not chinese_text(text) or len(text) > 650
             or not verify_numeric(text, quote) or not verify_temporal(text, quote)
