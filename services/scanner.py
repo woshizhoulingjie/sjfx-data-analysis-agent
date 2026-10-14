@@ -86,6 +86,16 @@ def resolve_under(root, requested):
     return candidate
 
 
+def nofollow_entry_stat(entry, path):
+    """Retain file identity when Windows directory enumeration omits it."""
+    # On Windows DirEntry.stat() returns zero device/inode fields, while
+    # lstat() obtains the same identifiers as a subsequently opened handle.
+    # Keep the no-follow check: a replacement reparse point is never content.
+    if os.name == "nt":
+        return Path(path).lstat()
+    return entry.stat(follow_symlinks=False)
+
+
 def _file_metadata(path, root, stat_result=None):
     # The caller normally supplies DirEntry.lstat() data. Reopening a path
     # here would create a type-check/open race if a writable NAS entry is
@@ -285,7 +295,9 @@ def scan_directory(root, max_files=10000, max_depth=32, progress_callback=None,
                     node["children"].append(_symlink_metadata(entry, root, item_path))
                     scanned_node_count += 1
                     continue
-                entry_stat = entry.stat(follow_symlinks=False)
+                entry_stat = nofollow_entry_stat(entry, item_path)
+                if getattr(entry_stat, "st_file_attributes", 0) & 0x400:
+                    raise OSError("目录项包含重解析点，不允许读取")
                 if stat_module.S_ISDIR(entry_stat.st_mode):
                     if visited_directory_count >= max_directories:
                         truncated = True

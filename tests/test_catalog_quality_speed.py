@@ -126,6 +126,9 @@ class ThemeQualityTests(unittest.TestCase):
         leaves=[members[0] for members in self.buckets.values()]
         client=Mock()
         client.model='scope-embedding'
+        client.identity='scope-embedding:test'
+        client._legacy_namespace=None
+        client.dimension=4
         client.embed.side_effect=lambda texts: np.eye(4,dtype=np.float32)[:len(texts)].tolist()
         fallback={leaf['group_id']:None for leaf in leaves}
         with patch.object(semantic,'embedding_client',return_value=client):

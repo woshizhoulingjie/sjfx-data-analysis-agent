@@ -36,6 +36,17 @@ from services.unified_parser import UnifiedDocumentParser
 
 class CoreRegressionTests(unittest.TestCase):
     class _NativeOllamaResponse:
+        def __init__(self):
+            import io
+            self._lines = iter(self)
+            self._buffer = io.BytesIO(b''.join(self))
+
+        def read1(self, size=-1):
+            return self._buffer.read(size)
+
+        def readline(self, size=-1):
+            return next(self._lines, b'')
+
         def __enter__(self):
             return self
 
@@ -257,7 +268,7 @@ class CoreRegressionTests(unittest.TestCase):
 
     def test_ollama_json_uses_native_api_with_thinking_disabled(self):
         client = OllamaClient("http://127.0.0.1:11434/v1", "qwen-agent:latest", timeout=5)
-        with patch("services.ollama.urllib.request.urlopen", return_value=self._NativeOllamaResponse()) as urlopen:
+        with patch("services.ollama.open_local_request", return_value=self._NativeOllamaResponse()) as urlopen:
             result = client.chat_json("system", "user", max_tokens=1200, timeout=5)
         request = urlopen.call_args[0][0]
         payload = json.loads(request.data.decode("utf-8"))

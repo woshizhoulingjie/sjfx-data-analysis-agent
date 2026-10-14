@@ -20,6 +20,7 @@ behaviour exactly as it was.
 """
 
 import json
+from services.embedding_encoding import prefix as embedding_prefix
 import os
 import re
 import urllib.request
@@ -239,7 +240,7 @@ def embedding_similarity(store: Any, package_id: str, query: str,
         return {}
     try:
         from config import Config
-        if not getattr(Config, "ENABLE_VLLM_EMBEDDINGS", False):
+        if getattr(Config, 'EMBED_BACKEND', 'openai_compatible' if getattr(Config, 'ENABLE_VLLM_EMBEDDINGS', False) else 'disabled') == 'disabled':
             return {}
     except Exception:
         return {}
@@ -250,13 +251,15 @@ def embedding_similarity(store: Any, package_id: str, query: str,
         import numpy as np
         from contextlib import closing
         from services.large_package_semantic import embedding_client, _norm, _project
-        from services.vllm import VLLMEmbeddingClient
+        from services.embedding_backend import client_identity
+        from services.large_package_semantic import _require_space
 
         base = embedding_client()
         if base is None:
             return {}
-        model = str(getattr(base, "model", "") or "")
+        model = client_identity(base)
         with closing(store._connect()) as conn:
+            _require_space(conn, package_id, base)
             stored = conn.execute(
                 "SELECT path, vector FROM large_catalog_members WHERE package_id=?"
                 " LIMIT ?",
@@ -278,14 +281,9 @@ def embedding_similarity(store: Any, package_id: str, query: str,
             return {}
         # A short interactive budget: one attempt, no retries, bounded wait, so
         # a slow embedding service can never stall a question.
-        client = VLLMEmbeddingClient(
-            base.base_url, model,
-            timeout=EMBED_TIMEOUT_SECONDS,
-            max_batch_size=1, max_chars=512,
-            api_key=getattr(base, "api_key", ""),
-            semaphore_timeout=1, retries=0,
-        )
-        encoded = client.embed(["query: " + question[:512]])
+        client = base.with_options(timeout=EMBED_TIMEOUT_SECONDS, max_batch_size=1,
+                                   max_chars=512, semaphore_timeout=1, retries=0)
+        encoded = client.embed([embedding_prefix('query', client=client) + question[:512]])
         if not encoded:
             return {}
         query_vector = _project(
@@ -373,21 +371,16 @@ def reranking_enabled() -> bool:
 
 
 def _rerank_endpoint() -> tuple:
-    """Return (base_url, model) for the local generation model.
-
-    Refuses any Ollama endpoint: this deployment serves generation exclusively
-    from the local vLLM instance, and a rerank pass must never introduce a
-    second model provider.
-    """
+    """Expose only the explicitly selected generation service."""
     try:
         from config import Config
     except Exception:
         return "", ""
-    base_url = str(getattr(Config, "VLLM_BASE_URL", "") or "").rstrip("/")
-    model = str(getattr(Config, "VLLM_MODEL", "") or "")
-    if not base_url or not model:
+    if not getattr(Config, "LLM_ENABLED", False):
         return "", ""
-    if "11434" in base_url or "ollama" in base_url.lower():
+    base_url = str(getattr(Config, "LLM_BASE_URL", "") or "").rstrip("/")
+    model = str(getattr(Config, "LLM_MODEL", "") or "")
+    if not base_url or not model:
         return "", ""
     return base_url, model
 
@@ -424,27 +417,19 @@ def rerank_candidates(query: str, results: Sequence[Mapping[str, Any]],
                           " | " + extract_passage(item.get("original_text") or item.get("text"), question, 420) if enabled() else "")
         for position, item in enumerate(pool, 1)
     )
-    payload = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": RERANK_SYSTEM_PROMPT},
-            {"role": "user", "content": "用户问题：{}\n\n候选文件：\n{}\n\n相关文件编号：".format(question, listing)},
-        ],
-        "temperature": 0.0,
-        "max_tokens": RERANK_MAX_TOKENS,
-        "stream": False,
-        # A reasoning trace would cost 7-40s instead of ~1s; measured on this
-        # deployment, so thinking must stay off for an interactive step.
-        "chat_template_kwargs": {"enable_thinking": False},
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        base_url + "/chat/completions", data=payload,
-        headers={"Content-Type": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(request, timeout=RERANK_TIMEOUT_SECONDS) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        raw = (body.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        from config import Config
+        from services.model_backend import create_model_client
+        client = create_model_client(Config, timeout=RERANK_TIMEOUT_SECONDS, max_concurrency=1)
+        if client is None:
+            return items
+        body = client.chat(
+            RERANK_SYSTEM_PROMPT,
+            "用户问题：{}\n\n候选文件：\n{}\n\n相关文件编号：".format(question, listing),
+            temperature=0.0, max_tokens=RERANK_MAX_TOKENS,
+            timeout=RERANK_TIMEOUT_SECONDS, retries=0,
+        )
+        raw = body.get("content") or ""
     except Exception as exc:  # reranking is optional, never fatal
         if logger is not None:
             logger.info("large-package rerank unavailable: %s", str(exc)[:160])

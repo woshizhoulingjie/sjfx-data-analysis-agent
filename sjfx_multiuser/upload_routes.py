@@ -33,6 +33,8 @@ base64 会把 4MB 的分片膨胀成 5.4MB —— **直接超过** 4MB 的 `max_
 """
 
 import os
+import re
+import stat
 import uuid
 
 from .http_adapter import HttpAdapter, make_adapter
@@ -54,8 +56,36 @@ def _human(n):
 
 def _manager_root(path):
     """上传暂存目录：优先与 OUTPUT_DIR 同分区（组装时能用 rename，免拷贝）。"""
+    path = os.path.abspath(path)
+    _reject_path_links(path)
     os.makedirs(path, mode=0o700, exist_ok=True)
+    _reject_path_links(path)
     return path
+
+
+def _reject_path_links(path):
+    """Reject existing symlink/reparse ancestors, including Windows junctions.
+
+    UploadManager repeats these checks while it writes. This route check is an
+    authorization preflight, not a substitute for its filesystem safeguards.
+    """
+    current = os.path.abspath(path)
+    while True:
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise UploadError("无法安全检查上传目录") from exc
+        else:
+            if (stat.S_ISLNK(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                raise UploadError("上传目录不能包含符号链接或重解析点")
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
 
 
 def upload_page_html(max_chunk_bytes):
@@ -83,13 +113,13 @@ def upload_page_html(max_chunk_bytes):
  p.sub{color:#5b6470;font-size:13px;margin:0 0 18px}
  .row{margin:14px 0}
  label{display:block;font-size:13px;font-weight:600;margin-bottom:5px}
- input[type=text],input[type=file]{width:100%%;box-sizing:border-box;padding:8px;
+ input[type=text],input[type=file]{width:100%;box-sizing:border-box;padding:8px;
       border:1px solid #cfd5dc;border-radius:6px;font-size:14px;background:#fff}
  button{padding:9px 18px;border:0;border-radius:6px;background:#1668d6;color:#fff;
       font-size:14px;cursor:pointer}
  button:disabled{background:#9fb4cd;cursor:default}
  .bar{height:9px;background:#e6e9ee;border-radius:5px;overflow:hidden;margin:8px 0}
- .bar>i{display:block;height:100%%;width:0;background:#1668d6;transition:width .2s}
+ .bar>i{display:block;height:100%;width:0;background:#1668d6;transition:width .2s}
  pre{background:#0f1419;color:#d6e2f0;padding:12px;border-radius:6px;font-size:12px;
       max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-all}
  .note{background:#fff8e6;border:1px solid #f2dfa8;border-radius:6px;padding:10px 12px;
@@ -99,7 +129,7 @@ def upload_page_html(max_chunk_bytes):
 <div class="card">
   <h1>上传数据包</h1>
   <p class="sub">文件会按 __MB__ MB 一片切分上传，中途断开可以续传。
-     上传完成后在「新建分析」里就能选到。</p>
+     上传完成后前往工作台导入，再选择需要分析的文件。</p>
   <div class="note">
     <b>断点续传</b>：暂停后重新选择相同文件即可继续。续传记录保存在当前浏览器标签页，关闭标签页后可能无法自动找回；服务端暂存会在 7 天后清理。
   </div>
@@ -117,209 +147,15 @@ def upload_page_html(max_chunk_bytes):
   </div>
   <div class="bar"><i id="bar"></i></div>
   <div id="stat" class="sub"></div>
+  <div id="ready" class="row" hidden>
+    <a id="openImport" href="/">前往工作台导入这个数据包</a>
+  </div>
   <pre id="log"></pre>
 </div>
-<script>
-const CHUNK = __CHUNK__;
-const STORAGE_KEY = 'sjfx.upload.resume.v2';
-let stopFlag = false;
-const $ = id => document.getElementById(id);
-function log(s){ const el=$('log'); el.textContent += s + "\n"; el.scrollTop = el.scrollHeight; }
-function say(s){ $('stat').textContent = s; }
-function setBar(p){ $('bar').style.width = Math.max(0, Math.min(100, p)).toFixed(1) + '%'; }
+<script src="/static/upload-sha256.js?v=1" defer></script>
+<script src="/static/upload.js?v=1" data-chunk-bytes="__CHUNK__" defer></script>
 
-function relPath(f){
-  return (f.webkitRelativePath || f.name).replace(/^\/+/, '');
-}
-
-async function sha256Hex(buf){
-  const d = await crypto.subtle.digest('SHA-256', buf);
-  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2,'0')).join('');
-}
-
-async function api(path, opts){
-  const r = await fetch(path, Object.assign({credentials:'same-origin'}, opts||{}));
-  let j = null;
-  try { j = await r.json(); } catch(e){}
-  if (!r.ok) {
-    const error = new Error((j && (j.error || j.detail)) || ('HTTP ' + r.status));
-    error.status = r.status;
-    throw error;
-  }
-  return j;
-}
-
-function fingerprint(files, packageName){
-  const stable = files.map(f => ({
-    rel_path: f.rel_path, size: f.size, last_modified: f.last_modified
-  })).sort((a,b) => a.rel_path.localeCompare(b.rel_path));
-  return JSON.stringify({package_name: packageName, files: stable});
-}
-
-function readResume(){
-  try { return JSON.parse(sessionStorage.getItem(STORAGE_KEY) || 'null'); }
-  catch(e) { sessionStorage.removeItem(STORAGE_KEY); return null; }
-}
-
-function saveResume(sessionId, key){
-  sessionStorage.setItem(STORAGE_KEY, JSON.stringify({
-    session_id: sessionId, fingerprint: key
-  }));
-}
-
-function clearResume(){ sessionStorage.removeItem(STORAGE_KEY); }
-
-function matchesRemote(remoteFiles, localFiles){
-  if (!Array.isArray(remoteFiles) || remoteFiles.length !== localFiles.length) return false;
-  const local = new Map(localFiles.map(f => [f.rel_path, f.size]));
-  if (local.size !== localFiles.length) return false;
-  return remoteFiles.every(f => local.has(f.rel_path) && local.get(f.rel_path) === f.size);
-}
-
-function receivedBytes(status){
-  return (status.files || []).reduce((sum, f) => sum + (Number(f.received_bytes) || 0), 0);
-}
-
-$('go').onclick = async () => {
-  const picked = [...$('files').files];
-  if (!picked.length) { log('先选择原来的文件，再点开始或继续上传'); return; }
-  $('go').disabled = true;
-  $('stop').disabled = false;
-  stopFlag = false;
-  try {
-    const packageName = $('pkg').value.trim() || null;
-    const files = picked.map(f => ({
-      file: f, rel_path: relPath(f), size: f.size,
-      last_modified: Number(f.lastModified) || 0
-    }));
-    const key = fingerprint(files, packageName);
-    let saved = readResume();
-    let status = null;
-    let sessionId = null;
-
-    if (saved && saved.fingerprint === key && saved.session_id) {
-      try {
-        status = await api('/api/uploads/' + encodeURIComponent(saved.session_id));
-        if (status.max_chunk_bytes !== CHUNK || !matchesRemote(status.files, files)) {
-          log('原续传会话与当前文件不匹配，将另建上传会话；旧暂存数据会按服务端期限清理。');
-          status = null;
-          clearResume();
-        } else {
-          sessionId = saved.session_id;
-          log('恢复会话 ' + sessionId + '，从服务器确认的进度继续。');
-        }
-      } catch(e) {
-        if (e.status !== 404) throw e;
-        log('原续传会话已过期，将重新上传。');
-        clearResume();
-        status = null;
-      }
-    } else if (saved) {
-      log('所选文件或数据包名称已变化，将另建上传会话；旧暂存数据会按服务端期限清理。');
-      clearResume();
-    }
-
-    if (!status) {
-      log('建立上传会话…');
-      const created = await api('/api/uploads', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({
-          package_name: packageName,
-          files: files.map(f => ({rel_path: f.rel_path, size: f.size}))
-        })
-      });
-      sessionId = created.session_id;
-      saveResume(sessionId, key);
-      status = await api('/api/uploads/' + encodeURIComponent(sessionId));
-      if (!matchesRemote(status.files, files)) throw new Error('服务器清单与所选文件不一致，已停止上传');
-      log('会话 ' + sessionId + '：' + status.file_count + ' 个文件，共 ' + status.total_bytes + ' 字节');
-    }
-
-    const serverFiles = new Map(status.files.map((f, index) => [f.rel_path, Object.assign({index}, f)]));
-    let doneBytes = receivedBytes(status);
-    const totalBytes = Number(status.total_bytes) || 0;
-    setBar(totalBytes ? doneBytes / totalBytes * 100 : 100);
-
-    for (const item of files) {
-      let entry = serverFiles.get(item.rel_path);
-      if (!entry) throw new Error('服务器缺少文件：' + item.rel_path);
-      if (entry.state === 'complete') {
-        log('✓ 已完成，跳过 ' + item.file.name);
-        continue;
-      }
-      let offset = Number(entry.received_bytes) || 0;
-      let chunkIndex = Number(entry.chunks_done) || 0;
-      while (offset < item.size) {
-        if (stopFlag) {
-          log('已暂停。重新选择相同文件并点击“开始上传”即可从服务器确认的断点继续。');
-          return;
-        }
-        const end = Math.min(offset + CHUNK, item.size);
-        const buf = await item.file.slice(offset, end).arrayBuffer();
-        const digest = await sha256Hex(buf);
-        let guard = 0;
-        for (;;) {
-          try {
-            const ack = await api('/api/uploads/' + encodeURIComponent(sessionId) +
-              '/chunks/' + entry.index + '?chunk_index=' + chunkIndex + '&sha256=' + digest, {
-                method:'PUT', headers:{'Content-Type':'application/octet-stream'}, body:buf
-              });
-            const nextOffset = Math.min(item.size, offset + buf.byteLength);
-            doneBytes += nextOffset - offset;
-            offset = nextOffset;
-            chunkIndex = Number(ack.chunks_done) || chunkIndex + 1;
-            entry.received_bytes = offset;
-            entry.chunks_done = chunkIndex;
-            entry.state = ack.file_complete ? 'complete' : entry.state;
-            break;
-          } catch(e) {
-            if (++guard > 4) throw e;
-            log('  第 ' + chunkIndex + ' 片请求未确认，检查服务器进度后重试：' + e.message);
-            await new Promise(r => setTimeout(r, 800 * guard));
-            const latest = await api('/api/uploads/' + encodeURIComponent(sessionId));
-            const fresh = latest.files && latest.files[entry.index];
-            if (!fresh || fresh.rel_path !== item.rel_path) throw new Error('无法确认服务器分片状态');
-            const confirmed = Number(fresh.chunks_done) || 0;
-            if (confirmed > chunkIndex) {
-              const advanced = (Number(fresh.received_bytes) || 0) - offset;
-              doneBytes += Math.max(0, advanced);
-              offset = Number(fresh.received_bytes) || 0;
-              chunkIndex = confirmed;
-              entry = Object.assign({index: entry.index}, fresh);
-              break;
-            }
-            if (confirmed < chunkIndex) throw new Error('服务器进度早于当前分片，请刷新状态后重试');
-          }
-        }
-        const pct = totalBytes ? doneBytes / totalBytes * 100 : 100;
-        setBar(pct);
-        say(item.file.name + '  ' + pct.toFixed(1) + '%  共 ' + doneBytes + ' / ' + totalBytes + ' 字节');
-      }
-      log('✓ ' + item.file.name);
-    }
-
-    if (stopFlag) {
-      log('已暂停。重新选择相同文件并点击“开始上传”即可继续。');
-      return;
-    }
-    $('stop').disabled = true;
-    log('全部分片已到服务器，正在组装…');
-    const result = await api('/api/uploads/' + encodeURIComponent(sessionId) + '/finalize', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'
-    });
-    log('✓ 组装完成：' + result.file_count + ' 个文件 → ' + result.dest_dir);
-    say('完成');
-    setBar(100);
-    clearResume();
-  } catch(e) {
-    log('✗ ' + e.message);
-  } finally {
-    $('go').disabled = false;
-    $('stop').disabled = true;
-  }
-};
-$('stop').onclick = () => { stopFlag = true; $('stop').disabled = true; };
-</script></body></html>""".replace("__CHUNK__", str(max_chunk_bytes)).replace(
+</body></html>""".replace("__CHUNK__", str(max_chunk_bytes)).replace(
         "__MB__", "%.0f" % mb)
 
 
@@ -334,8 +170,9 @@ def register(app, upload_root, allowed_roots=(), adapter=None,
     upload_root : str
         分片暂存目录
     allowed_roots : sequence of str
-        组装目标必须在这些根之下。应传 `Config.SCAN_ALLOWED_ROOTS` ——
-        因为包必须落进扫描目录才能被分析。
+        保留注册参数兼容。扫描允许根不是写入授权；HTTP 上传仅组装到
+        upload_root/assembled/<登录 owner>/<session_id>。显式 dest 只允许
+        这个同一目录。需要扫描时使用响应中的 dest_dir，不直接写共享扫描根。
     adapter : HttpAdapter
     session_resolver : callable 或 None
         无参，返回当前请求的有效会话 dict 或 None。
@@ -439,6 +276,19 @@ def register(app, upload_root, allowed_roots=(), adapter=None,
     def _fail(exc, status=400):
         return http.json({"ok": False, "error": str(exc)}, status)
 
+    def _json_object():
+        body = http.json_body()
+        if body is None:
+            if http.raw_body():
+                raise UploadError("请求体必须是合法 JSON 对象")
+            return {}
+        if not isinstance(body, dict):
+            raise UploadError("请求体必须是 JSON 对象")
+        return body
+
+    def _valid_digest(value):
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
+
     # ---------------- 页面 ----------------
 
     @app.route("/upload", methods=["GET"])
@@ -455,10 +305,19 @@ def register(app, upload_root, allowed_roots=(), adapter=None,
         owner, err = _owner()
         if err:
             return err
-        body = http.json_body() or {}
+        try:
+            body = _json_object()
+        except UploadError as exc:
+            return _fail(exc)
         files = body.get("files")
         if not isinstance(files, list):
             return _fail("缺少 files 列表")
+        for item in files:
+            if not isinstance(item, dict):
+                return _fail("files 中的每一项必须是对象")
+            digest = item.get("sha256")
+            if digest not in (None, "") and not _valid_digest(digest):
+                return _fail("文件 sha256 必须是 64 位十六进制字符串")
         # session_id 由服务端生成 —— 不接受客户端指定，
         # 否则客户端可以用同一个 id 覆盖/窥探别人的会话目录
         session_id = body.get("session_id") or _new_session_id()
@@ -504,7 +363,10 @@ def register(app, upload_root, allowed_roots=(), adapter=None,
             return _fail(exc, 404)
         return http.json({"ok": True, "aborted": session_id})
 
-    @app.route("/api/uploads/<session_id>/chunks/<int:file_index>",
+    # web_compat converts <name>, but not Flask's <int:name> syntax. The manager
+    # validates the integer and its bounds; a typed Flask converter would make
+    # the production /chunks/0 URL a literal-route 404.
+    @app.route("/api/uploads/<session_id>/chunks/<file_index>",
                methods=["PUT", "POST"])
     def sjfx_upload_chunk(session_id, file_index):
         owner, err = _owner()
@@ -522,6 +384,8 @@ def register(app, upload_root, allowed_roots=(), adapter=None,
             except (TypeError, ValueError):
                 return _fail("chunk_index 非法")
         digest = http.query_arg("sha256") or http.header("X-Chunk-SHA256") or None
+        if digest is not None and not _valid_digest(digest):
+            return _fail("分片 sha256 必须是 64 位十六进制字符串")
         try:
             res = mgr.put_chunk(owner, session_id, file_index, chunk_index, data,
                                 chunk_sha256=digest)
@@ -535,15 +399,27 @@ def register(app, upload_root, allowed_roots=(), adapter=None,
         owner, err = _owner()
         if err:
             return err
-        body = http.json_body() or {}
-        dest = (body.get("dest") or "").strip()
-        if not dest:
-            # 默认落在上传根之下（不触碰扫描目录）—— 安全默认
-            dest = os.path.join(root, "assembled", owner, session_id)
+        try:
+            body = _json_object()
+            requested = body.get("dest")
+            if requested is not None and not isinstance(requested, str):
+                raise UploadError("dest 必须是字符串")
+            # Validate the session/owner identifiers before constructing a path.
+            # A session from another owner is unavailable, even to an admin.
+            mgr.status(owner, session_id)
+        except UploadError as exc:
+            return _fail(exc)
+        dest = os.path.join(root, "assembled", owner, session_id)
+        try:
+            allowed = _pick_allowed_root(
+                requested.strip() if requested and requested.strip() else dest,
+                allowed_roots, own_root=dest,
+            )
+        except UploadError as exc:
+            return _fail(exc, 403)
         try:
             res = mgr.assemble(owner, session_id, dest,
-                               allowed_root=_pick_allowed_root(dest, allowed_roots,
-                                                               own_root=root))
+                               allowed_root=allowed)
         except UploadError as exc:
             return _fail(exc)
         res["ok"] = True
@@ -553,32 +429,23 @@ def register(app, upload_root, allowed_roots=(), adapter=None,
 
 
 def _pick_allowed_root(dest, allowed_roots, own_root=None):
-    """决定 dest 该受哪个根约束。
+    """Authorize only this owner's server-selected session output directory.
 
-    返回 None 表示"不受限"。两种情况下不受限：
-      1. dest 落在**上传根**之下 —— 那是我们自己的暂存区，本来就该能写
-      2. 没有配置任何 allowed_roots（未配置 = 不额外限制）
-    否则返回**最匹配**的允许根；dest 不在任何根之下时返回一个不可能匹配的哨兵，
-    让 `assemble` 抛出"目标目录必须位于 ... 之下"。
+    ``own_root`` must be the complete private session destination, never the
+    whole upload root. ``allowed_roots`` remains a compatibility parameter;
+    scanner read roots confer no write permission, including for administrators.
+    Return a concrete root: an absent allowlist never means unrestricted writes.
     """
-    dest = os.path.abspath(dest)
-    if own_root:
-        own_root = os.path.abspath(own_root)
-        if dest == own_root or dest.startswith(own_root + os.sep):
-            return None
-    best = None
-    for r in allowed_roots:
-        r = os.path.abspath(r)
-        if dest == r or dest.startswith(r + os.sep):
-            if best is None or len(r) > len(best):
-                best = r
-    if best:
-        return best
-    if not allowed_roots:
-        return None
-    # 不在任何允许根之下 —— 用一个必然不匹配的根，交给 assemble 统一报错。
-    # 这样"拒绝"的逻辑只有一处（UploadManager.assemble），不会两边不一致。
-    return os.path.join(dest, "\x00__not_allowed__")
+    if not own_root:
+        raise UploadError("缺少当前用户的私有上传目录")
+    if not isinstance(dest, str) or "\x00" in dest or not os.path.isabs(dest):
+        raise UploadError("上传只能组装到当前用户的私有会话目录；请省略 dest")
+    private = os.path.abspath(own_root)
+    requested = os.path.abspath(dest)
+    if os.path.normcase(requested) != os.path.normcase(private):
+        raise UploadError("上传只能组装到当前用户的私有会话目录；请省略 dest")
+    _reject_path_links(private)
+    return private
 
 
 def _new_session_id():

@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 import uuid
+from services.package_questions import PACKAGE_OVERVIEW_PATTERN, is_recorded_total_lookup
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -242,7 +243,7 @@ class ContextWindowPolicy:
         object.__setattr__(self, "max_recent_messages", max(2, int(self.max_recent_messages)))
         object.__setattr__(self, "max_recent_chars", max(800, int(self.max_recent_chars)))
         object.__setattr__(self, "max_summary_chars", max(400, int(self.max_summary_chars)))
-        object.__setattr__(self, "max_prompt_evidence", max(1, min(50, int(self.max_prompt_evidence))))
+        object.__setattr__(self, "max_prompt_evidence", max(1, min(200, int(self.max_prompt_evidence))))
         object.__setattr__(self, "max_evidence_chars", max(200, min(4000, int(self.max_evidence_chars))))
         object.__setattr__(self, "max_display_evidence", max(1, min(200, int(self.max_display_evidence))))
         object.__setattr__(self, "max_model_evidence_chars", max(2000, min(120000, int(self.max_model_evidence_chars))))
@@ -409,7 +410,7 @@ class IntentRouter:
         r"|\bfiles?\b",
         re.I,
     )
-    SUMMARY_RE = re.compile(r"总结|概括|概览|综述|梳理|整体介绍|总体介绍|主要(?:讲|内容|发现|主题|方向)|资料.{0,16}(?:研究什么|讲什么)|重点是什么|摘要|overview|summari[sz]e", re.I)
+    SUMMARY_RE = re.compile(r"总结|概括|概览|综述|梳理|整体介绍|总体介绍|主要(?:讲|内容|发现|主题|方向)|资料.{0,16}(?:研究什么|讲什么)|重点是什么|摘要|overview|summari[sz]e|" + PACKAGE_OVERVIEW_PATTERN, re.I)
     CASUAL_RE = re.compile(
         r"^(?:你好|您好|嗨|hi|hello|谢谢|感谢|辛苦了|再见|你是谁|你能做什么|怎么用|帮助)(?:[呀啊吗呢！!。.？?\s]*)$",
         re.I,
@@ -461,7 +462,7 @@ class IntentRouter:
                 ("summary", self.SUMMARY_RE),
                 ("analysis", self.ANALYSIS_RE),
             )
-            if pattern.search(text)
+            if pattern.search(text) and not (name == "structured" and is_recorded_total_lookup(text))
         ]
         if len(matched_intents) > 1:
             return IntentDecision(
@@ -477,7 +478,7 @@ class IntentRouter:
             ("summary", self.SUMMARY_RE, "问题要求概括当前资料范围"),
             ("analysis", self.ANALYSIS_RE, "问题要求分析、推理、研究方向或下一步建议"),
         ):
-            if pattern.search(text):
+            if pattern.search(text) and not (name == "structured" and is_recorded_total_lookup(text)):
                 return IntentDecision(name=name, confidence=0.98, reason=reason)
         if is_follow_up and previous_intent in {"file_search", "translation", "relationship", "structured", "summary", "retrieval", "analysis", "casual", "creative", "general_qa"}:
             return IntentDecision(
@@ -912,13 +913,14 @@ def _citation(item: Mapping[str, Any], index: int, structured: bool = False, que
     }
 
 
-def _normalise_citations(items: Iterable[Mapping[str, Any]], limit: int, structured: bool = False, query: str = "") -> List[Dict[str, Any]]:
+def _normalise_citations(items: Iterable[Mapping[str, Any]], limit: int, structured: bool = False, query: str = "", source_queries: Optional[Mapping[str, str]] = None) -> List[Dict[str, Any]]:
     output: List[Dict[str, Any]] = []
     seen = set()
     for item in items or []:
         if not isinstance(item, Mapping):
             continue
-        candidate = _citation(item, len(output) + 1, structured=structured, query=query)
+        source_query = (source_queries or {}).get(str(item.get("source_path") or "").replace("\\", "/"), query)
+        candidate = _citation(item, len(output) + 1, structured=structured, query=source_query)
         if not candidate:
             continue
         key = (candidate["evidence_id"], candidate["source_path"], json.dumps(candidate["location"], sort_keys=True, ensure_ascii=False))
@@ -1001,6 +1003,85 @@ def _select_model_citations(
             chosen.append(index)
             chosen_indexes.add(index)
     return [item for item in ordered if int(item.get("citation_index") or 0) in chosen_indexes]
+
+
+def _select_synthesis_citations(citations, policy, query, package_context):
+    """Give every mapped note an anchor before adding a second source or hits."""
+    from services.conversation_package_context import synthesis_note_sources
+    notes = synthesis_note_sources(package_context)
+    if not any(note["sources"] for note in notes):
+        return _select_model_citations(citations, policy, query)
+    budget = int(policy.max_model_evidence_chars)
+    wanted_paths = {path for note in notes for path in note["sources"][:2]}
+    passage_limit = min(policy.max_evidence_chars, max(200, budget // max(1, len(wanted_paths)) - 300))
+    candidates = []
+    for rank, raw in enumerate(citations):
+        if aq.source_kind(raw) == "preview":
+            continue
+        path = str(raw.get("source_path") or "").replace("\\", "/")
+        matched = {index for index, note in enumerate(notes) if path in note["sources"]}
+        if not matched:
+            continue
+        item = dict(raw)
+        location = dict(item.get("location") or {})
+        # The full location remains in the displayed citation. Aggregate span
+        # lists can otherwise consume the source budget before facts arrive.
+        if len(json.dumps(location, ensure_ascii=False)) > 800:
+            concise = {}
+            for key in ("source", "page", "section", "paragraph_index", "block_index",
+                        "char_start", "char_end", "table", "row", "row_range", "bbox",
+                        "archive_member", "selected_chunk_spans"):
+                if key not in location:
+                    continue
+                value = location[key]
+                if key == "selected_chunk_spans" and isinstance(value, list):
+                    concise[key] = value[:4]
+                    concise["selected_chunk_span_count"] = len(value)
+                elif len(json.dumps(value, ensure_ascii=False)) <= 300:
+                    concise[key] = value
+            concise["location_details_omitted"] = True
+            item["location"] = concise
+        focus = query + " " + " ".join(notes[index]["text"] for index in sorted(matched))
+        overhead = len(json.dumps(aq.evidence_payload({**item, "original_text": "", "translated_text": None}),
+                                  ensure_ascii=False, separators=(",", ":")))
+        room = max(50, budget // max(1, len(wanted_paths)) - overhead - 32)
+        item_limit = min(passage_limit, room // 2 if item.get("translated_text") else room)
+        item["original_text"] = aq.extract_passage(item["original_text"], focus, item_limit)
+        if item.get("translated_text"):
+            item["translated_text"] = aq.extract_passage(item["translated_text"], focus, item_limit)
+        cost = len(json.dumps(aq.evidence_payload(item), ensure_ascii=False, separators=(",", ":")))
+        candidates.append((item, matched, cost, rank, aq.relevance(focus, item["original_text"])))
+    chosen, chosen_paths, used = [], set(), 0
+    for source_count in (1, 2):
+        for index, note in enumerate(notes):
+            if len(chosen) >= policy.max_prompt_evidence:
+                break
+            target = min(source_count, len(note["sources"]))
+            if len(chosen_paths.intersection(note["sources"])) >= target:
+                continue
+            fitting = [row for row in candidates if index in row[1]
+                       and str(row[0]["source_path"]).replace("\\", "/") not in chosen_paths
+                       and used + row[2] <= budget]
+            if not fitting:
+                continue
+            winner = max(fitting, key=lambda row: (
+                sum(len(chosen_paths.intersection(notes[i]["sources"])) < source_count for i in row[1]),
+                row[4], aq.source_kind(row[0]) == "original", -row[3],
+            ))
+            item, _, cost, _, _ = winner
+            candidates.remove(winner)
+            chosen.append(item)
+            chosen_paths.add(str(item["source_path"]).replace("\\", "/"))
+            used += cost
+    chosen_ids = {item["citation_index"] for item in chosen}
+    for item in _select_model_citations([row for row in citations if row["citation_index"] not in chosen_ids], policy, query):
+        cost = len(json.dumps(aq.evidence_payload(item), ensure_ascii=False, separators=(",", ":")))
+        if len(chosen) >= policy.max_prompt_evidence:
+            break
+        if used + cost <= budget:
+            chosen.append(item)
+            used += cost
+    return chosen
 
 
 def _sanitize_citation_labels(answer: str, citation_count: int) -> str:
@@ -1533,24 +1614,73 @@ class ConversationEngine:
         )
         large_qa = (retrieval.get("package_context") or {}).get("large_qa")
         if large_qa and large_qa.get("global_mode"):
-            from services.large_qa_synthesis import prepare_global
-            retrieval = prepare_global(retrieval, resolution.resolved_query, self.answer_model)
+            from services.large_qa_synthesis import prepare_global, reusable_synthesis
+            from services.qa_execution import current_execution
+            control = current_execution()
+            prepared = control.prepared if control else None
+            reused = (reusable_synthesis(prepared, retrieval, resolution.resolved_query)
+                      if prepared is not None and control.prepared_query == resolution.resolved_query else None)
+            if reused is not None:
+                retrieval = reused
+            elif prepared is not None:
+                # A repair must never restart a long corpus scan. If its source
+                # snapshot changed, withdraw the old notes and use only fresh
+                # retrieved evidence, with an explicit incomplete result.
+                package_context = dict(retrieval.get("package_context") or {})
+                state = dict(package_context.get("large_qa") or {})
+                state.update(map_notes=[], synthesis_complete=False, map_complete=False,
+                             model_mapped_files=0, source_snapshot_current=False)
+                package_context['large_qa'] = state
+                retrieval['package_context'] = package_context
+                retrieval['warnings'] = list(retrieval.get('warnings') or []) + [
+                    '修订期间资料范围或版本变化，已撤回旧综合笔记；本轮只依据最新检索材料提供阶段性回答。']
+            else:
+                retrieval = prepare_global(retrieval, resolution.resolved_query, self.answer_model)
+                if control:
+                    control.prepared = retrieval
+                    control.prepared_query = resolution.resolved_query
+            if control:
+                control.publish(phase='compose')
+            large_qa = (retrieval.get("package_context") or {}).get("large_qa")
         turn_policy = self._turn_context_policy(session, decision, scope)
         if large_qa:
             turn_policy = replace(turn_policy, max_prompt_evidence=40, max_display_evidence=70,
                                   max_model_evidence_chars=26000)
             if large_qa.get("global_mode"):
-                turn_policy = replace(turn_policy, max_evidence_chars=1100, max_model_evidence_per_file=1)
-        citations = _normalise_citations(
-            _rerank_large_package_items(
+                turn_policy = replace(turn_policy, max_prompt_evidence=72, max_display_evidence=200,
+                                      max_model_evidence_chars=60000, max_evidence_chars=1400,
+                                      max_model_evidence_per_file=2)
+        source_queries = {}
+        if large_qa and large_qa.get("global_mode"):
+            from services.conversation_package_context import synthesis_note_sources
+            for note in synthesis_note_sources(retrieval.get("package_context") or {}):
+                for path in note["sources"]:
+                    source_queries[path] = source_queries.get(path, resolution.resolved_query) + " " + note["text"]
+        retrieval_items = _rerank_large_package_items(
                 session.scan_id,
                 resolution.resolved_query,
                 self._retrieval_items(retrieval),
-            ),
-            limit=turn_policy.max_display_evidence,
+            )
+        citations = _normalise_citations(
+            retrieval_items,
+            limit=max(turn_policy.max_display_evidence, len(retrieval_items)) if source_queries else turn_policy.max_display_evidence,
             query=resolution.resolved_query,
+            source_queries=source_queries,
         )
-        model_citations = _select_model_citations(citations, turn_policy, resolution.resolved_query)
+        if source_queries:
+            # Normalize before the display cap, then reserve one eligible
+            # citation for every provenance path. Rerank order is secondary.
+            anchors, remaining, seen_paths = [], [], set()
+            for item in citations:
+                path = str(item.get("source_path") or "").replace("\\", "/")
+                if path in source_queries and path not in seen_paths:
+                    anchors.append(item)
+                    seen_paths.add(path)
+                else:
+                    remaining.append(item)
+            citations = (anchors + remaining)[:turn_policy.max_display_evidence]
+        model_citations = (_select_synthesis_citations(citations, turn_policy, resolution.resolved_query, retrieval.get("package_context") or {})
+                           if large_qa and large_qa.get("global_mode") else _select_model_citations(citations, turn_policy, resolution.resolved_query))
         if large_qa:
             citations, model_citations = _compact_citation_numbers(citations, model_citations)
         coverage = CoverageSnapshot.from_values(
@@ -1576,7 +1706,7 @@ class ConversationEngine:
                 selected_paths.append(path)
             selected_chars += len(str(item.get("original_text") or ""))
         input_manifest = {
-            "large_qa": {key: value for key, value in ((retrieval.get("package_context") or {}).get("large_qa") or {}).items() if key not in {"topics", "map_notes"}},
+            "large_qa": {key: value for key, value in ((retrieval.get("package_context") or {}).get("large_qa") or {}).items() if not key.startswith('_') and key not in {"topics", "map_notes", "notes_provenance", "scope", "source_db_path"}},
             "candidate_files": len(retrieval.get("candidate_paths") or retrieval.get("paths") or []),
             "selected_files": len(selected_paths),
             "selected_paths": selected_paths[:100],
@@ -1687,8 +1817,15 @@ class ConversationEngine:
                     "\n".join(translated_blocks), answer
                 )
 
-        status = "partial" if promotion or reading_incomplete else "answered"
-        evidence_status = "partial" if promotion or reading_incomplete else "supported"
+        synthesis_incomplete = bool(
+            large_qa and large_qa.get("global_mode") and (
+                not large_qa.get("synthesis_complete", large_qa.get("map_complete", False))
+                or input_manifest.get("final_synthesis_complete") is False
+                or input_manifest.get("final_synthesis_sources_complete") is False
+            )
+        )
+        status = "partial" if promotion or reading_incomplete or synthesis_incomplete else "answered"
+        evidence_status = "partial" if promotion or reading_incomplete or synthesis_incomplete else "supported"
         turn = self._base_turn(
             session, resolution, decision, scope, answer, citations,
             status=status,
@@ -1807,11 +1944,52 @@ class ConversationEngine:
         from services.conversation_package_context import model_digest
 
         selected = [dict(item) for item in citations if aq.source_kind(item) != "preview"]
-        output_tokens = aq.output_budget(query, intent)
-        window = int(getattr(Config, "CONVERSATION_CONTEXT_TOKENS", 32768))
-        allowance = max(512, window - output_tokens - 512)
+        fallback_sources = [dict(item) for item in selected[:3]]
+        metadata = generation_manifest if generation_manifest is not None else {}
+        metadata.update(model_request_sent=False, answer_mode="generated")
+        large_qa = (package_context or {}).get("large_qa") or {}
+        global_synthesis = bool(large_qa.get("global_mode"))
+        output_tokens = aq.output_budget(query, "summary" if global_synthesis else intent)
+        from services.model_budget import context_window, reserve_tokens
+        window = min(context_window(Config), int(getattr(Config, "CONVERSATION_CONTEXT_TOKENS", 4096)))
+        if global_synthesis:
+            # A package overview can require several thousand words. Reserve
+            # enough output for all themes while budgeting the full prompt.
+            output_tokens = max(output_tokens, min(6000, window // 4))
+        output_tokens = min(output_tokens, max(128, window // 3))
+        template_reserve = 64 + reserve_tokens(window)
+        allowance = max(0, window - output_tokens - template_reserve)
         history = context
-        digest = model_digest(package_context, max_chars=6500, query=query) if package_context else "无"
+        if global_synthesis:
+            # Regeneration must not treat the previous assistant's omissions or
+            # invented outline as a template. Retain the controlled task and
+            # concrete repair feedback, never the old prose/citation labels.
+            history = ""
+            marker = "受控分析计划："
+            if marker in (context or ""):
+                try:
+                    task, _ = json.JSONDecoder().raw_decode(context.split(marker, 1)[1])
+                    feedback = dict(task.get("verification_feedback") or {})
+                    feedback.pop("previous_answer", None)
+                    feedback.pop("supported_claims", None)
+                    task["verification_feedback"] = feedback
+                    history = re.sub(r"\[\d{1,4}\]", "", json.dumps(task, ensure_ascii=False))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        digest_limit = 15000 if global_synthesis else 6500
+        digest_enabled = True
+        digest_context = package_context
+        if global_synthesis:
+            # The all-file mapped notes replace optional package descriptions
+            # and directory samples in the writing prompt. Keep the complete
+            # source context outside this prompt for the unchanged appendices.
+            digest_context = {key: (package_context or {}).get(key) for key in (
+                "package_type", "package_id", "coverage", "large_qa")}
+            digest_context["reading_manifest"] = {key: value for key, value in
+                ((package_context or {}).get("reading_manifest") or {}).items()
+                if key not in {"directory_atlas", "semantic_signals", "missing_summary_sample"}}
+        digest = model_digest(digest_context, max_chars=digest_limit, query=query, metadata=metadata,
+                              citations=selected if global_synthesis else None) if package_context else "无"
         instruction = {
             "comparison": "围绕同一组维度比较，先给关键差异，再解释条件与影响；适合时使用简短表格。",
             "timeline": "按资料中的时间串联关键事件，区分日期事实与因果推断。",
@@ -1820,13 +1998,22 @@ class ConversationEngine:
         }.get(intent, self.INTENT_INSTRUCTIONS.get(intent, self.INTENT_INSTRUCTIONS["retrieval"]))
         if (package_context or {}).get("large_qa"):
             if package_context["large_qa"].get("global_mode"):
-                instruction = self.INTENT_INSTRUCTIONS["summary"] + "这是大包总览，不能把某一篇的摘要当作整个资料包的结论。先把不同主题组织成清楚的脉络，再用少量代表性材料解释。"
-            instruction += "用户没有明确要求清单、步骤或表格时，以连贯自然段讲述：先说这批或这份资料的主线，再把问题、方法、发现和限制自然串联，每个主题一至两段，不使用嵌套条目，不逐项套用核心问题、研究方法、主要发现、适用范围模板。保留资料中的具体内容，不直接复制摘要或HTML标记。引用编号只使用每条编号证据外层的citation字段，资料内部原有的脚注数字不是本轮引用编号。"
+                instruction = self.INTENT_INSTRUCTIONS["summary"] + "这是大包总览。全范围扫描与分批归并的覆盖以统计为准，不能把某一篇的摘要当作整个资料包的结论，也不能把摘要扫描说成已读全文。先结合完整保留的归并要点组织不同主题，再用编号材料支持具体发现。按照note_citations匹配当前来源，不能沿用历史回答中的引用编号。回答可以长，优先完整说明主要主题、研究内容、方法与发现、主题之间的联系、不同观点及适用条件；需要时按主题分节，但不要逐份枚举重复文件。成稿须连贯，不输出空标题、空条目、阶段性报告或核验过程；必要的资料缺口在末尾用一小段说明。"
+                instruction += "请逐条检查综合要点，凡有对应材料支持的不同研究方向都应在所属主题中充分说明，不要只写一句领域名称。根据当前材料重新组织长回答，解释具体研究在解决什么问题、采用什么思路、资料实际报告了什么；材料只提供研究题目时仅说明研究问题，不能补造结果。每个结论贴近真正支持它的出处，不能把一个代表文件的引用挂到该主题所有不同研究上；综合要点的候选出处没有支持整句时，收窄到材料实际支持的内容。正文无须重复展示分析范围、证据轨迹或相关文件，系统会按原格式展示这些附录。"
+            if global_synthesis:
+                instruction += "以连贯自然段充分展开：先交代全包主线，每个主题按实际内容需要写多个段落，将不同子方向分别讲清楚，不限制为一至两段。每段的研究问题、方法、发现和条件自然衔接，既解释各方向各自讨论什么，也说明资料实际体现的联系。不要为缩短篇幅将多个不同研究挤进一句再共用代表引用；资料没有提供具体结果时，清楚介绍研究问题与方法即可。不逐项套用固定模板，不用重复空话凑长度。"
+            else:
+                instruction += "用户没有明确要求清单、步骤或表格时，以连贯自然段讲述：先说这批或这份资料的主线，再把问题、方法、发现和限制自然串联，每个主题一至两段，不使用嵌套条目，不逐项套用核心问题、研究方法、主要发现、适用范围模板。"
+            instruction += "保留资料中的具体内容，不直接复制摘要或HTML标记。引用编号只使用每条编号证据外层的citation字段，资料内部原有的脚注数字不是本轮引用编号。"
 
         def render():
+            nonlocal digest
+            if global_synthesis and digest_enabled:
+                digest = model_digest(digest_context, max_chars=digest_limit, query=query,
+                                      metadata=metadata, citations=selected)
             return (
                 "任务类型：{}\n任务要求：{}\n会话上下文（历史回答不是证据）：\n{}\n\n"
-                "全包阅读层（程序统计与有限摘要样本，不等于已读全文）：\n{}\n\n"
+                "全包阅读层（范围扫描统计、分批归并要点与有限摘要样本，不等于已读全文）：\n{}\n\n"
                 "当前问题：{}\n\n回答要点与资料缺口：{}\n\n"
                 "编号证据（具体事实仅据以下内容，保留各条 source_kind 的来源身份）：\n{}"
             ).format(intent, instruction, history or "无", digest, query,
@@ -1837,19 +2024,70 @@ class ConversationEngine:
         # Keep source facts before general background; never truncate a JSON
         # payload or a selected sentence after recording it in the manifest.
         if aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
-            history = aq.extract_passage(context, query, 2400)
-            digest = model_digest(package_context, max_chars=1800, query=query) if package_context else "无"
+            history = aq.extract_passage(history or "", query, 2400)
+            if not global_synthesis:
+                digest = model_digest(package_context, max_chars=1800, query=query, metadata=metadata) if package_context else "无"
             prompt = render()
         if aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
             history = ""
-            digest = "背景已按预算省略；回答仅据下方证据。"
+            if not global_synthesis:
+                digest = "背景已按预算省略；回答仅据下方证据。"
             prompt = render()
-        while selected and aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+        if global_synthesis:
+            # Preserve all final synthesis notes before optional history or
+            # repetitive excerpts. Shorten source context before dropping the
+            # sole source of a distinct theme.
+            if aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+                for item in selected:
+                    item["original_text"] = aq.extract_passage(item["original_text"], query, 750)
+                    if item.get("translated_text"):
+                        item["translated_text"] = aq.extract_passage(item["translated_text"], query, 750)
+                prompt = render()
+            from services.conversation_package_context import synthesis_note_sources
+            source_sets = [set(note["sources"]) for note in synthesis_note_sources(package_context)]
+            minimum_facts = min(3, len(selected))
+            while len(selected) > minimum_facts and aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+                removable = next((index for index in range(len(selected) - 1, -1, -1)
+                    if all(not paths.intersection({row["source_path"] for row in selected})
+                        or paths.intersection({row["source_path"] for j, row in enumerate(selected) if j != index})
+                        for paths in source_sets)), None)
+                if removable is None:
+                    break
+                selected.pop(removable)
+                prompt = render()
+            if aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+                for item in selected:
+                    item["original_text"] = aq.extract_passage(item["original_text"], query, 550)
+                    if item.get("translated_text"):
+                        item["translated_text"] = aq.extract_passage(item["translated_text"], query, 550)
+                prompt = render()
+            if aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+                digest_limit = 1800
+                prompt = render()
+            if aq.count_tokens(self.SYSTEM_PROMPT + prompt) > allowance:
+                digest = "全范围归并要点因本轮预算不足已省略；本轮只能依据下方部分证据，不能宣称全包完整结论。"
+                digest_enabled = False
+                metadata.update(final_synthesis_notes=0, final_synthesis_complete=False,
+                                final_synthesis_note_characters=0, final_synthesis_sources_complete=False,
+                                final_synthesis_notes_with_sources=0)
+                prompt = render()
+        while selected:
+            prompt_tokens = aq.count_tokens(self.SYSTEM_PROMPT + prompt)
+            if not global_synthesis:
+                # A short complete source may fit a small model even when the
+                # preferred long-answer reservation does not. Use the actual
+                # remaining output space before discarding its last evidence.
+                spare_output = window - template_reserve - prompt_tokens
+                minimum_output = min(output_tokens, max(128, window // 8))
+                if minimum_output <= spare_output < output_tokens:
+                    output_tokens = spare_output
+                    allowance = window - output_tokens - template_reserve
+            if prompt_tokens <= allowance:
+                break
             selected.pop()
             prompt = render()
         if isinstance(citations, list):
             citations[:] = selected
-        metadata = generation_manifest if generation_manifest is not None else {}
         metadata.update({
             "selected_files": len({x.get("source_path") for x in selected}),
             "selected_paths": list(dict.fromkeys(x.get("source_path") for x in selected)),
@@ -1859,17 +2097,72 @@ class ConversationEngine:
             "prompt_tokens": aq.count_tokens(self.SYSTEM_PROMPT + prompt),
             "token_count_method": aq.token_count_method(),
             "context_tokens": window, "output_token_budget": output_tokens,
-            "chat_template_token_reserve": 512,
+            "chat_template_token_reserve": template_reserve,
             "answer_contract": aq.answer_contract(query, selected),
         })
+        def evidence_extract(sources, warning):
+            # Extracts are independently verifiable without pretending that
+            # their sources were sent to a model whose prompt cannot fit.
+            metadata.update(answer_mode="evidence_extract",
+                            fallback_citation_indexes=[x["citation_index"] for x in sources],
+                            answer_contract=aq.answer_contract(query, sources))
+            if global_synthesis:
+                # Source extracts are a partial response, even when a cached
+                # all-package reading layer retained every synthesis note.
+                metadata.update(final_synthesis_complete=False,
+                                final_synthesis_sources_complete=False,
+                                final_synthesis_notes=0,
+                                final_synthesis_note_characters=0,
+                                final_synthesis_notes_with_sources=0,
+                                final_synthesis_notes_without_sources=0)
+                warning += " 全包综合回答尚未完成；以下仅为部分来源摘录。"
+            if not metadata["model_request_sent"]:
+                metadata.update(proposed_prompt_tokens=metadata["prompt_tokens"],
+                                prompt_tokens=0, selected_files=0, selected_paths=[],
+                                selected_evidence=0, selected_characters=0,
+                                actual_citation_indexes=[], output_token_budget=0)
+                if isinstance(citations, list):
+                    citations[:] = []
+            blocks = []
+            for item in sources:
+                passage = aq.extract_passage(item["original_text"], query, 500)
+                parts = re.split(r"(?<=[。！？!?])\s*|\n+", passage)
+                # Source footnotes are not this turn's citation indexes.
+                blocks.append(" ".join("{} {}".format(
+                    re.sub(r"\[\d{1,4}\]", "", part).strip(), item["citation_label"])
+                    for part in parts if part.strip()))
+            if not blocks:
+                return "当前范围没有找到能够支持该问题的正文证据，因此我不能可靠作答。", [warning]
+            metadata["invalid_generated_citation_indexes"] = []
+            return "根据当前可回查证据：\n\n" + "\n\n".join(blocks), [warning]
+
+        if self.answer_model is None:
+            return evidence_extract(fallback_sources, "未配置回答模型，已返回相关证据摘录。")
         if not selected or metadata["prompt_tokens"] > allowance:
-            return "当前可用资料未能在本轮预算内形成完整依据，暂时无法可靠回答这个问题。", ["资料问答输入预算不足；没有发送超限请求。"]
+            return evidence_extract(fallback_sources,
+                                    "资料问答输入预算不足；没有发送超限请求，已返回相关证据摘录。")
         warnings = []
+        if global_synthesis and not metadata.get("final_synthesis_complete"):
+            warnings.append("全范围归并或最终要点保留尚未完整：本轮保留 {} / {} 条归并要点，具体结论仅据已输入证据。".format(
+                metadata.get("final_synthesis_notes", 0), metadata.get("total_notes", 0)))
         try:
+            from services.qa_execution import current_execution
+            control = current_execution()
+            timeout = int(getattr(Config, "CONVERSATION_ANSWER_TIMEOUT_SECONDS", 120))
+            if global_synthesis:
+                timeout = max(timeout, 240)
+            if control:
+                if control.checkpoint:
+                    control.checkpoint()
+                remaining = control.remaining(reserve=30)
+                if remaining < 5:
+                    raise TimeoutError('本轮时间预算已用完，保留可核验的阶段性材料')
+                timeout = max(1, min(timeout, int(remaining)))
+            metadata["model_request_sent"] = True
             answer = _model_text(
                 self.answer_model, self.SYSTEM_PROMPT, prompt,
                 max_tokens=output_tokens,
-                timeout=int(getattr(Config, "CONVERSATION_ANSWER_TIMEOUT_SECONDS", 120)),
+                timeout=timeout,
                 interactive=False,
                 response_metadata=metadata,
             )
@@ -1877,16 +2170,15 @@ class ConversationEngine:
             answer = ""
             warnings.append("本地回答模型不可用，已返回相关证据摘录：{}".format(_clean_text(exc, 180)))
         if not answer:
-            answer = "根据当前可回查证据：\n\n" + "\n\n".join(
-                "{} {}".format(aq.extract_passage(x["original_text"], query, 500), x["citation_label"])
-                for x in selected[:3]
-            )
+            answer, extract_warnings = evidence_extract(selected[:3],
+                "回答模型未返回可用内容，已返回相关证据摘录。")
+            warnings.extend(extract_warnings)
         allowed = {x["citation_index"] for x in selected}
         invalid = [int(x) for x in re.findall(r"\[(\d{1,4})\]", answer) if int(x) not in allowed]
         if invalid:
             # Keep invalid labels for the verifier to identify and repair; silently
             # removing them could let automatic attribution hide the failure.
-            warnings.append("回答引用了本轮未输入的证据编号，须经核验修订。")
+            warnings.append("回答中有引用编号不对应本轮输入来源。")
         metadata["invalid_generated_citation_indexes"] = invalid
         if metadata.get("finish_reason") == "length":
             metadata["output_truncated"] = True
@@ -1921,8 +2213,11 @@ class ConversationEngine:
         if package_context:
             try:
                 from services.conversation_package_context import model_digest
-                package_digest = model_digest(package_context)
+                package_digest = model_digest(package_context, metadata=generation_manifest)
             except Exception:
+                if generation_manifest is not None and (package_context.get("large_qa") or {}).get("global_mode"):
+                    generation_manifest.update(final_synthesis_notes=0, final_synthesis_complete=False,
+                                               total_notes=len(package_context["large_qa"].get("map_notes") or []))
                 package_digest = json.dumps({
                     "coverage": package_context.get("coverage") or {},
                     "all_file_reading": package_context.get("reading_manifest") or {},

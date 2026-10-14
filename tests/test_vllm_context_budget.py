@@ -2,6 +2,7 @@
 import io
 import json
 import urllib.error
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -15,7 +16,7 @@ def response(value):
 
 def context_error():
     detail = "This model's maximum context length is 32768 tokens. However, you requested 3600 output tokens and your prompt contains at least 29169 input tokens, for a total of at least 32769 tokens."
-    return urllib.error.HTTPError('http://local/v1/chat/completions', 400, 'Bad Request', {},
+    return urllib.error.HTTPError('http://127.0.0.1/v1/chat/completions', 400, 'Bad Request', {},
                                   response({'error': {'message': detail}}))
 
 
@@ -24,16 +25,16 @@ def success():
                      'usage':{'prompt_tokens':29169,'completion_tokens':5,'total_tokens':29174}})
 
 
-def invoke(responses, retries=0):
+def invoke(responses, retries=0, **constructor_options):
     calls = []
-    def urlopen(request, timeout=None):
+    def urlopen(request, timeout=None, *, allowed_endpoints=()):
         calls.append((request.full_url, json.loads(request.data.decode('utf-8'))))
         value = responses.pop(0)
         if isinstance(value, Exception):
             raise value
         return value
-    client = VLLMClient('http://local/v1', 'test', api_key='test-key')
-    with patch('services.vllm.urllib.request.urlopen', side_effect=urlopen), \
+    client = VLLMClient('http://127.0.0.1/v1', 'test', api_key='test-key', **constructor_options)
+    with patch('services.vllm.open_local_request', side_effect=urlopen), \
          patch('services.llm_trace.get_recorder', return_value=None), \
          patch.object(VLLMClient, '_backoff'):
         # Execute real transport while avoiding the unrelated admission database.
@@ -46,7 +47,7 @@ def invoke(responses, retries=0):
                                               ({'tokens':list(range(30000))},2768)])
 def test_precise_dynamic_budget_preserves_all_input_and_schema(measured, effective):
     result, calls = invoke([context_error(), response(measured), success()])
-    assert [url for url, payload in calls] == ['http://local/v1/chat/completions','http://local/tokenize','http://local/v1/chat/completions']
+    assert [url for url, payload in calls] == ['http://127.0.0.1/v1/chat/completions','http://127.0.0.1/tokenize','http://127.0.0.1/v1/chat/completions']
     original, tokenize, retried = [payload for url, payload in calls]
     assert original['messages'] == tokenize['messages'] == retried['messages']
     assert tokenize['add_generation_prompt'] is True
@@ -63,6 +64,22 @@ def test_normal_request_never_tokenizes_or_changes_completion_budget():
     assert 'context_budget' not in result
 
 
+def test_configured_precise_retry_respects_selected_window_and_safety_reserve():
+    result, calls = invoke([context_error(), response({'count': 29169}), success()],
+                          budget_config=SimpleNamespace(LLM_CONTEXT_TOKENS=30000))
+    assert calls[-1][1]['max_tokens'] == 30000-29169-256
+    assert result['context_budget']['context_limit'] == 30000
+    assert result['context_budget']['provider_context_limit'] == 32768
+    assert result['context_budget']['reserve_tokens'] == 256
+    assert result['context_budget']['input_truncated'] is False
+
+
+def test_configured_precise_retry_never_consumes_reserved_input_capacity():
+    with pytest.raises(LocalModelError) as caught:
+        invoke([context_error(), response({'count': 29900})], context_tokens=30000)
+    assert caught.value.code == 'context_limit'
+
+
 @pytest.mark.parametrize('token_response', [response({'count':32768}), response({'count':40000})])
 def test_input_over_limit_is_explicit_and_never_truncated(token_response):
     with pytest.raises(LocalModelError, match='需要调用方分片'):
@@ -72,7 +89,7 @@ def test_input_over_limit_is_explicit_and_never_truncated(token_response):
 @pytest.mark.parametrize('token_response', [urllib.error.URLError('tokenizer offline'), response({'count':True}),
                                           response({'tokens':['invalid']})])
 def test_failed_or_invalid_tokenization_keeps_original_context_error(token_response):
-    with pytest.raises(LocalModelError, match='maximum context length is 32768'):
+    with pytest.raises(LocalModelError, match='输入超出模型上下文限制'):
         invoke([context_error(), token_response])
 
 
@@ -82,12 +99,12 @@ def test_second_context_rejection_is_not_hidden_or_retried_again():
 
 
 def test_unrelated_bad_request_never_uses_context_adaptation():
-    error = urllib.error.HTTPError('http://local/v1/chat/completions',400,'Bad Request',{},response({'error':'invalid schema'}))
-    with pytest.raises(LocalModelError, match='invalid schema'):
+    error = urllib.error.HTTPError('http://127.0.0.1/v1/chat/completions',400,'Bad Request',{},response({'error':'invalid schema'}))
+    with pytest.raises(LocalModelError, match='请求被本机服务拒绝'):
         invoke([error], retries=2)
 
 
 def test_transient_http_retry_budget_is_preserved():
-    error = urllib.error.HTTPError('http://local/v1/chat/completions',503,'Unavailable',{},response({'error':'busy'}))
+    error = urllib.error.HTTPError('http://127.0.0.1/v1/chat/completions',503,'Unavailable',{},response({'error':'busy'}))
     result, calls = invoke([error, success()], retries=1)
     assert len(calls) == 2 and all(payload['max_tokens'] == 3600 for url,payload in calls)

@@ -86,22 +86,18 @@ def resolve_owner(session, viewing_owner, config_owner_id):
     | 有但角色未知    | ?      | 任意          | 自己的 owner_id（保守）    |
     """
     # ---- 分支 1：无会话 → 回落配置值（绝不用 None）----
-    if not session:
+    if session is None:
         return OwnerDecision(config_owner_id, SOURCE_CONFIG_FALLBACK,
                              note="无有效会话，回落配置值（保持与改造前一致）")
 
     role = session.get("role")
     own_owner = session.get("owner_id")
+    if not own_owner:
+        raise ValueError("已认证会话缺少 owner_id，拒绝回落默认归属")
 
     # ---- 分支 2：普通用户 → 永远只有自己，视角参数被忽略 ----
     # 注意：这里**不信任** viewing_owner。普通用户就算构造了它也必须无效。
     if role != ROLE_ADMIN:
-        if not own_owner:
-            # 会话有效但没有 owner_id —— 数据异常。
-            # 保守起见回落到配置值而不是 None（None 会放大成"看全部"）。
-            return OwnerDecision(config_owner_id, SOURCE_CONFIG_FALLBACK,
-                                 user=session,
-                                 note="会话缺少 owner_id（异常），保守回落配置值")
         return OwnerDecision(own_owner, SOURCE_SESSION, user=session)
 
     # ---- 分支 3：管理员 ----

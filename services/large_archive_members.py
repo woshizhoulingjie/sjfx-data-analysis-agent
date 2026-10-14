@@ -10,16 +10,13 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import stat
-import tarfile
 import tempfile
-import zipfile
 
 from config import Config
 from services.scanner import is_sensitive_file
-from services.unified_parser import strict_archive_member_name, _zip_central_directory_preflight
+from services.unified_parser import strict_archive_member_name
+from services.archive_formats import ArchiveReader, ArchiveLimits, SUFFIXES
 
-SUFFIXES = ('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz')
 IDENTITY_FIELDS = ('container_path', 'container_size', 'container_modified_at_ns',
                    'container_device', 'container_inode', 'member_name', 'member_size')
 
@@ -94,7 +91,7 @@ def discover_members(root, container, on_error=None):
     """Yield a verified member inventory with disk-bounded metadata staging."""
     if not supported(container['path']) or container.get('sensitive'):
         return
-    from services.package_analysis import _open_inventory_source, _BoundedLogicalTarInfo
+    from services.package_analysis import _open_inventory_source
     Config.PARSE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     source_fd, before = _open_inventory_source(root, container)
     with os.fdopen(source_fd, 'rb') as handle, tempfile.TemporaryDirectory(
@@ -104,9 +101,8 @@ def discover_members(root, container, on_error=None):
             db.execute('CREATE TABLE members(name TEXT PRIMARY KEY,payload TEXT NOT NULL)')
             db.execute('CREATE TABLE names(name TEXT PRIMARY KEY)')
             count = 0
-            total = 0
             def store(name, size, regular, encrypted=False, compressed_size=None):
-                nonlocal count, total
+                nonlocal count
                 count += 1
                 if count > Config.MAX_LOGICAL_UNITS_PER_CONTAINER:
                     raise ValueError('归档成员数量超过逻辑清点上限')
@@ -114,11 +110,6 @@ def discover_members(root, container, on_error=None):
                     db.execute('INSERT INTO names VALUES(?)', (name,))
                 except sqlite3.IntegrityError as exc:
                     raise ValueError('归档成员名称重复，未发布该归档的成员清单') from exc
-                total += max(0, int(size))
-                if not str(container['path']).lower().endswith(('.zip', '.tar')):
-                    if total > min(Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,
-                                   before.st_size * Config.MAX_ARCHIVE_COMPRESSION_RATIO):
-                        raise ValueError('压缩TAR清点超过解压总量或压缩比上限')
                 if name.endswith('/') and not regular:
                     return
                 if not regular or encrypted or not strict_archive_member_name(name) or int(size) < 0:
@@ -140,23 +131,10 @@ def discover_members(root, container, on_error=None):
                     db.execute('INSERT INTO members VALUES(?,?)', (name, json.dumps(row, ensure_ascii=False)))
                 except sqlite3.IntegrityError as exc:
                     raise ValueError('归档成员名称重复，未发布该归档的成员清单') from exc
-            if str(container['path']).lower().endswith('.zip'):
-                result = _zip_central_directory_preflight(handle)
-                if not result.get('safe'):
-                    raise ValueError('归档中央目录预检失败：' + str(result.get('reason')))
-                with zipfile.ZipFile(handle) as archive:
-                    if len(archive.filelist) != result['observed_entries']:
-                        raise ValueError('归档目录在预检后变化')
-                    for entry in archive.filelist:
-                        mode = stat.S_IFMT((entry.external_attr >> 16) & 0xffff)
-                        store(entry.filename, entry.file_size, not entry.is_dir() and mode in {0, stat.S_IFREG},
-                              bool(entry.flag_bits & 1), entry.compress_size)
-            else:
-                with tarfile.open(fileobj=handle, mode='r:*', tarinfo=_BoundedLogicalTarInfo) as archive:
-                    for entry in archive:
-                        store(entry.name + ('/' if entry.isdir() and not entry.name.endswith('/') else ''),
-                              entry.size, entry.isfile() and not entry.issparse())
-                        archive.members.clear()
+            limits = ArchiveLimits.from_config(entry_limit=Config.MAX_LOGICAL_UNITS_PER_CONTAINER)
+            with ArchiveReader(handle, filename=container['path'], limits=limits) as archive:
+                for entry in archive.entries():
+                    store(entry.name, entry.size, entry.regular, entry.encrypted, entry.compressed_size)
             after = os.fstat(handle.fileno())
             keys = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns')
             if any(getattr(before, k) != getattr(after, k) for k in keys):

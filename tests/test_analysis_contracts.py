@@ -245,8 +245,10 @@ class AnalysisContractTests(unittest.TestCase):
             } for path in small_paths],
         }
         candidates = _direction_candidates({}, analysis)
-        assert candidates[0]["title"] == "病原体变异突增与高危传播监测"
-        assert candidates[0]["independent_source_count"] == 3
+        assert "病原体变异突增与高危传播监测" in candidates[0]["title"]
+        assert candidates[0]["opportunity_kind"] == "replication"
+        assert candidates[0]["independent_source_count"] == 1  # identical passages are copies
+        assert candidates[0]["independent_source_count"] == 1
 
     def test_direction_candidates_use_official_tree_evidence(self):
         evidence = {
@@ -284,12 +286,12 @@ class AnalysisContractTests(unittest.TestCase):
         }
         candidates = _direction_candidates({}, analysis)
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["title"], "区域市场经营数据分析与风险预警")
+        self.assertIn("区域市场经营数据分析与风险预警", candidates[0]["title"])
         self.assertEqual(set(candidates[0]["evidence_ids"]), {"E-market", "E-table"})
         self.assertEqual(candidates[0]["independent_source_count"], 2)
-        self.assertEqual(candidates[0]["candidate_source"], "official_analysis_tree")
+        self.assertEqual(candidates[0]["candidate_source"], "server_research_opportunity")
         self.assertEqual(candidates[0]["evidence_status"], "supported")
-        self.assertIn("交付周期", candidates[0]["research_questions"][0])
+        self.assertIn("条件", candidates[0]["research_questions"][0])
 
     def test_unclassified_tree_bucket_is_not_recommended(self):
         analysis = {

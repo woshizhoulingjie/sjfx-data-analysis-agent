@@ -5,6 +5,7 @@ import email
 import email.policy
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -97,6 +98,21 @@ def _clamd_scan(path, address):
         return -1,'本地病毒扫描服务不可用'
 
 
+def _scan_score(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _rspamd_symbols(result):
+    if (not isinstance(result, dict) or result.get('is_skipped') is True
+            or not _scan_score(result.get('score')) or not isinstance(result.get('symbols'), dict)):
+        raise ValueError('Rspamd 未返回完整扫描回执')
+    symbols = result['symbols']
+    if any(not isinstance(value, dict) or not _scan_score(value.get('score'))
+           for value in symbols.values()):
+        raise ValueError('Rspamd 规则回执无效')
+    return symbols
+
+
 def bounded_read(path, max_bytes=20*1024*1024, expected_sha256=None):
     fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)|getattr(os,'O_NONBLOCK',0))
     with os.fdopen(fd,'rb') as stream:
@@ -167,8 +183,9 @@ def inspect_file(path, *, max_bytes=20 * 1024 * 1024, clam=None, yara=None, yara
                 with urlopen(Request(rspamd.rstrip('/') + '/checkv2', data=raw,
                                      headers={"Content-Type": "message/rfc822"}), timeout=30) as resp:
                     result = json.loads(resp.read(1024 * 1024))
+                symbols = _rspamd_symbols(result)
                 engines["rspamd"] = "completed"
-                for name, value in (result.get("symbols") or {}).items():
+                for name, value in symbols.items():
                     if value.get("score", 0) > 0:
                         findings.append({"rule": "rspamd:" + name, "severity": "review",
                                          "detail": value.get("options", []), "score": value.get("score")})
@@ -178,7 +195,10 @@ def inspect_file(path, *, max_bytes=20 * 1024 * 1024, clam=None, yara=None, yara
     clam = clam or os.getenv('SJFX_PROTECTION_CLAM') or shutil.which("clamscan")
     if clam or clamd:
         status, output = _clamd_scan(path,clamd) if clamd else _run([clam, "--no-summary", "--alert-exceeds-max=yes", "--alert-encrypted=yes", str(path)])
-        engines["clamav"] = "completed" if status in (0, 1) else "error"
+        found_lines = [line for line in output.splitlines() if line.endswith(' FOUND')]
+        ok_lines = [line for line in output.splitlines() if line.endswith(' OK')]
+        receipt = status == 1 and bool(found_lines) or status == 0 and bool(ok_lines) and not found_lines
+        engines["clamav"] = "completed" if receipt else "error"
         if status == 1:
             for line in output.splitlines():
                 if line.endswith(" FOUND"):
@@ -194,6 +214,8 @@ def inspect_file(path, *, max_bytes=20 * 1024 * 1024, clam=None, yara=None, yara
         engines["yara_x"] = "completed" if status == 0 else "error"
         if status == 0 and output.strip():
             findings.append({"rule": "yara_x", "severity": "review", "detail": output[:8000]})
+    elif yara or yara_rules:
+        engines["yara_x"] = "error"
     if any(f.get("severity") == "dangerous" for f in findings):
         risk = "dangerous"
     elif findings:

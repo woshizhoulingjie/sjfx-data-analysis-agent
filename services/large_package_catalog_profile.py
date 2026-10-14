@@ -16,7 +16,7 @@ from services import large_package_evidence_store as feature_store
 
 LOGGER = logging.getLogger(__name__)
 
-POLICY_VERSION = 'evidence-profile/3'
+POLICY_VERSION = 'evidence-profile/6'
 
 # 模板检测：12 字窗口的文档频次 ≥30% 且至少出现在 3 份文件里，才算模板。
 TEMPLATE_NGRAM = 12
@@ -157,8 +157,7 @@ def group_profiles(store, package_id, group_id, limit=PROFILE_SAMPLE_MEMBERS):
     for raw in rows:
         row = store._row(raw)
         info = (row.get('local_summary') or {}).get('portrait') or {}
-        parts = [p for p in (info.get('evidence') or [])
-                 if isinstance(p, dict) and p.get('text')]
+        parts = evidence.row_parts(row)
         text = evidence.compact_text(parts, chars=PROFILE_TEXT_CHARS)
         profiles.append({'path': str(row.get('path') or ''),
                          'text': text,
@@ -745,12 +744,13 @@ def is_template_meta(value, templates):
     return False
 
 
-def filter_meta(values, templates, limit):
+def filter_meta(values, templates, limit, source_text=None, kind=None):
     """过滤模板字段并去重、限量。"""
     kept = []
     for item in values or ():
         text = re.sub(r'\s+', ' ', str(item or '')).strip()
-        if not text or is_template_meta(text, templates):
+        if (not text or is_template_meta(text, templates)
+                or evidence.is_publication_metadata(text, source_text, kind=kind)):
             continue
         if text in kept:
             continue

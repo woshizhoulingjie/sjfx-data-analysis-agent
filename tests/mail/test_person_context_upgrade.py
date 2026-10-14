@@ -17,7 +17,11 @@ from services.mail.person_context import validate_reviews
 
 
 @pytest.fixture
-def person_data(tmp_path):
+def person_data(tmp_path, monkeypatch):
+    # These synthetic providers exercise full reading/review contracts and
+    # assume a 32K service. Capacity tests explicitly override this locally.
+    from config import Config
+    monkeypatch.setattr(Config, 'LLM_CONTEXT_TOKENS', 32768)
     repo=MailRepository(Storage(tmp_path/'person.sqlite3'),text_segment_chars=350)
     repo.migrate()
     package,_=repo.create_package(owner_id='owner',display_name='Person context synthetic',source_kind='directory',

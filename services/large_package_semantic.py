@@ -8,14 +8,26 @@ import os
 import re
 import sqlite3
 import time
+from functools import wraps
 from contextlib import closing
+from pathlib import Path
 import numpy as np
 from services import large_package_catalog as catalog
+from services.embedding_encoding import prefix as embedding_prefix, tokenizer as selected_embedding_tokenizer
 
 LOGGER = logging.getLogger(__name__)
 
 EMBED_BATCH = 32
 SIMILARITY = .94
+
+
+def _leaf_batch(method):
+    @wraps(method)
+    def guarded(store, package_id, *args, **kwargs):
+        from services.large_package_catalog_coordination import leaf_batch
+        with leaf_batch(store, package_id, method.__name__, kwargs.get('cancelled', lambda: False)) as allowed:
+            return method(store, package_id, *args, **kwargs) if allowed else 0
+    return guarded
 
 # 全局聚类的状态一律落库（见 large_catalog_km_state / _km_signature）。
 # 这里曾有一个进程内字典记录"已聚类的文件数"，它在 Worker 重启后归零，
@@ -93,7 +105,8 @@ def embed_batch_size():
     是**死的**——所以调那个开关一直没效果（实测：批 16 比批 8 快 64%）。"""
     try:
         from config import Config
-        return max(1, min(64, int(getattr(Config, 'VLLM_EMBED_MAX_BATCH_SIZE', 8) or 8)))
+        return max(1, min(64, int(os.getenv('SJFX_LP_EMBED_MAX_BATCH_SIZE', '').strip() or
+            getattr(Config, 'VLLM_EMBED_MAX_BATCH_SIZE', 8) or 8)))
     except Exception:
         return 8
 
@@ -116,79 +129,116 @@ def embed_timeout():
     return 60
 
 
-class FallbackEmbeddingClient(object):
-    """主/备两个嵌入端点：主端点失败就换备端点，**不静默**。
-
-    为什么需要它（2026-09-20）：GPU sidecar 带显存守卫——空闲显存低于门槛时它会拒绝
-    加载或返回 503（这是为了不把同卡的 27B 挤到 OOM）。没有回退的话，守卫一触发
-    整条嵌入车道就停摆：文件拿不到向量 → 落进"未能识别内容"桶，那是**质量事故**。
-    有回退则只是慢（CPU 7.0 文件/秒 vs GPU 236），不会停。
-
-    行为：
-      · `embed()` 先试主端点；成功直接返回；
-      · 主端点抛错 → warning 记下原因 → 试备端点；
-      · 备端点也失败 → 抛错（交给上层 classify_failure，长退避、不烧 attempts）；
-      · `model` / `max_batch_size` / `base_url` 透传主端点，调用方（含 embed_many 的
-        切块逻辑）无需感知包装。
-    """
+class FallbackEmbeddingClient:
+    """Use an attested equivalent backup only for transient transport failures."""
 
     def __init__(self, primary, secondary):
-        self.primary = primary
-        self.secondary = secondary
-        self.model = getattr(primary, 'model', '')
-        self.max_batch_size = max(1, int(getattr(primary, 'max_batch_size', 8) or 8))
-        self.base_url = getattr(primary, 'base_url', '')
+        self.primary, self.secondary = primary, secondary
         self.fallbacks = 0
 
+    def __getattr__(self, name):
+        return getattr(self.primary, name)
+
+    @property
+    def identity(self):
+        # Persisted identity always belongs to the configured primary endpoint.
+        return self.primary.identity
+
+    def _legacy_namespace(self, identity):
+        return self.primary._legacy_namespace(identity)
+
+    def _require_equivalent_backup(self):
+        from services.model_contract import LocalModelError
+        if not self.primary._resolved_identity:
+            raise LocalModelError('主向量端点尚未核验真实身份，拒绝未验证的备用切换', code='embedding_incompatible')
+        primary = self.primary._legacy_namespace(self.primary.identity)
+        secondary = self.secondary._legacy_namespace(self.secondary.identity)
+        fields = ('model', 'backend', 'encoding_policy', 'weights_id', 'config_id', 'version', 'max_chars')
+        if (not primary or primary != secondary or primary != self.model or
+                not self.primary.weights_id or
+                any(getattr(self.primary, key) != getattr(self.secondary, key) for key in fields) or
+                not self.primary.dimension or self.primary.dimension != self.secondary.dimension):
+            raise LocalModelError('备用向量端点未通过同权重、编码和维度备案，拒绝混用', code='embedding_incompatible')
+
     def embed(self, texts, retries=None):
+        from services.embedding_backend import validate_vectors
+        from services.model_contract import LocalModelError
+        kwargs = {} if retries is None else {'retries': retries}
         try:
-            if retries is not None:
-                return self.primary.embed(texts, retries=retries)
-            return self.primary.embed(texts)
-        except Exception as exc:
+            return self.primary.embed(texts, **kwargs)
+        except LocalModelError as exc:
+            if not exc.retryable or exc.code not in {'unavailable', 'timeout', 'busy', 'resource_exhausted'}:
+                raise
+            self._require_equivalent_backup()
             self.fallbacks += 1
-            LOGGER.warning('embedding primary failed (%s: %s); falling back to %s',
-                           type(exc).__name__, str(exc)[:120],
-                           getattr(self.secondary, 'base_url', '?'))
-            if retries is not None:
-                return self.secondary.embed(texts, retries=retries)
-            return self.secondary.embed(texts)
+            LOGGER.warning('embedding primary temporarily unavailable [%s]; using verified backup %s',
+                           exc.code, self.secondary.base_url)
+            values = self.secondary.embed(texts, **kwargs)
+            return validate_vectors(values, dimension=self.primary.dimension)
+
+    def with_options(self, **options):
+        return type(self)(self.primary.with_options(**options), self.secondary.with_options(**options))
 
     def health_check(self, timeout=3):
-        for client in (self.primary, self.secondary):
-            try:
-                value = client.health_check(timeout=timeout)
-                if value.get('reachable'):
-                    return value
-            except Exception:
-                continue
-        return {'reachable': False, 'model_available': False, 'models': []}
+        from services.model_contract import LocalModelError
+        primary = self.primary.health_check(timeout=timeout)
+        if primary.get('reachable') and primary.get('model_available'):
+            return primary
+        if primary.get('code') not in {'unavailable', 'timeout', 'busy', 'resource_exhausted'}:
+            return {**primary, 'fallback_verified': False}
+        # Health is a bounded list-only probe, never a 60s identity bootstrap.
+        if not self.primary._resolved_identity or not self.secondary._resolved_identity:
+            return {**primary, 'fallback_verified': False}
+        try:
+            self._require_equivalent_backup()
+        except LocalModelError:
+            return {**primary, 'fallback_verified': False}
+        return {**self.secondary.health_check(timeout=timeout), 'fallback_verified': True,
+                'primary': primary}
+
+
+class _EmbeddingConfigView:
+    """Override one lane without mutating process configuration or other clients."""
+    def __init__(self, config, **overrides):
+        self.config, self.overrides = config, overrides
+
+    def __getattr__(self, name):
+        if name in self.overrides:
+            return self.overrides[name]
+        return getattr(self.config, name)
 
 
 def fallback_base_url():
-    """备端点（通常指向 CPU 嵌入服务）。未配置则返回空串 = 不启用回退，行为与改造前一致。"""
-    try:
-        from config import Config
-        return str(getattr(Config, 'LP_EMBED_FALLBACK_URL', '') or '').strip()
-    except Exception:
-        return ''
+    from config import Config
+    return str(getattr(Config, 'LP_EMBED_FALLBACK_URL', '') or
+               os.getenv('SJFX_LP_EMBED_FALLBACK_URL', '')).strip()
 
 
 def embedding_client():
     from config import Config
-    if not Config.ENABLE_VLLM_EMBEDDINGS:
-        return None
-    from services.vllm import VLLMEmbeddingClient
-    primary = VLLMEmbeddingClient(Config.VLLM_EMBED_BASE_URL, Config.VLLM_EMBED_MODEL,
-                                  timeout=embed_timeout(), max_batch_size=embed_batch_size(),
-                                  max_chars=4096, api_key=Config.VLLM_API_KEY)
+    from services.embedding_backend import create_embedding_client
+    options = dict(lane='large', timeout=embed_timeout(), max_batch_size=embed_batch_size())
+    primary = create_embedding_client(Config, **options)
     backup = fallback_base_url()
-    if not backup or backup.rstrip('/') == str(Config.VLLM_EMBED_BASE_URL or '').rstrip('/'):
+    if primary is None or not backup or backup.rstrip('/') == primary.base_url:
         return primary
-    secondary = VLLMEmbeddingClient(backup, Config.VLLM_EMBED_MODEL,
-                                    timeout=embed_timeout(), max_batch_size=embed_batch_size(),
-                                    max_chars=4096, api_key=Config.VLLM_API_KEY)
+    view = _EmbeddingConfigView(Config, EMBED_BASE_URL=backup,
+        SJFX_LP_EMBED_BASE_URL=backup,
+        SJFX_EMBED_LEGACY_ADOPTION_FILE=str(Path(Config.DATA_DIR) / 'embedding-fallback-adoption.json'))
+    secondary = create_embedding_client(view, **options)
     return FallbackEmbeddingClient(primary, secondary)
+
+
+def _require_space(conn, package_id, client, dimension=0):
+    from services.embedding_backend import client_identity, require_index_identity
+    identity = client_identity(client)
+    models = [r[0] for r in conn.execute('SELECT DISTINCT model FROM large_catalog_groups WHERE package_id=?', (package_id,))]
+    require_index_identity(conn, 'large', package_id, identity, dimension, models)
+    dims = {r[0] for r in conn.execute('SELECT DISTINCT LENGTH(vector)/4 FROM large_catalog_members WHERE package_id=? AND LENGTH(vector)>0', (package_id,))}
+    if len(dims)>1 or (dimension and dims and dims != {dimension}):
+        from services.model_contract import LocalModelError
+        raise LocalModelError('大包向量维度不一致，旧索引已保留，请重建', code='embedding_rebuild_required')
+    return identity
 
 
 def _vector(value):
@@ -334,8 +384,16 @@ def _mark_unusable(store, package_id, path, reason, token):
                 info = local.setdefault('portrait', {})
                 info['catalog_quality'] = reason
                 info['catalog_quality_note'] = QUALITY_NOTE.get(reason, '正文不可用于语义归纳')
+                info['catalog_status'] = 'deferred'
+                info['catalog_error'] = info['catalog_quality_note']
+                info['recognition_status'] = 'needs_review'
                 conn.execute('UPDATE files SET local_summary=? WHERE package_id=? AND path=?',
                              (json.dumps(local, ensure_ascii=False), package_id, path))
+                # A refreshed preview may replace formerly readable material.
+                # Its old vector belongs to the previous revision and must no
+                # longer contribute to a semantic leaf or its centroid.
+                conn.execute('DELETE FROM large_catalog_members WHERE package_id=? AND path=?',
+                             (package_id, path))
             changed = conn.execute(
                 "UPDATE queue SET status='completed',error=NULL,updated_at=?,lease_token=NULL "
                 "WHERE package_id=? AND path=? AND stage='catalog' AND lease_token=?",
@@ -603,6 +661,9 @@ def _group(store, package_id, path, digest, vector, model, calibration=None, lea
     from config import Config
     with store._lock, closing(store._connect()) as conn:
         conn.execute('BEGIN IMMEDIATE')
+        from services.embedding_backend import require_index_identity
+        models = [r[0] for r in conn.execute('SELECT DISTINCT model FROM large_catalog_groups WHERE package_id=?',(package_id,))]
+        require_index_identity(conn,'large',package_id,model,len(vector),models)
         raw = conn.execute('SELECT local_summary FROM files WHERE package_id=? AND path=?', (package_id, path)).fetchone()
         if not raw or json.loads(raw[0]).get('portrait', {}).get('catalog_input_hash') != digest:
             conn.rollback()
@@ -889,6 +950,7 @@ def catalog_mixed_share(store, package_id):
     return mixed, known, (mixed / float(known)) if known else None
 
 
+@_leaf_batch
 def maybe_escalate_k(store, package_id, force=False):
     from services.large_package_catalog_quality import repair_mixed
     return repair_mixed(store,package_id)
@@ -933,6 +995,7 @@ def leaf_growth_cap(store):
     return max(8, int(math.ceil(target * factor)))
 
 
+@_leaf_batch
 def split_oversized(store, package_id, max_size=None, max_rounds=6):
     """Split groups that grew past the configured size into coherent halves.
 
@@ -1054,17 +1117,8 @@ def clean_catalog_content(text, headings=()):
 
 def _legacy_embedding_passage(value):
     global _embedding_tokenizer, _embedding_tokenizer_checked
-    if not _embedding_tokenizer_checked:
-        _embedding_tokenizer_checked = True
-        try:
-            import os
-            from pathlib import Path
-            from config import Config
-            from tokenizers import Tokenizer
-            path=Path(os.getenv('SJFX_EMBED_MODEL_PATH',str(Path(Config.VLLM_MODEL_PATH).parent/'multilingual-e5-small')))/'tokenizer.json'
-            _embedding_tokenizer=Tokenizer.from_file(str(path))
-        except Exception:
-            pass
+    _embedding_tokenizer = selected_embedding_tokenizer()
+    _embedding_tokenizer_checked = True
     text=value['deep_summary'] or value['text'] or ' / '.join(value['fields'])
     text,headings=clean_catalog_content(text,value.get('headings',[]))
     from services.large_package_catalog_naming import content_snippet
@@ -1076,14 +1130,14 @@ def _legacy_embedding_passage(value):
         # Preserve diverse positions under the existing character cap.
         width=320
         windows=[text[:width],text[max(0,len(text)//2-width//2):len(text)//2+width//2],text[-width:]] if len(text)>960 else [text]
-        return 'passage: '+(headings[:140]+'\n'+'\n'.join(dict.fromkeys(windows)))[:1180]
+        return embedding_prefix('passage')+(headings[:140]+'\n'+'\n'.join(dict.fromkeys(windows)))[:1180]
     ids=tokenizer.encode(text,add_special_tokens=False).ids
     title=tokenizer.encode(headings,add_special_tokens=False).ids[:64]
     budget=440-len(title)
     if len(ids)>budget:
         width=budget//3
         ids=ids[:width]+ids[len(ids)//2-width//2:len(ids)//2+width//2]+ids[-width:]
-    return 'passage: '+tokenizer.decode(title+ids,skip_special_tokens=True)
+    return embedding_prefix('passage')+tokenizer.decode(title+ids,skip_special_tokens=True)
 
 
 def embedding_passage(value, policy=1):
@@ -1097,7 +1151,7 @@ def embedding_passage(value, policy=1):
     _legacy_embedding_passage({'text':'', 'deep_summary':'', 'fields':[], 'headings':[]})
     tokenizer = _embedding_tokenizer
     if tokenizer is None:
-        return 'query: '+(' / '.join(headings)+'\n'+'\n'.join(b['text'][:280] for b in chosen))[:1180]
+        return embedding_prefix('query')+(' / '.join(headings)+'\n'+'\n'.join(b['text'][:280] for b in chosen))[:1180]
     ids = tokenizer.encode(' / '.join(headings), add_special_tokens=False).ids[:52]
     budget = 440-len(ids)
     encoded = [tokenizer.encode(b['text'], add_special_tokens=False).ids for b in chosen]
@@ -1106,7 +1160,7 @@ def embedding_passage(value, policy=1):
     rest = budget-sum(shares)
     for i,tokens in enumerate(encoded):
         extra = min(rest,len(tokens)-shares[i]);shares[i]+=extra;rest-=extra
-    return 'query: '+tokenizer.decode(ids+[t for x,n in zip(encoded,shares) for t in x[:n]],skip_special_tokens=True)
+    return embedding_prefix('query')+tokenizer.decode(ids+[t for x,n in zip(encoded,shares) for t in x[:n]],skip_special_tokens=True)
 
 
 def _km_settings():
@@ -1470,6 +1524,7 @@ def solo_group_candidates(package_id, conn, limit=500):
         return []
 
 
+@_leaf_batch
 def assign_solo_groups(store, package_id, limit=500):
     """把候选各自落成一个单文件条目，交给现有命名链路（queue_groups→命名）起名。
 
@@ -1537,6 +1592,7 @@ def maintain_ungrouped(store, package_ids, limit=500):
     return out
 
 
+@_leaf_batch
 def kmeans_recluster(store, package_id, force=False):
     """把已落库的全部向量一次性用 k-means 重新分组。
 
@@ -1836,8 +1892,9 @@ def _km_model_name(store, package_id):
     except Exception:
         pass
     try:
-        from config import Config
-        return str(getattr(Config, 'VLLM_EMBED_MODEL', 'multilingual-e5-small'))
+        from services.embedding_backend import client_identity
+        client = embedding_client()
+        return client_identity(client) if client else ''
     except Exception:
         return 'multilingual-e5-small'
 
@@ -1891,8 +1948,9 @@ def embed_many(client, texts, factory=None):
         # Fall back once, before dispatch; never share its internal semaphore.
         if made is None or any(made is other for other in clients):
             return checked_embed(client, values)
-        expected_model = getattr(client, 'model', None)
-        actual_model = getattr(made, 'model', None)
+        from services.embedding_backend import client_identity
+        expected_model = client_identity(client)
+        actual_model = client_identity(made)
         if expected_model is not None and actual_model != expected_model:
             return checked_embed(client, values)
         clients.append(made)
@@ -1929,6 +1987,7 @@ def embed_concurrency():
         return 1
 
 
+@_leaf_batch
 def embed_batch(store, package_id, client=None, cancelled=lambda: False):
     if cancelled():
         return 0
@@ -1971,11 +2030,14 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
                         package_id, path, reason)
             _mark_unusable(store, package_id, path, reason, leases.get(path))
     rows = usable_rows
-    client = client or embedding_client()
     try:
+        client = client or embedding_client()
         if client is None:
             raise RuntimeError('本地语义向量模型暂不可用')
-        model = client.model
+        from services.embedding_backend import client_identity, validate_vectors
+        model = client_identity(client)
+        with closing(store._connect()) as conn:
+            _require_space(conn, package_id, client)
         vectors, pending, cache_keys = {}, {}, {}
         with closing(store._connect()) as conn:
             for path, value, digest in rows:
@@ -1995,12 +2057,14 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
             encoded = embed_many(client, [pending[k] for k in keys], factory=embedding_client)
             if len(encoded) != len(keys):
                 raise ValueError('语义向量数量不一致')
+            encoded = validate_vectors(encoded, len(keys), len(next(iter(vectors.values()))) if vectors else getattr(client, 'dimension', 0))
             fresh = {key:_vector(vector) for key,vector in zip(keys,encoded)}
             with closing(store._connect()) as conn:
                 # _connect uses autocommit; an explicit transaction amortizes
                 # WAL work across the batch without changing any cache key.
                 conn.execute('BEGIN IMMEDIATE')
                 try:
+                    _require_space(conn, package_id, client, len(next(iter(fresh.values()))))
                     conn.executemany('INSERT OR REPLACE INTO large_catalog_embeddings VALUES(?,?,?)', [(model,k,fresh[k].tobytes()) for k in keys])
                     conn.commit()
                 except Exception:
@@ -2018,11 +2082,13 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
             # 真正的分组由 kmeans_recluster 在"所有有素材的文件都有向量之后"
             # 一次性完成（由 Worker 的 _ensure_km_finalized 触发）。
             # 这里绝不主动触发聚类：批次中途聚类正是目录失真的根因。
+            validate_vectors([v.tolist() for v in vectors.values()], dimension=getattr(client, 'dimension', 0))
             now = time.time()
             placeholder = 'km-pending-%s' % hashlib.sha256(package_id.encode()).hexdigest()[:8]
             try:
                 with store._lock, closing(store._connect()) as conn:
                     conn.execute('BEGIN IMMEDIATE')
+                    _require_space(conn, package_id, client, len(next(iter(vectors.values()))) if vectors else 0)
                     # 沿用已有分组：深度解析改写正文后会重新入队 catalog，
                     # 若这里一律写占位分组，这些文件会被从算好的分组里拽出来。
                     #
@@ -2088,6 +2154,7 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
     return len(claimed)
 
 
+@_leaf_batch
 def name_batch(store, package_id, cancelled=lambda: False):
     if cancelled():
         return 0

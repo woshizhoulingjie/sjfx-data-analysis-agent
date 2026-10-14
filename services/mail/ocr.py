@@ -10,8 +10,9 @@ import math
 import os
 from pathlib import Path
 import subprocess
-import tempfile
 import time
+
+from services.parse_temp import temporary_parse_directory
 
 
 _MODELS = ("ch_PP-OCRv5_det_mobile.onnx", "ch_PP-OCRv5_rec_mobile.onnx",
@@ -194,7 +195,7 @@ def extract_result(path, max_chars, deadline, *, language="auto"):
             total_pages = len(pdf)
         else:
             total_pages = 1
-        with tempfile.TemporaryDirectory(prefix="mail-local-ocr-") as folder:
+        with temporary_parse_directory(prefix="mail-local-ocr-") as folder:
             for index in range(total_pages):
                 if time.monotonic() >= deadline - .1:
                     traversal_complete = False

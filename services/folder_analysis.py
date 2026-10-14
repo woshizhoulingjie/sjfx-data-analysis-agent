@@ -17,6 +17,9 @@ CHINESE_CONCLUSION_RULE = (
     "原文专有名词、缩写、CVE、数字和文件路径可以保留原文。"
 )
 
+# Internal cache identity, separate from the public summary JSON template.
+NODE_SUMMARY_INPUT_VERSION = "node-members-research-sections/1.0"
+
 
 def _catalog_evidence_item(evidence, source_path=None):
     """Normalize an evidence card while retaining exact source locators."""
@@ -371,6 +374,11 @@ def _file_summary_evidence(context, max_items):
             }.get(conclusion_status, conclusion_status)
             for support in conclusion.get("supports") or []:
                 if not isinstance(support, dict):
+                    continue
+                if context.get("member_paths") and not _evidence_in_member_scope(
+                    dict(support, source_path=support.get("source_path") or path),
+                    context["member_paths"],
+                ):
                     continue
                 text = " ".join(str(support.get("text") or support.get("supporting_quote") or "").split())
                 if len(text) < 6:
@@ -834,6 +842,19 @@ def _bounded_node_inputs(file_summaries, clusters, catalog, byte_budget=22000):
                 "summary":brief(f.get("summary") or f.get("core_summary"),500),
                 "key_facts":[x for x in f.get("key_facts") or [] if len(str(x))<=220][:2],
                 "file_conclusions":[x for x in f.get("file_conclusions") or [] if len(str(x))<=400][:2]}
+        for field in ("methodology", "arguments", "limitations", "uncertainties"):
+            if f.get(field):
+                item[field] = [brief(v, 180) for v in f[field][:2]]
+        if f.get("research_context"):
+            item["research_context"] = f["research_context"]
+            constraints = [str(p.get("text") or "")
+                           for role in ("limitation", "condition")
+                           for p in f["research_context"].get(role) or []
+                           if isinstance(p, dict) and p.get("text")]
+            if constraints:
+                item["limitations"] = list(dict.fromkeys(
+                    list(item.get("limitations") or []) + constraints,
+                ))[:6]
         # 分层汇总时携带该批次的文件清单，避免节点摘要丢失文件身份。
         # 普通文件摘要没有这个字段，因此输出与改动前逐字节一致。
         if f.get("batch_paths"):
@@ -863,6 +884,8 @@ def _bounded_node_inputs(file_summaries, clusters, catalog, byte_budget=22000):
             f["summary"]=brief(f["summary"],160)
             f["key_facts"]=f["key_facts"][:1]
             f["file_conclusions"]=[]
+            # Keep the exact limitations/conditions while reducing other prose.
+            f.pop("research_context", None)
     if size()>byte_budget:
         raise ValueError("节点文件摘要超过安全上下文预算，请拆分节点后汇总")
     return summaries, compact_clusters, evidence
@@ -923,6 +946,22 @@ def _local_batch_digest(index, total, rows):
     summary += "；".join(titles[:6]) if titles else "；".join(paths[:6])
     if facts:
         summary += " 关键信息：" + "；".join(facts[:4])
+    research_context = {}
+    for row in rows:
+        for role, passages in (row.get("research_context") or {}).items():
+            for passage in passages:
+                if not isinstance(passage, dict) or not passage.get("text"):
+                    continue
+                # Each selected passage keeps its member identity and original
+                # evidence locator through the map/reduce path.
+                research_context.setdefault(role, []).append(dict(
+                    passage, source_path=passage.get("source_path") or row.get("path"),
+                ))
+    for role, passages in research_context.items():
+        # Preserve a bounded spread, including the last member, instead of
+        # growing the reduce prompt with every member's raw research excerpts.
+        if len(passages) > 3:
+            research_context[role] = [passages[index] for index in (0, len(passages) // 2, len(passages) - 1)]
     return {
         "path": "批次 {}/{}".format(index + 1, total),
         "title": "批次摘要",
@@ -931,6 +970,10 @@ def _local_batch_digest(index, total, rows):
         "file_conclusions": [],
         "batch_paths": paths,
         "batch_file_count": len(rows),
+        "methodology": list(dict.fromkeys(str(v) for row in rows for v in row.get("methodology") or []))[:3],
+        "uncertainties": list(dict.fromkeys(str(v) for row in rows for v in row.get("uncertainties") or []))[:3],
+        "limitations": list(dict.fromkeys(str(v) for row in rows for v in row.get("limitations") or []))[:3],
+        "research_context": research_context,
         "batch_digest_source": "local",
     }
 
@@ -950,6 +993,10 @@ def _summarize_node_batch(llm, index, total, rows):
             "title": str(item.get("title") or "")[:120],
             "summary": str(item.get("summary") or item.get("core_summary") or "")[:400],
             "key_facts": [str(value)[:200] for value in (item.get("key_facts") or [])[:2]],
+            "methodology": [str(value)[:180] for value in (item.get("methodology") or [])[:2]],
+            "uncertainties": [str(value)[:180] for value in (item.get("uncertainties") or [])[:2]],
+            "limitations": [str(value)[:180] for value in (item.get("limitations") or [])[:2]],
+            "research_context": item.get("research_context") or {},
         }
         for item in rows
     ]
@@ -1011,7 +1058,8 @@ def _node_summary_inputs(llm, file_summaries, clusters, catalog):
 
     返回值除三元组外还包括一个 batching 元信息字典，供结果标注使用。
     """
-    meta = {"strategy": "single_request", "batches": 0, "files": len(file_summaries or [])}
+    meta = {"strategy": "single_request", "batches": 0, "files": len(file_summaries or []),
+            "model_input_files": len(file_summaries or [])}
 
     # 第 1 层：历史行为，逐字节不变。
     try:
@@ -1032,6 +1080,7 @@ def _node_summary_inputs(llm, file_summaries, clusters, catalog):
             "batches": len(batches),
             "batch_files": NODE_SUMMARY_BATCH_FILES,
             "files": len(file_summaries or []),
+            "model_input_files": len(file_summaries or []),
             "model_batches": sum(1 for item in digests if item.get("batch_digest_source") == "model"),
             "degraded_batches": sum(1 for item in digests if item.get("batch_digest_error")),
             "batch_errors": [
@@ -1056,6 +1105,7 @@ def _node_summary_inputs(llm, file_summaries, clusters, catalog):
                 inputs = _bounded_node_inputs(remaining, clusters, catalog)
                 meta["strategy"] = "hierarchical_trimmed"
                 meta["retained_batches"] = len(remaining)
+                meta["model_input_files"] = sum(item.get("batch_file_count", 0) for item in remaining)
                 return inputs[0], inputs[1], inputs[2], meta
             except Exception:
                 continue
@@ -1065,9 +1115,11 @@ def _node_summary_inputs(llm, file_summaries, clusters, catalog):
     try:
         inputs = _bounded_node_inputs([], clusters, catalog)
         meta["strategy"] = "evidence_only"
+        meta["model_input_files"] = 0
         return inputs[0], inputs[1], inputs[2], meta
     except Exception:
         meta["strategy"] = "empty"
+        meta["model_input_files"] = 0
         return [], [], [], meta
 
 
@@ -1214,6 +1266,7 @@ def analyze_folder(
 4. 发现与推论必须分开。
 5. 摘要重点说明这个节点实际包含的内容，而不是只罗列文件类型。
 6. claims 中的每个结论必须引用 evidence_ids；没有有效证据时标记证据不足，不得编造。
+7. 综合本节点共同问题、方法差异、结果条件及显式局限；分歧先核对口径，保留数字、单位、否定及未验证条件。研究方向只针对本节点成员，不引入或覆盖全包首选，保持上述输出字段与字数。
 """.format(
         path=node_path,
 
@@ -1329,6 +1382,10 @@ def analyze_folder(
         summary["file_summaries_complete"] = bool(context.get("file_summaries_complete", False))
         summary["deep_file_summaries_complete"] = bool(context.get("deep_file_summaries_complete", False))
         summary["node_summary_batching"] = summary_batching
+        if summary_batching.get("model_input_files", len(file_summaries)) < len(file_summaries):
+            summary["limitations"].append("节点汇总达到输入预算，仅 {} / {} 份成员摘要进入最终模型综合，其余成员不计为模型已阅读。".format(
+                summary_batching.get("model_input_files", 0), len(file_summaries),
+            ))
 
         return (
             summary,

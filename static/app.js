@@ -89,12 +89,17 @@ function normalizeApiToken(value) {
 
 const SJFXAuth = (() => {
   let pendingTokenRequest = null;
+  let memoryToken = '';
 
   function storedToken() {
-    const raw = window.sessionStorage.getItem(SJFX_API_TOKEN_KEY) || '';
-    const token = normalizeApiToken(raw);
-    if (raw && !token) window.sessionStorage.removeItem(SJFX_API_TOKEN_KEY);
-    return token;
+    try {
+      const raw = window.sessionStorage.getItem(SJFX_API_TOKEN_KEY) || '';
+      const token = normalizeApiToken(raw);
+      if (raw && !token) window.sessionStorage.removeItem(SJFX_API_TOKEN_KEY);
+      return token || memoryToken;
+    } catch (_) {
+      return memoryToken;
+    }
   }
 
   function authError() {
@@ -105,7 +110,8 @@ const SJFXAuth = (() => {
   }
 
   function clearToken() {
-    window.sessionStorage.removeItem(SJFX_API_TOKEN_KEY);
+    memoryToken = '';
+    try { window.sessionStorage.removeItem(SJFX_API_TOKEN_KEY); } catch (_) {}
   }
 
   function tokenDialog() {
@@ -131,7 +137,11 @@ const SJFXAuth = (() => {
         overlay.remove();
         pendingTokenRequest = null;
         const token = normalizeApiToken(value);
-        if (token) { window.sessionStorage.setItem(SJFX_API_TOKEN_KEY, token); resolve(token); }
+        if (token) {
+          memoryToken = token;
+          try { window.sessionStorage.setItem(SJFX_API_TOKEN_KEY, token); } catch (_) {}
+          resolve(token);
+        }
         else reject(authError());
       };
       overlay.addEventListener('click', (event) => {
@@ -156,12 +166,40 @@ const SJFXAuth = (() => {
 
   async function request(url, options = {}) {
     const headers = { ...(options.headers || {}) };
+    const { timeoutMs, ...fetchOptions } = options;
+    const timeout = timeoutMs == null
+      ? (/^(GET|HEAD)$/i.test(options.method || 'GET') ? 30000 : 120000)
+      : Number(timeoutMs);
     let retried = false;
     while (true) {
       const token = storedToken();
       if (token) headers['X-SJFX-Token'] = token;
       else delete headers['X-SJFX-Token'];
-      const response = await window.fetch(url, { ...options, headers });
+      const controller = new AbortController();
+      const callerSignal = options.signal;
+      const cancel = () => controller.abort();
+      if (callerSignal) {
+        if (callerSignal.aborted) cancel();
+        else callerSignal.addEventListener('abort', cancel, { once: true });
+      }
+      let timedOut = false;
+      const timer = timeout > 0 ? window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeout) : null;
+      let response;
+      try {
+        response = await window.fetch(url, { ...fetchOptions, headers, signal: controller.signal });
+      } catch (error) {
+        if (!timedOut) throw error;
+        const timeoutError = new Error('请求超时，请重试；已提交的后台任务可在任务中心查看。');
+        timeoutError.status = 408;
+        timeoutError.transient = true;
+        throw timeoutError;
+      } finally {
+        if (timer !== null) window.clearTimeout(timer);
+        if (callerSignal) callerSignal.removeEventListener('abort', cancel);
+      }
       if (response.status !== 401 || retried) return response;
       retried = true;
       clearToken();
@@ -3223,6 +3261,10 @@ function bindDataSourceControls() {
 // filter selection here means a user leaving a large package lands directly
 // in the matching history list instead of having to rediscover the tab.
 window.SJFXDataSources = {
+  async syncWorkspace(scanId, isCurrent = () => true) {
+    detachUiFromCurrentWork();
+    return refreshScan(scanId, isCurrent);
+  },
   open(kind = 'standard') {
     detachUiFromCurrentWork();
     state.dataSourceKind = kind === 'large' ? 'large' : 'standard';
@@ -3284,7 +3326,7 @@ function loadTaskRegistry() {
       }
     });
   } catch (_) {
-    window.localStorage.removeItem(TASK_REGISTRY_KEY);
+    try { window.localStorage.removeItem(TASK_REGISTRY_KEY); } catch (_) {}
   }
 }
 
@@ -3600,7 +3642,24 @@ function scanJobCandidate(jobs) {
 }
 
 
+function prepareUploadedImport() {
+  const params = new URLSearchParams(window.location.search);
+  const path = params.get('upload_path');
+  if (!path || !$('rootPath')) return false;
+  // Only prefill the user's next action; the scan endpoint authorizes it.
+  detachUiFromCurrentWork();
+  $('rootPath').value = path;
+  window.SJFXShell?.activate('packages');
+  setPackageStage('import');
+  $('rootPath').focus();
+  params.delete('upload_path');
+  const search = params.toString();
+  window.history.replaceState(null, '', window.location.pathname + (search ? '?' + search : '') + window.location.hash);
+  return true;
+}
+
 async function restoreWorkspace() {
+  if (prepareUploadedImport()) return;
   let storedScanId = '';
   try {
     storedScanId = window.localStorage.getItem(CURRENT_SCAN_KEY) || '';
@@ -5279,10 +5338,13 @@ async function initializeApp() {
   $('refreshDeepResultsBtn')?.addEventListener('click', (event) => {
     runPackageProcessingAction('refresh-deep-results', event.currentTarget);
   });
-  await refreshModelStatus();
-  await startTaskCenterRefresh();
-  await refreshDataSources();
-  await restoreWorkspace();
+  // Each panel can become usable without waiting for unrelated status reads.
+  await Promise.allSettled([
+    refreshModelStatus(),
+    startTaskCenterRefresh(),
+    refreshDataSources(),
+    restoreWorkspace().catch((error) => toast(error.message || '工作区恢复失败', true)),
+  ]);
 }
 
 initializeApp().catch((error) => toast(error.message || '工作区恢复失败', true));

@@ -24,7 +24,7 @@ class _Response:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def read(self):
+    def read(self, size=-1):
         return json.dumps(self.payload).encode("utf-8")
 
 
@@ -80,7 +80,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             "done": True,
         })
         with patch(
-            "services.ollama.urllib.request.urlopen",
+            "services.ollama.open_local_request",
             side_effect=[URLError("temporary restart"), response],
         ) as urlopen:
             result = client._request(payload, retries=1, timeout=1)
@@ -103,7 +103,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertFalse(result["coverage"]["complete"])
         self.assertEqual(result["confidence"], "中")
 
-    def test_windows_hard_stop_targets_the_complete_process_tree(self):
+    def test_worker_hard_stop_delegates_owned_tree_and_grace_to_lifecycle_helper(self):
         import worker
 
         class FakeProcess:
@@ -121,19 +121,14 @@ class RuntimeSafetyTests(unittest.TestCase):
             def terminate(self):
                 self.running = False
 
-        class Completed:
-            returncode = 0
-
         process = FakeProcess()
-        with patch.object(worker.os, "name", "nt"), patch(
-            "worker.subprocess.run", return_value=Completed()
-        ) as taskkill:
-            worker._stop_process(process)
-        command = taskkill.call_args[0][0]
-        self.assertEqual(command[:2], ["taskkill", "/PID"])
-        self.assertIn("/T", command)
-        self.assertIn("/F", command)
-        self.assertFalse(process.is_alive())
+        owner = object()
+        with patch("worker.terminate_process_tree") as terminate_tree:
+            worker._stop_process(process, owner)
+        terminate_tree.assert_called_once_with(
+            process, worker.Config.WORKER_TERMINATE_GRACE_SECONDS,
+            job=owner, private_group=True,
+        )
 
     def test_background_backfill_pauses_under_resource_pressure_only(self):
         import worker

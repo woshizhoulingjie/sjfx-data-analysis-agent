@@ -71,15 +71,27 @@ class ThemeCoverageTests(unittest.TestCase):
                           "result,status,updated_at,member_count,content_revision) "
                           "VALUES(?,?,?,?,?,?,?,?,?,?)",
                           (self.pid, gid, 'm', vec, 'rep.pdf', '{}', 'named', now, 4, 1))
+                # A visible leaf must own real files, not only a cached count.
+                revision = self._add_members(c, gid, vec, 4, now)
                 c.execute("INSERT INTO lp_catalog_labels(package_id,group_id,revision,version,name,"
                           "description,evidence,model,digest,needs_review,locked,updated) "
                           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                          (self.pid, gid, 1, 1, '叶组-%s' % gid[-5:], '说明', '[]', 'm',
+                          (self.pid, gid, revision, 1, '叶组-%s' % gid[-5:], '说明', '[]', 'm',
                            'd-' + gid, 0, 0, now))
             c.commit()
         self._flag = patch.object(Config, 'LP_TOPIC_MERGE', True)
         self._flag.start()
         self._saved = topics.name_topics
+
+    def _add_members(self, connection, gid, vector, count, now):
+        for index in range(count):
+            path = '%s/%d.txt' % (gid, index)
+            connection.execute('INSERT INTO files(package_id,path,name,updated_at) VALUES(?,?,?,?)',
+                               (self.pid, path, '%d.txt' % index, now))
+            connection.execute('INSERT INTO large_catalog_members(package_id,path,group_id,input_hash,vector) '
+                               'VALUES(?,?,?,?,?)', (self.pid, path, gid, path, vector))
+        return connection.execute('SELECT content_revision FROM large_catalog_groups '
+                                  'WHERE package_id=? AND id=?', (self.pid, gid)).fetchone()[0]
 
     def tearDown(self):
         topics.name_topics = self._saved
@@ -160,10 +172,11 @@ class ThemeCoverageTests(unittest.TestCase):
                       "result,status,updated_at,member_count,content_revision) "
                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
                       (self.pid, gid, 'm', b'', 'thin.pdf', '{}', 'named', now, 1, 1))
+            revision = self._add_members(c, gid, b'', 1, now)
             c.execute("INSERT INTO lp_catalog_labels(package_id,group_id,revision,version,name,"
                       "description,evidence,model,digest,needs_review,locked,updated) "
                       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                      (self.pid, gid, 1, 1, '正文过少的通知', '说明', '[]', 'm', 'thin', 0, 0, now))
+                      (self.pid, gid, revision, 1, '正文过少的通知', '说明', '[]', 'm', 'thin', 0, 0, now))
             c.commit()
         topics.name_topics = _name_every_bucket
         tree.build(self.store, self.pid, {'id': 'r1', 'deadline': time.time() + 3600},

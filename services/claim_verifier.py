@@ -281,6 +281,23 @@ class ClaimVerifier:
         citations = list(turn_result.get("citations") or [])
         if aq.enabled() and "model_citations" in turn_result:
             citations = list(turn_result.get("model_citations") or [])
+            manifest = turn_result.get("input_manifest") or {}
+            if (manifest.get("answer_mode") == "evidence_extract"
+                    and manifest.get("model_request_sent") is False
+                    and manifest.get("actual_citation_indexes") == []
+                    and turn_result.get("model_citations") == []):
+                # An extract produced before any model request has its own
+                # explicit source set. Empty model input on any other path
+                # must never grant access to unsent display evidence.
+                fallback_indexes = {index for index in
+                    (manifest.get("fallback_citation_indexes") or [])
+                    if type(index) is int and index > 0}
+                citations = [item for item in (turn_result.get("citations") or [])
+                    if isinstance(item, Mapping)
+                    and type(item.get("citation_index")) is int
+                    and item["citation_index"] in fallback_indexes
+                    and aq.source_kind(item) != "preview"
+                    and evidence_quality(_citation_item(item)).get("eligible")]
         by_index = {
             int(item.get("citation_index") or index): item
             for index, item in enumerate(citations, 1)
@@ -543,12 +560,12 @@ class ClaimVerifier:
             or coverage.get("total_files")
             or 0
         )
-        inspected_scope_files = int(
-            batch_summary.get("inspected_files")
-            or coverage.get("inspected_files")
-            or coverage.get("retrieved_files")
-            or 0
-        )
+        inspected_scope_files = batch_summary.get("inspected_files")
+        if inspected_scope_files is None:
+            inspected_scope_files = coverage.get("inspected_files")
+        if inspected_scope_files is None:
+            inspected_scope_files = coverage.get("retrieved_files")
+        inspected_scope_files = int(inspected_scope_files or 0)
         scope_incomplete = bool(
             broad_scope_modes.intersection(plan.get("modes") or [])
             and scope_files
@@ -618,7 +635,7 @@ class ClaimVerifier:
         candidate_files = (
             batch_summary.get("candidate_files") or coverage.get("candidate_files") or 0
         )
-        inspected_files = batch_summary.get("inspected_files") or candidate_files
+        inspected_files = inspected_scope_files
         unparsed_files = batch_summary.get("unparsed_files")
         if (
             unparsed_files is None
@@ -648,10 +665,8 @@ class ClaimVerifier:
             "query_coverage": query_coverage,
             "coverage_basis": coverage.get("coverage_basis"),
             "scope_files": scope_files or None,
-            "scope_inspection_coverage": coverage.get(
-                "scope_inspection_coverage"
-            ) if coverage.get("scope_inspection_coverage") is not None else (
-                round(inspected_scope_files / float(scope_files), 6)
+            "scope_inspection_coverage": (
+                inspected_scope_files / float(scope_files)
                 if scope_files else None
             ),
             "candidate_deep_coverage": coverage.get("candidate_deep_coverage"),

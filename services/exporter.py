@@ -26,15 +26,63 @@ EXPORT_IGNORED_DIRS = {
 }
 EXPORT_IGNORED_FILES = {".env", "agent.db", "agent.db-shm", "agent.db-wal"}
 EXPORT_SENSITIVE_EXTENSIONS = {".key", ".pem", ".p12", ".pfx", ".keystore"}
+EXPORT_METADATA_NAMES = {
+    "节点摘要.json", "整编任务说明.json", "源文件SHA-256清单.json", "结论-证据链.json",
+    "统一文档索引.json", "去重与聚类清单.json", "检索证据.json", "解析覆盖率清单.json", "导出清单.json",
+}
 
 
 def _should_ignore_export_file(name):
+    from services.scanner import is_sensitive_file
+
     lower_name = str(name or "").casefold()
     return (
         lower_name in EXPORT_IGNORED_FILES
         or lower_name.startswith("~$")
         or Path(lower_name).suffix in EXPORT_SENSITIVE_EXTENSIONS
+        or is_sensitive_file(lower_name)
     )
+
+
+def _excluded_export_source(relative, node):
+    """Apply the same handoff policy to physical files and archive members."""
+    names = [relative]
+    if node.get("source_kind") == "archive_member":
+        from services.large_archive_members import member_node
+
+        member = member_node(node)
+        names = [member["container_path"], member["member_name"]]
+    return bool(node.get("sensitive")) or any(
+        any(part.casefold() in EXPORT_IGNORED_DIRS for part in PurePosixPath(name).parts[:-1])
+        or _should_ignore_export_file(PurePosixPath(name).name)
+        for name in names
+    )
+
+
+def _export_archive_name(relative, node):
+    if node.get("source_kind") == "archive_member":
+        relative = node["container_path"] + ".members/" + node["member_name"]
+    return str(PurePosixPath(relative))
+
+
+def _check_export_name_collisions(names):
+    """Reject duplicate/file-directory names, including generated metadata."""
+    files = {name.casefold() for name in EXPORT_METADATA_NAMES}
+    directories = set()
+    for name in names:
+        key = name.casefold()
+        parts = PurePosixPath(key).parts
+        if (not parts or PurePosixPath(key).is_absolute()
+                or any(part in {".", ".."} or part.endswith((".", " "))
+                       or re.search(r'[<>:"\\|?*\x00-\x1f]', part)
+                       or re.match(r'^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)', part)
+                       for part in parts)):
+            raise ValueError("导出文件名不安全：{}".format(name))
+        parents = {"/".join(parts[:index]) for index in range(1, len(parts))}
+        if key in files or key in directories or parents & files:
+            raise ValueError("导出文件名冲突，不能安全写入ZIP：{}".format(name))
+        files.add(key)
+        directories.update(parents)
 
 
 def xml_safe_text(value):
@@ -124,10 +172,7 @@ def _collect_inventoried_files(root, selected, inventory_metadata):
         if selected_key != "." and relative != selected_key and not relative.startswith(selected_prefix):
             continue
         candidate = root.joinpath(*parts)
-        ignored = (
-            any(part.casefold() in EXPORT_IGNORED_DIRS for part in parts[:-1])
-            or _should_ignore_export_file(parts[-1])
-        )
+        ignored = _excluded_export_source(relative, node)
         if ignored:
             excluded.append(candidate)
         else:
@@ -159,7 +204,17 @@ def _inventory_node_for_source(root, path, inventory_metadata=None):
     relative = str(relative_path).replace("\\", "/")
     node = dict((inventory_metadata or {}).get(relative) or {})
     if node:
+        if node.get("path") not in {None, relative}:
+            raise ValueError("导出清点记录与所选来源路径不一致")
+        if node.get("source_kind") == "archive_member":
+            from services.large_archive_members import member_node
+
+            node = member_node(node)
+        elif "::" in relative:
+            raise ValueError("归档成员缺少可信来源身份，请重新盘点")
         return relative, node
+    if "::" in relative:
+        raise ValueError("归档成员缺少可信来源身份，请重新盘点")
     # Compatibility for direct library callers: create a one-shot inventory
     # record with lstat, then the handle-level opener below verifies it again.
     stat = path.lstat()
@@ -181,6 +236,18 @@ def _open_verified_export_source(root, path, inventory_metadata=None):
     from services.package_analysis import _open_inventory_source
 
     relative, node = _inventory_node_for_source(root, path, inventory_metadata)
+    if node.get("source_kind") == "archive_member":
+        from config import Config
+        from services.large_archive_members import member_snapshot
+
+        Config.PARSE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        required = int(node["size"]) + int(Config.PARSE_TEMP_DISK_RESERVE_BYTES or 0)
+        if shutil.disk_usage(str(Config.PARSE_TEMP_DIR)).free < required:
+            raise ValueError("导出归档成员的临时磁盘空间不足")
+        with member_snapshot(root, node) as snapshot:
+            with snapshot.open("rb") as stream:
+                yield relative, node, os.fstat(stream.fileno()), stream
+        return
     descriptor, opened = _open_inventory_source(root, node)
     try:
         stream = os.fdopen(descriptor, "rb", closefd=True)
@@ -328,9 +395,13 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
             ):
                 excluded_files.append(candidate)
             else:
-                # Handoff packages preserve every selected source file. Parsing
-                # support controls analysis coverage, never raw-material export.
-                files.append(candidate)
+                # Parsing support never limits raw-material export. Handoff
+                # exclusions apply to both physical files and archive members.
+                relative, node = _inventory_node_for_source(root, candidate, inventory_metadata)
+                if _excluded_export_source(relative, node):
+                    excluded_files.append(candidate)
+                else:
+                    files.append(candidate)
         selected_documents = [item for item in documents if item.get("path") in set(virtual_paths)]
         export_label = node_name or "主题节点"
     else:
@@ -351,22 +422,41 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
             prefix = selected_rel.rstrip("/") + "/"
             selected_documents = [item for item in documents if item.get("path") == selected_rel or item.get("path", "").startswith(prefix)]
         export_label = selected.name
+    allowed_document_paths = {str(path.relative_to(root)).replace("\\", "/") for path in files}
+    selected_documents = [item for item in selected_documents if item.get("path") in allowed_document_paths]
     selected_file_count = len(files)
     # Cheap metadata and capacity gates must run before any SHA-256 pass.  This
     # prevents a doomed 10 GiB export from reading the NAS twice merely to
     # report that it is too large or the destination is full.
     source_stats = {}
+    archive_name_list = []
     try:
         for path in files:
-            with _open_verified_export_source(root, path, inventory_metadata) as (relative, node, stat, _stream):
+            relative, node = _inventory_node_for_source(root, path, inventory_metadata)
+            archive_name_list.append(_export_archive_name(relative, node))
+            if node.get("source_kind") == "archive_member":
+                from services.large_archive_members import source_identity
+                from services.package_analysis import _validate_logical_member_size
+
+                source_identity(root, node)
+                _validate_logical_member_size(node, node["size"], node["container_size"],
+                                              node["source_metadata"].get("compressed_size"))
                 source_stats[path] = {
-                    "relative": relative,
-                    "node": node,
-                    "size": int(stat.st_size),
-                    "mtime_ns": int(stat.st_mtime_ns),
+                    "relative": relative, "node": node, "size": int(node["size"]),
+                    "mtime_ns": int(node["modified_at_ns"]),
                 }
+            else:
+                with _open_verified_export_source(root, path, inventory_metadata) as (relative, node, stat, _stream):
+                    source_stats[path] = {
+                        "relative": relative, "node": node, "size": int(stat.st_size),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                    }
     except (OSError, PermissionError) as exc:
         raise ValueError("导出前无法读取源文件：{}".format(exc))
+    # Keep the list until after collision validation: Windows Path keys compare
+    # case-insensitively, while a ZIP can contain two distinct member spellings.
+    _check_export_name_collisions(archive_name_list)
+    archive_names = dict(zip(files, archive_name_list))
     total_size = sum(item["size"] for item in source_stats.values())
     if total_size > max_bytes and not _allow_segmented:
         raise ValueError("单个分卷内容超过 {:.2f} GB 上限".format(max_bytes / 1073741824))
@@ -537,10 +627,12 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 raise ValueError("源文件总大小超过导出上限，已停止写入")
             digest = hashlib.sha256()
             copied = 0
-            with _open_verified_export_source(root, path, inventory_metadata) as (relative, _node, before, source):
-                if int(before.st_size) != expected_size or int(before.st_mtime_ns) != expected_stat["mtime_ns"]:
+            with _open_verified_export_source(root, path, inventory_metadata) as (relative, node, before, source):
+                source_mtime = (int(node["modified_at_ns"]) if node.get("source_kind") == "archive_member"
+                                else int(before.st_mtime_ns))
+                if int(before.st_size) != expected_size or source_mtime != expected_stat["mtime_ns"]:
                     raise ValueError("源文件在导出过程中发生变化：{}".format(path.name))
-                info = zipfile.ZipInfo(relative, time.localtime(before.st_mtime)[:6])
+                info = zipfile.ZipInfo(archive_names[path], time.localtime(source_mtime / 1_000_000_000)[:6])
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = (int(before.st_mode) & 0xFFFF) << 16
                 with archive.open(info, "w", force_zip64=True) as target:
@@ -560,7 +652,8 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
             if (
                 copied != expected_size
                 or int(after.st_size) != expected_size
-                or int(after.st_mtime_ns) != expected_stat["mtime_ns"]
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                   != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
             ):
                 raise ValueError("源文件在导出过程中发生变化：{}".format(path.name))
             expected_sha256 = expected_hashes.get(path)
@@ -568,7 +661,8 @@ def export_node(root, selected, summary, output_dir, max_bytes, analysis=None, d
                 raise ValueError("源文件内容与分析/去重摘要不一致：{}".format(path.name))
             written_size += copied
             source_manifest.append({
-                "path": relative, "size": copied, "sha256": actual_sha256,
+                "path": relative, "archive_path": archive_names[path],
+                "size": copied, "sha256": actual_sha256,
                 "modified_at_ns": expected_stat["mtime_ns"],
             })
             if progress_callback:
@@ -690,6 +784,12 @@ def create_report_docx(report, scan, output_path):
     except ImportError:
         raise RuntimeError("未安装 python-docx，无法生成 Word 报告")
 
+    ordinary_research = bool(report.get("research_version")) and not any(
+        str(value or "").lower() in {"large", "large_package"}
+        for value in (report.get("kind"), report.get("package_type"), report.get("source_kind"),
+                      scan.get("kind"), scan.get("package_type"), scan.get("source_kind"))
+    ) and not str(scan.get("scan_id") or scan.get("id") or "").startswith("lp-")
+
     def add_paragraph(text="", style=None):
         return doc.add_paragraph(xml_safe_text(text), style=style)
 
@@ -760,6 +860,51 @@ def create_report_docx(report, scan, output_path):
                     style="List Bullet",
                 )
 
+    def research_evidence_key(evidence):
+        return tuple(str(evidence.get(key) or "")
+                     for key in ("evidence_id", "source_path", "archive_source_path"))
+
+    def research_evidence_roles(evidence, counter=False):
+        names = {"support": "背景支撑", "prior_work": "已有工作", "conditions": "适用条件",
+                 "counterevidence": "反证线索", "resources": "资源条件"}
+        if ordinary_research and isinstance(evidence.get('roles'), list):
+            return [names[role] for role in ('counterevidence', 'conditions', 'prior_work', 'resources', 'support')
+                    if names[role] in evidence['roles']]
+        evidence_id = str(evidence.get("evidence_id") or "")
+        roles = set()
+        declared = recommendation.get("evidence_roles") or {}
+        for role, ids in declared.items():
+            if isinstance(ids, list) and evidence_id and evidence_id in {str(value) for value in ids}:
+                roles.add(role)
+        if evidence.get("evidence_role") in names:
+            roles.add(evidence["evidence_role"])
+        if counter:
+            roles.add("counterevidence")
+        if "counterevidence" in roles:
+            roles.discard("support")
+        return [names[role] for role in ("counterevidence", "conditions", "prior_work", "resources", "support") if role in roles]
+
+    def add_research_evidence(evidence, counter=False):
+        location = str(evidence.get("source_path") or evidence.get("archive_source_path") or "来源待核验")
+        archive = evidence.get("archive_source_path")
+        if archive and str(archive) != location:
+            location += "（归档来源：{}）".format(archive)
+        if evidence.get("page"):
+            location += "，第 {} 页".format(evidence["page"])
+        if evidence.get("section"):
+            location += "，{}".format(evidence["section"])
+        roles = research_evidence_roles(evidence, counter=counter)
+        add_paragraph("[{}] 来源：{}{}".format(
+            evidence.get("evidence_id") or "ID待核验", location,
+            "；角色：" + "、".join(roles) if roles else "；角色：研究依据（待核验）",
+        ), style="List Bullet")
+        if evidence.get("doi"):
+            add_paragraph("来源 DOI：{}".format(evidence["doi"]))
+        # The bounded research bundle already chose source units. Preserve the
+        # complete quoted unit here, especially late negations and conditions.
+        add_paragraph(evidence.get("text") or evidence.get("original_text") or evidence.get("snippet")
+                      or "该条未提供可展示原文，请打开来源资料核验。")
+
     def add_table(headers, rows, widths=None):
         table = doc.add_table(rows=1, cols=len(headers))
         table.style = "Table Grid"
@@ -815,6 +960,100 @@ def create_report_docx(report, scan, output_path):
     footer_run._r.extend([field_begin, field_instr, field_end])
     tail = add_run(footer, " 页")
     set_font(tail, size=9, color=(100, 100, 100))
+
+    if ordinary_research:
+        from services.ordinary_overview import build_overview_presentation
+        presentation = build_overview_presentation(report)
+        direction = presentation['direction']
+        set_xml_text(header, "资料情报概览")
+        for style_name, size in (("Heading 1", 16), ("Heading 2", 13), ("Heading 3", 12)):
+            configure_style(styles[style_name], size, (0, 0, 0), 12, 6, 1.10, True)
+        title = add_paragraph()
+        set_font(add_run(title, "资料情报概览"), size=23, bold=True)
+        coverage = report.get('coverage') or {}
+        from datetime import datetime as overview_datetime
+        raw_time = str(scan.get('scanned_at') or '')
+        try:
+            scanned_time = overview_datetime.fromisoformat(raw_time.replace('Z', '+00:00'))
+            display_time = scanned_time.strftime('%Y年%m月%d日 %H:%M:%S')
+            if scanned_time.utcoffset() is not None:
+                offset = scanned_time.strftime('%z')
+                display_time += '（时区{}:{}）'.format(offset[:3], offset[3:])
+        except ValueError:
+            display_time = '详见附件时间记录'
+        add_paragraph("资料文件 {} 个；已解析 {} 个；扫描时间：{}。".format(
+            scan['file_count'], coverage.get('parsed_files', '待核验'), display_time))
+        add_heading("一、关键发现", 1)
+        add_items(presentation['key_findings'][:5], empty_text="正文依据仍需补充。")
+        add_heading("二、文件分类", 1)
+        categories = presentation['file_categories']
+        if categories:
+            add_paragraph("分类范围：{}。文件数沿用已有分类结果，不将不同分类维度的数量相加作为文件总数。".format(presentation['classification_scope']))
+            add_table(["文件类别", "文件数", "已解析", "分类状态"], [
+                [row['name'], row['file_count'] if row['file_count'] is not None else '待核验',
+                 row['parsed_file_count'] if row['parsed_file_count'] is not None else '待核验', row['status']]
+                for row in categories])
+            if presentation['file_category_count'] > len(categories):
+                add_paragraph("展示前 {} 类，共 {} 类；完整分类可在智能目录中查看。".format(len(categories), presentation['file_category_count']))
+        else:
+            add_paragraph("当前尚未形成可用的文件分类，待分类结果生成后补齐。")
+        add_heading("三、推荐研究方向", 1)
+        add_heading(direction['title'], 2)
+        add_paragraph("优先级：{}；置信度：{}。假设状态：尚未验证。".format(
+            direction['priority'], direction['confidence']))
+        for reason in presentation['reasons']:
+            add_heading(reason['label'], 3)
+            add_paragraph(reason['text'])
+        numbers = direction.get('evidence_numbers') or []
+        if numbers:
+            add_paragraph("依据定位：附件一证据 {}。".format('、'.join(map(str, numbers))))
+        if direction.get('hypothesis'):
+            add_heading("待验证假设", 3)
+            add_paragraph(direction['hypothesis'])
+        add_heading("四、候选研究方向", 1)
+        candidates = (report.get('direction_candidates') or [])[:10]
+        if candidates:
+            titles = {row['candidate_id']: row['title'] for row in presentation['alternatives'] if row.get('candidate_id')}
+            if direction.get('candidate_id'):
+                titles[direction['candidate_id']] = direction['title']
+            add_table(["序号", "研究方向", "证据/来源身份"], [
+                [i + 1, titles.get(row.get('candidate_id')) or presentation['candidate_titles'][i] or '待核验',
+                 '{}/{}'.format(row.get('unique_evidence_count', 0), row.get('independent_source_count', 0))]
+                for i, row in enumerate(candidates)])
+        for row in presentation['alternatives']:
+            add_heading(row['title'], 2)
+            add_paragraph(row['research_gap'])
+            add_paragraph("取舍依据：" + row['selection_reason'])
+            add_paragraph("证据编号：" + '、'.join(map(str, row['evidence_numbers'])))
+        if not candidates and not presentation['alternatives']:
+            add_paragraph("当前尚无通过证据审查的其他候选方向。")
+        add_heading("五、验证步骤与限制", 1)
+        add_items(direction.get('research_questions', [])[:2], empty_text="先确认研究问题及资料覆盖范围。")
+        add_items(direction.get('methods', [])[:3], style="List Number", empty_text="先核对原文条件、资源与比较口径。")
+        limits = list(dict.fromkeys((direction.get('limitations') or []) + presentation['limitations']))
+        add_items(limits[:3], empty_text="当前未列出额外适用边界，需结合原文继续核验。")
+        add_paragraph("推荐是待验证的研究起点，来源身份数不等于独立实验数量。")
+        doc.add_page_break()
+        add_heading("附件一 证据与来源", 1)
+        add_paragraph("正文引用的证据按编号列示；保留原文、来源身份与定位信息。")
+        add_paragraph('扫描时间原始记录：' + raw_time)
+        for evidence in presentation['evidence_appendix']:
+            add_heading("证据 {}".format(evidence['number']), 2)
+            # The appendix is the sole home for complete quotes and source IDs.
+            add_research_evidence(evidence, counter='反证线索' in evidence['roles'])
+        if not presentation['evidence_appendix']:
+            add_paragraph("当前没有可展示的证据条目。")
+        doc.add_page_break()
+        add_heading("附件二 研究规划原始记录", 1)
+        add_heading("研究规划原始表述", 2)
+        for row in presentation['source_notes']:
+            add_paragraph("{}．{}".format(row['number'], row['text']))
+        audit = report.get('research_opportunity_audit') or {}
+        if audit:
+            add_heading("研究取舍与处理记录", 2)
+            add_paragraph(json.dumps(audit, ensure_ascii=False, indent=2))
+        doc.save(output_path)
+        return output_path
 
     title = add_paragraph()
     title.paragraph_format.space_after = Pt(4)
@@ -1020,10 +1259,14 @@ def create_report_docx(report, scan, output_path):
     if candidates:
         add_heading("候选方向排序", level=2)
         add_table(
-            ["排名", "候选方向", "综合分", "优先级", "置信度", "证据/独立来源"],
-            [[item.get("rank", index), item.get("title", "待命名"), item.get("score", 0), item.get("priority", "—"), item.get("confidence", "—"), "{}/{}".format((item.get("score_breakdown") or {}).get("evidence_count", 0), (item.get("score_breakdown") or {}).get("independent_source_count", 0))]
-             for index, item in enumerate(candidates[:5], 1)],
+            ["排名", "候选方向", "综合分", "优先级", "置信度", "证据/来源身份" if ordinary_research else "证据/独立来源"],
+            [[item.get("rank", index), item.get("title", "待命名"), item.get("score", 0), item.get("priority", "—"), item.get("confidence", "—"), "{}/{}".format(
+                item.get("unique_evidence_count", len(item.get("evidence_chain") or [])) if ordinary_research else (item.get("score_breakdown") or {}).get("evidence_count", 0),
+                item.get("independent_source_count", 0) if ordinary_research else (item.get("score_breakdown") or {}).get("independent_source_count", 0))]
+             for index, item in enumerate(candidates if ordinary_research else candidates[:5], 1)],
         )
+        if ordinary_research:
+            add_paragraph("比较分仅用于当前资料内排序，来源身份数不等于独立实验数量。")
     doc.add_page_break()
     add_heading("四、推荐研究方向", level=1)
     recommendation = report.get("recommended_research_direction") or {}
@@ -1032,13 +1275,64 @@ def create_report_docx(report, scan, output_path):
     lead_run = add_run(lead, "性质：推论；优先级：{}；置信度：{}".format(recommendation.get("priority", "中"), recommendation.get("confidence", "中")))
     set_font(lead_run, size=11, color=(31, 58, 95), bold=True)
     add_paragraph(recommendation.get("rationale") or "需要先生成代表性文档的全文摘要，再确定研究重点。")
+    if ordinary_research:
+        for field, label in (("selection_reason", "为什么优先这个"),
+                             ("known_work", "资料已经做到什么"),
+                             ("research_gap", "仍待核验的问题")):
+            if recommendation.get(field):
+                add_heading(label, level=3)
+                add_paragraph(recommendation[field])
+        if recommendation.get("hypothesis") or recommendation.get("hypothesis_status"):
+            add_heading("研究假设与状态", level=3)
+            if recommendation.get("hypothesis"):
+                add_paragraph(recommendation["hypothesis"])
+            status = recommendation.get("hypothesis_status") or "unverified"
+            status_label = {"unverified": "尚未验证", "inferred": "待验证推论", "verified": "已核验",
+                            "rejected": "未通过核验", "refuted": "存在反驳依据"}.get(status, str(status))
+            add_paragraph("假设状态：{}。".format(status_label))
+            if status in {"unverified", "inferred"}:
+                add_paragraph("现有资料尚不能确认该假设成立，需按建议路径核验。")
+        add_heading("资源确认", level=3)
+        resource_status = (recommendation.get("quality_gate") or {}).get("resources")
+        if resource_status == "material_described":
+            add_paragraph("资料已描述资源条件；仍需确认数据、代码、权限与运行条件的实际可用性。")
+        else:
+            add_paragraph("第一步先确认数据、代码与资源条件，再决定验证办法；登记已确认与缺失项。")
+        if recommendation.get("confidence_note"):
+            add_paragraph("置信度说明：{}".format(recommendation["confidence_note"]))
     add_heading("拟研究问题", level=3)
     add_items(recommendation.get("research_questions") or recommendation.get("questions"), style="List Number")
     add_heading("建议方法", level=3)
     add_items(recommendation.get("methods"), empty_text="建议采用分层抽样、证据矩阵和专题复核方法。")
     add_heading("方向依据与证据", level=3)
     recommendation_evidence = recommendation.get("evidence_chain", [])
-    if recommendation_evidence:
+    if ordinary_research:
+        counterevidence = []
+        counter_keys = set()
+        for evidence in recommendation.get("counterevidence") or []:
+            if isinstance(evidence, dict) and research_evidence_key(evidence) not in counter_keys:
+                counterevidence.append(evidence)
+                counter_keys.add(research_evidence_key(evidence))
+        for evidence in recommendation_evidence:
+            if (isinstance(evidence, dict) and "反证线索" in research_evidence_roles(evidence)
+                    and research_evidence_key(evidence) not in counter_keys):
+                counterevidence.append(evidence)
+                counter_keys.add(research_evidence_key(evidence))
+        basis = [evidence for evidence in recommendation_evidence if isinstance(evidence, dict)
+                 and research_evidence_key(evidence) not in counter_keys]
+        for evidence in basis:
+            add_research_evidence(evidence)
+        if not basis:
+            add_paragraph("当前未提供其他可展示的推荐依据，请结合原文继续核验。")
+        add_heading("反证、适用边界与待确认条件", level=3)
+        if counterevidence:
+            add_paragraph("以下原文用于核验推荐的适用边界、失败条件与比较口径。")
+            for evidence in counterevidence:
+                add_research_evidence(evidence, counter=True)
+        else:
+            add_paragraph("当前未提供可展示的反证线索，不表示不存在反例。")
+        add_items(recommendation.get("limitations"), empty_text="当前未列出额外适用边界，需结合原文继续核验。")
+    elif recommendation_evidence:
         for evidence in recommendation_evidence[:12]:
             if isinstance(evidence, dict):
                 location = evidence.get("source_path", "未知文件")

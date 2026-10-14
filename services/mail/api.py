@@ -117,10 +117,10 @@ def _queue(services, package_id, task_type, owner_id, options):
     return str(job_id), bool(created)
 
 
-def _source_revision(path):
+def _source_revision(path, *, policy=None, owner_id=None):
     """Make a stable source revision without treating a directory as one file."""
     if path.is_file():
-        return sha256_file(path)
+        return sha256_file(path, policy=policy, owner_id=owner_id)
     digest = hashlib.sha256()
     root = path.resolve()
     member_count = 0
@@ -316,14 +316,14 @@ def register_mail_routes(app, services):
         payload = request.get_json(silent=True) or {}
         source = payload.get("source") or {}
         raw_path = str(source.get("path") or "")
-        path = services.policy.resolve_source(raw_path)
+        owner_id = _owner(services)
+        path = services.policy.resolve_source(raw_path, owner_id=owner_id)
         source_kind = _source_kind(path)
         if not source_kind:
             raise MailPolicyError("邮件来源仅支持 ZIP、目录、EML、MBOX、MSG 或 PST")
         requested_kind = str(source.get("kind") or "").strip().casefold()
         if requested_kind and requested_kind not in {source_kind, "directory" if path.is_dir() else source_kind}:
             raise MailPolicyError("来源类型与服务器文件不匹配")
-        owner_id = _owner(services)
         config = dict(payload.get("options") or {})
         display_name = str(payload.get("display_name") or path.name or "邮件资料包").strip()[:200]
         package, created = services.repository.create_package(
@@ -331,7 +331,7 @@ def register_mail_routes(app, services):
             display_name=display_name or "邮件资料包",
             source_kind=source_kind,
             source_path=str(path),
-            source_revision=_source_revision(path),
+            source_revision=_source_revision(path, policy=services.policy, owner_id=owner_id),
             config=config,
             idempotency_key=str(payload.get("idempotency_key") or "").strip()[:200] or None,
         )
@@ -569,6 +569,7 @@ def register_mail_routes(app, services):
             max_model_calls=Config.MAIL_RESEARCH_MAX_MODEL_CALLS,
             max_seconds=Config.MAIL_RESEARCH_TIMEOUT_SECONDS,
             research_version=RESEARCH_VERSION if getattr(Config,'MAIL_PHASE2_ENABLED',True) else None,
+            answer_mode=payload.get("answer_mode"),
         )
         spec["analysis_version"]=3
         spec['budget']=research_budget(payload.get('budget'))

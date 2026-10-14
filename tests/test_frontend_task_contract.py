@@ -61,9 +61,9 @@ class FrontendTaskContractTests(unittest.TestCase):
 
     def test_model_probe_executes_a_bounded_generation(self):
         app_source = (PROJECT_ROOT / "app.py").read_text(encoding="utf-8")
-        self.assertIn("Reply with exactly SJFX_OK", app_source)
-        self.assertIn('"generation_tested": True', app_source)
-        self.assertIn("generation_reply", app_source)
+        self.assertIn('test_models(Config, role="all", timeout_seconds=20)', app_source)
+        self.assertIn('result["generation_tested"]', app_source)
+        self.assertIn('result.get("roles", {}).get("generation")', app_source)
 
     def test_dashboard_shell_reads_current_semantic_metric_contract(self):
         shell = (PROJECT_ROOT / "static" / "product-shell.js").read_text(encoding="utf-8")

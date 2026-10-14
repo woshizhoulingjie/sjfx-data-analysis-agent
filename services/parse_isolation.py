@@ -15,6 +15,9 @@ import os
 import threading
 import time
 import weakref
+from services.process_liveness import (
+    initialize_process_family, own_process_tree, process_rss_bytes, terminate_process_tree,
+)
 
 
 class ParseIsolationError(RuntimeError):
@@ -35,22 +38,15 @@ class ParseIsolationCancelled(ParseIsolationError):
 
 def _rss_bytes(pid):
     """Return a child RSS estimate without requiring psutil."""
-    try:
-        with open("/proc/{}/statm".format(pid), "r", encoding="ascii") as fh:
-            pages = int(fh.read().split()[1])
-        return pages * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError, AttributeError):
-        try:
-            import psutil
-
-            return int(psutil.Process(pid).memory_info().rss)
-        except Exception:
-            return None
+    return process_rss_bytes(pid)
 
 
-def _parser_server(conn, config):
+def _parser_server(conn, config, start_gate=None):
     """Run in a dedicated process and service one parse request at a time."""
     try:
+        initialize_process_family()
+        if start_gate is not None and not start_gate.wait(timeout=30):
+            raise RuntimeError("解析子进程未获得启动授权")
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         from services.unified_parser import UnifiedDocumentParser
@@ -124,6 +120,7 @@ class IsolatedParserRunner:
             preferred = "spawn" if "spawn" in available else available[0]
         self._ctx = mp.get_context(preferred)
         self._process = None
+        self._job_owner = None
         self._recv = None
         self._send = None
         self._lock = threading.RLock()
@@ -132,21 +129,28 @@ class IsolatedParserRunner:
     def alive(self):
         return bool(self._process and self._process.is_alive())
 
-    def _start(self, startup_timeout):
+    def _start(self, startup_timeout, cancel_check=None, memory_mb=8192):
         self.close()
         # A duplex pipe is required: the child receives requests and sends
         # results over the same connection.  ``Pipe(False)`` is send-only at
         # one endpoint and caused every real parse to be reported as an
         # unknown response.
         recv, send = self._ctx.Pipe(True)
+        start_gate = self._ctx.Event()
         process = self._ctx.Process(
             target=_parser_server,
-            args=(send, self._config),
+            args=(send, self._config, start_gate),
             daemon=True,
         )
         try:
             process.start()
+            self._job_owner = own_process_tree(process.pid)
+            if os.name == "nt" and self._job_owner is None:
+                raise ParseIsolationError("无法建立 Windows 解析子进程回收边界")
+            start_gate.set()
         except Exception:
+            if process.pid is not None:
+                terminate_process_tree(process, job=self._job_owner)
             recv.close()
             send.close()
             raise
@@ -156,8 +160,16 @@ class IsolatedParserRunner:
         self._process, self._recv, self._send = process, recv, recv
         deadline = time.monotonic() + max(1.0, startup_timeout)
         while time.monotonic() < deadline:
+            if self._cancelled(cancel_check):
+                self._terminate()
+                raise ParseIsolationCancelled("任务已取消，解析子进程启动已终止")
+            self._check_memory(memory_mb)
             if recv.poll(0.1):
-                message = recv.recv()
+                try:
+                    message = recv.recv()
+                except (EOFError, OSError) as exc:
+                    self._terminate()
+                    raise ParseIsolationError("解析子进程启动通信失败：{}".format(exc)) from exc
                 if message[0] == "ready":
                     return
                 self._terminate()
@@ -171,6 +183,21 @@ class IsolatedParserRunner:
                 )
         self._terminate()
         raise ParseIsolationTimeout("解析子进程启动超过 {} 秒".format(int(startup_timeout)))
+
+    @staticmethod
+    def _cancelled(cancel_check):
+        try:
+            return bool(cancel_check and cancel_check())
+        except Exception:
+            # A transient status read cannot turn a healthy parse into a
+            # false cancellation; the outer job checkpoint remains authoritative.
+            return False
+
+    def _check_memory(self, memory_mb):
+        rss = _rss_bytes(self._process.pid)
+        if rss is not None and rss > memory_mb * 1024 * 1024:
+            self._terminate()
+            raise ParseIsolationMemoryError("单文件解析子进程内存超过 {} MB".format(memory_mb))
 
     def parse(
         self,
@@ -186,24 +213,16 @@ class IsolatedParserRunner:
             timeout = max(1.0, float(timeout))
             memory_mb = max(256, int(memory_mb))
             if not self.alive or self._recv is None or self._send is None:
-                self._start(min(timeout, 30.0))
+                self._start(min(timeout, 30.0), cancel_check, memory_mb)
             try:
                 self._send.send(
                     ("parse", str(path), str(relative_path), str(mode), int(archive_depth or 0))
                 )
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
-                    if cancel_check is not None:
-                        try:
-                            cancelled = bool(cancel_check())
-                        except Exception:
-                            # A transient status read must not turn a healthy
-                            # parse into a false cancellation.  The outer job
-                            # progress checkpoint remains authoritative.
-                            cancelled = False
-                        if cancelled:
-                            self._terminate()
-                            raise ParseIsolationCancelled("任务已取消，当前解析子进程已终止")
+                    if self._cancelled(cancel_check):
+                        self._terminate()
+                        raise ParseIsolationCancelled("任务已取消，当前解析子进程已终止")
                     if self._recv.poll(0.2):
                         message = self._recv.recv()
                         if message[0] == "ok":
@@ -217,12 +236,7 @@ class IsolatedParserRunner:
                         raise ParseIsolationError(
                             "解析子进程异常退出（exitcode={})".format(self._process.exitcode)
                         )
-                    rss = _rss_bytes(self._process.pid)
-                    if rss is not None and rss > memory_mb * 1024 * 1024:
-                        self._terminate()
-                        raise ParseIsolationMemoryError(
-                            "单文件解析子进程内存超过 {} MB".format(memory_mb)
-                        )
+                    self._check_memory(memory_mb)
                 self._terminate()
                 raise ParseIsolationTimeout(
                     "单文件解析超过 {} 秒，解析子进程已终止".format(int(timeout))
@@ -244,15 +258,12 @@ class IsolatedParserRunner:
                 pass
         self._recv = self._send = None
         if process is None:
+            if self._job_owner is not None:
+                self._job_owner.close()
+                self._job_owner = None
             return
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-            if process.is_alive() and hasattr(process, "kill"):
-                process.kill()
-                process.join(timeout=2)
-        else:
-            process.join(timeout=1)
+        terminate_process_tree(process, grace_seconds=2, job=self._job_owner, private_group=True)
+        self._job_owner = None
         # A hard timeout can bypass UnifiedDocumentParser's ``finally`` block.
         # Scratch names carry the parser PID, so after join it is safe to reap
         # only application-owned objects whose owner is no longer alive.

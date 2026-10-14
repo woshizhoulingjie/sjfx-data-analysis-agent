@@ -1,0 +1,12 @@
+# Windows application dependencies. Connect an already running model service;
+# Ollama is one optional backend, alongside vLLM/OpenAI-compatible endpoints.
+# This is a constraints entry point, not a verified Windows wheel lock.
+# Native packages (torch, docling/rapidocr, ctranslate2, sentencepiece, etc.)
+# depend on the target Python version and CPU architecture.
+-r requirements-app.txt
+
+# Explicit local parser backends used by the Windows acceptance suite.
+# Native executables and model weights are separate private resource bundles.
+rapidocr>=3.9,<4
+onnxruntime>=1.28,<2
+extract-msg>=0.56,<1

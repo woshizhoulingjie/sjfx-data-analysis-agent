@@ -64,7 +64,8 @@ ALLOWED_TRANSITIONS: Dict[str, FrozenSet[str]] = {
     DEEP_NODES: frozenset({PARSING_SELECTED, DEEP_OVERVIEW, DEEP_UPDATE_AVAILABLE, PAUSED, PARTIAL, FAILED, CANCELLED}),
     DEEP_UPDATE_AVAILABLE: frozenset({PARSING_SELECTED, DEEP_OVERVIEW, DEEP_FILES, PAUSED, PARTIAL, FAILED, CANCELLED}),
     DEEP_OVERVIEW: frozenset({PARSING_SELECTED, DEEP_FILES, DEEP_NODES, DEEP_UPDATE_AVAILABLE, COMPLETED, PARTIAL, PAUSED, FAILED, CANCELLED}),
-    PAUSED: frozenset({PARSING_SELECTED, PRELIMINARY_FILES, PRELIMINARY_NODES,
+    PAUSED: frozenset({SCANNING, AWAITING_SELECTION, PARSED_OVERVIEW,
+                       PARSING_SELECTED, PRELIMINARY_FILES, PRELIMINARY_NODES,
                        PRELIMINARY_OVERVIEW, DEEP_FILES, DEEP_NODES, DEEP_UPDATE_AVAILABLE,
                        DEEP_OVERVIEW, CANCELLED}),
     COMPLETED: frozenset({PARSING_SELECTED, DEEP_OVERVIEW}),
@@ -133,6 +134,27 @@ def deep_report_outcome(task, report):
         return None
     if int(checkpoint.get("selection_version") or 0) != int(scope.get("selection_version") or 0):
         return None
+    model_status = (report.get("model_analysis") or {}).get("status")
+    model_completed = model_status == "completed"
+    if report.get("research_version"):
+        from services.research_opportunities import RESEARCH_VERSION
+        publication = report.get("research_publication") or {}
+        current_goal = str(checkpoint.get("research_goal") or task.get("research_goal") or "")
+        if (report.get("research_version") != RESEARCH_VERSION
+                or publication.get("version") != RESEARCH_VERSION
+                or str(report.get("research_goal") or "") != current_goal
+                or str(publication.get("research_goal") or "") != current_goal
+                or not report.get("research_source_fingerprint")
+                or publication.get("source_fingerprint") != report.get("research_source_fingerprint")
+                or publication.get("status") not in {"passed", "insufficient"}):
+            return None
+        # An explicit no-evidence result can finish the job honestly. A model
+        # timeout/failure never becomes completed merely because a report exists.
+        model_completed = model_completed or (
+            model_status == "skipped"
+            and (report.get("model_analysis") or {}).get("reason") == "no_candidate_evidence"
+            and publication.get("status") == "insufficient"
+        )
     pipeline = (report.get("coverage") or {}).get("pipeline_coverage") or {}
     quality = report.get("summary_quality") or {}
     complete = bool((pipeline.get("content_parse") or {}).get("complete")
@@ -141,5 +163,6 @@ def deep_report_outcome(task, report):
                     and quality.get("file_summaries") == len(selected)
                     and not quality.get("degraded_file_summaries")
                     and not quality.get("degraded_node_summaries")
-                    and (report.get("model_analysis") or {}).get("status") == "completed")
+                    and not quality.get("missing_node_summaries")
+                    and model_completed)
     return COMPLETED if complete else PARTIAL

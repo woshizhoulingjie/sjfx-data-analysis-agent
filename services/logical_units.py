@@ -79,7 +79,7 @@ def archive_member_units(root, container, max_units=250000):
                 raise ValueError("ZIP中央目录在预检后发生变化")
             for info in archive.filelist:
                 if not info.is_dir():
-                    unit = emit(info.filename, info.file_size, info.compress_size, info.flag_bits & 0x1)
+                    unit = emit(info.orig_filename, info.file_size, info.compress_size, info.flag_bits & 0x1)
                     if unit:
                         yield unit
         return
@@ -143,17 +143,75 @@ def structured_text_units(root, container, partition_bytes=1024 * 1024):
         return
     include_header = extension in {".csv", ".tsv"}
     ranges = []
+
+    def record_state(line, quoted, field_start):
+        delimiter = 0x09 if extension == ".tsv" else 0x2c
+        index = 0
+        while index < len(line):
+            value = line[index]
+            if quoted:
+                if value == 0x22:
+                    if index + 1 < len(line) and line[index + 1] == 0x22:
+                        index += 2
+                        continue
+                    quoted = False
+            elif value == delimiter or value in (0x0a, 0x0d):
+                field_start = True
+            else:
+                if value == 0x22 and field_start:
+                    quoted = True
+                field_start = False
+            index += 1
+        return quoted, field_start
+
     with path.open("rb") as source:
-        header = source.readline() if include_header else b""
+        if include_header:
+            probe = source.read(4)
+            if probe.startswith((b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")):
+                # UTF-16/32 newlines and quote characters span code units.
+                # Retain the complete source for the existing parser instead
+                # of generating byte partitions that can corrupt its records.
+                return
+            source.seek(0)
+        header = b""
+        if include_header:
+            header_lines = []
+            quoted, field_start = False, True
+            for line in source:
+                header_lines.append(line)
+                # A UTF-8 BOM is encoding metadata, not an unquoted field
+                # prefix. Keep its bytes in the header while allowing a quote
+                # at the beginning of the first actual field to open it.
+                state_line = line[3:] if len(header_lines) == 1 and line.startswith(b"\xef\xbb\xbf") else line
+                quoted, field_start = record_state(state_line, quoted, field_start)
+                if not quoted:
+                    break
+            header = b"".join(header_lines)
         data_start = source.tell() if include_header else 0
         data_ranges = []
         chunk_start = data_start
         chunk_end = data_start
+        # CSV/TSV records are allowed to contain physical newlines inside a
+        # quoted field.  Track RFC 4180 quote state while streaming lines and
+        # only close a partition at a complete logical record.  The previous
+        # implementation used ``for line`` boundaries and split such records,
+        # causing the next partition to parse as invented one-column rows.
+        in_quotes = False
+
+        field_start = True
         for line in source:
             chunk_end = source.tell()
-            if chunk_end - chunk_start > partition_bytes and chunk_end > chunk_start:
-                data_ranges.append((chunk_start, chunk_end - len(line)))
-                chunk_start = chunk_end - len(line)
+            if include_header:
+                in_quotes, field_start = record_state(line, in_quotes, field_start)
+            record_complete = not in_quotes
+            # Emit an oversized record as one unit.  For ordinary records this
+            # keeps each partition near the requested byte budget while never
+            # crossing a quoted multiline record boundary.
+            if record_complete and chunk_end > chunk_start and (
+                chunk_end - chunk_start >= partition_bytes
+            ):
+                data_ranges.append((chunk_start, chunk_end))
+                chunk_start = chunk_end
         if chunk_end > chunk_start:
             data_ranges.append((chunk_start, chunk_end))
         if include_header and data_ranges:
@@ -176,7 +234,8 @@ def structured_text_units(root, container, partition_bytes=1024 * 1024):
             extension, actual_size, "structured_text_partition",
             byte_start=start, byte_end=end, partition_index=index,
             include_header=bool(include_header and index > 1),
-            record_boundary="line",
+            header_byte_end=len(header) if include_header else 0,
+            record_boundary="record",
         )
         index += 1
 

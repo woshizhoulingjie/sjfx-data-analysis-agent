@@ -891,8 +891,11 @@ class HeldOutSupportTests(unittest.TestCase):
         from pathlib import Path
         from services.large_package_isolated import LargePackageStore
         from config import Config
+        # The twenty-member evidence fixture assumes a service capable of the
+        # complete naming contract, independently of small-context rejection.
         with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(Config, 'SCAN_ALLOWED_ROOTS', ()):
+                patch.object(Config, 'SCAN_ALLOWED_ROOTS', ()), \
+                patch.object(Config, 'LLM_CONTEXT_TOKENS', 32768):
             root = Path(tmp)
             store = LargePackageStore(root / 'state.db')
             pid = store.create(root)['id']
@@ -1080,70 +1083,57 @@ class EmbedLaneTests(unittest.TestCase):
         self.assertEqual(semantic.embed_concurrency(), Config.LP_EMBED_CONCURRENCY)
 
 
-class EmbedFallbackTests(unittest.TestCase):
-    """GPU 主 / CPU 备的自动回退：守卫触发时嵌入车道不能停摆。
+class EmbeddingBackendSelectionTests(unittest.TestCase):
+    """The selected vector space must never switch services after an outage."""
 
-    背景：GPU sidecar 有显存守卫，可能在启动时拒绝加载、或在批次前返回 503。
-    没有回退时那等于整条嵌入车道停摆——文件拿不到向量就落进"未能识别内容"桶，
-    那是质量事故；有回退则只是慢。这组测试钉住回退的四个行为边界。
-    """
+    def test_large_lane_uses_the_shared_factory_with_its_limits(self):
+        from config import Config
+        selected = object()
+        with patch('services.embedding_backend.create_embedding_client', return_value=selected) as factory:
+            self.assertIs(semantic.embedding_client(), selected)
+        factory.assert_called_once_with(Config, lane='large', timeout=semantic.embed_timeout(),
+                                        max_batch_size=semantic.embed_batch_size())
 
-    @staticmethod
-    def _client(result=None, error=None, base='http://primary/v1'):
-        class Fake(object):
-            def __init__(self):
-                self.base_url = base
-                self.model = 'multilingual-e5-small'
-                self.max_batch_size = 16
-                self.calls = 0
+    def test_disabled_backend_ignores_legacy_fallback_configuration(self):
+        from config import Config
+        with patch.object(Config, 'EMBED_BACKEND', 'disabled'), \
+                patch.dict('os.environ', {'SJFX_LP_EMBED_FALLBACK_BASE_URL': 'http://127.0.0.1:9/v1'}), \
+                patch('services.embedding_backend.OpenAIEmbeddingClient') as transport:
+            self.assertIsNone(semantic.embedding_client())
+        transport.assert_not_called()
 
-            def embed(self, texts, retries=None):
-                self.calls += 1
-                if error:
-                    raise error
-                return result if result is not None else [[0.0]] * len(texts)
-
-            def health_check(self, timeout=3):
-                return {'reachable': error is None, 'model_available': error is None,
-                        'models': []}
-        return Fake()
-
-    def test_primary_success_does_not_touch_the_backup(self):
-        primary, backup = self._client([[1.0]]), self._client([[2.0]])
-        client = semantic.FallbackEmbeddingClient(primary, backup)
-        self.assertEqual(client.embed(['a']), [[1.0]])
-        self.assertEqual(backup.calls, 0, '主端点正常时不该动用备端点')
-
-    def test_primary_failure_falls_back_and_logs(self):
-        primary = self._client(error=RuntimeError('Connection refused'))
-        backup = self._client([[2.0]])
-        client = semantic.FallbackEmbeddingClient(primary, backup)
-        with self.assertLogs('services.large_package_semantic', level='WARNING') as logs:
-            got = client.embed(['a'])
-        self.assertEqual(got, [[2.0]])
-        self.assertEqual(client.fallbacks, 1)
-        self.assertIn('falling back', '\n'.join(logs.output), '回退必须留痕，不能静默')
-
-    def test_both_failing_raises_for_the_shared_failure_path(self):
-        primary = self._client(error=RuntimeError('Connection refused'))
-        backup = self._client(error=RuntimeError('Connection refused'))
-        client = semantic.FallbackEmbeddingClient(primary, backup)
-        with self.assertRaises(RuntimeError) as caught:
-            client.embed(['a'])
+    def test_primary_outage_propagates_without_backup_requests(self):
+        from unittest.mock import Mock
+        selected = Mock()
+        selected.embed.side_effect = RuntimeError('Connection refused')
+        with patch('services.embedding_backend.create_embedding_client', return_value=selected) as factory:
+            with self.assertRaises(RuntimeError) as caught:
+                semantic.embedding_client().embed(['source passage'])
+        factory.assert_called_once()
         self.assertEqual(naming.classify_failure(caught.exception), naming.FAILURE_UNAVAILABLE)
+        selected.embed.assert_called_once_with(['source passage'])
 
-    def test_wrapper_exposes_the_attributes_callers_use(self):
-        client = semantic.FallbackEmbeddingClient(self._client(), self._client())
-        self.assertEqual(client.model, 'multilingual-e5-small')
-        self.assertEqual(client.max_batch_size, 16)
-        self.assertTrue(client.health_check()['reachable'])
+    def test_legacy_fallback_never_changes_configured_endpoint(self):
+        from config import Config
+        with patch.object(Config, 'EMBED_BACKEND', 'openai_compatible'), \
+                patch.object(Config, 'EMBED_BASE_URL', 'http://127.0.0.1:18004/v1'), \
+                patch.object(Config, 'EMBED_MODEL_PATH', ''), \
+                patch.dict('os.environ', {'SJFX_LP_EMBED_FALLBACK_BASE_URL': 'http://127.0.0.1:18005/v1'}), \
+                patch('services.embedding_backend.OpenAIEmbeddingClient') as transport:
+            self.assertIs(semantic.embedding_client(), transport.return_value)
+        transport.assert_called_once()
+        self.assertEqual(transport.call_args.args[0], 'http://127.0.0.1:18004/v1')
 
-    def test_no_fallback_url_configured_keeps_the_old_behaviour(self):
-        import inspect
-        source = inspect.getsource(semantic.embedding_client)
-        self.assertIn('fallback_base_url()', source)
-        self.assertIn('return primary', source, '未配备端点时必须原样返回主客户端')
-        self.assertEqual(semantic.fallback_base_url(), '')
+    def test_factory_client_retains_attributes_used_by_callers(self):
+        from config import Config
+        with patch.object(Config, 'EMBED_BACKEND', 'openai_compatible'), \
+                patch.object(Config, 'EMBED_BASE_URL', 'http://127.0.0.1:18004/v1'), \
+                patch.object(Config, 'EMBED_MODEL_PATH', ''):
+            client = semantic.embedding_client()
+        self.assertEqual(client.model, Config.EMBED_MODEL)
+        self.assertEqual(client.max_batch_size, semantic.embed_batch_size())
+        self.assertEqual(client.base_url, 'http://127.0.0.1:18004/v1')
+        self.assertTrue(callable(client.health_check))
 
 
 class TopicPurityTests(unittest.TestCase):

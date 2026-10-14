@@ -183,12 +183,12 @@ class LargeQAIndex:
     @contextmanager
     def connect(self, write=False):
         c = sqlite3.connect(str(self.path) if write else self.path.as_uri()+'?mode=ro', uri=not write, timeout=20)
-        c.row_factory = sqlite3.Row
-        c.execute('PRAGMA busy_timeout=20000')
-        if not write:
-            c.execute('PRAGMA query_only=ON')
-            c.execute('BEGIN')
         try:
+            c.row_factory = sqlite3.Row
+            c.execute('PRAGMA busy_timeout=20000')
+            if not write:
+                c.execute('PRAGMA query_only=ON')
+                c.execute('BEGIN')
             yield c
             if write:
                 c.commit()

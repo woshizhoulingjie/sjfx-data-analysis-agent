@@ -21,14 +21,17 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
+from fastapi import HTTPException
+
 from web_compat import (
     InternalExecutionCapability, SJFXFastAPI, has_request_context, jsonify,
     render_template, request, send_from_directory,
 )
 
 from config import Config, ensure_runtime_directories
-from services.ollama import LocalModelError, OllamaClient, OllamaEmbeddingClient
-from services.vllm import VLLMClient, VLLMEmbeddingClient
+from services.ollama import LocalModelError
+from services.model_backend import create_model_client, create_translation_client
+from services.embedding_backend import create_embedding_client
 from services.document_analysis import (
     _preview_claim_contract,
     analyze_document,
@@ -67,7 +70,7 @@ from services.model_dispatch import background_generation
 from services.retrieval import evidence_corpus, retrieve_evidence
 from services import large_package_recall
 from services.scanner import (
-    IGNORED_DIRS, IGNORED_FILES, human_size, resolve_under, scan_directory,
+    IGNORED_DIRS, IGNORED_FILES, human_size, is_sensitive_file, resolve_under, scan_directory,
     scan_inventory_slice,
 )
 from services.storage import LazyStorage, Storage
@@ -76,8 +79,10 @@ from services.structured_qa import answer_question
 from services.unified_parser import UnifiedDocumentParser
 from services.agent_runtime import PydanticAgentRuntime
 from services.offline_translation import OfflineNLLBProvider
-from services.file_translation import build_file_translation_service
+from services.quickmt_translation import OfflineQuickMTProvider
+from services.file_translation import build_file_translation_service, select_offline_file_provider
 from services.translation import (
+    TRANSLATION_CONTRACT_VERSION,
     OllamaTranslationProvider,
     StorageTranslationMemory,
     TranslationPolicy,
@@ -134,7 +139,12 @@ async def _app_lifespan(_application):
     _initialize_runtime_state()
     from services.selection_supplement import publication_watch
     async with publication_watch(storage):
-        yield
+        try:
+            yield
+        finally:
+            mail_services = getattr(_application, 'extensions', {}).get('sjfx_mail')
+            if mail_services is not None:
+                mail_services.close()
 
 
 app = SJFXFastAPI(
@@ -212,23 +222,23 @@ _token_owner_alias = (
 #   2. 首个管理员的 owner_id = Config.OWNER_ID（通常是 primary）
 #      → 现有 295 个扫描 / 409 个产物**不需要任何数据迁移**就被它继承
 #   3. 无会话时回落到 Config.OWNER_ID —— 与改造前行为完全一致（零回归）
-#   4. 全部 try/except 包裹：多用户模块加载失败**不能**拖垮主服务
+#   4. 身份模块加载/初始化失败拒绝启动，不能继续暴露默认归属资料。
 try:
     from sjfx_multiuser.users import UserStore as _MultiUserStore
     from sjfx_multiuser.ownership import resolve_owner as _resolve_owner
     from sjfx_multiuser import auth_routes as _auth_routes
     from sjfx_multiuser import upload_routes as _upload_routes
+    from sjfx_multiuser.scan_paths import authorize_uploaded_scan_path
     from sjfx_multiuser import runtime as _multiuser_runtime
     from sjfx_multiuser.http_adapter import SESSION_COOKIE as _MULTIUSER_COOKIE
     _MULTIUSER_AVAILABLE = True
 except Exception as _multiuser_import_error:  # pragma: no cover
-    _MULTIUSER_AVAILABLE = False
-    _MULTIUSER_COOKIE = "sjfx_session"
-    logger.error("多用户隔离模块加载失败，退回到单用户模式：%r", _multiuser_import_error)
+    logger.error("多用户隔离模块加载失败，拒绝启动：%r", _multiuser_import_error)
+    raise RuntimeError("用户隔离模块不可用，请检查依赖；拒绝退回默认归属") from _multiuser_import_error
 
 _multi_user_store = None
 if _MULTIUSER_AVAILABLE:
-    # 延迟初始化（同上）；真正建表在 `_initialize_runtime_state()`，失败则退回单用户。
+    # 延迟初始化（同上）；真正建表在 `_initialize_runtime_state()`，失败拒绝启动。
     _multi_user_store = LazyStorage(lambda: _MultiUserStore(str(Config.DB_PATH)))
 
 
@@ -247,7 +257,7 @@ def _bootstrap_multiuser_admin():
         boot = _multi_user_store.bootstrap_first_admin(owner_id=_configured_owner_id)
     except Exception as exc:  # noqa: BLE001
         logger.error("管理员引导失败：%r", exc)
-        return None
+        raise RuntimeError("管理员初始化失败，拒绝启动") from exc
     if boot:
         logger.warning(
             "已初始化管理员账号 %s，初始密码：%s（首次登录必须修改）",
@@ -277,34 +287,32 @@ def _multiuser_session_from_request():
         if not sid:
             return None
         return _multi_user_store.resolve_session(sid)
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("会话身份校验失败，拒绝请求：%r", exc)
+        raise HTTPException(status_code=503, detail="身份校验暂不可用，请稍后重试") from exc
 
+
+from services.model_settings_routes import register_model_settings_routes
+register_model_settings_routes(app, config=Config, session_resolver=_multiuser_session_from_request)
 
 # The deployment is intentionally local-only: all generation uses the selected
 # serving backend on this host. vLLM is the production default; Ollama remains
 # available through LLM_BACKEND=ollama for rollback.
-if Config.LLM_BACKEND == "vllm":
-    llm_transport = VLLMClient(
-        base_url=Config.VLLM_BASE_URL,
-        model=Config.VLLM_MODEL,
-        timeout=Config.VLLM_REQUEST_TIMEOUT,
-        max_concurrency=Config.LLM_MAX_CONCURRENCY,
-        api_key=Config.VLLM_API_KEY,
-    )
-    ACTIVE_LLM_BACKEND = "vllm"
-else:
-    llm_transport = OllamaClient(
-        base_url=Config.OLLAMA_BASE_URL,
-        model=Config.OLLAMA_MODEL,
-        timeout=Config.SHARED_OLLAMA_REQUEST_TIMEOUT,
-        max_concurrency=Config.LLM_MAX_CONCURRENCY,
-    )
-    ACTIVE_LLM_BACKEND = "ollama"
+llm_transport = create_model_client(Config, require_enabled=False)
+ACTIVE_LLM_BACKEND = Config.LLM_BACKEND
 llm_generation_enabled = Config.LLM_ENABLED
 llm = PydanticAgentRuntime(llm_transport)
 translation_transport = None
-if Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "offline_nllb":
+if Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "offline_quickmt":
+    translation_provider = OfflineQuickMTProvider(
+        resource_root=Config.TRANSLATION_QUICKMT_MODEL_DIR,
+        beam_size=Config.TRANSLATION_QUICKMT_BEAM_SIZE,
+        cpu_threads=Config.TRANSLATION_CPU_THREADS,
+        batch_size=Config.TRANSLATION_BATCH_SIZE,
+        max_input_tokens=Config.TRANSLATION_MAX_INPUT_TOKENS,
+        max_new_tokens=Config.TRANSLATION_MAX_NEW_TOKENS,
+    )
+elif Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "offline_nllb":
     translation_model_path = Config.TRANSLATION_MODEL_PATH
     # Checking availability must not import CT2's native runtime in the Web
     # process.  The provider imports it lazily only when translation executes.
@@ -324,12 +332,7 @@ if Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "offline_nllb":
         max_new_tokens=Config.TRANSLATION_MAX_NEW_TOKENS,
     )
 elif Config.ENABLE_TRANSLATION and Config.TRANSLATION_PROVIDER == "ollama":
-    translation_transport = OllamaClient(
-        base_url=Config.TRANSLATION_OLLAMA_BASE_URL,
-        model=Config.TRANSLATION_OLLAMA_MODEL,
-        timeout=Config.TRANSLATION_TIMEOUT_SECONDS,
-        max_concurrency=1,
-    )
+    translation_transport = create_translation_client(Config)
     translation_provider = OllamaTranslationProvider(translation_transport)
 elif Config.ENABLE_TRANSLATION:
     translation_provider = UnavailableTranslationProvider(
@@ -341,6 +344,9 @@ translation_service = TranslationService(
     provider=translation_provider,
     memory=StorageTranslationMemory(storage),
     policy=TranslationPolicy(
+        # Keep trial memories and checkpoints separate from the original model.
+        contract_version=(TRANSLATION_CONTRACT_VERSION + ":quickmt-trial-v1:" + translation_provider.provider_id
+                          if Config.TRANSLATION_PROVIDER == "offline_quickmt" else TRANSLATION_CONTRACT_VERSION),
         max_unit_chars=Config.TRANSLATION_MAX_UNIT_CHARS,
         max_attempts=Config.TRANSLATION_MAX_ATTEMPTS,
         timeout_seconds=Config.TRANSLATION_TIMEOUT_SECONDS,
@@ -365,18 +371,21 @@ translation_service = TranslationService(
 # native-backend contention on a shared server.
 _translation_execution_lock = threading.RLock()
 
-# Explicit file jobs share the production vLLM admission gate, not the mail/NLLB provider.
-file_translation_transport = (
-    llm_transport if isinstance(llm_transport, VLLMClient) else VLLMClient(
-        Config.VLLM_BASE_URL, Config.VLLM_MODEL,
-        timeout=Config.VLLM_REQUEST_TIMEOUT, max_concurrency=1, api_key=Config.VLLM_API_KEY,
-    )
-)
+# Explicit file jobs share the selected generation transport and admission gate.
+file_translation_transport = llm_transport
 file_translation_service = build_file_translation_service(
     file_translation_transport, StorageTranslationMemory(storage),
     max_unit_chars=Config.TRANSLATION_MAX_UNIT_CHARS,
     max_attempts=Config.TRANSLATION_MAX_ATTEMPTS,
     timeout_seconds=Config.TRANSLATION_TIMEOUT_SECONDS,
+)
+offline_file_translation_service = build_file_translation_service(
+    None, StorageTranslationMemory(storage),
+    provider=select_offline_file_provider(Config, translation_provider),
+    max_unit_chars=Config.TRANSLATION_MAX_UNIT_CHARS,
+    max_attempts=Config.TRANSLATION_MAX_ATTEMPTS,
+    timeout_seconds=Config.TRANSLATION_TIMEOUT_SECONDS,
+    coalesce_paragraphs=Config.TRANSLATION_COALESCE_PARAGRAPHS,
 )
 
 
@@ -385,31 +394,20 @@ file_translation_service = build_file_translation_service(
 def _translate_document_serialized(document, **kwargs):
     with _translation_execution_lock:
         return translation_service.translate_document(document, **kwargs)
+
+
+def _translate_file_document_serialized(document, **kwargs):
+    with _translation_execution_lock:
+        return offline_file_translation_service.translate_document(document, **kwargs)
 # 完整分析专用的文档级 embedding，以及交互式证据检索 embedding。
 # 优先使用独立 CPU vLLM 服务，避免占用 8001 的 GPU 生成模型；Ollama
 # 仅作为显式兼容回退。任一服务不可用时，evidence.py 会快速回退词法检索，
 # 不得阻塞导入或分析任务。
-_package_embedding_client = None
+_package_embedding_client = create_embedding_client(Config, lane="ordinary")
 _embedding_client = None
-ACTIVE_EMBEDDING_BACKEND = "disabled"
-if Config.ENABLE_VLLM_EMBEDDINGS:
-    _package_embedding_client = VLLMEmbeddingClient(
-        Config.VLLM_EMBED_BASE_URL,
-        Config.VLLM_EMBED_MODEL,
-        timeout=Config.VLLM_EMBED_TIMEOUT_SECONDS,
-        max_batch_size=Config.VLLM_EMBED_MAX_BATCH_SIZE,
-        max_chars=Config.VLLM_EMBED_MAX_CHARS,
-        api_key=Config.VLLM_API_KEY,
-    )
-    ACTIVE_EMBEDDING_BACKEND = "vllm-embedding"
-elif Config.ENABLE_SHARED_OLLAMA_EMBEDDINGS:
-    _package_embedding_client = OllamaEmbeddingClient(
-        Config.OLLAMA_BASE_URL,
-        Config.OLLAMA_EMBED_MODEL,
-        timeout=Config.SHARED_OLLAMA_REQUEST_TIMEOUT,
-        num_gpu=Config.OLLAMA_EMBED_NUM_GPU,
-    )
-    ACTIVE_EMBEDDING_BACKEND = "ollama-embedding"
+ACTIVE_EMBEDDING_BACKEND = (
+    _package_embedding_client.backend + "-embedding" if _package_embedding_client else "disabled"
+)
 
 if _package_embedding_client is not None:
     _embedding_client = _package_embedding_client
@@ -450,7 +448,8 @@ def _initialize_runtime_state():
         except Exception as _multiuser_init_error:  # pragma: no cover
             _MULTIUSER_AVAILABLE = False
             _multi_user_store = None
-            logger.error("多用户用户表初始化失败，退回单用户模式：%r", _multiuser_init_error)
+            logger.error("多用户用户表初始化失败，拒绝启动：%r", _multiuser_init_error)
+            raise RuntimeError("用户隔离初始化失败，拒绝退回默认归属") from _multiuser_init_error
     runtime_storage.migrate_legacy_ownership(
         _configured_owner_id,
         aliases=["legacy", "default", _token_owner_alias],
@@ -462,8 +461,11 @@ def _initialize_runtime_state():
     _bootstrap_multiuser_admin()
     if _MULTIUSER_AVAILABLE and _multi_user_store is not None:
         try:
+            from sjfx_multiuser.admin_materials import AdminMaterialCatalog
             _auth_routes.register(app, _multi_user_store,
-                                  config_owner_id=_configured_owner_id)
+                                  config_owner_id=_configured_owner_id,
+                                  material_catalog=AdminMaterialCatalog(
+                                      runtime_storage.db_path, large_package_store.db_path))
             # --- sjfx 分片上传路由（新增） ---
             _upload_info = _upload_routes.register(
                 app,
@@ -478,6 +480,7 @@ def _initialize_runtime_state():
             logger.info("多用户隔离已启用：注册/登录/管理员路由已挂载")
         except Exception as _route_error:  # noqa: BLE001
             logger.error("认证路由注册失败：%r", _route_error)
+            raise RuntimeError("认证与上传路由不可用，拒绝启动") from _route_error
     from services.mail.bootstrap import register_mail_module
     register_mail_module(
         app,
@@ -498,6 +501,22 @@ def _api_token_expired():
 
 @app.before_request
 def _access_guard():
+    # Translation records do not carry an owner column themselves, so their
+    # source scan/package must be checked at the route boundary even for the
+    # local/demo configuration where API token auth is disabled.  Otherwise a
+    # caller could use AUTH_REQUIRED=0 to read another owner's translations.
+    if request.path.startswith("/api/translations/") and _MULTIUSER_AVAILABLE:
+        _scan_id = request.path[len("/api/translations/"):].strip("/")
+        _owned_source = (
+            large_package_store.get(_scan_id, owner_id=_request_owner_id())
+            if _scan_id.startswith("lp-") else
+            storage.scan_owned(_scan_id, owner_id=_request_owner_id())
+        ) if _scan_id else True
+        if not _owned_source:
+            # Unified 404 avoids confirming that a foreign id exists.
+            return jsonify({"ok": False,
+                            "error": "扫描任务不存在、已失效或不属于当前访问用户"}), 404
+
     if not Config.AUTH_REQUIRED:
         return None
     if request.path.startswith("/static/") or request.path == "/":
@@ -527,25 +546,12 @@ def _access_guard():
         authorization = request.headers.get("Authorization", "")
         if authorization.lower().startswith("bearer "):
             supplied = authorization[7:].strip()
-    if _api_token_expired():
+    session = _multiuser_session_from_request()
+    if _api_token_expired() and session is None:
+        # A valid cookie session is an independent authentication mechanism;
+        # an expired deployment token must not log already-authenticated users
+        # out.  Requests without either credential remain rejected.
         return jsonify({"ok": False, "error": "SJFX API Token 已过期，请更新服务器配置后重启"}), 401
-    # 多用户隔离（新增）：补一个既有的越权点。
-    #
-    # 实测发现（2026-09-21，真实 HTTP 测试）：
-    #   /api/translations/<scan_id> 在会话鉴权下返回 200 并泄露他人的翻译内容。
-    #   三层证据：
-    #     1. 该路由**没有** require_scan 守卫（静态审查确认）
-    #     2. storage.list_translation_page() 参数只有 scan_id，**不带 owner_id**
-    #     3. document_translations 表**根本没有 owner_id 列**（存储层无法兜底）
-    #
-    # 这类"内容表靠 scan_id 间接归属"的接口，隔离责任全在路由层。
-    # 在这里补校验而不改那个路由，是为了把改动收在一处（便于回滚与审查）。
-    if request.path.startswith("/api/translations/") and _MULTIUSER_AVAILABLE:
-        _scan_id = request.path[len("/api/translations/"):].strip("/")
-        if _scan_id and not storage.scan_owned(_scan_id, owner_id=_request_owner_id()):
-            # 统一 404（不是 403）—— 403 会确认"这个 id 存在"
-            return jsonify({"ok": False,
-                            "error": "扫描任务不存在、已失效或不属于当前访问用户"}), 404
 
     if not configured or not supplied or not hmac.compare_digest(supplied, configured):
         # 多用户隔离（新增）：没有 token 时，尝试用**会话**放行。
@@ -554,16 +560,26 @@ def _access_guard():
         #
         # 安全说明：放行不等于放权。归属仍由 _request_owner_id() 从会话派生，
         # 普通用户只能看到自己的数据；未登录会在这里被拒。
-        if _multiuser_session_from_request() is not None:
+        if session is not None:
+            _request_owner_id()
             return None
         return jsonify({"ok": False, "error": "未授权访问，请提供有效的 SJFX API Token"}), 401
+    _request_owner_id()
     return None
 
 
-def _resolve_allowed_scan_root(raw_path):
+def _resolve_allowed_scan_root(raw_path, owner_id=None):
+    # Uploaded files live outside the administrator's NAS allow-list. Check
+    # their reserved namespace first, even if a configured root contains it.
+    upload_root = Path(Config.OUTPUT_DIR) / "_uploads"
+    uploaded = authorize_uploaded_scan_path(raw_path, upload_root, owner_id, check_filesystem=True)
     root = Path(raw_path).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError("目录不存在或不是文件夹")
+    # An external symlink must not provide an alias into another user's files.
+    resolved_upload = authorize_uploaded_scan_path(root, upload_root, owner_id, check_filesystem=True)
+    if uploaded is not None or resolved_upload is not None:
+        return root
     for allowed in Config.SCAN_ALLOWED_ROOTS:
         try:
             root.relative_to(allowed)
@@ -617,19 +633,25 @@ def _request_owner_id():
         return None
 
     if not _MULTIUSER_AVAILABLE or _multi_user_store is None:
-        # 多用户模块不可用 → 完全保持改造前行为
-        return Config.OWNER_ID
+        raise HTTPException(status_code=503, detail="用户隔离暂不可用，请稍后重试")
 
     try:
         override = _multiuser_runtime.get_current_user()
-        session = override or _multiuser_session_from_request()
+        session = override if override is not None else _multiuser_session_from_request()
+        if session is not None and not session.get("owner_id"):
+            raise ValueError("会话缺少资料归属")
         viewing = session.get("viewing_owner") if session else None
         decision = _resolve_owner(session, viewing, Config.OWNER_ID)
+        if session is None and (not decision.owner_id or decision.owner_id != Config.OWNER_ID):
+            raise ValueError("默认身份与资料归属不一致")
+        if session is not None and session.get("role") != "admin" and decision.owner_id != session["owner_id"]:
+            raise ValueError("身份与资料归属不一致")
         return decision.owner_id
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
-        # 归属解析出问题时**必须保守回落**，绝不能变成 None（= 看全部）
-        logger.error("归属解析失败，回落配置 owner：%r", exc)
-        return Config.OWNER_ID
+        logger.error("归属解析失败，拒绝请求：%r", exc)
+        raise HTTPException(status_code=503, detail="资料归属校验失败，请稍后重试") from exc
 
 # --- sjfx 写路径 owner 语义修正（新增） ---
 def _effective_owner():
@@ -648,10 +670,7 @@ def _effective_owner():
       - 管理员且未切视角 → `_configured_owner_id`（默认目录，语义清楚）
       - 管理员切到某用户 → 那个用户的 owner
     """
-    try:
-        owner = _request_owner_id()
-    except Exception:  # noqa: BLE001
-        return _configured_owner_id
+    owner = _request_owner_id()
     if owner:
         return owner
     # owner 为 None = 管理员"全部视角" → 用配置 owner 作为默认目录
@@ -672,6 +691,19 @@ def _output_candidates(filename, owner_id=None):
         out.append(Config.OUTPUT_DIR / owner_id / filename)
     out.append(Config.OUTPUT_DIR / filename)
     return out
+
+
+def _artifact_read_owner(filename, allow_legacy=False):
+    """Resolve the registered owner after applying the current read filter."""
+    owner_id = storage.artifact_owner(filename)
+    if owner_id is None:
+        if allow_legacy:
+            return _effective_owner()
+        raise ValueError("输出文件不存在或不属于当前访问用户")
+    requested_owner = _request_owner_id()
+    if requested_owner is not None and owner_id != requested_owner:
+        raise ValueError("输出文件不存在或不属于当前访问用户")
+    return owner_id
 
 
 def _resolve_output_file(filename, owner_id=None):
@@ -727,8 +759,9 @@ def _output_dir_for_export(owner_id=None):
     return directory
 
 
-def require_scan(scan_id):
-    scan = storage.get_scan(scan_id, owner_id=_request_owner_id())
+def require_scan(scan_id, lightweight=False):
+    reader = storage.get_scan_identity if lightweight else storage.get_scan
+    scan = reader(scan_id, owner_id=_request_owner_id())
     if not scan:
         raise ValueError("扫描任务不存在、已失效或不属于当前访问用户")
     _file_protection.guard_root(scan.get("root") or "")
@@ -1309,6 +1342,8 @@ def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
             "topics": [str(item)[:50] for item in (summary.get("topics") or [])[:4]],
             "key_facts": [_short(item.get("text") if isinstance(item, dict) else item, 120) for item in (summary.get("key_facts") or [])[:2]],
             "arguments": [_short(item.get("text") if isinstance(item, dict) else item, 120) for item in (summary.get("arguments") or [])[:2]],
+            "methodology": [_short(item.get("text") if isinstance(item, dict) else item, 180) for item in (summary.get("methodology") or [])[:2]],
+            "uncertainties": [_short(item.get("text") if isinstance(item, dict) else item, 180) for item in (summary.get("uncertainties") or [])[:2]],
             # conclusions 与 file_conclusions 高度重复；节点模型只消费已带证据的版本。
             "file_conclusions": compact_file_conclusions,
             "limitations": [_short(item.get("text") if isinstance(item, dict) else item, 120) for item in (summary.get("limitations") or summary.get("file_limitations") or [])[:2]],
@@ -1321,6 +1356,18 @@ def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
                 if isinstance(item, dict) and item.get("evidence_id")
             ],
         })
+
+    if not scope_limited:
+        from services.research_elements import research_passages
+        by_path = {str(d.get("path") or ""): d.get("payload") or {} for d in documents}
+        for item in file_summaries:
+            local = by_path.get(item["path"]) or {}
+            item["research_context"] = {
+                role: [{"text": e["text"], "evidence_id": e.get("evidence_id"), "section": e.get("section"),
+                        "source_path": e.get("source_path") or item["path"], "page": e.get("page")} for e in rows]
+                for role, rows in research_passages(local, per_role=1, max_chars=220).items()
+                if rows and role in {"problem", "method", "result", "limitation", "condition"}
+            }
 
     type_counts = Counter()
 
@@ -1369,6 +1416,7 @@ def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
         cluster = dict(source)
 
         cluster["members"] = members
+        cluster["file_count"] = len(members)
 
         cluster["representative_documents"] = [
             path
@@ -1394,7 +1442,11 @@ def _virtual_node_context(scan_id, node, max_files=30, summary_stage=None):
         if len(topic_clusters) >= 8:
             break
 
-    member_source_fingerprint = _preliminary_member_source_fingerprint(file_summaries)
+    member_source_fingerprint = (
+        _preliminary_member_source_fingerprint(file_summaries)
+        if summary_stage == "preliminary"
+        else _node_member_source_fingerprint(scan_id, member_paths, summary_stage)
+    )
     for item in file_summaries:
         for internal_key in (
             "source_fingerprint", "summary_input_version", "summary_prompt_version",
@@ -1778,7 +1830,8 @@ def _combined_export_context(scan_id, scan_result, analysis, payload):
 
 def require_local_model_enabled():
     if not llm_generation_enabled:
-        flag = "ENABLE_VLLM" if Config.LLM_BACKEND == "vllm" else "ENABLE_SHARED_OLLAMA"
+        flag = {"vllm": "ENABLE_VLLM", "ollama": "ENABLE_SHARED_OLLAMA",
+                "openai_compatible": "ENABLE_OPENAI_COMPATIBLE"}[Config.LLM_BACKEND]
         raise ValueError("本地模型生成未启用，请将 {} 设置为 1 后重试".format(flag))
 
 
@@ -1942,7 +1995,7 @@ def _analyze_report_with_model(scan_result, summaries, analysis, report_data, ba
     if not (llm_generation_enabled and llm.configured):
         return report_data, None, {}, "模型分析未启用；报告保留待模型分析的研究方向。"
 
-    aligned = bool(Config.OVERVIEW_EVIDENCE_ALIGN)
+    aligned = bool(Config.OVERVIEW_EVIDENCE_ALIGN or report_data.get("research_version"))
     if aligned and not candidates_have_evidence(report_data):
         # O1: with no evidence-backed candidate the model output can only be
         # rejected, so the ~30 s call is skipped and the local version is kept.
@@ -2020,8 +2073,11 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         current_fingerprint = _preliminary_overview_source_fingerprint(scan_id)
         if current_fingerprint != source_fingerprint:
             raise ValueError("初步摘要或节点摘要版本已变化，拒绝生成过期情报概览")
+    if deep_source_fingerprint and _legacy_deep_report_fingerprint(scan_id) != deep_source_fingerprint:
+        raise ValueError("深度摘要或研究依据已变化，拒绝生成过期情报概览")
     scan_result = require_scan(scan_id)
-    analysis = dict(storage.get_analysis(scan_id) or {})
+    import copy
+    analysis = copy.deepcopy(storage.get_analysis(scan_id) or {})
     # Reports consume the same edge contract exposed to graph/search/dialogue
     # clients.  Feature-index rows remain recall signals and are not promoted
     # into report conclusions as file relationships.
@@ -2039,6 +2095,10 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         analysis["summary_stage_only"] = True
     import_task = storage.get_import_task(scan_id) or {}
     checkpoint = import_task.get("checkpoint") or {}
+    research_evidence = storage.list_evidence_index(scan_id)
+    research_source_fingerprint = _ordinary_report_source_fingerprint(
+        scan_id, summary_stage, task=import_task, analysis=analysis, evidence=research_evidence,
+    )
     selected_paths = {
         str(path) for path in (
             checkpoint.get("selected_paths")
@@ -2046,13 +2106,15 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
             or []
         ) if str(path)
     }
+    expected_node_members = {}
     if selected_paths:
         # Keep selected file results, and only node summaries still represented
         # by the current directory or current queued node jobs.
-        valid_node_paths = (
-            _preliminary_expected_node_paths(scan_id, selected_paths)
-            if summary_stage == "preliminary" else None
+        expected_node_members = (
+            _preliminary_expected_node_members(scan_id, selected_paths)
+            if summary_stage in {"preliminary", "deep"} else {}
         )
+        valid_node_paths = set(expected_node_members) if summary_stage in {"preliminary", "deep"} else None
         scoped = []
         for item in summaries:
             node_path = str((item.get("payload") or {}).get("node_path") or item.get("path") or "")
@@ -2067,6 +2129,10 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
                 and members.issubset(selected_paths)
                 and (valid_node_paths is None or node_path in valid_node_paths)
             ):
+                if valid_node_paths is not None and members != expected_node_members[node_path]:
+                    continue
+                if summary_stage == "deep" and (item.get("payload") or {}).get("member_source_fingerprint") != _node_member_source_fingerprint(scan_id, members, "deep"):
+                    continue
                 scoped.append(item)
         summaries = scoped
         analysis["selected_scope_paths"] = sorted(selected_paths)
@@ -2075,14 +2141,12 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         names = {str(item.get("path") or ""):str((item.get("payload") or {}).get("title") or "")
                  for item in summaries if item.get("type") == staged_summary_type(summary_stage,"node")}
         tree = analysis.get("analysis_tree") or {}
-        changed = False
         for node in _walk_analysis_nodes(tree):
             title = names.get("node:"+str(node.get("node_id") or ""))
             if title and ("待智能命名" in str(node.get("name") or "") or re.match(r"^主题\d+",str(node.get("name") or ""))):
                 node["name"] = title[:120]
-                changed = True
-        if changed:
-            storage.save_analysis(scan_id, analysis)
+        # This is a report-local title projection. Saving the directory here
+        # would invalidate the queued source fingerprint during this job.
     # O5: local-fallback summaries (raw text preview) stay in coverage counts
     # (``summary_quality`` below) but are never used as content evidence.
     content_summaries = (
@@ -2090,10 +2154,19 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         if Config.OVERVIEW_EXCLUDE_FALLBACK else summaries
     )
     aggregation_started = time.perf_counter()
+    # Ordinary evidence only, using the existing persistent index. Scope is
+    # filtered again by the opportunity module; no large QA access or writes.
+    analysis["research_evidence"] = research_evidence
+    analysis["research_goal"] = str(checkpoint.get("research_goal") or import_task.get("research_goal") or "")
+    if job_id:
+        _ensure_job_active(job_id)
+        storage.update_job(job_id, progress=15, stage="research_opportunities", message="正在盘点研究问题、条件与反证", heartbeat=True)
     report_data = build_local_report(
         scan_result, content_summaries, analysis,
-        content_findings=bool(Config.OVERVIEW_EVIDENCE_ALIGN),
+        content_findings=True,
     )
+    report_data["research_source_fingerprint"] = research_source_fingerprint
+    report_data["research_goal"] = analysis["research_goal"]
     if summary_stage == "preliminary" and source_fingerprint:
         report_data["source_fingerprint"] = source_fingerprint
     report_data.setdefault("pipeline_timing_ms", {})["local_overview_aggregation"] = round(
@@ -2105,6 +2178,9 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         report_data["summary_quality"] = {"stage":summary_stage,"file_summaries":len(stage_files),"node_summaries":len(stage_nodes),
             "degraded_file_summaries":sum(bool((s.get("parser_info") or {}).get("degraded")) for s in stage_files),
             "degraded_node_summaries":sum(bool((s.get("parser_info") or {}).get("degraded")) for s in stage_nodes)}
+        if selected_paths:
+            report_data["summary_quality"]["expected_node_summaries"] = len(expected_node_members)
+            report_data["summary_quality"]["missing_node_summaries"] = max(0, len(expected_node_members) - len(stage_nodes))
         if Config.OVERVIEW_EXCLUDE_FALLBACK:
             report_data["summary_quality"]["fallback_file_summaries"] = sum(is_fallback_summary(s) for s in stage_files)
             report_data["summary_quality"]["fallback_node_summaries"] = sum(is_fallback_summary(s) for s in stage_nodes)
@@ -2142,7 +2218,7 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
             report_data["structured_table_findings"] = statistics
             from services.tabular_document import table_research_direction
             direction = table_research_direction(table_documents)
-            if direction:
+            if direction and not report_data.get("research_version"):
                 report_data["recommended_research_direction"] = direction
             facts = list(statistics.get("key_facts") or [])
             report_data["key_findings"] = facts[:5] + list(statistics.get("conclusions") or []) + facts[5:] + [x for x in (report_data.get("key_findings") or []) if "抽样/首轮概览" not in str(x) and x != KEY_FINDINGS_PLACEHOLDER]
@@ -2276,10 +2352,52 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
     report_data.setdefault("pipeline_timing_ms", {})["overview_total_before_export"] = round(
         (time.perf_counter() - overview_started) * 1000, 2
     )
+    if report_data.get("research_version"):
+        direction = report_data.get("recommended_research_direction") or {}
+        candidates = {str(item.get("candidate_id") or ""): item
+                      for item in report_data.get("direction_candidates") or []
+                      if (item.get("quality_gate") or {}).get("status") == "passed"}
+        candidate = candidates.get(str(direction.get("candidate_id") or ""))
+        if candidate and (direction.get("quality_gate") or {}).get("status") == "passed":
+            publication_status = "passed"
+        elif direction.get("evidence_status") == "insufficient":
+            publication_status = "insufficient"
+        else:
+            raise ValueError("研究方向未通过当前范围候选闸门，也未明确标记证据不足，拒绝发布")
+        report_data["research_publication"] = {
+            "status": publication_status,
+            "version": report_data["research_version"],
+            "source_fingerprint": research_source_fingerprint,
+            "research_goal": analysis["research_goal"],
+        }
+        from services.ordinary_overview import build_overview_presentation, translate_overview
+        cached_chinese = {}
+        for previous_type in ("parsed_report", "preliminary_report", "deep_report", "report"):
+            previous_chinese = storage.get_summary(scan_id, ".", previous_type) or {}
+            cached_chinese.update((previous_chinese.get("overview_presentation") or {}).get("translations") or {})
+        chinese_model = llm if llm_generation_enabled and llm.configured else None
+        translation_started = time.perf_counter()
+        gate = background_generation() if background and Config.OVERVIEW_BACKGROUND_PRIORITY else nullcontext()
+        try:
+            with gate:
+                translations, translation_status = translate_overview(report_data, chinese_model, cached_chinese, explain=True)
+        except LocalModelError:
+            translations, translation_status = translate_overview(report_data, None, cached_chinese)
+            translation_status["status"] = "pending"
+        report_data["overview_presentation"] = build_overview_presentation(
+            report_data, translations, translation_status,
+        )
+        report_data.setdefault("pipeline_timing_ms", {})["overview_chinese_translation"] = round(
+            (time.perf_counter() - translation_started) * 1000, 2
+        )
     if summary_stage == "preliminary" and source_fingerprint:
         current_fingerprint = _preliminary_overview_source_fingerprint(scan_id)
         if current_fingerprint != source_fingerprint:
             raise ValueError("初步摘要在概览生成期间发生变化，拒绝保存过期情报概览")
+    if _ordinary_report_source_fingerprint(scan_id, summary_stage) != research_source_fingerprint:
+        raise ValueError("情报概览的范围、研究目标、目录或正文依据在生成期间发生变化，拒绝保存过期结果")
+    if job_id:
+        _ensure_job_active(job_id)
     report_summary_type = report_type or ("{}_report".format(summary_stage) if summary_stage else "report")
     if report_type == "deep_report" and report_data.get("summary_stage") == "legacy":
         report_data["summary_stage"] = "deep"
@@ -2308,8 +2426,15 @@ def _write_local_overview(scan_id, owner_id=None, job_id=None, summary_stage=Non
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         name = "情况概览报告_{}_{}_自动.docx".format(safe_name(Path(scan_result["root"]).name), stamp)
         create_report_docx(report_data, scan_result, _output_path_for_write(name, owner_id))
-        storage.save_artifact(name, owner_id, scan_id=scan_id, job_id=job_id, kind="overview_report")
+        if job_id:
+            _ensure_job_active(job_id)
     report_data["docx_file_name"] = name
+    if _ordinary_report_source_fingerprint(scan_id, summary_stage) != research_source_fingerprint:
+        raise ValueError("报告导出期间研究依据已变化，拒绝发布过期概览")
+    if job_id:
+        _ensure_job_active(job_id)
+    if not reuse_name:
+        storage.save_artifact(name, owner_id, scan_id=scan_id, job_id=job_id, kind="overview_report")
     storage.save_summary(scan_id, ".", report_summary_type, report_data)
     return {
         "file_name": name,
@@ -2801,6 +2926,9 @@ def _local_preliminary_summary(local_summary, path, reason):
 PRELIMINARY_SUMMARY_VERSION_PAIRS = frozenset({
     ("preview-source-blocks-v2", "preview-claims-evidence-v2"),
     ("preview-source-blocks-v2", "preview-claims-qualifiers-v3"),
+    ("preview-source-blocks-v3-sections", "preview-claims-qualifiers-v4-sections"),
+    ("preview-source-blocks-v3-sections", "preliminary-batch-claims-evidence-v3-sections"),
+    ("selective-6500-v3-research-sections", "compact-6500-qualifiers-v4-sections"),
     ("preview-source-blocks-v2", "preliminary-batch-claims-evidence-v2"),
     ("selective-6500-v2-source-ids", "compact-6500-evidence-v2"),
     ("selective-6500-v2-source-ids", "compact-6500-qualifiers-v3"),
@@ -2808,11 +2936,30 @@ PRELIMINARY_SUMMARY_VERSION_PAIRS = frozenset({
 })
 
 
+def _preliminary_summary_version_current(summary):
+    """Keep historical identifiers readable without reusing old model inputs."""
+    pair = (str(summary.get("summary_input_version") or ""),
+            str(summary.get("summary_prompt_version") or ""))
+    if pair in {
+        ("preview-source-blocks-v3-sections", "preview-claims-qualifiers-v4-sections"),
+        ("preview-source-blocks-v3-sections", "preliminary-batch-claims-evidence-v3-sections"),
+        ("selective-6500-v3-research-sections", "compact-6500-qualifiers-v4-sections"),
+        ("local-no-content-v1", "local-no-content-v1"),
+    }:
+        return True
+    # Existing local error fallbacks used the historical preview pair. They
+    # carry no successful old model analysis to mistake for the new recipe.
+    return (pair in PRELIMINARY_SUMMARY_VERSION_PAIRS
+            and str(summary.get("generated_by") or "").startswith("local-")
+            and bool((summary.get("parser_info") or {}).get("degraded")))
+
+
 def _preliminary_summary_content_fingerprint(summary):
     fields = (
         "title", "summary", "core_summary", "topics", "key_facts", "arguments",
         "methodology", "conclusions", "file_conclusions", "evidence_chain",
-        "limitations", "file_limitations", "structure_overview", "warnings",
+        "limitations", "file_limitations", "structure_overview", "warnings", "uncertainties",
+        "recommended_research_direction", "question", "answer", "claims", "evidence",
     )
     material = {field: (summary or {}).get(field) for field in fields}
     return hashlib.sha256(
@@ -2834,7 +2981,7 @@ def _preliminary_summary_identity(scan_id, path, summary=None, document=None):
         return None
     input_version = str(summary.get("summary_input_version") or "")
     prompt_version = str(summary.get("summary_prompt_version") or "")
-    if (input_version, prompt_version) not in PRELIMINARY_SUMMARY_VERSION_PAIRS:
+    if not _preliminary_summary_version_current(summary):
         return None
     return {
         "path": str(path),
@@ -2846,6 +2993,8 @@ def _preliminary_summary_identity(scan_id, path, summary=None, document=None):
 
 
 def _preliminary_member_source_fingerprint(file_summaries):
+    from services.folder_analysis import NODE_SUMMARY_INPUT_VERSION
+    from services.research_elements import ELEMENT_VERSION
     rows = []
     for item in file_summaries or []:
         path = str((item or {}).get("path") or "")
@@ -2859,12 +3008,38 @@ def _preliminary_member_source_fingerprint(file_summaries):
     if not rows:
         return ""
     payload = {
-        "contract": "preliminary-node-members-v3",
+        "contract": "preliminary-node-members-v4-research",
+        "node_input_version": NODE_SUMMARY_INPUT_VERSION,
+        "research_elements_version": ELEMENT_VERSION,
         "members": sorted(rows),
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _node_member_source_fingerprint(scan_id, member_paths, summary_stage=None):
+    """Bind non-preliminary node caches to both body and summary contents."""
+    from services.folder_analysis import NODE_SUMMARY_INPUT_VERSION
+    from services.research_elements import ELEMENT_VERSION
+    rows = []
+    for path in sorted(set(member_paths or [])):
+        summary_type = staged_summary_type(summary_stage, "file") if summary_stage else "file"
+        summary = storage.get_summary(scan_id, path, summary_type) or {}
+        document = storage.get_document(scan_id, path) or {}
+        if not summary or not document:
+            return ""
+        rows.append((path, document_source_fingerprint(document),
+                     summary.get("source_fingerprint"),
+                     summary.get("summary_input_version"), summary.get("summary_prompt_version"),
+                     _preliminary_summary_content_fingerprint(summary)))
+    if not rows:
+        return ""
+    return hashlib.sha256(json.dumps({
+        "node_input_version": NODE_SUMMARY_INPUT_VERSION,
+        "research_elements_version": ELEMENT_VERSION,
+        "stage": summary_stage or "legacy", "members": rows,
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _queue_preliminary_file_summaries(scan_id, owner_id=None):
@@ -2915,10 +3090,7 @@ def _queue_preliminary_file_summaries(scan_id, owner_id=None):
         if (
             is_preliminary
             and summary.get("source_fingerprint") == current_fingerprint
-            and (
-                summary.get("summary_input_version"),
-                summary.get("summary_prompt_version"),
-            ) in PRELIMINARY_SUMMARY_VERSION_PAIRS
+            and _preliminary_summary_version_current(summary)
         ):
             continue
         local_summary = storage.get_summary(scan_id, path, "file") or {}
@@ -2973,8 +3145,8 @@ def _queue_preliminary_file_summaries(scan_id, owner_id=None):
                 "workflow_source": "preliminary_model_summary",
                 "deep_batch_id": checkpoint.get("deep_batch_id"),
                 "source_fingerprint": current_fingerprint,
-                "summary_input_version": "preview-source-blocks-v2",
-                "summary_prompt_version": "preview-claims-evidence-v2",
+                "summary_input_version": "preview-source-blocks-v3-sections",
+                "summary_prompt_version": "preview-claims-qualifiers-v4-sections",
             },
             owner_id=owner_id or "legacy",
         )
@@ -3163,14 +3335,14 @@ def _queue_preliminary_node_summaries(scan_id, owner_id=None):
         storage.update_import_task(scan_id, checkpoint=checkpoint)
     return node_job_ids
 
-def _preliminary_expected_node_paths(scan_id, selected_paths=None):
+def _preliminary_expected_node_members(scan_id, selected_paths=None):
     selected = {str(path) for path in (selected_paths or []) if str(path)}
     if not selected:
-        return set()
-    valid_ids = set()
+        return {}
+    valid_members = {}
     analysis_tree = (storage.get_analysis(scan_id) or {}).get("analysis_tree") or {}
-    nodes = list(_walk_analysis_nodes(analysis_tree))
-    nodes.extend((_build_candidate_preview_directory(scan_id) or {}).get("topics") or [])
+    nodes = list((_build_candidate_preview_directory(scan_id) or {}).get("topics") or [])
+    nodes.extend(_walk_analysis_nodes(analysis_tree))
     for node in nodes:
         node_id = str(node.get("node_id") or "")
         members = {
@@ -3178,7 +3350,7 @@ def _preliminary_expected_node_paths(scan_id, selected_paths=None):
             if str(path)
         }
         if node_id and members and members.issubset(selected):
-            valid_ids.add(node_id)
+            valid_members.setdefault(node_id, members)
     task = storage.get_import_task(scan_id) or {}
     checkpoint = task.get("checkpoint") or {}
     job_ids = [
@@ -3203,8 +3375,12 @@ def _preliminary_expected_node_paths(scan_id, selected_paths=None):
                 str(path) for path in (options.get("member_paths") or []) if str(path)
             }
             if node_id and members and members.issubset(selected):
-                valid_ids.add(node_id)
-    return {"node:" + node_id for node_id in valid_ids}
+                valid_members.setdefault(node_id, members)
+    return {"node:" + node_id: members for node_id, members in valid_members.items()}
+
+
+def _preliminary_expected_node_paths(scan_id, selected_paths=None):
+    return set(_preliminary_expected_node_members(scan_id, selected_paths))
 
 
 def _preliminary_overview_source_fingerprint(scan_id):
@@ -3235,7 +3411,8 @@ def _preliminary_overview_source_fingerprint(scan_id):
             summary.get("generated_at"),
         ))
     nodes = []
-    expected_node_paths = _preliminary_expected_node_paths(scan_id, selected)
+    expected_node_members = _preliminary_expected_node_members(scan_id, selected)
+    expected_node_paths = set(expected_node_members)
     for row in storage.list_summaries(scan_id):
         payload = row.get("payload") or {}
         node_path = str(payload.get("node_path") or row.get("path") or "")
@@ -3244,9 +3421,12 @@ def _preliminary_overview_source_fingerprint(scan_id):
         })
         if (
             node_path in expected_node_paths
+            and row.get("type") == staged_summary_type("preliminary", "node")
             and str(payload.get("analysis_stage") or "").lower() == "preliminary"
             and members and set(members).issubset(selected)
         ):
+            if set(members) != expected_node_members[node_path]:
+                return ""
             expected_member_fingerprint = _preliminary_member_source_fingerprint(
                 [current_identities[path] for path in members]
             )
@@ -3255,9 +3435,17 @@ def _preliminary_overview_source_fingerprint(scan_id):
             nodes.append((
                 node_path, payload.get("member_source_fingerprint"),
                 payload.get("generated_at"),
+                _preliminary_summary_content_fingerprint(payload),
             ))
+    if {row[0] for row in nodes} != expected_node_paths:
+        return ""
     material = {
-        "contract": "preliminary-overview-source-v3",
+        "contract": "preliminary-overview-source-v4-research",
+        "overview_presentation_version": __import__("services.ordinary_overview", fromlist=["VERSION"]).VERSION,
+        "research_version": __import__("services.research_opportunities", fromlist=["RESEARCH_VERSION"]).RESEARCH_VERSION,
+        "research_goal": checkpoint.get("research_goal") or task.get("research_goal"),
+        "directory": (storage.get_analysis(scan_id) or {}).get("analysis_tree"),
+        "evidence_fingerprint": _ordinary_research_current_evidence_fingerprint(scan_id, selected),
         "selection_version": checkpoint.get("selection_version"),
         "files": files,
         "nodes": sorted(nodes),
@@ -3265,6 +3453,86 @@ def _preliminary_overview_source_fingerprint(scan_id):
     return hashlib.sha256(
         json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _ordinary_research_evidence_fingerprint(evidence, selected_paths=None):
+    """Hash ordinary persisted body cards without retaining another body copy."""
+    selected = {str(path) for path in (selected_paths or []) if str(path)}
+    digest = hashlib.sha256()
+    rows = []
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        paths = [str(item.get(key) or "") for key in ("source_path", "archive_source_path")]
+        if selected and not any(path == member or path.startswith(member + "::")
+                                for path in paths for member in selected):
+            continue
+        rows.append((str(item.get("source_path") or ""), str(item.get("evidence_id") or ""),
+                     hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True,
+                                               default=str).encode("utf-8")).hexdigest()))
+    for row in sorted(rows):
+        digest.update(json.dumps(row, ensure_ascii=False).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _ordinary_research_current_evidence_fingerprint(scan_id, selected_paths=None):
+    """Stream the same ordinary index for rechecks, keeping body memory bounded."""
+    def cards(rows):
+        for row in rows:
+            try:
+                item = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(item, dict):
+                yield item
+    with storage._connect() as conn:
+        rows = conn.execute("SELECT payload FROM evidence_index WHERE scan_id=? ORDER BY rowid", (str(scan_id),))
+        return _ordinary_research_evidence_fingerprint(cards(rows), selected_paths)
+
+
+def _ordinary_report_source_fingerprint(scan_id, summary_stage=None, task=None,
+                                        analysis=None, evidence=None):
+    """Current scope, recipe and body identity for every ordinary report stage."""
+    from services.research_opportunities import RESEARCH_VERSION
+    from services.ordinary_overview import VERSION as OVERVIEW_PRESENTATION_VERSION
+    task = (storage.get_import_task(scan_id) or {}) if task is None else task
+    checkpoint = task.get("checkpoint") or {}
+    analysis = (storage.get_analysis(scan_id) or {}) if analysis is None else analysis
+    selected = sorted({str(path) for path in (checkpoint.get("selected_paths")
+                       or checkpoint.get("deep_selected_paths") or []) if str(path)})
+    rows = []
+    allowed_types = (
+        {staged_summary_type(summary_stage, kind) for kind in ("file", "node")}
+        if summary_stage in {"preliminary", "deep"}
+        else {"file", "folder"} | {staged_summary_type(stage, kind)
+                                   for stage in ("preliminary", "deep") for kind in ("file", "node")}
+    )
+    for row in storage.list_summaries(scan_id):
+        if row.get("type") not in allowed_types:
+            continue
+        payload = row.get("payload") or {}
+        path = str(payload.get("node_path") or row.get("path") or "")
+        members = {str(p) for p in payload.get("member_paths") or []}
+        if selected and path not in selected and not (path.startswith("node:") and members and members.issubset(selected)):
+            continue
+        rows.append((path, row.get("type"), payload.get("source_fingerprint"),
+                     payload.get("member_source_fingerprint"), payload.get("summary_input_version"),
+                     payload.get("summary_prompt_version"), _preliminary_summary_content_fingerprint(payload)))
+    evidence_fingerprint = (
+        _ordinary_research_current_evidence_fingerprint(scan_id, selected)
+        if evidence is None else _ordinary_research_evidence_fingerprint(evidence, selected)
+    )
+    material = {
+        "research_version": RESEARCH_VERSION, "overview_presentation_version": OVERVIEW_PRESENTATION_VERSION,
+        "stage": summary_stage or "legacy",
+        "research_goal": str(checkpoint.get("research_goal") or task.get("research_goal") or ""),
+        "selection_version": int(checkpoint.get("selection_version") or 0),
+        "selected_paths": selected, "directory": analysis.get("analysis_tree"),
+        "summaries": sorted(rows),
+        "evidence": evidence_fingerprint,
+    }
+    return hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True,
+                                     default=str).encode("utf-8")).hexdigest()
 
 
 def _queue_preliminary_overview(scan_id, owner_id=None):
@@ -3363,7 +3631,10 @@ def _preliminary_chain_ready_for_idle(scan_id):
         report = conn.execute("SELECT status FROM analysis_jobs WHERE id=? AND scan_id=?", (report_id, str(scan_id))).fetchone()
     if not report or str(report["status"] or "") != "completed":
         return False
-    return all(states.get(job_id) == "completed" for job_id in ids)
+    current_fingerprint = _preliminary_overview_source_fingerprint(scan_id)
+    published = storage.get_summary(scan_id, ".", "preliminary_report") or {}
+    return bool(current_fingerprint and published.get("source_fingerprint") == current_fingerprint
+                and all(states.get(job_id) == "completed" for job_id in ids))
 
 
 DEEP_BACKFILL_MAX_FAILURES = max(1, int(os.getenv("SJFX_DEEP_BACKFILL_MAX_FAILURES", "3")))
@@ -3545,7 +3816,8 @@ def _legacy_deep_report_fingerprint(scan_id):
         for row in rows
     ]
     return hashlib.sha256(
-        json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        json.dumps({"summaries": material, "research_source": _ordinary_report_source_fingerprint(scan_id)},
+                   ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 
@@ -3661,7 +3933,12 @@ def _queue_deep_node_rebuilds(
         node_path = "node:{}".format(node_id)
         existing = _deep_node(node_path)
         existing_members = {str(path) for path in (existing.get("member_paths") or []) if str(path)}
-        if str(existing.get("analysis_depth") or "") == "deep_folder" and bool(existing.get("deep_analysis")) and existing_members == members:
+        member_fingerprint = _node_member_source_fingerprint(
+            scan_id, members, "deep" if strict_selected else None,
+        )
+        if (str(existing.get("analysis_depth") or "") == "deep_folder"
+                and bool(existing.get("deep_analysis")) and existing_members == members
+                and member_fingerprint and existing.get("member_source_fingerprint") == member_fingerprint):
             continue
         job_id, _created = storage.create_or_get_typed_job(
             scan_id,
@@ -3674,6 +3951,7 @@ def _queue_deep_node_rebuilds(
                 "workflow_source": "deep_node_rebuild",
                 "analysis_level": "deep",
                 "member_paths": sorted(members),
+                "member_source_fingerprint": member_fingerprint,
                 "deep_batch_id": batch_id or None,
             },
             owner_id=owner_id or "legacy",
@@ -3870,6 +4148,8 @@ def _run_claimed_summary_job(job):
             return generate_ready_results(llm, storage, job, _local_document_fallback)
     if options.get("workflow_source") in {"idle_deep_model_summary", "deep_node_rebuild"}:
         from services.import_checkpoint import CheckpointedModel
+        from services.folder_analysis import NODE_SUMMARY_INPUT_VERSION
+        from services.research_elements import ELEMENT_VERSION
         import hashlib
         identity = {
             "scan_id": str(job.get("scan_id") or ""),
@@ -3877,7 +4157,19 @@ def _run_claimed_summary_job(job):
             "path": str(options.get("path") or ""),
             "node_id": str(options.get("node_id") or ""),
             "member_paths": sorted(str(path) for path in (options.get("member_paths") or []) if str(path)),
+            "node_input_version": NODE_SUMMARY_INPUT_VERSION,
+            "research_elements_version": ELEMENT_VERSION,
         }
+        if options.get("workflow_source") == "deep_node_rebuild":
+            checkpoint = (storage.get_import_task(job.get("scan_id")) or {}).get("checkpoint") or {}
+            identity["member_source_fingerprint"] = _node_member_source_fingerprint(
+                job.get("scan_id"), identity["member_paths"],
+                "deep" if checkpoint.get("selected_paths") else None,
+            )
+        else:
+            identity["source_fingerprint"] = document_source_fingerprint(
+                storage.get_document(job.get("scan_id"), identity["path"]) or {},
+            )
         checkpoint_key = "import:" + hashlib.sha256(
             json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -3969,10 +4261,15 @@ def _prepare_node_summary(scan_id, payload):
             "file_count": len(set(member_paths)),
         }
     workflow_source = str(payload.get("workflow_source") or "")
-    summary_stage = "deep" if workflow_source == "deep_node_rebuild" else (
+    task_checkpoint = (storage.get_import_task(scan_id) or {}).get("checkpoint") or {}
+    summary_stage = "deep" if (workflow_source == "deep_node_rebuild" and task_checkpoint.get("selected_paths")) else (
         "preliminary" if workflow_source == "preliminary_node_summary" else None
     )
     context = _virtual_node_context(scan_id, node, summary_stage=summary_stage)
+    planned_members = {str(path) for path in payload.get("member_paths") or [] if str(path)}
+    if ((summary_stage or workflow_source == "deep_node_rebuild") and planned_members
+            and planned_members != set(context.get("member_paths") or [])):
+        raise ValueError("节点成员范围已变化，请按当前目录重新排队")
     declared_count = int(
         node.get("file_count")
         or plan.get("selected_file_count")
@@ -3981,6 +4278,8 @@ def _prepare_node_summary(scan_id, payload):
     )
     if not context.get("file_summaries_complete"):
         raise ValueError("候选节点仍有文件摘要未完成，不能生成节点摘要")
+    if workflow_source == "deep_node_rebuild" and not context.get("deep_file_summaries_complete"):
+        raise ValueError("深度节点仍有成员深度摘要未就绪，不能生成节点摘要")
     expected_member_fingerprint = str(payload.get("member_source_fingerprint") or "")
     if expected_member_fingerprint and context.get("member_source_fingerprint") != expected_member_fingerprint:
         raise ValueError("节点成员文件摘要版本已变化，请重新排队")
@@ -3989,6 +4288,7 @@ def _prepare_node_summary(scan_id, payload):
         "declared_count": declared_count, "workflow_source": workflow_source,
         "is_deep_node": workflow_source == "deep_node_rebuild",
         "is_preliminary_node": workflow_source == "preliminary_node_summary",
+        "summary_stage": summary_stage,
     }
 
 
@@ -4008,6 +4308,12 @@ def _generate_node_summary(scan_id, prepared, node_llm):
     workflow_source = prepared["workflow_source"]
     context["analysis_level"] = "deep" if is_deep_node else "preview"
     generated, result, errors = analyze_folder(node_llm, context, node.get("name") or "node:{}".format(node_id))
+    batching = generated.get("node_summary_batching") or {}
+    incomplete_model_input = (
+        batching.get("model_input_files", context.get("file_summary_count", 0))
+        < context.get("file_summary_count", 0)
+        or bool(batching.get("degraded_batches"))
+    )
     member_documents = {path: storage.get_document(scan_id, path) for path in context.get("member_paths") or []}
     table_members = {path:d for path,d in member_documents.items() if (d or {}).get("parser", {}).get("name") == "structured-table"}
     if table_members:
@@ -4055,7 +4361,7 @@ def _generate_node_summary(scan_id, prepared, node_llm):
         "parser_info": {"local_model": result.get("model"), "usage": result.get("usage") or {},
                         "file_summary_count": context.get("file_summary_count") or 0,
                         "file_summaries_complete": bool(context.get("file_summaries_complete")),
-                        "batch_errors": errors, "degraded": bool(errors or not result.get("model"))},
+                        "batch_errors": errors, "degraded": bool(errors or not result.get("model") or incomplete_model_input)},
     })
     generated["coverage"] = {
         **dict(generated.get("coverage") or {}),
@@ -4070,7 +4376,7 @@ def _generate_node_summary(scan_id, prepared, node_llm):
         "scope_limited": bool(node.get("member_paths_lazy") or plan.get("schema_version")),
         "claim_scope": "模型结论仅适用于选定范围内已进入模型的文件；类别计数覆盖完整类别清单。",
         "verification_status": (
-            "verified" if is_deep_node and not errors and result.get("model")
+            "verified" if is_deep_node and not errors and result.get("model") and not incomplete_model_input
             else "partial"
         ),
     }
@@ -4086,9 +4392,14 @@ def _generate_node_summary(scan_id, prepared, node_llm):
             raise ValueError("节点摘要生成期间成员文件或摘要版本发生变化，拒绝保存过期结果")
         summary_type = staged_summary_type("preliminary", "node")
     elif is_deep_node:
-        summary_type = staged_summary_type("deep", "node")
+        if (_node_member_source_fingerprint(scan_id, context.get("member_paths"), prepared.get("summary_stage"))
+                != context.get("member_source_fingerprint")):
+            raise ValueError("深度节点生成期间成员正文或摘要已变化，拒绝保存过期结果")
+        summary_type = staged_summary_type("deep", "node") if prepared.get("summary_stage") == "deep" else "folder"
     else:
         summary_type = "folder"
+    if prepared.get("job_id"):
+        _ensure_job_active(prepared["job_id"])
     storage.save_summary(scan_id, generated["node_path"], summary_type, generated)
     return {"summary": generated, "errors": errors, "model": result.get("model")}
 
@@ -4422,6 +4733,7 @@ def _execute_summary_job(job):
     }:
         workflow_source = str(payload.get("workflow_source") or "")
         prepared = _prepare_node_summary(scan_id, payload)
+        prepared["job_id"] = job_id
         node_id = prepared["node_id"]
         is_preliminary_node = prepared["is_preliminary_node"]
         if is_preliminary_node:
@@ -4473,9 +4785,16 @@ def _execute_summary_job(job):
     # Reuse the established summary implementation under an isolated request
     # context. The web route has no model call after the async gate below.
     # The route enforces scan ownership.  A Worker has no browser request, so
-    # explicitly carry the job's owner token into this internal request rather
-    # than letting the task fail as an anonymous caller.
-    with _summary_worker_execution_context():
+    # Bind the persisted task owner as a regular user. Request payload fields
+    # cannot choose this identity, and the ContextVar token restores any outer
+    # identity even when the route raises. Never give an internal job the
+    # administrator's unfiltered view.
+    job_owner = str(job.get("owner_id") or "").strip()
+    if not job_owner:
+        raise ValueError("摘要任务缺少资料归属，拒绝执行")
+    with _summary_worker_execution_context(), _multiuser_runtime.current_user_scope({
+        "owner_id": job_owner, "role": "user",
+    }):
         with app.test_request_context(
             "/api/summary",
             method="POST",
@@ -4935,8 +5254,8 @@ def _run_claimed_analysis_job(job):
                 if source_fingerprint:
                     summary_options.update({
                         "source_fingerprint": source_fingerprint,
-                        "summary_input_version": "preview-source-blocks-v2",
-                        "summary_prompt_version": "preview-claims-evidence-v2",
+                        "summary_input_version": "preview-source-blocks-v3-sections",
+                        "summary_prompt_version": "preview-claims-qualifiers-v4-sections",
                     })
             summary_job_id, _created = storage.create_or_get_typed_job(
                 scan_id, "generate_summary", options=summary_options,
@@ -5246,16 +5565,26 @@ def _translation_candidate_paths(scan_id, phase):
                 if translation.get("full_translation"):
                     continue
                 if translation.get("source_level") == "full" and translation.get("status") == "failed":
-                    # Older builds treated harmless prose line-wrap changes as
-                    # hard failures. Retry those stale records once under the
-                    # relaxed contract, while keeping unavailable models and
-                    # real table/token failures out of an infinite loop.
+                    # Retry old heuristic-only failures under the current file
+                    # policy once. Do not loop over failures already evaluated
+                    # with this contract or basic/provider errors.
                     error_codes = {
                         str(error.get("code") or error)
                         if isinstance(error, dict) else str(error)
                         for error in (translation.get("errors") or [])
                     }
-                    if error_codes != {"line_structure_changed"}:
+                    advisory_codes = {
+                        "line_structure_changed", "protected_token_mismatch",
+                        "glossary_term_missing", "target_contains_untranslated_text",
+                        "implausible_length_ratio", "table_structure_changed",
+                    }
+                    service = (file_translation_service
+                               if Config.TRANSLATION_FILE_BACKEND == "vllm"
+                               else offline_file_translation_service)
+                    if (
+                        not error_codes or not error_codes.issubset(advisory_codes)
+                        or translation.get("contract_version") == service.policy.contract_version
+                    ):
                         continue
             candidates.append(path)
         representatives = set((storage.get_content_map(scan_id) or {}).get("representative_paths") or [])
@@ -5290,7 +5619,8 @@ def _is_large_translation_source(scan_id):
 
 
 def _large_package_owner_id(owner_id=None):
-    return str(owner_id or _effective_owner())
+    # Translation reads use the query filter, including admin's all-owner None.
+    return str(owner_id) if owner_id is not None else _request_owner_id()
 
 
 def _large_translation_target(package_id, node_path, owner_id=None):
@@ -5428,61 +5758,11 @@ def _large_translation_item(package_id, row, state=None):
 
 
 def _large_translation_page(package_id, offset=0, limit=100, query="", statuses=None, language="all"):
-    """Return a bounded translation work list backed by large_package.db."""
-    offset = max(0, int(offset or 0))
-    limit = max(1, min(500, int(limit or 100)))
-    query = str(query or "").strip().casefold()
-    wanted = {str(value).strip() for value in (statuses or []) if str(value).strip()}
-    wanted = {"not_started" if value == "pending" else value for value in wanted}
-    language = str(language or "all").strip().lower()
-    package = _large_package_owned(package_id)
-    matches = []
-    status_counts, language_counts = {}, {}
-    scan_offset = 0
-    while True:
-        page = large_package_store.file_page(package_id, limit=500, offset=scan_offset)
-        rows = page.get("files") or []
-        if not rows:
-            break
-        for row in rows:
-            path = str(row.get("path") or "")
-            state = storage.get_translation(package_id, path, hydrate=False) or {}
-            item = _large_translation_item(package_id, row, state)
-            item_status = str(item.get("status") or "not_started")
-            item_language = str(item.get("source_language") or "unknown").lower()
-            status_counts[item_status] = status_counts.get(item_status, 0) + 1
-            language_counts[item_language] = language_counts.get(item_language, 0) + 1
-            if wanted and item_status not in wanted:
-                continue
-            if language not in {"", "all"}:
-                if language == "foreign":
-                    if item_language in {"zh", "zh-cn", "zh-hans"}:
-                        continue
-                elif item_language != language:
-                    continue
-            if query:
-                haystack = " ".join((path, str(row.get("name") or ""),
-                                      str((item.get("titles") or {}).get("original") or ""),
-                                      str((item.get("titles") or {}).get("translated") or ""))).casefold()
-                if query not in haystack:
-                    continue
-            matches.append(item)
-        scan_offset += len(rows)
-        if scan_offset >= int(page.get("total") or 0):
-            break
-    total = len(matches)
-    items = matches[offset:offset + limit]
-    next_offset = offset + len(items)
-    return {
-        "items": items, "offset": offset, "limit": limit, "total": total,
-        "next_offset": next_offset if next_offset < total else None,
-        "has_more": next_offset < total,
-        "status": next(iter(wanted)) if len(wanted) == 1 else None,
-        "statuses": sorted(wanted), "language": language, "query": query,
-        "unfiltered_total": sum(status_counts.values()),
-        "status_counts": status_counts, "language_counts": language_counts,
-        "package_id": package.get("id"),
-    }
+    from services.large_translation_catalog import list_large_translation_page
+    return list_large_translation_page(
+        _large_package_owned(package_id), large_package_store, storage,
+        offset=offset, limit=limit, query=query, statuses=statuses, language=language,
+    )
 
 
 def _translation_document(scan_id, node_path, source_level):
@@ -5962,7 +6242,7 @@ def _prepare_import_translations(scan_id, job_id, documents, policy, priority_pa
 
 
 def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_units=None,
-                            translation_backend=None, owner_id=None):
+                            translation_backend=None, owner_id=None, job_progress_range=None):
     document = (
         _large_translation_document(scan_id, node_path, source_level=source_level, owner_id=owner_id)
         if _is_large_translation_source(scan_id)
@@ -5980,20 +6260,35 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
         state["full_translation"] = bool(
             source_level == "full" and state.get("status") in {"completed", "not_required"}
         )
-        storage.save_translation(scan_id, node_path, state)
-        if job_id and time.monotonic() - checkpoint_state["last"] >= 1.0:
+        # Checkpoints persist usable text, while the final save publishes the
+        # paired evidence index once. FTS metadata is unindexed; rebuilding it
+        # per unit can block every job heartbeat behind a database writer lock.
+        storage.save_translation(scan_id, node_path, state, index_evidence=False)
+        if job_id and (
+            time.monotonic() - checkpoint_state["last"] >= 1.0
+            or state.get("status") in {"completed", "not_required"}
+        ):
             checkpoint_state["last"] = time.monotonic()
             progress = state.get("progress") or {}
+            progress_update = {}
+            if job_progress_range is not None:
+                start, end = job_progress_range
+                required = max(1, int(progress.get("required_units") or 0))
+                ratio = min(1.0, int(progress.get("completed_units") or 0) / required)
+                if state.get("status") in {"completed", "not_required"}:
+                    ratio = 1.0
+                progress_update["progress"] = min(94, int(start + (end - start) * ratio))
             storage.update_job(
                 job_id,
                 message="正在翻译 {}：{}/{} 个翻译单元".format(
                     node_path, progress.get("completed_units", 0), progress.get("required_units", 0)
                 ),
                 current_stage="文档翻译", current_file=node_path, heartbeat=True,
+                **progress_update,
             )
 
     translate = (file_translation_service.translate_document
-                 if translation_backend == "vllm" else _translate_document_serialized)
+                 if translation_backend == "vllm" else _translate_file_document_serialized)
     result = translate(
         document,
         resume_state=previous,
@@ -6001,11 +6296,14 @@ def _translate_one_document(scan_id, node_path, source_level, job_id=None, max_u
         checkpoint_callback=checkpoint,
         cancel_check=(lambda: storage.is_job_cancel_requested(job_id)) if job_id else None,
     )
-    before_completed = int(((previous or {}).get("progress") or {}).get("completed_units") or 0)
-    after_completed = int((result.get("progress") or {}).get("completed_units") or 0)
     # A slice that translated nothing new must not be re-queued immediately;
-    # the caller falls back to the slower retry round in that case.
-    result["slice_advanced"] = after_completed > before_completed
+    # a policy/provider change can create a new plan with fewer completed units
+    # than the old checkpoint, so count this run's successful work directly.
+    result["slice_advanced"] = any(
+        unit.get("translation_required") and unit.get("status") == "completed"
+        and not unit.get("reused_from")
+        for unit in result.get("units") or []
+    )
     result["source_level"] = source_level
     if translation_backend == "vllm":
         result["translation_mode"] = "vllm"
@@ -6210,7 +6508,8 @@ def _run_claimed_large_translation_job(job):
             current_stage="大数据包文件翻译", current_file=node_path, heartbeat=True,
         )
         result = _translate_one_document(package_id, node_path, source_level,
-                                         job_id=job_id, owner_id=owner_id, **model_options)
+                                         job_id=job_id, owner_id=owner_id,
+                                         job_progress_range=(5, 94), **model_options)
         _ensure_job_active(job_id)
         progress = result.get("progress") or {}
         if backend == "vllm" and progress.get("pending_units") and result.get("slice_advanced", True):
@@ -6266,7 +6565,10 @@ def _run_claimed_large_translation_job(job):
                 state_status = "completed"
             source_level = "full" if state_status == "completed" else "preview"
             result = _translate_one_document(package_id, node_path, source_level,
-                                             job_id=job_id, owner_id=owner_id, **model_options)
+                                             job_id=job_id, owner_id=owner_id,
+                                             job_progress_range=(4 + 90 * (index - 1) / max(1, len(current)),
+                                                                 4 + 90 * index / max(1, len(current))),
+                                             **model_options)
             _ensure_job_active(job_id)
             progress = result.get("progress") or {}
             if backend == "vllm" and progress.get("pending_units") and result.get("slice_advanced", True):
@@ -6335,7 +6637,8 @@ def _run_claimed_translation_job(job):
             job_id, progress=5, stage="translating", message="正在准备文档翻译",
             current_stage="文档翻译", current_file=node_path, heartbeat=True,
         )
-        result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id, **model_options)
+        result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id,
+                                         job_progress_range=(5, 94), **model_options)
         _ensure_job_active(job_id)
         progress = result.get("progress") or {}
         if translation_backend == "vllm" and progress.get("pending_units") and result.get("slice_advanced", True):
@@ -6393,7 +6696,10 @@ def _run_claimed_translation_job(job):
                 _promote_for_translation(scan_id, scan_result, node_path, job_id)
                 state = "completed"
             source_level = "full" if state == "completed" else "preview"
-            result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id, **model_options)
+            result = _translate_one_document(scan_id, node_path, source_level, job_id=job_id,
+                                             job_progress_range=(4 + 90 * (index - 1) / max(1, len(current)),
+                                                                 4 + 90 * index / max(1, len(current))),
+                                             **model_options)
             _ensure_job_active(job_id)
             progress = result.get("progress") or {}
             if translation_backend == "vllm" and progress.get("pending_units") and result.get("slice_advanced", True):
@@ -6484,6 +6790,7 @@ def _run_claimed_scan_and_analyze_job(job):
     """Inventory a filesystem path asynchronously, then run the normal workflow."""
     job_id = job["id"]
     options = job.get("options") or {}
+    owner_id = job.get("owner_id")
     storage.update_import_task(job_id, status="scanning", phase="scanning")
     root_path = str(options.get("root_path") or "").strip()
     if not root_path:
@@ -6493,7 +6800,7 @@ def _run_claimed_scan_and_analyze_job(job):
     # the next slice, continue from file checkpoints instead of rescanning a
     # potentially slow NAS tree.
     existing_scan = storage.get_scan(
-        job_id, owner_id=options.get("owner_id") or job.get("owner_id")
+        job_id, owner_id=owner_id
     )
     if existing_scan and existing_scan.get("inventory_complete"):
         scan_result = existing_scan
@@ -6514,7 +6821,7 @@ def _run_claimed_scan_and_analyze_job(job):
         job_id, progress=1, stage="scanning", message="正在验证并扫描目录", heartbeat=True,
         current_stage="目录扫描", current_file=root_path,
     )
-    resolved_root = _resolve_allowed_scan_root(root_path)
+    resolved_root = _resolve_allowed_scan_root(root_path, owner_id=owner_id)
     if scan_result is None:
         saved_cursor = storage.get_inventory_cursor(job_id)
         if saved_cursor:
@@ -6536,7 +6843,7 @@ def _run_claimed_scan_and_analyze_job(job):
         )
         scan_result = storage.save_inventory_slice(
             job_id, resolved_root, scan_slice["cursor"], scan_slice["records"],
-            owner_id=options.get("owner_id") or job.get("owner_id") or "legacy",
+            owner_id=owner_id or "legacy",
             parse_mode=options.get("parse_mode"), complete=scan_slice["complete"],
         )
         preview_paths = [str(item.get("path") or item.get("node_path") or "") for item in (scan_slice.get("records") or []) if item.get("kind") == "file" and (item.get("path") or item.get("node_path"))]
@@ -6717,8 +7024,15 @@ def index():
     return response
 
 
+@app.route("/api/file-capabilities")
+def file_capabilities():
+    from services.file_capabilities import capability_matrix
+    return jsonify({"ok": True, **capability_matrix()})
+
+
 @app.route("/api/status")
 def status():
+    from services.file_capabilities import DOCUMENT_EXTENSIONS, ARCHIVE_EXTENSIONS
     runtime = _python_runtime_status()
     return jsonify({
         "ok": True,
@@ -6743,7 +7057,8 @@ def status():
         "state_dir": str(Config.DATA_DIR),
         "sqlite_network_filesystem_allowed": os.getenv("SJFX_ALLOW_NETWORK_SQLITE", "0").strip().lower() in {"1", "true", "yes"},
         "document_parser": parser.status(),
-        "supported_inputs": ["PDF", "Word", "PowerPoint", "Excel", "CSV/XLSX/JSON 数据画像", "图片 OCR", "文本/Markdown/HTML", "ZIP/TAR/TAR.GZ/TAR.BZ2 压缩包"],
+        "supported_inputs": sorted(DOCUMENT_EXTENSIONS | ARCHIVE_EXTENSIONS),
+        "file_capabilities_url": "/api/file-capabilities",
         "local_features": [
             "Office 内嵌图片 OCR", "SHA-256 去重", "SimHash+LSH 聚类",
             "BM25/FTS 候选召回 + {} + 证据质量重排".format(
@@ -6811,9 +7126,9 @@ def status():
                 "enabled": Config.ENABLE_TRANSLATION,
                 "provider": translation_provider.provider_id,
                 "configured_provider": Config.TRANSLATION_PROVIDER,
-                "device": getattr(translation_provider, "device", "cpu") if Config.TRANSLATION_PROVIDER == "offline_nllb" else "local",
-                "batch_size": Config.TRANSLATION_BATCH_SIZE if Config.TRANSLATION_PROVIDER == "offline_nllb" else 1,
-                "cpu_threads": Config.TRANSLATION_CPU_THREADS if Config.TRANSLATION_PROVIDER == "offline_nllb" else None,
+                "device": getattr(translation_provider, "device", "cpu") if Config.TRANSLATION_PROVIDER in {"offline_nllb", "offline_quickmt"} else "local",
+                "batch_size": Config.TRANSLATION_BATCH_SIZE if Config.TRANSLATION_PROVIDER in {"offline_nllb", "offline_quickmt"} else 1,
+                "cpu_threads": Config.TRANSLATION_CPU_THREADS if Config.TRANSLATION_PROVIDER in {"offline_nllb", "offline_quickmt"} else None,
                 "max_unit_chars": Config.TRANSLATION_MAX_UNIT_CHARS,
                 "mode": "quality" if Config.TRANSLATION_REVIEW_COMPLEX_UNITS else "fast",
                 "paragraph_batching": Config.TRANSLATION_COALESCE_PARAGRAPHS,
@@ -6832,35 +7147,14 @@ def status():
 
 @app.route("/api/test-model", methods=["POST"])
 def test_model():
+    """Legacy connection control now verifies all configured model capabilities."""
+    from services.model_diagnostics import test_models
     try:
-        require_local_model_enabled()
-        health = llm.health_check()
-        if not health["reachable"]:
-            return api_error("\u672c\u5730 {} \u670d\u52a1\u4e0d\u53ef\u8fbe\uff1a{}".format(ACTIVE_LLM_BACKEND, health.get("error", "\u672a\u77e5\u9519\u8bef")), 503)
-        if not health["model_available"]:
-            return api_error("\u5df2\u8fde\u63a5\u672c\u5730 {}\uff0c\u4f46\u672a\u627e\u5230\u6a21\u578b {}".format(ACTIVE_LLM_BACKEND, llm.model), 503)
-        # A model-list response only proves that the API server is up. Execute
-        # one bounded generation so this control verifies the active transport.
-        result = llm_transport.chat(
-            "This is a local health check. Reply with exactly SJFX_OK and nothing else.",
-            "Return the exact token now.",
-            temperature=0,
-            max_tokens=8,
-            retries=0,
-            timeout=min(30, int(getattr(Config, "VLLM_INTERACTIVE_TIMEOUT_SECONDS", 30))),
-        )
-        return jsonify({
-            "ok": True,
-            "reply": "\u672c\u5730 {} \u6a21\u578b\u5df2\u5b8c\u6210\u5b9e\u9645\u751f\u6210\u9a8c\u8bc1\u3002".format(ACTIVE_LLM_BACKEND),
-            "model": result.get("model") or llm.model,
-            "usage": result.get("usage") or {},
-            "finish_reason": result.get("finish_reason"),
-            "generation_reply": result.get("content") or "",
-            "generation_tested": True,
-        })
-    except LocalModelError as exc:
-        return api_error("\u672c\u5730 {} \u751f\u6210\u9a8c\u8bc1\u5931\u8d25\uff1a{}".format(ACTIVE_LLM_BACKEND, exc), 503)
-    except ValueError as exc:
+        result = test_models(Config, role="all", timeout_seconds=20)
+        result["generation_tested"] = bool((result.get("roles", {}).get("generation") or {}).get("inference"))
+        result["reply"] = "所配置的模型能力测试通过。" if result["ok"] else "所配置的模型能力测试未全部通过，请查看逐项结果。"
+        return jsonify(result), 200 if result["ok"] else 503
+    except (LocalModelError, ValueError) as exc:
         return api_error(str(exc), 400)
 
 
@@ -6934,11 +7228,24 @@ def scan():
         # The supervised Worker performs the authoritative allow-list and
         # existence check, where a cancel request can terminate a blocked call.
         root = _validate_scan_path_request(path)
+        owner_id = _effective_owner()
+        session = _multiuser_session_from_request()
+        upload_owner = session["owner_id"] if session is not None else owner_id
+        try:
+            uploaded = authorize_uploaded_scan_path(
+                root, Path(Config.OUTPUT_DIR) / "_uploads", upload_owner,
+            )
+            if uploaded is not None:
+                if session and session.get("viewing_owner") not in (None, "", upload_owner):
+                    raise ValueError("切换用户视角时不能导入私有上传目录")
+                owner_id = upload_owner
+        except ValueError as exc:
+            return api_error(str(exc), 403)
         _file_protection.guard_root(root)
         job_id = storage.create_scan_job(
             root, payload.get("max_files", Config.MAX_SCAN_FILES), parse_mode,
             payload.get("max_depth", Config.MAX_SCAN_DEPTH),
-            owner_id=_effective_owner(),
+            owner_id=owner_id,
         )
         return jsonify({
             "ok": True,
@@ -6949,6 +7256,8 @@ def scan():
             "analysis_job_id": job_id,
             "status_url": "/api/jobs/{}".format(job_id),
         }), 202
+    except HTTPException:
+        raise
     except Exception as exc:
         return api_error(str(exc))
 
@@ -8349,28 +8658,98 @@ def tree_edits(scan_id):
         return api_error(str(exc), 400)
 
 
+def _check_raw_source_policy(node, path):
+    """Apply the same inventory/name policy to physical and logical reads."""
+    names = [str(path).split("::", 1)[0], str(node.get("member_name") or ""),
+             str(node.get("name") or "")]
+    if (node.get("sensitive") or node.get("content_analysis_allowed") is False
+            or node.get("content_policy") == "metadata_only_sensitive"
+            or any(is_sensitive_file(Path(name).name) for name in names if name)):
+        raise ValueError("当前文件仅允许查看元数据")
+
+
+def _raw_snapshot_response(snapshot, filename, *, attachment=False):
+    """Keep a private, verified snapshot alive until ASGI finishes sending."""
+    from fastapi.responses import FileResponse
+    resolved = snapshot.__enter__()
+    try:
+        class SnapshotFileResponse(FileResponse):
+            async def __call__(self, scope, receive, send):
+                try:
+                    await super().__call__(scope, receive, send)
+                finally:
+                    snapshot.__exit__(None, None, None)
+        filename = Path(str(filename or resolved.name)).name
+        media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        # Documents with active browser content must never run in our origin,
+        # including HTML/SVG members extracted from an archive.
+        attachment = attachment or media_type in {
+            "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+        } or Path(filename).suffix.casefold() in {
+            ".html", ".htm", ".xhtml", ".svg", ".svgz", ".xml",
+        }
+        response = SnapshotFileResponse(
+            resolved, filename=filename, media_type=media_type,
+            content_disposition_type="attachment" if attachment else "inline",
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; base-uri 'none'; object-src 'none'; sandbox; frame-ancestors 'self'"
+        )
+        return response
+    except BaseException:
+        snapshot.__exit__(None, None, None)
+        raise
+
+
 @app.route("/api/document/<scan_id>/raw")
 def get_raw_document(scan_id):
     """Stream the original source file for reading or download."""
+    from services.package_analysis import SourceFileChangedError
     try:
         scan = require_scan(scan_id)
-        node_path = str(request.args.get("path") or "").strip()
+        node_path = str(request.args.get("path") or "").replace("\\", "/").strip()
         if not node_path:
             raise ValueError("缺少文件路径")
         physical_path = node_path.split("::", 1)[0]
         resolve_under(scan["root"], physical_path)
-        source_path = Path(scan["root"]) / physical_path
-        if not source_path.is_file():
-            raise ValueError("原始文件不存在或尚未可访问")
-        response = send_from_directory(
-            str(source_path.parent), source_path.name,
-            as_attachment=str(request.args.get("download") or "").lower() in {"1", "true", "yes"},
+        source = storage.get_inventory_entry(scan_id, node_path)
+        if not source:
+            # Older ordinary scans persist the identity in the physical tree.
+            # A missing logical record must never fall back to its container.
+            if "::" in node_path:
+                raise ValueError("逻辑文件缺少可信清点记录，请重新盘点")
+            source = next((node for node in _walk_analysis_nodes(scan.get("tree") or {})
+                           if node.get("path") == node_path), None)
+        if not source or source.get("path") != node_path:
+            raise ValueError("文件不属于当前扫描清单")
+        _check_raw_source_policy(source, node_path)
+        if source.get("source_changed"):
+            return api_error("来源文件已变更，请重新盘点后再读取", 409)
+        logical = bool(source.get("logical_unit"))
+        if "::" in node_path and not logical:
+            raise ValueError("逻辑文件缺少可信来源身份")
+        if logical:
+            if source.get("logical_kind") == "archive_member":
+                if node_path != "{}::{}".format(source.get("container_path"), source.get("member_name")):
+                    raise ValueError("归档成员来源路径不一致")
+                container = storage.get_inventory_entry(scan_id, physical_path)
+                if not container:
+                    container = next((node for node in _walk_analysis_nodes(scan.get("tree") or {})
+                                      if node.get("path") == physical_path), {})
+                _check_raw_source_policy(container, physical_path)
+            snapshot = _logical_source_snapshot(scan["root"], source)
+        else:
+            snapshot = _secure_source_snapshot(scan["root"], source)
+        return _raw_snapshot_response(
+            snapshot, source.get("member_name") or source.get("name") or node_path,
+            attachment=str(request.args.get("download") or "").lower() in {"1", "true", "yes"},
         )
-        # 原文件阅读器会在当前站点内嵌 PDF/图片。全局安全头默认 DENY，
-        # 会让浏览器提示“已阻止该页面的显示”；原文件只允许同源页面嵌入。
-        response.headers["X-Frame-Options"] = "SAMEORIGIN"
-        response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
-        return response
+    except SourceFileChangedError as exc:
+        return api_error(str(exc), 409)
+    except OSError:
+        return api_error("原始文件不存在或尚未可访问", 404)
     except ValueError as exc:
         return api_error(str(exc), 404)
 
@@ -9228,7 +9607,7 @@ conversation_engine = ConversationEngine(
 
 def _conversation_index_status(scan_id):
     if str(scan_id).startswith("lp-"):
-        package = large_package_store.get(str(scan_id), owner_id=_effective_owner())
+        package = large_package_store.get(str(scan_id), owner_id=_request_owner_id())
         if not package:
             return {"usable": False, "ready": False, "status": "missing", "code": "index_unavailable", "total_files": 0}
         counts = large_package_store.counts(str(scan_id)) or {}
@@ -9413,6 +9792,7 @@ def _run_claimed_conversation_turn_job(job):
         batch_size=Config.CONVERSATION_ANALYSIS_BATCH_FILES,
         max_candidate_evidence=Config.CONVERSATION_MAX_CANDIDATE_EVIDENCE,
         max_revision_attempts=Config.CONVERSATION_MAX_REVISION_ATTEMPTS,
+        verify_answers=False,
         cancel_check=lambda: _ensure_job_active(job["id"]),
     ).execute(
         turn, session, scope, inventory_paths=inventory_paths,
@@ -9518,6 +9898,17 @@ def _scope_paths_from_storage(scan_id, scan_result, kind, value, constraints):
     """Resolve a logical overview selection to every matching physical file."""
     constraints = dict(constraints or {})
     inventory = _inventory_by_path(scan_result)
+    if not inventory and scan_result.get("_owner_id") and not str(scan_id).startswith("lp-"):
+        inventory = {
+            str(row["path"]): dict(row.get("payload") or {})
+            for row in storage.iter_inventory_entries(scan_id)
+            if row.get("kind") in {"file", "logical_file"}
+        }
+        if not inventory:
+            inventory = {
+                str(node["path"]): node for node in storage.iter_tree_records(scan_id)
+                if node.get("kind") in {"file", "logical_file"} and node.get("path")
+            }
     records = {path: dict(node or {}) for path, node in inventory.items()}
     for item in storage.iter_file_previews(scan_id):
         path = str(item.get("path") or "")
@@ -9630,18 +10021,28 @@ def _conversation_package_record(scan_id, payload=None):
     """
     package_type = str((payload or {}).get("package_type") or "").lower()
     if package_type == "large" or str(scan_id).startswith("lp-"):
-        item = large_package_store.get(str(scan_id), owner_id=_effective_owner())
-        if not item:
-            raise ValueError("大数据包不存在、已失效或不属于当前用户")
-        return {"root": item.get("root_path"), "package_type": "large", "large_package": item}
-    return require_scan(scan_id)
+        item = _large_package_owned(str(scan_id))
+        return {"root": item.get("root_path"), "package_type": "large", "large_package": item,
+                "_owner_id": item.get("owner_id") or "legacy"}
+    return require_scan(scan_id, lightweight=True)
+
+
+def _conversation_identity_owned(session_id, scan_id=None):
+    """Authorize both the stored session and its source before using its owner."""
+    identity = storage.get_conversation_identity(
+        session_id, owner_id=_request_owner_id(), scan_id=scan_id,
+    )
+    if not identity:
+        raise ValueError("会话不存在或不属于当前访问用户")
+    _conversation_package_record(identity["scan_id"])
+    return identity
 
 
 @app.route("/api/package-overview/<scan_id>")
 def package_overview(scan_id):
     """Return only intrinsic facts about the imported data package."""
     try:
-        require_scan(scan_id)
+        scan = require_scan(scan_id, lightweight=True)
         overview = build_package_overview_from_storage(storage, scan_id, batch_size=250)
         task = storage.get_import_task(scan_id) or {}
         checkpoint = dict(task.get("checkpoint") or {})
@@ -9667,7 +10068,9 @@ def package_overview(scan_id):
         direction["research_questions"] = list(direction.get("research_questions") or [])[:8]
         direction["methods"] = list(direction.get("methods") or [])[:8]
         direction["representative_documents"] = list(direction.get("representative_documents") or [])[:20]
-        direction["evidence_chain"] = list(direction.get("evidence_chain") or [])[:8]
+        # Discovery already bounds candidates and their evidence bundles. Keep
+        # the full bundle here so late limiting/counterevidence is not hidden.
+        direction["evidence_chain"] = list(direction.get("evidence_chain") or [])
         brief = {
             "title": report.get("title") or "数据包研究简报",
             "basic_information": list(report.get("basic_information") or [])[:12],
@@ -9676,21 +10079,27 @@ def package_overview(scan_id):
             "value_judgment": report.get("value_judgment") or {},
             "global_categories": list(report.get("global_categories") or [])[:10],
             "recommended_research_direction": direction,
-            "direction_candidates": list(report.get("direction_candidates") or [])[:6],
+            "direction_candidates": list(report.get("direction_candidates") or []),
+            "research_version": report.get("research_version"),
+            "research_publication": report.get("research_publication") or {},
+            "research_opportunity_audit": report.get("research_opportunity_audit") or {},
             "limitations": list((report.get("value_judgment") or {}).get("limitations") or [])[:10],
             "available": bool(report),
             # O7: lets the page label parsed / preliminary / deep / legacy.
             "summary_stage": report.get("summary_stage") or ("legacy" if report else None),
         }
+        if report.get("research_version"):
+            from services.ordinary_overview import build_overview_presentation
+            brief["overview_presentation"] = build_overview_presentation(report)
         artifact = None
         report_docx = str(report.get("docx_file_name") or "")
-        if report_docx and storage.artifact_owner(report_docx) == _effective_owner():
+        if report_docx and storage.artifact_owner(report_docx) == scan["_owner_id"]:
             # O6: a reused DOCX is older than later artifacts; link the one
             # that belongs to the report actually shown.
             artifact = {"filename": report_docx, "scan_id": scan_id, "kind": "overview_report"}
         if artifact is None:
             artifact = storage.latest_artifact(
-                scan_id, _effective_owner(), kind="overview_report"
+                scan_id, scan["_owner_id"], kind="overview_report"
             )
         return jsonify({
             "ok": True, "overview": overview,
@@ -10155,7 +10564,7 @@ def conversations_for_scan(scan_id):
         _conversation_package_record(scan_id, request.args)
         return jsonify({
             "ok": True,
-            "items": storage.list_conversations(scan_id, _effective_owner()),
+            "items": storage.list_conversations(scan_id, _request_owner_id()),
         })
     except ValueError as exc:
         return api_error(str(exc), 404)
@@ -10165,7 +10574,9 @@ def conversations_for_scan(scan_id):
 def get_conversation(session_id):
     scan_id = str(request.args.get("scan_id", "") or "")
     try:
-        _conversation_package_record(scan_id, request.args)
+        identity = _conversation_identity_owned(session_id, scan_id=scan_id or None)
+        scan_id = identity["scan_id"]
+        owner_id = identity["owner_id"]
         message_limit = max(
             20, min(200, int(request.args.get("message_limit", 100) or 100))
         )
@@ -10173,17 +10584,23 @@ def get_conversation(session_id):
         if before_sequence is not None:
             before_sequence = max(1, int(before_sequence))
         payload = storage.get_conversation(
-            session_id, _effective_owner(), scan_id=scan_id,
+            session_id, owner_id, scan_id=scan_id,
             message_limit=message_limit,
             before_sequence=before_sequence,
         )
         if not payload:
             return api_error("会话不存在", 404)
-        owner_id = _effective_owner()
+        visible_turn_ids = {
+            (message.get("metadata") or {}).get("turn_id")
+            for message in payload.get("messages") or []
+            if (message.get("metadata") or {}).get("turn_id")
+        }
         return jsonify({
             "ok": True,
             "session": payload,
-            "turns": storage.list_conversation_turns(session_id, owner_id),
+            "turns": storage.list_conversation_turns(
+                session_id, owner_id, limit=message_limit, turn_ids=visible_turn_ids,
+            ),
             "research_memory": storage.get_conversation_research_memory(session_id),
             "search_index": _conversation_index_status(scan_id),
         })
@@ -10228,10 +10645,10 @@ def delete_conversation(session_id):
 @app.route("/api/conversation/<session_id>/turns", methods=["POST"])
 def create_conversation_turn(session_id):
     payload = request.get_json(silent=True) or {}
-    owner_id = _effective_owner()
     try:
         scan_id = str(payload.get("scan_id") or "")
         scan_result = _conversation_package_record(scan_id, payload)
+        owner_id = _conversation_identity_owned(session_id, scan_id)["owner_id"]
         stored = storage.get_conversation(session_id, owner_id, scan_id=scan_id)
         if not stored:
             return api_error("会话不存在", 404)
@@ -10306,9 +10723,15 @@ def rebuild_search_index(scan_id):
 
 @app.route("/api/turns/<turn_id>")
 def get_conversation_turn(turn_id):
-    owner_id = _effective_owner()
-    turn = storage.get_conversation_turn(turn_id, owner_id=owner_id)
+    turn = storage.get_conversation_turn(turn_id, owner_id=_request_owner_id())
     if not turn:
+        return api_error("分析轮次不存在", 404)
+    try:
+        identity = _conversation_identity_owned(turn["session_id"], turn["scan_id"])
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+    owner_id = identity["owner_id"]
+    if turn["owner_id"] != owner_id:
         return api_error("分析轮次不存在", 404)
     session = storage.get_conversation(
         turn["session_id"], owner_id, scan_id=turn["scan_id"]
@@ -10327,9 +10750,16 @@ def get_conversation_turn_events(turn_id):
         after = max(0, int(request.args.get("after", 0) or 0))
     except (TypeError, ValueError):
         after = 0
-    events = storage.get_conversation_turn_events(
-        turn_id, _effective_owner(), after=after,
-    )
+    turn = storage.get_conversation_turn(turn_id, owner_id=_request_owner_id())
+    if not turn:
+        return api_error("分析轮次不存在", 404)
+    try:
+        identity = _conversation_identity_owned(turn["session_id"], turn["scan_id"])
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+    if turn["owner_id"] != identity["owner_id"]:
+        return api_error("分析轮次不存在", 404)
+    events = storage.get_conversation_turn_events(turn_id, identity["owner_id"], after=after)
     if events is None:
         return api_error("分析轮次不存在", 404)
     return jsonify({
@@ -10482,7 +10912,7 @@ def _large_document_translation(package_id):
             package_id, "translate_document",
             options={"path": path, "require_full": bool(payload.get("require_full", True)),
                      "translation_backend": Config.TRANSLATION_FILE_BACKEND, "package_type": "large"},
-            owner_id=_effective_owner(),
+            owner_id=_package.get("owner_id") or "legacy",
         )
         return jsonify({"ok": True, "job_id": job_id, "path": path,
                         "package_type": "large"}), 202
@@ -10558,6 +10988,7 @@ def _translate_large_package_request(package_id):
         raise ValueError("至少选择一个需要翻译的文件")
     if len(selected_paths) > 500:
         raise ValueError("单次最多选择 500 个文件")
+    package = _large_package_owned(package_id)
     for path in selected_paths:
         _large_translation_target(package_id, path)
     options = {
@@ -10567,7 +10998,7 @@ def _translate_large_package_request(package_id):
     }
     job_id, _created = storage.create_or_get_typed_job(
         package_id, "translate_package", options=options,
-        owner_id=_effective_owner(),
+        owner_id=package.get("owner_id") or "legacy",
     )
     return jsonify({"ok": True, "job_id": job_id, "package_type": "large",
                     "phase": phase, "selected_files": len(selected_paths)}), 202
@@ -10656,7 +11087,8 @@ def document_translation(scan_id):
                     "require_full": bool(payload.get("require_full", True)),
                     "translation_backend": Config.TRANSLATION_FILE_BACKEND,
                 },
-                owner_id=_effective_owner(),
+                owner_id=storage.get_scan_identity(
+                    scan_id, owner_id=_request_owner_id())["_owner_id"],
             )
             return jsonify({"ok": True, "job_id": job_id, "path": node_path}), 202
 
@@ -10782,7 +11214,8 @@ def translate_package(scan_id):
             })
         job_id, _created = storage.create_or_get_typed_job(
             scan_id, "translate_package", options=options,
-            owner_id=_effective_owner(),
+            owner_id=storage.get_scan_identity(
+                scan_id, owner_id=_request_owner_id())["_owner_id"],
         )
         return jsonify({
             "ok": True,
@@ -12035,12 +12468,13 @@ def create_download_ticket():
     filename = str(payload.get("filename") or "").strip()
     if not filename or Path(filename).name != filename:
         return api_error("非法输出文件路径", 400)
-    output_path = _resolve_output_file(filename)
+    try:
+        owner_id = _artifact_read_owner(filename)
+    except ValueError as exc:
+        return api_error(str(exc), 404)
+    output_path = _resolve_output_file(filename, owner_id)
     if output_path is None:
         return api_error("输出文件不存在或已被清理", 404)
-    owner_id = _effective_owner()
-    if storage.artifact_owner(filename) != owner_id:
-        return api_error("输出文件不存在或不属于当前访问用户", 404)
     ticket = storage.create_download_ticket(
         filename, owner_id, ttl_seconds=Config.DOWNLOAD_TICKET_TTL_SECONDS
     )
@@ -12060,7 +12494,10 @@ def outputs(filename):
     # record in addition to the global API token and reject path tricks.
     if Path(filename).name != filename:
         return api_error("非法输出文件路径", 404)
-    owner_id = _effective_owner()
+    try:
+        owner_id = _artifact_read_owner(filename, allow_legacy=True)
+    except ValueError as exc:
+        return api_error(str(exc), 404)
     # 磁盘隔离（新增）：优先 outputs/<owner>/，回落旧平目录 outputs/
     output_path = _resolve_output_file(filename, owner_id)
     if output_path is None:
@@ -12563,7 +13000,10 @@ def formal_directory(scan_id):
             if str(path)
         ]
         inventory = len(selected_scope) if selected_scope else int(counts.get("total") or counts.get("total_files") or 0)
-        edits = storage.list_tree_edits(scan_id, _effective_owner(), limit=500)
+        identity = storage.get_scan_identity(scan_id, owner_id=_request_owner_id())
+        if not identity:
+            raise ValueError("扫描任务不存在、已失效或不属于当前访问用户")
+        edits = storage.list_tree_edits(scan_id, identity["_owner_id"], limit=500)
         task_status = str(import_task.get("status") or "")
         selected_complete = bool(selected_scope) and selected_scope and all(path in deep_summary_paths for path in selected_scope)
         formal_ready = bool(
@@ -12607,15 +13047,20 @@ def create_large_package():
         root = str(payload.get("path") or "").strip()
         if not root:
             raise ValueError("请输入要处理的大数据包目录")
+        owner_id = _effective_owner()
+        # The ordinary scan resolver is the single owner-aware gate for the
+        # reserved upload namespace.  Package ownership cannot substitute for
+        # source-directory ownership.
+        root = str(_resolve_allowed_scan_root(root, owner_id))
         _file_protection.guard_root(root)
-        item = large_package_store.create(root, owner_id=_effective_owner())
+        item = large_package_store.create(root, owner_id=owner_id)
         return jsonify({"ok": True, "large_package": item, "package_id": item["id"]}), 202
     except (ValueError, OSError) as exc:
         return api_error(str(exc), 400)
 
 
 def _large_package_owned(package_id):
-    item = large_package_store.get(package_id, owner_id=_effective_owner())
+    item = large_package_store.get(package_id, owner_id=_request_owner_id())
     if not item:
         raise ValueError("大数据包任务不存在、已失效或不属于当前访问用户")
     _file_protection.guard_root(item.get("root_path") or "")
@@ -12629,7 +13074,7 @@ def _large_package_summary_map(package_id, limit=500):
     scan tables, so the chat file cards read exactly the two columns the
     conversation context already consumes.
     """
-    package = large_package_store.get(package_id, owner_id=_effective_owner())
+    package = large_package_store.get(package_id, owner_id=_request_owner_id())
     if not package:
         raise ValueError("大数据包不存在、已失效或不属于当前用户")
     summaries = {}
@@ -12680,7 +13125,7 @@ def _large_package_file_search(package_id, query, page, page_size):
     ``/api/search/files`` response contract using the persisted quick/deep
     summaries as the corpus. Evidence stays at file level and says so.
     """
-    package = large_package_store.get(package_id, owner_id=_effective_owner())
+    package = large_package_store.get(package_id, owner_id=_request_owner_id())
     if not package:
         raise ValueError("大数据包不存在、已失效或不属于当前用户")
     tokens = _large_package_query_tokens(query)
@@ -12802,7 +13247,7 @@ def _large_package_document(package_id):
     reader shows an ordinary-shaped document card, and it labels the sampling
     boundary instead of pretending the text is a full parse.
     """
-    package = large_package_store.get(package_id, owner_id=_effective_owner())
+    package = large_package_store.get(package_id, owner_id=_request_owner_id())
     if not package:
         raise ValueError("大数据包不存在、已失效或不属于当前用户")
     node_path = str(request.args.get("path", "") or "").replace("\\", "/").strip()
@@ -12813,12 +13258,22 @@ def _large_package_document(package_id):
         raise ValueError("文件不属于当前大数据包")
     if row.get("sensitive"):
         raise ValueError("当前文件仅允许查看元数据")
+    if row.get("source_changed"):
+        raise ValueError("来源文件已变更，请重新盘点或等待索引更新后再读取")
+    if row.get("source_kind") == "archive_member":
+        from services.large_archive_members import source_identity
+        from services.package_analysis import SourceFileChangedError
+        try:
+            source_identity(package["root_path"], row)
+        except (OSError, ValueError, SourceFileChangedError) as exc:
+            raise ValueError("归档来源已变更或不可读取，请重新盘点后再打开") from exc
     if Config.LARGE_QA_ENABLED:
         import sqlite3
         from services.large_qa_search import original_document
         try:
             original = original_document(package_id, package["root_path"], node_path,
-                                         full=str(request.args.get("full") or "").lower() in {"1", "true", "yes"})
+                                         full=str(request.args.get("full") or "").lower() in {"1", "true", "yes"},
+                                         current_source=row)
         except (sqlite3.Error, OSError):
             app.logger.exception("Large QA reader unavailable; using existing preview")
             original = None
@@ -12920,7 +13375,7 @@ def list_large_package_history():
         limit = int(request.args.get("limit", 8))
         offset = int(request.args.get("offset", 0))
         return jsonify({"ok": True, **large_package_store.list_history(
-            owner_id=_effective_owner(), query=query, limit=limit, offset=offset
+            owner_id=_request_owner_id(), query=query, limit=limit, offset=offset
         )})
     except (TypeError, ValueError) as exc:
         return api_error(str(exc), 400)
@@ -13075,6 +13530,7 @@ def list_large_package_files(package_id):
 @app.route("/api/large-packages/<package_id>/file")
 def large_package_file(package_id):
     """Read/download one file from an isolated large package."""
+    from services.package_analysis import SourceFileChangedError
     try:
         item = _large_package_owned(package_id)
         path = str(request.args.get("path") or "").replace("\\", "/").strip()
@@ -13082,25 +13538,44 @@ def large_package_file(package_id):
         if not path or path not in valid:
             return api_error("文件不属于当前大数据包", 404)
         row = large_package_store.get_file(package_id, path)
-        if row and row.get('source_kind') == 'archive_member':
-            from fastapi.responses import FileResponse
-            from services.large_archive_members import member_snapshot
-            snapshot = member_snapshot(item['root_path'], row)
-            resolved = snapshot.__enter__()
-            try:
-                class MemberFileResponse(FileResponse):
-                    async def __call__(self, scope, receive, send):
-                        try:
-                            await super().__call__(scope, receive, send)
-                        finally:
-                            snapshot.__exit__(None, None, None)
-                response = MemberFileResponse(resolved, filename=resolved.name, content_disposition_type='attachment')
-                response.headers['X-Content-Type-Options'] = 'nosniff'
-                return response
-            except BaseException:
-                snapshot.__exit__(None, None, None)
-                raise
-        return send_from_directory(item["root_path"], path, as_attachment=str(request.args.get("download") or "") in {"1", "true", "yes"})
+        if not row:
+            return api_error("文件不属于当前大数据包", 404)
+        _check_raw_source_policy(row, path)
+        if row.get("source_changed"):
+            return api_error("来源文件已变更，请重新盘点或等待索引更新后再读取", 409)
+        if row.get('source_kind') == 'archive_member':
+            from services.large_archive_members import member_node
+            source = member_node(row)
+            _check_raw_source_policy(source, path)
+            container = large_package_store.get_file(package_id, source['container_path']) or {}
+            _check_raw_source_policy(container, source['container_path'])
+            if container.get('source_changed'):
+                return api_error("来源文件已变更，请重新盘点后再读取", 409)
+            snapshot = _logical_source_snapshot(item['root_path'], source)
+            attachment = True
+        else:
+            if "::" in path:
+                raise ValueError("逻辑文件缺少可信来源身份")
+            source = dict(row)
+            # New physical inventory keeps device/inode in source_metadata;
+            # existing packages still have authoritative size/mtime columns.
+            metadata = row.get("source_metadata") or {}
+            if not isinstance(metadata, dict):
+                raise ValueError("文件清点身份无效，请重新盘点")
+            for key in ("size", "modified_at_ns"):
+                if key in metadata and int(metadata[key]) != int(row.get(key) or 0):
+                    raise ValueError("文件清单与来源身份不一致")
+            for key in ("device", "inode"):
+                if key in metadata:
+                    source[key] = metadata[key]
+            snapshot = _secure_source_snapshot(item['root_path'], source)
+            attachment = str(request.args.get("download") or "").lower() in {"1", "true", "yes"}
+        return _raw_snapshot_response(snapshot, source.get("member_name") or source.get("name") or path,
+                                      attachment=attachment)
+    except SourceFileChangedError as exc:
+        return api_error(str(exc), 409)
+    except OSError:
+        return api_error("原始文件不存在或尚未可访问", 404)
     except ValueError as exc:
         return api_error(str(exc), 404)
 

@@ -71,6 +71,8 @@ def embedding_mode():
 
 
 def _cosine(left, right):
+    if len(left) != len(right):
+        raise ValueError('embedding 维度不一致')
     numerator = sum(float(a) * float(b) for a, b in zip(left, right))
     left_norm = math.sqrt(sum(float(value) * float(value) for value in left))
     right_norm = math.sqrt(sum(float(value) * float(value) for value in right))
@@ -82,7 +84,13 @@ def _cosine(left, right):
 def _embedding_scores(topic_text, texts, provider):
     if not provider or not topic_text or not texts:
         return {}, "lexical-fallback"
-    keys = [hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest() for value in [topic_text] + texts]
+    from services.embedding_backend import client_identity, validate_vectors
+    owner = getattr(provider, '__self__', None)
+    try:
+        identity = client_identity(owner) if owner else str(getattr(provider, 'identity', '') or id(provider))
+    except Exception:
+        return {}, 'lexical-fallback'
+    keys = [hashlib.sha256((identity+'\0'+value).encode("utf-8", errors="replace")).hexdigest() for value in [topic_text] + texts]
     vectors = [None] * len(keys)
     missing_indices = []
     missing_values = []
@@ -95,6 +103,7 @@ def _embedding_scores(topic_text, texts, provider):
     try:
         if missing_values:
             generated = provider(missing_values)
+            generated = validate_vectors(generated, len(missing_values), len(next((v for v in vectors if v), [])))
             if len(generated) != len(missing_values):
                 raise ValueError("embedding 返回数量不一致")
             for index, vector in zip(missing_indices, generated):
@@ -103,6 +112,7 @@ def _embedding_scores(topic_text, texts, provider):
             while len(_EMBEDDING_CACHE) > _EMBEDDING_CACHE_LIMIT:
                 _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
         query_vector = vectors[0]
+        validate_vectors(vectors, len(keys))
         return {index: _cosine(query_vector, vectors[index + 1]) for index in range(len(texts))}, "semantic+lexical"
     except Exception:
         return {}, "lexical-fallback"

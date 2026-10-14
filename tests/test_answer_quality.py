@@ -165,7 +165,11 @@ class AnswerQualityTests(unittest.TestCase):
     def test_grounded_answer_bypasses_interactive_short_reply_clamp(self):
         model = Model()
         engine = ConversationEngine(CallableEvidenceRetriever(lambda request: {'results': [dict(evidence_id='e1', source_path='f.txt', text='项目因设备故障延期，影响交付。下一步计划更换设备。')]}), answer_model=model)
-        with patch.object(Config, 'LLM_BACKEND', 'vllm'), patch.object(Config, 'VLLM_INTERACTIVE_MAX_TOKENS', 480):
+        # This fake 32K provider isolates the interactive output clamp.
+        with patch.object(Config, 'LLM_CONTEXT_TOKENS', 32768), \
+                patch.object(Config, 'CONVERSATION_CONTEXT_TOKENS', 32768), \
+                patch.object(Config, 'LLM_BACKEND', 'vllm'), \
+                patch.object(Config, 'VLLM_INTERACTIVE_MAX_TOKENS', 480):
             result = engine.ask(engine.new_session('scan'), '详细说明为什么项目延期、影响和下一步计划')
         self.assertGreater(model.calls[0][2]['max_tokens'], 480)
         self.assertNotIn('120 个汉字', model.calls[0][0])
@@ -178,7 +182,8 @@ class AnswerQualityTests(unittest.TestCase):
         engine = ConversationEngine(CallableEvidenceRetriever(lambda _: {}), answer_model=model)
         rows = [citation(i, '甲项目因设备故障延期，需更换设备。' * 30) for i in range(1, 15)]
         manifest = {}
-        with patch.object(Config, 'CONVERSATION_CONTEXT_TOKENS', 8192):
+        with patch.object(Config, 'LLM_CONTEXT_TOKENS', 8192), \
+                patch.object(Config, 'CONVERSATION_CONTEXT_TOKENS', 8192):
             engine._quality_grounded_answer('retrieval', '甲项目延期原因', '旧问题' * 5000, rows, {}, 14, manifest)
         self.assertLessEqual(manifest['prompt_tokens'] + manifest['output_token_budget'] + 512, 8192)
         self.assertEqual(manifest['selected_evidence'], len(rows))

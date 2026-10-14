@@ -35,13 +35,16 @@ class ResearchQuoteRepairTests(TestCase):
                'context_reviews':{'m':{'complete':True,'gaps':[]}},'context_gaps':[],'allowed_keys':{'m'}}
         def model(t,o,state,purpose,system,prompt,**kwargs):
             payload=json.loads(prompt);calls.append(purpose)
+            if purpose=='evidence_analysis_repair':
+                self.assertEqual(payload['invalid_rows'][0]['atom_index'],0)
+                self.assertIn('source_quote_not_exact',payload['validation_errors'][0]['errors'])
+                return None
             if purpose=='evidence_analysis':
-                if payload.get('validation_errors'):return None
                 return {'answer':'待验证','claims':[row(CLAIM)],'findings':[]}
             return verdict(payload,QUOTE)
         with patch.object(runtime,'_model_call',side_effect=model):
             runtime._analyze_evidence('t','owner',state,{'objective':'交期','budget':{}},'p',[deepcopy(SOURCE)])
-        self.assertEqual(calls,['evidence_analysis','evidence_analysis','semantic_claim_verification'])
+        self.assertEqual(calls,['evidence_analysis','evidence_analysis_repair','semantic_claim_verification'])
         self.assertEqual(recorded[0]['semantic_status'],'insufficient')
         self.assertIn('source_quote_not_exact',recorded[0]['semantic_verification']['missing_requirements'])
 
@@ -55,19 +58,20 @@ class ResearchQuoteRepairTests(TestCase):
         def model(t,o,state,purpose,system,prompt,**kwargs):
             payload=json.loads(prompt);calls.append((purpose,payload))
             if purpose=='evidence_analysis':
-                if not payload.get('validation_errors'):
-                    self.assertEqual(payload['evidence'][0]['participants'],SOURCE['participants'])
-                    self.assertEqual(payload['evidence'][0]['body_fragments'],SOURCE['body_fragments'])
-                    return {'answer':'说明交付要求','claims':[row(CLAIM)],'findings':[]}
+                self.assertEqual(payload['evidence'][0]['participants'],SOURCE['participants'])
+                self.assertEqual(payload['evidence'][0]['body_fragments'],SOURCE['body_fragments'])
+                return {'answer':'说明交付要求','claims':[row(CLAIM)],'findings':[]}
+            if purpose=='evidence_analysis_repair':
                 self.assertIn('source_quote_not_exact',payload['validation_errors'][0]['errors'])
-                return {'answer':'说明交付要求','claims':[row()],'findings':[]}
+                self.assertEqual(payload['invalid_rows'],[{'atom_index':0,'row':row(CLAIM)}])
+                return {'repairs':[{'atom_index':0,'row':row()}]}
             if not payload.get('validation_errors'):return verdict(payload,CLAIM)
             self.assertIn('judge_quote_not_exact',payload['validation_errors'][0]['errors'])
             self.assertEqual(payload['evidence'][0]['quote_text'],QUOTE)
             return verdict(payload,QUOTE)
         with patch.object(runtime,'_model_call',side_effect=model):
             runtime._analyze_evidence('t','owner',state,{'objective':'查交期','budget':{}},'p',[deepcopy(SOURCE)])
-        self.assertEqual([c[0] for c in calls],['evidence_analysis','evidence_analysis','semantic_claim_verification','semantic_claim_verification'])
+        self.assertEqual([c[0] for c in calls],['evidence_analysis','evidence_analysis_repair','semantic_claim_verification','semantic_claim_verification'])
         self.assertEqual(recorded[0]['semantic_status'],'supported')
         self.assertEqual([e[2]['repair'] for e in events if e[1]=='evidence_analysis_output'],[False,True])
         self.assertEqual([e[2]['repair'] for e in events if e[1]=='semantic_claim_judge_output'],[False,True])

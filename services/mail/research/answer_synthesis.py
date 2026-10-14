@@ -413,7 +413,21 @@ def synthesize(runtime, tid, owner, state, spec, evidence, claims, *, direct=Fal
         if not review:
             stop('相关线程、回复或附件仍有读取缺口');return
     incomplete,warnings=source_completeness(reviews,evidence)
-    if incomplete:stop(incomplete);return
+    if incomplete:
+        if direct and state.get('answer_mode')=='fast':
+            # Fast mode answers from its single pass even when some reviewed
+            # context was read under limits (for example long threads); the
+            # gap is carried as a warning instead of blocking the answer.
+            warnings=list(warnings)+[incomplete]
+            runtime.repository.event(tid,'fast_mode_context_gap_warned',{'reason':incomplete,'scope':'answer_synthesis'})
+        else:
+            stop(incomplete);return
+    subset=state.get('fast_source_subset')
+    if subset:
+        # Labelled fast-mode subset pass: the source set is deliberately
+        # narrowed, so completeness wording must not be reused unchanged.
+        warnings=list(warnings)+['快速模式仅使用相关性最高的{}条来源（共{}条），未覆盖全部来源；不得据此推断全部或没有更多来源。'.format(
+            subset.get('kept'),subset.get('total'))]
     # A speculative direct attempt retains one legacy analysis/judge pair for
     # fallback under small user budgets. No allowance is increased.
     if state.get('model_calls',0)+(4 if direct else 2)>state.get('max_model_calls',0):
@@ -435,6 +449,9 @@ def synthesize(runtime, tid, owner, state, spec, evidence, claims, *, direct=Fal
         'historical_records':[{'text':c.get('claim_text'),'evidence_ids':c.get('evidence_ids'),
             'semantic_status':c.get('semantic_status'),'context_status':c.get('support_status')} for c in claims],
         'record_note':'Records are hints with explicit statuses; only original evidence supports answer atoms.'}
+    if state.get('fast_source_subset'):
+        payload['scope_note']='Fast mode analysed only a leading most-relevant subset of the related sources (kept {} of {}). Coverage is partial: never infer absence, completeness or package-final/latest status.'.format(
+            state['fast_source_subset'].get('kept'),state['fast_source_subset'].get('total'))
     serialized=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
     context_tokens=int((spec.get('budget') or {}).get('max_context_tokens',runtime.context_limit//2))
     if len(serialized)>runtime.context_limit or estimate_tokens(serialized)>context_tokens:
@@ -586,3 +603,201 @@ def synthesize(runtime, tid, owner, state, spec, evidence, claims, *, direct=Fal
     runtime.repository.event(tid,'answer_synthesized',{'supported_atoms':len(supported),'total_atoms':len(raw),
         'source_count':len(records),'scope':'reviewed_related_sources'})
     return bool(state['answer_synthesis']['status']=='complete' and any(row.get('semantic_status')=='supported' and row.get('answer_relevance')=='direct' for row in checked) and '所问结论' not in unanswered)
+
+
+FAST_OVERVIEW_SYSTEM = '''你是中文邮件研究助理。材料是用户的研究目标与邮件内容（可能是全部邮件原文，或对全部邮件的分块阅读笔记）。请写一份可以直接阅读的中文综合回答。
+要求：
+- 直接回答研究目标；先给整体概况，再按项目或事项分述关键信息（涉及的项目、公司、金额、时间安排、当前状态、后续变化与待确认事项）。
+- 必须覆盖全部项目/事项：即使某个项目只出现一两封邮件，也要列出，不要遗漏；行政类通知（会议、系统维护等）若不相关可简要带过或忽略。
+- 开头如需概述，直接写"涉及以下项目/事项"，不要写任何数量表述（如"共N个项目"、"四个具体项目"——数量极易数错）；直接逐一列出各项目/事项即可。
+- 内容充实、条理清楚，但必须一次性完整输出：全文控制在 700 字以内（最多不超过 900 字）；输出一旦超出上限被截断，整条回答就会作废。
+- 只使用材料中出现的真实信息，不要编造；材料没有记载或互相矛盾之处，用简短一句话说明即可。
+- 语言自然、有逻辑，可分短段；不要罗列来源编号、文件名或元数据。
+输出 JSON：{"overview": "..."}'''
+
+FAST_OVERVIEW_BLOCK_SYSTEM = '''你是中文邮件研究助理。以下是资料包中一部分邮件的完整内容（全部邮件被分块阅读，这是其中一块）。请通读这一块并写阅读笔记。
+要求：
+- 逐个记录这块邮件中出现的所有项目/事项名称，以及各自的关键事实：相关公司/人物、金额、时间安排、当前状态、后续变化与待确认事项。
+- 只记录材料中明确出现的信息；不确定的注明"待确认"；不要编造。
+- 笔记简洁分点，约 150~400 字，必须一次性完整输出（被截断会作废），使用中文。输出 JSON：{"notes": "..."}'''
+
+
+_COUNT_CLAIM = re.compile(r'(?<!第)(?<!第\s)(?:一共|共计|共)?\s*[一二三四五六七八九十两0-9]+\s*个\s*(?:具体)?\s*项目')
+
+
+def _neutralize_count_claims(text):
+    """Model self-counts are unreliable (e.g. '四个' while listing five items),
+    so a count claim never ships: it is rewritten to a neutral phrase."""
+    return _COUNT_CLAIM.sub('以下项目', text)
+
+
+def _package_corpus(runtime, package_id, owner):
+    """Every message of the package: subject/sender/date plus its complete
+    stored text (body and attachment segments), so a fast overview reads the
+    WHOLE mail set instead of a retrieval-filtered subset."""
+    directory = runtime.repository.list_messages(package_id, owner, limit=200) or {}
+    items = directory.get('items') or []
+    texts = {}
+    with runtime.repository._connection() as connection:
+        for row in connection.execute(
+                "SELECT message_key, text FROM mail_text_segments WHERE package_id=? ORDER BY message_key, ordinal",
+                (package_id,)):
+            key = row[0]
+            texts[key] = (texts.get(key) or '') + (row[1] or '')
+    corpus = []
+    for item in items:
+        corpus.append({'sent_at': str(item.get('sent_at_utc') or '')[:10],
+            'subject': str(item.get('subject_raw') or '')[:140],
+            'from': str(item.get('sender') or '')[:120],
+            'text': str(texts.get(item.get('message_key')) or '')})
+    return sorted(corpus, key=lambda row: (row.get('sent_at') or '', row.get('subject') or ''))
+
+
+def _fit_result(value, cap):
+    return estimate_tokens(value) > cap
+
+
+def synthesize_fast_overview(runtime, tid, owner, state, spec, evidence, package_id=None):
+    """Fast mode: a labelled Chinese overview after reading the WHOLE package
+    mail set. When the complete text cannot fit one call the mails are split
+    into up to four blocks, every block is read completely, and the answer is
+    synthesised from all block notes; no message is ever dropped."""
+    if state.get('deadline_reached') or state.get('tool_limit_reached') or (state.get('token_usage') or {}).get('exhausted'):
+        return False
+    if state.get('model_calls', 0) + 5 > state.get('max_model_calls', 0):
+        return False
+    corpus = []
+    scope = 'package_all_messages'
+    if package_id:
+        try:
+            corpus = _package_corpus(runtime, package_id, owner)
+        except Exception:
+            corpus = []
+    if not corpus:
+        scope = 'related_evidence'
+        ordered = sorted([row for row in evidence or [] if isinstance(row, dict)],
+            key=lambda s: (str(s.get('sent_at_utc') or ''), str(s.get('message_key') or ''),
+                           int(s.get('char_start') or 0)))
+        for row in ordered:
+            authors = [p.get('normalized_address') or p.get('address')
+                       for p in row.get('participants') or []
+                       if isinstance(p, dict) and p.get('role') == 'from']
+            corpus.append({'sent_at': str(row.get('sent_at_utc') or '')[:10],
+                'subject': str(row.get('subject_raw') or '')[:140],
+                'from': (authors[0] if authors else '')[:120],
+                'text': str(row.get('quote_text') or '')})
+    if not corpus:
+        return False
+    # The local model serves 32K context tokens; a generous single-call input
+    # budget lets a normal mail package be read in ONE pass, while oversized
+    # sets still split into blocks below. The estimator counts Chinese close
+    # to one token per character (utf-8 bytes / 3).
+    overview_cap = int(getattr(runtime, 'fast_overview_cap', 26000))
+    per_call_chars = max(3000, overview_cap - 2000)
+    if scope == 'package_all_messages':
+        note = '资料包共 {} 封邮件（按时间排序）。必须覆盖全部项目/事项，包括只出现一两封邮件的项目，不要遗漏；行政类通知若不相关可简要带过或忽略。'.format(len(corpus))
+    else:
+        note = '相关邮件来源共 {} 条（按时间排序）。只依据这些来源作答；没有记载的内容必须如实说明。'.format(len(corpus))
+
+    def build(rows, text_limit):
+        sources = [{'sent_at': row.get('sent_at') or '', 'subject': row.get('subject') or '',
+                    'from': row.get('from') or '', 'text': str(row.get('text') or '')[:text_limit]}
+                   for row in rows]
+        return json.dumps({'objective': str(spec.get('objective') or ''), 'note': note,
+                           'sources': sources}, ensure_ascii=False, separators=(',', ':'))
+
+    def fit(rows):
+        text_limit = 2000
+        payload = build(rows, text_limit)
+        while text_limit > 200 and _fit_result(payload, overview_cap):
+            text_limit = max(200, text_limit * 2 // 3)
+            payload = build(rows, text_limit)
+        return payload
+
+    # Split every message into at most four blocks; no message is ever dropped.
+    blocks = []
+    current, size = [], 0
+    for row in corpus:
+        item = len(str(row.get('text') or '')) + len(str(row.get('subject') or '')) + 160
+        if current and size + item > per_call_chars:
+            blocks.append(current)
+            current, size = [], 0
+        current.append(row)
+        size += item
+    if current:
+        blocks.append(current)
+    while len(blocks) > 4:
+        shortest = min(range(len(blocks) - 1), key=lambda index: len(blocks[index]) + len(blocks[index + 1]))
+        blocks[shortest:shortest + 2] = [blocks[shortest] + blocks[shortest + 1]]
+    payloads = [fit(block) for block in blocks]
+    if any(_fit_result(payload, overview_cap) for payload in payloads):
+        return False
+
+    def write_overview(payload):
+        """Final overview call with one compressed retry.
+
+        A structured output cut off at the token cap comes back empty; retry
+        once with a hard compression directive so a long-winded generation can
+        never silently degrade the whole fast answer."""
+        value = runtime._model_call(tid, owner, state, 'fast_overview', FAST_OVERVIEW_SYSTEM, payload,
+            required_fields=('overview',)) or {}
+        text = str(value.get('overview') or '').strip()
+        if not text:
+            retry_payload = json.loads(payload)
+            retry_payload['note'] = str(retry_payload.get('note') or '') + \
+                ' 重要：上一次输出超出上限被截断而作废。请重新完整作答：把内容压缩到 600 字以内，必须输出完整的 JSON。'
+            retried = runtime._model_call(tid, owner, state, 'fast_overview', FAST_OVERVIEW_SYSTEM,
+                json.dumps(retry_payload, ensure_ascii=False, separators=(',', ':')),
+                required_fields=('overview',)) or {}
+            text = str(retried.get('overview') or '').strip()
+        return _neutralize_count_claims(text)
+
+    if len(payloads) == 1:
+        runtime._publish_progress(92, 'mail_research_answer', '正在通读全部邮件并生成综合回答')
+        overview = write_overview(payloads[0])
+        read_mode = 'single_pass'
+        writer_calls = 1
+    else:
+        notes = []
+        for index, payload in enumerate(payloads):
+            runtime._publish_progress(88 + min(index, 3), 'mail_research_answer',
+                '正在通读全部邮件（{}/{}）'.format(index + 1, len(payloads)))
+            value = runtime._model_call(tid, owner, state, 'fast_overview_block', FAST_OVERVIEW_BLOCK_SYSTEM, payload,
+                required_fields=('notes',)) or {}
+            piece = str(value.get('notes') or '').strip()
+            if not piece:
+                retry_payload = json.loads(payload)
+                retry_payload['note'] = '重要：上一次输出被截断而作废。请重新完整输出，把本块笔记压缩到 400 字以内。'
+                value = runtime._model_call(tid, owner, state, 'fast_overview_block', FAST_OVERVIEW_BLOCK_SYSTEM,
+                    json.dumps(retry_payload, ensure_ascii=False, separators=(',', ':')),
+                    required_fields=('notes',)) or {}
+                piece = str(value.get('notes') or '').strip()
+            if not piece:
+                return False
+            notes.append(_neutralize_count_claims(piece))
+        reduce_payload = json.dumps({'objective': str(spec.get('objective') or ''),
+            'note': '以下是对资料包全部 {} 封邮件的分块阅读笔记（共 {} 块，全部邮件已被完整阅读）。请基于笔记写综合回答。'.format(len(corpus), len(notes)),
+            'notes': notes}, ensure_ascii=False, separators=(',', ':'))
+        if _fit_result(reduce_payload, overview_cap):
+            return False
+        runtime._publish_progress(92, 'mail_research_answer', '正在生成综合回答')
+        overview = write_overview(reduce_payload)
+        read_mode = 'blocked_notes'
+        writer_calls = len(payloads) + 1
+    if not overview or len(overview) > 3000:
+        return False
+    state['fast_overview'] = {'version': 'mail-fast-overview-v1', 'overview': overview,
+        'messages': len(corpus), 'blocks': len(payloads), 'read_mode': read_mode,
+        'chars': len(overview), 'scope': scope, 'writer_calls': writer_calls}
+    state['answer_presentation'] = {'version': 'mail-fast-overview-v1', 'status': 'fast_overview',
+        'answer': overview, 'paragraphs': [part for part in (value.strip() for value in overview.split('\n\n')) if part] or [overview],
+        'unknowns': [], 'scope': scope,
+        'reason': 'fast_mode_labelled_overview', 'original_verdicts_unchanged': True}
+    runtime.repository.event(tid, 'fast_overview_synthesized',
+        {'scope': scope, 'messages': len(corpus), 'blocks': len(payloads), 'read_mode': read_mode,
+         'chars': len(overview)})
+    runtime.repository.record_research_step(tid, 'fast_overview',
+        {'scope': scope, 'messages': len(corpus), 'blocks': len(payloads), 'read_mode': read_mode,
+         'writer_calls': writer_calls},
+        output_ref=json.dumps({'overview': overview}, ensure_ascii=False))
+    return True

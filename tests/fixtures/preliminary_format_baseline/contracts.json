@@ -1,0 +1,25 @@
+{
+  "sources": {
+    "services/preliminary_summary_fast.py": {
+      "sha256": "e9ee693982c73d9f0b59d1d2c5ceeaf44bdcd166d8bdc979f9111d74ff16eb4a"
+    },
+    "services/document_analysis.py": {
+      "sha256": "af78e2c257554f276c43275c09b31f3fb3b18b56e0c10522e45f067f9d8e24c2"
+    },
+    "services/folder_analysis.py": {
+      "sha256": "62187c7c2a2fe2abf89fb94a67d06ed526ddadf438a892d63b6dd8f599adf109"
+    },
+    "static/app.js": {
+      "sha256": "6e5c8ab84934c77a2530669f10b456548cfb9825e2e4415f5635312036f42472"
+    },
+    "static/intelligence-overview.js": {
+      "sha256": "f23387b92fbc05318622a87a8bda30f1b5b2a4a9742c6fd74a033ea9cf5f9109"
+    }
+  },
+  "persisted_summaries": 9,
+  "scans": 1,
+  "api_statuses": [
+    200,
+    200
+  ]
+}

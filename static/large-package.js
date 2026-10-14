@@ -4,6 +4,7 @@
   const api = () => window.sjfxApi;
   let packageId = '';
   let pollTimer = null;
+  let pollingNeeded = true;
   let selected = new Set();
   let files = [];
   let lastCatalogAt = 0;
@@ -21,6 +22,18 @@
   let contextSeq = 0;
   const contextToken = () => `${packageId}#${contextSeq}`;
   const stillCurrent = (token) => token === contextToken();
+  const activeView = () => !document.body.dataset.route || document.body.dataset.route === 'large-select';
+  function stopPolling() {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  function startPolling() {
+    if (packageId && activeView() && pollingNeeded && !pollTimer) pollTimer = setInterval(refresh, 1500);
+  }
+  function activate(route) {
+    if (route !== 'large-select') { stopPolling(); return; }
+    if (packageId) { startPolling(); refresh(); }
+  }
   const selectableStatuses = new Set(['waiting_for_selection', 'completed']);
   const activeStatuses = new Set(['queued', 'running']);
 
@@ -33,7 +46,7 @@
     if (btn) btn.textContent = large ? '启动大数据包流式处理' : '仅导入目录';
     const note = $('workflowModeNote');
     if (note) note.textContent = large
-      ? '大包模式使用独立队列和 large_package.db；先盘点和本地摘要，再选择文件做深度解析。'
+      ? '大数据包生成智能目录后即完成导入；完成后可按需选择文件生成深度摘要。'
       : '普通模式保持现有导入分析流程。';
   }
   function showPanel(show) {
@@ -106,7 +119,11 @@
         (wf.catalog_id ? `(${String(wf.catalog_id).slice(4, 12)})` : '') +
         (wf.catalog_degraded ? ` · ⚠ 降级目录（${(wf.catalog_degraded_detail || {}).fragment_groups || '?'}/${(wf.catalog_degraded_detail || {}).groups || '?'} 个叶组是碎片，未经语义聚类）` : '')
       : '';
-    const text = `${view.message || ''} · 阶段：${view.phase || '—'} · 进度 ${view.progress || 0}%` +
+    const importState = wf || status;
+    const importNote = importState.import_completed
+      ? '大数据包导入已完成（100%）；深度摘要可按需选择' : `大数据包导入进度 ${importState.import_progress ?? view.progress ?? 0}%`;
+    const deepNote = view.phase === 'deep_parse' ? ` · 深度摘要进度 ${view.progress || 0}%` : '';
+    const text = `${importNote}${deepNote} · ${view.message || ''}` +
       ` · 文件 ${counts.total_files || 0} · 快速摘要 ${quick.completed || 0} · 深度 ${deep.completed || 0}` + pendingNote + catalogNote;
     if ($('largePackageStatus')) $('largePackageStatus').textContent = text;
     if ($('largePackageProgress')) $('largePackageProgress').style.width = `${Math.max(0, Math.min(100, Number(view.progress || 0)))}%`;
@@ -200,11 +217,11 @@
     const tree = $('largePackageSelectCatalogTree');
     if (!tree) return;
     const smart = (catalog || {}).smart || {};
-    const topicCount = smart.topic_total || (smart.topics || []).length;
+    const topicCount = smart.topic_total ?? (smart.topics || []).length;
     const hint = $('largePackageSelectCatalogHint');
     if (hint) {
       hint.textContent = topicCount
-        ? `${smart.theme_total || 0} 个主题 · ${smart.leaf_total || topicCount} 个叶子分组`
+        ? window.SJFXLargePortrait.catalogSummary(catalog).text
         : '智能目录在快速解析完成后生成；当前可按原始列表选择。';
     }
     tree.innerHTML = window.SJFXLargePortrait?.catalog(catalog) || '<p class="large-empty">智能目录尚未生成。</p>';
@@ -243,28 +260,30 @@
       `专业概览：已盘点 ${coverage.inventory_files || 0}，快速解析 ${coverage.quick_completed || 0}，本地摘要 ${coverage.quick_completed || 0}，深度解析 ${coverage.deep_completed || 0}，模型摘要 ${coverage.model_summaries || 0}，失败/不支持 ${failures.length}。`;
   }
   async function refresh() {
+    if (!activeView()) { stopPolling(); return; }
     if (!packageId || refreshing) return;
     refreshing = true;
     try {
       const token = contextToken();
       const data = await api()(`/api/large-packages/${encodeURIComponent(packageId)}`);
-      if (!stillCurrent(token)) return;          // 晚到响应：包的上下文已变，丢弃
+      if (!stillCurrent(token) || !activeView()) return;
       const pkg = data.large_package || {};
       const wf = data.workflow || null;
       render(pkg, wf);
       const statusValue = String((wf && wf.status) || pkg.status || '').toLowerCase();
       const catalogReady = Number(pkg.counts?.total_files || 0) > 0;
       if (catalogReady && Date.now() - lastCatalogAt > 5000) await loadCatalog();
-      if (!stillCurrent(token)) return;
+      if (!stillCurrent(token) || !activeView()) return;
       if (statusValue === 'completed') await loadReport();
-      if (!stillCurrent(token)) return;
-      if (['failed','cancelled'].includes(statusValue) || (statusValue === 'completed' && !directoryPending)) {
-        clearInterval(pollTimer); pollTimer = null;
-      }
+      if (!stillCurrent(token) || !activeView()) return;
+      pollingNeeded = !(['failed','cancelled'].includes(statusValue) || (statusValue === 'completed' && !directoryPending));
+      if (!pollingNeeded) stopPolling(); else startPolling();
       const selectable = wf && wf.allowed_actions ? !!wf.allowed_actions.select : selectableStatuses.has(statusValue);
       if (selectable && currentStage === 'select') await loadFiles();
     } catch (error) {
+      if (!activeView()) return;
       if ($('largePackageStatus')) $('largePackageStatus').textContent = error.message || '状态读取失败';
+      if ([401, 403, 404, 410].includes(error.status)) { pollingNeeded = false; stopPolling(); }
     } finally { refreshing = false; }
   }
   async function loadFiles() {
@@ -297,6 +316,7 @@
   async function start() {
     const result = await api()('/api/large-packages', {method:'POST', body: JSON.stringify({path: $('rootPath')?.value || ''})});
     packageId = result.package_id;
+    pollingNeeded = true;
     window.sjfxLargeResultId = packageId;
     selected = new Set();
     fileOffset = 0; fileTopic = ''; fileNodeId = ''; fileCategory = '';
@@ -305,20 +325,22 @@
     if (window.SJFXShell) window.SJFXShell.activate('large-select');
     else setStage('select');
     await refresh();
-    clearInterval(pollTimer);
-    pollTimer = setInterval(refresh, 1500);
+    stopPolling();
+    startPolling();
   }
   async function confirmSelection() {
     if (!selected.size) return window.alert('请至少选择一个文件');
     await api()(`/api/large-packages/${encodeURIComponent(packageId)}/select`, {method:'POST', body: JSON.stringify({paths: Array.from(selected), rule:{kind:'manual_ui'}})});
     selected.clear();
     if ($('largePackageSelectionStats')) $('largePackageSelectionStats').textContent = '已提交深度解析，后台继续处理。';
-    clearInterval(pollTimer); pollTimer = setInterval(refresh, 1500);
+    pollingNeeded = true;
+    stopPolling(); startPolling();
     await refresh();
   }
   window.openLargePackageHistory = async function (id, requestedStage = '') {
     requestedStage = typeof requestedStage === 'string' ? requestedStage : '';
     packageId = String(id || '');
+    pollingNeeded = true;
     contextSeq += 1;                       // 换包：让所有在途响应立即失效
     window.sjfxLargeResultId = packageId;
     selected = new Set();
@@ -328,12 +350,13 @@
     showPanel(true);
     if (requestedStage) setStage(requestedStage);
     await refresh();
-    clearInterval(pollTimer);
+    stopPolling();
     const current = await api()(`/api/large-packages/${encodeURIComponent(packageId)}`);
     const curStatus = String((current.workflow && current.workflow.status) || current.large_package?.status || '');
     const route = requestedStage || (curStatus === 'completed' ? 'large-overview' : 'large-select');
     if (window.SJFXShell) window.SJFXShell.activate(route); else setStage(route === 'large-overview' ? 'overview' : 'select');
-    if (!['completed', 'failed', 'cancelled'].includes(curStatus) || (curStatus === 'completed' && directoryPending > 0)) pollTimer = setInterval(refresh, 1500);
+    pollingNeeded = !['completed', 'failed', 'cancelled'].includes(curStatus) || (curStatus === 'completed' && directoryPending > 0);
+    if (!pollingNeeded) stopPolling(); else startPolling();
   };
   async function control(action) {
     if (!packageId) return;
@@ -343,7 +366,8 @@
     // pause/resume/cancel 三个接口统一返回 snapshot（改动前 cancel 返回的是
     // 裸 large_package，页面因此渲染不出来）。两者都接受，然后立刻整体刷新一次。
     render(response.large_package || {}, response.snapshot || null);
-    if (endpoint === 'cancel') clearInterval(pollTimer);
+    if (endpoint === 'cancel') { pollingNeeded = false; stopPolling(); }
+    if (endpoint === 'resume') { pollingNeeded = true; startPolling(); }
     await refresh();
   }
   document.addEventListener('DOMContentLoaded', () => {
@@ -417,7 +441,7 @@
     return button;
   }
 
-  window.SJFXLargePackage = { setStage };
+  window.SJFXLargePackage = { setStage, activate };
   document.addEventListener('click', event => {
     const node = event.target.closest('#largePackageSmartCatalog [data-large-node-type], #largePackageSelectCatalogTree [data-large-node-type]');
     if (node && event.target.closest('summary')) {

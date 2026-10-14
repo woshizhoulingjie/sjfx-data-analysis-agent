@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import functools
 import hashlib
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -14,22 +15,68 @@ import threading
 import time
 import uuid
 
+from services.process_liveness import pid_is_alive
+
 _background = ContextVar('sjfx_background_generation', default=None)
 _generation_priority = ContextVar('sjfx_generation_priority', default=None)
 _generation_status = ContextVar('sjfx_generation_status', default=None)
+_generation_deadline = ContextVar('sjfx_generation_deadline', default=None)
+_generation_timings = ContextVar('sjfx_generation_timings', default=None)
+
+
+def generation_timeout(timeout):
+    """Bound all admission and HTTP waits by the same outer task deadline."""
+    from services.model_contract import LocalModelError
+    deadline = _generation_deadline.get()
+    if deadline is None:
+        return float(timeout)
+    remaining = deadline-time.monotonic()
+    if remaining <= 0:
+        raise LocalModelError('模型调用已达到总时间预算', code='cancelled')
+    return min(float(timeout), remaining)
+
+
+def acquire_generation_semaphore(semaphore, timeout):
+    """Client-local admission remains cancelable and consumes the outer budget."""
+    from services.model_contract import LocalModelError
+    started = time.monotonic()
+    deadline = started+generation_timeout(timeout)
+    cancel = _background.get()
+    try:
+        while True:
+            if cancel is not None and cancel():
+                raise LocalModelError('目录命名已暂停或达到预算', code='cancelled')
+            remaining = min(deadline-time.monotonic(), generation_timeout(timeout))
+            if remaining <= 0:
+                return False
+            if semaphore.acquire(timeout=min(.05, remaining)):
+                return True
+    finally:
+        timings = _generation_timings.get()
+        if timings is not None:
+            timings['client_admission_wait_seconds'] += time.monotonic()-started
 
 
 @contextmanager
-def background_generation(cancelled=lambda: False, priority=10, on_status=None):
+def background_generation(cancelled=lambda: False, priority=10, on_status=None, deadline=None):
     """Cancelable admission; user-requested durable work may opt into FIFO.
 
     Optional catalog work keeps its existing lower priority. Status callbacks
     report actual admission transitions, never an estimated inference state.
+    An optional absolute monotonic deadline can only shorten a parent budget.
     """
     if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 100:
         raise ValueError('Generation priority must be an integer between 0 and 100')
     if on_status is not None and not callable(on_status):
         raise TypeError('Generation status callback must be callable')
+    if deadline is not None:
+        if isinstance(deadline, bool) or not math.isfinite(float(deadline)):
+            raise ValueError('Generation deadline must be a finite monotonic timestamp')
+        deadline = float(deadline)
+        parent_deadline = _generation_deadline.get()
+        if parent_deadline is not None:
+            deadline = min(deadline, parent_deadline)
+    deadline_token = _generation_deadline.set(deadline) if deadline is not None else None
     token = _background.set(cancelled)
     priority_token = _generation_priority.set(priority)
     status_token = _generation_status.set(on_status)
@@ -39,6 +86,8 @@ def background_generation(cancelled=lambda: False, priority=10, on_status=None):
         _generation_status.reset(status_token)
         _generation_priority.reset(priority_token)
         _background.reset(token)
+        if deadline_token is not None:
+            _generation_deadline.reset(deadline_token)
 
 
 _schema_lock = threading.Lock()
@@ -202,13 +251,7 @@ if hasattr(os, 'register_at_fork'):
 
 
 def _alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError):
-        return True
+    return pid_is_alive(pid)
 
 
 def _concurrency_limit():
@@ -218,7 +261,8 @@ def _concurrency_limit():
     放开并发时必须同时提高 vLLM 的 --max-num-seqs，否则服务端仍会串行。
     """
     try:
-        value = int(os.getenv('SJFX_GENERATION_CONCURRENCY', '1'))
+        from config import Config
+        value = int(os.getenv('SJFX_GENERATION_CONCURRENCY', str(Config.LLM_MAX_CONCURRENCY)))
     except (TypeError, ValueError):
         value = 1
     return max(1, min(8, value))
@@ -339,7 +383,9 @@ def generation_slot(endpoint, timeout=15):
         for old, pid, beat in c.execute('SELECT id,pid,heartbeat FROM admission WHERE endpoint=?', (endpoint,)).fetchall():
             if not _alive(pid) or beat < time.time()-120:
                 c.execute('DELETE FROM admission WHERE id=?', (old,))
-        active_count = c.execute('SELECT COUNT(*) FROM admission WHERE endpoint=? AND active=1',(endpoint,)).fetchone()[0]
+        active_count, background_active_count = c.execute(
+            'SELECT COUNT(*),COUNT(CASE WHEN priority<100 THEN 1 END) '
+            'FROM admission WHERE endpoint=? AND active=1', (endpoint,)).fetchone()
         # 方案 §5.1 方案 B：后台名额按"此刻"算（借用关闭时就是上面算好的 N-1）。
         claim_limit = limit if priority >= 100 else _background_limit(c, endpoint, slot_limit)
         first = c.execute('SELECT id FROM admission WHERE endpoint=? AND active=0 ORDER BY priority DESC,created,id LIMIT 1',(endpoint,)).fetchone()
@@ -347,7 +393,9 @@ def generation_slot(endpoint, timeout=15):
         # A client timeout may leave server work finishing. Only optional
         # background requests observe the quarantine; frontend stays usable.
         quarantined=priority<100 and cooldown and cooldown[0]>time.time()
-        allowed = active_count < claim_limit and not quarantined and first and first[0] == ticket
+        # Foreground usage counts toward total capacity, not the background cap.
+        has_capacity = active_count < slot_limit and (priority >= 100 or background_active_count < claim_limit)
+        allowed = has_capacity and not quarantined and first and first[0] == ticket
         if allowed:
             c.execute('UPDATE admission SET active=1 WHERE id=?',(ticket,))
         c.commit()
@@ -362,11 +410,11 @@ def generation_slot(endpoint, timeout=15):
         if status is not None:status('waiting_for_model')
         while True:
             if cancel is not None and cancel():
-                raise LocalModelError('目录命名已暂停或达到预算')
+                raise LocalModelError('目录命名已暂停或达到预算', code='cancelled')
             if _run(_claim):
                 break
             if time.monotonic()-start >= timeout:
-                raise LocalModelError('模型正在处理其他请求，请稍后重试')
+                raise LocalModelError('模型正在处理其他请求，请稍后重试', code='busy', retryable=True)
             time.sleep(.05)
         if status is not None:status('running')
         try:
@@ -382,10 +430,66 @@ def generation_slot(endpoint, timeout=15):
 
 
 def serialized_generation(func):
+    import inspect
+    signature = inspect.signature(func)
+
     @functools.wraps(func)
     def call(self, *args, **kwargs):
+        preflight = getattr(self, '_preflight_generation', None)
+        if callable(preflight):
+            parameters = signature.bind(self, *args, **kwargs)
+            parameters.apply_defaults()
+            preflight(parameters.arguments)
         requested = kwargs.get('timeout') or self.timeout
-        with generation_slot(self.base_url, _admission_wait_limit(requested)):
-            return func(self,*args,**kwargs)
+        requested = float(requested)
+        separate_admission = bool(getattr(self, 'separate_admission_timeout', False))
+        queue_limit = min(_admission_wait_limit(requested),
+                          float(getattr(self, 'queue_timeout', _admission_wait_limit(requested))))
+        parent_deadline = _generation_deadline.get()
+        # Existing clients share one deadline across admission and generation;
+        # catalog clients may explicitly request a separate admission allowance.
+        deadline = time.monotonic()+requested+(queue_limit if separate_admission else 0)
+        token = _generation_deadline.set(min(deadline, parent_deadline) if parent_deadline is not None else deadline)
+        timings = {'admission_wait_seconds':0., 'client_admission_wait_seconds':0.}
+        timing_token = _generation_timings.set(timings)
+        started = time.monotonic()
+        generated = None
+        try:
+            queue_timeout = generation_timeout(queue_limit)
+            started = time.monotonic()
+            with generation_slot(self.base_url, queue_timeout):
+                timings['admission_wait_seconds'] = time.monotonic()-started
+                if separate_admission:
+                    # Queueing may use its own allowance, but generation and
+                    # client-local waits still share the bounded outer budget.
+                    _generation_deadline.set(min(deadline, time.monotonic()+requested,
+                                                 parent_deadline if parent_deadline is not None else deadline))
+                kwargs['timeout'] = generation_timeout(requested)
+                generated = time.monotonic()
+                result = func(self,*args,**kwargs)
+                if isinstance(result, dict):
+                    result = dict(result)
+                    timing = dict(result.get('timing') or {})
+                    timing.update(timings)
+                    # Client wall includes network/decoding and any local wait;
+                    # it is never labeled as pure model inference time.
+                    timing['client_generation_wall_seconds'] = time.monotonic()-generated
+                    result['timing'] = timing
+                return result
+        except BaseException as exc:
+            failed_timing = dict(timings)
+            if generated is None:
+                failed_timing['admission_wait_seconds'] = time.monotonic()-started
+            else:
+                failed_timing['client_generation_wall_seconds'] = time.monotonic()-generated
+            # Safe scalar diagnostics also survive a queue timeout, when there
+            # is no model response from which to read timings.
+            try:
+                exc.generation_timing = failed_timing
+            except (AttributeError, TypeError):
+                pass
+            raise
+        finally:
+            _generation_timings.reset(timing_token)
+            _generation_deadline.reset(token)
     return call
-

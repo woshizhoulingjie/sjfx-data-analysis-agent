@@ -1,4 +1,8 @@
-"""The previous greedy selector is an oracle, not a new quality heuristic."""
+"""Direct greedy oracle for evidence/4; incremental redundancy must remain exact.
+
+The source-ranking policy deliberately changed to preserve scientific body text.
+This oracle still recomputes all overlaps instead of using incremental state.
+"""
 import copy
 import hashlib
 import random
@@ -19,8 +23,11 @@ def reference_candidates(parts, max_candidates=64):
             continue
         source_cut=len(raw)>24000
         ranked=[]
-        for index,(value,cut) in enumerate(list(evidence._pieces(raw[:24000]))[:128]):
-            kind=part.get('kind') or 'unknown'
+        kind=part.get('kind') or 'unknown'
+        pieces=[(value,cut) for value,cut in evidence._pieces(raw[:24000])
+                if kind in evidence._STRUCTURED_KINDS or not (
+                    evidence._LAYOUT_NUMBER.fullmatch(value) or evidence._PREPRINT_NOTICE.search(value))][:128]
+        for index,(value,cut) in enumerate(pieces):
             structure=1.0 if kind in {'heading','title','fields','abstract'} else 0.0
             intent=.5 if re.search(r'摘要|目的|结论|结果|提出|用于|abstract|objective|conclusion',value,re.I) else 0
             score=evidence.quality(value)+structure+intent+min(len(evidence._units(value)),20)/40
@@ -51,8 +58,12 @@ def reference_select(parts, limit=8, chars=4000, terms=()):
         key = re.sub(r'\s+', ' ', value).casefold()
         structure = .7 if block['kind'] in {'title', 'heading', 'fields', 'abstract'} else 0
         penalty = 3 if evidence.is_boilerplate(value) or block['kind'] in {'footer', 'navigation'} else .6 if block['kind'] in {'header', 'quoted_history'} else .3 if block['kind'] == 'derived_summary' else 0
-        score = evidence.quality(value) + structure + min(4, sum(t in value.casefold() for t in anchors))*.12 - penalty
-        prepared.append((block, key, evidence._units(value), score))
+        if block['kind'] not in evidence._STRUCTURED_KINDS | {'title','heading'} and re.fullmatch(r'[A-Za-z]{1,24}',value.strip()):
+            penalty += .8
+        units=evidence._units(value)
+        signal=min(12,len(units))/24+min(80,len(value))/320
+        score = evidence.quality(value) + signal + structure + min(4, sum(t in value.casefold() for t in anchors))*.12 - penalty
+        prepared.append((block, key, units, score))
     pool, selected_units = prepared, []
     while pool and len(chosen) < limit:
         best = None

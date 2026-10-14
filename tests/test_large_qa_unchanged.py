@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 from services.large_qa_index import LargeQAIndex, _fingerprint_rows
@@ -15,7 +16,8 @@ class UnchangedSyncTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.db = self.base/'source.db'
-        with sqlite3.connect(str(self.db)) as c:
+        # Native SQLite contexts commit/rollback but do not own the handle.
+        with closing(sqlite3.connect(str(self.db))) as c, c:
             c.executescript('''
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE packages(id TEXT PRIMARY KEY,root_path TEXT,owner_id TEXT,updated_at TEXT);
@@ -37,7 +39,7 @@ class UnchangedSyncTests(unittest.TestCase):
         self.index = LargeQAIndex('p', self.base/'indexes', create=True)
 
     def execute(self, sql, args=()):
-        with sqlite3.connect(str(self.db)) as c:
+        with closing(sqlite3.connect(str(self.db))) as c, c:
             c.execute(sql, args)
 
     def meta(self):
@@ -239,7 +241,7 @@ class UnchangedSyncTests(unittest.TestCase):
             source.execute('SELECT 1')
 
     def test_full_membership_not_limited_to_first_batch(self):
-        with sqlite3.connect(str(self.db)) as c:
+        with closing(sqlite3.connect(str(self.db))) as c, c:
             c.executemany("INSERT INTO files VALUES('p',?,?,'energy',0,0,'',0,'{}','{}')",
                           [('file-%04d.txt'%i,'file-%04d.txt'%i) for i in range(400)])
         self.assertEqual(self.index.sync_store(self.store), 401)

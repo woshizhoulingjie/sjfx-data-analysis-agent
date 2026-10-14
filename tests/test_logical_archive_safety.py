@@ -42,7 +42,16 @@ def node(path,member='report.txt',size=5,**extra):
 def make_zip(root,members=None,compression=zipfile.ZIP_STORED):
     path=root/'input.zip'
     with zipfile.ZipFile(path,'w',compression=compression) as archive:
-        for name,data in (members or [('report.txt',b'hello')]): archive.writestr(name,data)
+        for name,data in (members or [('report.txt',b'hello')]):
+            if isinstance(name,zipfile.ZipInfo):
+                archive.writestr(name,data)
+                continue
+            info=zipfile.ZipInfo(name)
+            # ZipInfo normalizes Windows separators at construction. Keep
+            # the malicious on-disk name so both hosts test the same input.
+            info.filename=name;info.orig_filename=name
+            info.compress_type=compression
+            archive.writestr(info,data)
     return path
 
 
@@ -167,9 +176,17 @@ def test_zip_metadata_preflight_runs_before_zipfile(sandbox,monkeypatch):
 def test_preflight_open_handle_keeps_position_and_ignores_replaced_path(sandbox):
     root,scratch=sandbox;path=make_zip(root)
     with path.open('rb') as handle:
-        handle.seek(7);path.rename(root/'original.zip');path.write_bytes(b'not a zip')
+        handle.seek(7)
+        if os.name=='nt':
+            # The default Windows handle denies deletion/replacement. This
+            # protects the snapshot just as an open POSIX inode does.
+            with pytest.raises(PermissionError):path.rename(root/'original.zip')
+        else:
+            path.rename(root/'original.zip');path.write_bytes(b'not a zip')
         assert parser._zip_central_directory_preflight(handle)['safe']
         assert handle.tell()==7 and not handle.closed
+    if os.name=='nt':
+        path.rename(root/'original.zip');path.write_bytes(b'not a zip')
 
 
 def test_tar_member_count_limit(sandbox,monkeypatch):

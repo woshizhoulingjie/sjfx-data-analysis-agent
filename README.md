@@ -1,5 +1,7 @@
 # SJFX 数据分析 Agent：完整系统说明与快速部署
 
+Windows/Linux 的统一启动、目录配置及本阶段验证范围见 [双平台运行说明](docs/platform-compatibility.md)。当前兼容源码版需要预先准备运行时、依赖和模型资源；完整离线安装包将在后续阶段交付。
+
 SJFX 是一个本地运行、多用户隔离、证据可回溯、任务可恢复的数据分析系统。它把目录扫描、多格式文件解析、摘要、智能目录、情报概览、邮件关系挖掘、翻译、结构化分析、交互式对话和报告导出组织成一个完整工作流。对几万到几十万文件的大数据包，系统先生成“文件 → 内容分组 → 主题”三层智能目录，再让用户从目录里挑选资料进入普通分析和资料问答；可选的文件保护模块负责服务器与本机文件的关联、检查和审计。
 
 本文同时作为 README 和新成员培训文档，目标是让读者能够：
@@ -616,13 +618,15 @@ CSV、XLSX、JSON 和 JSONL 会先做结构画像：列名和类型、行数、�
 
 ### 21.1 推荐环境
 
-- Linux x86_64，Python 3.10 或更高版本。
+- Windows 11 x64 或 Linux x86_64；代码最低要求 Python 3.10 或更高版本，本阶段统一以 Python 3.12 验证。其他系统版本需另做验收。
 - 普通 CPU 解析建议 8 GB 以上内存；启用 Docling/OCR 建议 16 GB 以上。
 - 本地磁盘用于 SQLite、缓存、解析临时文件和报告；原始资料可以放在 NAS。
 - 如果启用本地大模型，显存和模型大小决定摘要吞吐。
 - 生产环境不要把 SQLite 放在 NFS/CIFS 上；项目已经支持将状态目录切换到本地磁盘。
 
-### 21.2 从零启动
+### 21.2 Linux 开发环境示例
+
+本节命令供联网构建机和现有 Linux 开发环境参考。Windows/Linux 新实例的统一配置、启动和停止见 [双平台运行说明](docs/platform-compatibility.md)；断网客户现场将使用后续预置依赖的安装包。
 
 ```bash
 git clone https://github.com/woshizhoulingjie/sjfx-data-analysis-agent.git
@@ -634,11 +638,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-生产服务器可以使用锁定依赖：
-
-```bash
-pip install -r requirements.lock.txt
-```
+`requirements.txt` 安装完整应用依赖，包含 MSG 解析。可选的 Linux vLLM 模型服务须在另一个虚拟环境安装 `requirements-vllm.txt`，避免其 `lark` 固定版本与 MSG 的 RTFDE 依赖冲突。现有共用模型环境保持原依赖，并通过 `SJFX_MSG_PYTHON` 指定独立 MSG 解释器。`requirements.lock.txt` 是旧 Linux 共用服务器快照，未包含完整 MSG 依赖，不能作为新应用或 Windows 安装的完整入口。
 
 复制配置并至少修改访问令牌和扫描根目录：
 

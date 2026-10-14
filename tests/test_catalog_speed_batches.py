@@ -345,7 +345,7 @@ class UnifiedCacheKeyTests(_Base):
 class CompactOutputTests(_Base):
     def test_switch_off_keeps_the_exact_prompt(self):
         self.assertFalse(naming.compact_output_enabled())
-        self.assertEqual(naming.prompt_variant(), 'full')
+        self.assertEqual(naming.prompt_variant(), 'full-v2')
         self.assertEqual(naming.system_prompt(), naming.SYSTEM)
         self.assertEqual(naming.naming_output_rules(), naming.NAMING_OUTPUT_RULES)
         self.assertEqual(naming.naming_result_schema(), naming.NAMING_RESULT_SCHEMA)
@@ -354,7 +354,7 @@ class CompactOutputTests(_Base):
     def test_switch_on_swaps_the_output_rules_only(self):
         os.environ['SJFX_LP_NAMING_COMPACT_OUTPUT'] = '1'
         self.assertTrue(naming.compact_output_enabled())
-        self.assertEqual(naming.prompt_variant(), 'compact')
+        self.assertEqual(naming.prompt_variant(), 'compact-v3')
         prompt = naming.system_prompt()
         self.assertIn(naming.NAMING_OUTPUT_RULES_COMPACT, prompt)
         self.assertNotIn(naming.NAMING_OUTPUT_RULES, prompt)

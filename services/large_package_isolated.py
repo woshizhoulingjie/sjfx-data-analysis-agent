@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import Config
-from services.scanner import human_size, is_sensitive_file
+from services.scanner import human_size, is_sensitive_file, nofollow_entry_stat
 
 LOGGER = logging.getLogger("sjfx.large_package_store")
 
@@ -30,11 +30,7 @@ LOGGER = logging.getLogger("sjfx.large_package_store")
 _PHASE_CLOCK = {}
 
 
-TEXT_EXTENSIONS = {
-    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
-    ".xml", ".html", ".htm", ".log", ".ini", ".cfg", ".yaml", ".yml",
-}
-ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".7z", ".rar"}
+from services.file_capabilities import TEXT_EXTENSIONS, ARCHIVE_EXTENSIONS
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}")
 STOPWORDS = {"the", "and", "for", "with", "from", "this", "that", "数据", "资料", "文件", "分析", "报告"}
 
@@ -83,14 +79,57 @@ def _loads(value, default=None):
         return default if default is not None else {}
 
 
-def _under_allowed_root(path):
+def _under_allowed_root(path, owner_id=None):
+    # Upload trees are reserved for their authenticated owner.  Apply this
+    # check here as well as at the HTTP boundary because inventory runs in a
+    # separate worker process and must not trust a persisted root blindly.
+    from sjfx_multiuser.scan_paths import authorize_uploaded_scan_path
+    upload_root = Path(Config.OUTPUT_DIR) / "_uploads"
+    uploaded = authorize_uploaded_scan_path(
+        path, upload_root, owner_id, check_filesystem=True
+    )
     candidate = Path(path).expanduser().resolve()
+    resolved_upload = authorize_uploaded_scan_path(
+        candidate, upload_root, owner_id, check_filesystem=True
+    )
+    if not candidate.is_dir():
+        raise ValueError("目录不存在或不是文件夹")
+    # Match the ordinary scanner: an authenticated owner's assembled upload
+    # is usable even when OUTPUT_DIR is outside the administrator's NAS roots.
+    if uploaded is not None or resolved_upload is not None:
+        return candidate
     roots = tuple(getattr(Config, "SCAN_ALLOWED_ROOTS", ()) or ())
     if roots and not any(candidate == root or root in candidate.parents for root in roots):
         raise ValueError("目录不在服务器扫描白名单内")
-    if not candidate.is_dir():
-        raise ValueError("目录不存在或不是文件夹")
     return candidate
+
+
+def _catalog_publication_fact(conn, package_id):
+    """Read dependency coverage only for trees carrying the new schema marker."""
+    marker = conn.execute("SELECT CASE WHEN json_valid(payload) THEN "
+                          "json_extract(payload,'$.publication_schema') ELSE NULL END "
+                          "FROM lp_catalog_tree WHERE package_id=?", (package_id,)).fetchone()
+    if not marker or not marker[0]:
+        return None
+    from services.large_package_catalog_tree import publication_state
+    return publication_state(conn, package_id)
+
+
+class _OwnedConnection(sqlite3.Connection):
+    """A store connection owns its handle as well as its transaction.
+
+    SQLite's normal connection context commits/rolls back but keeps the handle
+    open. API and worker operations must release it immediately, including on
+    failures; waiting for cyclic garbage collection leaks handles and pins the
+    database/WAL files on Windows. Explicit ``closing(connection)`` callers
+    remain supported.
+    """
+
+    def __exit__(self, *exc_info):
+        try:
+            return super().__exit__(*exc_info)
+        finally:
+            self.close()
 
 
 class LargePackageStore:
@@ -102,7 +141,17 @@ class LargePackageStore:
         self._init_db()
 
     def _connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        conn = sqlite3.connect(
+            self.db_path, timeout=30, isolation_level=None, factory=_OwnedConnection
+        )
+        try:
+            return self._configure_connection(conn)
+        except BaseException:
+            conn.close()
+            raise
+
+    @staticmethod
+    def _configure_connection(conn):
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -357,10 +406,27 @@ class LargePackageStore:
             if key in item:
                 item[key] = _loads(item[key], [] if key == "paths" else {})
         item["sensitive"] = bool(item.get("sensitive"))
+        if "root_path" in item:
+            item.update(LargePackageStore._import_state(item))
         return item
 
+    @staticmethod
+    def _import_state(package, catalog_complete=False):
+        """Import ends at the catalog; optional deep batches retain their own state."""
+        completed_at = (package.get("counts") or {}).get("import_completed_at")
+        # Older deep batches already crossed the catalog milestone.
+        complete = bool(completed_at or package.get("phase") in {"deep_parse", "report_ready"}
+                        or catalog_complete)
+        status = "completed" if complete else str(package.get("status") or "queued")
+        if status == "waiting_for_selection":
+            status = "running"
+        return {"import_status": status, "import_completed": complete,
+                "import_progress": 100 if complete else min(99, int(package.get("progress") or 0)),
+                "import_message": ("智能目录已生成，大数据包导入已完成；可按需选择深度摘要范围"
+                                   if complete else str(package.get("message") or ""))}
+
     def create(self, root_path, owner_id="legacy"):
-        root = str(_under_allowed_root(root_path))
+        root = str(_under_allowed_root(root_path, owner_id=owner_id))
         package_id = "lp-" + uuid.uuid4().hex
         now = time.time()
         with self._lock, self._connect() as conn:
@@ -411,20 +477,51 @@ class LargePackageStore:
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         limit = max(1, min(50, int(limit)))
         offset = max(0, int(offset))
-        with self._connect() as conn:
+        # Keep the page, live file counts and summary availability in one short
+        # read snapshot. History needs none of counts()'s six status/group
+        # aggregations, and must not open another connection for every item.
+        file_counts = {}
+        chat_ready = {}
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
             total = int(conn.execute("SELECT COUNT(*) FROM packages" + clause, args).fetchone()[0])
             rows = conn.execute("SELECT * FROM packages" + clause + " ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                                 args + [limit, offset]).fetchall()
+            if rows:
+                package_ids = [row["id"] for row in rows]
+                placeholders = ",".join("?" for _ in package_ids)
+                file_counts = dict(conn.execute(
+                    "SELECT package_id,COUNT(*) FROM files WHERE package_id IN (" + placeholders + ") "
+                    "GROUP BY package_id", package_ids))
+                from services.large_qa_index import summary_text
+
+                def has_summary(local, deep):
+                    local, deep = _loads(local, {}), _loads(deep, {})
+                    return bool(summary_text({
+                        "local_summary": local if isinstance(local, dict) else {},
+                        "deep_summary": deep if isinstance(deep, dict) else {},
+                    }))
+
+                conn.create_function("lp_history_has_summary", 2, has_summary, deterministic=True)
+                # EXISTS stops at the first usable summary per page package.
+                # Reuse QA's content and model_pending rules without accessing
+                # the index or source filesystem during history polling.
+                chat_ready = dict(conn.execute(
+                    "SELECT p.id,EXISTS(SELECT 1 FROM files f WHERE f.package_id=p.id "
+                    "AND f.sensitive=0 AND f.source_changed=0 "
+                    "AND (f.local_summary NOT IN ('','{}') OR f.deep_summary NOT IN ('','{}')) "
+                    "AND lp_history_has_summary(f.local_summary,f.deep_summary)) "
+                    "FROM packages p WHERE p.id IN (" + placeholders + ")", package_ids))
         items = []
         for row in rows:
             item = self._row(row)
-            counts = self.counts(item["id"])
             counts_json = item.get("counts") or {}
             phase = item.get("phase") or "inventory"
             status = item.get("status") or "queued"
-            if status in {"queued", "running"} and phase == "inventory": label = "scanning"
+            if item["import_completed"]: label = "completed"
+            elif status in {"queued", "running"} and phase == "inventory": label = "scanning"
             elif status in {"queued", "running"} and phase == "quick_parse": label = "preprocessing"
-            elif status == "waiting_for_selection": label = "awaiting_selection"
+            elif status == "waiting_for_selection": label = "running"
             elif status == "completed": label = "completed"
             else: label = status
             root = item["root_path"]
@@ -432,14 +529,16 @@ class LargePackageStore:
                 "kind": "large", "scan_id": item["id"], "large_package_id": item["id"],
                 "name": Path(root).name or root, "root": root,
                 "status": label, "large_status": status, "phase": phase,
-                "file_count": counts.get("total_files", 0),
+                "file_count": file_counts.get(item["id"], 0),
                 "total_size": counts_json.get("total_bytes", 0),
                 "total_size_human": counts_json.get("total_size_human", ""),
                 "analysis_ready": status in {"waiting_for_selection", "completed"},
-                "usable": status in {"waiting_for_selection", "completed"},
+                "usable": bool(chat_ready.get(item["id"])),
+                "can_chat": bool(chat_ready.get(item["id"])),
                 "created_at": datetime.fromtimestamp(float(item["created_at"]), timezone.utc).isoformat(),
                 "updated_at": datetime.fromtimestamp(float(item["updated_at"]), timezone.utc).isoformat(),
-                "progress": item.get("progress", 0), "message": item.get("message", ""),
+                "progress": item["import_progress"], "message": item["import_message"],
+                "import_status": item["import_status"], "import_completed": item["import_completed"],
             })
         return {"items": items, "total": total, "limit": limit, "offset": offset}
 
@@ -467,6 +566,21 @@ class LargePackageStore:
         if phase:
             self._log_phase_transition(package_id, str(phase))
         return self.get(package_id)
+
+    def mark_import_complete(self, package_id, message):
+        """Commit the catalog milestone without overwriting a concurrent deep batch."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            result = conn.execute(
+                "UPDATE packages SET counts=json_set(COALESCE(counts,'{}'),"
+                "'$.import_completed_at',COALESCE(json_extract(counts,'$.import_completed_at'),?)),"
+                "progress=CASE WHEN phase='catalog_ready' AND status='waiting_for_selection' "
+                "AND control_state='active' THEN 100 ELSE progress END,"
+                "message=CASE WHEN phase='catalog_ready' AND status='waiting_for_selection' "
+                "AND control_state='active' THEN ? ELSE message END,updated_at=? "
+                "WHERE id=? AND phase IN ('catalog_ready','deep_parse','report_ready')",
+                (now, str(message), now, str(package_id)))
+        return bool(result.rowcount)
 
     def _log_phase_transition(self, package_id, phase):
         """阶段边界记一条可恢复时间线的事件（纯观测，不改变任何行为）。
@@ -692,9 +806,12 @@ class LargePackageStore:
 
     def commit_stage_batch(self, items):
         if len(items)>32:raise ValueError('A preview commit batch is limited to 32 files')
-        results=[]
+        results=[]; batch_started=time.monotonic()
         with self._lock,closing(self._connect()) as conn:
+            lock_connection_seconds=time.monotonic()-batch_started
+            begin_started=time.monotonic()
             conn.execute('BEGIN IMMEDIATE')
+            sqlite_lock_seconds=time.monotonic()-begin_started
             try:
                 for item in items:
                     conn.execute('SAVEPOINT preview_item')
@@ -705,12 +822,36 @@ class LargePackageStore:
                 conn.commit()
             except Exception:
                 conn.rollback();raise
+            finally:
+                if _PROFILE_COMMIT:
+                    LOGGER.info('preview_commit_batch files=%d total_seconds=%.6f '
+                                'lock_connection_seconds=%.6f sqlite_lock_seconds=%.6f',
+                                len(items),time.monotonic()-batch_started,
+                                lock_connection_seconds,sqlite_lock_seconds)
         return results
 
     def _commit_stage_conn(self, conn, package_id, path, stage, token, *, ok=True,
                             file_fields=None, error=None, require_source_hash=None,
                             drop_catalog_queue=False):
-        now=time.time();_pf=None;_t0=time.monotonic()
+        started=time.monotonic(); profile={} if _PROFILE_COMMIT else None
+        outcome='exception'
+        try:
+            result=self._commit_stage_conn_impl(conn,package_id,path,stage,token,ok=ok,
+                file_fields=file_fields,error=error,require_source_hash=require_source_hash,
+                drop_catalog_queue=drop_catalog_queue,_profile=profile)
+            outcome='accepted' if result[0] else result[1]
+            return result
+        finally:
+            elapsed=time.monotonic()-started
+            if profile is not None and elapsed*1000 >= _PROFILE_COMMIT_MIN_MS:
+                LOGGER.info('preview_commit_item package=%s stage=%s outcome=%s '
+                            'total_seconds=%.6f steps=%s',package_id,stage,outcome,elapsed,
+                            json.dumps(profile,sort_keys=True))
+
+    def _commit_stage_conn_impl(self, conn, package_id, path, stage, token, *, ok=True,
+                            file_fields=None, error=None, require_source_hash=None,
+                            drop_catalog_queue=False, _profile=None):
+        now=time.time();_pf=_profile;_t0=time.monotonic()
         row = conn.execute(
             "SELECT status,lease_token FROM queue WHERE package_id=? AND path=? AND stage=?",
             (str(package_id), str(path), str(stage))).fetchone()
@@ -795,6 +936,7 @@ class LargePackageStore:
         if drop_catalog_queue:
             conn.execute("DELETE FROM queue WHERE package_id=? AND path=? AND stage='catalog'",
                          (str(package_id), str(path)))
+        _m(_pf, 'queue_update', _t0)
         return True,''
 
     def preview_files(self,package_id,paths):
@@ -802,6 +944,31 @@ class LargePackageStore:
         with closing(self._connect()) as c:
             rows=c.execute('SELECT * FROM files WHERE package_id=? AND path IN ('+','.join('?' for _ in paths)+')',[package_id]+list(paths))
             return {r['path']:self._row(r) for r in rows}
+
+    def preview_source_files(self, package_id, paths):
+        """Only the source contract consumed by PreviewRunner; no old portraits.
+
+        The full-row preview_files API stays available to refinement callers.
+        Source checks and prepare_update still read the previous row inside the
+        atomic commit transaction, after lease validation.
+        """
+        if not paths:
+            return {}
+        keys = ('path', 'name', 'size', 'modified_at_ns', 'sensitive', 'extension',
+                'source_kind', 'source_metadata')
+        paths = list(dict.fromkeys(str(path) for path in paths))
+        result = {}
+        with closing(self._connect()) as conn:
+            for offset in range(0, len(paths), 128):
+                chunk = paths[offset:offset+128]
+                rows = conn.execute('SELECT '+','.join(keys)+' FROM files WHERE package_id=? '
+                                    'AND path IN ('+','.join('?' for _ in chunk)+')',
+                                    [str(package_id)] + chunk)
+                for row in rows:
+                    item = dict(row)
+                    item['source_metadata'] = _loads(item.get('source_metadata'), {})
+                    result[item['path']] = item
+        return result
 
     def holds_lease(self, package_id, path, stage, token):
         """只读检查：该队列项仍由这个令牌持有且处于 running。"""
@@ -958,6 +1125,7 @@ class LargePackageStore:
                        (pid,))
             ov = one("SELECT report_id,milestone,status,schema_version FROM lp_overview_versions "
                      "WHERE package_id=? ORDER BY created DESC LIMIT 1", (pid,))
+            publication = _catalog_publication_fact(conn, pid)
 
         status = str(pkg.get("status") or "")
         phase = str(pkg.get("phase") or "")
@@ -999,6 +1167,8 @@ class LargePackageStore:
             validation = dict(validation or {})
             validation.setdefault('blocked_reason', str(latest_reject['reason'] or ''))
             validation['blocked_at'] = float(latest_reject['created'] or 0)
+        if publication is not None and not publication['complete'] and catalog_state != 'rejected':
+            catalog_state = 'partial'
         # 概览页横幅「目录校验未通过，当前显示上一版」：最近一次 catalog/rejected 事件
         # **比当前已发布的概览更新**、且确实有上一版可显示时才给出（复用上面的 latest_reject）。
         catalog_rejection = None
@@ -1045,6 +1215,9 @@ class LargePackageStore:
             published_view = dict(view)
         return {
             "package_id": pid,
+            **self._import_state(self._row(pkg), catalog_complete=bool(
+                phase == "catalog_ready" and publication and publication['complete']
+                and not pend('catalog') and not pend('quick') and not pend('inventory'))),
             "control_state": control,
             "control_generation": int(pkg.get("control_generation") or 0),
             "phase": phase, "status": status, "progress": int(pkg.get("progress") or 0),
@@ -1058,6 +1231,7 @@ class LargePackageStore:
             "catalog_state": catalog_state,
             "naming_pending": naming_pending,
             "catalog_validation": validation,
+            "catalog_publication": publication,
             "leaf_count": (int(catv["leaf_count"]) if catv is not None else 0),
             "topic_count": (int(catv["topic_count"]) if catv is not None else 0),
             "overview_state": overview_state,
@@ -1238,11 +1412,13 @@ class LargePackageStore:
         """
         pid = str(package_id)
         with closing(self._connect()) as conn:
+            conn.execute('BEGIN')
             row = conn.execute("SELECT phase,status,control_state FROM packages WHERE id=?",
                                (pid,)).fetchone()
             if not row:
                 return {"ok": False, "reason": "no_such_package"}
             phase = str(row["phase"] or "")
+            spec = dict(self.PHASES.get(phase) or {})
             facts = {
                 "phase": phase,
                 "status": str(row["status"] or ""),
@@ -1261,7 +1437,8 @@ class LargePackageStore:
                     "SELECT COUNT(*) FROM lp_catalog_branches WHERE package_id=?",
                     (pid,)).fetchone()[0] or 0),
             }
-        spec = dict(self.PHASES.get(phase) or {})
+            if spec.get('next') in {'catalog_ready', 'report_ready'}:
+                facts['catalog_publication'] = _catalog_publication_fact(conn, pid)
         blocked_by = []
         for gate in tuple(spec.get("gates") or ()):
             if gate == "naming":
@@ -1271,6 +1448,9 @@ class LargePackageStore:
                 left = int(facts["queue_pending"].get(gate) or 0)
                 if left:
                     blocked_by.append("%s=%d" % (gate, left))
+        publication = facts.get('catalog_publication')
+        if publication is not None and not publication['complete']:
+            blocked_by.append('catalog_partial_snapshot')
         terminal = not spec.get("next")
         waiting = bool(spec.get("waiting"))
         return {"ok": True, "phase": phase, "next_phase": str(spec.get("next") or ""),
@@ -1944,9 +2124,9 @@ def _closing_entries(entries):
         entries.close()
 
 
-def iter_inventory(root, on_error=None):
+def iter_inventory(root, on_error=None, owner_id=None):
     from services.large_package_resources import resource_code
-    root = _under_allowed_root(root)
+    root = _under_allowed_root(root, owner_id=owner_id)
     stack = [root]
     while stack:
         folder = stack.pop()
@@ -1960,11 +2140,16 @@ def iter_inventory(root, on_error=None):
         for entry in _closing_entries(entries):
             path = Path(entry.path)
             try:
-                stat = entry.stat(follow_symlinks=False)
+                stat = nofollow_entry_stat(entry, path)
             except OSError as exc:
                 if resource_code(exc):
                     raise
                 if on_error:on_error(str(path),str(exc))
+                continue
+            # Windows directory junctions are reparse points and need an
+            # explicit check in addition to follow_symlinks=False.
+            if getattr(stat, "st_file_attributes", 0) & 0x400:
+                if on_error:on_error(str(path), "目录成员包含重解析点，不允许读取")
                 continue
             rel = str(path.relative_to(root)).replace("\\", "/")
             if entry.is_dir(follow_symlinks=False):
@@ -1978,6 +2163,13 @@ def iter_inventory(root, on_error=None):
                 "size": int(stat.st_size), "modified_at_ns": int(stat.st_mtime_ns),
                 "device": int(stat.st_dev), "inode": int(stat.st_ino),
                 "sensitive": is_sensitive_file(entry.name),
+                # Persist the no-follow identity so HTTP reads can reject a
+                # replaced file even when size and mtime happen to match.
+                "source_metadata": {
+                    "version": 1, "device": int(stat.st_dev),
+                    "inode": int(stat.st_ino), "size": int(stat.st_size),
+                    "modified_at_ns": int(stat.st_mtime_ns),
+                },
             }
             yield item
             from services.large_archive_members import discover_members

@@ -29,7 +29,25 @@ def read_message_raw(repository, message_key, owner_id, package_id, occurrence_i
         sources=c.execute('SELECT s.locator_json FROM mail_sources s JOIN mail_occurrences o ON o.source_id=s.source_id WHERE o.package_id=? AND o.message_key=? AND o.raw_sha256=? ORDER BY o.source_member_ordinal',(package_id,message_key,digest)).fetchall()
     for source in sources:
         try:
-            with open_locator(json.loads(source[0])) as stream:raw=stream.read()
+            from config import Config
+            from .policy import MailPolicy
+            package = repository.get_package(package_id, owner_id)
+            if not package:
+                raise LookupError("邮件资料包不存在或不属于当前所有者")
+            policy = MailPolicy.from_config(Config)
+            # Historical locators may still point at a readable conversion
+            # cache after the original container has been removed.
+            policy.resolve_source(package['source_path'], owner_id=owner_id, require_exists=False)
+            locator = policy.resolve_locator(
+                json.loads(source[0]), owner_id=owner_id,
+                source_kind=package['source_kind'],
+                source_revision=package['source_revision'],
+            )
+            with open_locator(locator, policy=policy, owner_id=owner_id,
+                              source_kind=package['source_kind'],
+                              source_revision=package['source_revision']) as stream:
+                raw=stream.read(policy.max_message_bytes + 1)
+            policy.validate_size(len(raw), limit=policy.max_message_bytes, label='邮件')
             if hashlib.sha256(raw).hexdigest()==digest:return raw
         except (OSError,ValueError,KeyError):
             continue

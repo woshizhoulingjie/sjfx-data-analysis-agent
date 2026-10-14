@@ -12,7 +12,7 @@ from services.scanner import extract_text
 from services.summary_fidelity import SUMMARY_QUALIFIER_INSTRUCTION, summary_qualifier_patch
 
 
-PREVIEW_SUMMARY_PROMPT_VERSION = "preview-claims-qualifiers-v3"
+PREVIEW_SUMMARY_PROMPT_VERSION = "preview-claims-qualifiers-v4-sections"
 
 
 CHINESE_CONCLUSION_RULE = (
@@ -99,11 +99,9 @@ def _normalise_summary_topics(summary, text, title=""):
     return summary
 
 def _estimated_tokens(text):
-    """Conservative tokenizer-free estimate used only for prompt budgeting."""
-    value = str(text or "")
-    cjk = len(re.findall(r"[\u3400-\u9fff]", value))
-    remainder = max(0, len(value) - cjk)
-    return cjk + int(math.ceil(remainder / 3.5))
+    """Use the same selected-model accounting as transport preflight."""
+    from services.model_budget import count_tokens
+    return count_tokens(str(text or ''))
 
 
 def _split_text(text, max_chunks=64, preferred_chars=42000, max_input_tokens=14000, overlap_chars=320):
@@ -114,14 +112,16 @@ def _split_text(text, max_chunks=64, preferred_chars=42000, max_input_tokens=140
     """
     if not text:
         return []
-    preferred_chars = max(512, int(preferred_chars))
-    max_input_tokens = max(1000, int(max_input_tokens))
+    preferred_chars = max(1, int(preferred_chars))
+    max_input_tokens = max(1, int(max_input_tokens))
     chunks = []
     start = 0
     while start < len(text):
         end = min(len(text), start + preferred_chars)
-        while end > start + 256 and _estimated_tokens(text[start:end]) > max_input_tokens:
-            end = start + max(256, int((end - start) * 0.85))
+        while end > start + 1 and _estimated_tokens(text[start:end]) > max_input_tokens:
+            end = start + max(1, int((end - start) * 0.85))
+        if _estimated_tokens(text[start:end]) > max_input_tokens:
+            raise LocalModelError('单个正文字符超过可用输入预算', code='context_limit')
         if end < len(text):
             search_from = start + int((end - start) * 0.65)
             boundaries = [
@@ -137,11 +137,14 @@ def _split_text(text, max_chunks=64, preferred_chars=42000, max_input_tokens=140
         chunks.append({
             "index": len(chunks) + 1, "start": start, "end": end,
             "text": chunk_text, "estimated_input_tokens": _estimated_tokens(chunk_text),
-            "overlap_chars": 0 if not chunks else min(overlap_chars, start),
+            "overlap_chars": max(0, chunks[-1]['end'] - start) if chunks else 0,
         })
         if end >= len(text):
             break
-        next_start = max(start + 1, end - max(0, int(overlap_chars)))
+        # A small window must not turn a 320-character overlap into one-char
+        # progress. Keep the full source covered while bounding duplication.
+        actual_overlap = min(max(0, int(overlap_chars)), (end - start) // 4)
+        next_start = max(start + 1, end - actual_overlap)
         start = next_start
     return chunks
 
@@ -390,6 +393,16 @@ def _preview_input(unified_document, max_chars=24000):
         seen.add(key)
         deduped.append((item, text))
 
+    from services.preliminary_summary_input import build_preliminary_input
+    from services.research_elements import research_passages, LABELS
+    if limit <= 6500:
+        return build_preliminary_input(document, max_chars=limit)
+    for role, units in research_passages(document, per_role=2, max_chars=650).items():
+        for unit in units:
+            identity = str(unit.get("evidence_id") or "")
+            locator = str(unit.get("section") or unit.get("page") or "正文")
+            pieces.append("{}〔{}｜{}〕 {}".format(LABELS[role], identity, locator, unit["text"]))
+    remaining = max(0, limit - len("\n\n".join(pieces)) - 2)
     evidence_budget = min(4500, remaining // 3) if deduped else 0
     body_budget = max(0, remaining - evidence_budget)
     if raw and body_budget > 0:
@@ -542,6 +555,8 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
     prompt = """你正在进行文献候选集预读。输入只包含文件的结构和代表性片段，不是全文。
 请只根据给定内容生成与正式文件摘要相同类型的结果；不要把未提供的全文内容当成事实。
 候选结论必须标记为待深度校验，输出要简洁，不能写成长篇报告。
+综合章节中的问题、方法、结果和局限，保留数字、单位、样本、比较基线、条件与否定。
+研究方向仅针对当前文件的内容与待验证事项，不回灌全包首选，不增删输出字段。
 输入片段中的 evidence_id 是唯一允许引用的来源 ID。请在 claim_evidence 中为每条
 结论、事实、论点或方法原样列出 statement，并仅填写直接相关的 evidence_ids；没有
 直接来源时留空。引用 ID 仍只表示可回查来源，不代表已经验证其蕴含该主张。
@@ -603,7 +618,7 @@ def analyze_document_preview(llm, path, node_path, unified_document=None,
             "degraded": False,
         },
         "source_fingerprint": document_source_fingerprint(unified_document),
-        "summary_input_version": "preview-source-blocks-v2",
+        "summary_input_version": "preview-source-blocks-v3-sections",
         "summary_prompt_version": PREVIEW_SUMMARY_PROMPT_VERSION,
         "pipeline_timing_ms": {
             "input_selection": input_selection_ms,
@@ -651,7 +666,8 @@ def analyze_document_previews_batch(llm, documents, max_chars=8000,
     )
     prompt = """你正在进行文献候选集预读。下面包含多个文件的结构和代表性片段，
 不是全文。请严格依据每个文件自己的内容分别输出简洁候选摘要，不要把文件之间的内容混合，
-也不要把候选结论写成全文校验结论。方括号内 evidence_id 是唯一允许引用的来源 ID；
+也不要把候选结论写成全文校验结论。综合章节问题、方法、结果和局限，
+数字必须保留单位、条件、对照与否定；不得增加输出栏目。方括号内 evidence_id 是唯一允许引用的来源 ID；
 请在 claim_evidence 中为每条事实或结论原样给出 statement 和直接相关的 evidence_ids，
 没有直接来源时留空，来源可回查不等于主张已被验证。所有 title、core_summary、topics、key_facts、arguments、
 methodology、conclusions、uncertainties、warnings 必须使用简体中文；专业术语可在中文后保留英文缩写。
@@ -719,7 +735,7 @@ methodology、conclusions、uncertainties、warnings 必须使用简体中文；
             "preview_coverage": {"mode": "selective", "selected_chars": len(row["input"]), "complete": False},
             "parser_info": {"model": result.get("model"), "usage": result.get("usage") or {}, "batch_size": len(rows)},
             "source_fingerprint": document_source_fingerprint(row.get("document") or {}),
-            "summary_input_version": "preview-source-blocks-v2",
+            "summary_input_version": "preview-source-blocks-v3-sections",
             "summary_prompt_version": PREVIEW_SUMMARY_PROMPT_VERSION,
             "pipeline_timing_ms": {
                 "input_selection": row.get("input_build_ms", 0),
@@ -908,7 +924,14 @@ def _analyze_tabular_document(llm, node_path, document, context_window_tokens):
 
 def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
                      unified_document=None, preferred_chunk_chars=42000,
-                     context_window_tokens=65536):
+                     context_window_tokens=None):
+    from config import Config
+    from services.model_budget import context_window, reserve_tokens
+    configured = getattr(llm, 'budget_config', None) or Config
+    window = context_window(configured)
+    context_window_tokens = min(window, int(context_window_tokens or window))
+    full_output = min(3200, context_window_tokens // 3)
+    chunk_output = min(1800, context_window_tokens // 3)
     parser_name = str((unified_document or {}).get("parser", {}).get("name") or "").lower()
     if unified_document and parser_name == "structured-table":
         return _analyze_tabular_document(llm, node_path, unified_document, context_window_tokens)
@@ -942,11 +965,17 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
         raise ValueError("未能从该文件提取正文。{}".format("；".join(extracted["warnings"])))
 
     text = extracted["text"]
+    # Budget the complete source as chunks; metadata/contract is checked by the
+    # transport. Small windows may honestly reject a contract that cannot fit.
+    header_tokens = _estimated_tokens(CHINESE_CONCLUSION_RULE) + _estimated_tokens(node_path) + _estimated_tokens(json.dumps(extracted['metadata'], ensure_ascii=False)) + 900
+    input_budget = context_window_tokens - chunk_output - reserve_tokens(context_window_tokens) - 64 - header_tokens
+    if input_budget < 1:
+        raise LocalModelError('文档分析约定及元数据超过所选模型上下文预算', code='context_limit')
     chunks = _split_text(
         text,
         max_chunks=max_chunks,
         preferred_chars=preferred_chunk_chars,
-        max_input_tokens=max(4000, int(preferred_chunk_chars / 3.5)),
+        max_input_tokens=min(input_budget, max(1, int(preferred_chunk_chars / 3.5))),
     )
     coverage = {
         "parser": extracted["parser"],
@@ -978,7 +1007,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
         result = llm.chat_json(
             "你是严谨的全文文献分析助手，需要覆盖研究问题、方法、主要论点、结论和局限。" + CHINESE_CONCLUSION_RULE,
             prompt,
-            max_tokens=3200,
+            max_tokens=full_output,
             long_output=True,
             strict=True,
             retries=1,
@@ -990,7 +1019,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             result["json"], text, extracted.get("metadata", {}).get("title") or node_path
         )
         coverage["model_calls"] = [_model_call_profile(
-            "full_document_analysis", result, 3200, context_window_tokens, 1,
+            "full_document_analysis", result, full_output, context_window_tokens, 1,
         )]
         if coverage["model_calls"][0]["output_truncated"]:
             coverage["warnings"].append("全文分析输出达到模型预算上限，结论可能不完整，建议继续生成或缩小分析范围。")
@@ -1015,7 +1044,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
         result = llm.chat_json(
             "你正在进行全文分块阅读。不要猜测其他块内容，只提取当前块的事实和论证。" + CHINESE_CONCLUSION_RULE,
             prompt,
-            max_tokens=1800,
+            max_tokens=chunk_output,
             long_output=True,
             strict=True,
             retries=1,
@@ -1036,7 +1065,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             try:
                 data, call_result = future.result()
                 data["model_call"] = _model_call_profile(
-                    "document_chunk_analysis", call_result, 1800,
+                    "document_chunk_analysis", call_result, chunk_output,
                     context_window_tokens, chunk["index"],
                 )
                 if data["model_call"]["output_truncated"]:
@@ -1067,7 +1096,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
         final_result = llm.chat_json(
             "你是全文文献综合分析助手。必须综合所有分块，区分作者结论、事实和局限。" + CHINESE_CONCLUSION_RULE,
             merge_prompt,
-            max_tokens=3200,
+            max_tokens=full_output,
             long_output=True,
             strict=True,
             retries=1,
@@ -1076,12 +1105,17 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
             output_context="全文分块汇总",
         )
         summary = _normalise_summary_topics(final_result["json"], text, node_path)
+        coverage['final_synthesis_complete'] = True
     except LocalModelError as exc:
-        summary = _local_merge(node_path, chunks, ordered, extracted["warnings"] + ["最终本地模型汇总失败：{}".format(exc)])
+        warning = '最终模型汇总失败，以下为正文块结果的本地整理：{}'.format(exc)
+        coverage['final_synthesis_complete'] = False
+        coverage['final_synthesis_failure'] = {'code':getattr(exc,'code','model_error'), 'message':str(exc)}
+        coverage['warnings'].append(warning)
+        summary = _local_merge(node_path, chunks, ordered, extracted["warnings"] + [warning])
         final_result = {"model": None, "usage": {}, "content": ""}
 
     reduce_call = _model_call_profile(
-        "document_chunk_reduce", final_result, 3200, context_window_tokens,
+        "document_chunk_reduce", final_result, full_output, context_window_tokens,
     )
     coverage["model_calls"].append(reduce_call)
     if reduce_call["output_truncated"]:

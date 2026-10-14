@@ -55,6 +55,16 @@ def process_one(worker):
     claimed=store.claim('catalog_refine',1)
     if not claimed:return False
     package_id,path,token=claimed[0]
+    from services.large_package_catalog_coordination import leaf_batch
+    with leaf_batch(store, package_id, 'catalog-refine', lambda:worker._interrupted(package_id)) as allowed:
+        if not allowed:
+            store.requeue(package_id, path, 'catalog_refine', token=token)
+            return False
+        return _process_claimed(worker, package_id, path, token)
+
+
+def _process_claimed(worker, package_id, path, token):
+    store=worker.store
     worker._resource_package_id=package_id
     outcome='failed';finished=False
     try:

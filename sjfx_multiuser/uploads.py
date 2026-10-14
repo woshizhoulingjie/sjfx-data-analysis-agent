@@ -1,544 +1,808 @@
-"""可断点续传的分片上传管理器（框架无关，可本地测试）。
+"""Durable, ordered chunk uploads with owner/session isolation.
 
-## 为什么必须分片 + 断点续传
-
-实测约束：`app.py:136` 把 `max_content_length` 设成 **4MB**，
-`web_compat._read_request_body()` 超限直接抛 `_RequestBodyTooLarge` → 413。
-
-而用户的场景是"U 盘里约 100G 数据"。按 4MB 分片，那是 **25600 个请求**。
-在真实网络上传这么久，**中途断开是必然事件**，不是可能性。
-所以"断点续传"不是优化，是**可用性的前提** ——
-没有它，用户传到 80% 断一次就要从头再来。
-
-## 设计
-
-```
-<root>/<owner_id>/<session_id>/
-    session.json          ← 清单：文件列表、每个文件的分片状态
-    files/
-        <file_index>.part  ← 正在接收的文件（按分片顺序 append）
-        <file_index>.done  ← 已收完（原子改名，出现即代表完整）
-```
-
-**关键设计选择**
-
-1. **状态落盘，不只在内存** —— 服务重启后仍能续传。
-   否则运维重启一次，用户的上传就全废了。
-
-2. **分片按顺序 append，不预分配** —— 因为浏览器/HTTP 不保证到达顺序，
-   而"随机写"需要 seek 到偏移。这里要求**分片按序提交**（index 必须等于当前段数），
-   代价是客户端必须串行发送，收益是服务端逻辑极简且天然防重放/防乱序。
-   > 对 100G 场景，串行发送本来就是唯一可行的（带宽是瓶颈，不是并发）。
-
-3. **完成后原子改名 `.part` → `.done`** —— 出现 `.done` 就代表文件完整，
-   组装阶段不需要再校验长度（虽然仍会校验）。
-
-4. **每个分片带 SHA-256 校验** —— 网络传输损坏是真实的，
-   而"静默损坏"的数据比"失败"更糟（会污染后续分析）。
-
-5. **路径安全是硬要求** —— 文件名来自客户端，必须严格校验，
-   否则 `../../etc/passwd` 就能写到任意位置。
-
-## 不做的事
-
-- 不做秒传/去重（那需要先算全文件哈希，与"边传边处理"冲突）
-- 不做并行分片（见第 2 条）
-- 不做 resumable.js 那套复杂协议（自研更可控，且能对齐 owner 隔离）
+A persisted chunk intent bridges data fsync, completion rename and manifest
+publication. Session locks cover recovery as well as writes, across manager
+instances and processes. Completed bytes are verified, never inferred only
+from a filename or length. Schema-1 manifests remain readable.
 """
 
+import errno
+import functools
 import hashlib
 import json
 import os
 import re
 import shutil
-import tempfile
+import stat
+import threading
 import time
+import uuid
+import weakref
+from contextlib import contextmanager
 
-#: 单片上限（字节）。必须 <= app.py 的 max_content_length（实测 4MB）。
-#: 留 64KB 余量给 multipart/头部开销。
 MAX_CHUNK_BYTES = 4 * 1024 * 1024 - 65536
-
-#: 单文件上限（默认 10GiB，与 Config.MAX_SINGLE_FILE_BYTES 的默认一致）
 DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
-
-#: 段内不允许出现的字符：路径分隔符与控制字符。
-#: 只能用来检查**单个路径段** —— 归一化后的整串路径本来就含 /，
-#: 拿这个正则去匹配整串会把所有正常的多级路径全部误拒。
-_UNSAFE_SEG = re.compile(r"[/\\\x00-\x1f]")
-_DOTS_ONLY = re.compile(r"^\.+$")
-
-#: session_id / owner_id 允许的字符（它们会进路径）
-_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_UNSAFE_SEG = re.compile(r'[/\\\x00-\x1f<>:"|?*]')
+_SAFE_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
+_SHA256 = re.compile(r'^[0-9a-fA-F]{64}$')
+_DEVICE = re.compile(r'^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)', re.I)
+_THREAD_LOCKS = weakref.WeakValueDictionary()
+_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 class UploadError(Exception):
-    """可预期的上传错误，消息可以直接给用户看。"""
+    """Expected upload failure suitable for the API response."""
 
 
 def safe_rel_path(rel_path):
-    """把客户端给的相对路径规范化，或抛错。
-
-    这是**安全边界**：`rel_path` 完全来自客户端，
-    不校验就能用 `../../../` 写到服务器任意位置。
-
-    规则：
-      - 拒绝空、拒绝绝对路径、拒绝盘符（`C:`）
-      - 拒绝 `..` 段
-      - 反斜杠统一成正斜杠（U 盘来自 Windows，路径是 `a\\b\\c`）
-      - 逐段拒绝控制字符、限制段长度
-    """
-    if not rel_path or not isinstance(rel_path, str):
+    if not isinstance(rel_path, str) or not rel_path:
         raise UploadError("文件路径为空")
-    raw = rel_path.replace("\\", "/").strip()
-    if not raw:
-        raise UploadError("文件路径为空")
-    if len(raw) > 1024:
-        raise UploadError("文件路径过长")
-    if raw.startswith("/"):
-        raise UploadError("不允许绝对路径")
-    if re.match(r"^[A-Za-z]:", raw):
-        raise UploadError("不允许盘符路径")
-
+    raw = rel_path.replace('\\', '/')
+    if not raw.strip() or len(raw) > 1024 or raw.startswith('/'):
+        raise UploadError("文件路径为空、过长或为绝对路径")
     parts = []
-    for seg in raw.split("/"):
-        seg = seg.strip()
-        if not seg or seg == ".":
+    for seg in raw.split('/'):
+        if not seg or seg == '.':
             continue
-        if seg == "..":
-            raise UploadError("文件路径不允许包含 ..")
-        # 逐段检查：走到这里分隔符已经消解完，
-        # 段内再出现 / \\ 或控制字符就一定是伪造的。
-        # 注意不能拿这个正则去匹配归一化后的整串 —— 整串本来就含 /，
-        # 那样会把所有正常的多级路径（包括中文名）全部误拒。
-        if _UNSAFE_SEG.search(seg):
-            raise UploadError("文件路径含非法字符")
-        if len(seg.encode("utf-8")) > 255:
+        if (seg == '..' or _UNSAFE_SEG.search(seg) or seg.endswith(('.', ' '))
+                or seg != seg.strip() or _DEVICE.match(seg)):
+            raise UploadError("文件路径含非法或不安全的名称")
+        if len(seg.encode('utf-8')) > 255:
             raise UploadError("文件名过长（超过 255 字节）")
         parts.append(seg)
     if not parts:
         raise UploadError("文件路径无效")
-    return "/".join(parts)
+    return '/'.join(parts)
 
 
 def _check_id(value, label):
-    if not _SAFE_ID.match(value or ""):
+    if (not isinstance(value, str) or not _SAFE_ID.fullmatch(value)
+            or value.endswith('.') or _DEVICE.match(value)):
         raise UploadError("%s 含非法字符" % label)
     return value
 
 
-class UploadManager(object):
-    """管理一批文件的分片上传。
+def _digest(value, optional=True):
+    if value is None or value == '':
+        if optional:
+            return None
+        raise UploadError("缺少 SHA-256")
+    if not isinstance(value, str) or not _SHA256.fullmatch(value):
+        raise UploadError("SHA-256 必须为 64 位十六进制字符串")
+    return value.lower()
 
-    线程安全：每个进程一个实例，内部用文件锁语义（原子改名 + 顺序 append）保证一致。
-    多进程并发同一 session 不在支持范围内（上传是单用户串行的）。
-    """
 
+def _is_link(st):
+    return stat.S_ISLNK(st.st_mode) or bool(
+        getattr(st, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+
+
+def _assert_no_links(path):
+    """Reject existing symlink/junction/reparse components, including ancestors."""
+    current = os.path.abspath(path)
+    while True:
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            pass
+        else:
+            if _is_link(info):
+                raise UploadError("上传路径包含符号链接或重解析点")
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+
+def _mkdir(path):
+    _assert_no_links(path)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    _assert_no_links(path)
+    if not stat.S_ISDIR(os.lstat(path).st_mode):
+        raise UploadError("上传路径不是目录")
+
+
+def _within(path, root):
+    try:
+        path = os.path.normcase(os.path.realpath(path))
+        root = os.path.normcase(os.path.realpath(root))
+        return os.path.commonpath([path, root]) == root
+    except (ValueError, OSError):
+        return False
+
+
+def _sync_dir(path):
+    if os.name == 'nt':
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _safe_open(path, flags, mode=0o600):
+    """Open a regular file; POSIX walks parents with no-follow descriptors."""
+    path = os.path.abspath(path)
+    _assert_no_links(path)
+    fd = None
+    directories = []
+    try:
+        if os.name != 'nt' and os.open in os.supports_dir_fd:
+            pieces = path.split(os.sep)
+            parent = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+            directories.append(parent)
+            for piece in pieces[1:-1]:
+                parent = os.open(piece, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                directories.append(parent)
+            fd = os.open(pieces[-1], flags | os.O_NOFOLLOW, mode, dir_fd=parent)
+        else:
+            fd = os.open(path, flags | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0), mode)
+        opened = os.fstat(fd)
+        _assert_no_links(path)
+        current = os.lstat(path)
+        if (not stat.S_ISREG(opened.st_mode) or _is_link(current)
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+            raise UploadError("上传文件路径或身份发生变化")
+        return fd
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+    finally:
+        for directory in reversed(directories):
+            os.close(directory)
+
+
+def _stamp(fd):
+    st = os.fstat(fd)
+    value = {'device': st.st_dev, 'inode': st.st_ino, 'size': st.st_size,
+             'mtime_ns': st.st_mtime_ns, 'ctime_ns': st.st_ctime_ns}
+    if os.name == 'nt':
+        # Windows st_ctime is creation time. Use NTFS ChangeTime as well so
+        # restoring mtime cannot hide a changed same-size file from the cache.
+        import ctypes
+        import msvcrt
+        class BasicInfo(ctypes.Structure):
+            _fields_ = [('creation', ctypes.c_longlong), ('access', ctypes.c_longlong),
+                        ('write', ctypes.c_longlong), ('change', ctypes.c_longlong),
+                        ('attributes', ctypes.c_ulong)]
+        info = BasicInfo()
+        function = ctypes.windll.kernel32.GetFileInformationByHandleEx
+        function.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+        function.restype = ctypes.c_int
+        if function(msvcrt.get_osfhandle(fd), 0, ctypes.byref(info), ctypes.sizeof(info)):
+            value['change_time'] = info.change
+        else:
+            # No stable change identity available: callers must rehash.
+            value['cacheable'] = False
+    return value
+
+
+def _regular_exists(path):
+    _assert_no_links(path)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        raise UploadError("上传文件不是普通文件")
+    return True
+
+
+def _session_locked(method):
+    @functools.wraps(method)
+    def wrapped(self, owner_id, session_id, *args, **kwargs):
+        with self._locked(owner_id, session_id):
+            return method(self, owner_id, session_id, *args, **kwargs)
+    return wrapped
+
+
+class UploadManager:
     def __init__(self, root, max_file_bytes=DEFAULT_MAX_FILE_BYTES,
                  max_chunk_bytes=MAX_CHUNK_BYTES, session_ttl_seconds=7 * 86400):
         self.root = os.path.abspath(root)
         self.max_file_bytes = int(max_file_bytes)
         self.max_chunk_bytes = int(max_chunk_bytes)
         self.session_ttl_seconds = int(session_ttl_seconds)
-        os.makedirs(self.root, mode=0o700, exist_ok=True)
-
-    # ---------------- 路径 ----------------
+        if self.max_file_bytes < 0 or self.max_chunk_bytes <= 0:
+            raise UploadError("上传大小上限非法")
+        _mkdir(self.root)
 
     def _session_dir(self, owner_id, session_id):
-        _check_id(owner_id, "owner_id")
-        _check_id(session_id, "session_id")
-        return os.path.join(self.root, owner_id, session_id)
+        _check_id(owner_id, 'owner_id')
+        _check_id(session_id, 'session_id')
+        path = os.path.join(self.root, owner_id, session_id)
+        _assert_no_links(path)
+        return path
 
     def _manifest_path(self, owner_id, session_id):
-        return os.path.join(self._session_dir(owner_id, session_id), "session.json")
+        return os.path.join(self._session_dir(owner_id, session_id), 'session.json')
+
+    @contextmanager
+    def _locked(self, owner_id, session_id):
+        self._session_dir(owner_id, session_id)
+        directory = os.path.join(self.root, '.locks', owner_id)
+        _mkdir(directory)
+        path = os.path.join(directory, session_id + '.lock')
+        with _THREAD_LOCKS_GUARD:
+            lock = _THREAD_LOCKS.get(os.path.normcase(path))
+            if lock is None:
+                lock = threading.RLock()
+                _THREAD_LOCKS[os.path.normcase(path)] = lock
+        with lock:
+            fd = _safe_open(path, os.O_RDWR | os.O_CREAT)
+            held = False
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b'\0')
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    while True:
+                        try:
+                            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError as exc:
+                            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                                raise
+                            time.sleep(0.05)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                held = True
+                yield
+            finally:
+                if held:
+                    if os.name == 'nt':
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
     def _load(self, owner_id, session_id):
-        path = self._manifest_path(owner_id, session_id)
-        if not os.path.isfile(path):
-            raise UploadError("上传会话不存在或已过期")
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return json.load(fh)
+            with os.fdopen(_safe_open(self._manifest_path(owner_id, session_id), os.O_RDONLY), 'r', encoding='utf-8') as source:
+                manifest = json.load(source)
+        except FileNotFoundError:
+            raise UploadError("上传会话不存在或已过期")
         except (OSError, ValueError) as exc:
             raise UploadError("上传会话清单损坏：%r" % exc)
+        if (not isinstance(manifest, dict) or manifest.get('owner_id') != owner_id
+                or manifest.get('session_id') != session_id or not isinstance(manifest.get('files'), list)):
+            raise UploadError("上传会话清单归属或结构不符")
+        try:
+            limit = manifest['max_chunk_bytes']
+            if not isinstance(limit, int) or limit <= 0 or manifest['file_count'] != len(manifest['files']):
+                raise ValueError('invalid manifest counts')
+            for entry in manifest['files']:
+                if not isinstance(entry, dict) or safe_rel_path(entry['rel_path']) != entry['rel_path']:
+                    raise ValueError('invalid file entry')
+                if any(not isinstance(entry[k], int) or entry[k] < 0
+                       for k in ('size', 'chunks_total', 'chunks_done', 'received_bytes')):
+                    raise ValueError('invalid file counts')
+                if (entry['chunks_total'] != (entry['size'] + limit - 1) // limit
+                        or entry['chunks_done'] > entry['chunks_total'] or entry['received_bytes'] > entry['size']
+                        or entry['state'] not in ('pending', 'complete')
+                        or (entry['state'] == 'complete' and (entry['chunks_done'] != entry['chunks_total']
+                                                            or entry['received_bytes'] != entry['size']))):
+                    raise ValueError('inconsistent file counts')
+                _digest(entry.get('sha256'))
+                _digest(entry.get('actual_sha256'))
+            if manifest['total_bytes'] != sum(f['size'] for f in manifest['files']):
+                raise ValueError('invalid manifest size')
+        except (KeyError, TypeError, ValueError) as exc:
+            raise UploadError("上传会话清单结构损坏：%s" % exc)
+        return manifest
 
     def _save(self, owner_id, session_id, manifest):
-        manifest["updated_at"] = time.time()
+        manifest['updated_at'] = time.time()
         path = self._manifest_path(owner_id, session_id)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh, ensure_ascii=False, indent=1)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)          # 原子：清单不会被读成半截
+        temporary = path + '.tmp.' + uuid.uuid4().hex
+        try:
+            with os.fdopen(_safe_open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL), 'w', encoding='utf-8') as output:
+                json.dump(manifest, output, ensure_ascii=False, indent=1)
+                output.flush()
+                os.fsync(output.fileno())
+            _assert_no_links(path)
+            os.replace(temporary, path)
+            _sync_dir(os.path.dirname(path))
+        finally:
+            if os.path.lexists(temporary):
+                _assert_no_links(temporary)
+                os.unlink(temporary)
 
-    # ---------------- 会话 ----------------
+    def _paths(self, manifest, index):
+        folder = os.path.join(self._session_dir(manifest['owner_id'], manifest['session_id']), 'files')
+        return os.path.join(folder, '%d.part' % index), os.path.join(folder, '%d.done' % index)
 
+    def _hash_file(self, path, entry, use_cache=True):
+        with os.fdopen(_safe_open(path, os.O_RDONLY), 'rb') as source:
+            before = _stamp(source.fileno())
+            if before['size'] != entry['size']:
+                raise UploadError("文件 %s 长度不符" % entry['rel_path'])
+            actual = entry.get('actual_sha256')
+            if not (use_cache and actual and entry.get('verified_source') == before
+                    and before.get('cacheable', True)):
+                digest = hashlib.sha256()
+                receipts = list(entry.get('chunk_receipts', {}).values())
+                if entry.get('pending_chunk'):
+                    receipts.append(entry['pending_chunk'])
+                position = 0
+                for receipt in sorted(receipts, key=lambda row: row['offset']):
+                    offset, length = int(receipt['offset']), int(receipt['size'])
+                    if offset < position or length <= 0 or offset + length > entry['size']:
+                        raise UploadError("上传分片摘要记录不一致")
+                    for segment_size, chunk_digest in ((offset - position, None), (length, hashlib.sha256())):
+                        remaining = segment_size
+                        while remaining:
+                            block = source.read(min(1024 * 1024, remaining))
+                            if not block:
+                                raise UploadError("上传分片字节丢失")
+                            digest.update(block)
+                            if chunk_digest is not None:
+                                chunk_digest.update(block)
+                            remaining -= len(block)
+                        if chunk_digest is not None and chunk_digest.hexdigest() != receipt['sha256']:
+                            raise UploadError("已确认分片完整 SHA-256 校验失败")
+                    position = offset + length
+                for block in iter(lambda: source.read(1024 * 1024), b''):
+                    digest.update(block)
+                actual = digest.hexdigest()
+            if before != _stamp(source.fileno()):
+                raise UploadError("文件在校验过程中发生变化")
+        expected = _digest(entry.get('sha256'))
+        recorded = entry.get('actual_sha256')
+        if (expected and actual != expected) or (recorded and actual != recorded):
+            raise UploadError("文件 %s 完整 SHA-256 校验失败" % entry['rel_path'])
+        entry['actual_sha256'] = actual
+        entry['verified_source'] = before
+        return actual
+
+    def _slice_hash(self, path, offset, length):
+        with os.fdopen(_safe_open(path, os.O_RDONLY), 'rb') as source:
+            source.seek(offset)
+            data = source.read(length)
+        if len(data) != length:
+            raise UploadError("已接收分片丢失或长度不符")
+        return hashlib.sha256(data).hexdigest()
+
+    def _truncate(self, path, size):
+        with os.fdopen(_safe_open(path, os.O_RDWR), 'r+b') as output:
+            output.truncate(size)
+            output.flush()
+            os.fsync(output.fileno())
+
+    def _recover_entry(self, manifest, index, verify_complete=True):
+        entry = manifest['files'][index]
+        if entry['size'] == 0:
+            actual = hashlib.sha256(b'').hexdigest()
+            if _digest(entry.get('sha256')) not in (None, actual):
+                raise UploadError("空文件完整 SHA-256 校验失败")
+            entry['actual_sha256'] = actual
+            return
+        part, done = self._paths(manifest, index)
+        has_part, has_done = _regular_exists(part), _regular_exists(done)
+        if has_part and has_done:
+            raise UploadError("上传同时存在 part/done，拒绝覆盖已完成文件")
+        assembled = str(index) in manifest.get('assembled_files', {})
+        if not has_part and not has_done:
+            if verify_complete and (assembled or manifest.get('assembling_file') == index):
+                record = manifest.get('assembled_files', {}).get(str(index), {})
+                destination = manifest.get('assembly_destination') or manifest.get('assembled_to')
+                if not destination:
+                    raise UploadError("已组装文件缺少目标目录记录")
+                target = os.path.join(destination, *safe_rel_path(entry['rel_path']).split('/'))
+                if not _regular_exists(target):
+                    raise UploadError("已组装文件丢失")
+                if not assembled and not entry.get('actual_sha256') and not entry.get('sha256'):
+                    raise UploadError("旧组装中断缺少可信摘要，保留现场供核验")
+                probe = dict(entry, actual_sha256=entry.get('actual_sha256') or record.get('sha256'),
+                             verified_source=record.get('verified_source') or entry.get('verified_source'))
+                self._hash_file(target, probe)
+                if probe['verified_source'] != record.get('verified_source'):
+                    entry['actual_sha256'] = probe['actual_sha256']
+                    if assembled:
+                        record.update(sha256=probe['actual_sha256'], verified_source=probe['verified_source'])
+                    else:
+                        entry['verified_source'] = probe['verified_source']
+                    self._save(manifest['owner_id'], manifest['session_id'], manifest)
+            if entry['received_bytes'] and not assembled and manifest.get('assembling_file') != index:
+                raise UploadError("已确认上传字节丢失，拒绝从错误偏移续传")
+            return
+        path = done if has_done else part
+        intent = entry.get('pending_chunk')
+        if intent:
+            offset, length = int(intent['offset']), int(intent['size'])
+            if (intent['index'] != entry['chunks_done'] or offset != entry['received_bytes']
+                    or length <= 0 or length > manifest['max_chunk_bytes']):
+                raise UploadError("上传分片恢复记录不一致")
+            size = os.path.getsize(path)
+            if size < offset:
+                raise UploadError("已确认上传前缀丢失")
+            valid = size == offset + length and self._slice_hash(path, offset, length) == intent['sha256']
+            if not valid:
+                if has_done:
+                    raise UploadError("已完成文件与分片恢复记录不一致")
+                self._truncate(part, offset)
+                entry.pop('pending_chunk', None)
+                self._save(manifest['owner_id'], manifest['session_id'], manifest)
+                return
+            last = entry['chunks_done'] + 1 == entry['chunks_total']
+            if last:
+                try:
+                    self._hash_file(path, entry, use_cache=False)
+                except UploadError:
+                    if not has_done:
+                        self._truncate(part, offset)
+                        entry.pop('pending_chunk', None)
+                        self._save(manifest['owner_id'], manifest['session_id'], manifest)
+                    raise
+                if not has_done:
+                    os.rename(part, done)
+                    _sync_dir(os.path.dirname(done))
+                    with os.fdopen(_safe_open(done, os.O_RDONLY), 'rb') as source:
+                        entry['verified_source'] = _stamp(source.fileno())
+                entry['state'] = 'complete'
+            elif has_done:
+                raise UploadError("非末片出现已完成文件")
+            receipt = {key: intent[key] for key in ('index', 'offset', 'size', 'sha256')}
+            entry.setdefault('chunk_receipts', {})[str(intent['index'])] = receipt
+            entry['chunks_done'] += 1
+            entry['received_bytes'] += length
+            entry.pop('pending_chunk', None)
+            self._save(manifest['owner_id'], manifest['session_id'], manifest)
+        elif has_done:
+            if entry['state'] != 'complete':
+                # Legacy crash after rename: the done file, not stale received
+                # bytes, is authoritative, but only after full SHA validation.
+                old_count, old_bytes = entry['chunks_done'], entry['received_bytes']
+                self._hash_file(done, entry, use_cache=False)
+                if old_count == entry['chunks_total'] - 1:
+                    length = entry['size'] - old_bytes
+                    entry.setdefault('chunk_receipts', {})[str(old_count)] = {
+                        'index': old_count, 'offset': old_bytes, 'size': length,
+                        'sha256': self._slice_hash(done, old_bytes, length)}
+                entry.update(state='complete', chunks_done=entry['chunks_total'], received_bytes=entry['size'])
+                self._save(manifest['owner_id'], manifest['session_id'], manifest)
+            elif verify_complete:
+                prior = entry.get('verified_source')
+                self._hash_file(done, entry)
+                if prior != entry.get('verified_source'):
+                    self._save(manifest['owner_id'], manifest['session_id'], manifest)
+        else:
+            if os.path.getsize(part) < entry['received_bytes']:
+                raise UploadError("已确认上传前缀丢失")
+            if os.path.getsize(part) > entry['received_bytes']:
+                # Schema-1 has no intent; only its confirmed prefix is durable.
+                self._truncate(part, entry['received_bytes'])
+            if entry['state'] == 'complete':
+                raise UploadError("完成状态缺少已完成文件")
+
+    @_session_locked
     def begin(self, owner_id, session_id, files, package_name=None):
-        """建立上传会话。
-
-        files: [{"rel_path": "...", "size": 123, "sha256": "..."(可选)}]
-        返回会话清单（含每个文件的分片数）。
-        """
-        _check_id(owner_id, "owner_id")
-        _check_id(session_id, "session_id")
-        if not files:
+        if not isinstance(files, list) or not files:
             raise UploadError("文件列表为空")
-
-        seen = set()
-        prepared = []
-        total_bytes = 0
+        prepared, seen, directories = [], set(), set()
         for item in files:
-            rel = safe_rel_path(item.get("rel_path"))
-            if rel in seen:
-                raise UploadError("文件列表里有重复路径：%s" % rel)
-            seen.add(rel)
-            size = item.get("size")
+            if not isinstance(item, dict):
+                raise UploadError("文件列表结构非法")
+            rel = safe_rel_path(item.get('rel_path'))
+            # Portable case-insensitive collision and file/directory aliases.
+            key = rel.casefold()
+            pieces = key.split('/')
+            parents = ['/'.join(pieces[:index]) for index in range(1, len(pieces))]
+            if key in seen or key in directories or any(parent in seen for parent in parents):
+                raise UploadError("文件列表里有重复或冲突路径：%s" % rel)
+            seen.add(key)
+            directories.update(parents)
             try:
-                size = int(size)
+                size = int(item.get('size'))
             except (TypeError, ValueError):
                 raise UploadError("文件 %s 缺少合法大小" % rel)
-            if size < 0:
-                raise UploadError("文件 %s 大小非法" % rel)
-            if size > self.max_file_bytes:
-                raise UploadError("文件 %s 超过单文件上限（%d 字节）"
-                                  % (rel, self.max_file_bytes))
-            total_bytes += size
-            chunks_total = ((size + self.max_chunk_bytes - 1) // self.max_chunk_bytes
-                            if size else 0)
-            prepared.append({
-                "rel_path": rel,
-                "size": size,
-                "sha256": (item.get("sha256") or "").lower() or None,
-                "chunks_total": chunks_total,
-                "chunks_done": 0,
-                "received_bytes": 0,
-                # 0 字节文件天然完整 —— 它没有任何分片可传。
-                # 早先把 chunks_total==0 但 state 仍留成 pending，
-                # 结果是它永远无法被标记完成，整个会话卡死在组装这一步。
-                # 空文件在 U 盘里是常态（Thumbs.db、占位文件），必须支持。
-                "state": "complete" if size == 0 else "pending",
-            })
-
+            if size < 0 or size > self.max_file_bytes:
+                raise UploadError("文件 %s 大小非法或超过单文件上限" % rel)
+            digest = _digest(item.get('sha256'))
+            if size == 0 and digest not in (None, hashlib.sha256(b'').hexdigest()):
+                raise UploadError("空文件完整 SHA-256 校验失败")
+            prepared.append({'rel_path': rel, 'size': size, 'sha256': digest,
+                             'chunks_total': (size + self.max_chunk_bytes - 1) // self.max_chunk_bytes,
+                             'chunks_done': 0, 'received_bytes': 0,
+                             'state': 'complete' if not size else 'pending', 'chunk_receipts': {},
+                             **({'actual_sha256': hashlib.sha256(b'').hexdigest()} if not size else {})})
+        path = self._manifest_path(owner_id, session_id)
+        if os.path.lexists(path):
+            existing = self._load(owner_id, session_id)
+            fields = ('rel_path', 'size', 'sha256')
+            if ([tuple(f.get(k) for k in fields) for f in existing['files']]
+                    != [tuple(f.get(k) for k in fields) for f in prepared]
+                    or existing.get('package_name') != package_name):
+                raise UploadError("上传会话已存在，拒绝覆盖不同文件清单")
+            return existing
         sdir = self._session_dir(owner_id, session_id)
-        os.makedirs(os.path.join(sdir, "files"), mode=0o700, exist_ok=True)
-
-        manifest = {
-            "schema": 1,
-            "session_id": session_id,
-            "owner_id": owner_id,
-            "package_name": package_name,
-            "created_at": time.time(),
-            "updated_at": time.time(),
-            "max_chunk_bytes": self.max_chunk_bytes,
-            "file_count": len(prepared),
-            "total_bytes": total_bytes,
-            "files": prepared,
-        }
+        if os.path.isdir(sdir) and os.listdir(sdir):
+            raise UploadError("上传会话缺少清单但仍有文件，拒绝覆盖")
+        _mkdir(os.path.join(sdir, 'files'))
+        manifest = {'schema': 2, 'owner_id': owner_id, 'session_id': session_id,
+                    'package_name': package_name, 'created_at': time.time(),
+                    'max_chunk_bytes': self.max_chunk_bytes, 'file_count': len(prepared),
+                    'total_bytes': sum(f['size'] for f in prepared), 'files': prepared}
         self._save(owner_id, session_id, manifest)
         return manifest
 
+    @_session_locked
     def status(self, owner_id, session_id):
-        """返回进度快照（用于断点续传：客户端据此知道哪些文件已完成）。"""
         m = self._load(owner_id, session_id)
-        done = sum(1 for f in m["files"] if f["state"] == "complete")
-        got = sum(f["received_bytes"] for f in m["files"])
-        return {
-            "session_id": m["session_id"],
-            "file_count": m["file_count"],
-            "files_complete": done,
-            "total_bytes": m["total_bytes"],
-            "received_bytes": got,
-            "max_chunk_bytes": m["max_chunk_bytes"],
-            "complete": done == m["file_count"],
-            "files": [{
-                "rel_path": f["rel_path"], "size": f["size"],
-                "chunks_total": f["chunks_total"], "chunks_done": f["chunks_done"],
-                "received_bytes": f["received_bytes"], "state": f["state"],
-            } for f in m["files"]],
-        }
+        for index in range(len(m['files'])):
+            self._recover_entry(m, index)
+        done = sum(f['state'] == 'complete' for f in m['files'])
+        return {'session_id': m['session_id'], 'file_count': m['file_count'],
+                'files_complete': done, 'total_bytes': m['total_bytes'],
+                'received_bytes': sum(f['received_bytes'] for f in m['files']),
+                'max_chunk_bytes': m['max_chunk_bytes'], 'complete': done == m['file_count'],
+                'files': [{k: f.get(k) for k in ('rel_path', 'size', 'chunks_total', 'chunks_done',
+                                                'received_bytes', 'state', 'actual_sha256')} for f in m['files']]}
 
-    # ---------------- 分片写入 ----------------
+    def _retry_path(self, m, index):
+        part, done = self._paths(m, index)
+        if _regular_exists(done):
+            return done
+        if _regular_exists(part):
+            return part
+        dest = m.get('assembly_destination') or m.get('assembled_to')
+        if dest and (str(index) in m.get('assembled_files', {}) or m.get('assembling_file') == index):
+            path = os.path.join(dest, *safe_rel_path(m['files'][index]['rel_path']).split('/'))
+            if _regular_exists(path):
+                return path
+        raise UploadError("重试分片的原始字节不存在")
 
-    def put_chunk(self, owner_id, session_id, file_index, chunk_index, data,
-                  chunk_sha256=None):
-        """接收一个分片。
-
-        **要求分片按序到达**（chunk_index 必须等于当前的 chunks_done）。
-        理由见模块文档第 2 条：串行发送是 100G 场景下唯一可行的方式，
-        而按序 append 让"重放/乱序/越界"这三类问题自然消失。
-
-        幂等性：重复提交同一个 chunk_index 会返回 `already=True` 而不重复写入
-        —— 这对"客户端超时重试但服务端其实已收到"的场景很重要。
-
-        `chunk_index` 可以传 `None`，表示"就传下一片"（等价于当前的 chunks_done）。
-        这不是便利糖，而是**安全默认**：并发/乱序下客户端自己维护的索引一旦算错，
-        服务端会把重复索引当成"重试"而静默跳过，用户就会**无声地少收数据**。
-        服务端本来就知道期望值，让它自己决定比信任客户端更安全。
-        """
+    @_session_locked
+    def put_chunk(self, owner_id, session_id, file_index, chunk_index, data, chunk_sha256=None):
         m = self._load(owner_id, session_id)
         try:
             file_index = int(file_index)
         except (TypeError, ValueError):
             raise UploadError("file_index 非法")
-        if file_index < 0 or file_index >= len(m["files"]):
+        if file_index < 0 or file_index >= len(m['files']):
             raise UploadError("file_index 越界")
-        entry = m["files"][file_index]
-
-        # 长度校验**要在写入之前**做。
-        # 早先是等 chunks_done 追平 chunks_total 才校验，于是"声明 30 字节却传 50"
-        # 这种提前溢出会先把 20 字节垃圾写进 .part 才报错。
-        received = entry["received_bytes"]
-
-        if chunk_index is None:
-            chunk_index = entry["chunks_done"]          # 下一个期待的分片
-        else:
-            try:
-                chunk_index = int(chunk_index)
-            except (TypeError, ValueError):
-                raise UploadError("chunk_index 非法")
-
-        expected = entry["chunks_done"]
-
-        # 文件已收完 —— 只接受"重发最后一片"，其余一律拒绝。
-        # 为什么必须接受它：最后一片的响应在网络上丢了是**必然事件**，
-        # 客户端会重试；而 state=="complete" 的提前返回正是唯一没有幂等兜底的分支，
-        # 会把这类重试判成"乱序"报错，让用户卡在 99.99%。
-        if entry["state"] == "complete":
-            if chunk_index == expected - 1:
-                return {"already": True, "file_complete": True,
-                        "chunks_done": expected, "chunks_total": entry["chunks_total"],
-                        "session_complete": all(f["state"] == "complete"
-                                                for f in m["files"])}
-            raise UploadError("该文件已收完")
-
-        data = data or b""
-        if not data:
-            raise UploadError("分片内容为空")
-        if len(data) > self.max_chunk_bytes:
-            raise UploadError("分片超过上限（%d 字节）" % self.max_chunk_bytes)
-
-        # 每片校验：静默损坏的数据比失败更糟（会污染后续分析）
-        if chunk_sha256:
-            got = hashlib.sha256(data).hexdigest()
-            if got.lower() != str(chunk_sha256).lower():
-                raise UploadError("分片校验失败（期望 %s，实际 %s）"
-                                  % (str(chunk_sha256)[:12], got[:12]))
-
+        self._recover_entry(m, file_index)
+        entry = m['files'][file_index]
+        if not isinstance(data, (bytes, bytearray, memoryview)) or not data:
+            raise UploadError("分片内容为空或类型非法")
+        data = bytes(data)
+        limit = min(self.max_chunk_bytes, int(m['max_chunk_bytes']))
+        if len(data) > limit:
+            raise UploadError("分片超过上限（%d 字节）" % limit)
+        actual = hashlib.sha256(data).hexdigest()
+        expected_hash = _digest(chunk_sha256)
+        if expected_hash and actual != expected_hash:
+            raise UploadError("分片校验失败")
+        try:
+            chunk_index = entry['chunks_done'] if chunk_index is None else int(chunk_index)
+        except (TypeError, ValueError):
+            raise UploadError("chunk_index 非法")
+        expected = entry['chunks_done']
+        if chunk_index < 0:
+            raise UploadError("chunk_index 非法")
         if chunk_index < expected:
-            # 已经收过这一段 —— 视为重试，不重复写入
-            return {"already": True, "chunks_done": expected,
-                    "chunks_total": entry["chunks_total"]}
-        if chunk_index > expected:
-            raise UploadError("分片乱序：期望 %d，收到 %d" % (expected, chunk_index))
-        if expected >= entry["chunks_total"]:
-            raise UploadError("该文件分片已收完")
-        if received + len(data) > entry["size"]:
-            raise UploadError("文件 %s 收到的字节超出声明大小（%d + %d > %d）"
-                              % (entry["rel_path"], received, len(data), entry["size"]))
-
-        # 写到 .part（append）
-        sdir = self._session_dir(owner_id, session_id)
-        part = os.path.join(sdir, "files", "%d.part" % file_index)
-        # 上次因长度不符回滚过状态时，.part 里可能残留多余字节 —— 对齐到已确认长度
-        if os.path.isfile(part) and os.path.getsize(part) != received:
-            with open(part, "r+b") as fh:
-                fh.truncate(received)
-                fh.flush()
-                os.fsync(fh.fileno())
-        with open(part, "ab") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())      # 断电也不丢已确认的分片
-
-        entry["chunks_done"] = expected + 1
-        entry["received_bytes"] = received + len(data)
-
-        # 收完 → 校验总长、原子改名 .done
-        completed = False
-        if entry["chunks_done"] >= entry["chunks_total"]:
-            actual = os.path.getsize(part)
-            if actual != entry["size"]:
-                # 长度不符：**状态和文件都要回滚**，让客户端能干净地重传。
-                # 早先只回滚了清单、没截断 .part，残留字节会把重传的文件永久污染
-                # —— 而这正是"分片校验失败"最想防的静默损坏。
-                entry["chunks_done"] = expected
-                entry["received_bytes"] = received
-                with open(part, "r+b") as fh:
-                    fh.truncate(received)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                self._save(owner_id, session_id, m)
-                raise UploadError("文件 %s 长度不符（期望 %d，实际 %d）"
-                                  % (entry["rel_path"], entry["size"], actual))
-            done_path = os.path.join(sdir, "files", "%d.done" % file_index)
-            os.replace(part, done_path)
-            entry["state"] = "complete"
-            completed = True
-
-        self._save(owner_id, session_id, m)
-        return {
-            "already": False,
-            "chunks_done": entry["chunks_done"],
-            "chunks_total": entry["chunks_total"],
-            "file_complete": completed,
-            "session_complete": all(f["state"] == "complete" for f in m["files"]),
-        }
-
-    # ---------------- 组装 ----------------
-
-    def assemble(self, owner_id, session_id, dest_dir, allowed_root=None):
-        """Assemble all .done files into the destination and support finalize retries."""
-        m = self._load(owner_id, session_id)
-        pending = [f["rel_path"] for f in m["files"] if f["state"] != "complete"]
-        if pending:
-            raise UploadError("还有 %d 个文件未传完，例如 %s"
-                              % (len(pending), pending[0]))
-
-        sdir = self._session_dir(owner_id, session_id)
-        dest_dir = os.path.abspath(dest_dir)
-        if allowed_root:
-            allowed_root = os.path.abspath(allowed_root)
-            if not (dest_dir == allowed_root
-                    or dest_dir.startswith(allowed_root + os.sep)):
-                raise UploadError("目标目录必须位于 %s 之下" % allowed_root)
-
-        prior_dest = m.get("assembly_destination") or m.get("assembled_to")
-        if prior_dest and os.path.abspath(prior_dest) != dest_dir:
-            raise UploadError("该上传会话已开始组装到另一个目录，拒绝改写目标")
-
-        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
-        m.setdefault("assembled_files", {})
-        m["assembly_destination"] = dest_dir
-        self._save(owner_id, session_id, m)
-
-        written = []
-        for idx, entry in enumerate(m["files"]):
-            rel = safe_rel_path(entry["rel_path"])
-            target = os.path.abspath(os.path.join(dest_dir, *rel.split("/")))
-            if not (target == dest_dir or target.startswith(dest_dir + os.sep)):
-                raise UploadError("文件 %s 的目标路径越界" % entry["rel_path"])
-            os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-            key = str(idx)
-            record = m["assembled_files"].get(key)
-
-            if record:
-                if (record.get("rel_path") != entry["rel_path"]
-                        or record.get("size") != entry["size"]
-                        or not os.path.isfile(target)
-                        or os.path.getsize(target) != entry["size"]):
-                    raise UploadError("已组装文件与会话记录不一致：%s" % entry["rel_path"])
-                written.append({"rel_path": entry["rel_path"], "path": target,
-                                "size": entry["size"]})
-                continue
-
-            src = os.path.join(sdir, "files", "%d.done" % idx)
-            pending_idx = m.get("assembling_file")
-            if pending_idx == idx and os.path.isfile(target):
-                if os.path.getsize(target) != entry["size"]:
-                    raise UploadError("组装中断且目标文件大小不符，保留现场供检查：%s"
-                                      % entry["rel_path"])
-                # A previous attempt may have stopped after placing the file.
-                if os.path.isfile(src):
-                    os.remove(src)
+            if entry['state'] == 'complete' and chunk_index != expected - 1:
+                raise UploadError("该文件已收完")
+            receipt = entry.get('chunk_receipts', {}).get(str(chunk_index))
+            if receipt:
+                offset, length = receipt['offset'], receipt['size']
+                if length != len(data) or receipt['sha256'] != actual:
+                    raise UploadError("重试分片与已接收内容不一致")
             else:
-                if os.path.exists(target):
-                    raise UploadError("目标文件已存在，拒绝覆盖：%s" % target)
-                m["assembling_file"] = idx
-                self._save(owner_id, session_id, m)
-
-                if entry["size"] == 0:
-                    with open(target, "xb"):
-                        pass
+                # Legacy chunks have no receipts. Only compare saved bytes;
+                # never treat an unknown index as proof that content matches.
+                if entry['state'] == 'complete':
+                    offset, length = entry['size'] - len(data), len(data)
+                elif entry['received_bytes'] == expected * m['max_chunk_bytes']:
+                    offset, length = chunk_index * m['max_chunk_bytes'], m['max_chunk_bytes']
                 else:
-                    if not os.path.isfile(src):
-                        raise UploadError("文件 %s 的已完成分片丢失" % entry["rel_path"])
-                    temp_fd, temp_path = tempfile.mkstemp(
-                        prefix=".sjfx-assemble-", suffix=".tmp",
-                        dir=os.path.dirname(target),
-                    )
-                    try:
-                        with open(src, "rb") as source, os.fdopen(temp_fd, "wb") as output:
-                            temp_fd = None
-                            shutil.copyfileobj(source, output, 1024 * 1024)
+                    raise UploadError("旧清单缺少该分片边界，不能安全接受重试")
+                if length != len(data):
+                    raise UploadError("重试分片长度不一致")
+            if self._slice_hash(self._retry_path(m, file_index), offset, length) != actual:
+                raise UploadError("重试分片与已保存字节不一致")
+            return {'already': True, 'chunks_done': expected, 'chunks_total': entry['chunks_total'],
+                    'file_complete': entry['state'] == 'complete', 'actual_sha256': entry.get('actual_sha256'),
+                    'session_complete': all(f['state'] == 'complete' for f in m['files'])}
+        if entry['state'] == 'complete':
+            raise UploadError("该文件已收完")
+        if chunk_index != expected or expected >= entry['chunks_total']:
+            raise UploadError("分片乱序：期望 %d，收到 %d" % (expected, chunk_index))
+        if entry['received_bytes'] + len(data) > entry['size']:
+            raise UploadError("收到的字节超出声明大小")
+        part, done = self._paths(m, file_index)
+        if _regular_exists(done):
+            raise UploadError("已存在完成件，拒绝覆盖")
+        new_part = not _regular_exists(part)
+        entry['pending_chunk'] = {'index': expected, 'offset': entry['received_bytes'],
+                                  'size': len(data), 'sha256': actual}
+        self._save(owner_id, session_id, m)
+        with os.fdopen(_safe_open(part, os.O_RDWR | os.O_CREAT), 'r+b') as output:
+            if os.fstat(output.fileno()).st_size != entry['received_bytes']:
+                raise UploadError("分片文件长度与已确认偏移不一致")
+            output.seek(entry['received_bytes'])
+            if output.write(data) != len(data):
+                raise OSError("分片写入不完整")
+            output.flush()
+            os.fsync(output.fileno())
+        if new_part:
+            _sync_dir(os.path.dirname(part))
+        self._recover_entry(m, file_index)
+        if entry['chunks_done'] != expected + 1:
+            raise UploadError("写入分片未通过持久化校验，请重传")
+        return {'already': False, 'chunks_done': entry['chunks_done'], 'chunks_total': entry['chunks_total'],
+                'file_complete': entry['state'] == 'complete', 'actual_sha256': entry.get('actual_sha256'),
+                'session_complete': all(f['state'] == 'complete' for f in m['files'])}
+
+    def _copy_verified(self, source_path, temporary, entry):
+        digest = hashlib.sha256()
+        with os.fdopen(_safe_open(source_path, os.O_RDONLY), 'rb') as source:
+            before = _stamp(source.fileno())
+            with os.fdopen(_safe_open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL), 'wb') as output:
+                for block in iter(lambda: source.read(1024 * 1024), b''):
+                    digest.update(block)
+                    if output.write(block) != len(block):
+                        raise OSError("组装写入不完整")
+                output.flush()
+                os.fsync(output.fileno())
+            if before != _stamp(source.fileno()) or before['size'] != entry['size']:
+                raise UploadError("组装期间上传源文件发生变化")
+        actual = digest.hexdigest()
+        if any(want and want != actual for want in (_digest(entry.get('sha256')), entry.get('actual_sha256'))):
+            raise UploadError("组装文件完整 SHA-256 校验失败")
+        entry['actual_sha256'] = actual
+        return actual
+
+    @_session_locked
+    def assemble(self, owner_id, session_id, dest_dir, allowed_root=None):
+        m = self._load(owner_id, session_id)
+        for index in range(len(m['files'])):
+            self._recover_entry(m, index, verify_complete=False)
+        pending = [f['rel_path'] for f in m['files'] if f['state'] != 'complete']
+        if pending:
+            raise UploadError("还有 %d 个文件未传完，例如 %s" % (len(pending), pending[0]))
+        dest_dir = os.path.abspath(dest_dir)
+        _assert_no_links(dest_dir)
+        if allowed_root:
+            _assert_no_links(allowed_root)
+            if not _within(dest_dir, allowed_root):
+                raise UploadError("目标目录必须位于允许根之下")
+        prior_dest = m.get('assembly_destination') or m.get('assembled_to')
+        if prior_dest and os.path.normcase(os.path.abspath(prior_dest)) != os.path.normcase(dest_dir):
+            raise UploadError("该上传会话已开始组装到另一个目录，拒绝改写目标")
+        _mkdir(dest_dir)
+        m.setdefault('assembled_files', {})
+        m['assembly_destination'] = dest_dir
+        self._save(owner_id, session_id, m)
+        written = []
+        for index, entry in enumerate(m['files']):
+            rel = safe_rel_path(entry['rel_path'])
+            target = os.path.join(dest_dir, *rel.split('/'))
+            _assert_no_links(target)
+            if not _within(target, dest_dir):
+                raise UploadError("组装目标路径越界")
+            _mkdir(os.path.dirname(target))
+            part, source = self._paths(m, index)
+            record = m['assembled_files'].get(str(index))
+            exists = _regular_exists(target)
+            if record:
+                if record.get('rel_path') != rel or record.get('size') != entry['size'] or not exists:
+                    raise UploadError("已组装文件与会话记录不一致")
+                if record.get('sha256') and entry.get('actual_sha256') not in (None, record['sha256']):
+                    raise UploadError("已组装文件摘要记录不一致")
+                probe = dict(entry, actual_sha256=entry.get('actual_sha256') or record.get('sha256'),
+                             verified_source=record.get('verified_source'))
+                actual = self._hash_file(target, probe)
+            elif m.get('assembling_file') == index and exists:
+                probe = dict(entry)
+                if not entry.get('actual_sha256') and not entry.get('sha256'):
+                    if not _regular_exists(source):
+                        raise UploadError("旧组装中断缺少可信摘要，保留现场供核验")
+                    self._hash_file(source, probe, use_cache=False)
+                actual = self._hash_file(target, probe, use_cache=False)
+            else:
+                if exists:
+                    raise UploadError("目标文件已存在，拒绝覆盖：%s" % target)
+                m['assembling_file'] = index
+                self._save(owner_id, session_id, m)
+                temporary = os.path.join(os.path.dirname(target), '.sjfx-assemble-' + uuid.uuid4().hex + '.tmp')
+                try:
+                    if entry['size']:
+                        if not _regular_exists(source):
+                            raise UploadError("已完成分片丢失")
+                        actual = self._copy_verified(source, temporary, entry)
+                        _assert_no_links(source)
+                        _assert_no_links(temporary)
+                        shutil.copystat(source, temporary, follow_symlinks=False)
+                    else:
+                        with os.fdopen(_safe_open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL), 'wb') as output:
                             output.flush()
                             os.fsync(output.fileno())
+                        actual = hashlib.sha256(b'').hexdigest()
+                    _assert_no_links(target)
+                    try:
+                        os.link(temporary, target)
+                    except FileExistsError:
+                        raise UploadError("目标文件已存在，拒绝覆盖")
+                    except OSError:
+                        # Preserve exclusive/no-overwrite behavior where links
+                        # are unavailable. A partial target is never accepted.
                         try:
-                            os.link(temp_path, target)  # atomic, same filesystem, no overwrite
+                            fd = _safe_open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
                         except FileExistsError:
-                            raise UploadError("目标文件已存在，拒绝覆盖：%s" % target)
-                        except OSError:
-                            # Rare filesystems may disallow hard links. Use exclusive
-                            # creation as a last resort; the complete copy is staged first.
-                            try:
-                                with open(temp_path, "rb") as source, open(target, "xb") as output:
-                                    shutil.copyfileobj(source, output, 1024 * 1024)
-                                    output.flush()
-                                    os.fsync(output.fileno())
-                            except FileExistsError:
-                                raise UploadError("目标文件已存在，拒绝覆盖：%s" % target)
-                        shutil.copystat(src, target)
-                        os.remove(src)
-                    finally:
-                        if temp_fd is not None:
-                            os.close(temp_fd)
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
-
-            m["assembled_files"][key] = {
-                "rel_path": entry["rel_path"], "size": entry["size"]
-            }
-            m["assembling_file"] = None
+                            raise UploadError("目标文件已存在，拒绝覆盖")
+                        created_stamp = _stamp(fd)
+                        try:
+                            with os.fdopen(fd, 'wb') as output, os.fdopen(_safe_open(temporary, os.O_RDONLY), 'rb') as staged:
+                                shutil.copyfileobj(staged, output, 1024 * 1024)
+                                output.flush()
+                                os.fsync(output.fileno())
+                        except BaseException:
+                            if _regular_exists(target):
+                                st = os.stat(target)
+                                if (st.st_dev, st.st_ino) == (created_stamp['device'], created_stamp['inode']):
+                                    os.unlink(target)
+                            raise
+                    _sync_dir(os.path.dirname(target))
+                finally:
+                    if os.path.lexists(temporary):
+                        _assert_no_links(temporary)
+                        os.unlink(temporary)
+                with os.fdopen(_safe_open(target, os.O_RDONLY), 'rb') as placed:
+                    probe = dict(entry, verified_source=_stamp(placed.fileno()))
+            entry['actual_sha256'] = actual
+            m['assembled_files'][str(index)] = {'rel_path': rel, 'size': entry['size'],
+                                                 'sha256': actual, 'verified_source': probe['verified_source']}
+            m['assembling_file'] = None
+            # Persist receipt before removing the only uploaded source. A
+            # failure here leaves both copies and a recoverable placement intent.
             self._save(owner_id, session_id, m)
-            written.append({"rel_path": entry["rel_path"], "path": target,
-                            "size": entry["size"]})
-
-        m["assembled_at"] = time.time()
-        m["assembled_to"] = dest_dir
-        m["assembling_file"] = None
+            if _regular_exists(source):
+                os.unlink(source)
+                _sync_dir(os.path.dirname(source))
+            written.append({'rel_path': rel, 'path': target, 'size': entry['size'], 'sha256': actual})
+        m['assembled_at'] = time.time()
+        m['assembled_to'] = dest_dir
         self._save(owner_id, session_id, m)
-        return {"ok": True, "file_count": len(written), "dest_dir": dest_dir,
-                "files": written}
+        return {'ok': True, 'file_count': len(written), 'dest_dir': dest_dir, 'files': written}
 
-    # ---------------- 清理 ----------------
-
+    @_session_locked
     def abort(self, owner_id, session_id):
-        """放弃一个上传会话，删掉它的分片目录。
-
-        必须有这个入口：用户点了"取消"，或建错了会话，那些 `.part` 文件会一直占着
-        磁盘直到 TTL 到期 —— 100G 的场景下这就是 100G 的白占。
-        """
         sdir = self._session_dir(owner_id, session_id)
         if not os.path.isdir(sdir):
             raise UploadError("上传会话不存在或已过期")
-        shutil.rmtree(sdir, ignore_errors=True)
+        if not _within(sdir, self.root) or sdir == self.root:
+            raise UploadError("上传清理路径越界")
+        _assert_no_links(sdir)
+        shutil.rmtree(sdir)
         return True
 
     def purge_expired(self, now=None):
-        """清掉超过 TTL 的会话目录（默认 7 天）。
-
-        为什么必须有：100G 上传会产生大量分片文件，
-        用户放弃上传后如果不清理，磁盘会被慢慢吃光。
-        """
-        now = now or time.time()
+        now = time.time() if now is None else now
         removed = []
-        if not os.path.isdir(self.root):
-            return removed
+        _assert_no_links(self.root)
         for owner in os.listdir(self.root):
-            owner_dir = os.path.join(self.root, owner)
-            if not os.path.isdir(owner_dir):
-                continue
-            for sid in os.listdir(owner_dir):
-                sdir = os.path.join(owner_dir, sid)
-                manifest = os.path.join(sdir, "session.json")
-                try:
-                    if not os.path.isfile(manifest):
-                        continue
-                    with open(manifest, "r", encoding="utf-8") as fh:
-                        meta = json.load(fh)
-                    age = now - float(meta.get("updated_at") or 0)
-                    if age > self.session_ttl_seconds:
-                        shutil.rmtree(sdir, ignore_errors=True)
-                        removed.append("%s/%s" % (owner, sid))
-                except (OSError, ValueError):
+            try:
+                _check_id(owner, 'owner_id')
+                directory = os.path.join(self.root, owner)
+                _assert_no_links(directory)
+                if not os.path.isdir(directory):
                     continue
+                for session in os.listdir(directory):
+                    try:
+                        with self._locked(owner, session):
+                            m = self._load(owner, session)
+                            if now - float(m.get('updated_at') or 0) > self.session_ttl_seconds:
+                                sdir = self._session_dir(owner, session)
+                                shutil.rmtree(sdir)
+                                removed.append(owner + '/' + session)
+                    except (UploadError, OSError, ValueError):
+                        continue
+            except (UploadError, OSError):
+                continue
         return removed

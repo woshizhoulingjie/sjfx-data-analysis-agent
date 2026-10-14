@@ -36,12 +36,35 @@ def _json(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
 
 
+def close_database(db_path):
+    """Release one stopped instance's watcher and views before removing its DB.
+
+    A SQLite connection context does not close this deliberately persistent
+    data_version watcher. Instance owners must call this at shutdown; keeping
+    it alive until LRU eviction otherwise pins the database on Windows.
+    """
+    path = str(Path(db_path).resolve())
+    with _LOCK:
+        watcher = _WATCHERS.pop(path, None)
+        try:
+            if watcher is not None:
+                watcher[0].close()
+        finally:
+            for key in tuple(_CACHE):
+                if key[0] == path:
+                    del _CACHE[key]
+
+
 def _watch(repository):
     path = str(Path(repository.storage.db_path).resolve())
     watcher = _WATCHERS.get(path)
     if watcher is None:
         connection = sqlite3.connect(Path(path).as_uri() + '?mode=ro', uri=True, check_same_thread=False)
-        connection.execute('PRAGMA query_only=ON')
+        try:
+            connection.execute('PRAGMA query_only=ON')
+        except BaseException:
+            connection.close()
+            raise
         watcher = (connection, uuid.uuid4().hex)
         _WATCHERS[path] = watcher
         while len(_WATCHERS) > 4:

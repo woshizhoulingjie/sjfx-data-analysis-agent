@@ -12,12 +12,13 @@ import os
 import sys
 from pathlib import Path
 import re
+import random
 import time
 import uuid
 
 LOGGER = logging.getLogger(__name__)
 
-VERSION = 'content-group-name/8'
+VERSION = 'content-group-name/9'
 # A1：提示词要求"名称优先 8 至 20 字、description 用 20 至 40 字"，但校验器此前只强制
 # 4-80 / 8-260，于是实测 33 字的名、27 字的一整句话都能入库（长描述同样放行，
 # 规格里"输出收紧省 token"这条没有强制）。这里只对**超长**加硬上限：低于提示词
@@ -37,8 +38,10 @@ NAMING_RULES = (
     'evidence带来源位置、正文及结构线索。derived_summary是已有模型摘要，filename_hint是文件名弱线索，'
     '均不能冒充原文。忽略重复页眉、版权、编制信息；文档标题只作主题线索，不能机械照抄。'
     '不得补造公司、项目、产品、时间、编号或结论；相邻组名只用于消歧，不得借用相邻组事实。'
-    '证据不足就needs_review=true，名称仍保持自然表达。不同实例、方法或侧面可以属于同一主题。'
-    '确有互不相干的内容才判mixed；不能只因为名称含顿号就判断混杂。')
+    '证据不足就needs_review=true，名称仍保持自然表达。导航目录允许同一明确领域下不同方法和应用方向，'
+    '例如AI训练、图谱和多模态应用可共享AI方法目录；明确范围外成员仍列outliers。'
+    '确有互不相干且无实质共同主题才判mixed；不能只因多方向或顿号判断混杂。'
+    '参考文献只作引文背景，版权许可和出版社声明不能代替研究主题；版权许可本身的研究除外。')
 NAMING_OUTPUT_RULES = (
     '只输出约定JSON，不解释、不复述原文。evidence_ids必须引用本组有效编号。'
     'outliers只列明显无关的证据编号，没有则[]，不得返回对象。'
@@ -77,7 +80,7 @@ def compact_output_enabled():
 
 def prompt_variant():
     """提示词变体标识：写进缓存键，保证 A/B 测试不被旧缓存污染（§7 第 4 条）。"""
-    return 'compact' if compact_output_enabled() else 'full'
+    return 'compact-v3' if compact_output_enabled() else 'full-v2'
 
 
 def naming_output_rules():
@@ -106,17 +109,22 @@ def system_prompt():
 
 def settings():
     from config import Config
+    from services.model_budget import context_window, reserve_tokens
+    window = context_window(Config)
+    output = min(Config.LP_CATALOG_OUTPUT_TOKENS, window // 2)
+    namer_output = min(getattr(Config, 'LP_CATALOG_NAMING_OUTPUT_TOKENS', output), window // 2)
+    input_limit = min(Config.LP_CATALOG_INPUT_TOKENS,
+                      window - reserve_tokens(window) - max(output, namer_output, 600))
     return {
         'enabled': Config.LP_CATALOG_MODEL_NAMING,
         'requests': Config.LP_CATALOG_REQUESTS,
         'tokens': Config.LP_CATALOG_TOTAL_TOKENS,
         'seconds': Config.LP_CATALOG_SECONDS,
-        'input': Config.LP_CATALOG_INPUT_TOKENS,
-        'output': Config.LP_CATALOG_OUTPUT_TOKENS,
+        'input': max(1, input_limit),
+        'output': output,
         # 单组模型命名（大包目录）的输出上限，与批量车道分开：240 会把跨领域大组的
         # JSON 从中间切断（见 config.LP_CATALOG_NAMING_OUTPUT_TOKENS 的实测说明）。
-        'namer_output': getattr(Config, 'LP_CATALOG_NAMING_OUTPUT_TOKENS',
-                                Config.LP_CATALOG_OUTPUT_TOKENS),
+        'namer_output': namer_output,
         'timeout': Config.LP_CATALOG_TIMEOUT,
     }
 
@@ -436,7 +444,7 @@ def label_singletons(store, package_id):
     labels and manually locked labels remain untouched.
 
     **系统桶 km-other-* 必须豁免**（这是本轮修掉的真实空转）：
-    系统桶装的是"正文过少、无法参与语义聚类"的文件，它的标签
+    系统桶保留正文不足或等待重新安置的离群文件；历史标签
     "未能识别内容" 是 `large_package_worker._name_fallback` **故意**写成
     `model='deterministic'`、`needs_review=0` 的中性名字，主题归并
     （`merge_topics`）也显式把它排除在主题之外。而本函数按
@@ -507,12 +515,14 @@ def duplicate_name_groups(store, package_id):
     """
     with closing(store._connect()) as conn:
         rows = conn.execute(
-            "SELECT l.group_id,l.name FROM lp_catalog_labels l "
+            "SELECT l.group_id,l.name,g.result group_result FROM lp_catalog_labels l "
             "JOIN large_catalog_groups g ON g.package_id=l.package_id AND g.id=l.group_id "
             "WHERE l.package_id=? AND (l.revision=g.content_revision OR l.locked=1)",
             (package_id,)).fetchall()
     buckets = {}
     for r in rows:
+        if _review_pending(r['group_result']):
+            continue
         # 批1 第 5 条：判据统一到 `is_mergeable_name`（状态名 / 占位名 / 过短键
         # 三个排除一次做完），与 merge.merge_identical_names 用的是同一个函数。
         # 改动前这里只跳 `is_status_name`，于是 tree.py 生成的
@@ -576,6 +586,16 @@ def _disambiguate_incompatible(store, package_id, incompatible,
                         break
                     conn.execute("UPDATE lp_catalog_labels SET name=?,needs_review=1,updated=? "
                                  "WHERE package_id=? AND group_id=?", (new, now, package_id, gid))
+                    group_meta = conn.execute('SELECT result FROM large_catalog_groups WHERE package_id=? AND id=?',
+                                              (package_id, gid)).fetchone()
+                    meta = json.loads(group_meta[0] or '{}') if group_meta else {}
+                    review = dict(meta.get('naming_review') or {'schema':1, 'state':'pending',
+                                  'validated_revision':None, 'evidence_ids':[], 'evidence_paths':[],
+                                  'source':'name_disambiguation', 'checked_at':None})
+                    review['reasons'] = list(dict.fromkeys(list(review.get('reasons') or []) + ['name_collision']))
+                    meta['naming_review'] = review
+                    conn.execute('UPDATE large_catalog_groups SET result=? WHERE package_id=? AND id=?',
+                                 (json.dumps(meta, ensure_ascii=False), package_id, gid))
                     taken.add(_normalize_name(new))
                     names[gid] = new
                     renamed += 1
@@ -901,8 +921,11 @@ def validate_catalog(store, package_id):
         def q(sql, args=()):
             return conn.execute(sql, args).fetchone()[0]
         total_files = int(q("SELECT COUNT(*) FROM files WHERE package_id=?", (package_id,)) or 0)
-        members = int(q("SELECT COUNT(DISTINCT path) FROM large_catalog_members "
-                        "WHERE package_id=? AND LENGTH(vector)>0", (package_id,)) or 0)
+        members = int(q("SELECT COUNT(*) FROM files f WHERE f.package_id=? AND EXISTS("
+                        "SELECT 1 FROM large_catalog_members m JOIN large_catalog_groups g "
+                        "ON g.package_id=m.package_id AND g.id=m.group_id "
+                        "WHERE m.package_id=f.package_id AND m.path=f.path AND LENGTH(m.vector)>0)",
+                        (package_id,)) or 0)
         no_content = int(q("SELECT COUNT(*) FROM files WHERE package_id=? AND "
                            "json_extract(local_summary,'$.portrait.catalog_status')='no_content'",
                            (package_id,)) or 0)
@@ -910,8 +933,8 @@ def validate_catalog(store, package_id):
                          "json_extract(local_summary,'$.portrait.catalog_status')='deferred'",
                          (package_id,)) or 0)
         # 只有 km-pending-* 是真正的占位组（还没完成语义聚类）。
-        # km-other-* 是**设计上的系统桶**：装"正文过少、无法参与语义聚类"的文件，
-        # 目录里有明确的确定性名字"未能识别内容"，且 merge_topics 显式把它排除在
+        # km-other-* 是系统保留桶：正文不足或离群内容按保留原因展示，
+        # 不把临时保留成员冒充语义主题，且 merge_topics 显式把它排除在
         # 主题层之外。改动前把两者一起算作"占位组不得进入正式目录"，于是任何
         # 有系统桶的包都恒带一条阻断级违规（实测 cssj4 报了 67 个文件），
         # 而实际上它本来就该那样显示。
@@ -963,10 +986,12 @@ def validate_catalog(store, package_id):
         # member_count=0）不出现在目录里，也不会再排命名任务 —— 原来把它算成
         # "没名字也没任务"，于是 INV-7 永久阻断（生产实测 lp-ba9afc71）。
         unnamed = int(q("SELECT COUNT(*) FROM large_catalog_groups g WHERE g.package_id=? AND "
+                        "g.id NOT LIKE 'km-other-%' AND g.id NOT LIKE 'km-pending-%' AND "
                         "EXISTS(SELECT 1 FROM large_catalog_members m WHERE m.package_id=g.package_id "
                         "AND m.group_id=g.id) AND "
                         "NOT EXISTS(SELECT 1 FROM lp_catalog_labels l WHERE l.package_id=g.package_id "
-                        "AND l.group_id=g.id AND l.name<>'')", (package_id,)) or 0)
+                        "AND l.group_id=g.id AND l.name<>'' AND (l.revision=g.content_revision OR l.locked=1))",
+                        (package_id,)) or 0)
         fix = _validate_fix_enabled()
         solo_unvectored = named_staging = 0
         if fix:
@@ -1000,21 +1025,50 @@ def validate_catalog(store, package_id):
                 "    WHERE b.package_id=g.package_id AND je.value=g.id)",
                 (package_id,)) or 0)
             placeholders = max(0, placeholders - named_staging)
+        # Count the UNION of file identities. A classified/no-content/deferred
+        # overlap must not compensate for a different file with no result.
+        covered = int(q(
+            "SELECT COUNT(*) FROM files f WHERE f.package_id=? AND ("
+            "COALESCE(json_extract(f.local_summary,'$.portrait.catalog_status'),'') IN ('no_content','deferred') "
+            "OR EXISTS(SELECT 1 FROM large_catalog_members m JOIN large_catalog_groups g "
+            " ON g.package_id=m.package_id AND g.id=m.group_id "
+            " WHERE m.package_id=f.package_id AND m.path=f.path AND (LENGTH(m.vector)>0 "
+            " OR (? AND (m.group_id LIKE 'km-solo-%' OR m.group_id LIKE 'km-other-%')))))",
+            (package_id, int(fix))) or 0)
+        orphan_members = int(q(
+            "SELECT COUNT(*) FROM large_catalog_members m WHERE m.package_id=? AND ("
+            "NOT EXISTS(SELECT 1 FROM files f WHERE f.package_id=m.package_id AND f.path=m.path) "
+            "OR NOT EXISTS(SELECT 1 FROM large_catalog_groups g WHERE g.package_id=m.package_id AND g.id=m.group_id))",
+            (package_id,)) or 0)
+        independent_files = int(q(
+            "SELECT COUNT(*) FROM files f WHERE f.package_id=? AND EXISTS("
+            "SELECT 1 FROM large_catalog_members m JOIN large_catalog_groups g ON g.package_id=m.package_id AND g.id=m.group_id "
+            "JOIN lp_catalog_labels l ON l.package_id=g.package_id AND l.group_id=g.id "
+            "WHERE m.package_id=f.package_id AND m.path=f.path AND l.name<>'' "
+            "AND (l.revision=g.content_revision OR l.locked=1) AND EXISTS("
+            "SELECT 1 FROM lp_catalog_branches b,json_each(b.children) child "
+            "WHERE b.package_id=g.package_id AND b.id LIKE 'independent:%' AND child.value=g.id "
+            "AND json_extract(b.revisions, '$.\"' || g.id || '\"')=g.content_revision))",
+            (package_id,)) or 0)
+        tree_partition = _tree_partition_check(conn, package_id)
     try:
         from services.large_package_semantic import leaf_growth_cap
         growth = int(leaf_growth_cap(store))
     except Exception:
         growth = 240
     dups = duplicate_name_groups(store, package_id)
-    covered = members + no_content + deferred + solo_unvectored
     checks["INV2_covered"] = {"files": total_files, "members": members,
                               "no_content": no_content, "deferred": deferred,
+                              "covered": covered, "orphan_members": orphan_members,
+                              "overlap": members + no_content + deferred + solo_unvectored - covered,
                               "uncovered": max(0, total_files - covered)}
     if fix:
         checks["INV2_covered"]["single_or_system_without_vector"] = solo_unvectored
     if total_files and covered < total_files:
         violations.append("INV-2：有 %d 个已发现文件既不在正式目录、也没有明确的未分类原因"
                           % (total_files - covered))
+    if orphan_members:
+        violations.append("INV-2：有 %d 个目录成员引用了不存在的文件或叶组" % orphan_members)
     # 同名必须分两类看。目录是**主题 → 叶子**两级：用户在某个主题下浏览时，
     # 看不到另一个主题里的同名叶子，所以**跨主题同名是正常的**；
     # 真正要消灭的是**同一主题内**出现两个同名叶子（同一列表里出现重复条目）。
@@ -1023,14 +1077,14 @@ def validate_catalog(store, package_id):
     topic_of = {}
     with closing(store._connect()) as conn_t:
         try:
-            for b in conn_t.execute("SELECT name,children FROM lp_catalog_branches "
+            for b in conn_t.execute("SELECT id,name,children FROM lp_catalog_branches "
                                     "WHERE package_id=?", (package_id,)):
                 try:
                     kids = json.loads(b["children"] or "[]")
                 except (TypeError, ValueError):
                     kids = []
                 for gid in kids:
-                    topic_of[str(gid)] = str(b["name"])
+                    topic_of[str(gid)] = str(b["id"])
         except Exception:
             topic_of = {}
     same_topic_keys = {}
@@ -1083,7 +1137,11 @@ def validate_catalog(store, package_id):
                         "这是合并的正常结果" % (groups, growth))
     checks["INV5_placeholders"] = {"files_in_placeholder_groups": placeholders,
                                    "files_in_system_bucket": system_bucket,
-                                   "files_in_single_file_entries": solo_outside}
+                                   "files_in_single_file_entries": solo_outside,
+                                   "files_in_independent_leaves": independent_files}
+    if independent_files:
+        warnings.append("INV-5（提示）：有 %d 个文件在已命名、已持久登记的独立内容主题中，"
+                        "未强行并入不相关的上位主题" % independent_files)
     if fix:
         checks["INV5_placeholders"]["files_in_named_staging_groups"] = named_staging
     if named_staging:
@@ -1094,7 +1152,7 @@ def validate_catalog(store, package_id):
     if system_bucket:
         checks["INV5b_system_bucket"] = {
             "files": system_bucket,
-            "note": "系统桶按设计不属于任何主题，名称固定为'未能识别内容'，不是占位组"}
+            "note": "系统保留桶按设计不属于语义主题，按保留原因展示（如离群内容待归并或未能识别内容），不是占位组"}
     checks["INV6_count_drift"] = {"groups_with_drift": drift}
     if drift:
         violations.append("INV-6：有 %d 个组的 member_count 与实际成员数不一致" % drift)
@@ -1103,10 +1161,11 @@ def validate_catalog(store, package_id):
         try:
             awaiting = int(conn2.execute(
                 "SELECT COUNT(*) FROM large_catalog_groups g WHERE g.package_id=? AND "
+                "g.id NOT LIKE 'km-other-%' AND g.id NOT LIKE 'km-pending-%' AND "
                 "EXISTS(SELECT 1 FROM large_catalog_members m WHERE m.package_id=g.package_id "
                 "AND m.group_id=g.id) AND "
                 "NOT EXISTS(SELECT 1 FROM lp_catalog_labels l WHERE l.package_id=g.package_id "
-                "AND l.group_id=g.id AND l.name<>'') AND EXISTS("
+                "AND l.group_id=g.id AND l.name<>'' AND (l.revision=g.content_revision OR l.locked=1)) AND EXISTS("
                 "SELECT 1 FROM lp_catalog_jobs j WHERE j.package_id=g.package_id "
                 "AND j.group_id=g.id AND j.status IN ('queued','running','retry'))",
                 (package_id,)).fetchone()[0] or 0)
@@ -1118,11 +1177,97 @@ def validate_catalog(store, package_id):
     elif unnamed:
         warnings.append("INV-7（警告）：有 %d 个语义组正在等待命名（合并后重新命名，属正常中间态）"
                         % unnamed)
+    if tree_partition is not None:
+        checks['INV8_tree_partition'] = tree_partition
+        if not tree_partition.get('ok'):
+            violations.append('INV-8：' + str(tree_partition.get('reason') or '持久主题与可见目录不一致'))
     return {"ok": not violations, "checks": checks, "violations": violations,
             "warnings": warnings, "blocking": bool(violations)}
 
 
-def _write_evidence_snapshot(conn, package_id, catalog_id, labels, branches, validation, leaves):
+def _tree_partition_check(conn, package_id):
+    """Verify saved navigation and legacy partition describe the same leaf identities."""
+    row = conn.execute('SELECT fingerprint,payload FROM lp_catalog_tree WHERE package_id=?',
+                       (package_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        from services.large_package_catalog_tree import fingerprint, publication_state, _digest, live_leaf_sql
+        leaves = [dict(r) for r in conn.execute(
+            "SELECT g.id group_id,g.content_revision,l.version,l.name FROM large_catalog_groups g "
+            "JOIN lp_catalog_labels l ON l.package_id=g.package_id AND l.group_id=g.id "
+            "WHERE g.package_id=? AND " + live_leaf_sql('g') + " AND (l.revision=g.content_revision OR l.locked=1) AND "
+            + system_group_sql('g.id'), (package_id,))]
+        payload = json.loads(row['payload'])
+        publication = None
+        if payload.get('publication_schema') == 1:
+            dependencies = payload.get('dependencies') or {}
+            semantic = payload.get('semantic_snapshot') or {}
+            if payload.get('snapshot_id') != _digest([row['fingerprint'], semantic, dependencies]):
+                raise ValueError('主题快照身份与依赖记录不一致')
+            expected = set(payload.get('coverage_leaf_ids', []))
+            if not expected <= set(dependencies):
+                raise ValueError('主题覆盖范围不属于已校验依赖快照')
+            if payload.get('publication_state') == 'complete' and expected != set(semantic.get('leaf_ids', [])):
+                raise ValueError('完整目录未覆盖构建快照中的全部叶组')
+            publication = publication_state(conn, package_id, payload)
+        elif row['fingerprint'] != fingerprint(leaves):
+            return {'ok': False, 'reason': '主题快照与当前叶组名称或内容修订不一致'}
+        else:
+            expected = {leaf['group_id'] for leaf in leaves}
+        nodes = {node['node_id']: node for node in payload['nodes']}
+        if len(nodes) != len(payload['nodes']):
+            raise ValueError('重复的主题节点身份')
+        independent = list(payload.get('independent_leaf_ids', []))
+        if len(independent) != len(set(independent)) or not set(independent) <= expected:
+            raise ValueError('独立叶组身份重复或不存在')
+        visited = set()
+        def walk(gid, ancestors):
+            if gid in ancestors or gid in visited:
+                raise ValueError('主题节点存在循环或多个父节点')
+            visited.add(gid)
+            node = nodes[gid]
+            found = []
+            for child in node['child_nodes']:
+                if child in nodes:
+                    if nodes[child].get('parent_id') != gid:
+                        raise ValueError('子主题声明的父节点不一致')
+                    found.extend(walk(child, ancestors | {gid}))
+                elif child in expected:
+                    found.append(child)
+                else:
+                    raise ValueError('主题引用了不存在的子目录')
+            if len(found) != len(set(found)) or set(found) != set(node['leaf_ids']) or set(found) != set(node['children']):
+                raise ValueError('主题的递归叶组集合与选择范围不一致')
+            return found
+        themed = [leaf for gid, node in nodes.items() if not node.get('parent_id') for leaf in walk(gid, set())]
+        if visited != set(nodes) or len(themed) != len(set(themed)):
+            raise ValueError('存在无根主题或叶组被多个主题引用')
+        if set(themed) & set(independent) or set(themed) | set(independent) != expected:
+            raise ValueError('主题与独立叶组不是已发布快照覆盖范围的完整分区')
+        bottom = {gid: set(node['leaf_ids']) for gid, node in nodes.items()
+                  if not any(child in nodes for child in node['child_nodes'])}
+        persisted = {}
+        registered = []
+        for branch in conn.execute('SELECT id,children FROM lp_catalog_branches WHERE package_id=?', (package_id,)):
+            children = json.loads(branch['children'])
+            if str(branch['id']).startswith('independent:'):
+                if len(children) != 1:
+                    raise ValueError('独立目录登记并非单独叶组')
+                registered.extend(children)
+            else:
+                persisted[str(branch['id'])] = set(children)
+        if bottom != persisted or len(registered) != len(set(registered)) or set(registered) != set(independent):
+            raise ValueError('持久主题分区与可见目录树不一致')
+        return {'ok': True, 'leaf_nodes': len(expected), 'independent_leaf_nodes': len(independent),
+                'theme_nodes': len(nodes), **({'publication':publication,
+                'complete':publication['complete'], 'publication_state':'complete' if publication['complete'] else 'partial'} if publication is not None else {})}
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        return {'ok': False, 'reason': str(exc)}
+
+
+def _write_evidence_snapshot(conn, package_id, catalog_id, labels, branches, validation, leaves,
+                             topic_count=None, root_theme_nodes=None):
     """批3 第 19 条：为刚生成的 catalog 版本写一条证据快照（幂等）。
 
     `payload` 存的是**证据条目本身**（每个叶组的名字与它引用的证据条数），
@@ -1142,7 +1287,9 @@ def _write_evidence_snapshot(conn, package_id, catalog_id, labels, branches, val
             item_count += 1
             payload.append({'group_id': gid, 'name': name, 'revision': int(row[4] or 0)})
         stats = json.dumps({'leaf_groups': int(leaves), 'named_groups': item_count,
-                            'topic_branches': len(branches),
+                            'topic_branches': topic_count if topic_count is not None else sum(
+                                not str(row[0]).startswith('independent:') for row in branches),
+                            'root_theme_nodes': root_theme_nodes,
                             'violations': len(validation.get('violations') or []),
                             'source': 'catalog-version'}, ensure_ascii=False)
         conn.execute(
@@ -1173,7 +1320,35 @@ def ensure_catalog_version(store, package_id, connection=None, allow_previous=Tr
         branches = [tuple(row) for row in conn.execute(
             "SELECT id,name,children,revisions FROM lp_catalog_branches WHERE package_id=? ORDER BY id",
             (package_id,))]
-        signature = json.dumps([package_id, labels, branches], ensure_ascii=True, sort_keys=True)
+        tree_row = conn.execute('SELECT fingerprint,payload FROM lp_catalog_tree WHERE package_id=?',
+                                (package_id,)).fetchone()
+        topic_count = sum(not str(row[0]).startswith('independent:') for row in branches)
+        root_theme_nodes = topic_count
+        if tree_row:
+            try:
+                payload = json.loads(tree_row['payload'])
+                topic_count = sum(not node.get('name_pending') and node.get('status') != 'pending'
+                                  for node in payload.get('nodes', []))
+                root_theme_nodes = sum(not node.get('parent_id') and not node.get('name_pending')
+                                       and node.get('status') != 'pending' for node in payload.get('nodes', []))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        # Parent relationships are part of the version too; identical bottom
+        # partitions may have different upper navigation and theme counts.
+        tree_version = None
+        if tree_row:
+            try:
+                tree_payload = json.loads(tree_row['payload'])
+                # Retries and diagnostic bookkeeping do not change the directory.
+                # Keep names, revisions, hierarchy, partition and pending state.
+                transient = {'attempted_round', 'topic_regeneration_attempts',
+                             'coverage', 'rejected_outliers'}
+                tree_version = [tree_row['fingerprint'],
+                                {k: v for k, v in tree_payload.items() if k not in transient}]
+            except (ValueError, TypeError, AttributeError):
+                tree_version = tuple(tree_row)
+        signature = json.dumps([package_id, labels, branches, tree_version],
+                                ensure_ascii=True, sort_keys=True)
         catalog_id = "cat-" + hashlib.sha256(signature.encode()).hexdigest()[:20]
         row = conn.execute("SELECT catalog_id FROM lp_catalog_versions WHERE catalog_id=?", (catalog_id,)).fetchone()
         if row:
@@ -1181,6 +1356,8 @@ def ensure_catalog_version(store, package_id, connection=None, allow_previous=Tr
                 conn.commit()
             return catalog_id
         validation = validate_catalog(store, package_id)
+        validation.setdefault('checks', {})['HIERARCHY_counts'] = {
+            'theme_nodes': topic_count, 'root_theme_nodes': root_theme_nodes}
         if validation.get('blocking'):
             previous = conn.execute("SELECT catalog_id FROM lp_catalog_versions WHERE package_id=? "
                                     "ORDER BY created DESC LIMIT 1", (package_id,)).fetchone()
@@ -1195,18 +1372,27 @@ def ensure_catalog_version(store, package_id, connection=None, allow_previous=Tr
             return previous_id if allow_previous else ''
         run = conn.execute("SELECT run_id FROM lp_runs WHERE package_id=? ORDER BY started DESC LIMIT 1",
                            (package_id,)).fetchone()
-        leaves = sum(1 for row in labels if row[2] and (row[4] == row[1] or row[6]))
+        live_leaf_ids = {str(row[0]) for row in conn.execute(
+            "SELECT g.id FROM large_catalog_groups g WHERE g.package_id=? "
+            "AND g.id NOT LIKE 'km-other-%' AND g.id NOT LIKE 'km-pending-%' AND EXISTS("
+            "SELECT 1 FROM large_catalog_members m JOIN files f ON f.package_id=m.package_id AND f.path=m.path "
+            "WHERE m.package_id=g.package_id AND m.group_id=g.id)", (package_id,))}
+        evidence_labels = [row for row in labels if str(row[0]) in live_leaf_ids
+                           and row[2] and (row[4] == row[1] or row[6])]
+        leaves = len(evidence_labels)
         published = bool(conn.execute("SELECT 1 FROM lp_published_views WHERE package_id=? LIMIT 1",
                                       (package_id,)).fetchone())
         conn.execute("INSERT INTO lp_catalog_versions(catalog_id,package_id,run_id,input_version,status,validation,"
                      "leaf_count,topic_count,created,published) VALUES(?,?,?,'catalog-content/2','available',?,?,?,?,?)",
                      (catalog_id, package_id, str(run[0]) if run else '',
-                      json.dumps(validation, ensure_ascii=False), leaves, len(branches), time.time(), int(published)))
+                      json.dumps(validation, ensure_ascii=False), leaves,
+                      topic_count, time.time(), int(published)))
         # 批3 第 19 条：**在版本生成处同步写一条证据快照。**
         # 改动前唯一的写入者是 repair.py 的 R8（历史回填），新导入的包永远没有快照 →
         # `reporting` 读不到 → `evidence_id=''` → 发布出来的 `view_id` 证据位是空的。
         # 快照与 catalog 版本**同事务**写入，保证两者要么都有、要么都没有。
-        _write_evidence_snapshot(conn, package_id, catalog_id, labels, branches, validation, leaves)
+        _write_evidence_snapshot(conn, package_id, catalog_id, evidence_labels, branches, validation, leaves,
+                                 topic_count, root_theme_nodes)
         if own_transaction:
             conn.commit()
         return catalog_id
@@ -1317,6 +1503,14 @@ def prune_round_history(store, package_id, keep=None):
 
 
 def maintain_catalog(store, package_id, force=False):
+    from services.large_package_catalog_coordination import leaf_batch
+    with leaf_batch(store, package_id, 'catalog-maintenance') as allowed:
+        if not allowed:
+            return False
+        return _maintain_catalog(store, package_id, force)
+
+
+def _maintain_catalog(store, package_id, force=False):
     """结构性维护（同名归一 / 切分超大组 / 历史裁剪 / 单例命名）**按目录修订执行一次**。
 
     账①：这些步骤只依赖"目录结构成什么样"，与"这一批要命名哪几组"无关，但
@@ -1372,6 +1566,14 @@ def maintain_catalog(store, package_id, force=False):
 
 
 def queue_groups(store, package_id):
+    from services.large_package_catalog_coordination import leaf_batch
+    with leaf_batch(store, package_id, 'catalog-queue') as allowed:
+        if not allowed:
+            return False
+        return _queue_groups(store, package_id)
+
+
+def _queue_groups(store, package_id):
     """把"还有哪些组该命名"落进任务表。结构性维护按目录签名门控（见 maintain_catalog）。
 
     任务表的 upsert 与孤儿清理**每次都要跑**：它们是"这一批领谁"的依据，
@@ -1407,6 +1609,25 @@ def queue_groups(store, package_id):
         c.execute('DELETE FROM lp_catalog_jobs WHERE package_id=? AND NOT EXISTS(SELECT 1 FROM large_catalog_groups g WHERE g.package_id=lp_catalog_jobs.package_id AND g.id=lp_catalog_jobs.group_id)',(package_id,))
 
 
+def _current_topic_publication(conn, package_id):
+    row = conn.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?', (package_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (ValueError, TypeError):
+        return {'complete':False, 'valid_node_ids':[], 'validation_error':'主题快照格式无效'}
+    if not isinstance(payload, dict):
+        return {'complete':False, 'valid_node_ids':[], 'validation_error':'主题快照不是对象'}
+    if payload.get('publication_schema') != 1:
+        return None
+    from services.large_package_catalog_tree import publication_state
+    try:
+        return publication_state(conn, package_id, payload)
+    except (ValueError, TypeError, KeyError):
+        return {'complete':False, 'valid_node_ids':[], 'validation_error':'主题依赖快照无效'}
+
+
 def state(store, package_id, settle=False):
     """读轮次状态。**默认不写任何东西。**
 
@@ -1432,20 +1653,43 @@ def state(store, package_id, settle=False):
         retryable_deferred = c.execute(
             "SELECT COUNT(*) FROM lp_catalog_jobs WHERE package_id=? AND status='deferred' "
             "AND attempts<?", (package_id, _name_max_attempts)).fetchone()[0]
-        named = c.execute('SELECT COUNT(*) FROM lp_catalog_labels l JOIN large_catalog_groups g ON g.package_id=l.package_id AND g.id=l.group_id WHERE l.package_id=? AND (l.revision=g.content_revision OR l.locked=1)',(package_id,)).fetchone()[0]
-        covered = c.execute('SELECT COALESCE(SUM(g.member_count),0) FROM large_catalog_groups g JOIN lp_catalog_labels l ON l.package_id=g.package_id AND l.group_id=g.id WHERE g.package_id=? AND (l.revision=g.content_revision OR l.locked=1)',(package_id,)).fetchone()[0]
-        total = c.execute('SELECT COUNT(*) FROM large_catalog_groups WHERE package_id=?',(package_id,)).fetchone()[0]
+        live_semantic = ("g.id NOT LIKE 'km-other-%' AND g.id NOT LIKE 'km-pending-%' AND EXISTS("
+                         "SELECT 1 FROM large_catalog_members m JOIN files f ON f.package_id=m.package_id AND f.path=m.path "
+                         "WHERE m.package_id=g.package_id AND m.group_id=g.id)")
+        named = c.execute('SELECT COUNT(*) FROM lp_catalog_labels l JOIN large_catalog_groups g '
+                          'ON g.package_id=l.package_id AND g.id=l.group_id WHERE l.package_id=? '
+                          "AND l.name<>'' AND (l.revision=g.content_revision OR l.locked=1) AND "+live_semantic,
+                          (package_id,)).fetchone()[0]
+        covered = c.execute("SELECT COUNT(*) FROM files f WHERE f.package_id=? AND EXISTS("
+                            "SELECT 1 FROM large_catalog_members m JOIN large_catalog_groups g ON g.package_id=m.package_id AND g.id=m.group_id "
+                            "JOIN lp_catalog_labels l ON l.package_id=g.package_id AND l.group_id=g.id "
+                            "WHERE m.package_id=f.package_id AND m.path=f.path AND g.id NOT LIKE 'km-other-%' "
+                            "AND g.id NOT LIKE 'km-pending-%' AND l.name<>'' AND (l.revision=g.content_revision OR l.locked=1))",
+                            (package_id,)).fetchone()[0]
+        total = c.execute('SELECT COUNT(*) FROM large_catalog_groups g WHERE g.package_id=? AND '+live_semantic,
+                          (package_id,)).fetchone()[0]
         result = dict(row) if row else {}
-        if row and row['status']=='active':
+        publication = _current_topic_publication(c, package_id)
+        if publication is not None:
+            result['topic_publication'] = publication
+            result['hierarchy_status'] = 'completed' if publication['complete'] else 'partial'
+            if settle and row and not publication['complete'] and row['hierarchy_status'] == 'completed':
+                c.execute("UPDATE lp_catalog_rounds SET hierarchy_status='partial' WHERE package_id=? AND id=?", (package_id,row['id']))
+        partial_topics = publication is not None and not publication['complete']
+        if row and (row['status']=='active' or (partial_topics and row['status']=='completed')):
             exhausted = row['deadline'] <= time.time() or row['requests'] >= row['max_requests'] or row['tokens'] >= row['max_tokens']
             if exhausted:
                 if settle:
                     c.execute("UPDATE lp_catalog_rounds SET status='exhausted' WHERE package_id=? AND id=?",(package_id,row['id']))
                 result['status']='exhausted'
-            elif (not counts.get('queued',0) and not counts.get('running',0)
+            else:
+                result['status']='active'
+                if settle and row['status']=='completed' and partial_topics:
+                    c.execute("UPDATE lp_catalog_rounds SET status='active' WHERE package_id=? AND id=?", (package_id,row['id']))
+            if not exhausted and (not counts.get('queued',0) and not counts.get('running',0)
                   and not retryable_deferred):
                 from services.large_package_catalog_hierarchy import needed
-                hierarchy_pending=row['hierarchy_status'] in {'queued','running'} and needed(c,package_id)
+                hierarchy_pending=(publication is not None and not publication['complete']) or (row['hierarchy_status'] in {'queued','running'} and needed(c,package_id))
                 if hierarchy_pending:
                     return {**result,'enabled':cfg['enabled'],'jobs':counts,'named_nodes':named,'named_files':covered,
                             'total_nodes':total,'pending_nodes':max(0,total-named),'active':True,
@@ -1482,6 +1726,9 @@ def naming_work_pending(store, package_id):
         if c.execute("SELECT 1 FROM lp_catalog_jobs WHERE package_id=? AND "
                      "(status IN ('queued','running','retry') OR (status='deferred' AND attempts<?)) "
                      "LIMIT 1", (package_id, max_attempts)).fetchone():
+            return True
+        publication = _current_topic_publication(c, package_id)
+        if publication is not None and not publication['complete']:
             return True
         try:
             if latest['hierarchy_status'] in {'queued', 'running'}:
@@ -1857,36 +2104,10 @@ def representatives(store, package_id, group_id, limit=None):
             break
     return rows, dict(group)
 
-_tokenizers={}
-# 修补 7：tokenizer 加载**失败的冷却期**（秒）。
-# 原来是"失败即永久缓存 None"，于是 tokenizer 文件后来到位也不会恢复，本进程
-# 生命周期内一直用字节数兜底（中文约 3x 高估 token → 过度裁剪），只能靠重启。
-# 但完全不缓存也不行：`bundle_key` 每次建包都调 `_tokenizer_version()` → `_tokenizer()`，
-# 一个大包会变成上万次失败的文件打开（热循环）。所以用**有界冷却 + 带退避的
-# 失败原因记录**：窗口内不重复尝试，窗口过后自动重试，恢复无需重启。
-_TOKENIZER_FAIL_TTL = 120.0
-_TOKENIZER_FAIL = {}
-
 def _tokenizer():
     from config import Config
-    model_path=Path(Config.VLLM_MODEL_PATH)/'tokenizer.json'
-    key=str(model_path)
-    if key not in _tokenizers:
-        failed = _TOKENIZER_FAIL.get(key)
-        if failed and time.time() - failed[0] < _TOKENIZER_FAIL_TTL:
-            return None
-        try:
-            from tokenizers import Tokenizer
-            _tokenizers[key]=Tokenizer.from_file(key)
-            _TOKENIZER_FAIL.pop(key,None)
-        except Exception:
-            reason=str(sys.exc_info()[1])
-            if not _TOKENIZER_FAIL.get(key) or _TOKENIZER_FAIL[key][1]!=reason:
-                LOGGER.warning('tokenizer unavailable, using byte-length fallback: %s (%s)',
-                               key,reason)
-            _TOKENIZER_FAIL[key]=(time.time(),reason)
-            return None
-    return _tokenizers[key]
+    from services.model_budget import tokenizer
+    return tokenizer(config=Config)
 
 
 from services.performance_primitives import WeightedLRU
@@ -1895,8 +2116,11 @@ _TOKEN_COUNT_CACHE = WeightedLRU(capacity=256, max_weight=2_000_000)
 
 def token_count(text):
     tokenizer=_tokenizer()
-    # Encoder identity prevents cross-model/fallback count reuse.
-    key = (tokenizer, text)
+    # Keep the actual encoder in the bounded cache key as well as its selected
+    # model/file identity. A replaced encoder or the byte fallback must not
+    # reuse another encoder's count; retaining it also prevents object-id reuse.
+    # Unhashable encoders safely bypass this optional cache below.
+    key = (_tokenizer_version(), tokenizer, text)
     try:
         cached = _TOKEN_COUNT_CACHE.get(key)
     except TypeError:
@@ -1937,7 +2161,7 @@ def content_snippet(text):
 
 
 # 命名证据策略版本：取文 / 画像 / 选样口径变化时递增，用来作废按修订号的缓存。
-EVIDENCE_POLICY_VERSION = 'evidence-policy/2'
+EVIDENCE_POLICY_VERSION = 'evidence-policy/5'
 # 修补 3c 的开关：默认**关**。它会改变送进模型的证据正文（因此改变未来新包的命名
 # 结果），属"改输入"而不是纯 bug 修复，必须由运维显式开启。
 #   SJFX_LP_EVIDENCE_TEMPLATE_STRIP=1  开启；不设或 0 则保持现状。
@@ -1949,8 +2173,10 @@ _BUNDLE_CACHE_LIMIT = 2048
 
 
 def _tokenizer_version():
-    """分词口径版本：本机 tokenizer 可用与否会改变 token 计数与裁剪位置。"""
-    return 'local-bpe' if _tokenizer() is not None else 'byte-fallback'
+    """The selected model and actual tokenizer content define cache identity."""
+    from config import Config
+    from services.model_budget import tokenizer_identity
+    return tokenizer_identity(config=Config)
 
 
 def bundle_key(package_id, group_id, revision, owner_id):
@@ -1965,9 +2191,8 @@ def bundle_key(package_id, group_id, revision, owner_id):
     """
     parts = [EVIDENCE_POLICY_VERSION, VERSION, _tokenizer_version(),
              str(owner_id or ''), str(package_id), str(group_id), str(int(revision or 0))]
-    # 批次 3b §7 第 4 条：提示词变体必须进键，否则只改提示词时旧缓存照样被命中。
-    # **只在非默认变体时追加**：默认（full）下键与改动前逐字相同，重启后既有缓存
-    # 仍可命中；若无条件追加，所有 digest 都会变，重启后第一轮会全量重新调用模型。
+    # A semantic prompt change needs its own cache variant. Existing published
+    # labels stay visible; only actual queued work prepares new-version inputs.
     variant = prompt_variant()
     if variant != 'full':
         parts.append(variant)
@@ -2036,7 +2261,8 @@ def held_out_members(store, package_id, group_id, used, want=4, max_tokens=200):
     fetched = store.get_files(package_id, candidates)
     for path in candidates:
         row = fetched.get(path)
-        source = catalog_material(row)[0] if row else None
+        available = catalog_material(row) if row else None
+        source = available[0] if available else None
         if not source:
             continue
         info = (row.get('local_summary') or {}).get('portrait') or {}
@@ -2160,10 +2386,12 @@ def _bundle_core_impl(store, package_id, group_id):
             continue
         evidence.append({'id':'E'+str(len(evidence)+1),'source_path':row['path'],
             'location':'；'.join(dict.fromkeys(str(b.get('location') or '内容片段') for b in blocks)),
-            'headings':filter_meta(value.get('headings'),meta_block,3),
-            'fields':filter_meta(value.get('fields'),meta_block,5),
-            'keywords':filter_meta(value.get('keywords'),meta_block,4),
-            'kinds':list(dict.fromkeys(b.get('kind','unknown') for b in blocks)),
+            'headings':filter_meta(value.get('headings'),meta_block,3,source_text=text,kind='heading'),
+            'fields':filter_meta(value.get('fields'),meta_block,5,source_text=text),
+            'keywords':filter_meta(value.get('keywords'),meta_block,4,source_text=text),
+            'kinds':list(dict.fromkeys([b.get('kind','unknown') for b in blocks] +
+                    (['reference'] if any(b.get('evidence_role')=='reference' for b in blocks) else []))),
+            **({'publication_notice_removed':True} if any(b.get('publication_notice_removed') for b in blocks) else {}),
             'truncated':any(b.get('truncated') for b in blocks),
             'text':text,'blocks':blocks})
     if not evidence:
@@ -2183,8 +2411,11 @@ def _bundle_core_impl(store, package_id, group_id):
         payload['evidence']=[{k:v for k,v in e.items() if k not in {'source_path','blocks'}} for e in evidence]
         return json.dumps(payload,ensure_ascii=False,separators=(',',':'))
     cfg=settings()
-    core_budget=max(400,int(cfg['input'])-NEIGHBOR_RESERVE)
+    core_budget=max(1,int(cfg['input'])-NEIGHBOR_RESERVE)
     _system=system_prompt()
+    if token_count(_system)+64 >= core_budget:
+        from services.model_contract import LocalModelError
+        raise LocalModelError('目录命名约定超过所选模型上下文预算', code='context_limit')
     user=serialize()
     while token_count(_system+'\n'+user)+64>core_budget:
         # Remove weak metadata before shortening source evidence.
@@ -2203,7 +2434,8 @@ def _bundle_core_impl(store, package_id, group_id):
                 longest['blocks'].pop()
                 longest['text']='\n'.join(b['text'] for b in longest['blocks'])
                 longest['location']='；'.join(dict.fromkeys(b.get('location','内容片段') for b in longest['blocks']))
-                longest['kinds']=list(dict.fromkeys(b.get('kind','unknown') for b in longest['blocks']))
+                longest['kinds']=list(dict.fromkeys([b.get('kind','unknown') for b in longest['blocks']] +
+                    (['reference'] if any(b.get('evidence_role')=='reference' for b in longest['blocks']) else [])))
                 longest['truncated']=True
             elif token_count(longest['text'])>80:
                 longest['text']=clip(longest['text'],max(60,token_count(longest['text'])-60))
@@ -2212,7 +2444,8 @@ def _bundle_core_impl(store, package_id, group_id):
             elif len(evidence)>1:
                 evidence.pop()
             else:
-                raise ValueError('提示词超过输入预算')
+                from services.model_contract import LocalModelError
+                raise LocalModelError('目录命名证据无法容纳于所选模型上下文预算', code='context_limit')
         user=serialize()
     revision=int(group.get('content_revision') or 0)
     held_out=held_out_members(store,package_id,group_id,[e['source_path'] for e in evidence])
@@ -2264,6 +2497,7 @@ def bundle(store, package_id, group_id):
     context_digest=hashlib.sha256(
         json.dumps([x.get('name') for x in neighbors],ensure_ascii=False).encode()).hexdigest()
     return {'system':system_prompt(),'user':user,'evidence':core['evidence'],
+            'route':core['route'],
             # 留出成员与画像**只给校验用**：它们不出现在 user/payload 里
             # （payload 在上面已按 core['payload'] 复制，不含这两个键）。
             'held_out':core.get('held_out') or [],'profile':core.get('profile') or {},
@@ -2462,6 +2696,60 @@ def _drop_unknown_tokens(text, tokens):
     return cleaned, True
 
 
+def _publication_topic_mismatch(name, evidence):
+    """Flag a notice-derived topic only when cleaned body lacks that subject.
+
+    This is a conservative review signal, never a keyword ban on copyright or
+    licensing scholarship. The evidence cleaner owns precise notice detection.
+    """
+    if not re.search(r'版权|知识共享许可|管辖权声明|出版社.*声明', name):
+        return False
+    from services import large_package_evidence as source_evidence
+    clean = getattr(source_evidence, 'clean_publication_spans', lambda value: value)
+    normalize = getattr(source_evidence, 'normalize', lambda value: value)
+    body = []
+    notice_removed = False
+    for item in evidence:
+        parts = item.get('blocks') or [item]
+        for part in parts:
+            if part.get('evidence_role') == 'reference':
+                continue
+            text = str(part.get('text') or '')
+            cleaned = clean(text)
+            notice_removed |= bool(part.get('publication_notice_removed')) or cleaned != normalize(text)
+            body.append(cleaned)
+    if not notice_removed:
+        return False
+    # A substantive licensing/copyright paper retains these concepts after
+    # precise publisher notices are removed. Open access alone is publication
+    # context and cannot substantiate a Creative Commons licensing theme.
+    return not re.search(r'copyright|licen[cs](?:e|ing)|creative\s+commons|jurisdiction|'
+                         r'版权|著作权|知识共享|许可制度|许可协议|管辖权',
+                         ' '.join(body), re.I)
+
+
+def _review_pending(value):
+    try:
+        meta=json.loads(value or '{}') if isinstance(value,str) else (value or {})
+        return (meta.get('naming_review') or {}).get('state')=='pending'
+    except (TypeError,ValueError,AttributeError):
+        return False
+
+
+def _review_metadata(result, revision, evidence, source='model_validation', now=None):
+    """Durable validation facts for views, workers and quality measurement."""
+    pending = source in {'subtopic_split', 'outlier_split'}
+    return {'schema': 1, 'state': 'pending' if pending else 'checked',
+            'reasons': (['post_split_unverified'] if pending else
+                        list(dict.fromkeys(result.get('review_reasons') or []))),
+            'validated_revision': None if pending else int(revision),
+            'evidence_ids': [] if pending else [e['id'] for e in evidence],
+            'evidence_paths': [] if pending else list(dict.fromkeys(
+                str(e['source_path']) for e in evidence if e.get('source_path'))),
+            'source': source, 'prompt_variant': prompt_variant(),
+            'checked_at': None if pending else (time.time() if now is None else now)}
+
+
 def validate(content, material):
     from services.model_output import extract_json_value
     result=extract_json_value(content)
@@ -2566,11 +2854,28 @@ def validate(content, material):
             name=STATUS_NAMES['insufficient_evidence']
         else:
             status='thin_evidence'
+    reasons=[]
+    if unknown:
+        reasons.append('name_content_mismatch')
+    if purity=='unsure':
+        reasons.append('model_uncertain')
+    elif purity=='mixed':
+        reasons.append('cross_topic')
+    if outliers:
+        reasons.append('cross_topic')
+    if len(allowed)>1 and len(set(ids))<2:
+        reasons.append('insufficient_evidence')
     needs=bool(result.get('needs_review',False)) or purity=='unsure' or (len(allowed)>1 and len(set(ids))<2)
     if any('filename_hint' in e.get('kinds',[]) for e in cited):
         needs=True
+        reasons.append('insufficient_evidence')
+    if any(e.get('blocks') and all(b.get('evidence_role')=='reference'
+                                  for b in e['blocks']) for e in cited):
+        needs=True
+        reasons.append('insufficient_evidence')
     if status!='coherent':
         needs=True
+        reasons.append('insufficient_evidence' if status in {'thin_evidence', 'insufficient_evidence'} else 'model_uncertain')
     elif _GENERIC_WORD.search(name):
         # 泛化词不一定是错的（“XX政策汇编”可能是诚实描述），但必须让复核者看见。
         needs=True
@@ -2579,6 +2884,10 @@ def validate(content, material):
         # 应当复核而不是当成主题名。这里只置复核、不硬拒——硬拒会白白重试一次，
         # 而"列举得对不对"需要人看。
         needs=True
+        reasons.append('scope_granularity')
+    if _publication_topic_mismatch(name, cited):
+        needs=True
+        reasons.append('name_content_mismatch')
     # §4.3–4.6：留出成员 + L2 画像 + 被引用证据三方对照的**软**支撑评分。
     # 只在三条同时成立时置复核：名称的字面支撑主要来自模型读过的那几份、
     # 组里其余成员几乎不支持、且名称单元完全不在全组画像里。任何一条不成立就放过——
@@ -2591,9 +2900,17 @@ def validate(content, material):
                 and support['profile']==0.0
                 and support['held_out']<0.5*support['cited']):
             needs=True
+            reasons.append('name_content_mismatch')
+    # A valid partition still reports real cross-topic/outlier content even if
+    # the model omitted its optional review flag or splitting is unavailable.
+    if 'cross_topic' in reasons:
+        needs=True
+    if needs and not reasons:
+        reasons.append('model_review')
     return {'name':name,'description':description,'evidence_ids':list(dict.fromkeys(ids)),
             'outliers':outliers,'needs_review':needs,'naming_status':status,
-            'support':support,'purity':purity,'subtopics':subtopics,'model_name':model_name}
+            'support':support,'purity':purity,'subtopics':subtopics,'model_name':model_name,
+            'review_reasons':list(dict.fromkeys(reasons))}
 
 
 def reserve(store,package_id,round_id,group_id,tokens,group_scope=None):
@@ -2620,6 +2937,8 @@ def reserve(store,package_id,round_id,group_id,tokens,group_scope=None):
 # 成百上千个任务的退避额度烧掉，而组内失败还被整次记成 completed。
 # 这里把分类与释放收口成一份，两条路径共用；逐组结果另记进调用台账的 detail。
 FAILURE_UNAVAILABLE = 'unavailable'        # 依赖不可用：根本没调成
+FAILURE_BUSY = 'busy'                      # 准入暂忙：短退避，不消耗内容重试
+FAILURE_TIMEOUT = 'timeout'                # 请求超时：可能已消耗模型资源，独立退避
 FAILURE_INVALID_OUTPUT = 'invalid_output'  # 模型产出不合法（再试也是同样结果）
 FAILURE_STALE = 'stale'                    # 修订已变，结果作废
 FAILURE_CANCELLED = 'cancelled'            # 暂停/取消
@@ -2865,11 +3184,11 @@ def inherit_leaf_names(store, package_id):
     try:
         with closing(store._connect()) as c:
             rows = [dict(r) for r in c.execute(
-                "SELECT l.group_id,l.revision,l.model,l.digest,l.evidence,l.locked "
+                "SELECT l.group_id,l.revision,l.model,l.digest,l.evidence,l.locked,g.result group_result "
                 "FROM lp_catalog_labels l JOIN large_catalog_groups g "
                 "  ON g.package_id=l.package_id AND g.id=l.group_id "
                 "WHERE l.package_id=? AND l.revision!=g.content_revision AND l.locked=0",
-                (package_id,))]
+                (package_id,)) if not _review_pending(r['group_result'])]
     except Exception:
         LOGGER.exception('leaf name inheritance scan failed: %s', package_id)
         return 0, 0
@@ -3076,9 +3395,20 @@ def lease_renewal(store, package_id, group_ids, stop=None, interval=30.0):
 
 def classify_failure(exc):
     """把异常归到统一类别。批次、单组、主题命名、合并校验共用这一份判据。"""
+    code = str(getattr(exc, 'code', '') or '')
+    text = str(exc or '')
+    if code == 'cancelled' or '暂停' in text or '取消' in text:
+        return FAILURE_CANCELLED
+    if code == 'busy' or (getattr(exc, 'status', None) == 429):
+        return FAILURE_BUSY
+    if code == 'timeout':
+        return FAILURE_TIMEOUT
+    if code in {'invalid_response', 'invalid_structured_output', 'context_limit'}:
+        return FAILURE_INVALID_OUTPUT
+    if '正在处理其他请求' in text:
+        return FAILURE_BUSY
     if _is_infrastructure_error(exc):
         return FAILURE_UNAVAILABLE
-    text = str(exc or '')
     if isinstance(exc, ValueError):
         return FAILURE_BUDGET if '预算' in text else FAILURE_INVALID_OUTPUT
     if '陈旧' in text or 'stale' in text.lower():
@@ -3269,6 +3599,7 @@ def release_job(store, package_id, group_id, revision, attempts=0, error='', cat
     类别决定状态与退避：
       · unavailable：不递增 attempts、长退避（`LP_NAME_INFRA_BACKOFF_SECONDS`，默认 120s）
         ——模型挂多久就等多久；调用方负责 refund_call() 退回轮次额度；
+      · timeout：不递增内容 attempts，60–75s 有界退避，保留请求与估算 token 结算；
       · invalid_output / unknown：指数退避并递增 attempts；
       · stale：立刻回 queued 让新修订重排，不动 attempts；
       · cancelled：释放成 queued，不动 attempts。
@@ -3283,6 +3614,21 @@ def release_job(store, package_id, group_id, revision, attempts=0, error='', cat
     if category in (None, FAILURE_RELEASED):
         # 只是把本次领取放回去：不改 attempts、不等待。批次处理不完的组走这条。
         status, delta, next_at, message = 'queued', 0, now, str(error)[:250]
+    elif category == FAILURE_BUSY:
+        try:
+            backoff = float(os.getenv('SJFX_LP_NAME_BUSY_BACKOFF_SECONDS', '8') or 8)
+        except (TypeError, ValueError):
+            backoff = 8.0
+        # Bounded jitter prevents two lanes waking up in lockstep. This does
+        # not consume a content/format retry and the due job remains batchable.
+        backoff = min(15.0, max(5.0, backoff))
+        status, delta, next_at = 'deferred', 0, now + random.uniform(backoff * .8, backoff * 1.2)
+        message = '[模型暂忙，短暂等待重试] ' + str(error)[:220]
+    elif category == FAILURE_TIMEOUT:
+        # Beyond the shared 30-second quarantine; retain finite request/token
+        # charges because the provider may still have processed this request.
+        status, delta, next_at = 'deferred', 0, now + random.uniform(60.0, 75.0)
+        message = '[模型请求超时，等待重试] ' + str(error)[:220]
     elif category == FAILURE_UNAVAILABLE:
         try:
             from config import Config as _Cfg
@@ -3511,7 +3857,7 @@ def split_off_outliers(store, package_id, group_id, material, result):
     再花一次命名调用。但"这撮人自成一类"这件事在本语料上**无法验证**：我们试过
     四种搬动前核对的判据，判别力全部为零（详见函数内的长注释）。没有验证手段时，
     编一个名字比不给名字更糟——它会把"不知道"包装成一个看起来确定的主题，用户
-    无从分辨。所以默认把它们移进已有系统桶 km-other-*，显示为"未能识别内容"。
+    无从分辨。所以默认把它们移进已有系统桶 km-other-*，按原因显示为"离群内容待归并"。
     置 `SJFX_LP_LEAF_SPLIT_NAMED=1` 可回到"新建命名叶组"的旧行为做 A/B 对照。
 
     **为什么用语义判据而不是几何阈值。** 这类语料（上千篇学术 PDF）里任意两篇的
@@ -3585,13 +3931,19 @@ def split_off_outliers(store, package_id, group_id, material, result):
                              (package_id,)).fetchone()
             actual = c.execute('SELECT content_revision FROM large_catalog_groups WHERE package_id=? AND id=?',
                                (package_id,group_id)).fetchone()
-            package = c.execute('SELECT status FROM packages WHERE id=?',(package_id,)).fetchone()
+            package = c.execute('SELECT status,COALESCE(control_generation,0) FROM packages WHERE id=?',(package_id,)).fetchone()
             label = c.execute('SELECT locked FROM lp_catalog_labels WHERE package_id=? AND group_id=?',
                               (package_id,group_id)).fetchone()
             if (not actual or actual[0] != material.get('revision') or actual[0] != group[1]
                     or not package or package[0] in {'paused','cancelled'} or (label and label[0])):
                 c.rollback()
                 _split_reject(package_id, group_id, 'stale-or-locked')
+                return False
+            job = c.execute('SELECT status,COALESCE(control_generation,0) FROM lp_catalog_jobs '
+                            'WHERE package_id=? AND group_id=?', (package_id, group_id)).fetchone()
+            if job and (job[0] != 'running' or int(job[1]) != int(package[1])):
+                c.rollback()
+                _split_reject(package_id, group_id, 'lease-or-control-changed')
                 return False
             used = int(used[0]) if used else 0
             if used >= limit:
@@ -3631,7 +3983,10 @@ def split_off_outliers(store, package_id, group_id, material, result):
                 c.execute('INSERT INTO large_catalog_groups(package_id,id,model,anchor,representative,'
                           'result,status,updated_at,member_count,content_revision) '
                           'VALUES(?,?,?,?,?,?,?,?,0,?)',
-                          (package_id, gid, group[0], b'', take[0], '{}', 'queued', now, revision))
+                          (package_id, gid, group[0], b'', take[0], json.dumps({
+                              'from_split':group_id, 'naming_review':_review_metadata(
+                                  {}, revision, [], source='outlier_split')}, ensure_ascii=False),
+                           'queued', now, revision))
                 mode = 'named'
             else:
                 gid = 'km-other-%s' % sha
@@ -3652,9 +4007,9 @@ def split_off_outliers(store, package_id, group_id, material, result):
                 payload['holds'] = holds[-20:]
                 blob = json.dumps(payload, ensure_ascii=False)
                 # status='named' 与 semantic.py 建桶时一致：**系统桶不参与语义命名**
-                # （否则模型会拿桶里某个文件的标题给它起名），显示名由 worker 的
-                # _name_fallback 固定写成"未能识别内容"——这正是我们要的诚实答案：
-                # 不知道这撮人是什么，就不要编一个名字。
+                # （否则模型会拿桶里某个文件的标题给它起名）。持久标签由 worker
+                # 保留，读取端根据 hold_reason 显示“离群内容待归并”，
+                # 不把尚未安置的文件包装成已确认的主题。
                 c.execute('INSERT INTO large_catalog_groups(package_id,id,model,anchor,'
                           'representative,result,status,updated_at,member_count,content_revision) '
                           'VALUES(?,?,?,?,?,?,?,?,0,?) '
@@ -3682,19 +4037,23 @@ def split_off_outliers(store, package_id, group_id, material, result):
                           'WHERE package_id=? AND id=?',
                           (_anchor, _representative, package_id, _gid))
             if mode == 'named':
+                child_revision = c.execute('SELECT content_revision FROM large_catalog_groups '
+                                           'WHERE package_id=? AND id=?', (package_id,gid)).fetchone()[0]
                 c.execute("INSERT INTO lp_catalog_jobs(package_id,group_id,revision,next_at) "
                           "VALUES(?,?,?,?) "
-                          "ON CONFLICT(package_id,group_id) DO UPDATE SET status='queued',"
+                          "ON CONFLICT(package_id,group_id) DO UPDATE SET revision=excluded.revision,status='queued',"
                           "attempts=0,next_at=excluded.next_at,leased=NULL,error=''",
-                          (package_id, gid, 1, now))
-            # 成员搬运会通过 lp_member_changed 触发器给父子两组都加上 content_revision，
-            # 那样刚写下的标签会立刻被判成"过期"，任务被反复重排。这里把两组显式归一到 1，
-            # 并让新组的命名任务也用同一个修订号——任务修订与组修订必须一致。
-            c.execute('UPDATE large_catalog_groups SET content_revision=1 '
-                      'WHERE package_id=? AND id=?', (package_id, group_id))
-            if mode == 'named':
-                c.execute('UPDATE large_catalog_groups SET content_revision=1 '
-                          'WHERE package_id=? AND id=?', (package_id, gid))
+                          (package_id, gid, child_revision, now))
+            # Preserve the trigger's monotonically increasing revisions. The
+            # retained name is provisional until independently revalidated;
+            # resetting revisions would make older in-flight inputs look fresh.
+            parent_meta=json.loads(c.execute('SELECT result FROM large_catalog_groups '
+                                            'WHERE package_id=? AND id=?',(package_id,group_id)).fetchone()[0] or '{}')
+            parent_meta['naming_review']=_review_metadata({},revision,[],source='outlier_split')
+            c.execute('UPDATE large_catalog_groups SET result=? WHERE package_id=? AND id=?',
+                      (json.dumps(parent_meta,ensure_ascii=False),package_id,group_id))
+            c.execute('UPDATE lp_catalog_labels SET needs_review=1 WHERE package_id=? AND group_id=?',
+                      (package_id,group_id))
             c.execute('INSERT INTO lp_leaf_splits(package_id,splits,updated_at) VALUES(?,?,?) '
                       'ON CONFLICT(package_id) DO UPDATE SET splits=excluded.splits,'
                       'updated_at=excluded.updated_at',
@@ -3744,8 +4103,8 @@ def split_into_subtopics(store, package_id, group_id, material, result):
     与 split_off_outliers（摘异类）的区别：
       · 那个是"少数不属于"，新组由下一次命名调用取名；
       · 这个是"整体是拼凑"，模型已在同一次调用里给出各子主题及其名字与成员，
-        所以**不需要额外调用**：直接把子主题落成组并写标签（needs_review=1）。
-    两者共用同一套预算、几何重算、原因日志与回滚开关。
+        先保存候选子主题名，再排正常命名任务，用各组自己的正文独立核验。
+    不在拆分事务中调用模型；后续任务共用缓存、合批、轮次预算和协调窗口。
     """
     limit = _leaf_split_enabled()
     if not limit:
@@ -3780,9 +4139,9 @@ def split_into_subtopics(store, package_id, group_id, material, result):
             c.execute('BEGIN IMMEDIATE')
             used = c.execute('SELECT splits FROM lp_leaf_splits WHERE package_id=?',
                              (package_id,)).fetchone()
-            group = c.execute('SELECT model,content_revision FROM large_catalog_groups '
+            group = c.execute('SELECT model,content_revision,result FROM large_catalog_groups '
                               'WHERE package_id=? AND id=?', (package_id, group_id)).fetchone()
-            package = c.execute('SELECT status FROM packages WHERE id=?', (package_id,)).fetchone()
+            package = c.execute('SELECT status,COALESCE(control_generation,0) FROM packages WHERE id=?', (package_id,)).fetchone()
             label = c.execute('SELECT locked FROM lp_catalog_labels '
                               'WHERE package_id=? AND group_id=?', (package_id, group_id)).fetchone()
             if (not group or group[1] != material.get('revision')
@@ -3790,6 +4149,19 @@ def split_into_subtopics(store, package_id, group_id, material, result):
                     or (label and label[0])):
                 c.rollback()
                 _split_reject(package_id, group_id, 'stale-or-locked')
+                return False
+            job = c.execute('SELECT status,COALESCE(control_generation,0) FROM lp_catalog_jobs '
+                            'WHERE package_id=? AND group_id=?', (package_id, group_id)).fetchone()
+            if job and (job[0] != 'running' or int(job[1]) != int(package[1])):
+                c.rollback()
+                _split_reject(package_id, group_id, 'lease-or-control-changed')
+                return False
+            parent_meta = json.loads(group[2] or '{}')
+            depth = int(parent_meta.get('split_depth') or 0) + 1
+            max_depth = min(4, max(1, int(os.getenv('SJFX_LP_SUBTOPIC_MAX_DEPTH', '2') or 2)))
+            if depth > max_depth:
+                c.rollback()
+                _split_reject(package_id, group_id, 'split-depth-limit')
                 return False
             used = int(used[0]) if used else 0
             if used >= limit:
@@ -3829,7 +4201,8 @@ def split_into_subtopics(store, package_id, group_id, material, result):
                           'VALUES(?,?,?,?,?,?,?,?,0,1)',
                           (package_id, gid, group[0], b'', bucket['paths'][0],
                            json.dumps({'from_split': group_id, 'parent_purity': 'mixed',
-                                       'purity': 'subtopic', 'subtopic': bucket['name']},
+                                       'purity': 'subtopic', 'subtopic': bucket['name'],
+                                       'split_depth': depth},
                                       ensure_ascii=False),
                            'named', now))
                 c.executemany('UPDATE large_catalog_members SET group_id=? '
@@ -3845,24 +4218,37 @@ def split_into_subtopics(store, package_id, group_id, material, result):
                           'WHERE package_id=? AND id=?',
                           (anchor, representative, package_id, gid))
             revisions = dict(c.execute('SELECT id,content_revision FROM large_catalog_groups WHERE package_id=?',(package_id,)))
-            # 写标签：**复用模型给的名字**，needs_review=1（来源是二次判断，交人复核）
+            # 候选标签先可见；只有各组自己的 validate/apply 能关闭待核验状态。
             rows = [(package_id, group_id, revisions[group_id], 1,
                      _subtopic_name(buckets[0]['name']) or STATUS_NAMES['mixed'],
-                     '该组经主题纯度判定为跨领域拼凑，已按子主题拆分；本条目为其中最大的一类，名称待人工确认。',
+                     '该条目按子主题拆分，候选名称等待本组正文独立核验。',
                      '[]', 'model-subtopic', 'subtopic-' + group_id, 1, 0, now)]
             for gid, sub_name, _count in created:
                 rows.append((package_id, gid, revisions[gid], 1,
                              _subtopic_name(sub_name) or STATUS_NAMES['mixed'],
-                             '该条目由主题纯度判定从原组拆出，名称取自模型给出的子主题，待人工确认。',
+                             '该条目按子主题拆出，候选名称等待本组正文独立核验。',
                              '[]', 'model-subtopic', 'subtopic-' + gid, 1, 0, now))
             rows = [r[:3]+(int(c.execute('SELECT COALESCE(MAX(version),0)+1 FROM lp_catalog_label_history WHERE package_id=? AND group_id=?',r[:2]).fetchone()[0]),)+r[4:] for r in rows]
             c.executemany('INSERT OR REPLACE INTO lp_catalog_labels VALUES'
                           '(?,?,?,?,?,?,?,?,?,?,?,?)', rows)
-            c.executemany('INSERT INTO lp_catalog_label_history VALUES(?,?,?,?,?)',
-                          [(r[0], r[1], r[3], json.dumps({'name': r[4], 'description': r[5],
-                                                          'model': r[7], 'split': True},
-                                                         ensure_ascii=False), now)
-                           for r in rows])
+            for row in rows:
+                gid = row[1]
+                meta = dict(parent_meta) if gid == group_id else {}
+                review = _review_metadata({}, row[2], [], source='subtopic_split')
+                meta.update(from_split=group_id, parent_purity='mixed', purity='subtopic',
+                            subtopic=row[4], split_depth=depth, naming_review=review)
+                c.execute('UPDATE large_catalog_groups SET result=? WHERE package_id=? AND id=?',
+                          (json.dumps(meta, ensure_ascii=False), package_id, gid))
+                c.execute('INSERT INTO lp_catalog_label_history VALUES(?,?,?,?,?)',
+                          (package_id, gid, row[3], json.dumps({'name':row[4], 'description':row[5],
+                           'model':row[7], 'split':True, 'naming_review':review}, ensure_ascii=False), now))
+                # A matching provisional label must not suppress independent
+                # naming. All children, including the retained id, are queued
+                # at their real post-move revision in this same transaction.
+                c.execute("INSERT INTO lp_catalog_jobs(package_id,group_id,revision,status,attempts,leased,next_at,error) "
+                          "VALUES(?,?,?,'queued',0,NULL,0,'') ON CONFLICT(package_id,group_id) DO UPDATE SET "
+                          "revision=excluded.revision,status='queued',attempts=0,leased=NULL,next_at=0,error=''",
+                          (package_id, gid, row[2]))
             c.execute('INSERT INTO lp_leaf_splits(package_id,splits,updated_at) VALUES(?,?,?) '
                       'ON CONFLICT(package_id) DO UPDATE SET splits=excluded.splits,'
                       'updated_at=excluded.updated_at', (package_id, used + 1, now))
@@ -3930,13 +4316,9 @@ def apply(store,package_id,group_id,material,result,model):
     if split and result.get('purity') == 'mixed':
         # Split labels describe the resulting children. Do not overwrite them with the old mixed name.
         #
-        # 修补 2：`apply_topic_split` 在子主题拆分被拒（尺寸守卫/预算/歧义）时会**退回**
-        # `split_off_outliers`，后者成功同样返回 True；而它刚把本组 content_revision
-        # 重置为 1。此时若只把任务标 completed，本组就永久停在一个"修订号匹配"的旧名上
-        # （界面据 revision==content_revision 判为新鲜 model 名，queue_groups 也因
-        # revision 未变不再派任务）；无旧标签时则被兜底写成文件标题。
-        # 事实是成员已被搬走、这一组的内容确实变了 —— 按既有设计它该重新命名一次。
-        # 这里只重排任务，不改任何命名规则，也不替它写名字。
+        # Subtopic refusal can fall back to outlier removal. Either mutation
+        # changes the retained group's scope: keep its real current revision
+        # queued, never certify the old mixed input against the new members.
         with store._lock,closing(store._connect()) as c:
             c.execute("INSERT INTO lp_catalog_jobs(package_id,group_id,revision,status,"
                       "attempts,leased,next_at,error) "
@@ -3989,10 +4371,14 @@ def apply(store,package_id,group_id,material,result,model):
                         package_id, group_id, material['revision'], revision_at_entry)
             c.rollback();return False
         revision=int(g[0])
+        if split:
+            own={r[0] for r in c.execute('SELECT path FROM large_catalog_members '
+                                        'WHERE package_id=? AND group_id=?',(package_id,group_id))}
+            evidence=[e for e in evidence if e.get('source_path') in own]
         version=c.execute('SELECT COALESCE(MAX(version),0)+1 FROM lp_catalog_label_history WHERE package_id=? AND group_id=?',(package_id,group_id)).fetchone()[0]
         payload={'package_id':package_id,'group_id':group_id,'revision':revision,'version':version,
                  'name':result['name'],'description':result['description'],'evidence':json.dumps(evidence,ensure_ascii=False),
-                 'model':model,'digest':material['digest'],'needs_review':int(result['needs_review']),'locked':0,'updated':time.time()}
+                 'model':model,'digest':material['digest'],'needs_review':int(bool(split) or result['needs_review']),'locked':0,'updated':time.time()}
         c.execute('INSERT OR REPLACE INTO lp_catalog_labels VALUES(:package_id,:group_id,:revision,:version,:name,:description,:evidence,:model,:digest,:needs_review,:locked,:updated)',payload)
         c.execute('INSERT INTO lp_catalog_label_history VALUES(?,?,?,?,?)',(package_id,group_id,version,json.dumps(payload,ensure_ascii=False),time.time()))
         # 批次 3a（方案 §6.1 第 1 条）：**每发布一个模型名字就记一次当时的成员指纹**。
@@ -4022,6 +4408,8 @@ def apply(store,package_id,group_id,material,result,model):
                                         'WHERE package_id=? AND id=?',
                                         (package_id, group_id)).fetchone()[0] or '{}')
             meta['purity'] = str(result.get('purity') or 'unsure')
+            meta['naming_review'] = _review_metadata(result, revision, evidence,
+                source='outlier_split' if split else 'model_validation')
             if result.get('naming_status'):
                 meta['naming_status'] = str(result['naming_status'])
             c.execute('UPDATE large_catalog_groups SET result=? WHERE package_id=? AND id=?',
@@ -4054,6 +4442,12 @@ def apply(store,package_id,group_id,material,result,model):
         # 并把任务修订号同步为当前值，保证两者一致。
         c.execute("UPDATE lp_catalog_jobs SET status='completed',error='',revision=? "
                   "WHERE package_id=? AND group_id=?",(revision,package_id,group_id))
+        if split:
+            # Outlier removal also changes the retained group's evidence scope.
+            # Its old name remains visible, but this input cannot certify the
+            # resulting membership. A normal bounded follow-up validates it.
+            c.execute("UPDATE lp_catalog_jobs SET status='queued',attempts=0,leased=NULL,next_at=0 "
+                      "WHERE package_id=? AND group_id=?", (package_id,group_id))
         # 组状态要跟着标签一起落定。原来这一步是由 name_batch（抽取式命名）做的，
         # 而模型命名开启时 name_batch 不再运行，于是组会永远停在 'queued'——
         # 后台循环按组状态判断"谁还有命名任务"时就会一直空转，
@@ -4064,6 +4458,8 @@ def apply(store,package_id,group_id,material,result,model):
         c.commit()
     store._catalog_cache.pop(package_id,None)
     try:
+        if split:
+            return True
         from services.large_package_catalog_refine import request as request_refine
         request_refine(store,package_id,group_id,material,result)
     except Exception:
@@ -4087,16 +4483,28 @@ def naming_concurrency():
         return 2
 
 
+def round_generation_deadline(round_state):
+    """Carry the unchanged round deadline into admission and transport waits."""
+    return time.monotonic() + max(0.0, float(round_state['deadline']) - time.time())
+
+
 def client():
     from config import Config
-    width = naming_concurrency()
-    if Config.LLM_BACKEND=='vllm' and Config.ENABLE_VLLM:
-        from services.vllm import VLLMClient
-        return VLLMClient(Config.VLLM_BASE_URL,Config.VLLM_MODEL,timeout=settings()['timeout'],max_concurrency=width,api_key=Config.VLLM_API_KEY)
-    if Config.ENABLE_SHARED_OLLAMA:
-        from services.ollama import OllamaClient
-        return OllamaClient(Config.OLLAMA_BASE_URL,Config.OLLAMA_MODEL,timeout=settings()['timeout'],max_concurrency=width)
-    return None
+    from services.model_backend import create_model_client
+    result = create_model_client(Config, timeout=settings()['timeout'],
+                                 max_concurrency=naming_concurrency())
+    if result is not None:
+        try:
+            queue = float(os.getenv('SJFX_LP_NAME_QUEUE_TIMEOUT_SECONDS', '45') or 45)
+        except (TypeError, ValueError):
+            queue = 45.0
+        # Both cross-process and client-local admission read this value. Only
+        # the catalog client changes; foreground transports retain their limit.
+        result.queue_timeout = max(30.0, min(60.0, queue))
+        # Only catalog calls separate queue wait from HTTP generation time.
+        # Every call site supplies its round's absolute parent deadline.
+        result.separate_admission_timeout = True
+    return result
 
 
 
@@ -4131,7 +4539,8 @@ def refund_call(store, call_id):
 
     `reserve()` 在调用模型**之前**就 `requests+1`，而模型不可达时这次调用什么都
     没做。不退的话，模型一次宕机就会把整轮预算烧光。只退 requests ——
-    tokens 由 finish_call 按实际用量结算（失败时实际为 0，等于已经退了）。
+    tokens 由 finish_call 按服务端用量或缺 usage 时的预留估算结算。
+    请求超时可能已消耗模型资源，不应走本函数退请求额度。
     """
     if not call_id:
         return
@@ -4148,7 +4557,15 @@ def refund_call(store, call_id):
         LOGGER.exception('refund_call failed: %s', call_id)
 
 
-def process_one(store,package_id,cancelled=lambda:False,model_client=None):
+def process_one(store,package_id,cancelled=lambda:False,model_client=None,repair_only=False):
+    from services.large_package_catalog_coordination import leaf_batch
+    with leaf_batch(store, package_id, 'naming-single', cancelled) as allowed:
+        if not allowed:
+            return False
+        return _process_one(store, package_id, cancelled, model_client, repair_only)
+
+
+def _process_one(store,package_id,cancelled=lambda:False,model_client=None,repair_only=False):
     cfg=settings()
     if not cfg['enabled'] or cancelled():return False
     # **先把轮次的有效状态落库，再 ensure_round。**
@@ -4166,6 +4583,10 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
     if not current['active']:return False
     with store._lock,closing(store._connect()) as c:
         c.execute('BEGIN IMMEDIATE')
+        from services.large_package_catalog_coordination import blocked
+        if blocked(c, package_id):
+            c.commit()
+            return False
         c.execute("UPDATE lp_catalog_jobs SET status='queued',next_at=? WHERE package_id=? AND status='running' AND leased<?",(time.time(),package_id,time.time()-120))
         # **deferred 必须有出路。**
         #
@@ -4182,8 +4603,12 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
         _max_attempts = max(1, int(getattr(_Cfg, 'LP_NAME_MAX_ATTEMPTS', 5) or 5))
         # Every fourth call prioritizes a small group, preserving the long tail.
         order='ASC' if current.get('requests',0)%4==3 else 'DESC'
-        job=c.execute("SELECT j.*, (SELECT member_count FROM large_catalog_groups g WHERE g.package_id=j.package_id AND g.id=j.group_id) n FROM lp_catalog_jobs j WHERE j.package_id=? AND j.status IN ('queued','deferred') AND j.next_at<=? AND j.attempts<? ORDER BY n "+order+",j.group_id LIMIT 1",(package_id,time.time(),_max_attempts)).fetchone()
+        repair_clause = ' AND j.attempts>0' if repair_only else ''
+        job=c.execute("SELECT j.*, (SELECT member_count FROM large_catalog_groups g WHERE g.package_id=j.package_id AND g.id=j.group_id) n FROM lp_catalog_jobs j WHERE j.package_id=? AND j.status IN ('queued','deferred') AND j.next_at<=? AND j.attempts<?" + repair_clause + " ORDER BY n "+order+",j.group_id LIMIT 1",(package_id,time.time(),_max_attempts)).fetchone()
         if not job:
+            if repair_only:
+                c.commit()
+                return False
             # 可重试的 deferred 也要算作待办：否则会在叶组还没名字时就宣告
             # "命名已排空"，主题层随即在残缺集合上生成（这正是「待归并主题」
             # 堆满叶组的上游原因）。
@@ -4211,11 +4636,25 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
                   "WHERE package_id=? AND group_id=?",(time.time(),package_id,gid))
         c.commit()
     call_id=None;started=time.monotonic();response={};_infra=False;_category=None;_miss=None;_route=None
+    phase_timings = {'validation_seconds':0., 'commit_seconds':0.}
+    def validated(content, material):
+        at = time.monotonic()
+        try:
+            return validate(content, material)
+        finally:
+            phase_timings['validation_seconds'] += time.monotonic()-at
+    def published(material, result, model):
+        at = time.monotonic()
+        try:
+            return apply(store,package_id,gid,material,result,model)
+        finally:
+            phase_timings['commit_seconds'] += time.monotonic()-at
     def stop():
         item=store.get(package_id)
         return cancelled() or not item or item['status'] in {'paused','cancelled'} or time.time()>=current['deadline']
     try:
         material=bundle(store,package_id,gid)
+        phase_timings['evidence_preparation_seconds'] = time.monotonic()-started
         _route=material.get('route')
         model_client=model_client or client()
         if model_client is None:raise ValueError('本机命名模型未启用')
@@ -4240,22 +4679,22 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
                 # 否则开关一打开就等于把历史缓存全部作废（方案 §6.3 第 2 条）。
                 cached=c.execute('SELECT result FROM lp_catalog_cache WHERE owner_id=? AND model=? AND digest=?',(material['owner_id'],model,cache_key_legacy(material))).fetchone()
         if cached:
-            result=validate(cached[0],material)
+            result=validated(cached[0],material)
         else:
             from services.model_dispatch import background_generation
             if stop():raise ValueError('目录命名已暂停或达到预算')
             _miss=cache_miss_reason(store,package_id,gid,material['digest'],model)
             call_id=reserve(store,package_id,current['id'],gid,material['tokens']+output)
             if not call_id:raise ValueError('本轮命名预算已用尽')
-            with background_generation(stop), lease_renewal(store, package_id, [gid], stop):
+            with background_generation(stop, deadline=round_generation_deadline(current)), lease_renewal(store, package_id, [gid], stop):
                 kwargs={'temperature':.1,'max_tokens':output,'retries':0,'timeout':min(cfg['timeout'],max(1,int(current['deadline']-time.time())))}
                 if getattr(model_client,'supports_json_response_format',False):
                     from services.large_package_catalog_schema import response as schema_response
                     kwargs['response_format']=schema_response(material)
                 response=model_client.chat(material['system'],material['user'],**kwargs)
             if response.get('finish_reason')=='length':raise ValueError('命名输出被截断')
-            result=validate(response.get('content',''),material)
-        if not stop() and apply(store,package_id,gid,material,result,model):
+            result=validated(response.get('content',''),material)
+        if not stop() and published(material,result,model):
             status='completed'
         else:
             status='stale'
@@ -4264,7 +4703,8 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
     except Exception as exc:
         status='failed'
         _category = classify_failure(exc)
-        _infra = _category == FAILURE_UNAVAILABLE
+        phase_timings.update(getattr(exc,'generation_timing',{}))
+        _infra = _category in {FAILURE_UNAVAILABLE, FAILURE_BUSY, FAILURE_CANCELLED}
         # 失败处理统一走 release_job（与批量路径同一份判据与退避）：
         # 依赖不可用不递增 attempts、长退避；内容类指数退避并递增 attempts。
         release_job(store,package_id,gid,revision,attempts=job['attempts'],
@@ -4281,6 +4721,8 @@ def process_one(store,package_id,cancelled=lambda:False,model_client=None):
                                 'output_chars':len(response.get('content') or ''),
                                 # 方案 §4：按 route 统计截断率要用（clear/boundary…）。
                                 'route':_route,
+                                'timing':response.get('timing') or {},
+                                'phase_timings':phase_timings,
                                 'cache_miss':{gid:_miss} if _miss else {}})
             if _infra:
                 refund_call(store,call_id)          # 没调成的那次不该占额度

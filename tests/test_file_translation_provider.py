@@ -35,10 +35,12 @@ class FileTranslationProviderTests(unittest.TestCase):
         service = build_file_translation_service(self.client(''), None)
         self.assertFalse(service.policy.preserve_untranslated_tail)
         self.assertTrue(service.policy.preserve_figure_blocks)
-        self.assertIn(':file:strict-v2:', service.policy.contract_version)
+        self.assertTrue(service.policy.relaxed_quality_checks)
+        self.assertIn(':file:relaxed-v1:', service.policy.contract_version)
 
     def test_shared_mail_and_import_policy_remains_unchanged(self):
         policy = TranslationPolicy()
         self.assertFalse(policy.preserve_untranslated_tail)
         self.assertFalse(policy.preserve_figure_blocks)
+        self.assertFalse(policy.relaxed_quality_checks)
         self.assertNotIn(':file:strict-v2:', policy.contract_version)

@@ -3,3 +3,5 @@ pytest>=9,<10
 ruff>=0.12,<1
 # Generates binary XLS fixtures for legacy import regression tests.
 xlwt==1.3.0
+# Validates persisted mail research and literal question schemas.
+jsonschema>=4.20,<5

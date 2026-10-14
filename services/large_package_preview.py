@@ -19,11 +19,17 @@ from email.parser import BytesParser
 from pathlib import Path
 from html.parser import HTMLParser
 from services import large_package_evidence as evidence
+from services.file_capabilities import (
+    TEXT_EXTENSIONS, IMAGE_EXTENSIONS, ARCHIVE_EXTENSIONS,
+    MAIL_SOURCE_EXTENSIONS as ALL_MAIL_SOURCE_EXTENSIONS, file_extension,
+)
 from xml.etree import ElementTree as ET
 
 SCHEMA = "large-content-portrait/2"
-TEXT = {".txt", ".md", ".markdown", ".log", ".html", ".htm", ".xml", ".yaml", ".yml", ".ini", ".cfg"}
-IMAGES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+PREVIEW_CONTRACT = "bounded-preview/3-first-last"
+TEXT = TEXT_EXTENSIONS
+IMAGES = IMAGE_EXTENSIONS
+MAIL_SOURCE_EXTENSIONS = ALL_MAIL_SOURCE_EXTENSIONS - {".eml"}
 BOILERPLATE = re.compile(r"免责声明|版权所有|目录$|保密声明|all rights reserved|disclaimer|confidential", re.I)
 TOPICS = [
     ("销售与回款", "财务资料", ("销售额", "销售明细", "回款", "应收", "订单金额", "新客户数", "市场经营", "sales", "receivable", "revenue")),
@@ -328,19 +334,34 @@ def _xml_text(blob, tag="t"):
     return values
 
 
+def _sample_indices(total, budget):
+    """Evenly spaced actual samples, including both endpoints when possible."""
+    count = min(max(0, total), max(0, budget))
+    return sorted({round(i * max(0, total - 1) / max(1, count - 1))
+                   for i in range(count)})
+
+
+def _xml_groups(blob, tags):
+    """One bounded XML parse; retain the old per-tag document ordering."""
+    groups = {tag: [] for tag in tags}
+    parser = ET.XMLPullParser(['end'])
+    try:
+        parser.feed(blob)
+    except ET.ParseError:
+        pass
+    try:
+        for _, element in parser.read_events():
+            tag = element.tag.rsplit('}', 1)[-1]
+            if tag in groups:
+                groups[tag].append(element)
+    except ET.ParseError:
+        pass
+    return groups
+
+
 def _office(path, budget, options, parts, fields, headings):
     def elements(blob, tag):
-        parser = ET.XMLPullParser(['end'])
-        try:
-            parser.feed(blob)
-        except ET.ParseError:
-            pass
-        try:
-            for _,element in parser.read_events():
-                if element.tag.rsplit('}',1)[-1] == tag:
-                    yield element
-        except ET.ParseError:
-            pass
+        return _xml_groups(blob, {tag})[tag]
 
     def texts(element):
         return ''.join(x.text or '' for x in element.iter() if x.tag.rsplit('}',1)[-1] == 't')
@@ -361,7 +382,8 @@ def _office(path, budget, options, parts, fields, headings):
                     _record(parts,'文档属性标题',title,'title')
             if 'word/document.xml' in names:
                 blob = _member_bytes(archive,'word/document.xml',budget)
-                for i,element in enumerate(elements(blob,'p')):
+                groups = _xml_groups(blob, {'p', 'tr'})
+                for i,element in enumerate(groups['p']):
                     budget.check()
                     value = texts(element)
                     styles = [x.attrib for x in element.iter() if x.tag.rsplit('}',1)[-1] in {'pStyle','outlineLvl'}]
@@ -370,7 +392,7 @@ def _office(path, budget, options, parts, fields, headings):
                     if is_heading:
                         headings.append(clean(value,100))
                     _record(parts,'Word 段落 {}（有界前缀）'.format(i+1),value,'heading' if is_heading else 'text')
-                for i,element in enumerate(elements(blob,'tr')):
+                for i,element in enumerate(groups['tr']):
                     cells = [texts(x) for x in element if x.tag.rsplit('}',1)[-1]=='tc']
                     is_header = any(x.tag.rsplit('}',1)[-1]=='tblHeader' for x in element.iter())
                     if is_header:
@@ -392,18 +414,19 @@ def _office(path, budget, options, parts, fields, headings):
                 order_note = '（关系未完整解析，按编号采样）'
             else:
                 order_note = '（已解析的演示顺序）'
-            indices = sorted(set(round(i*max(0,len(slides)-1)/max(1,options['pages']-1)) for i in range(min(len(slides),options['pages']))))
+            indices = _sample_indices(len(slides), options['pages'])
             for i in indices:
                 budget.check()
                 blob = _member_bytes(archive,slides[i],budget,max(1,(budget.limit-budget.used)//max(1,len(indices))))
-                for shape_index,shape in enumerate(elements(blob,'sp')):
+                groups = _xml_groups(blob, {'sp', 'tr'})
+                for shape_index,shape in enumerate(groups['sp']):
                     placeholder = next((x.attrib.get('type','body') for x in shape.iter() if x.tag.rsplit('}',1)[-1]=='ph'),'body')
                     value = '\n'.join(texts(x) for x in shape.iter() if x.tag.rsplit('}',1)[-1]=='p')
                     kind = 'title' if placeholder in {'title','ctrTitle'} else 'footer' if placeholder in {'ftr','dt','sldNum'} else 'text'
                     if kind == 'title':
                         headings.append(clean(value,100))
                     _record(parts,'幻灯片 {} / 文本框 {}{}'.format(i+1,shape_index+1,order_note),value,kind)
-                for row_index,row in enumerate(elements(blob,'tr')):
+                for row_index,row in enumerate(groups['tr']):
                     _record(parts,'幻灯片 {} / 表格行 {}'.format(i+1,row_index+1),' | '.join(texts(x) for x in row),'record')
         else:
             shared = []
@@ -414,7 +437,7 @@ def _office(path, budget, options, parts, fields, headings):
             rels = _member_bytes(archive,'xl/_rels/workbook.xml.rels',budget,8192) if 'xl/_rels/workbook.xml.rels' in names else b''
             mapping = {r.attrib.get('Id'):r.attrib.get('Target','') for r in elements(rels,'Relationship') if r.attrib.get('TargetMode')!='External'}
             sheets = list(elements(workbook,'sheet'))
-            indices = sorted(set(round(i*max(0,len(sheets)-1)/max(1,options['pages']-1)) for i in range(min(len(sheets),options['pages']))))
+            indices = _sample_indices(len(sheets), options['pages'])
             for i in indices:
                 sheet = sheets[i]
                 title = sheet.attrib.get('name','工作表')
@@ -504,16 +527,67 @@ def _ocr(image):
     return "\n".join(list(result.txts) if result.txts is not None else [])
 
 
-def _pdf(path, budget, options, parts, fields, headings):
-    from pypdf import PdfReader
-    reader = PdfReader(str(path), strict=False)
-    total = len(reader.pages)
-    indices = sorted(set(round(i * max(0, total - 1) / max(1, options["pages"] - 1)) for i in range(min(total, options["pages"]))))
-    for index in indices:
-        budget.check()
-        value = reader.pages[index].extract_text() or ""
+def _pdf(path, budget, options, parts, fields, headings, *, engine=None, diagnostics=None):
+    # PDFium is a recovery parser only. Both engines receive the exact same
+    # corrected page selection and share one deadline, including fallback.
+    total, indices, pages = 0, [], []
+    fallback, primary_error = engine == 'pdfium', ''
+    diagnostics = diagnostics if diagnostics is not None else {}
+    diagnostics.update(pdf_parser='pypdfium2' if fallback else 'pypdf',
+                       pdf_fallback=fallback, pages_sampled=[])
+    if not fallback:
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(path), strict=False)
+            total = len(reader.pages)
+            indices = _sample_indices(total, options['pages'])
+            diagnostics.update(pages_total=total, pages_requested=[i+1 for i in indices])
+            for index in indices:
+                budget.check()
+                pages.append((index, reader.pages[index].extract_text() or ''))
+        except Exception as exc:
+            from services.large_package_resources import resource_code
+            if resource_code(exc):
+                raise
+            primary_error = '{}: {}'.format(type(exc).__name__, str(exc)[:160])
+            budget.check()
+            fallback = True
+    if fallback:
+        diagnostics.update(pdf_parser='pypdfium2', pdf_fallback=True,
+                           pdf_primary_error=primary_error,
+                           pdf_quality_gate='needs_same_page_review')
+        import pypdfium2 as pdfium
+        document = pdfium.PdfDocument(str(path))
+        try:
+            recovered_total = len(document)
+            if total and recovered_total != total:
+                raise ValueError('PDF 备用解析页数与主解析不一致，未采用结果')
+            total = recovered_total
+            indices = _sample_indices(total, options['pages'])
+            diagnostics.update(pages_total=total, pages_requested=[i+1 for i in indices])
+            recovered = []
+            for index in indices:
+                budget.check()
+                page = document[index]
+                textpage = None
+                try:
+                    textpage = page.get_textpage()
+                    recovered.append((index, textpage.get_text_range() or ''))
+                finally:
+                    if textpage is not None:
+                        textpage.close()
+                    page.close()
+            pages = recovered
+        finally:
+            document.close()
+    page_quality = []
+    for index, value in pages:
         _record(parts, "PDF 第 {} 页".format(index + 1), value)
         headings.extend(clean(x, 100) for x in value.splitlines()[:2] if 3 < len(clean(x)) < 100 and not BOILERPLATE.search(x))
+        page_quality.append({'page': index + 1, 'characters': len(value),
+                             'quality': round(evidence.quality(value), 3),
+                             'numeric_spans': len(re.findall(r'\d+(?:[.,]\d+)*', value)),
+                             'replacement_characters': value.count('\ufffd')})
     if sum(len(x["text"]) for x in parts) < 80 and options["ocr_pages"]:
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(str(path))
@@ -533,7 +607,12 @@ def _pdf(path, budget, options, parts, fields, headings):
                     page.close()
         finally:
             pdf.close()
-    return {"pages_total": total, "pages_sampled": [i + 1 for i in indices], "io_accounting": "PDF 解析器内部读取；以进程时间和内存限制约束"}
+    return {"pages_total": total, "pages_sampled": [i + 1 for i in indices],
+            'pdf_parser': 'pypdfium2' if fallback else 'pypdf',
+            'pdf_fallback': fallback, 'pdf_primary_error': primary_error,
+            'pdf_page_quality': page_quality,
+            'pdf_quality_gate': 'needs_same_page_review' if fallback else 'existing_primary_contract',
+            "io_accounting": "PDF 解析器内部读取；以进程时间和内存限制约束"}
 
 
 def _image(path, budget, options, parts, fields, headings):
@@ -549,18 +628,23 @@ def _image(path, budget, options, parts, fields, headings):
 
 
 def _archive(path, budget, options, parts, fields, headings):
-    with _zip_open(path) as archive:
-        candidates = []
-        for item in archive.infolist():
-            if not item.is_dir():
-                candidates.append(item.filename)
-        names = candidates[:200]
+    from services.archive_formats import ArchiveLimits, ArchiveReader
+    with ArchiveReader(path, filename=path.name, limits=ArchiveLimits.from_config(),
+                       cancel_check=budget.check) as archive:
+        members = []
+        for item in archive.entries():
+            budget.check()
+            members.append(item)
+            if len(members) >= 200:
+                break
+        names = [item.name for item in members]
         _record(parts, "压缩包成员名称（最多 200 项）", "\n".join(names), "member_names")
         # Do not let names alone become content evidence or a verified topic.
         if options["ocr_pages"]:
-            for name in names[:12]:
-                if Path(name).suffix.lower() in TEXT | {".csv", ".jsonl"}:
-                    _record(parts, "压缩包成员 " + name, decode(_member_bytes(archive, name, budget, 8192)))
+            for item in members[:12]:
+                if item.regular and not item.encrypted and file_extension(item.name) in TEXT:
+                    with archive.open_member(item) as stream:
+                        _record(parts, "压缩包成员 " + item.name, decode(budget.read(stream, 8192)))
 
 
 def _terms(text):
@@ -573,7 +657,7 @@ def _match(term, text):
     return bool(re.search(r"\b" + re.escape(term) + r"\b", text, re.I)) if term.isascii() else term in text
 
 
-def portrait(item, parts, fields, headings, refine=False, warnings=None):
+def portrait(item, parts, fields, headings, refine=False, warnings=None, *, prepared=None):
     fields = list(dict.fromkeys(clean(x, 100) for x in fields if clean(x)))[:40]
     headings = list(dict.fromkeys(clean(x, 100) for x in headings if clean(x)))[:20]
     body_parts = [p for p in parts if p["kind"] not in {"member_names", "attachment"}]
@@ -588,7 +672,7 @@ def portrait(item, parts, fields, headings, refine=False, warnings=None):
     scores.sort(key=lambda row: (-row[0], row[1]))
     ambiguous = len(scores) > 1 and scores[0][0] == scores[1][0]
     supported = bool(scores and scores[0][0] >= 2 and not ambiguous)
-    ext = Path(item.get("path") or item.get("name") or "").suffix.lower()
+    ext = file_extension(item.get("path") or item.get("name") or "")
     role = "数据表" if fields or ext in {".csv", ".tsv", ".xls", ".xlsx", ".xlsm", ".json", ".jsonl"} else "邮件" if ext in {".eml", ".mbox", ".msg"} else "演示文稿" if ext in {".ppt", ".pptx"} else "文档"
     quality = "content" if len(body) >= 40 or len(fields) >= 2 else "metadata_only"
     if supported:
@@ -596,7 +680,7 @@ def portrait(item, parts, fields, headings, refine=False, warnings=None):
         quality = "identified"
         basis = "内容命中：" + "、".join(hits)
     else:
-        category = "结构化数据" if role == "数据表" else "邮件资料" if role == "邮件" else "压缩包" if ext == ".zip" else "文本资料" if body else "未分类"
+        category = "结构化数据" if role == "数据表" else "邮件资料" if role == "邮件" else "压缩包" if ext in ARCHIVE_EXTENSIONS else "文本资料" if body else "未分类"
         # A bounded, source-derived title/schema preserves unfamiliar subjects.
         title = next((x for x in headings if 4 <= len(x) <= 100 and not BOILERPLATE.search(x) and not re.fullmatch(r"[\d\W]+|Sheet\d+", x, re.I)), "")
         if fields:
@@ -617,7 +701,7 @@ def portrait(item, parts, fields, headings, refine=False, warnings=None):
     # Explicit project identifiers are facets, not evidence that every similarly
     # named file belongs to one matter.
     metadata_parts = [p for p in parts if p.get('kind') in {'attachment','member_names'}][:4]
-    selected_parts = evidence.select_blocks(parts, limit=16-len(metadata_parts), chars=9600)
+    selected_parts = evidence.select_blocks(parts, limit=16-len(metadata_parts), chars=9600, prepared=prepared)
     kept_evidence = [dict(p, source_path=item.get("path")) for p in selected_parts + metadata_parts]
     return {
         "schema": SCHEMA, "topic": topic, "category": category, "document_role": role,
@@ -632,9 +716,11 @@ def portrait(item, parts, fields, headings, refine=False, warnings=None):
     }
 
 
-def _preview_path(root, item, refine=False, logical_source=None):
+def _preview_path(root, item, refine=False, logical_source=None, *, pdf_engine=None, seconds_remaining=None):
     options = settings(refine)
     budget = Budget(options)
+    if seconds_remaining is not None:
+        budget.deadline = min(budget.deadline, time.monotonic() + max(0, seconds_remaining))
     base = Path(root).resolve()
     path = (base / item["path"]).resolve()
     if base != path and base not in path.parents:
@@ -646,8 +732,9 @@ def _preview_path(root, item, refine=False, logical_source=None):
     if item.get("modified_at_ns") and (stat.st_mtime_ns != int(item["modified_at_ns"]) or stat.st_size != int(item.get("size", stat.st_size))):
         raise RuntimeError("文件自盘点后发生变化，请重新盘点")
     parts, fields, headings, warnings = [], [], [], []
-    ext = path.suffix.lower()
+    ext = file_extension(path)
     extra = {}
+    parse_status = "partial"
     try:
         if ext in {".csv", ".tsv"}:
             _csv(path, budget, options, parts, fields, headings)
@@ -677,51 +764,73 @@ def _preview_path(root, item, refine=False, logical_source=None):
             extra.update(legacy_format=True, legacy_byte_budget=metadata.get("byte_budget", 0),
                 legacy_source_bytes=stat.st_size, legacy_parser=extracted.get("parser"),
                 legacy_complete=metadata.get("content_complete", False))
-        elif ext in {".eml", ".mbox"}:
+        elif ext == ".eml":
             _mail(path, budget, options, parts, fields, headings)
-            if ext == ".mbox":
-                warnings.append("MBOX 仅抽取有界前缀，未覆盖全部邮件")
+        elif ext in MAIL_SOURCE_EXTENSIONS:
+            parse_status = "unsupported"
+            extra.update(mail_source_required=True, route_hint="mail_import")
+            warnings.append("该格式属于邮件完整来源，请使用邮件完整导入；轻量预览未读取邮件正文。")
         elif ext == ".pdf":
-            extra = _pdf(path, budget, options, parts, fields, headings)
+            extra = _pdf(path, budget, options, parts, fields, headings,
+                         engine=pdf_engine, diagnostics=extra)
         elif ext in IMAGES:
             _image(path, budget, options, parts, fields, headings)
-        elif ext == ".zip":
+        elif ext in ARCHIVE_EXTENSIONS:
             _archive(path, budget, options, parts, fields, headings)
         else:
+            parse_status = "unsupported"
             warnings.append("该格式暂不支持轻量正文识别，保留文件清单")
-    except (TimeoutError, ValueError, OSError, ImportError, zipfile.BadZipFile) as exc:
+    except Exception as exc:
         from services.large_package_resources import resource_code
         if resource_code(exc):
             raise
+        from services.unified_parser import parse_failure_status
+        parse_status = parse_failure_status(exc)
         warnings.append(str(exc)[:240])
+        if ext == '.pdf':
+            extra.update(pdf_primary_timeout=isinstance(exc, TimeoutError) and not extra.get('pdf_fallback'),
+                         pdf_quality_gate='incomplete_parse', pdf_parse_error=type(exc).__name__)
     after = path.stat()
     if (stat.st_size, stat.st_mtime_ns, stat.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
         raise RuntimeError("文件在预览过程中发生变化，已丢弃本次样本")
-    info = portrait(logical_source or item, parts, fields, headings, refine, warnings)
+    prepared = evidence.prepare_selection(parts)
+    info = portrait(logical_source or item, parts, fields, headings, refine, warnings, prepared=prepared)
+    if extra.get('pdf_fallback'):
+        # A recovered parse is useful evidence but has not passed a same-page
+        # comparison with the failed primary parser. Do not promote its topic.
+        info['fallback_quality_review'] = True
+        if parts:
+            info.update(recognition_status='needs_review' if refine else 'needs_more',
+                        needs_refine=not refine)
     info["format"] = ext
     info["parser_mode"] = "bounded_refinement" if refine else "bounded_native_preview"
-    if ext not in TEXT | IMAGES | {".csv", ".tsv", ".json", ".jsonl", ".docx", ".pptx", ".xlsx", ".xlsm", ".doc", ".ppt", ".xls", ".rtf", ".eml", ".mbox", ".pdf", ".zip"}:
+    if parse_status == "unsupported":
         info.update(needs_refine=False, recognition_status="unsupported")
+    elif parse_status in {"dependency_missing", "encrypted", "damaged", "timeout"}:
+        # Keep the existing queue/UI vocabulary. The separate parse status
+        # records the cause and lets an explicit retry follow a repair.
+        info.update(needs_refine=False, recognition_status="needs_review")
+    info["parse_status"] = parse_status
     material = json.dumps(parts, ensure_ascii=False, sort_keys=True).encode()
-    coverage = {"complete": False, "preview_only": True, "sampled_bytes": budget.used, "byte_budget": budget.limit,
+    coverage = {"complete": False, "status": parse_status, "preview_only": True, "preview_contract": PREVIEW_CONTRACT, "sampled_bytes": budget.used, "byte_budget": budget.limit,
                 "seconds_budget": options["seconds"], "sample_locations": list(dict.fromkeys(p["location"] for p in parts)),
                 "retained_locations": list(dict.fromkeys(p["location"] for p in info["evidence"])),
                 "truncated_blocks": sum(bool(p.get("truncated")) for p in info["evidence"]), **extra}
     return {
-        "schema_version": SCHEMA, "summary_type": "local", "title": headings[0] if headings else path.stem,
-        "category": info["category"], "keywords": info["keywords"], "sample": evidence.compact_text(parts, chars=4000) or "\n".join(p['text'] for p in parts)[:4000],
+        "schema_version": SCHEMA, "summary_type": "local", "parse_status": parse_status, "title": headings[0] if headings else path.stem,
+        "category": info["category"], "keywords": info["keywords"], "sample": evidence.compact_text(parts, chars=4000, prepared=prepared) or "\n".join(p['text'] for p in parts)[:4000],
         "size": stat.st_size, "sampled_bytes": budget.used, "complete": False, "portrait": info, "coverage": coverage,
         "sample_sha256": hashlib.sha256(material).hexdigest(), "source_hash_kind": "pending",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "notice": "；".join(warnings),
     }, None
 
 
-def preview_file(root, item, refine=False):
+def preview_file(root, item, refine=False, *, pdf_engine=None, seconds_remaining=None):
     if item.get('source_kind') != 'archive_member' or item.get('sensitive'):
-        return _preview_path(root, item, refine)
+        return _preview_path(root, item, refine, pdf_engine=pdf_engine, seconds_remaining=seconds_remaining)
     from services.large_archive_members import member_node, member_snapshot
     node = member_node(item)
-    prefix_formats = TEXT | {'.csv', '.tsv', '.json', '.jsonl', '.eml', '.mbox'}
+    prefix_formats = TEXT | {'.eml'}
     limit = settings(refine)['bytes'] if node['extension'] in prefix_formats else _int(
         'SJFX_LP_MEMBER_PREVIEW_BYTES', 32 * 1024 * 1024, 65536, 256 * 1024 * 1024)
     if node['size'] > limit and node['extension'] not in prefix_formats:
@@ -736,7 +845,8 @@ def preview_file(root, item, refine=False):
         st = path.stat()
         physical = {**item, 'path': path.name, 'source_kind': 'physical_file',
                     'size': st.st_size, 'modified_at_ns': st.st_mtime_ns}
-        summary, digest = _preview_path(path.parent, physical, refine, logical_source=node)
+        summary, digest = _preview_path(path.parent, physical, refine, logical_source=node,
+                                       pdf_engine=pdf_engine, seconds_remaining=seconds_remaining)
         summary['size'] = node['size']
         summary['source_path'] = node['path']
         summary['coverage'].update(archive_member=True, container_path=node['container_path'],

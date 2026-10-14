@@ -332,7 +332,10 @@ class NamingTests(unittest.TestCase):
         self.store._catalog_cache.clear()
         catalog=self.store.catalog(self.pid)
         branch=catalog['smart']['branches'][0]
-        self.assertEqual(branch['status'],'pending')
+        self.assertEqual(branch['status'],'current')
+        self.assertEqual(branch['kind'],'independent')
+        self.assertEqual(branch['pending_files'],0)
+        self.assertEqual(set(branch['independent_leaf_ids']),set(groups))
         self.assertEqual(self.store.file_page(self.pid,node_id=branch['node_id'])['total'],3)
         self.assertEqual(len(catalog['smart']['topics']),3)
         self.assertEqual(naming.state(self.store,self.pid)['requests'],3)

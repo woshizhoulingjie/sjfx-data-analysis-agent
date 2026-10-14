@@ -1,0 +1,32 @@
+{
+  "origin": "work/ordinary_research_20261011/validation/baseline",
+  "preserved_existing_artifact": true,
+  "generated_from_current_implementation": false,
+  "files": [
+    {
+      "file": "preliminary_summary_fast.py",
+      "sha256": "e9ee693982c73d9f0b59d1d2c5ceeaf44bdcd166d8bdc979f9111d74ff16eb4a",
+      "historical_contract_sha_verified": true
+    },
+    {
+      "file": "document_analysis.py",
+      "sha256": "af78e2c257554f276c43275c09b31f3fb3b18b56e0c10522e45f067f9d8e24c2",
+      "historical_contract_sha_verified": true
+    },
+    {
+      "file": "app.js",
+      "sha256": "6e5c8ab84934c77a2530669f10b456548cfb9825e2e4415f5635312036f42472",
+      "historical_contract_sha_verified": true
+    },
+    {
+      "file": "actual_api.json",
+      "sha256": "f064c858d4179e46152082a5f01d61a48abf33998f7ded41bab088242de08043",
+      "historical_contract_sha_verified": false
+    },
+    {
+      "file": "contracts.json",
+      "sha256": "eff746bd146edabaecb720532ab939e351acecbc2a2abc94125879887f248e37",
+      "historical_contract_sha_verified": false
+    }
+  ]
+}

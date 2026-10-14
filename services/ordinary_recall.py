@@ -19,6 +19,7 @@ exactly as it was when this cannot help.
 from __future__ import annotations
 
 import hashlib
+from services.embedding_encoding import prefix as embedding_prefix
 import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -43,17 +44,9 @@ def _client():
         from config import Config
     except Exception:
         return None
-    if not getattr(Config, "ENABLE_VLLM_EMBEDDINGS", False):
-        return None
     try:
-        from services.vllm import VLLMEmbeddingClient
-        return VLLMEmbeddingClient(
-            Config.VLLM_EMBED_BASE_URL, Config.VLLM_EMBED_MODEL,
-            timeout=Config.VLLM_EMBED_TIMEOUT_SECONDS,
-            max_batch_size=Config.VLLM_EMBED_MAX_BATCH_SIZE,
-            max_chars=Config.VLLM_EMBED_MAX_CHARS,
-            api_key=Config.VLLM_API_KEY,
-        )
+        from services.embedding_backend import create_embedding_client
+        return create_embedding_client(Config, lane='ordinary')
     except Exception:
         return None
 
@@ -62,10 +55,12 @@ def _flatten(vector: Any) -> List[float]:
     values = []
     for value in vector or []:
         try:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return []
             values.append(float(value))
         except (TypeError, ValueError):
             return []
-    return values
+    return values if any(values) else []
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
@@ -99,7 +94,7 @@ def _file_text(name: str, summary: str, document: Optional[Mapping[str, Any]]) -
 
 def file_vectors(storage: Any, scan_id: str, paths: Sequence[str],
                  summaries: Optional[Iterable[Mapping[str, Any]]] = None,
-                 logger: Any = None) -> Dict[str, List[float]]:
+                 logger: Any = None, client=None) -> Dict[str, List[float]]:
     """Return ``{path: vector}`` for the package's files, cached in SQLite.
 
     Called by the query path and by the index refresh, so the first question
@@ -108,7 +103,7 @@ def file_vectors(storage: Any, scan_id: str, paths: Sequence[str],
     wanted = [str(path) for path in (paths or []) if str(path)][:EMBED_MAX_FILES]
     if not wanted:
         return {}
-    client = _client()
+    client = client or _client()
     if client is None:
         return {}
     by_path = {}
@@ -136,11 +131,17 @@ def file_vectors(storage: Any, scan_id: str, paths: Sequence[str],
     if not texts:
         return {}
 
-    model = str(getattr(client, "model", "") or "")
+    from services.embedding_backend import client_identity, validate_vectors, require_index_identity
     try:
+        model = client_identity(client)
+        if hasattr(storage, '_connect'):
+            with storage._connect() as conn:
+                old = [r[0] for r in conn.execute('SELECT DISTINCT model FROM embedding_cache WHERE substr(cache_key,1,?)=?', (len(VECTOR_CACHE_PREFIX+'::'+scan_id+'::'),VECTOR_CACHE_PREFIX+'::'+scan_id+'::'))]
+                require_index_identity(conn, 'ordinary', scan_id, model, existing_keys=old)
         cached = storage.get_embeddings(list(cache_keys.values()), model)
     except Exception:
-        cached = {}
+        if logger: logger.warning('普通向量索引不可用，模型版本变化时需要显式重建', exc_info=True)
+        return {}
 
     vectors: Dict[str, List[float]] = {}
     missing = []
@@ -158,7 +159,8 @@ def file_vectors(storage: Any, scan_id: str, paths: Sequence[str],
         for start in range(0, len(missing), batch_size):
             group = missing[start:start + batch_size]
             try:
-                encoded = client.embed(["passage: " + texts[path] for path in group])
+                encoded = client.embed([embedding_prefix('passage', client=client) + texts[path] for path in group])
+                encoded = validate_vectors(encoded, len(group), len(next(iter(vectors.values()))) if vectors else getattr(client, 'dimension', 0))
             except Exception:
                 if logger is not None:
                     logger.warning("ordinary semantic recall: embedding failed", exc_info=True)
@@ -170,9 +172,17 @@ def file_vectors(storage: Any, scan_id: str, paths: Sequence[str],
                     fresh[cache_keys[path]] = values
         if fresh:
             try:
+                validate_vectors(list(vectors.values()))
+                if hasattr(storage, '_connect'):
+                    with storage._connect() as conn:
+                        require_index_identity(conn, 'ordinary', scan_id, model, len(next(iter(fresh.values()))))
                 storage.save_embeddings(model, fresh)
             except Exception:
-                pass
+                return {}
+    try:
+        validate_vectors(list(vectors.values()), dimension=getattr(client, 'dimension', 0))
+    except Exception:
+        return {}
     return vectors
 
 
@@ -194,11 +204,13 @@ def file_semantic_scores(storage: Any, scan_id: str, query: str,
     client = _client()
     if client is None:
         return {}
-    vectors = file_vectors(storage, scan_id, paths, summaries=summaries, logger=logger)
+    vectors = file_vectors(storage, scan_id, paths, summaries=summaries, logger=logger, client=client)
     if not vectors:
         return {}
     try:
-        encoded_query = client.embed(["query: " + question[:512]])
+        encoded_query = client.embed([embedding_prefix('query', client=client) + question[:512]])
+        from services.embedding_backend import validate_vectors
+        validate_vectors(encoded_query, 1, len(next(iter(vectors.values()))))
     except Exception:
         return {}
     query_vector = _flatten((encoded_query or [None])[0])

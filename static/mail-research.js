@@ -299,30 +299,31 @@
     await presentSource({kind:"evidence",evidence_id:evidenceId},`证据位置：${evidence.mime_path}${evidence.page_number ? `，第 ${evidence.page_number} 页` : ""}\n\n${evidence.quote_text || ""}`);
   }
   async function loadSessions() {
-    const packageEpoch=state.packageEpoch;
+    const packageEpoch=state.packageEpoch, sessionEpoch=sessionRestoreEpoch;
     const payload = await api(`/api/mail/research-sessions?package_id=${encodeURIComponent(state.packageId)}`);
-    if(packageEpoch!==state.packageEpoch)return;
+    if(packageEpoch!==state.packageEpoch || sessionEpoch!==sessionRestoreEpoch)return;
     const select = byId("mail-session"); clear(select); select.appendChild(option("新建会话...", "")); payload.sessions.forEach((item) => select.appendChild(option(item.title, item.session_id)));
   }
   async function ensureSession() {
-    const packageEpoch=state.packageEpoch;
+    const packageEpoch=state.packageEpoch, sessionEpoch=sessionRestoreEpoch;
     state.sessionId = byId("mail-session").value || state.sessionId;
     if (state.sessionId) return state.sessionId;
     const payload = await api("/api/mail/research-sessions", { method: "POST", body: JSON.stringify({ package_id: state.packageId, title: "邮件研究" }) });
-    if(packageEpoch!==state.packageEpoch)return "";
-    state.sessionId = payload.session.session_id; await loadSessions();if(packageEpoch!==state.packageEpoch)return "";byId("mail-session").value = state.sessionId; return state.sessionId;
+    if(packageEpoch!==state.packageEpoch || sessionEpoch!==sessionRestoreEpoch)return "";
+    state.sessionId = payload.session.session_id; await loadSessions();if(packageEpoch!==state.packageEpoch || sessionEpoch!==sessionRestoreEpoch)return "";byId("mail-session").value = state.sessionId; return state.sessionId;
   }
   async function runResearch(event) {
     event.preventDefault(); if (!state.packageId) throw new Error("请先选择邮件资料包");
-    const packageEpoch=state.packageEpoch;
+    const packageEpoch=state.packageEpoch, sessionEpoch=sessionRestoreEpoch;
     const question = byId("mail-question").value.trim(); if (!question) throw new Error("请输入研究目标");
     state.resultEpoch++;Object.keys(state.chinese).filter(k=>k.startsWith("field:") || k.startsWith("evidence:")).forEach(k=>delete state.chinese[k]);
     const sessionId = await ensureSession();
-    if(packageEpoch!==state.packageEpoch)return;
+    if(packageEpoch!==state.packageEpoch || sessionEpoch!==sessionRestoreEpoch)return;
     const selectedScope = window.SJFXMailFoundation?.currentScope() || {};
     const {package_id: _packageId, ...filters} = selectedScope;
-    const payload = await api(`/api/mail/research-sessions/${encodeURIComponent(sessionId)}/turns`, { method: "POST", body: JSON.stringify({ question, scope: { ...filters, include_explicit_attachments: true, include_inline_resources: false }, base_result_set_id: byId("mail-followup").checked ? state.resultSetId || null : null }) });
-    if(packageEpoch!==state.packageEpoch)return;
+    const answerMode = byId("mail-answer-mode")?.value === "deep" ? "deep" : "fast";
+    const payload = await api(`/api/mail/research-sessions/${encodeURIComponent(sessionId)}/turns`, { method: "POST", body: JSON.stringify({ question, answer_mode: answerMode, scope: { ...filters, include_explicit_attachments: true, include_inline_resources: false }, base_result_set_id: byId("mail-followup").checked ? state.resultSetId || null : null }) });
+    if(packageEpoch!==state.packageEpoch || sessionEpoch!==sessionRestoreEpoch)return;
     resetAnswerExtras();renderAnswerQuestion(question);state.questions[payload.turn.turn_id]=question;state.jobId = payload.job_id; state.turnId = payload.turn.turn_id; byId("mail-start").disabled = true; byId("mail-cancel").disabled = false; byId("mail-progress").textContent = payload.waiting_for_index ? "研究已提交，等待资料导入或文字识别" : "研究已提交，正在排队";byId("mail-answer").textContent="正在研究，本次结论尚未生成。";clear(byId("mail-answer-meta"));clear(byId("mail-limitations"));clear(byId("mail-conflicts"));clear(byId("mail-findings"));clear(byId("mail-fields"));clear(byId("mail-evidence-list"));byId("mail-export").disabled=true;openModule("answer"); status(payload.waiting_for_index ? "研究已提交，附件和文字识别覆盖仍在准备" : "研究任务已提交"); pollTurn(payload.turn.turn_id);
     updateProgress(byId("mail-progress").textContent);
     state.currentResult=null;state.final=null;clear(byId("mail-result-items"));updateText("mail-result-summary","本次研究结果尚未生成");updateText("mail-result-language","研究结果生成后显示中文字段与证据");byId("mail-filter-result").disabled=true;
@@ -376,19 +377,22 @@
         if(final || state.resultSetId){openModule("answer");status(final?.kind==='intent_screen'&&final.complete===false?'逐封筛查已暂停，现有结果覆盖不完整；可增加预算从检查点继续。':'研究完成，可核查结论、证据和限制');}else {byId("mail-answer").textContent="后台任务已结束，但研究结果尚不可用，请刷新历史结果或重试。";updateProgress("任务已结束，尚未取得研究结果");status("任务已结束，尚未取得研究结果",true);}return;
       }
       byId("mail-start").disabled = true; byId("mail-cancel").disabled = false;
-      window.setTimeout(() => tick().catch(report), 1500);
-    }; return tick().catch(report);
+      window.setTimeout(() => tick().catch(error=>{if(epoch===state.pollEpoch)report(error);}), 1500);
+    }; return tick().catch(error=>{if(epoch===state.pollEpoch)report(error);});
   }
   let sessionRestoreEpoch = 0;
   async function restoreSession(sessionId) {
     const packageEpoch = state.packageEpoch, ticket = ++sessionRestoreEpoch;
     ++state.pollEpoch;
+    ++state.resultEpoch;
     state.sessionId = sessionId; state.resultSetId = ""; state.turnId = "";
-    state.currentResult = null;
+    state.currentResult = null; state.final = null; state.jobId = "";
     resetAnswerExtras();
-    clear(byId("mail-answer-meta"));clear(byId("mail-findings"));clear(byId("mail-evidence-list"));clear(byId("mail-fields"));clear(byId("mail-limitations"));
+    clear(byId("mail-answer-meta"));clear(byId("mail-findings"));clear(byId("mail-evidence-list"));clear(byId("mail-fields"));clear(byId("mail-limitations"));clear(byId("mail-conflicts"));clear(byId("mail-result-items"));
+    updateText("mail-result-summary","本次研究结果尚未生成");updateText("mail-result-language","研究结果生成后显示中文字段与证据");
     byId("mail-answer").textContent = "选择已有研究后显示其结论与进度。";
     byId("mail-export").disabled = true;
+    byId("mail-filter-result").disabled = true;
     byId("mail-start").disabled = false; byId("mail-cancel").disabled = true;
     if (!sessionId) {updateProgress("尚无任务");return;}
     const valid = () => packageEpoch === state.packageEpoch && ticket === sessionRestoreEpoch && sessionId === byId("mail-session").value;
@@ -570,9 +574,9 @@
     (final.evidence || []).forEach(e=>{if(e.subject_raw)state.titles[e.message_key]=e.subject_raw;});renderFields(final.fields);renderEvidence(final.evidence);
   }
   async function showResult(id) {
-    const packageEpoch=state.packageEpoch;
+    const packageEpoch=state.packageEpoch, sessionEpoch=sessionRestoreEpoch, resultEpoch=++state.resultEpoch;
     const payload=await api(`/api/mail/result-sets/${encodeURIComponent(id)}`);const result=payload.result_set;
-    if(packageEpoch!==state.packageEpoch)return;
+    if(packageEpoch!==state.packageEpoch || sessionEpoch!==sessionRestoreEpoch || resultEpoch!==state.resultEpoch)return;
     Object.keys(state.chinese).filter(k=>k.startsWith("field:") || k.startsWith("evidence:")).forEach(k=>delete state.chinese[k]);
     state.currentResult=result;
     if(result.source_turn_id&&!state.researchTurns[id])state.researchTurns[id]={turn_id:result.source_turn_id};
@@ -704,7 +708,16 @@
   byId("mail-apply-filter").addEventListener("click", () => {state.offset=0;if(window.SJFXMailFoundation)window.SJFXMailFoundation.emitScope();loadMessages().catch(report);loadMiningViews().catch(report);loadRelations().catch(report);});
   byId("mail-show-unreviewed-relations").addEventListener("change", () => loadRelations().catch(report));
   byId("mail-question-form").addEventListener("submit", (event) => runResearch(event).catch(report));
-  byId("mail-new-session").addEventListener("click", () => { state.sessionId = ""; state.resultSetId = ""; byId("mail-session").value=""; ensureSession().then(() => status("已创建研究会话")).catch(report); });
+  byId("mail-new-session").addEventListener("click", () => {
+    // A new session must invalidate the previous turn's polling closure.  The
+    // old request may still resolve after the session selector changes; the
+    // epoch check prevents stale progress/results from being painted into the
+    // new session.
+    byId("mail-session").value="";
+    restoreSession("");
+    byId("mail-answer").textContent = "输入你要查找、比较或提取的内容。";
+    ensureSession().then(id => {if(id && id===state.sessionId)status("已创建研究会话");}).catch(report);
+  });
   byId("mail-index").addEventListener("click",()=>queueIndex("attachments").catch(report));
   byId("mail-embed").addEventListener("click",()=>queueIndex("embedding").catch(report));
   byId("mail-factextract").addEventListener("click",()=>queueIndex("facts").catch(report));

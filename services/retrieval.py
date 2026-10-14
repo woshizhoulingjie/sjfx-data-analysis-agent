@@ -1,28 +1,71 @@
 import math
 import re
+import unicodedata
 from collections import Counter, defaultdict
 
 from services.evidence import evidence_quality
+from services import large_qa_thai as thai
 
 
 TOKEN_RE = re.compile(
-    r"[A-Za-z][A-Za-z0-9]*(?:[_.-][A-Za-z0-9]+)*|[\u4e00-\u9fff]{2,}"
+    # Keep the historical ASCII identifier form (so values such as ``Q3``
+    # remain one token), while also accepting words from every Unicode script.
+    # ``[^\W\d_]`` is the Unicode-letter class in Python's ``re`` engine;
+    # unlike the old Latin/Chinese-only expression it includes Cyrillic,
+    # Arabic, Greek, etc.  Numeric-only fragments remain noise.
+    r"[^\W\d_][^\W_]*(?:[_.-][^\W_]+)*"
 )
 
 
-def _tokens(text):
+def _tokens(text, warnings=None):
+    text = str(text or "")
     output = []
-    for value in TOKEN_RE.findall(str(text or "").lower()):
+    for value in TOKEN_RE.findall(text.lower()):
         if re.fullmatch(r"[\u4e00-\u9fff]+", value):
             output.append(value)
             for size in (2, 3):
                 output.extend(value[index:index + size] for index in range(max(0, len(value) - size + 1)))
-        else:
+        elif not thai.has_thai(value):
             # Do not keep one-character Latin noise, and do not absorb
             # sentence punctuation into the searchable token.
+            # Thai retains its dedicated offline tokenizer and failure contract;
+            # generic Unicode letter fragments must not bypass a missing dictionary.
             if len(value) > 1:
                 output.append(value)
+    if thai.has_thai(text) and len(output) < 20000:
+        try:
+            # The shared FTS tokenizer encodes terms as ASCII; ordinary BM25
+            # and automatic query suggestions can retain the Unicode words.
+            output.extend(bytes.fromhex(term[2:]).decode("utf-8")
+                          for term in thai.thai_tokens(text))
+        except thai.ThaiIndexError as exc:
+            if warnings is None:
+                raise
+            message = "泰文关键词检索暂不可用（离线分词器或词典未就绪）：{}".format(exc)
+            if message not in warnings:
+                warnings.append(message)
     return output[:20000]
+
+
+def _thai_surface_matches(text, tokens, query_tokens):
+    """Recover exact Thai substrings when contextual word boundaries differ.
+
+    Expand only bounded query terms, preserving tones and whitespace boundaries;
+    the existing Chinese/English token sequence and evidence scope stay intact.
+    """
+    if not thai.has_thai(text) or len(tokens) >= 20000:
+        return
+    present = set(tokens)
+    runs = None
+    for term in dict.fromkeys(query_tokens):
+        if term in present or not thai.THAI.fullmatch(term):
+            continue
+        if runs is None:
+            runs = thai.THAI.findall(unicodedata.normalize("NFC", text))
+        if any(term in run for run in runs):
+            tokens.append(term)
+            if len(tokens) >= 20000:
+                return
 
 
 def _in_scope(path, scope):
@@ -33,6 +76,18 @@ def _in_scope(path, scope):
     # container must include ``archive.zip::member.pdf`` without broadening the
     # scope to unrelated files.
     return path == scope or path.startswith(prefix) or path.startswith(scope + "::")
+
+
+def _scope_matches(scope, *paths):
+    """Match either a logical path or its physical archive path.
+
+    An indexed archive member has ``source_path=bundle.zip::member`` and
+    ``archive_source_path=bundle.zip``.  Scope checks must retain the logical
+    member path while still allowing a container-wide query to match the
+    physical path.  Callers pass both values instead of selecting one with
+    ``or`` (which used to hide member scopes).
+    """
+    return any(_in_scope(str(path or ""), scope) for path in paths if path)
 
 
 def _document_items(documents):
@@ -74,8 +129,9 @@ def evidence_corpus(documents, scope="."):
                 continue
             if "formal_evidence_ready" in item_coverage and not bool(item_coverage.get("formal_evidence_ready")):
                 continue
-            item_source = item.get("archive_source_path") or item.get("source_path") or path
-            if not (_in_scope(path, scope) or _in_scope(str(item_source), scope)):
+            if not _scope_matches(
+                scope, path, item.get("source_path"), item.get("archive_source_path")
+            ):
                 continue
             text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
             if len(text) < 2:
@@ -199,7 +255,7 @@ def _match_type(item):
 
 def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
                       candidate_evidence_ids=None, indexed_chunks=None,
-                      use_tfidf=True, semantic_scores=None):
+                      use_tfidf=True, semantic_scores=None, token_cache=None):
     query = re.sub(r"\s+", " ", str(query or "")).strip()
     if not query:
         raise ValueError("检索问题不能为空")
@@ -209,7 +265,9 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
     else:
         chunks = [
             dict(item) for item in indexed_chunks
-            if _in_scope(str(item.get("archive_source_path") or item.get("source_path") or ""), scope)
+            if _scope_matches(
+                scope, item.get("source_path"), item.get("archive_source_path")
+            )
         ]
         index_mode = "persistent-evidence-index"
     if candidate_evidence_ids is not None:
@@ -237,8 +295,22 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
         )
         for item in chunks
     ]
-    tokenized = [_tokens(text) for text in texts]
-    bm25 = _bm25_scores(tokenized, _tokens(query))
+    warnings = []
+    query_tokens = _tokens(query, warnings)
+    if token_cache is None:
+        tokenized = [_tokens(text, warnings) for text in texts]
+    else:
+        # Optional job-local reuse for repeated opportunity queries. No global
+        # cache, no persisted summary rows, and scope filtering still runs above.
+        tokenized = []
+        for text in texts:
+            if text not in token_cache:
+                token_cache[text] = _tokens(text, warnings)
+            tokenized.append(list(token_cache[text]))
+    if thai.has_thai(query):
+        for text, terms in zip(texts, tokenized):
+            _thai_surface_matches(text, terms, query_tokens)
+    bm25 = _bm25_scores(tokenized, query_tokens)
     vectors, vector_ready = _tfidf_scores(texts, query) if use_tfidf else ([0.0] * len(texts), False)
     def _semantic_for(item):
         if not semantic_scores:
@@ -288,13 +360,13 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
         "scope": scope,
         "method": (
             "BM25 + 本地 TF-IDF 字符向量"
-            + (" + 多语言语义向量" if semantic_scores is not None else "")
-        ) if vector_ready else ("BM25 + 多语言语义向量" if semantic_scores is not None else "BM25"),
+            + (" + 文件级多语言语义排序" if semantic_scores is not None else "")
+        ) if vector_ready else ("BM25 + 文件级多语言语义排序" if semantic_scores is not None else "BM25"),
         "corpus_chunks": len(chunks),
         "result_count": len(results),
         "results": results,
         "match_type_counts": dict(match_type_counts),
-        "warnings": [] if results else ["未找到与问题有明显相关性的证据。"],
+        "warnings": warnings + ([] if results else ["未找到与问题有明显相关性的证据。"]),
         "index_mode": index_mode,
     }
 
@@ -302,6 +374,7 @@ def retrieve_evidence(documents, query, scope=".", top_k=8, per_source_limit=3,
 def build_retrieval_manifest(documents, topic_clusters=None, max_queries=5):
     topic_clusters = topic_clusters or []
     queries = []
+    warnings = []
     for cluster in topic_clusters:
         topic = str(cluster.get("topic") or "").strip()
         if topic and topic not in queries:
@@ -312,7 +385,7 @@ def build_retrieval_manifest(documents, topic_clusters=None, max_queries=5):
         stop = {"核心", "主题", "主要", "文件", "文档", "内容", "分析", "资料", "报告", "数据"}
         frequency = Counter()
         for item in evidence_corpus(documents):
-            frequency.update(token for token in _tokens(item.get("text")) if 2 <= len(token) <= 16 and token not in stop)
+            frequency.update(token for token in _tokens(item.get("text"), warnings) if 2 <= len(token) <= 16 and token not in stop)
         terms = [term for term, _count in frequency.most_common(8)]
         queries = [" ".join(terms)] if terms else ["核心主题 关键发现 主要结论"]
     searches = [retrieve_evidence(documents, query, top_k=6) for query in queries]
@@ -321,5 +394,6 @@ def build_retrieval_manifest(documents, topic_clusters=None, max_queries=5):
         "method": searches[0]["method"] if searches else "BM25",
         "evidence_chunks": len(evidence_corpus(documents)),
         "queries": searches,
+        "warnings": warnings,
         "remote_services_enabled": False,
     }

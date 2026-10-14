@@ -227,7 +227,17 @@ def merge_retrieval_results(
             "candidate_files": max(reported_candidate_files, visible_candidate_files),
             "inspected_files": visible_candidate_files,
             "retrieved_files": visible_candidate_files,
-            **({**indexed_coverage, "query_coverage": None, "inspected_files": visible_candidate_files} if indexed_mode else {}),
+            **({
+                **indexed_coverage,
+                "query_coverage": None,
+                # Index metadata belongs to the source snapshot; these counts
+                # and the ratio belong to the final bounded merged evidence.
+                "scope_files": scope_files or None,
+                "candidate_files": max(reported_candidate_files, visible_candidate_files),
+                "inspected_files": visible_candidate_files,
+                "retrieved_files": visible_candidate_files,
+                "scope_inspection_coverage": scope_inspection_coverage,
+            } if indexed_mode else {}),
         },
         "needs_promotion": bool(deferred),
         "warnings": list(dict.fromkeys(warnings)),

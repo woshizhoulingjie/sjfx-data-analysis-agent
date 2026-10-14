@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import time
 from pathlib import PurePosixPath
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
@@ -22,6 +24,7 @@ from services.answer_retention import (
     advance_evidence_state, capture_candidate, evidence_state, select_candidate,
 )
 from services.conversation import ConversationScope, ConversationSession
+from services.qa_execution import ExecutionControl, bind_execution
 from services.research_memory import update_research_memory
 
 
@@ -36,6 +39,7 @@ class AnalysisTurnRuntime:
         max_candidate_evidence: int = 5000,
         max_revision_attempts: int = 1,
         cancel_check: Optional[Callable[[], Any]] = None,
+        verify_answers: bool = True,
     ):
         self.storage = storage
         self.engine = conversation_engine
@@ -47,6 +51,7 @@ class AnalysisTurnRuntime:
         )
         self.max_revision_attempts = max(0, min(2, int(max_revision_attempts or 0)))
         self.cancel_check = cancel_check
+        self.verify_answers = bool(verify_answers)
 
     def _checkpoint(self) -> None:
         if self.cancel_check:
@@ -107,9 +112,111 @@ class AnalysisTurnRuntime:
                 )
                 return
 
+    def _execution_progress_callback(self, turn, repairing):
+        """Publish observable synthesis work without flooding durable events."""
+        last = {"phase": None, "time": None, "progress": 62, "repairing": False}
+
+        def publish(event):
+            if not isinstance(event, Mapping):
+                return
+            phase = str(event.get("phase") or "")
+            if phase not in {"scan", "map", "reduce", "done", "compose"}:
+                return
+            is_repair = bool(repairing())
+            if last["repairing"] != is_repair:
+                last.update(phase=None, time=None, progress=88, repairing=is_repair)
+            now = time.monotonic()
+            if (last["phase"] == phase and last["time"] is not None
+                    and now - last["time"] < 5):
+                return
+
+            def count(*names):
+                for name in names:
+                    if event.get(name) is not None:
+                        try:
+                            return max(0, int(event[name]))
+                        except (ValueError, TypeError):
+                            continue
+                return 0
+
+            files_done = count("files_done", "scanned_files")
+            files_total = count("files_total", "scope_files", "source_files", "total")
+            batch_done = count("batch_done", "batches_done", "map_processed_batches")
+            batch_total = count("batch_total", "batches_total", "map_batches", "total")
+            mapped_files = count("mapped_files", "model_mapped_files")
+            ratio = min(1., (files_done / max(1, files_total) if phase == "scan"
+                             else batch_done / max(1, batch_total)))
+            windows = ({"scan": (88, 90), "map": (90, 92), "reduce": (92, 93),
+                        "done": (93, 93), "compose": (94, 94)} if is_repair else
+                       {"scan": (62, 66), "map": (66, 75), "reduce": (75, 78),
+                        "done": (78, 78), "compose": (79, 79)})
+            low, high = windows[phase]
+            progress = max(last["progress"], int(low + (high - low) * ratio))
+            messages = {
+                "scan": "正在综合资料：已扫描 {}/{} 份文件".format(files_done, files_total),
+                "map": "正在归并资料：已完成 {}/{} 批，涉及 {} 份文件".format(
+                    batch_done, batch_total, mapped_files),
+                "reduce": "正在汇总跨文件要点：已完成 {}/{} 批".format(batch_done, batch_total),
+                "done": "资料综合已完成当前处理，准备组织回答",
+                "compose": "正在依据已综合资料{}回答".format("修订" if is_repair else "撰写"),
+            }
+            self._publish(turn, "running", "repairing" if is_repair else "executing",
+                          progress, messages[phase], event_type="progress")
+            last.update(phase=phase, time=now, progress=progress)
+
+        return publish
+
     @staticmethod
     def _fresh_session(session: ConversationSession) -> ConversationSession:
         return ConversationSession.from_dict(session.as_dict())
+
+    @staticmethod
+    def _answer_completion_gaps(result, verification, batch_summary):
+        """Keep answer fulfilment separate from a successful worker lifecycle.
+
+        Local guards and candidate selection may rebuild a readable answer and
+        mark it answered. They cannot fill unread sources, recover truncated
+        generation or make a partial verification complete. Inspect the final
+        candidate so a genuinely repaired answer can still be fulfilled.
+        """
+        gaps = []
+        manifest = result.get("input_manifest") or {}
+        large_qa = manifest.get("large_qa") or {}
+        reading = result.get("package_reading") or manifest.get("package_reading") or {}
+        metrics = verification.get("quality_metrics") or {}
+        if verification.get("status") not in {"verified", "not_required"}:
+            gaps.append("verification_incomplete")
+        semantic = metrics.get("auxiliary_semantic_review") or {}
+        if semantic.get("reviewed_claims", 0) < semantic.get("eligible_claims", 0):
+            gaps.append("auxiliary_semantic_review_incomplete")
+        if verification.get("missing_answer_aspects"):
+            gaps.append("missing_answer_aspects")
+        if (metrics.get("scope_incomplete")
+                or (batch_summary and not batch_summary.get("scope_complete"))):
+            gaps.append("scope_incomplete")
+        if reading.get("files_read") and not reading.get("complete"):
+            gaps.append("package_reading_incomplete")
+        if (large_qa.get("global_mode")
+                and not large_qa.get("synthesis_complete", large_qa.get("map_complete", False))):
+            gaps.append("synthesis_incomplete")
+        if manifest.get("final_synthesis_complete") is False:
+            gaps.append("final_synthesis_incomplete")
+        if manifest.get("final_synthesis_sources_complete") is False:
+            gaps.append("synthesis_sources_incomplete")
+        if large_qa.get("global_mode") and large_qa.get("source_snapshot_current") is False:
+            gaps.append("source_snapshot_changed")
+        if manifest.get("output_truncated") or manifest.get("finish_reason") == "length":
+            gaps.append("output_truncated")
+        if manifest.get("invalid_generated_citation_indexes"):
+            gaps.append("invalid_generated_citations")
+        if ((result.get("promotion_request") or {}).get("required")
+                or result.get("promotion_limit_reached")):
+            gaps.append("promotion_pending")
+        if (result.get("evidence_status") in {"partial", "unverified"}
+                and not (result.get("evidence_status") == "unverified"
+                         and verification.get("disabled") is True)):
+            gaps.append("evidence_not_fully_supported")
+        return gaps
 
     @staticmethod
     def _explicit_question_paths(
@@ -287,6 +394,16 @@ class AnalysisTurnRuntime:
         turn_id = str(turn.get("id") or "")
         if not turn_id:
             raise ValueError("分析轮次缺少 turn_id")
+        budget = max(60., min(810., float(
+            getattr(Config, "JOB_CONVERSATION_TURN_TIMEOUT_SECONDS", 900)) - 90.))
+        revision_in_progress = False
+        execution = ExecutionControl(
+            deadline=time.monotonic() + budget,
+            checkpoint=self._checkpoint,
+            progress=self._execution_progress_callback(turn, lambda: revision_in_progress),
+        )
+        if isinstance(self.verifier, ClaimVerifier):
+            self.verifier.deadline = execution.deadline
         try:
             self._publish(turn, "running", "understanding", 5, "正在理解分析目标和约束")
             memory_record = self.storage.get_conversation_research_memory(turn["session_id"])
@@ -295,6 +412,11 @@ class AnalysisTurnRuntime:
                 scope.as_dict(),
                 memory=memory_record.get("payload") or {},
             )
+            if not self.verify_answers:
+                plan["steps"] = [step for step in plan.get("steps") or []
+                                 if step.get("tool") != "claim_verifier"]
+                plan["tasks"] = [task for task in plan.get("tasks") or []
+                                 if task != "claim_verifier"]
             self.storage.replace_conversation_turn_steps(turn_id, plan.get("steps") or [])
             self._publish(
                 turn,
@@ -309,8 +431,9 @@ class AnalysisTurnRuntime:
             ordered_modes = list(plan.get("modes") or [])
             modes = set(ordered_modes)
             primary_mode = ordered_modes[0] if ordered_modes else "analysis"
-            # File discovery is a deterministic UX operation; factual modes still require verification.
-            verification_required = bool(modes - {"casual", "creative", "general_qa", "file_search"})
+            # Package answers may directly publish the composed text when review is disabled.
+            factual_answer = bool(modes - {"casual", "creative", "general_qa", "file_search"})
+            verification_required = factual_answer and self.verify_answers
             scoped_inventory_paths = [
                 str(path) for path in inventory_paths or []
                 if scope.contains_source(path)
@@ -483,14 +606,15 @@ class AnalysisTurnRuntime:
             )
             self._checkpoint()
             working_session = self._fresh_session(session)
-            turn_result = self.engine.ask(
-                working_session,
-                turn["question"],
-                scope=execution_scope,
-                persist_scope=False,
-                retrieval_override=retrieval_override,
-                analysis_plan=plan,
-            )
+            with bind_execution(execution):
+                turn_result = self.engine.ask(
+                    working_session,
+                    turn["question"],
+                    scope=execution_scope,
+                    persist_scope=False,
+                    retrieval_override=retrieval_override,
+                    analysis_plan=plan,
+                )
 
             def apply_scope_guard(result: Dict[str, Any]) -> Dict[str, Any]:
                 if not batch_summary or batch_summary.get("scope_complete"):
@@ -509,6 +633,10 @@ class AnalysisTurnRuntime:
                     result["answer"] = "范围说明\n- {}\n\n{}".format(
                         limitation, answer
                     )
+                if result.get("status") == "answered":
+                    result["status"] = "partial"
+                if result.get("evidence_status") == "supported":
+                    result["evidence_status"] = "partial"
                 return result
 
             turn_result = apply_scope_guard(turn_result)
@@ -517,6 +645,12 @@ class AnalysisTurnRuntime:
             if (modes & {"summary", "analysis", "multi_task"}) and execution_scope.kind in {"package", "directory", "files"}:
                 turn_result["related_file_paths"] = list(dict.fromkeys(scoped_inventory_paths))[:5000]
                 turn_result["file_results_total"] = len(turn_result["related_file_paths"])
+
+            self.storage.update_conversation_turn(
+                turn_id, result=copy.deepcopy(turn_result), event_type="draft",
+                message=("已保存回答初稿，正在核验引用和结论" if verification_required
+                         else "回答已生成，正在保存成稿和资料范围"),
+            )
 
             promotion = dict(turn_result.get("promotion_request") or {})
             inventory = set(scoped_inventory_paths)
@@ -606,12 +740,13 @@ class AnalysisTurnRuntime:
                     turn_id, plan, turn_result, tool_results, batch_summary
                 )
             else:
-                # Conversational and creative turns are not package-backed
-                # factual claims. Do not let an empty evidence set rewrite a
-                # valid natural-language response as "insufficient".
+                # Direct answers bypass all post-generation model review,
+                # revision, candidate selection and sentence deletion.
+                # Source counts and completion boundaries still describe work done.
                 verification = {
                     "schema_version": "claim-verification/2.0",
                     "status": "not_required",
+                    "disabled": factual_answer and not self.verify_answers,
                     "needs_revision": False,
                     "warnings": [],
                     "ledger": {
@@ -620,17 +755,42 @@ class AnalysisTurnRuntime:
                     },
                     "quality_metrics": {
                         "verification_status": "not_required",
-                        "citation_count": 0,
+                        "citation_count": len(turn_result.get("citations") or []),
+                        "answer_verification_enabled": verification_required,
                     },
                 }
+            if factual_answer and not self.verify_answers:
+                if turn_result.get("evidence_status") == "supported":
+                    turn_result["evidence_status"] = "unverified"
+                turn_result["answer_verification_enabled"] = False
             revision_attempts = 0
+            revision_budget_warning = None
             retention_candidates = []
             observed_evidence = evidence_state(retrieval_override)
+
+            def skip_revision_for_budget():
+                nonlocal revision_budget_warning
+                answer_timeout = float(getattr(Config, "CONVERSATION_ANSWER_TIMEOUT_SECONDS", 120))
+                repair_reserve = (max(answer_timeout, 240.) if broad_package_question else answer_timeout) + 60.
+                if execution.remaining() >= repair_reserve:
+                    return False
+                revision_budget_warning = (
+                    "当前轮次剩余时间不足以完成再次生成与核验，已保留阶段性回答；"
+                    "尚未解决的资料或核验缺口需要继续补充。"
+                )
+                turn_result["status"] = "partial"
+                turn_result["warnings"] = list(dict.fromkeys(
+                    list(turn_result.get("warnings") or []) + [revision_budget_warning]
+                ))
+                return True
+
             while (
                 verification.get("needs_revision")
                 and revision_attempts < self.max_revision_attempts
                 and verification_required
             ):
+                if skip_revision_for_budget():
+                    break
                 if aq.enabled():
                     retention_candidates.append(capture_candidate(
                         turn_result, verification, plan, working_session.as_dict(), observed_evidence
@@ -685,16 +845,20 @@ class AnalysisTurnRuntime:
                         in {"unsupported", "partially_supported"}
                     ][:12],
                 }
+                if skip_revision_for_budget():
+                    break
                 self._checkpoint()
                 working_session = self._fresh_session(session)
-                turn_result = self.engine.ask(
-                    working_session,
-                    turn["question"],
-                    scope=execution_scope,
-                    persist_scope=False,
-                    retrieval_override=retrieval_override,
-                    analysis_plan=repair_plan,
-                )
+                revision_in_progress = True
+                with bind_execution(execution):
+                    turn_result = self.engine.ask(
+                        working_session,
+                        turn["question"],
+                        scope=execution_scope,
+                        persist_scope=False,
+                        retrieval_override=retrieval_override,
+                        analysis_plan=repair_plan,
+                    )
                 turn_result = apply_scope_guard(turn_result)
                 if (modes & {"summary", "analysis", "multi_task"}) and execution_scope.kind in {"package", "directory", "files"}:
                     turn_result["related_file_paths"] = list(dict.fromkeys(scoped_inventory_paths))[:5000]
@@ -738,6 +902,12 @@ class AnalysisTurnRuntime:
                 )
                 turn_result = apply_scope_guard(turn_result)
 
+            if revision_budget_warning:
+                turn_result["status"] = "partial"
+                turn_result["warnings"] = list(dict.fromkeys(
+                    list(turn_result.get("warnings") or []) + [revision_budget_warning]
+                ))
+
             verification["revision_attempts"] = revision_attempts
             quality_metrics = dict(verification.get("quality_metrics") or {})
             quality_metrics["revision_attempts"] = revision_attempts
@@ -752,17 +922,28 @@ class AnalysisTurnRuntime:
                     "package_reading_complete": package_reading.get("complete"),
                 })
             if (turn_result.get("input_manifest") or {}).get("large_qa"):
-                quality_metrics["summary_index_complete"] = package_reading.get("complete", False)
+                quality_metrics["summary_index_complete"] = package_reading.get(
+                    "summary_complete", package_reading.get("complete", False))
                 quality_metrics["package_reading_complete"] = False
                 quality_metrics["original_indexed_files"] = (turn_result.get("package_coverage") or {}).get("original_indexed_files", 0)
-            turn_result["quality_metrics"] = quality_metrics
-            if verification.get("missing_answer_aspects") and turn_result.get("status") == "answered":
+            completion_gaps = self._answer_completion_gaps(
+                turn_result, verification, batch_summary,
+            ) if factual_answer else []
+            quality_metrics["answer_completion_gaps"] = completion_gaps
+            if completion_gaps and turn_result.get("status") == "answered":
                 turn_result["status"] = "partial"
+            if completion_gaps and turn_result.get("evidence_status") == "supported":
+                turn_result["evidence_status"] = "partial"
+            turn_result["quality_metrics"] = quality_metrics
+            if verification.get("missing_answer_aspects"):
                 turn_result["warnings"] = list(dict.fromkeys(list(turn_result.get("warnings") or []) + list(verification.get("warnings") or [])))
             turn_result["citation_verification_status"] = verification.get("status")
             turn_result["scope_completeness"] = (
                 "candidate_only"
-                if quality_metrics.get("scope_incomplete")
+                if quality_metrics.get("scope_incomplete") or any(gap in completion_gaps for gap in (
+                    "scope_incomplete", "package_reading_incomplete", "synthesis_incomplete",
+                    "final_synthesis_incomplete", "source_snapshot_changed",
+                ))
                 else "checked_scope"
             )
             turn_result["analysis_tools"] = self._tool_summaries(tool_results)

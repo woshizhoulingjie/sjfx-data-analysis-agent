@@ -60,7 +60,10 @@ class OfflineNLLBProvider(TranslationProvider):
         if self._model is not None or self._translator is not None:
             return
         with self._load_lock:
-            if self._model is not None:
+            # A caller may have waited while another thread initialized CT2.
+            # CT2 never sets _model; checking only that field reloads the same
+            # weights for every waiting caller and multiplies native memory.
+            if self._model is not None or self._translator is not None:
                 return
             if not self.model_path:
                 raise TranslationProviderError(

@@ -1,8 +1,4 @@
-"""Local Ollama model transport.
-
-This module contains only the local Ollama transport. The application talks
-only to the Ollama service configured on the same host.
-"""
+"""Native Ollama transport for loopback or approved remote model services."""
 import json
 import threading
 import time
@@ -10,85 +6,29 @@ import urllib.error
 import urllib.request
 
 from services.model_dispatch import serialized_generation
-from services.model_output import ModelOutputError, extract_json_value, validate_json_object
-
-
-class LocalModelError(RuntimeError):
-    """Raised when the local model or its structured output is unavailable."""
-
-
-class LocalModelClient:
-    """Small transport contract shared by local Ollama generation paths."""
-
-    def __init__(self, base_url, model, timeout=180, max_concurrency=1):
-        self.base_url = (base_url or "").rstrip("/")
-        self.model = model
-        self.timeout = max(10, int(timeout))
-        self.max_concurrency = max(1, int(max_concurrency))
-        self._semaphore = threading.BoundedSemaphore(self.max_concurrency)
-
-    @property
-    def requires_confirmation(self):
-        return False
-
-    @property
-    def privacy_label(self):
-        return "服务器本机 Ollama（全程本地处理）"
-
-    @property
-    def configured(self):
-        return bool(self.base_url and self.model)
-
-    def chat(self, system_prompt, user_prompt, temperature=0.2, max_tokens=1800,
-             retries=2, timeout=None):
-        return self._request({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }, retries=retries, timeout=timeout)
-
-    @staticmethod
-    def _retry_limit(retries):
-        try:
-            return max(0, min(5, int(retries)))
-        except (TypeError, ValueError):
-            return 0
-
-    @staticmethod
-    def _retryable_http(code):
-        return int(code) in {408, 425, 429, 500, 502, 503, 504}
-
-    @staticmethod
-    def _backoff(attempt):
-        # Keep a local restart from creating a busy retry storm.  The model is
-        # local, so a short bounded delay is enough; no unbounded sleep here.
-        time.sleep(min(0.5 * (2 ** max(0, int(attempt))), 4.0))
-
-    @staticmethod
-    def _parse_json_content(content, required_fields=None, context="模型输出"):
-        try:
-            return validate_json_object(
-                extract_json_value(content),
-                required_fields=required_fields,
-                context=context,
-            )
-        except ModelOutputError as exc:
-            raise LocalModelError(str(exc)) from exc
+from services.model_contract import (LocalModelClient, LocalModelError, ModelCapabilities,
+    bounded_timeout, read_error_detail, open_local_request, read_json_response, safe_http_error, transport_error,
+    native_ollama_metadata, ollama_model_identity, iter_response_lines)
 
 
 class OllamaClient(LocalModelClient):
     """Native client for the server's local Ollama service."""
 
-    def __init__(self, base_url, model, timeout=180, max_concurrency=1):
+    backend_name = "ollama"
+    supports_json_response_format = False
+    supports_json_schema = False
+    capabilities = ModelCapabilities(native_json=True, streaming=True, thinking_control=True)
+
+    def __init__(self, base_url, model, timeout=180, max_concurrency=1, api_key=None, queue_timeout=15, *,
+                 allowed_endpoints=(), budget_config=None, context_tokens=0):
         # Ollama's loaded model is shared by all requests.  A Python setting of
         # 2+ can create concurrent KV caches and exhaust the shared GPU even
         # though the process itself remains alive.  Keep this backend serial.
-        super().__init__(base_url, model, timeout=timeout, max_concurrency=max_concurrency)
+        super().__init__(base_url, model, timeout=timeout, max_concurrency=max_concurrency, queue_timeout=queue_timeout,
+                         allowed_endpoints=allowed_endpoints, budget_config=budget_config, context_tokens=context_tokens)
+        self.api_key = str(api_key or '').strip()
+        if any(ord(c) < 32 or ord(c) == 127 for c in self.api_key):
+            raise LocalModelError('模型认证配置包含无效字符', code='configuration_error')
 
     @property
     def configured(self):
@@ -102,17 +42,32 @@ class OllamaClient(LocalModelClient):
 
     @property
     def privacy_label(self):
-        return "服务器本机 Ollama（不出网）"
+        return super().privacy_label
+
+    def _headers(self, stream=False):
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/x-ndjson' if stream else 'application/json', 'User-Agent': 'SJFX/local-ollama'}
+        if self.api_key:
+            headers['Authorization'] = 'Bearer ' + self.api_key
+        return headers
 
     def health_check(self, timeout=5):
-        request = urllib.request.Request(self.base_url + "/models", method="GET")
+        native_base = self.base_url[:-3] if self.base_url.endswith('/v1') else self.base_url
+        request = urllib.request.Request(native_base + '/api/tags', headers=self._headers(), method='GET')
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            models = [item.get("id") or item.get("name") for item in data.get("data", [])]
-            return {"reachable": True, "model_available": self.model in models, "models": models}
-        except Exception as exc:
-            return {"reachable": False, "model_available": False, "models": [], "error": str(exc)}
+            with open_local_request(request, timeout, allowed_endpoints=self.allowed_endpoints) as response:
+                data = read_json_response(response)
+            rows = data.get('models')
+            if not isinstance(rows, list) or any(not isinstance(row, dict) or not isinstance(row.get('name') or row.get('model'), str) for row in rows):
+                raise LocalModelError('本机服务模型列表结构无效', code='invalid_response')
+            models = [row.get('name') or row['model'] for row in rows]
+            return {'reachable': True, 'model_available': any(ollama_model_identity(name) == ollama_model_identity(self.model) for name in models), 'models': models}
+        except urllib.error.HTTPError as exc:
+            error = safe_http_error('Ollama', exc.code, read_error_detail(exc))
+        except LocalModelError as exc:
+            error = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            error = transport_error('Ollama', exc)
+        return {'reachable': False, 'model_available': False, 'models': [], 'error': str(error), 'error_code': error.code}
 
     @serialized_generation
     def _request(self, payload, retries=2, timeout=None):
@@ -123,6 +78,8 @@ class OllamaClient(LocalModelClient):
         returns the usable answer in ``message.content``.
         """
         native_base = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        messages = payload['messages']
+        budget = self._messages_budget(messages, payload.get('max_tokens', 1800))
         body = json.dumps({
             "model": payload["model"],
             "messages": payload["messages"],
@@ -130,58 +87,53 @@ class OllamaClient(LocalModelClient):
             "think": False,
             "options": {
                 "temperature": payload.get("temperature", 0.1),
-                "num_predict": max(1, int(payload.get("max_tokens", 1800))),
+                "num_predict": budget['max_tokens'],
+                **({'num_ctx': budget['context_tokens']} if budget['context_tokens'] else {}),
             },
         }, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             native_base.rstrip("/") + "/api/chat",
             data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "DataAnalysisAgentDemo/local-ollama",
-            },
+            headers=self._headers(),
             method="POST",
         )
-        effective_timeout = max(1, int(timeout if timeout is not None else self.timeout))
+        effective_timeout = min(bounded_timeout(timeout, self.timeout), self.timeout)
         attempts = LocalModelClient._retry_limit(retries) + 1
         for attempt in range(attempts):
             try:
-                with self._semaphore:
-                    with urllib.request.urlopen(request, timeout=effective_timeout) as response:
-                        data = json.loads(response.read().decode("utf-8"))
+                with self._admission(effective_timeout):
+                    with open_local_request(request, effective_timeout, allowed_endpoints=self.allowed_endpoints) as response:
+                        data = read_json_response(response)
                 break
             except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                message = "Ollama HTTP {}: {}".format(exc.code, detail[:500])
+                detail = read_error_detail(exc)
+                error = safe_http_error("Ollama", exc.code, detail)
                 if not LocalModelClient._retryable_http(exc.code) or attempt + 1 >= attempts:
-                    raise LocalModelError(message) from exc
-            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-                message = "本机 Ollama 调用失败：{}".format(exc)
+                    raise error from None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                error = transport_error("Ollama", exc)
                 if attempt + 1 >= attempts:
-                    raise LocalModelError(message) from exc
+                    raise error from None
             LocalModelClient._backoff(attempt)
 
         message = data.get("message", {})
-        content = (message.get("content") or "").strip()
+        if not isinstance(message, dict) or not isinstance(message.get('content'), str):
+            raise LocalModelError('Ollama 响应结构无效', code='invalid_response')
+        content = message['content'].strip()
         if not content:
-            raise LocalModelError("Ollama 未返回最终答案")
-        return {
+            raise LocalModelError("Ollama 未返回最终答案", code="invalid_response")
+        model, usage, finish_reason, timing = native_ollama_metadata(data, self.model)
+        reasoning = message.get("thinking") or message.get("reasoning")
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise LocalModelError("Ollama 响应思考字段无效", code="invalid_response")
+        return self._budget_result({
             "content": content,
-            "reasoning_content": message.get("thinking") or message.get("reasoning"),
-            "model": data.get("model", self.model),
-            "usage": {
-                "prompt_tokens": data.get("prompt_eval_count", 0),
-                "completion_tokens": data.get("eval_count", 0),
-            },
-            "finish_reason": data.get("done_reason") or ("stop" if data.get("done") else None),
-            "timing": {
-                "total_seconds": float(data.get("total_duration") or 0) / 1e9,
-                "load_seconds": float(data.get("load_duration") or 0) / 1e9,
-                "prefill_seconds": float(data.get("prompt_eval_duration") or 0) / 1e9,
-                "decode_seconds": float(data.get("eval_duration") or 0) / 1e9,
-            },
-        }
+            "reasoning_content": reasoning,
+            "model": model,
+            "usage": usage,
+            "finish_reason": finish_reason,
+            "timing": timing,
+        }, budget)
 
     @serialized_generation
     def _stream_request(self, payload, timeout=None, retries=2):
@@ -189,6 +141,8 @@ class OllamaClient(LocalModelClient):
         # Qwen model. Use Ollama's native endpoint, where the switch is honored.
         native_base = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
         native_url = native_base.rstrip("/") + "/api/chat"
+        messages = payload['messages']
+        budget = self._messages_budget(messages, payload.get('max_tokens', 1800))
         body_payload = {
             "model": payload["model"],
             "messages": payload["messages"],
@@ -197,23 +151,23 @@ class OllamaClient(LocalModelClient):
             "format": "json",
             "options": {
                 "temperature": payload.get("temperature", 0.1),
-                "num_predict": max(1024, int(payload.get("max_tokens", 1800))),
+                "num_predict": budget['max_tokens'],
+                **({'num_ctx': budget['context_tokens']} if budget['context_tokens'] else {}),
             },
         }
         body = json.dumps(body_payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             native_url,
             data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/x-ndjson",
-                "User-Agent": "DataAnalysisAgentDemo/local-ollama",
-            },
+            headers=self._headers(stream=True),
             method="POST",
         )
         attempts = LocalModelClient._retry_limit(retries) + 1
-        effective_timeout = max(1, int(timeout if timeout is not None else self.timeout))
+        effective_timeout = min(bounded_timeout(timeout, self.timeout), self.timeout)
         for attempt in range(attempts):
+            started = time.monotonic()
+            read_bytes = 0
+            completed = False
             content_parts = []
             reasoning_parts = []
             model = self.model
@@ -221,66 +175,75 @@ class OllamaClient(LocalModelClient):
             finish_reason = None
             timing = {}
             try:
-                with self._semaphore:
-                    with urllib.request.urlopen(request, timeout=effective_timeout) as response:
-                        for raw_line in response:
-                            line = raw_line.decode("utf-8", errors="replace").strip()
+                with self._admission(effective_timeout):
+                    with open_local_request(request, effective_timeout, allowed_endpoints=self.allowed_endpoints) as response:
+                        for raw_line in iter_response_lines(response):
+                            read_bytes += len(raw_line)
+                            if read_bytes > 16 * 1024 * 1024 or time.monotonic() - started > effective_timeout:
+                                raise LocalModelError('Ollama 流式响应超过限定时间或大小', code='invalid_response')
+                            try:
+                                line = raw_line.decode("utf-8").strip()
+                            except UnicodeError:
+                                raise LocalModelError("Ollama 流式响应字符编码无效", code="invalid_response") from None
                             if not line:
                                 continue
-                            data = json.loads(line)
-                            model = data.get("model", model)
+                            try:
+                                data = json.loads(line)
+                            except ValueError:
+                                raise LocalModelError('Ollama 流式响应 JSON 无效', code='invalid_response') from None
+                            if not isinstance(data, dict):
+                                raise LocalModelError('Ollama 流式响应结构无效', code='invalid_response')
+                            if 'error' in data:
+                                raise LocalModelError('Ollama 流式服务返回错误，请检查服务资源', code='unavailable', retryable=True)
+                            parsed_model, parsed_usage, parsed_finish, parsed_timing = native_ollama_metadata(data, model)
+                            model = parsed_model
                             if data.get("prompt_eval_count") is not None or data.get("eval_count") is not None:
-                                usage = {
-                                    "prompt_tokens": data.get("prompt_eval_count", 0),
-                                    "completion_tokens": data.get("eval_count", 0),
-                                }
+                                usage = parsed_usage
                             message = data.get("message", {})
+                            if not isinstance(message, dict) or any(message.get(field) is not None and not isinstance(message.get(field), str) for field in ('content', 'thinking', 'reasoning')):
+                                raise LocalModelError('Ollama 流式响应消息无效', code='invalid_response')
                             if message.get("content"):
                                 content_parts.append(message["content"])
                             reasoning = message.get("thinking") or message.get("reasoning")
                             if reasoning:
                                 reasoning_parts.append(reasoning)
                             if data.get("done"):
-                                finish_reason = data.get("done_reason") or "stop"
-                                timing = {
-                                    "total_seconds": float(data.get("total_duration") or 0) / 1e9,
-                                    "load_seconds": float(data.get("load_duration") or 0) / 1e9,
-                                    "prefill_seconds": float(data.get("prompt_eval_duration") or 0) / 1e9,
-                                    "decode_seconds": float(data.get("eval_duration") or 0) / 1e9,
-                                }
+                                completed = True
+                                finish_reason = parsed_finish
+                                timing = parsed_timing
                                 break
             except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                message = "Ollama HTTP {}: {}".format(exc.code, detail[:500])
+                detail = read_error_detail(exc)
+                error = safe_http_error("Ollama", exc.code, detail)
                 if not LocalModelClient._retryable_http(exc.code) or attempt + 1 >= attempts:
-                    raise LocalModelError(message) from exc
-            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-                message = "本机 Ollama 流式调用失败：{}".format(exc)
+                    raise error from None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                error = transport_error("Ollama", exc)
                 if attempt + 1 >= attempts:
-                    raise LocalModelError(message) from exc
+                    raise error from None
             else:
                 content = "".join(content_parts).strip()
-                if content:
-                    return {
+                if content and completed:
+                    return self._budget_result({
                         "content": content,
                         "reasoning_content": "".join(reasoning_parts).strip() or None,
                         "model": model,
                         "usage": usage,
                         "finish_reason": finish_reason,
                         "timing": timing,
-                    }
+                    }, budget)
                 reasoning = "".join(reasoning_parts).strip()
                 message = (
                     "Ollama 在限定时间内只完成了思考，尚未输出最终答案"
                     if reasoning else "Ollama 未返回任何输出"
                 )
                 if attempt + 1 >= attempts:
-                    raise LocalModelError(message)
+                    raise LocalModelError(message, code="invalid_response")
             LocalModelClient._backoff(attempt)
         raise LocalModelError("本机 Ollama 流式调用失败")
 
     def chat_json(self, system_prompt, user_prompt, max_tokens=2400, strict=True, retries=2, timeout=None, required_fields=None, output_context="模型输出", long_output=False):
-        prompt = system_prompt + "\n你必须只输出一个合法 JSON 对象，不要输出 Markdown 代码围栏。"
+        prompt = str(system_prompt or "") + "\n你必须只输出一个合法 JSON 对象，不要输出 Markdown 代码围栏。"
         result = self._stream_request({
             "model": self.model,
             "messages": [
@@ -290,67 +253,18 @@ class OllamaClient(LocalModelClient):
             "temperature": 0.1,
             # With thinking disabled, honor the bounded output budget. This
             # keeps folder and report summaries responsive on the shared GPU.
-            "max_tokens": max(1024, max_tokens),
+            "max_tokens": max(1, max_tokens),
         }, timeout=timeout, retries=retries)
+        if result.get('finish_reason') == 'length':
+            raise LocalModelError('Ollama 结构化输出被截断', code='invalid_structured_output')
         try:
             result["json"] = self._parse_json_content(
                 result["content"], required_fields=required_fields, context=output_context
             )
             return result
         except (ValueError, LocalModelError) as exc:
-            raise LocalModelError("本机 Ollama 未返回合法 JSON：{}".format(exc))
+            raise LocalModelError("本机 Ollama 未返回合法 JSON：{}".format(exc), code="invalid_structured_output") from None
 
 
-class OllamaEmbeddingClient:
-    """Bounded client for Ollama's small local embedding model."""
-
-    def __init__(self, base_url, model, timeout=60, num_gpu=0):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = max(10, int(timeout))
-        # Ollama uses num_gpu=0 to force CPU execution for this small model.
-        self.num_gpu = max(0, int(num_gpu))
-        self._semaphore = threading.BoundedSemaphore(1)
-
-    @property
-    def configured(self):
-        return bool(self.base_url and self.model)
-
-    def embed(self, texts, retries=2):
-        values = [str(value or "").strip()[:1800] for value in texts]
-        if not values:
-            return []
-        native_base = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
-        body = json.dumps({
-            "model": self.model,
-            "input": values,
-            "keep_alive": "30s",
-            "options": {"num_gpu": self.num_gpu},
-        }, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            native_base.rstrip("/") + "/api/embed",
-            data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        attempts = LocalModelClient._retry_limit(retries) + 1
-        for attempt in range(attempts):
-            try:
-                with self._semaphore:
-                    with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                        data = json.loads(response.read().decode("utf-8"))
-                embeddings = data.get("embeddings")
-                if not isinstance(embeddings, list) or len(embeddings) != len(values):
-                    raise LocalModelError("embedding 服务返回数量不一致")
-                return embeddings
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                message = "本机 embedding HTTP {}：{}".format(exc.code, detail[:300])
-                if not LocalModelClient._retryable_http(exc.code) or attempt + 1 >= attempts:
-                    raise LocalModelError(message) from exc
-            except (urllib.error.URLError, TimeoutError, ValueError, OSError, LocalModelError) as exc:
-                message = "本机 embedding 调用失败：{}".format(exc)
-                if attempt + 1 >= attempts:
-                    raise LocalModelError(message) from exc
-            LocalModelClient._backoff(attempt)
-        raise LocalModelError("本机 embedding 调用失败")
+# Historical imports remain supported without a second implementation.
+from services.embedding_backend import OllamaEmbeddingClient

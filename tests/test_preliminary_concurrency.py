@@ -77,6 +77,8 @@ def setup(tmp_path):
 
 
 def _run(store, monkeypatch, width):
+    # The four-file batching contract uses a fake model with a 32K window.
+    monkeypatch.setattr(Config, "LLM_CONTEXT_TOKENS", 32768)
     monkeypatch.setattr(Config, "PRELIMINARY_SUMMARY_CONCURRENCY", width)
     monkeypatch.setattr(Config, "PRELIMINARY_SUMMARY_BATCH_SIZE", 4)
     lead = store.claim_next_job("worker")
@@ -143,6 +145,7 @@ def test_width_four_recovers_only_missing_files(tmp_path, monkeypatch):
                 with self.lock:
                     self.live -= 1
 
+    monkeypatch.setattr(Config, "LLM_CONTEXT_TOKENS", 32768)
     monkeypatch.setattr(Config, "PRELIMINARY_SUMMARY_CONCURRENCY", 2)
     monkeypatch.setattr(Config, "PRELIMINARY_SUMMARY_BATCH_SIZE", 4)
     lead = store.claim_next_job("worker")

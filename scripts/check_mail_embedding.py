@@ -1,4 +1,4 @@
-"""Synthetic pipeline smoke test. Run from sjfx repo root with .venv/bin/python.
+"""Synthetic pipeline smoke test. Run with the application's Python environment.
 No production DB/mail, no generation calls. All writes are inside TemporaryDirectory.
 """
 import os, sys, time, json, sqlite3, tempfile
@@ -9,8 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 import numpy as np
 
-sys.path.insert(0, str(Path.cwd()))
-os.environ.setdefault('SJFX_EMBED_MODEL_PATH', '/home/zhoulingjie/models/multilingual-e5-small')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import Config
 from services.mail.repository import MailRepository
 from services.mail.models import MailMember
@@ -98,4 +97,3 @@ with patch.multiple(Config, **settings), tempfile.TemporaryDirectory(prefix='sjf
 report['temporary_files_cleaned']=not root.exists()
 assert report['temporary_files_cleaned']
 print(json.dumps(report,ensure_ascii=False,indent=2))
-

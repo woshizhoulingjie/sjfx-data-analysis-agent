@@ -205,7 +205,11 @@ class _SecurityHeadersMiddleware:
                         "default-src 'self'; base-uri 'self'; object-src 'none'; "
                         "frame-ancestors 'none'; form-action 'self'; "
                         "script-src 'self'; style-src 'self' 'unsafe-inline'; "
-                        "img-src 'self' data:; connect-src 'self'"
+                        # Mail inline images are fetched with the authenticated
+                        # API and exposed to the page as short-lived Blob URLs.
+                        # Keep blob: scoped to image loads; scripts and frames
+                        # remain same-origin unless a route opts in explicitly.
+                        "img-src 'self' data: blob:; connect-src 'self'"
                     ),
                 }
                 for name, value in defaults.items():

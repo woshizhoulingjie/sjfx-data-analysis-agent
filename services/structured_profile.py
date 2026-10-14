@@ -3,6 +3,7 @@
 import csv
 import codecs
 import json
+import math
 import os
 import re
 from collections import Counter, defaultdict
@@ -34,10 +35,13 @@ def _env_int(name, default):
 
 
 def _missing(value):
-    return value is None or str(value).strip().lower() in {"", "null", "none", "nan", "n/a", "na", "-"}
+    if value is None or str(value).strip().lower() in {"", "null", "none", "nan", "n/a", "na", "-"}:
+        return True
+    number = _parse_number(value)
+    return number is not None and not math.isfinite(number)
 
 
-def _number(value):
+def _parse_number(value):
     if isinstance(value, bool) or value is None:
         return None
     try:
@@ -45,6 +49,11 @@ def _number(value):
         return float(text) if text else None
     except (TypeError, ValueError):
         return None
+
+
+def _number(value):
+    number = _parse_number(value)
+    return number if number is not None and math.isfinite(number) else None
 
 
 def _date(value):
@@ -91,7 +100,28 @@ def _profile_rows(rows, columns, row_count, duplicate_rows, max_values=20, limit
         }
         if numbers:
             ordered = sorted(numbers)
-            item.update({"min": min(numbers), "max": max(numbers), "sum": round(sum(numbers), 6), "count": len(numbers), "mean": round(sum(numbers) / len(numbers), 6), "median": ordered[len(ordered) // 2]})
+            total = sum(numbers)
+            mean = total / len(numbers)
+            if not math.isfinite(total):
+                # Finite cells can still overflow an intermediate sum. Scale
+                # only this exceptional path, preserving ordinary statistics.
+                scale = max(abs(value) for value in numbers)
+                scaled_total = math.fsum(value / scale for value in numbers)
+                total = scaled_total * scale
+                mean = (scaled_total / len(numbers)) * scale
+            middle = len(ordered) // 2
+            median = ordered[middle]
+            if len(ordered) % 2 == 0:
+                left, right = ordered[middle - 1], ordered[middle]
+                midpoint_total = left + right
+                median = midpoint_total / 2 if math.isfinite(midpoint_total) else left / 2 + right / 2
+            item.update({"min": ordered[0], "max": ordered[-1], "count": len(numbers), "mean": round(mean, 6), "median": median})
+            if math.isfinite(total):
+                item["sum"] = round(total, 6)
+            else:
+                # An unrepresentable total must not poison strict JSON or
+                # be reported as a misleading finite value.
+                item["numeric_warnings"] = ["sum_out_of_range"]
             if len(ordered) >= 4:
                 q1, q3 = ordered[len(ordered) // 4], ordered[(len(ordered) * 3) // 4]
                 iqr = q3 - q1
@@ -100,7 +130,15 @@ def _profile_rows(rows, columns, row_count, duplicate_rows, max_values=20, limit
                 buckets = Counter()
                 lower, upper = min(numbers), max(numbers)
                 width = (upper - lower) / 5.0 if upper != lower else 1.0
-                for value in numbers:
+                bucket_values = numbers
+                if not math.isfinite(width) or not width:
+                    # Normalize an overflowing range (or underflowing bucket
+                    # width) while retaining the same five equal-width bins.
+                    scale = max(abs(lower), abs(upper))
+                    lower, upper = lower / scale, upper / scale
+                    width = (upper - lower) / 5.0
+                    bucket_values = (value / scale for value in numbers)
+                for value in bucket_values:
                     bucket = min(4, int((value - lower) / width)) if width else 0
                     buckets["{}-{}".format(bucket + 1, 5)] += 1
                 item["distribution"] = dict(buckets)

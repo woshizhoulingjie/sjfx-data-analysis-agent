@@ -51,7 +51,7 @@ const shell='<meta charset="utf-8"><style>body{margin:20px;background:#1d2529;co
     assert.equal(await page.locator('.mp-report-step textarea,.mp-report-step input[type=checkbox]').count(),0,'the first step has a fixed objective and requires no issue selection or question');
     assert(await page.getByRole('button',{name:'深度分析',exact:true}).isDisabled());
     await page.getByRole('button',{name:'通读整个资料包并生成完整报告',exact:true}).click();
-    await page.getByText('正在扫描资料包第1批',{exact:true}).waitFor();
+    await page.locator('.mp-live-title').filter({hasText:'正在扫描资料包第1批'}).waitFor();
     const firstPost=await page.evaluate(()=>JSON.parse(window.reportCalls.find(call=>call.method==='POST').body));
     assert.deepEqual(firstPost,{address:'alice@example.com',analysis_mode:'full_report',model_call_budget:4096},'the first task neither supplies a user question nor narrows the full package to browsing filters');
     assert.equal(await page.locator('.mp-live-progress progress').getAttribute('value'),'20');
@@ -91,7 +91,7 @@ const shell='<meta charset="utf-8"><style>body{margin:20px;background:#1d2529;co
     assert(!queuedDeep.includes('逐批阅读')&&!queuedDeep.includes('核查相关原文')&&!queuedDeep.includes('等待阅读与核查'),'queued deep analysis never presents a new reading phase');
     assert.equal(await page.locator('.mp-live-progress progress').getAttribute('value'),'100','the verified parent supplies inherited coverage before the deep checkpoint arrives');
     assert.equal(await page.getByRole('button',{name:'下载深度分析文件（Markdown）',exact:true}).count(),0,'inherited full coverage cannot mark a queued deep file complete');
-    await page.evaluate(()=>window.releaseDeepPoll());await page.getByText('正在综合态度与后续',{exact:true}).waitFor();
+    await page.evaluate(()=>window.releaseDeepPoll());await page.locator('.mp-live-activity span').getByText('正在综合态度与后续',{exact:true}).waitFor();
     const deepPost=await page.evaluate(()=>JSON.parse(window.reportCalls.filter(call=>call.method==='POST')[1].body));
     assert.equal(deepPost.analysis_mode,'deep_analysis');assert.equal(deepPost.source_report_turn_id,'full');assert.equal(deepPost.target,'合同附录');assert.equal(deepPost.question,'他对合同附录的态度和意图是什么，后来如何变化？');assert.equal(deepPost.address,'alice@example.com');
     const waitingDeep=await page.locator('.mp-live-progress').innerText();
@@ -129,7 +129,7 @@ const shell='<meta charset="utf-8"><style>body{margin:20px;background:#1d2529;co
     assert(await page.getByRole('button',{name:'深度分析',exact:true}).isDisabled());
     await page.getByLabel('查看此前报告与分析（最近20次）').selectOption('deep');await page.getByRole('button',{name:'下载完整报告文件（Markdown）',exact:true}).waitFor();
     assert((await page.locator('.mp-live-progress').innerText()).includes('文件已生成'),'changing history restores the parent binding before rendering the completed deep stages');
-    const output=path.resolve(root,'../../outputs');fs.mkdirSync(output,{recursive:true});await page.screenshot({path:path.join(output,'person-report-ui-v3-desktop.png'),fullPage:true});
+    const output=process.env.SJFX_UI_ARTIFACT_DIR?path.resolve(process.env.SJFX_UI_ARTIFACT_DIR):path.resolve(root,'../../outputs');fs.mkdirSync(output,{recursive:true});await page.screenshot({path:path.join(output,'person-report-ui-v3-desktop.png'),fullPage:true});
     await page.setViewportSize({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),'complete report and controls fit the mobile viewport');await page.screenshot({path:path.join(output,'person-report-ui-v3-mobile.png'),fullPage:true});
     assert.deepEqual(errors,[]);await page.close();
     for(const mode of ['foreign-package','foreign-person','partial-source','race-package','race-person']){

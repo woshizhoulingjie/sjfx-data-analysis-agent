@@ -8,6 +8,44 @@ from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 
+
+def resolve_config_path(value, *, base_dir=None):
+    """Resolve a configured local path against the application directory.
+
+    This applies to paths from both process variables and .env files, including
+    an external .env: changing the working directory never relocates runtime
+    data or models. Native Windows drives, UNC paths, spaces and Unicode are
+    handled by pathlib; drive-relative paths (C:folder) are ambiguous and fail.
+    """
+    raw = str(value).strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        raw = raw[1:-1]
+    path = Path(raw).expanduser()
+    if re.match(r"^[A-Za-z]:", raw):
+        if os.name != "nt" or not path.is_absolute():
+            raise RuntimeError("Windows 路径必须在 Windows 上使用完整盘符绝对路径")
+    if not path.is_absolute():
+        path = Path(base_dir or BASE_DIR) / path
+    return path.resolve()
+
+
+def _path_setting(name, default, *aliases):
+    """Use the first nonempty environment override, preserving legacy names."""
+    for key in (name,) + aliases:
+        raw = os.getenv(key, "").strip()
+        if raw:
+            return resolve_config_path(raw)
+    return resolve_config_path(default)
+
+
+def _optional_path_setting(name, *aliases):
+    """An empty explicit selection disables a local model/tokenizer path."""
+    for key in (name,) + aliases:
+        if key in os.environ:
+            raw = os.environ[key].strip()
+            return str(resolve_config_path(raw)) if raw else ""
+    return ""
+
 # The product contract uses one binary 10 GiB ceiling for every individual
 # content object (source file, archive container/member, expanded archive and
 # export). Component-specific environment variables may lower their budgets,
@@ -95,15 +133,23 @@ DEFAULT_STATE_DIR = _default_state_dir()
 
 
 def load_local_env():
+    """Load one explicit/state/project .env without searching other locations.
+
+    An explicit file must exist. It is never replaced with a deployment .env
+    when misspelled, and all relative paths still use BASE_DIR as their anchor.
+    """
     explicit = str(os.getenv("SJFX_ENV_FILE") or "").strip()
-    candidates = []
     if explicit:
-        candidates.append(Path(explicit).expanduser())
-    candidates.extend((DEFAULT_STATE_DIR / ".env", BASE_DIR / ".env"))
-    env_file = next((item for item in candidates if item.is_file()), None)
+        env_file = resolve_config_path(explicit)
+        if not env_file.is_file():
+            raise RuntimeError("SJFX_ENV_FILE 指定的配置文件不存在或不是普通文件")
+    else:
+        state_dir = _path_setting("SJFX_STATE_DIR", DEFAULT_STATE_DIR)
+        candidates = (state_dir / ".env", BASE_DIR / ".env")
+        env_file = next((item for item in candidates if item.is_file()), None)
     if env_file is None:
         return
-    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+    for raw_line in env_file.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -113,10 +159,25 @@ def load_local_env():
 
 load_local_env()
 
+# Persisted model-only overrides belong to this instance and take effect on
+# process restart. No file means exactly the legacy environment behaviour.
+from services.model_settings import apply_model_settings_environment
+apply_model_settings_environment(_path_setting("SJFX_STATE_DIR", DEFAULT_STATE_DIR))
+
 # Defaults must be applied after .env loading, otherwise setdefault() would
 # make the hard-coded defaults win over project-local configuration.
-os.environ.setdefault("HF_HOME", str(BASE_DIR / "models" / "huggingface"))
-os.environ.setdefault("DOCLING_CACHE_DIR", str(BASE_DIR / "models" / "docling"))
+_MODELS_DIR = _path_setting("SJFX_MODELS_DIR", BASE_DIR / "models", "MODELS_DIR")
+_DOCLING_ARTIFACTS_DIR = _path_setting(
+    "SJFX_DOCLING_ARTIFACTS_DIR", _MODELS_DIR / "docling",
+    "DOCLING_ARTIFACTS_DIR", "DOCLING_CACHE_DIR",
+)
+_EMBED_MODEL_PATH = _path_setting(
+    "SJFX_EMBED_MODEL_PATH", _MODELS_DIR / "multilingual-e5-small", "VLLM_EMBED_MODEL_PATH"
+)
+os.environ["HF_HOME"] = str(_path_setting("HF_HOME", _MODELS_DIR / "huggingface"))
+os.environ["DOCLING_CACHE_DIR"] = str(_DOCLING_ARTIFACTS_DIR)
+# Tokenizer consumers and the separate embedding server share this path.
+os.environ["SJFX_EMBED_MODEL_PATH"] = str(_EMBED_MODEL_PATH)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 # The laboratory server has no outbound Hugging Face route.  Never let a
 # document parse attempt a model download into a shared system cache or wait
@@ -155,33 +216,34 @@ def _token_expiry(raw):
 
 
 def _local_model_url(raw):
-    """Reject accidental remote model endpoints in the offline product."""
-    value = str(raw or "").strip().rstrip("/")
-    parsed = urlparse(value)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme not in {"http", "https"} or host not in {"127.0.0.1", "localhost", "::1"}:
-        raise RuntimeError(
-            "物理断网部署只允许本机模型地址（127.0.0.1/localhost/::1），拒绝远程模型地址"
-        )
-    return value
+    """Accept loopback and only explicitly allowed model service origins."""
+    from services.model_contract import validate_model_url
+    return validate_model_url(raw, allowed_endpoints=_MODEL_ALLOWED_ENDPOINTS)
+
+
+from services.model_contract import normalize_allowed_endpoints, model_url_origin
+_MODEL_ALLOWED_ENDPOINTS = normalize_allowed_endpoints(os.getenv("SJFX_MODEL_ALLOWED_ENDPOINTS", "[]"))
 
 
 class Config:
     BASE_DIR = BASE_DIR
-    DATA_DIR = Path(os.getenv("SJFX_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser().resolve()
-    OUTPUT_DIR = BASE_DIR / "outputs"
+    DATA_DIR = _path_setting("SJFX_STATE_DIR", DEFAULT_STATE_DIR)
+    OUTPUT_DIR = _path_setting("SJFX_OUTPUT_DIR", BASE_DIR / "outputs", "OUTPUT_DIR")
     LOG_DIR = DATA_DIR / "logs"
-    MODELS_DIR = BASE_DIR / "models"
-    DOCLING_ARTIFACTS_DIR = MODELS_DIR / "docling"
-    RAPIDOCR_MODEL_DIR = MODELS_DIR / "rapidocr"
+    MODELS_DIR = _MODELS_DIR
+    MODEL_ALLOWED_ENDPOINTS = _MODEL_ALLOWED_ENDPOINTS
+    TOOLS_DIR = _path_setting("SJFX_TOOLS_DIR", BASE_DIR / ".tools", "TOOLS_DIR")
+    DOCLING_ARTIFACTS_DIR = _DOCLING_ARTIFACTS_DIR
+    RAPIDOCR_MODEL_DIR = _path_setting(
+        "SJFX_RAPIDOCR_MODEL_DIR", MODELS_DIR / "rapidocr", "RAPIDOCR_MODEL_DIR"
+    )
+    EMBED_MODEL_PATH = str(_EMBED_MODEL_PATH)
     DB_PATH = DATA_DIR / "agent.db"
     DOCUMENT_CACHE_DIR = DATA_DIR / "document_payloads"
     # Parsing can temporarily expand an archive close to the product ceiling.
     # Keep that traffic off the small system /tmp filesystem by default. The
     # directory may be moved to a dedicated local volume in production.
-    PARSE_TEMP_DIR = Path(
-        os.getenv("SJFX_PARSE_TEMP_DIR", str(DATA_DIR / "parse_temp"))
-    ).expanduser().resolve()
+    PARSE_TEMP_DIR = _path_setting("SJFX_PARSE_TEMP_DIR", DATA_DIR / "parse_temp")
     PARSE_TEMP_DISK_RESERVE_BYTES = max(
         0, int(os.getenv("PARSE_TEMP_DISK_RESERVE_BYTES", str(1024 * 1024 * 1024)))
     )
@@ -191,14 +253,21 @@ class Config:
     # Select the local serving backend. vLLM is the default; Ollama remains
     # available as an explicit compatibility option during migration.
     LLM_BACKEND = os.getenv("LLM_BACKEND", "vllm").strip().lower()
-    if LLM_BACKEND not in {"vllm", "ollama"}:
-        raise RuntimeError("LLM_BACKEND 只能是 vllm 或 ollama")
+    if LLM_BACKEND not in {"vllm", "ollama", "openai_compatible"}:
+        raise RuntimeError("LLM_BACKEND 只能是 vllm、ollama 或 openai_compatible")
     ENABLE_VLLM = os.getenv("ENABLE_VLLM", "1").strip().lower() in {"1", "true", "yes", "on"}
     VLLM_BASE_URL = _local_model_url(os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8001/v1"))
     VLLM_MODEL = os.getenv("VLLM_MODEL", "qwen3.6:27b").strip()
-    VLLM_MODEL_PATH = os.getenv("VLLM_MODEL_PATH", str(BASE_DIR / "models" / "Qwen3.6-27B")).strip()
+    VLLM_MODEL_PATH = str(_path_setting("VLLM_MODEL_PATH", MODELS_DIR / "Qwen3.6-27B"))
     VLLM_API_KEY = os.getenv("VLLM_API_KEY", "").strip()
-    VLLM_REQUEST_TIMEOUT = max(60, int(os.getenv("VLLM_REQUEST_TIMEOUT", "600")))
+    VLLM_REQUEST_TIMEOUT = max(60, min(3600, int(os.getenv("VLLM_REQUEST_TIMEOUT", "600"))))
+    ENABLE_OPENAI_COMPATIBLE = os.getenv("ENABLE_OPENAI_COMPATIBLE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    OPENAI_COMPATIBLE_BASE_URL = _local_model_url(os.getenv("OPENAI_COMPATIBLE_BASE_URL", "http://127.0.0.1:8001/v1"))
+    OPENAI_COMPATIBLE_MODEL = os.getenv("OPENAI_COMPATIBLE_MODEL", "local-model").strip()
+    OPENAI_COMPATIBLE_API_KEY = os.getenv("OPENAI_COMPATIBLE_API_KEY", "").strip()
+    OPENAI_COMPATIBLE_REQUEST_TIMEOUT = max(60, min(3600, int(os.getenv("OPENAI_COMPATIBLE_REQUEST_TIMEOUT", "180"))))
+    OPENAI_COMPATIBLE_SUPPORTS_JSON_RESPONSE_FORMAT = os.getenv("OPENAI_COMPATIBLE_SUPPORTS_JSON_RESPONSE_FORMAT", "0").strip().lower() in {"1", "true", "yes", "on"}
+    LLM_QUEUE_TIMEOUT_SECONDS = max(1, min(60, int(os.getenv("LLM_QUEUE_TIMEOUT_SECONDS", "15"))))
     # Keep single-GPU vLLM replies within a responsive output budget while
     # preserving the configured 32K input context window.
     VLLM_INTERACTIVE_MAX_TOKENS = max(128, min(800, int(os.getenv("VLLM_INTERACTIVE_MAX_TOKENS", "480"))))
@@ -232,6 +301,8 @@ class Config:
     # 或返回 503；没有备端点时那等于整条嵌入车道停摆（文件拿不到向量 → 进"未能识别
     # 内容"桶），那是质量事故。配了备端点就只是慢，不会停。默认空 = 不启用回退。
     LP_EMBED_FALLBACK_URL = os.getenv("SJFX_LP_EMBED_FALLBACK_URL", "").strip()
+    if LP_EMBED_FALLBACK_URL:
+        LP_EMBED_FALLBACK_URL = _local_model_url(LP_EMBED_FALLBACK_URL)
     VLLM_EMBED_MAX_CHARS = max(128, min(4000, int(os.getenv("VLLM_EMBED_MAX_CHARS", "1200"))))
     # The client-side mutex must fail fast so an interactive lane can fall back
     # to lexical retrieval immediately, while the socket budget above is what
@@ -248,10 +319,11 @@ class Config:
     ENABLE_SHARED_OLLAMA = os.getenv("ENABLE_SHARED_OLLAMA", "0").strip().lower() in {"1", "true", "yes"}
     OLLAMA_BASE_URL = _local_model_url(os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"))
     OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen-agent:latest")
+    OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
     OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "qwen-embed:latest")
     # Keep the embedding model on CPU so the vLLM generation model retains the GPU.
     OLLAMA_EMBED_NUM_GPU = max(0, int(os.getenv("OLLAMA_EMBED_NUM_GPU", "0")))
-    LLM_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1")))
+    LLM_MAX_CONCURRENCY = max(1, min(8, int(os.getenv("LLM_MAX_CONCURRENCY", "1"))))
     # Directory names are the product's primary output.  On the ordinary
     # "import -> select -> confirm" path the naming model used to be disabled,
     # which left every name to a deterministic fallback that could emit raw
@@ -264,35 +336,66 @@ class Config:
     # The available Ollama service is shared by the laboratory. Do not send
     # long document prompts to it unless a dedicated scheduling decision was made.
     ENABLE_SHARED_OLLAMA_EMBEDDINGS = os.getenv("ENABLE_SHARED_OLLAMA_EMBEDDINGS", "0").strip().lower() in {"1", "true", "yes"}
-    SHARED_OLLAMA_REQUEST_TIMEOUT = max(60, int(os.getenv("SHARED_OLLAMA_REQUEST_TIMEOUT", "600")))
+    SHARED_OLLAMA_REQUEST_TIMEOUT = max(60, min(3600, int(os.getenv("SHARED_OLLAMA_REQUEST_TIMEOUT", "600"))))
+    # The embedding selection is independent of the generation selection.
+    _default_embed_backend = "openai_compatible" if ENABLE_VLLM_EMBEDDINGS else ("ollama" if ENABLE_SHARED_OLLAMA_EMBEDDINGS else "disabled")
+    EMBED_BACKEND = os.getenv("SJFX_EMBED_BACKEND", _default_embed_backend).strip().lower()
+    if EMBED_BACKEND not in {"openai_compatible", "vllm", "ollama", "disabled"}:
+        raise RuntimeError("SJFX_EMBED_BACKEND 只能是 openai_compatible、vllm、ollama 或 disabled")
+    EMBED_BASE_URL = _local_model_url(os.getenv("SJFX_EMBED_BASE_URL", OLLAMA_BASE_URL if EMBED_BACKEND == "ollama" else VLLM_EMBED_BASE_URL))
+    EMBED_MODEL = os.getenv("SJFX_EMBED_MODEL", OLLAMA_EMBED_MODEL if EMBED_BACKEND == "ollama" else VLLM_EMBED_MODEL).strip()
+    # A generation key belongs to its configured service, not every endpoint
+    # selected later. Preserve the existing dedicated vLLM embedding lane's
+    # shared key only when its legacy URL and model are still the selected pair.
+    _default_embed_api_key = ""
+    if EMBED_BACKEND == "ollama":
+        if model_url_origin(EMBED_BASE_URL) == model_url_origin(OLLAMA_BASE_URL):
+            _default_embed_api_key = OLLAMA_API_KEY
+    elif EMBED_BACKEND in {"vllm", "openai_compatible"}:
+        if (model_url_origin(EMBED_BASE_URL) == model_url_origin(VLLM_BASE_URL)
+                or (EMBED_BASE_URL == VLLM_EMBED_BASE_URL and EMBED_MODEL == VLLM_EMBED_MODEL)):
+            _default_embed_api_key = VLLM_API_KEY
+    EMBED_API_KEY = os.getenv("SJFX_EMBED_API_KEY", _default_embed_api_key).strip()
+    EMBED_VERSION = os.getenv("SJFX_EMBED_VERSION", "").strip()
+    EMBED_WEIGHTS_ID = os.getenv("SJFX_EMBED_WEIGHTS_ID", "").strip()
+    EMBED_CONFIG_ID = os.getenv("SJFX_EMBED_CONFIG_ID", "").strip()
+    EMBED_DIMENSION = max(0, min(65536, int(os.getenv("SJFX_EMBED_DIMENSION", "0"))))
+    EMBED_ENCODING = os.getenv("SJFX_EMBED_ENCODING", "e5" if "e5" in EMBED_MODEL.lower() else "plain").strip().lower()
+    if EMBED_ENCODING not in {"e5", "plain"}:
+        raise RuntimeError("SJFX_EMBED_ENCODING 只能是 e5 或 plain")
+    EMBED_TOKENIZER_PATH = _optional_path_setting("SJFX_EMBED_TOKENIZER_PATH")
     SHARED_OLLAMA_MAX_CHARS = max(4000, int(os.getenv("SHARED_OLLAMA_MAX_CHARS", "48000")))
-    # Keep the prompt budget aligned with the serving engine.  This project's
-    # vLLM service is intentionally configured for a 32K context window on the
-    # single RTX 3090; using the old 64K Ollama default can overfill long
-    # document prompts before they reach the model.
-    _default_context_tokens = "32768" if LLM_BACKEND == "vllm" else "65536"
+    # A model's window must be configured for that model. Existing deployment
+    # LLM_CONTEXT_TOKENS=32768 remains intact; an unknown model gets a cautious
+    # 4K default rather than inheriting Qwen's old deployment size.
+    _default_context_tokens = "4096"
     LLM_CONTEXT_TOKENS = max(
-        8192, int(os.getenv("LLM_CONTEXT_TOKENS", _default_context_tokens))
+        2048, min(1048576, int(os.getenv("LLM_CONTEXT_TOKENS", _default_context_tokens)))
     )
-    LLM_MODEL = VLLM_MODEL if LLM_BACKEND == "vllm" else OLLAMA_MODEL
-    LLM_BASE_URL = VLLM_BASE_URL if LLM_BACKEND == "vllm" else OLLAMA_BASE_URL
-    LLM_ENABLED = ENABLE_VLLM if LLM_BACKEND == "vllm" else ENABLE_SHARED_OLLAMA
+    LLM_MODEL = {"vllm": VLLM_MODEL, "ollama": OLLAMA_MODEL, "openai_compatible": OPENAI_COMPATIBLE_MODEL}[LLM_BACKEND]
+    LLM_BASE_URL = {"vllm": VLLM_BASE_URL, "ollama": OLLAMA_BASE_URL, "openai_compatible": OPENAI_COMPATIBLE_BASE_URL}[LLM_BACKEND]
+    LLM_ENABLED = {"vllm": ENABLE_VLLM, "ollama": ENABLE_SHARED_OLLAMA, "openai_compatible": ENABLE_OPENAI_COMPATIBLE}[LLM_BACKEND]
+    LLM_MODEL_VERSION = os.getenv("LLM_MODEL_VERSION", "").strip()
+    LLM_TOKENIZER_VERSION = os.getenv("LLM_TOKENIZER_VERSION", "").strip()
+    LLM_TOKENIZER_PATH = _optional_path_setting("LLM_TOKENIZER_PATH", "CONVERSATION_TOKENIZER_PATH")
     ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "1").strip().lower() in {"1", "true", "yes", "on"}
     # Translation is local-only by default. Set TRANSLATION_PROVIDER=ollama
     # explicitly to retain the legacy Ollama adapter.
     TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "offline_nllb").strip().lower()
+    TRANSLATION_QUICKMT_MODEL_DIR = str(_path_setting(
+        "TRANSLATION_QUICKMT_MODEL_DIR", MODELS_DIR / "quickmt"
+    ))
+    TRANSLATION_QUICKMT_BEAM_SIZE = max(1, min(10, int(os.getenv("TRANSLATION_QUICKMT_BEAM_SIZE", "5"))))
     # Explicit document/file translation backend. Mail translation is assembled separately.
     TRANSLATION_FILE_BACKEND = os.getenv("TRANSLATION_FILE_BACKEND", "vllm").strip().lower()
-    if TRANSLATION_FILE_BACKEND not in {"offline_nllb", "vllm"}:
+    if TRANSLATION_FILE_BACKEND not in {"offline_nllb", "offline_quickmt", "vllm"}:
         TRANSLATION_FILE_BACKEND = "vllm"
-    TRANSLATION_MODEL_PATH = os.getenv(
-        "TRANSLATION_MODEL_PATH",
-        str(BASE_DIR / "models" / "nllb-200-distilled-600m"),
-    ).strip()
-    TRANSLATION_CT2_MODEL_PATH = os.getenv(
-        "TRANSLATION_CT2_MODEL_PATH",
-        str(BASE_DIR / "models" / "nllb-200-distilled-600m-ct2-int8"),
-    ).strip()
+    TRANSLATION_MODEL_PATH = str(_path_setting(
+        "TRANSLATION_MODEL_PATH", MODELS_DIR / "nllb-200-distilled-600m"
+    ))
+    TRANSLATION_CT2_MODEL_PATH = str(_path_setting(
+        "TRANSLATION_CT2_MODEL_PATH", MODELS_DIR / "nllb-200-distilled-600m-ct2-int8"
+    ))
     TRANSLATION_PREFER_CT2 = os.getenv("TRANSLATION_PREFER_CT2", "1").strip().lower() in {
         "1", "true", "yes", "on",
     }
@@ -404,7 +507,7 @@ class Config:
     if not _allowed_roots_raw and not _LOOPBACK_HOST:
         raise RuntimeError("非回环地址部署必须显式设置 SCAN_ALLOWED_ROOTS，拒绝使用宽泛默认扫描范围")
     _allowed_roots = _allowed_roots_raw or str(BASE_DIR.parent)
-    SCAN_ALLOWED_ROOTS = tuple(Path(item).expanduser().resolve() for item in _split_path_list(_allowed_roots))
+    SCAN_ALLOWED_ROOTS = tuple(resolve_config_path(item) for item in _split_path_list(_allowed_roots))
     MAX_EXTRACT_CHARS = int(os.getenv("MAX_EXTRACT_CHARS", "60000"))
     MAX_FULL_DOCUMENT_CHARS = int(os.getenv("MAX_FULL_DOCUMENT_CHARS", "2000000"))
     MAX_CONTENT_BYTES = content_byte_limit()
@@ -913,8 +1016,9 @@ class Config:
     )
     # QA composition policy; disable for a quick rollback without schema changes.
     LARGE_QA_ENABLED = os.getenv("LARGE_QA_ENABLED", "1").lower() not in {"0", "false", "off"}
-    LARGE_QA_INDEX_DIR = Path(os.getenv("LARGE_QA_INDEX_DIR", str(DATA_DIR / "large_qa")))
+    LARGE_QA_INDEX_DIR = _path_setting("LARGE_QA_INDEX_DIR", DATA_DIR / "large_qa")
     LARGE_QA_REFINE_TOPICS = os.getenv("LARGE_QA_REFINE_TOPICS", "1").lower() not in {"0", "false", "off"}
+    LARGE_QA_SYNTHESIS_TIMEOUT_SECONDS = max(0, min(600, int(os.getenv("LARGE_QA_SYNTHESIS_TIMEOUT_SECONDS", "480"))))
     # 按需 / 懒加载：只索引"有需求"的大包（最近被问答过、或问答时点名要过原文的）。
     # 设 LARGE_QA_DEMAND_ONLY=0 可回到"遍历全部大包"的旧行为。
     LARGE_QA_DEMAND_ONLY = os.getenv("LARGE_QA_DEMAND_ONLY", "1").lower() not in {"0", "false", "off"}
@@ -925,10 +1029,10 @@ class Config:
     LARGE_QA_EXTRACT_PAUSE = float(os.getenv("LARGE_QA_EXTRACT_PAUSE", "1.5"))
     LARGE_QA_IDLE_SLEEP = float(os.getenv("LARGE_QA_IDLE_SLEEP", "60"))
     CONVERSATION_QUALITY_ENABLED = os.getenv("CONVERSATION_QUALITY_ENABLED", "1").lower() not in {"0", "false", "off"}
-    CONVERSATION_TOKENIZER_PATH = os.getenv("CONVERSATION_TOKENIZER_PATH", VLLM_MODEL_PATH)
-    CONVERSATION_MAX_ANSWER_TOKENS = max(800, min(4096, int(os.getenv("CONVERSATION_MAX_ANSWER_TOKENS", "3000"))))
+    CONVERSATION_TOKENIZER_PATH = LLM_TOKENIZER_PATH
+    CONVERSATION_MAX_ANSWER_TOKENS = max(128, min(4096, LLM_CONTEXT_TOKENS // 2, int(os.getenv("CONVERSATION_MAX_ANSWER_TOKENS", "3000"))))
     CONVERSATION_ANSWER_TIMEOUT_SECONDS = max(30, min(180, int(os.getenv("CONVERSATION_ANSWER_TIMEOUT_SECONDS", "120"))))
-    CONVERSATION_CONTEXT_TOKENS = max(4096, min(LLM_CONTEXT_TOKENS, int(os.getenv("CONVERSATION_CONTEXT_TOKENS", "32768"))))
+    CONVERSATION_CONTEXT_TOKENS = max(2048, min(LLM_CONTEXT_TOKENS, int(os.getenv("CONVERSATION_CONTEXT_TOKENS", str(LLM_CONTEXT_TOKENS)))))
 
     CONVERSATION_ANALYSIS_BATCH_FILES = max(
         20, min(50, int(os.getenv("CONVERSATION_ANALYSIS_BATCH_FILES", "30")))
@@ -1050,14 +1154,21 @@ class Config:
     MAIL_ENABLE_VECTOR_INDEX = os.getenv("MAIL_ENABLE_VECTOR_INDEX", "0").strip().lower() in {"1", "true", "yes", "on"}
     # Mail-only additions. Disable each independently; no global model settings change.
     MAIL_ENABLE_AGENT_MINING = os.getenv("MAIL_ENABLE_AGENT_MINING", "1").lower() in {"1", "true", "yes", "on"}
+    # Whole-package person reports retain raw evidence and both fact passes.
+    # Effective parallelism also respects the client and shared admission gate.
+    MAIL_PERSON_PARALLEL_ENABLED = os.getenv("MAIL_PERSON_PARALLEL_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+    MAIL_PERSON_READING_CONCURRENCY = max(1, min(4, int(os.getenv("MAIL_PERSON_READING_CONCURRENCY", "3"))))
+    MAIL_PERSON_READING_CHARS = max(1000, min(24000, int(os.getenv("MAIL_PERSON_READING_CHARS", "12000"))))
+    MAIL_PERSON_READING_OUTPUT_TOKENS = max(5000, min(24576, int(os.getenv("MAIL_PERSON_READING_OUTPUT_TOKENS", "16384"))))
+    MAIL_PERSON_READING_TIMEOUT_SECONDS = max(120, min(600, int(os.getenv("MAIL_PERSON_READING_TIMEOUT_SECONDS", "600"))))
     MAIL_ENABLE_CONVERSATIONS = os.getenv("MAIL_ENABLE_CONVERSATIONS", "1").lower() in {"1", "true", "yes", "on"}
     MAIL_ENABLE_FACT_EXTRACTION = os.getenv("MAIL_ENABLE_FACT_EXTRACTION", "1").lower() in {"1", "true", "yes", "on"}
     MAIL_ENABLE_GRAPH_METRICS = os.getenv("MAIL_ENABLE_GRAPH_METRICS", "1").lower() in {"1", "true", "yes", "on"}
     MAIL_ENABLE_ATTACHMENT_VERSIONS = os.getenv("MAIL_ENABLE_ATTACHMENT_VERSIONS", "1").lower() in {"1", "true", "yes", "on"}
     MAIL_ENABLE_ISOLATED_PARSING = os.getenv("MAIL_ENABLE_ISOLATED_PARSING", "1").lower() in {"1", "true", "yes", "on"}
     MAIL_ENABLE_NESTED_MESSAGES = os.getenv("MAIL_ENABLE_NESTED_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
-    MAIL_EMBED_BASE_URL = _local_model_url(os.getenv("MAIL_EMBED_BASE_URL", VLLM_EMBED_BASE_URL))
-    MAIL_EMBED_MODEL = os.getenv("MAIL_EMBED_MODEL", VLLM_EMBED_MODEL)
+    MAIL_EMBED_BASE_URL = _local_model_url(os.getenv("MAIL_EMBED_BASE_URL", EMBED_BASE_URL))
+    MAIL_EMBED_MODEL = os.getenv("MAIL_EMBED_MODEL", EMBED_MODEL)
     MAIL_EMBED_BATCH = max(1, min(8, int(os.getenv("MAIL_EMBED_BATCH", "4"))))
     MAIL_EMBED_MAX_CHARS = max(128, min(1180, int(os.getenv("MAIL_EMBED_MAX_CHARS", "1180"))))
     MAIL_EMBED_INTERVAL_SECONDS = max(0.0, float(os.getenv("MAIL_EMBED_INTERVAL_SECONDS", "2")))
@@ -1150,11 +1261,12 @@ def ensure_runtime_directories():
         Config.PARSE_TEMP_DIR,
         Config.OUTPUT_DIR,
         Config.LOG_DIR,
-        Config.MODELS_DIR,
-        Config.DOCLING_ARTIFACTS_DIR,
-        Config.RAPIDOCR_MODEL_DIR,
     ):
         directory.mkdir(parents=True, exist_ok=True)
+    # Models, OCR and Docling artifacts are input resources. An installation
+    # may place them on a read-only volume; startup must never create or chmod
+    # their directories. Missing resources are reported by deployment/feature
+    # diagnostics, rather than silently represented by new empty directories.
     if os.name != "nt":
         for private_dir in (
             Config.DATA_DIR,

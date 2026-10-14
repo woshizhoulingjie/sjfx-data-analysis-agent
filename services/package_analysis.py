@@ -7,9 +7,7 @@ import os
 import shutil
 import stat as stat_module
 import tempfile
-import bz2
 import tarfile
-import zipfile
 from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 import re
@@ -21,6 +19,7 @@ from pathlib import Path, PurePosixPath
 
 from config import Config
 from services.scanner import human_size, resolve_under
+from services.process_liveness import process_rss_bytes, try_lock_file
 from services.evidence import (
     embedding_mode,
     evidence_quality,
@@ -48,8 +47,9 @@ from services.large_package_runtime import explore_large_package
 from services.import_pipeline import parse_plan, build_preview_directory
 from services.processing_queue import estimated_work_units, ranked_pending_paths
 from services.unified_parser import compact_document
-from services.unified_parser import UnifiedDocumentParser, _zip_central_directory_preflight, strict_archive_member_name
+from services.unified_parser import UnifiedDocumentParser, strict_archive_member_name
 from services.logical_units import container_node_for
+from services.archive_formats import ArchiveReader, ArchiveLimits, supported as supported_archive
 from services.parse_isolation import (
     ParseIsolationCancelled,
     ParseIsolationError,
@@ -464,7 +464,7 @@ def _inventory_mtime_seconds(file_node):
 
 def _is_archive_node(file_node):
     name = str(file_node.get("path") or file_node.get("name") or "").lower()
-    return name.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".gz", ".bz2", ".7z", ".rar"))
+    return supported_archive(name)
 
 
 def _source_has_open_writer(path):
@@ -718,15 +718,15 @@ def _secure_source_snapshot(scan_root, file_node, cancel_check=None):
         prefix="sjfx-source-p{}-".format(os.getpid()), dir=str(Config.PARSE_TEMP_DIR)
     ))
     lease_handle = None
-    if os.name != "nt":
-        try:
-            import fcntl
-            lease_handle = (scratch / ".lease").open("a+b")
-            fcntl.flock(lease_handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            if lease_handle is not None:
-                lease_handle.close()
-            lease_handle = None
+    try:
+        lease_handle = (scratch / ".lease").open("a+b")
+        if not try_lock_file(lease_handle):
+            raise BlockingIOError("解析源快照租约已被占用")
+    except OSError:
+        if lease_handle is not None:
+            lease_handle.close()
+        shutil.rmtree(str(scratch), ignore_errors=True)
+        raise
     original_name = str(file_node.get("name") or Path(str(file_node.get("path") or "")).name)
     if not original_name or Path(original_name).name != original_name or original_name in {".", ".."}:
         suffixes = "".join(Path(original_name or "source").suffixes[-2:])
@@ -788,11 +788,6 @@ def _secure_source_snapshot(scan_root, file_node, cancel_check=None):
         if source_fd is not None:
             os.close(source_fd)
         if lease_handle is not None:
-            try:
-                import fcntl
-                fcntl.flock(lease_handle.fileno(), fcntl.LOCK_UN)
-            except (ImportError, OSError):
-                pass
             lease_handle.close()
         shutil.rmtree(str(scratch), ignore_errors=True)
 
@@ -859,7 +854,13 @@ def _logical_source_snapshot(scan_root, file_node, cancel_check=None, *, max_sna
             end = max(start, int(file_node.get("byte_end") or 0))
             with os.fdopen(source_fd, "rb", closefd=True) as source, target.open("xb") as output:
                 include_header = bool(file_node.get("include_header"))
-                header = source.readline(1024 * 1024) if include_header else b""
+                if include_header:
+                    header_end = int(file_node.get("header_byte_end") or 0)
+                    # New inventories record a complete CSV/TSV logical header;
+                    # legacy partitions retain their physical-line header.
+                    header = source.read(header_end) if header_end else source.readline(1024 * 1024)
+                else:
+                    header = b""
                 if start > 0:
                     if include_header:
                         output.write(header)
@@ -889,120 +890,36 @@ def _logical_source_snapshot(scan_root, file_node, cancel_check=None, *, max_sna
             with os.fdopen(source_fd, "rb", closefd=True) as container:
                 member = str(file_node.get("member_name") or "")
                 archive_name = str(container_node.get("path") or "").lower()
-                if archive_name.endswith(".zip"):
-                    preflight = _zip_central_directory_preflight(container)
-                    if not preflight.get("safe"):
-                        raise ValueError("ZIP中央目录预检失败：{}".format(preflight.get("reason")))
-                    archive = zipfile.ZipFile(container)
-                    try:
-                        matches = [item for item in archive.filelist if item.filename == member]
-                        if len(matches) != 1:
-                            raise ValueError("ZIP成员缺失或名称重复，不能唯一定位")
-                        info = matches[0]
-                        mode_bits = (info.external_attr >> 16) & 0xFFFF
-                        if info.is_dir() or stat_module.S_IFMT(mode_bits) not in {0, stat_module.S_IFREG}:
-                            raise ValueError("ZIP链接或特殊成员不能作为普通文件读取")
-                        encrypted = bool(info.flag_bits & 0x1)
-                        if encrypted:
-                            raise ValueError("加密压缩包成员需要密码，不能读取")
-                        size = int(info.file_size or 0)
-                        _validate_logical_member_size(file_node, size, opened_before.st_size, info.compress_size)
-                        source_stream = archive.open(info, "r")
-                    except Exception:
-                        archive.close()
-                        raise
-                elif archive_name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
-                    archive = tarfile.open(fileobj=container, mode="r:*", tarinfo=_BoundedLogicalTarInfo)
-                    try:
-                        info = None
-                        total_declared = 0
-                        for count, candidate in enumerate(archive, 1):
+                limits = ArchiveLimits.from_config(entry_limit=Config.MAX_LOGICAL_UNITS_PER_CONTAINER)
+                with ArchiveReader(container, filename=archive_name, limits=limits,
+                                   cancel_check=cancel_check) as archive:
+                    entry = next((item for item in archive.entries() if item.name == member), None)
+                    if entry is None:
+                        raise ValueError("归档成员已不存在")
+                    size = entry.size
+                    _validate_logical_member_size(file_node, size, opened_before.st_size,
+                                                  entry.compressed_size)
+                    with archive.open_member(entry) as source, target.open("xb") as output:
+                        copied = 0
+                        copy_limit = size if max_snapshot_bytes is None else min(size, max_snapshot_bytes)
+                        while True:
                             if cancel_check is not None and cancel_check():
-                                raise ParseIsolationCancelled("任务已取消，停止核验归档目录")
-                            # Logical imports intentionally support more entries
-                            # than a whole-archive preview. Preserve that budget.
-                            if count > Config.MAX_LOGICAL_UNITS_PER_CONTAINER:
-                                raise ValueError("TAR成员数量超过安全上限")
-                            total_declared += max(0, int(candidate.size))
-                            if total_declared > min(Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES,
-                                    max(1, int(opened_before.st_size * Config.MAX_ARCHIVE_COMPRESSION_RATIO))):
-                                raise ValueError("TAR解压总量或压缩比超过安全上限")
-                            if candidate.name == member:
-                                if info is not None:
-                                    raise ValueError("TAR成员名称重复，不能唯一定位")
-                                if not candidate.isfile() or candidate.issparse():
-                                    raise ValueError("TAR链接、稀疏或特殊成员不能作为普通文件读取")
-                                info = candidate
-                            archive.members.clear()
-                        if info is None:
-                            raise ValueError("TAR成员已不存在")
-                        encrypted = False
-                        size = int(info.size or 0)
-                        _validate_logical_member_size(file_node, size, opened_before.st_size)
-                        source_stream = archive.extractfile(info)
-                    except Exception:
-                        archive.close()
-                        raise
-                elif archive_name.endswith(".bz2"):
-                    archive = None
-                    source_stream = bz2.BZ2File(container, mode="rb")
-                    info = None
-                    encrypted = False
-                    size = int(Config.MAX_CONTENT_BYTES)
-                elif archive_name.endswith(".rar"):
-                    try:
-                        import rarfile
-                    except ImportError as exc:
-                        raise ValueError("RAR逻辑成员需要安装 rarfile 依赖") from exc
-                    archive = rarfile.RarFile(container)
-                    info = archive.getinfo(member)
-                    encrypted = bool(getattr(info, "needs_password", lambda: False)())
-                    size = int(info.file_size or 0)
-                    source_stream = archive.open(info, "r")
-                else:
-                    try:
-                        import py7zr
-                    except ImportError as exc:
-                        raise ValueError("7z逻辑成员需要安装 py7zr 依赖") from exc
-                    # py7zr extracts into a private directory, preserving the
-                    # same bounded snapshot/cleanup contract as other archives.
-                    archive = py7zr.SevenZipFile(container, mode="r")
-                    archive.extract(path=str(scratch), targets=[member])
-                    extracted = scratch / member
-                    size = extracted.stat().st_size
-                    encrypted = False
-                    source_stream = extracted.open("rb")
-                try:
-                        if encrypted:
-                            raise ValueError("加密压缩包成员需要密码，不能读取")
-                        if size > int(Config.MAX_CONTENT_BYTES):
-                            raise ValueError("压缩包成员超过中央内容上限")
-                        with source_stream as source, target.open("xb") as output:
-                            copied = 0
-                            copy_limit = size if max_snapshot_bytes is None else min(size, max_snapshot_bytes)
-                            while True:
-                                if cancel_check is not None and cancel_check():
-                                    raise ParseIsolationCancelled("任务已取消，停止提取压缩包成员")
-                                if max_snapshot_bytes is not None and copied >= copy_limit:
-                                    break
-                                read_size = (4 * 1024 * 1024 if max_snapshot_bytes is None
-                                             else min(4 * 1024 * 1024, copy_limit - copied))
-                                chunk = source.read(read_size)
-                                if not chunk:
-                                    break
-                                copied += len(chunk)
-                                if copied > min(size, _logical_archive_size_limit(opened_before.st_size)):
-                                    raise ValueError("压缩包成员实际大小超过声明或解压安全上限")
-                                output.write(chunk)
-                            output.flush()
-                            os.fsync(output.fileno())
-                finally:
-                    try:
-                        archive.close()
-                    except Exception:
-                        pass
+                                raise ParseIsolationCancelled("任务已取消，停止提取压缩包成员")
+                            if max_snapshot_bytes is not None and copied >= copy_limit:
+                                break
+                            read_size = (4 * 1024 * 1024 if max_snapshot_bytes is None
+                                         else min(4 * 1024 * 1024, copy_limit - copied))
+                            chunk = source.read(read_size)
+                            if not chunk:
+                                break
+                            copied += len(chunk)
+                            if copied > min(size, _logical_archive_size_limit(opened_before.st_size)):
+                                raise ValueError("压缩包成员实际大小超过声明或解压安全上限")
+                            output.write(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
                 opened_after = os.fstat(container.fileno())
-            if not archive_name.endswith(".bz2") and copied != copy_limit:
+            if copied != copy_limit:
                 raise ValueError("压缩包成员提取长度与中央目录不一致")
             if (
                 int(opened_before.st_dev), int(opened_before.st_ino),
@@ -1062,11 +979,9 @@ def _parse_with_limits(
 ):
     """Apply per-file wall-clock and current-process-memory guards.
 
-    ``resource.getrusage(...).ru_maxrss`` is a *lifetime high-water mark*,
-    not the Worker\'s current memory use.  Docling/OCR may legitimately push
-    that high-water mark above the configured budget while loading a model;
-    using it as a preflight check would then reject every later file instantly.
-    On Linux read /proc/self/statm instead, which reports the current RSS.
+    The shared probe reads current RSS on Linux and Windows. A lifetime
+    high-water mark would reject later files even after Docling/OCR releases
+    a model's transient allocation, so it is not used as a fallback.
     """
     timeout = max(
         1,
@@ -1077,18 +992,7 @@ def _parse_with_limits(
         ),
     )
     memory_limit = max(256, int(os.getenv("MAX_WORKER_MEMORY_MB", "8192"))) * 1024 * 1024
-    rss = None
-    try:
-        with open("/proc/self/statm", "r", encoding="ascii") as handle:
-            resident_pages = int(handle.read().split()[1])
-        rss = resident_pages * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError, AttributeError):
-        # Keep a conservative fallback for non-Linux development machines.
-        try:
-            import resource
-            rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
-        except (ImportError, AttributeError):
-            rss = None
+    rss = process_rss_bytes(os.getpid())
     if rss is not None and rss > memory_limit:
         raise MemoryError(
             "Worker 当前内存为 {} MB，已达到 {} MB 上限，跳过该文件".format(
@@ -2309,6 +2213,71 @@ def _enrich_analysis_tree(tree, documents):
     return tree
 
 
+def _finalize_named_catalog_topics(tree, documents):
+    """Publish named directions without the internal boundary-review wrapper.
+
+    Boundary sampling remains diagnostic metadata.  Its already-named child
+    directions are independent topics in the user-facing catalog, with the
+    same member paths, node ids, evidence and naming provenance.
+    """
+    children = []
+    for node in tree.get("children") or []:
+        if not (node.get("kind") == "group"
+                and node.get("name") == "边界待复核"
+                and node.get("dimension") == "分类复核"):
+            children.append(node)
+            continue
+        paths = set(node.get("member_paths") or [])
+        named = [child for child in node.get("children") or []
+                 if child.get("kind") == "group" and child.get("name")
+                 and child.get("name") != "边界待复核"]
+        counts = Counter(path for child in named for path in child.get("member_paths") or [])
+        if counts != Counter({path: 1 for path in paths}):
+            # Older catalogs may only have file leaves. Keep their inventory
+            # intact and use their existing topic label or a local label.
+            existing = list(dict.fromkeys(node.get("related_topics") or []))
+            name = (existing[0] if len(existing) == 1 else
+                    _fallback_semantic_name({"members": sorted(paths)}, documents))
+            node["name"] = name or "相关资料"
+            node["summary"] = "{}，包含 {} 个文件。".format(node["name"], len(paths))
+            named = [node]
+        for topic in named:
+            name = topic["name"]
+            topic.update({
+                "node_type": "topic", "dimension": "内容主题",
+                "topic_key": name, "classification_status": "classified",
+            })
+            topic["boundary_review"] = dict(node.get("boundary_review") or {})
+            topic["boundary_review"]["catalog_display"] = "named_topic"
+            if "边界待复核" in str(topic.get("summary") or ""):
+                topic["summary"] = "{}，包含 {} 个文件。".format(name, topic.get("file_count", 0))
+            stack = [topic]
+            while stack:
+                current = stack.pop()
+                for conclusion in current.get("conclusion_evidence") or []:
+                    for key in ("analysis_question", "question", "question_value", "value"):
+                        if isinstance(conclusion.get(key), str):
+                            conclusion[key] = conclusion[key].replace("边界待复核", name)
+                if current.get("kind") == "file":
+                    current["primary_topic"] = name
+                    current["topic_memberships"] = [name]
+                stack.extend(current.get("children") or [])
+            for path in topic.get("member_paths") or []:
+                if path in documents:
+                    documents[path].setdefault("classification", {}).update({
+                        "primary_topic": name, "topic_memberships": [name],
+                        "classification_status": "classified",
+                        "confidence_kind": "uncalibrated_embedding_similarity",
+                        "classification_reason": "目录采用已生成的内容主题名称。",
+                    })
+            children.append(topic)
+    tree["children"] = children
+    for dimension in tree.get("dimensions") or []:
+        if dimension.get("name") == "内容主题":
+            dimension["cardinality"] = len(children)
+    return tree
+
+
 def _expand_duplicate_aliases_in_tree(
     tree, documents, canonical_by_path, aliases_by_canonical, node_summaries
 ):
@@ -3161,6 +3130,18 @@ def _semantic_document_profile(path, document, max_chars=1700):
     if len(body) <= remaining - len("正文："):
         return (prefix + "\n正文：" + body)[:limit]
 
+    from services.research_elements import research_passages, LABELS
+    element_rows = []
+    for role, units in research_passages(document, per_role=1, max_chars=max(80, remaining // 6)).items():
+        if units:
+            element_rows.append(LABELS[role] + "：" + units[0]["text"])
+    if element_rows:
+        elements = "\n".join(element_rows)
+        # Keep positional coverage as a supplement when sections are absent.
+        prefix += "\n" + elements
+        remaining = max(0, limit - len(prefix) - 8)
+        if remaining < 40:
+            return prefix[:limit]
     labels = ("开头：", "中段：", "结尾：")
     body_budget = max(0, remaining - sum(len(label) for label in labels) - 4)
     if body_budget <= 0:
@@ -3257,10 +3238,11 @@ def _semantic_document_clusters(
         for path in paths
     }
 
-    model_name = str(getattr(embedding_client, "model", "local-embedding"))
+    from services.embedding_backend import client_identity, validate_vectors
+    model_name = client_identity(embedding_client)
     cache_keys = {
         path: hashlib.sha256(
-            "semantic-profile-v2|{}|{}".format(
+            "semantic-profile-v3-research-sections|{}|{}".format(
                 (documents[path].get("source") or {}).get("sha256") or "",
                 profiles[path],
             ).encode("utf-8", errors="replace")
@@ -3271,6 +3253,10 @@ def _semantic_document_clusters(
     vectors_by_path = {
         path: cached[cache_keys[path]] for path in paths if cache_keys[path] in cached
     }
+    dimension = int(getattr(embedding_client, "dimension", 0) or 0)
+    if vectors_by_path:
+        cached_vectors = validate_vectors(list(vectors_by_path.values()), dimension=dimension)
+        dimension = dimension or len(cached_vectors[0])
     missing_paths = [path for path in paths if path not in vectors_by_path]
     from services.performance_primitives import unique_embedding_paths
     request_paths, aliases = unique_embedding_paths(missing_paths, cache_keys)
@@ -3290,10 +3276,8 @@ def _semantic_document_clusters(
             [profiles[path] for path in batch_paths],
         )
 
-        if len(batch_vectors) != len(batch_paths):
-            raise ValueError(
-                "文档级 embedding 返回数量不一致"
-            )
+        batch_vectors = validate_vectors(batch_vectors, count=len(batch_paths), dimension=dimension)
+        dimension = dimension or len(batch_vectors[0])
         newly_cached = {}
         for path, vector in zip(batch_paths, batch_vectors):
             for alias in aliases[cache_keys[path]]:
@@ -3309,14 +3293,11 @@ def _semantic_document_clusters(
             )
     if batch_progress and not missing_paths:
         batch_progress(len(paths), len(paths))
-    vectors = [vectors_by_path[path] for path in paths]
+    vectors = validate_vectors([vectors_by_path[path] for path in paths], count=len(paths), dimension=dimension)
     # Grouping happens in the corpus-centred space; the raw vectors are kept for
-    # the reported similarity values.  A dimension mismatch (mixed embedding
-    # models in one cache) falls back to the raw vectors instead of failing.
-    try:
-        cluster_vectors = _centered_vectors(vectors)
-    except Exception:
-        cluster_vectors = vectors
+    # the reported similarity values. Mixed dimensions are rejected before
+    # clustering; retaining an old cache never permits mixing vector spaces.
+    cluster_vectors = _centered_vectors(vectors)
 
     if len(paths) == 1:
         return [{
@@ -3781,7 +3762,7 @@ SEMANTIC_NAMING_BATCH_CLUSTERS = 8
 
 def _semantic_naming_cache_id(cluster):
     payload = {
-        "contract": "semantic-naming-cache-v4-boundary",
+        "contract": "semantic-naming-cache-v5-research-terms",
         "members": sorted(str(path) for path in (cluster.get("members") or [])),
         "profile_fingerprint": str(cluster.get("profile_fingerprint") or ""),
         "boundary_documents": list(cluster.get("boundary_documents") or [])[:2],
@@ -3808,6 +3789,9 @@ def _name_semantic_clusters(
     if not clusters:
         return clusters, None
 
+    from services.research_elements import distinguishing_terms
+    for cluster, terms in zip(clusters, distinguishing_terms(clusters, documents)):
+        cluster["distinguishing_terms"] = terms
     cached_names = cached_names or {}
     for cluster in clusters:
         cluster["name"] = _fallback_semantic_name(
@@ -3869,6 +3853,7 @@ def _name_semantic_clusters(
             )
         )
 
+        lines.append("主题区分词（表达参考，须核对成员内容）：" + "、".join(cluster.get("distinguishing_terms") or []))
         samples = [
             (path, "中心代表")
             for path in cluster.get("representative_documents", [])[:3]
@@ -5964,11 +5949,31 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
             "package_queries_deferred": True,
         }
     else:
+        if cancel_check is not None and cancel_check():
+            raise ParseIsolationCancelled("任务已取消，停止建立全文检索索引")
+        progress(76, "准备检索清单：{} 个主题".format(len(topic_clusters)))
+        stage_started = time.perf_counter()
         retrieval = build_retrieval_manifest(canonical_documents, topic_clusters)
-        evidence_index_count = storage.replace_evidence_index(
-            scan_id,
-            _index_chunks_from_full_documents(storage, scan_id, canonical_documents),
+        pipeline_timing_ms["retrieval_manifest"] = round(
+            (time.perf_counter() - stage_started) * 1000, 2
         )
+        stage_started = time.perf_counter()
+        index_chunks = _index_chunks_from_full_documents(
+            storage, scan_id, canonical_documents,
+            cancel_check=cancel_check,
+            progress=lambda done, total: progress(
+                76, "整理全文检索证据：{}/{} 个文件".format(done, total)
+            ),
+        )
+        if cancel_check is not None and cancel_check():
+            raise ParseIsolationCancelled("任务已取消，停止发布全文检索索引")
+        progress(76, "发布全文检索索引：{} 条证据".format(len(index_chunks)))
+        evidence_index_count = storage.replace_evidence_index(scan_id, index_chunks)
+        pipeline_timing_ms["full_evidence_index"] = round(
+            (time.perf_counter() - stage_started) * 1000, 2
+        )
+        del index_chunks
+        progress(76, "全文检索索引已保存，正在整理研究主题")
     research_documents = {
         path: document for path, document in canonical_documents.items()
         if document.get("classification", {}).get("document_role") not in {"要求与说明材料", "派生概览材料"}
@@ -6197,6 +6202,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         )
     else:
         subtopic_naming_result = None
+    adaptive_tree = _finalize_named_catalog_topics(adaptive_tree, canonical_documents)
     adaptive_tree = _expand_duplicate_aliases_in_tree(
         adaptive_tree,
         documents,
@@ -6633,7 +6639,9 @@ def refresh_package_progress_counts(scan_id, scan, storage):
     return analysis
 
 
-def _index_chunks_from_full_documents(storage, scan_id, fallback_documents):
+def _index_chunks_from_full_documents(
+    storage, scan_id, fallback_documents, *, cancel_check=None, progress=None
+):
     """Build searchable evidence chunks from each file's full document.
 
     ``iter_documents(hydrate=False)`` yields the bounded overview window --
@@ -6648,13 +6656,19 @@ def _index_chunks_from_full_documents(storage, scan_id, fallback_documents):
     incremental index and is deliberately untouched.
     """
     chunks = []
-    for path, fallback in (fallback_documents or {}).items():
+    total = len(fallback_documents or {})
+    report_every = max(1, total // 20)
+    for done, (path, fallback) in enumerate((fallback_documents or {}).items(), 1):
+        if cancel_check is not None and cancel_check():
+            raise ParseIsolationCancelled("任务已取消，停止整理全文检索证据")
         document = None
         try:
             document = storage.get_document(scan_id, path)
         except Exception:
             document = None
         chunks.extend(evidence_corpus({path: document or fallback}))
+        if progress is not None and (done % report_every == 0 or done == total):
+            progress(done, total)
     return chunks
 
 

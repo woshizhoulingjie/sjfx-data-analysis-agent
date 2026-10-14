@@ -33,6 +33,8 @@ def raw_mail(subject='Test',body='Alice confirms delivery date 2026-10-10',mid='
 class MiningTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
+        allowed_roots=patch.object(Config,'SCAN_ALLOWED_ROOTS',[str(self.root.resolve())])
+        allowed_roots.start();self.addCleanup(allowed_roots.stop)
         self.storage=Storage(self.root/'test.db');self.r=MailRepository(self.storage);self.r.migrate();self.n=0
         self.package,_=self.r.create_package(owner_id='owner',display_name='test',source_kind='directory',source_path=str(self.root),source_revision='test-v1',config={})
         self.pid=self.package['package_id']

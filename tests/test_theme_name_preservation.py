@@ -60,10 +60,20 @@ class ThemeOverwriteTests(unittest.TestCase):
                           "result,status,updated_at,member_count,content_revision) "
                           "VALUES(?,?,?,?,?,?,?,?,?,?)",
                           (self.pid, gid, 'm', _anchor(i), 'rep%d.pdf' % i, '{}', 'named', now, 5, 1))
+                # Build the live membership the tree now requires; labels must
+                # match the revision advanced by the member insert triggers.
+                for index in range(5):
+                    path = '%s/%d.txt' % (gid, index)
+                    c.execute('INSERT INTO files(package_id,path,name,updated_at) VALUES(?,?,?,?)',
+                              (self.pid, path, '%d.txt' % index, now))
+                    c.execute('INSERT INTO large_catalog_members(package_id,path,group_id,input_hash,vector) '
+                              'VALUES(?,?,?,?,?)', (self.pid, path, gid, path, _anchor(i)))
+                revision = c.execute('SELECT content_revision FROM large_catalog_groups '
+                                     'WHERE package_id=? AND id=?', (self.pid, gid)).fetchone()[0]
                 c.execute("INSERT INTO lp_catalog_labels(package_id,group_id,revision,version,name,"
                           "description,evidence,model,digest,needs_review,locked,updated) "
                           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                          (self.pid, gid, 1, 1, '叶组%d' % i, '说明', '[]', 'm', 'd%d' % i, 0, 0, now))
+                          (self.pid, gid, revision, 1, '叶组%d' % i, '说明', '[]', 'm', 'd%d' % i, 0, 0, now))
             c.commit()
         self._saved = topics.name_topics
         self.round = {'id': 'round-a', 'deadline': time.time() + 3600}

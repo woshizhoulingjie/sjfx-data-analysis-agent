@@ -33,6 +33,9 @@ class CatalogBatchTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
         self.patches=[patch.object(Config,'SCAN_ALLOWED_ROOTS',()),patch.object(Config,'LP_CATALOG_MODEL_NAMING',True),patch.object(Config,'LP_CATALOG_SECONDS',60),patch.object(Config,'LP_CATALOG_BATCH_SIZE',4),patch.object(Config,'LP_CATALOG_BATCH_INPUT_TOKENS',10000),patch.object(Config,'LP_CATALOG_TOTAL_TOKENS',100000)]
+        # The four-group mock contract assumes a 32K service. The production
+        # default remains cautious; a separate test exercises its 4K packing.
+        self.patches.append(patch.object(Config, 'LLM_CONTEXT_TOKENS', 32768))
         for p in self.patches:p.start()
         self.store=LargePackageStore(self.root/'state.db');self.pid=self.store.create(self.root)['id'];self.model=BatchModel()
         self.gids=[]
@@ -89,6 +92,31 @@ class CatalogBatchTests(unittest.TestCase):
         self.assertLess(len(inputs[0]['groups']),4)
         for group in inputs[0]['groups']:
             self.assertTrue(group['evidence'][0]['text'])
+    def test_small_context_splits_complete_bundles_within_model_budget(self):
+        from services.model_budget import reserve_tokens
+        expected = [json.loads(naming.bundle(self.store, self.pid, gid)['user'])['evidence']
+                    for gid in self.gids]
+        inputs = []
+        original = self.model.chat
+        def capture(system, user, **kwargs):
+            inputs.append((system, user, kwargs))
+            return original(system, user, **kwargs)
+        self.model.chat = capture
+        with patch.object(Config, 'LLM_CONTEXT_TOKENS', 4096):
+            self.assertTrue(process_batch(self.store, self.pid, model_client=self.model))
+            self.assertEqual(len(inputs), 1)
+            system, user, kwargs = inputs[0]
+            groups = json.loads(user)['groups']
+            self.assertGreater(len(groups), 0)
+            self.assertLess(len(groups), 4)
+            self.assertLessEqual(naming.token_count(system + '\n' + user) + 64 +
+                                 kwargs['max_tokens'] + reserve_tokens(4096), 4096)
+            for group in groups:
+                self.assertIn(group['evidence'], expected)
+            self.assertEqual(naming.state(self.store, self.pid)['named_nodes'], len(groups))
+            with closing(self.store._connect()) as c:
+                queued = c.execute("SELECT COUNT(*) FROM lp_catalog_jobs WHERE status='queued'").fetchone()[0]
+            self.assertEqual(queued, 4 - len(groups))
     def test_invalid_evidence_cannot_publish_any_name_and_retries_are_durable(self):
         self.model.bad=True;process_batch(self.store,self.pid,model_client=self.model)
         self.assertEqual(naming.state(self.store,self.pid)['named_nodes'],0)

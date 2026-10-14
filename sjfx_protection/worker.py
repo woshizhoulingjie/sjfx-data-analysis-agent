@@ -11,6 +11,12 @@ from .scanner import inspect_file, stable_hash, bounded_read
 from .store import Store, uid, encode
 
 
+def _directory_indirection(path):
+    # Windows junctions are not symlinks, and os.walk(followlinks=False) still
+    # traverses them. Never certify an inventory containing either kind.
+    return path.is_symlink() or getattr(path, 'is_junction', lambda: False)()
+
+
 def inventory(store, collection, allowed_roots, max_files=200000, deadline=7200):
     with store.db(True) as db:
         row = db.execute("SELECT * FROM collections WHERE id=? AND state='queued'", (collection,)).fetchone()
@@ -21,7 +27,10 @@ def inventory(store, collection, allowed_roots, max_files=200000, deadline=7200)
     count = 0
     started = time.monotonic()
     try:
-        root = Path(row["root"]).resolve(strict=True)
+        selected_root = Path(row["root"])
+        if _directory_indirection(selected_root):
+            raise ValueError("所选目录是符号链接或目录联接，请选择实际资料目录")
+        root = selected_root.resolve(strict=True)
         if not root.is_dir() or not any(root.is_relative_to(Path(a).resolve()) for a in allowed_roots):
             raise ValueError("目录不在允许范围内")
         def fail_walk(error):
@@ -29,8 +38,8 @@ def inventory(store, collection, allowed_roots, max_files=200000, deadline=7200)
         for directory, dirs, files in os.walk(root, followlinks=False, onerror=fail_walk):
             # Skipped symlinks are explicit failures: no false complete inventory.
             for name in dirs + files:
-                if (Path(directory) / name).is_symlink():
-                    raise ValueError("所选目录含符号链接，请选择实际资料目录：" + name)
+                if _directory_indirection(Path(directory) / name):
+                    raise ValueError("所选目录含符号链接或目录联接，请选择实际资料目录：" + name)
             for name in sorted(files):
                 if count >= max_files or time.monotonic() - started > deadline:
                     raise ValueError("清单达到数量或时间限制，请分批登记")
@@ -93,7 +102,7 @@ def verify_inventory(store, collection):
             records={r['path']:dict(r) for r in db.execute('SELECT * FROM files WHERE collection=?',(collection,))}
         if not row:return
         root=Path(row['root'])
-        if root.is_symlink() or not root.is_dir():raise ValueError('资料目录已改变')
+        if _directory_indirection(root) or not root.is_dir():raise ValueError('资料目录已改变')
         seen=set()
         changes=[]
         renamed=set()
@@ -103,7 +112,7 @@ def verify_inventory(store, collection):
         def fail(error):raise error
         for directory,dirs,files in os.walk(root,followlinks=False,onerror=fail):
             for name in dirs+files:
-                if (Path(directory)/name).is_symlink():raise ValueError('目录出现符号链接')
+                if _directory_indirection(Path(directory)/name):raise ValueError('目录出现符号链接或目录联接')
             for name in files:
                 path=str(Path(directory)/name)
                 previous=records.get(path)

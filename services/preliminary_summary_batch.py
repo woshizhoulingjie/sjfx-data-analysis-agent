@@ -101,12 +101,14 @@ def _make_rows(storage, jobs, max_chars):
 def _fit_rows(rows, context_window_tokens, output_tokens_per_file=240):
     """Keep four-file batching within the existing model context budget."""
     # Reserve room for the contract, file IDs and the per-file JSON result.
-    budget = max(4000, int(context_window_tokens or 32768) - 3200)
+    from services.model_budget import reserve_tokens
+    window = int(context_window_tokens or 4096)
+    budget = max(0, window - 3200 - reserve_tokens(window))
     selected = []
     used = 0
     for row in rows:
         cost = _estimated_tokens(row["input"]) + 260
-        if selected and used + cost + output_tokens_per_file * (len(selected) + 1) > budget:
+        if used + cost + output_tokens_per_file * (len(selected) + 1) > budget:
             break
         selected.append(row)
         used += cost
@@ -138,6 +140,7 @@ def analyze_preliminary_batch(llm, storage, jobs, max_chars=8000,
 必须逐个文件分析，绝不能合并、借用或推断另一个文件的内容。
 每条结论、事实、论点、方法、风险和不确定性都必须使用简体中文表达；文件原文中的专有名词、缩写和文件路径可以保留原文。
 必须返回 JSON，并且每个对象必须原样带回对应的 file_id 和 path。
+综合本文件章节中的问题、方法、结果和局限；保留数字的单位、样本、条件、对照和否定，不增加输出字段。
 
 原文片段中的 evidence_id 是唯一可用的来源 ID。请在 claim_evidence 中为每条关键事实或结论
 原样列出 statement 和直接相关 ID；没有直接来源时留空。来源可回查不等于主张已被验证。
@@ -208,8 +211,8 @@ def analyze_preliminary_batch(llm, storage, jobs, max_chars=8000,
             "preview_coverage": {"mode": "selective", "selected_chars": len(row["input"]), "complete": False},
             "parser_info": {"model": result.get("model"), "usage": result.get("usage") or {}, "batch_size": len(rows)},
             "source_fingerprint": document_source_fingerprint(row["document"]),
-            "summary_input_version": "preview-source-blocks-v2",
-            "summary_prompt_version": "preliminary-batch-claims-evidence-v2",
+            "summary_input_version": "preview-source-blocks-v3-sections",
+            "summary_prompt_version": "preliminary-batch-claims-evidence-v3-sections",
             "pipeline_timing_ms": {
                 "input_selection": row.get("input_build_ms", 0),
                 "shared_model_generation_ms": model_generation_ms,

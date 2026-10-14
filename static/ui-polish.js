@@ -8,7 +8,7 @@
   const routeTitles = {
     dashboard: '数据分析智能体 · 工作台', packages: '数据分析智能体 · 数据包管理',
     physical: '数据分析智能体 · 原始目录', analysis: '数据分析智能体 · 智能分析',
-    homogeneous: '数据分析智能体 · 同构文件关联', overview: '数据分析智能体 · 数据包概览',
+    overview: '数据分析智能体 · 数据包概览',
     evidence: '数据分析智能体 · 证据问答', chat: '数据分析智能体 · 资料问答',
     translation: '数据分析智能体 · 全文翻译', tasks: '数据分析智能体 · 任务中心',
     exports: '数据分析智能体 · 导出中心', settings: '数据分析智能体 · 系统设置'
@@ -21,11 +21,11 @@
   };
   const workflow = [
     ['packages', '资料'], ['overview', '概览'], ['analysis', '分析'],
-    ['homogeneous', '关联'], ['evidence', '核验'], ['exports', '交付']
+    ['evidence', '核验'], ['exports', '交付']
   ];
   const stageForRoute = {
     packages: 'packages', physical: 'packages', overview: 'overview', analysis: 'analysis',
-    homogeneous: 'homogeneous', evidence: 'evidence', chat: 'evidence',
+    evidence: 'evidence', chat: 'evidence',
     translation: 'analysis', tasks: 'packages', exports: 'exports'
   };
   const quickRoutes = [
@@ -34,7 +34,6 @@
     ['physical', '原始目录', '按原始路径浏览资料'],
     ['analysis', '智能分析', '按主题整理和深度分析资料'],
     ['overview', '数据包概览', '查看全局结构、质量与研究方向'],
-    ['homogeneous', '同构文件关联', '核对信件、通知等结构相似文件'],
     ['evidence', '证据问答', '按范围检索原文证据'],
     ['chat', '资料问答', '针对资料提出多轮分析问题'],
     ['translation', '全文翻译', '保留原文并查看中文译文'],
@@ -278,8 +277,8 @@
     if (['failed', 'retry_waiting', 'partial', 'paused'].includes(state)) return { route: 'packages', label: '处理异常' };
     const routeMap = {
       packages: ['overview', '查看全景'], physical: ['analysis', '进入智能分析'],
-      overview: ['analysis', '查看智能目录'], analysis: ['homogeneous', '查看文件关联'],
-      homogeneous: ['evidence', '核验证据'], evidence: ['chat', '进入资料问答'],
+      overview: ['analysis', '查看智能目录'], analysis: ['evidence', '核验证据'],
+      evidence: ['chat', '进入资料问答'],
       chat: ['exports', '准备交付'], translation: ['chat', '进入资料问答'],
       tasks: ['packages', '返回数据包'], exports: ['analysis', '选择交付内容']
     };

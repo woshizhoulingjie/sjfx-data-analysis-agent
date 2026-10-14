@@ -109,10 +109,16 @@
           </div>
           <form id="mail-question-form" class="mail-question-form">
             <label for="mail-question">你想从这批邮件中查清什么？</label>
-            <p class="mail-hint">直接用中文提问。系统检索邮件和附件，给出中文发现、提取字段与可回查证据。</p>
+            <p class="mail-hint">直接用中文提问。回答方式可选「快速」（单遍核验，几分钟内给结论，未确认部分会明确标出）或「深度」（必要时自动补检并复核，更彻底但更久）。</p>
             <div class="mail-examples"><button type="button" data-mail-example="找出与交付日期有关的邮件和附件，列出相关内容和原文证据">找相关邮件</button><button type="button" data-mail-example="梳理交付日期变更的事情经过，按时间列出提出、回应与后续变化，并附原文证据">梳理事情经过</button><button type="button" data-mail-example="核对交付日期最后确认的安排，列出确认人、时间、条件和原文证据；如有矛盾请明确说明">核对最后确认</button></div>
             <textarea id="mail-question" rows="3" placeholder="例如：找出与交付日期变更有关的邮件和附件，并说明最早提出、原因、最终确认和后续变化。"></textarea>
             <div class="mail-command-row">
+              <label class="mail-answer-mode"><span>回答方式</span>
+                <select id="mail-answer-mode" title="快速：单遍核验，几分钟内给出结论，未确认部分会直接标出；深度：必要时自动补检并复核，更彻底但更久">
+                  <option value="fast" selected>快速（推荐）</option>
+                  <option value="deep">深度</option>
+                </select>
+              </label>
               <button id="mail-start" type="submit">开始研究</button>
               <label><input id="mail-followup" type="checkbox" checked> 在上一结果中继续</label>
               <button id="mail-cancel" type="button" disabled>取消研究</button>
@@ -263,7 +269,7 @@
   <script src="/static/mail-foundation.js?v=20261008-progress-ocr-repair" defer></script>
   <script src="/static/mail-research.js?v=20261009-answer-first-v1" defer></script>
   <script src="/static/mail-modules.js?v=20261007-usability-v1" defer></script>
-  <script src="/static/mail-people.js?v=20261008-person-report-v35" defer></script>
+  <script src="/static/mail-people.js?v=20261013-process-output-v37" defer></script>
 </body>
 </html>
 

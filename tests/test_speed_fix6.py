@@ -3,7 +3,7 @@
 
 1. km_finalize / km_repair 触发源只在成员真的改动时记录；
 2. 模型重新命名后，连续沿用次数清零；
-3. 默认提示词变体下 bundle_key 与改动前逐字相同（重启不会让缓存全量失效）；
+3. 默认提示词语义版本变更使旧缓存失效，同一版本重启仍保持稳定键；
 4. 语义合并 / 同名合并记 consolidate 触发源。
 """
 import hashlib
@@ -169,9 +169,15 @@ class BundleKeyCompatTests(_Base):
                  'owner', 'lp-x', 'g1', '3']
         return hashlib.sha256('\0'.join(parts).encode('utf-8')).hexdigest()
 
-    def test_default_variant_keeps_the_pre_change_key(self):
-        """默认（full）下键与改动前逐字相同：重启后既有缓存仍可命中。"""
-        self.assertEqual(naming.bundle_key(*self.ARGS), self.legacy())
+    def test_versioned_default_invalidates_legacy_and_is_stable(self):
+        """语义提示词升级不能复用旧响应，同版本的键仍然稳定。"""
+        current = naming.bundle_key(*self.ARGS)
+        self.assertNotEqual(current, self.legacy())
+        self.assertEqual(current, naming.bundle_key(*self.ARGS))
+        with mock.patch.object(naming, 'prompt_variant', return_value='full'):
+            self.assertEqual(naming.bundle_key(*self.ARGS), self.legacy())
+        with mock.patch.object(naming, 'prompt_variant', return_value='full-next'):
+            self.assertNotEqual(naming.bundle_key(*self.ARGS), current)
 
     def test_compact_variant_still_gets_its_own_key(self):
         os.environ['SJFX_LP_NAMING_COMPACT_OUTPUT'] = '1'
@@ -278,17 +284,23 @@ class BorrowIdleTests(unittest.TestCase):
         os.environ['SJFX_GENERATION_CONCURRENCY'] = '2'
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.object(Config, 'DATA_DIR', Path(folder)):
-            for borrow, expect in (('0', False), ('60', True)):
-                os.environ['SJFX_GENERATION_BG_BORROW_IDLE_SECONDS'] = borrow
-                admitted = False
-                with md.background_generation():
-                    with md.generation_slot('fixture://borrow', timeout=2):
-                        try:
-                            with md.generation_slot('fixture://borrow', timeout=1):
-                                admitted = True
-                        except LocalModelError:
-                            admitted = False
-                self.assertEqual(admitted, expect, 'borrow=%s' % borrow)
+            try:
+                for borrow, expect in (('0', False), ('60', True)):
+                    os.environ['SJFX_GENERATION_BG_BORROW_IDLE_SECONDS'] = borrow
+                    admitted = False
+                    with md.background_generation():
+                        with md.generation_slot('fixture://borrow', timeout=2):
+                            try:
+                                with md.generation_slot('fixture://borrow', timeout=1):
+                                    admitted = True
+                            except LocalModelError:
+                                admitted = False
+                    self.assertEqual(admitted, expect, 'borrow=%s' % borrow)
+            finally:
+                # The dispatch pool deliberately retains one connection per
+                # thread. This test owns its temporary instance and must close
+                # it before TemporaryDirectory removes its Windows DB file.
+                md._drop_conn()
 
     def test_worker_lane_cap_follows_borrow(self):
         os.environ['SJFX_GENERATION_CONCURRENCY'] = '2'

@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import unittest
+from contextlib import closing
 from unittest.mock import patch
 import test_large_qa_unchanged as fixtures
 from services import large_qa_changes as changes
@@ -15,7 +16,7 @@ class ChangeTrackingTests(unittest.TestCase):
     documents = fixtures.UnchangedSyncTests.documents
 
     def install(self):
-        with sqlite3.connect(str(self.db)) as c:
+        with closing(sqlite3.connect(str(self.db))) as c, c:
             changes.install(c)
 
     def stamp(self, package='p'):
@@ -84,7 +85,7 @@ class ChangeTrackingTests(unittest.TestCase):
                 self.execute(f'UPDATE {table} SET {key}=?', ('q',))
                 self.assertNotEqual(old_p, self.stamp())
                 self.assertNotEqual(old_q, self.stamp('q'))
-                with sqlite3.connect(str(self.db)) as c:
+                with closing(sqlite3.connect(str(self.db))) as c, c:
                     row = c.execute(f'SELECT * FROM {table}').fetchone()
                     c.execute('BEGIN')
                     before = changes.read_stamp(c, 'q')
@@ -108,7 +109,7 @@ class ChangeTrackingTests(unittest.TestCase):
     def test_rollback_and_source_snapshot_are_consistent(self):
         self.prime()
         before = self.stamp()
-        with sqlite3.connect(str(self.db)) as writer:
+        with closing(sqlite3.connect(str(self.db))) as writer, writer:
             writer.execute("UPDATE files SET name='rolled back'")
             self.assertNotEqual(changes.read_stamp(writer, 'p'), before)
             self.assertEqual(self.stamp(), before)
@@ -170,7 +171,7 @@ class ChangeTrackingTests(unittest.TestCase):
         self.install()
         self.execute('CREATE UNIQUE INDEX global_name ON files(name)')
         self.assertIsNone(self.stamp())
-        with sqlite3.connect(str(self.db)) as c:
+        with closing(sqlite3.connect(str(self.db))) as c, c:
             self.assertFalse(changes.install(c))
 
     def test_case_insensitive_package_unique_disables_shortcut(self):
@@ -259,12 +260,14 @@ class ChangeTrackingTests(unittest.TestCase):
         self.prime()
         before = self.documents()
         saved = self.base/'saved.db'
-        with sqlite3.connect(str(self.db)) as source, sqlite3.connect(str(saved)) as dest:
+        with (closing(sqlite3.connect(str(self.db))) as source, source,
+              closing(sqlite3.connect(str(saved))) as dest, dest):
             source.backup(dest)
         self.execute('UPDATE files SET local_summary=?',(json.dumps({'summary':'newer evidence'}),))
         self.index.sync_store(self.store)
         self.assertNotEqual(self.documents(),before)
-        with sqlite3.connect(str(saved)) as source, sqlite3.connect(str(self.db)) as dest:
+        with (closing(sqlite3.connect(str(saved))) as source, source,
+              closing(sqlite3.connect(str(self.db))) as dest, dest):
             source.backup(dest)
         self.assertEqual(self.index.sync_store(self.store),1)
         self.assertEqual(self.documents(),before)
@@ -289,7 +292,7 @@ class ChangeTrackingTests(unittest.TestCase):
         self.assertEqual(self.index.sync_store(self.store),1)
 
     def test_install_failure_is_atomic(self):
-        with sqlite3.connect(str(self.db)) as c:
+        with closing(sqlite3.connect(str(self.db))) as c, c:
             with patch.object(changes, 'definitions', return_value={'bad':'invalid SQL'}):
                 with self.assertRaises(sqlite3.OperationalError):
                     changes.install(c)

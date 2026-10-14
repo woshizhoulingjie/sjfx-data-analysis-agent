@@ -169,7 +169,7 @@ def _direction(category, data, groups=None, total_files=None, topic_profile=None
     }
 
 
-def catalog_input_revision(conn, package_id):
+def catalog_input_revision(conn, package_id, quality=None):
     """Hash report-relevant catalog content, not polling timestamps or vectors.
 
     Call within the caller's read/write transaction so the signature describes
@@ -189,7 +189,10 @@ def catalog_input_revision(conn, package_id):
         "SELECT status,COUNT(*) FROM lp_catalog_jobs WHERE package_id=? "
         "AND status IN ('queued','running','retry','deferred') GROUP BY status ORDER BY status",
         (package_id,))]
-    return hashlib.sha256(json.dumps([package_id, groups, branches, pending],
+    if quality is None:
+        from services.large_package_catalog_review import catalog_review_state
+        quality = catalog_review_state(conn, package_id)
+    return hashlib.sha256(json.dumps([package_id, groups, branches, pending, quality['revision']],
         ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()[:24]
 
 
@@ -332,7 +335,9 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
     directory = report_directory(store, package_id)
     with _lock, closing(store._connect()) as conn:
         conn.execute("BEGIN")
-        catalog_revision = catalog_input_revision(conn, package_id)
+        from services.large_package_catalog_review import catalog_review_state
+        catalog_quality = catalog_review_state(conn, package_id)
+        catalog_revision = catalog_input_revision(conn, package_id, quality=catalog_quality)
         revision = conn.execute("SELECT COUNT(*),MAX(updated_at) FROM files WHERE package_id=?", (package_id,)).fetchone()
 # 缓存键必须覆盖**主题层**与**研究方向规则版本**：改动前只含 files 与
         # lp_catalog_labels 的 (COUNT, MAX)，于是"只新增了主题层"时报告仍命中
@@ -587,6 +592,9 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
             limits.append("有 {} 个文件解析失败；页面和报告最多展示前 50 条失败记录。".format(coverage["failed_files"]))
         if coverage["unsupported_files"]:
             limits.append("有 {} 个非敏感文件尚未提取到可读正文，可能需要 OCR、格式支持或人工复核。".format(coverage["unsupported_files"]))
+        if catalog_quality['review_leaf_nodes'] or catalog_quality['review_theme_nodes']:
+            limits.append("目录仍有 {} 个分组、{} 个上层主题范围待确认；待确认状态不等于名称错误。".format(
+                catalog_quality['review_leaf_nodes'], catalog_quality['review_theme_nodes']))
         package_status = str(item.get("status") or "")
         if package_status == "paused":
             limits.insert(0, "数据包已暂停；本概览基于已完成的深度摘要与本地摘要生成，继续深度摘要后概览会随之更新。")
@@ -612,6 +620,7 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
         report = {
             "schema_version": SCHEMA, "revision": cache_key, "package_id": package_id,
             "catalog_input_revision": catalog_revision,
+            "catalog_quality": catalog_quality,
             "generated_at": datetime.now(timezone.utc).isoformat(), "status": item.get("status"), "phase": item.get("phase"),
             "root_path": item["root_path"], "coverage": dict(coverage), "categories": categories,
             # 报告骨架用的是哪一套：topic=智能目录的主题层，category=快速解析分类器
@@ -829,15 +838,9 @@ def _loose_json(text):
 def _direction_client():
     from config import Config
     try:
-        if Config.LLM_BACKEND == "vllm" and Config.ENABLE_VLLM:
-            from services.vllm import VLLMClient
-            return VLLMClient(Config.VLLM_BASE_URL, Config.VLLM_MODEL,
-                              timeout=Config.LP_DIRECTION_TIMEOUT,
-                              max_concurrency=1, api_key=Config.VLLM_API_KEY)
-        if Config.ENABLE_SHARED_OLLAMA:
-            from services.ollama import OllamaClient
-            return OllamaClient(Config.OLLAMA_BASE_URL, Config.OLLAMA_MODEL,
-                                timeout=Config.LP_DIRECTION_TIMEOUT, max_concurrency=1)
+        from services.model_backend import create_model_client
+        return create_model_client(Config, timeout=Config.LP_DIRECTION_TIMEOUT,
+                                   max_concurrency=1)
     except Exception:
         LOGGER.exception("direction client unavailable")
     return None
@@ -1365,6 +1368,44 @@ def build_overview(store, item, milestone="catalog", note="", _dedup_retry=True)
     被拒时，在发布事务与锁之外跑一次 normalize_leaves，目录确有改动就重建并**只重试
     一次**（`_dedup_retry=False` 防止递归）。拒绝原因不是重名时保持阻断不变。
     """
+    # Run the cheap publication gates before preparing the report.  The final
+    # transaction check in _publish_overview remains authoritative because the
+    # catalog can change while report preparation is running.
+    preflight = _overview_publication_preflight(store, str(item["id"]))
+    if preflight:
+        rejection = {"violations": list(preflight.get("violations") or [])}
+        if preflight.get("reason") == "catalog_validation":
+            # The early gate skips _publish_overview, so preserve the same
+            # rejection audit before returning or attempting the one-shot repair.
+            with store._lock, closing(store._connect()) as conn:
+                conn.execute(
+                    "INSERT INTO lp_workflow_events(package_id,object,old_state,new_state,"
+                    "reason,source,created) VALUES(?,?,?,?,?,?,?)",
+                    (str(item["id"]), 'catalog', '', 'rejected',
+                     '发布被目录校验阻断：' + '；'.join(rejection["violations"])[:300],
+                     'build_overview_preflight', time.time()))
+                conn.commit()
+        LOGGER.info("overview preparation deferred by catalog gate: package=%s reason=%s",
+                    item.get("id"), preflight.get("reason"))
+        blocked_report = {
+            "package_id": str(item["id"]), "milestone": milestone,
+            "published": False, "catalog_rejected": True,
+            "publication_blocked": preflight,
+            "rejection": rejection,
+        }
+        # Preserve the existing one-shot dedup repair for INV-3.  The repair
+        # runs only after the cheap gate rejects the snapshot and before any
+        # expensive report preparation is attempted.
+        if (_dedup_retry and _dedup_retry_wanted(rejection)):
+            from config import Config
+            if getattr(Config, "LP_PUBLISH_DEDUP_RETRY", False) and _dedup_for_retry(
+                    store, str(item["id"])):
+                LOGGER.info("overview publication retry after dedup: package=%s milestone=%s",
+                            item.get("id"), milestone)
+                return build_overview(store, store.get(item["id"]) or item,
+                                      milestone=milestone, note=note, _dedup_retry=False)
+        return blocked_report
+
     report = dict(build_report(store, item))
     report["version"] = 2 if milestone == "deep" else 1
     report["milestone"] = milestone
@@ -1432,6 +1473,40 @@ def build_overview(store, item, milestone="catalog", note="", _dedup_retry=True)
     return report
 
 
+def _overview_publication_preflight(store, package_id):
+    """Return a cheap publication blocker, or ``None`` when preparation may run.
+
+    This deliberately duplicates no final-write behavior: it only reads the
+    current catalog validation and tree completeness.  _publish_overview still
+    repeats both checks in its write transaction to protect against races.
+    """
+    from services.large_package_catalog_naming import validate_catalog
+
+    verdict = validate_catalog(store, package_id) or {}
+    if verdict.get("blocking"):
+        return {
+            "reason": "catalog_validation",
+            "violations": list(verdict.get("violations") or []),
+        }
+    with closing(store._connect()) as conn:
+        row = conn.execute(
+            "SELECT payload FROM lp_catalog_tree WHERE package_id=?", (package_id,)
+        ).fetchone()
+        if row:
+            try:
+                payload = json.loads(row[0] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if payload.get("publication_schema"):
+                from services.large_package_catalog_tree import publication_state
+                if not publication_state(conn, package_id, payload).get("complete"):
+                    return {
+                        "reason": "catalog_partial_snapshot",
+                        "violations": ["catalog_partial_snapshot"],
+                    }
+    return None
+
+
 def _publish_overview(store, item, report, milestone, rejection=None):
     """把 report 落成不可变产物，并登记 overview 版本与发布视图指针。
 
@@ -1466,6 +1541,17 @@ def _publish_overview(store, item, report, milestone, rejection=None):
             conn.rollback()
             LOGGER.info("overview publication deferred: catalog changed during build: %s", package_id)
             return None
+        tree_row = conn.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',
+                                (package_id,)).fetchone()
+        tree_payload = json.loads(tree_row[0] or '{}') if tree_row else {}
+        if tree_payload.get('publication_schema'):
+            from services.large_package_catalog_tree import publication_state
+            if not publication_state(conn, package_id, tree_payload)['complete']:
+                conn.rollback()
+                if isinstance(rejection, dict):
+                    rejection['violations'] = ['catalog_partial_snapshot']
+                LOGGER.info('overview publication deferred: catalog snapshot partial: %s', package_id)
+                return None
         from services.large_package_catalog_naming import ensure_catalog_version
         catalog_id = ensure_catalog_version(
             store, package_id, connection=conn, allow_previous=False)

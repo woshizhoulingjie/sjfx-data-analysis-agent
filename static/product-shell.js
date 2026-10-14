@@ -7,13 +7,12 @@
     physical: ['原始目录', '物理资料树'], analysis: ['智能分析', '主题与证据'],
     'large-import': ['大数据包', '导入资料'], 'large-select': ['大数据包', '选择深度摘要'],
     'large-catalog': ['大数据包', '原始目录与智能目录'], 'large-overview': ['大数据包', '情报概览'], 'large-result': ['大数据包', '情报概览'],
-    homogeneous: ['同构文件关联', '台账与事项脉络'],
     chat: ['资料问答', '持续对话'], translation: ['全文翻译', '原文与中文'],
     evidence: ['证据问答', '可追溯检索'], overview: ['数据包概览', '内容地图'],
     exports: ['导出中心', '交接成果'], tasks: ['任务中心', '运行状态'],
     settings: ['系统设置', '本地运行环境']
   };
-  const viewFor = { dashboard: 'dashboard', source: 'source', packages: 'packages', physical: 'explore', analysis: 'explore', 'large-import': 'packages', 'large-select': 'packages', 'large-catalog': 'large-result', 'large-overview': 'large-result', 'large-result': 'large-result', homogeneous: 'homogeneous', chat: 'chat', translation: 'translation', evidence: 'evidence', overview: 'overview', exports: 'exports', tasks: 'tasks', settings: 'settings' };
+  const viewFor = { dashboard: 'dashboard', source: 'source', packages: 'packages', physical: 'explore', analysis: 'explore', 'large-import': 'packages', 'large-select': 'packages', 'large-catalog': 'large-result', 'large-overview': 'large-result', 'large-result': 'large-result', chat: 'chat', translation: 'translation', evidence: 'evidence', overview: 'overview', exports: 'exports', tasks: 'tasks', settings: 'settings' };
   let activeRoute = 'dashboard';
   let navigationRestoreTarget = null;
   const SIDEBAR_COLLAPSED_KEY = 'sjfx_sidebar_collapsed_v1';
@@ -230,6 +229,7 @@
   function activate(route) {
     // Legacy links to the former evidence page now open the unified materials chat.
     if (route === 'evidence') route = 'chat';
+    if (route === 'homogeneous') route = 'analysis';
     route = routeNames[route] ? route : 'dashboard';
     const routeChanged = activeRoute !== route;
     activeRoute = route;
@@ -247,8 +247,8 @@
     if (route === 'tasks') window.SJFXTasks?.refresh();
     if (route === 'large-import' || route === 'large-select') window.SJFXLargePackage?.setStage(route === 'large-import' ? 'import' : 'select');
     if (route === 'packages' || route === 'source') window.SJFXLargePackage?.setStage('normal');
+    window.SJFXLargePackage?.activate(route);
     if (route === 'large-catalog' || route === 'large-overview' || route === 'large-result') window.SJFXLargeResult?.activate(window.sjfxLargeResultId || '', route === 'large-catalog' ? 'catalog' : 'overview');
-    if (route === 'homogeneous') window.SJFXHomogeneous?.activate();
     window.SJFXEngineering?.activate(route);
     window.SJFXExportCenter?.activate(route);
     if (route === 'packages') {

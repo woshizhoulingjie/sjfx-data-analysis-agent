@@ -79,7 +79,7 @@ class ResourceTests(unittest.TestCase):
         for error, tag in ((OSError(errno.ENOSPC, 'full'), 'resource_pressure'), (MemoryError('full'), 'resource_pressure'), (ValueError('invalid file'), 'error')):
             with self.subTest(tag=tag, error=type(error).__name__):
                 connection = MagicMock()
-                with patch.dict(os.environ), patch.object(extraction.os, 'nice'), patch.object(extraction, '_extract', side_effect=error):
+                with patch.dict(os.environ), patch.object(extraction.os, 'nice', create=True), patch.object(extraction, '_extract', side_effect=error):
                     extraction._child(connection, 'x', 'x', 100)
                 self.assertEqual(connection.send.call_args.args[0][0], tag)
                 connection.close.assert_called_once()
@@ -93,6 +93,8 @@ class ResourceTests(unittest.TestCase):
         context.Pipe.return_value = (parent, child)
         parent.poll.return_value = True
         parent.recv.return_value = ('resource_pressure', {'code':'ENOSPC', 'message':'full'})
+        # This fixture creates no OS process; never expose MagicMock's PID=1 coercion.
+        context.Process.return_value.pid = None
         context.Process.return_value.is_alive.return_value = False
         with patch.object(extraction.mp, 'get_context', return_value=context):
             with self.assertRaises(ResourcePressure) as caught:
@@ -100,6 +102,8 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'ENOSPC')
         parent.close.assert_called_once()
         context.Process.return_value.join.assert_called()
+        context.Process.return_value.terminate.assert_not_called()
+        context.Process.return_value.kill.assert_not_called()
 
     def test_heartbeat_failure_keeps_last_good_status_and_logs_error(self):
         target = self.root/'worker_status.json'
@@ -183,7 +187,7 @@ class WorkerResourceTests(unittest.TestCase):
         factory.assert_not_called()
         self.assertEqual((code, calls), (1, 0))
         self.assertIn('resource_pause', states['lp-test'])
-        status = json.loads((self.base/'worker_status.json').read_text())
+        status = json.loads((self.base/'worker_status.json').read_text(encoding='utf-8'))
         self.assertEqual(status['phase'], 'waiting_for_resources')
 
     def test_resource_pause_preserves_pending_document_and_recovers_all_languages(self):

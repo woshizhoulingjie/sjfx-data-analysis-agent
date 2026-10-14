@@ -1,6 +1,7 @@
 """Ordinary preliminary-only generation and versioned, per-job ready results."""
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -18,8 +19,8 @@ from services.preliminary_summary_input import INPUT_VERSION, build_preliminary_
 from services.summary_fidelity import SUMMARY_QUALIFIER_INSTRUCTION
 
 LOG = logging.getLogger("sjfx.preliminary")
-CONTRACT = "preliminary-ready-v2-source-ids"
-PROMPT_VERSION = "compact-6500-qualifiers-v3"
+CONTRACT = "preliminary-ready-v3-file-citations"
+PROMPT_VERSION = "compact-6500-qualifiers-v4-sections"
 
 
 def enabled(job):
@@ -71,6 +72,7 @@ def _prompt(rows):
         "不要在摘要、事实、论点、结论中反复表达同一句话。"
         "保留重要数字、单位、日期、否定条件和限制，不得为压缩字数改变事实。"
         "uncertainties/warnings保留影响判断的事项，无依据的字段留空，不凑字段。\n"
+        "综合问题、方法、结果及局限的原文，关联数字的单位、样本、比较基线与条件；局部研究方向只针对该文件，不借用全包首选。\n"
         "claim_evidence只引用输入中逐字出现的evidence_id，并为每条结论和事实给出直接来源；来源可回查不等于主张已获验证。"
         "仅输出所列字段；如包含结构概览，只列最多3个短章节名；研究方向最多一个简短问题，理由一句话。"
         + SUMMARY_QUALIFIER_INSTRUCTION
@@ -108,13 +110,14 @@ def _validated(response, rows):
     values = (response.get("json") or {}).get("documents")
     if not isinstance(values, list):
         return {}
-    expected = {str(r["job"]["id"]): r["job"]["options"]["path"] for r in rows}
+    expected = {str(r["job"]["id"]): r for r in rows}
     grouped = {}
     for value in values:
         if isinstance(value, dict):
             grouped.setdefault(str(value.get("file_id") or ""), []).append(value)
     output = {}
-    for job_id, path in expected.items():
+    for job_id, row in expected.items():
+        path = row["job"]["options"]["path"]
         matches = grouped.get(job_id) or []
         if len(matches) != 1:
             continue
@@ -137,6 +140,29 @@ def _validated(response, rows):
             )
         ):
             continue
+        if "claim_evidence" in item:
+            # IDs are selectable only when this file's bounded source actually
+            # sent them. Parse the source labels, so a longer ID (or an ID
+            # mentioned in prose) cannot make an omitted ID look available.
+            sent_ids = {
+                value.strip()
+                for label in re.findall(r"\((?:ID|原文证据ID)=([^\r\n)]*)\)", str(row.get("input") or ""))
+                for value in label.split(",") if value.strip()
+            }
+            document_ids = {
+                str(evidence.get("evidence_id"))
+                for evidence in (row.get("document") or {}).get("evidence") or []
+                if isinstance(evidence, dict) and evidence.get("evidence_id")
+            }
+            allowed_ids = sent_ids & document_ids
+            if any(evidence_id not in allowed_ids
+                   for citation in item["claim_evidence"]
+                   for evidence_id in citation.get("evidence_ids", [])):
+                # Reject only this file. The caller performs one single-file
+                # recovery before using a fresh local fallback; siblings keep
+                # their accepted responses and no rejected raw citation leaks
+                # into _prepare or the durable ready-result cache.
+                continue
         if any(k in item and not isinstance(item[k], dict) for k in ("structure_overview", "recommended_research_direction")):
             continue
         output[job_id] = item

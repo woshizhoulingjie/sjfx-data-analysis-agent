@@ -42,11 +42,36 @@ _MODE_ISOLATED_LEGACY = (
 class SemanticCatalogTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
+        self.workers=[]
         self.allowed=patch.object(Config,'SCAN_ALLOWED_ROOTS',());self.allowed.start()
         self.store=LargePackageStore(self.root/'large.db');self.pid=self.store.create(self.root)['id']
         self.embed=Embeddings();self.embedding_patch=patch('services.large_package_semantic.embedding_client',return_value=self.embed);self.embedding_patch.start()
     def tearDown(self):
+        # Directory updates run in a real background lane. Keep the isolated
+        # database and embedding fixture alive until every lane has stopped.
+        for worker in self.workers:
+            for executor in (worker._catalog_lane, worker._naming_executor):
+                if executor is not None:
+                    executor.shutdown(wait=True, cancel_futures=True)
+            for runner in worker._preview_runners:
+                runner.close()
         self.embedding_patch.stop();self.allowed.stop();self.tmp.cleanup()
+    def worker(self):
+        worker=LargePackageWorker(self.store);self.workers.append(worker)
+        return worker
+    def finish_catalog(self,worker,paths):
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline:
+            worker.run_once()
+            worker._drain_catalog_lane()
+            pending=self.store.pending_by_stage(self.pid,'catalog')
+            if (not any(pending.get(state,0) for state in ('queued','running','retry'))
+                    and all(self.row(path)['local_summary']['portrait'].get('catalog_status')=='classified'
+                            for path in paths)
+                    and self.store.catalog(self.pid)['smart']['catalog_states'].get('classified')==len(paths)):
+                return
+            time.sleep(.05)
+        self.fail('Directory classification did not persist within 10 seconds')
     def add(self,path,text,**extra):
         self.store.upsert_file(self.pid,{'path':path,'name':path,**extra})
         self.store.update_file(self.pid,path,quick_status='completed',local_summary={'sample':text,'portrait':{'schema':'large-content-portrait/1','fields':[],'headings':[]}})
@@ -99,7 +124,7 @@ class SemanticCatalogTests(unittest.TestCase):
     def test_pause_prevents_semantic_work(self):
         self.add('a.pdf','Remote attestation evidence and verification mechanisms.')
         self.store.update_package(self.pid,status='paused',phase='catalog_ready')
-        worker=LargePackageWorker(self.store)
+        worker=self.worker()
         self.assertFalse(worker.run_once());self.assertEqual(len(self.embed.calls),0)
     def test_empty_sensitive_files_do_not_infer_topic_from_filename(self):
         self.add('sales-contract.pdf','',sensitive=True)
@@ -122,21 +147,50 @@ class SemanticCatalogTests(unittest.TestCase):
     def test_bad_vectors_are_rejected(self):
         for vector in ([0,0,0],[float('nan'),1,0]):
             with self.assertRaises(ValueError):semantic._vector(vector)
+    def test_legacy_catalog_view_requires_current_named_evidence(self):
+        self.add('a.pdf','Remote attestation protocols and evidence verification.')
+        self.classify()
+        def states():
+            self.store._catalog_cache.clear()
+            return self.store.catalog(self.pid)['smart']['catalog_states']
+        self.assertEqual(states().get('classified'),1)
+        with self.store._connect() as c:
+            member=c.execute('SELECT group_id,input_hash FROM large_catalog_members WHERE package_id=? AND path=?',
+                             (self.pid,'a.pdf')).fetchone()
+            gid,digest=member
+            c.execute('UPDATE large_catalog_members SET input_hash=? WHERE package_id=? AND path=?',
+                      ('stale-hash',self.pid,'a.pdf'))
+        self.assertEqual(states().get('pending'),1,'A stale source hash must not remain classified')
+        with self.store._connect() as c:
+            c.execute('UPDATE large_catalog_members SET input_hash=? WHERE package_id=? AND path=?',
+                      (digest,self.pid,'a.pdf'))
+            c.execute("UPDATE large_catalog_groups SET status='deferred' WHERE package_id=? AND id=?",(self.pid,gid))
+        self.assertEqual(states().get('pending'),1,'A failed legacy naming result must not remain classified')
+        with self.store._connect() as c:
+            c.execute("UPDATE large_catalog_groups SET status='named' WHERE package_id=? AND id=?",(self.pid,gid))
+            revision=c.execute('SELECT content_revision FROM large_catalog_groups WHERE package_id=? AND id=?',
+                               (self.pid,gid)).fetchone()[0]
+            c.execute('INSERT INTO lp_catalog_labels VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                      (self.pid,gid,revision+1,1,'未完成模型标签','','[]','failed-model','d',1,0,0))
+        self.assertEqual(states().get('grouped'),1,'Stale/review model labels must keep their existing gate')
     def test_extractive_labels_preserve_chinese_source_phrases(self):
         result=name_group([{'text':'机密计算发展现状与趋势。机密计算发展现状与趋势。','deep_summary':'','headings':['机密计算发展现状与趋势'],'fields':[]}])
         self.assertIn('机密计算',result['topic'])
     @unittest.skipIf(Config.LP_CATALOG_KMODE, _MODE_ISOLATED_LEGACY)
+    @patch.object(Config,'LP_CATALOG_MODEL_NAMING',False)
     def test_preview_stage_produces_visible_groups_before_selection(self):
         source=self.root/'input';source.mkdir();(source/'one.txt').write_text('Remote attestation protocols verify remote device claims.',encoding='utf-8')
         self.store.update_package(self.pid,status='paused')
-        self.pid=self.store.create(source)['id'];worker=LargePackageWorker(self.store)
+        self.pid=self.store.create(source)['id'];worker=self.worker()
         try:
             worker.run_once();worker.run_once();worker.run_once()
+            self.finish_catalog(worker,['one.txt'])
             item=self.store.get(self.pid);cat=self.store.catalog(self.pid)
             self.assertEqual(item['status'],'waiting_for_selection')
             self.assertEqual(cat['smart']['catalog_states']['classified'],1)
             self.assertTrue(cat['smart']['topics'])
         finally:worker.preview_runner.close()
+    @patch.object(Config,'LP_CATALOG_MODEL_NAMING',False)
     def test_selected_file_summary_updates_directory_overview_and_exports(self):
         self.add('one.pdf','Trusted execution architecture and memory isolation.')
         self.add('two.pdf','Remote attestation protocols and evidence verification.')
@@ -145,10 +199,13 @@ class SemanticCatalogTests(unittest.TestCase):
         old_topic=self.row('one.pdf')['topic']
         self.store.save_selection(self.pid,['one.pdf'])
         result={'summary_type':'model','summary':'Remote attestation protocols require fresh evidence. Finding: nonce verification prevents replay attacks.','text_preview':'Trusted execution background and generic introduction.'}
-        worker=LargePackageWorker(self.store)
+        worker=self.worker()
         with patch.object(worker,'_deep_parse',return_value=result):worker.run_once()
+        self.finish_catalog(worker,['one.pdf','two.pdf'])
         current=self.store.get(self.pid);report=build_report(self.store,current)
         self.assertEqual(current['status'],'completed');self.assertNotEqual(old_topic,self.row('one.pdf')['topic'])
+        self.assertIn('attestation',self.row('one.pdf')['topic'].lower())
+        self.assertEqual(self.row('one.pdf')['deep_summary'],result)
         self.assertEqual(self.row('two.pdf')['deep_status'],'idle')
         self.assertNotEqual(before['revision'],report['revision'])
         self.assertIn('nonce verification',json.dumps(report['research_brief']['key_findings']))
@@ -165,9 +222,18 @@ class SemanticCatalogTests(unittest.TestCase):
         self.add('a.pdf','Remote attestation protocols and evidence verification.')
         semantic.embed_batch(self.store,self.pid,self.embed)
         self.store.update_package(self.pid,status='waiting_for_selection',phase='catalog_ready')
-        worker=LargePackageWorker(self.store)
-        with patch('services.vllm.VLLMClient.chat',side_effect=AssertionError('Do not call')):
-            self.assertTrue(worker.run_once())
+        worker=self.worker()
+        try:
+            with patch('services.vllm.VLLMClient.chat',side_effect=AssertionError('Do not call')):
+                self.assertTrue(worker.run_once())
+        finally:
+            # run_once schedules real background work. Join it before tearDown
+            # removes the isolated SQLite directory, including on Windows.
+            for executor in (worker._catalog_lane, worker._naming_executor):
+                if executor is not None:
+                    executor.shutdown(wait=True, cancel_futures=True)
+            for runner in worker._preview_runners:
+                runner.close()
         # 终态随模式不同，且**两种都是正确的**：
         #   * legacy 抽取式车道（KMODE=0）在本次调度里就写完名字 -> 'classified'
         #   * KMODE=1 把命名**有意**派给后台队列（"不让可选措辞阻塞选择"是既定

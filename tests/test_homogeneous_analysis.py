@@ -159,18 +159,19 @@ class HomogeneousDocumentAnalysisTests(unittest.TestCase):
             storage.delete_scan("scan-h", owner_id="owner")
             self.assertIsNone(storage.get_homogeneous_analysis("scan-h"))
 
-    def test_frontend_exposes_independent_module(self):
+    def test_frontend_legacy_route_and_homogeneous_backend_contract(self):
         project = Path(__file__).resolve().parents[1]
         template = (project / "templates" / "index.html").read_text(encoding="utf-8")
         shell = (project / "static" / "product-shell.js").read_text(encoding="utf-8")
         client = (project / "static" / "homogeneous-analysis.js").read_text(encoding="utf-8")
         polish = (project / "static" / "ui-polish.js").read_text(encoding="utf-8")
-        # 8a2f524（2026-09-13）起侧栏"邮件分析"改为独立工作台 /mail-research，
-        # 同构分析不再占侧栏按钮，但仍须可达：快速导航与"查看文件关联"都路由到它。
+        # The current shell routes former homogeneous links to the analysis
+        # workspace. Mail research has its own entry; the local analysis API
+        # and evidence contract remain available for existing consumers.
         self.assertIn('href="/mail-research"', template)
-        self.assertIn("['homogeneous', '同构文件关联'", polish)
-        self.assertIn('data-view="homogeneous"', template)
-        self.assertIn("homogeneous: 'homogeneous'", shell)
+        self.assertIn("['analysis', '智能分析'", polish)
+        self.assertIn('data-view="explore"', template)
+        self.assertIn("if (route === 'homogeneous') route = 'analysis';", shell)
         self.assertIn("/api/homogeneous-analysis/", client)
         self.assertIn("文件结论", client)
         self.assertIn("原文支撑", client)

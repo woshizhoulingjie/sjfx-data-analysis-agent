@@ -1,4 +1,5 @@
 """HTTP contract for catalog handoff; isolated stores, no model or lifespan."""
+import gc
 import json
 import sqlite3
 from contextlib import closing
@@ -25,6 +26,9 @@ def api(monkeypatch):
         yield web, case, client
         client.close()
     finally:
+        # Large-store connections held by sqlite's internal cycles must be
+        # collected before Windows can remove the temporary database files.
+        gc.collect()
         case.tearDown()
 
 

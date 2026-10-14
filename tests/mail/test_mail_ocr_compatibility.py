@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from config import Config
+
 from services.mail.ocr import _rapid_engine, _rapid_models, _rapid_result, _rapid_text, extract_result, rapid_available
 from services.mail.extraction import extract_ocr
 
@@ -39,7 +41,7 @@ class MailOCRCompatibilityTests(unittest.TestCase):
             for name in ('ch_PP-OCRv5_det_mobile.onnx', 'ch_PP-OCRv5_rec_mobile.onnx',
                          'ch_ppocr_mobile_v2.0_cls_mobile.onnx', 'ch_PP-OCRv5_rec_server.onnx'):
                 (root / name).write_bytes(b'local model fixture')
-            modules = {'config': SimpleNamespace(Config=SimpleNamespace(RAPIDOCR_MODEL_DIR=root))}
+            modules = {'config': SimpleNamespace(Config=SimpleNamespace(RAPIDOCR_MODEL_DIR=root, PARSE_TEMP_DIR=root / 'parse-temp'))}
             with patch.dict(sys.modules, modules), patch.dict(os.environ, {'MAIL_OCR_REC_MODEL': 'auto'}):
                 selected = _rapid_models()
                 self.assertEqual(selected[1], 'ch_PP-OCRv5_rec_server.onnx')
@@ -54,7 +56,7 @@ class MailOCRCompatibilityTests(unittest.TestCase):
             for name in ('ch_PP-OCRv5_det_mobile.onnx', 'ch_PP-OCRv5_rec_mobile.onnx',
                          'ch_ppocr_mobile_v2.0_cls_mobile.onnx'):
                 (root / name).write_bytes(b'local model fixture')
-            modules = {'config': SimpleNamespace(Config=SimpleNamespace(RAPIDOCR_MODEL_DIR=root))}
+            modules = {'config': SimpleNamespace(Config=SimpleNamespace(RAPIDOCR_MODEL_DIR=root, PARSE_TEMP_DIR=root / 'parse-temp'))}
             with patch.dict(sys.modules, modules), patch('services.mail.ocr.importlib.util.find_spec', return_value=object()):
                 with patch.dict(os.environ, {'MAIL_OCR_REC_MODEL': 'auto'}):
                     self.assertTrue(rapid_available())
@@ -107,7 +109,7 @@ class MailOCRCompatibilityTests(unittest.TestCase):
         def complete(command, **kwargs):
             Path(command[3]).with_name('ocr-result.json').write_text(json.dumps({'status': 'ready', 'text': 'exact OCR'}), encoding='utf-8')
             return SimpleNamespace(returncode=0)
-        config = SimpleNamespace(MAIL_PARSE_TIMEOUT_SECONDS=60, MAIL_OCR_TIMEOUT_SECONDS=120)
+        config = SimpleNamespace(MAIL_PARSE_TIMEOUT_SECONDS=60, MAIL_OCR_TIMEOUT_SECONDS=120, PARSE_TEMP_DIR=Config.PARSE_TEMP_DIR)
         modules = {'config': SimpleNamespace(Config=config),
                    'services.parse_isolation': SimpleNamespace(runner_for=MagicMock())}
         part = SimpleNamespace(filename_raw='scan.pdf', content_type='application/pdf', raw_payload=b'PDF fixture')

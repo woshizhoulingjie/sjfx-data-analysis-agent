@@ -1,5 +1,8 @@
 import unittest
 import json
+from unittest.mock import patch
+
+from config import Config
 
 from services.conversation import (
     CallableEvidenceRetriever,
@@ -140,6 +143,14 @@ class IntentRoutingTests(unittest.TestCase):
 
 
 class ConversationEngineTests(unittest.TestCase):
+    def setUp(self):
+        # These fake-model tests exercise answering and provider failure;
+        # small-window capacity has its own explicit 4K regression suite.
+        for setting in ('LLM_CONTEXT_TOKENS', 'CONVERSATION_CONTEXT_TOKENS'):
+            patcher = patch.object(Config, setting, 32768)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def make_engine(self, retrieval, model=None, structured=None, translator=None, **kwargs):
         return ConversationEngine(
             CallableEvidenceRetriever(lambda request: retrieval(request) if callable(retrieval) else retrieval),

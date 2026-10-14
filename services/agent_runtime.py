@@ -114,7 +114,7 @@ class StructuredAgentResult(BaseModel):
 
 
 class PydanticAgentRuntime:
-    """Dependency-light typed adapter around the local Ollama transport.
+    """Dependency-light typed adapter around the selected local transport.
 
     The previous implementation instantiated ``pydantic_ai.Agent`` but never
     executed it: every request already travelled through the audited local
@@ -169,7 +169,7 @@ class PydanticAgentRuntime:
         # enforces the model context window; each business feature remains free
         # to choose the output budget appropriate for its response contract.
         max_tokens = requested_max_tokens
-        if use_vllm_json:
+        if use_vllm_json and getattr(self.transport, "backend_name", "vllm") == "vllm":
             minimum_timeout = int(
                 getattr(Config, "VLLM_STRUCTURED_TIMEOUT_SECONDS", 180)
             )
@@ -190,9 +190,12 @@ class PydanticAgentRuntime:
             "timeout": timeout,
         }
         if use_vllm_json:
-            chat_kwargs["response_format"] = _vllm_structured_response_format(
-                required_fields, output_schema
-            )
+            if getattr(self.transport, "supports_json_schema", True):
+                chat_kwargs["response_format"] = _vllm_structured_response_format(
+                    required_fields, output_schema
+                )
+            else:
+                chat_kwargs["response_format"] = {"type": "json_object"}
         compact_contract = ""
         if use_vllm_json and not long_output:
             compact_contract = (
@@ -216,6 +219,8 @@ class PydanticAgentRuntime:
         )
 
         def parse_payload(response):
+            if str(response.get("finish_reason") or "").lower() in {"length", "max_tokens", "max_length"}:
+                raise ValueError("结构化结果达到输出上限，不能标记为完整结果")
             extracted = extract_json_value(response["content"])
             repaired = repair_json_object(
                 extracted, required_fields=required_fields

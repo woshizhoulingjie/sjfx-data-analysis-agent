@@ -153,6 +153,8 @@ def _number(value):
 
 def _result_number(value):
     value = round(float(value), 6)
+    if not math.isfinite(value):
+        raise ValueError("统计结果超出可表示数字范围")
     if value == 0:
         return 0
     if value.is_integer():
@@ -407,13 +409,15 @@ def _local_stat(operation, item):
     count = _number(column.get("count"))
     if count is not None and count < 0:
         count = None
+    if operation in {"sum", "average"} and "sum_out_of_range" in (column.get("numeric_warnings") or []):
+        return None, count, True
 
     if operation == "sum":
         value = _number(column.get("sum"))
         if value is None:
             mean = _number(column.get("mean"))
             if mean is not None and count is not None:
-                value = mean * count
+                value = _number(mean * count)
                 return value, count, True
         return value, count, False
     if operation == "average":
@@ -422,7 +426,7 @@ def _local_stat(operation, item):
         if count is None or count <= 0:
             return None, count, False
         if total is None and mean is not None:
-            total = mean * count
+            total = _number(mean * count)
             return total, count, True
         return total, count, False
     if operation == "max":
@@ -434,6 +438,22 @@ def _local_stat(operation, item):
     return None, count, False
 
 
+def _scaled_weighted_average(items, values, counts):
+    """Keep a representable mean when its intermediate numerator overflows."""
+    means = [
+        _number(value / count) if value is not None else _number(item["column"].get("mean"))
+        for item, value, count in zip(items, values, counts)
+    ]
+    if any(mean is None for mean in means):
+        raise ValueError("缺少可用于加权平均的有限均值")
+    count_scale = max(counts)
+    weights = [count / count_scale for count in counts]
+    mean_scale = max(abs(mean) for mean in means)
+    if not mean_scale:
+        return 0.0
+    return (math.fsum((mean / mean_scale) * weight for mean, weight in zip(means, weights)) / math.fsum(weights)) * mean_scale
+
+
 def _aggregate(operation, items, column_name):
     values = []
     counts = []
@@ -442,8 +462,11 @@ def _aggregate(operation, items, column_name):
     for item in items:
         value, count, was_reconstructed = _local_stat(operation, item)
         if value is None:
-            missing.append("{}::{}".format(item["source_path"], item["table"]))
-            continue
+            if operation == "sum" and was_reconstructed:
+                raise ValueError("字段 {} 的局部合计超出可表示数字范围：{}::{}".format(column_name, item["source_path"], item["table"]))
+            if not (operation == "average" and was_reconstructed and count is not None and count > 0 and _number(item["column"].get("mean")) is not None):
+                missing.append("{}::{}".format(item["source_path"], item["table"]))
+                continue
         values.append(value)
         counts.append(count)
         reconstructed.append(was_reconstructed)
@@ -456,14 +479,27 @@ def _aggregate(operation, items, column_name):
     if not values:
         raise ValueError("字段 {} 没有可用的完整统计值".format(column_name))
     if operation == "sum":
-        value = math.fsum(values)
+        try:
+            value = math.fsum(values)
+        except OverflowError:
+            scale = max(abs(value) for value in values)
+            value = math.fsum(value / scale for value in values) * scale
+        if not math.isfinite(value):
+            raise ValueError("字段 {} 的合计超出可表示数字范围".format(column_name))
         calculation = "各参与表字段 sum 相加"
     elif operation == "average":
-        total_count = math.fsum(count for count in counts if count is not None)
-        if total_count <= 0:
+        if any(count is None or count <= 0 for count in counts):
             raise ValueError("字段 {} 没有可用于加权平均的数值记录".format(column_name))
-        value = math.fsum(values) / total_count
-        calculation = "各参与表字段 sum 总和 ÷ 非空数值 count 总和（加权平均）"
+        try:
+            total_count = math.fsum(counts)
+            value = math.fsum(values) / total_count if all(value is not None for value in values) else None
+        except OverflowError:
+            value = None
+        if value is None or not math.isfinite(value):
+            value = _scaled_weighted_average(items, values, counts)
+            calculation = "按局部均值与非空数值 count 缩放加权；中间合计超出可表示数字范围"
+        else:
+            calculation = "各参与表字段 sum 总和 ÷ 非空数值 count 总和（加权平均）"
     elif operation == "max":
         value = max(values)
         calculation = "取各参与表字段 max 的最大值"
@@ -482,9 +518,12 @@ def _field_evidence(operation, items, reconstructed):
         value, count, _ = _local_stat(operation, item)
         if operation == "average":
             local_value = _number(item["column"].get("mean"))
-            detail = "局部均值={}，非空数值={}，加权分子={}。".format(
-                local_value, _result_number(count or 0), _result_number(value or 0)
-            )
+            if value is None:
+                detail = "局部均值={}，非空数值={}，加权分子超出可表示数字范围。".format(local_value, _result_number(count or 0))
+            else:
+                detail = "局部均值={}，非空数值={}，加权分子={}。".format(
+                    local_value, _result_number(count or 0), _result_number(value)
+                )
         elif operation == "count":
             detail = "字段非空数值={}；表记录数={}。".format(
                 _result_number(value or 0), _row_count(item["profile"])
@@ -497,14 +536,14 @@ def _field_evidence(operation, items, reconstructed):
         if _is_partial(item["profile"]):
             notes.append("有界采样，建议复核原表")
         if reconstructed[index]:
-            notes.append("由均值×非空数值数重建")
+            notes.append("按有限均值与计数加权" if value is None else "由均值×非空数值数重建")
         evidence.append({
             "source_path": item["source_path"],
             "table": item["table"],
             "column": item["name"],
             "row_range": _row_range(item["profile"]),
             "statistic": operation,
-            "value": _result_number(value),
+            "value": _result_number(value) if value is not None else None,
             "numeric_count": _result_number(count) if count is not None else None,
             "text": "字段 {}：{}{}".format(
                 item["name"], detail, " " + "；".join(notes) + "。" if notes else ""

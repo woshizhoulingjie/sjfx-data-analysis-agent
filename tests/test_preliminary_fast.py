@@ -13,6 +13,8 @@ from services.preliminary_summary_fast import enabled, generate_ready_results
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
+    # Ordinary generation/cache tests assume a fake model that fits four files.
+    monkeypatch.setattr(Config, "LLM_CONTEXT_TOKENS", 32768)
     monkeypatch.setattr(Config, "PRELIMINARY_SUMMARY_OPTIMIZATION_ENABLED", True)
     store = Storage(tmp_path / "test.db")
     store.save_scan({"root": str(tmp_path), "tree": {}}, "scan", owner_id="owner")
@@ -134,6 +136,47 @@ def test_only_missing_file_is_retried(setup):
     assert model.calls[1][0][0]["path"] == "b.txt"
     assert all(kwargs["structured_retry_limit"] == 0 for rows, kwargs in model.calls)
     assert not any(v["result"]["degraded"] for v in results.values())
+
+
+def test_4k_packing_leaves_unsent_files_queued_until_their_own_claim(setup, monkeypatch):
+    store, ids = setup
+    monkeypatch.setattr(Config, "LLM_CONTEXT_TOKENS", 4096)
+    monkeypatch.setattr(Config, "PRELIMINARY_SUMMARY_BATCH_SIZE", 4)
+    monkeypatch.setattr(Config, "PRELIMINARY_SUMMARY_CONCURRENCY", 1)
+    model = Model()
+    completed = []
+    original_documents = {
+        store.get_job(job_id)["options"]["path"]:
+            store.get_document("scan", store.get_job(job_id)["options"]["path"])
+        for job_id in ids
+    }
+
+    for expected_id in ids:
+        lead = store.claim_next_job("worker")
+        assert lead["id"] == expected_id
+        result = generate_ready_results(model, store, lead, fallback)
+        ready = result["_preliminary_ready_results"]
+        sent = model.calls[-1][0]
+        assert [row["file_id"] for row in sent] == [expected_id]
+        assert set(ready) == {expected_id}
+        assert result["_preliminary_batch_size"] == 1
+        assert store.get_job(expected_id)["status"] == "running"
+        assert not ready[expected_id]["result"]["degraded"]
+        unsent = ids[len(completed) + 1:]
+        assert all(store.get_job(job_id)["status"] == "queued" for job_id in unsent)
+        assert all(store.get_summary("scan", store.get_job(job_id)["options"]["path"],
+                                     "preliminary_file_summary") is None for job_id in unsent)
+        assert store.commit_preliminary_result(lead, ready[expected_id]) == "completed"
+        completed.append(expected_id)
+
+    assert completed == ids
+    assert [row["file_id"] for rows, _kwargs in model.calls for row in rows] == ids
+    assert all(store.get_job(job_id)["status"] == "completed" for job_id in ids)
+    assert all(store.get_summary("scan", path, "preliminary_file_summary") is not None
+               for path in original_documents)
+    assert all(store.get_document("scan", path) == document
+               for path, document in original_documents.items())
+    assert store.claim_next_job("worker") is None
 
 
 def test_fallback_is_marked_and_retries_bounded(setup):

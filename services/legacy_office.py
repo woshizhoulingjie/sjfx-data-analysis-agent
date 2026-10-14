@@ -8,14 +8,42 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
-import tempfile
 import time
+
+# This module is also invoked by absolute script path in a helper interpreter.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from services.process_liveness import initialize_process_family, own_process_tree, terminate_process_tree
+from services.parse_temp import temporary_parse_directory
 
 EXTENSIONS = frozenset({".doc", ".ppt", ".xls", ".rtf"})
 TOOLS = Path(__file__).resolve().parents[1] / ".tools" / "legacy-office" / "usr"
+
+
+def _tool_roots():
+    from config import Config, resolve_config_path
+    configured = str(os.getenv("SJFX_TOOLS_DIR") or "").strip()
+    root = resolve_config_path(configured) if configured else Config.TOOLS_DIR
+    return tuple(dict.fromkeys((root / "legacy-office" / "usr", root / "legacy-office", root)))
+
+
+def _find_tool(tool):
+    """Find external Windows .exe tools and retain the bundled Linux layout."""
+    import shutil
+    names = (tool + ".exe",) if os.name == "nt" else (tool,)
+    for root in _tool_roots():
+        for directory in (root / "bin", root):
+            for name in names:
+                executable = directory / name
+                if executable.is_file():
+                    return str(executable), root
+    for name in names:
+        executable = shutil.which(name)
+        if executable:
+            return executable, None
+    raise RuntimeError("缺少本地旧格式解析组件：" + tool)
 
 
 def _limit(name, default, low, high):
@@ -47,12 +75,20 @@ def extract_legacy(path, max_chars=200000, *, preview=False, refine=False, secon
         return _empty("旧格式文件超过本次读取预算；已保留清单，可选择深度解析或提高旧格式读取预算")
     request = {"parent_pid": os.getpid(), "path": str(path), "max_chars": max_chars, "max_bytes": max_bytes,
                "preview": bool(preview), "refine": bool(refine), "seconds": deadline}
-    with tempfile.TemporaryDirectory(prefix="sjfx-legacy-") as scratch:
+    with temporary_parse_directory(prefix="sjfx-legacy-") as scratch:
         target = Path(scratch) / "result.json"
+        # The native tool cannot run before the Windows parent owns its tree.
+        gate = Path(scratch) / "start"
+        request["start_gate"] = str(gate)
         command = [sys.executable, str(Path(__file__).resolve()), "--worker", json.dumps(request), str(target)]
         proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                start_new_session=(os.name != "nt"))
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+        job_owner = None
         try:
+            job_owner = own_process_tree(proc.pid)
+            if os.name == "nt" and job_owner is None:
+                raise RuntimeError("无法建立 Windows 旧格式解析子进程回收边界")
+            gate.touch()
             proc.wait(timeout=max(.1, deadline))
             if proc.returncode != 0 or not target.exists():
                 return _empty("旧格式解析进程失败或达到资源上限；未将空正文标记为成功")
@@ -61,14 +97,7 @@ def extract_legacy(path, max_chars=200000, *, preview=False, refine=False, secon
             return _empty("旧格式解析时间预算已用尽；可选择深度解析重试")
         finally:
             # Also reap native parser descendants on timeout/cancellation.
-            if os.name != "nt":
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            elif proc.poll() is None:
-                proc.kill()
-            proc.wait()
+            terminate_process_tree(proc, grace_seconds=.5, job=job_owner, private_group=True)
     after = path.stat()
     if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
         raise RuntimeError("文件在旧格式解析过程中发生变化，已丢弃结果")
@@ -76,25 +105,22 @@ def extract_legacy(path, max_chars=200000, *, preview=False, refine=False, secon
 
 
 def _native(path, ext, max_chars, seconds):
-    import shutil
     tool = "antiword" if ext == ".doc" else "catppt"
-    executable = TOOLS / "bin" / tool
-    executable = str(executable) if executable.is_file() else shutil.which(tool)
-    if not executable:
-        raise RuntimeError("缺少本地旧格式解析组件：" + tool)
+    executable, tool_root = _find_tool(tool)
     env = os.environ.copy()
-    if (TOOLS / "share" / "antiword").is_dir():
-        env["ANTIWORDHOME"] = str(TOOLS / "share" / "antiword")
+    if tool_root is not None and (tool_root / "share" / "antiword").is_dir():
+        env["ANTIWORDHOME"] = str(tool_root / "share" / "antiword")
     args = [executable, "-m", "UTF-8.txt", "-w", "0", str(path)] if ext == ".doc" else [executable, "-d", "utf-8", str(path)]
-    with tempfile.TemporaryDirectory(prefix="sjfx-legacy-native-") as scratch:
+    with temporary_parse_directory(prefix="sjfx-legacy-native-") as scratch:
         # catdoc resolves charsets through its own private rc file.
         env["HOME"] = scratch
-        if (TOOLS / "share" / "catdoc").is_dir():
-            (Path(scratch) / ".catdocrc").write_text("charset_path=" + str(TOOLS / "share" / "catdoc") + "\nmap_path=" + str(TOOLS / "share" / "catdoc") + "\n", encoding="utf-8")
+        if tool_root is not None and (tool_root / "share" / "catdoc").is_dir():
+            (Path(scratch) / ".catdocrc").write_text("charset_path=" + str(tool_root / "share" / "catdoc") + "\nmap_path=" + str(tool_root / "share" / "catdoc") + "\n", encoding="utf-8")
         out = Path(scratch) / "out.txt"
         err = Path(scratch) / "err.txt"
         with out.open("wb") as stdout, err.open("wb") as stderr:
-            proc = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=env)
+            proc = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=env,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
             until = time.monotonic() + seconds
             limited = False
             try:
@@ -217,15 +243,15 @@ def _read(request):
 
 if __name__ == "__main__":
     request = json.loads(sys.argv[2])
+    initialize_process_family()
+    gate = Path(request["start_gate"])
+    until = time.monotonic() + 30
+    while not gate.exists():
+        if time.monotonic() >= until:
+            sys.exit(1)
+        time.sleep(.01)
     if os.name != "nt":
         import resource
-        import ctypes
-        # Linux delivers SIGTERM when the owning parser process is killed.
-        ctypes.CDLL(None).prctl(1, signal.SIGTERM)
-        def terminate_family(*_):
-            # The native reader belongs to this worker's private process group.
-            os.killpg(os.getpgrp(), signal.SIGKILL)
-        signal.signal(signal.SIGTERM, terminate_family)
         if os.getppid() != request['parent_pid']:
             sys.exit(1)
         memory = _limit("SJFX_LEGACY_MEMORY_MIB", 768, 128, 2048) * 1024**2

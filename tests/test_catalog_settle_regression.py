@@ -181,7 +181,7 @@ def test_catalog_message_switches_to_refined_when_everything_is_done():
             paths = case.add('g1', v, n=2)
             _branch(case, '主题甲', ['g1'])
             with closing(case.store._connect()) as c:
-                c.execute("UPDATE queue SET status='completed' WHERE package_id=? AND stage='catalog'", (case.pid,))
+                c.execute("UPDATE queue SET status='completed' WHERE package_id=? AND stage IN ('catalog','quick','inventory')", (case.pid,))
                 c.commit()
             case.store.update_package(case.pid, status='waiting_for_selection', phase='catalog_ready',
                                       message='内容目录已就绪，可选择深度摘要范围；主题名称正在后台按证据完善')

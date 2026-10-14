@@ -94,6 +94,17 @@ class AgentRuntimeStructuredOutputTests(unittest.TestCase):
 
         self.assertEqual(len(transport.calls), 2)
 
+    def test_valid_but_truncated_json_is_never_a_completed_analysis(self):
+        transport = _StructuredTransport([
+            {"content": '{"core_summary":"可能只完成一部分"}', "model": "test",
+             "usage": {}, "finish_reason": "length"},
+        ])
+        runtime = PydanticAgentRuntime(transport)
+        with self.assertRaisesRegex(LocalModelError, "输出上限"):
+            runtime.chat_json("system", "user", required_fields=("core_summary",),
+                              structured_retry_limit=0)
+        self.assertEqual(len(transport.calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

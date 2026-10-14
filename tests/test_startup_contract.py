@@ -29,14 +29,17 @@ def _run_import(code, state_dir, **overrides):
             "ENABLE_API_DOCS": "0",
             "ENABLE_TRANSLATION": "0",
             "ENABLE_IMPORT_TRANSLATION": "0",
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
         }
     )
     env.update(overrides)
     return subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-X", "utf8", "-c", code],
         cwd=PROJECT_ROOT,
         env=env,
         text=True,
+        encoding="utf-8",
         capture_output=True,
         timeout=90,
         check=False,

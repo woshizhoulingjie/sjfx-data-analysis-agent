@@ -193,8 +193,10 @@ def capture_documents(run_dir, state_dir, source_root):
     from services.agent_runtime import PydanticAgentRuntime
     from services.document_analysis import analyze_document_preview, analyze_document_previews_batch, analyze_document
     from services.folder_analysis import analyze_folder
-    from services.vllm import VLLMClient
-    transport = VLLMClient(Config.VLLM_BASE_URL, Config.VLLM_MODEL, timeout=600, max_concurrency=1, api_key=Config.VLLM_API_KEY)
+    from services.model_backend import create_model_client
+    transport = create_model_client(Config, timeout=600, max_concurrency=1)
+    if transport is None:
+        raise RuntimeError("Enable the selected generation model before capturing features")
     llm = PydanticAgentRuntime(transport)
     root = Path(source_root).resolve()
     paths = sorted((path for path in root.rglob("*.txt") if path.is_file()), key=lambda p: p.stat().st_size, reverse=True)
@@ -249,7 +251,7 @@ def capture_conversations(run_dir, state_dir, source_root):
     from services.agent_runtime import PydanticAgentRuntime
     from services.conversation import CallableEvidenceRetriever, ConversationEngine
     from services.llm_trace import context as trace_context
-    from services.vllm import VLLMClient
+    from services.model_backend import create_model_client
     root = Path(source_root).resolve(); paths = sorted(root.glob("*.txt"), key=lambda p:p.stat().st_size, reverse=True)[:3]
     evidence = []
     for path in paths:
@@ -258,7 +260,9 @@ def capture_conversations(run_dir, state_dir, source_root):
             evidence.append({"evidence_id":"{}-C{:02d}".format(path.stem,index), "source_path":str(path.relative_to(root)).replace("\\","/"),
                 "location":"字符 {}-{}".format(start,start+3000), "original_text":text[start:start+3000], "score":1.0-index*.01})
     retrieval = {"results": evidence, "coverage":{"complete":True,"indexed_files":len(paths)}, "evidence_total":len(evidence)}
-    transport = VLLMClient(Config.VLLM_BASE_URL, Config.VLLM_MODEL, timeout=600, max_concurrency=1, api_key=Config.VLLM_API_KEY)
+    transport = create_model_client(Config, timeout=600, max_concurrency=1)
+    if transport is None:
+        raise RuntimeError("Enable the selected generation model before capturing features")
     llm = PydanticAgentRuntime(transport)
     engine = ConversationEngine(CallableEvidenceRetriever(lambda _request: retrieval), answer_model=llm, top_k=20)
     session = engine.new_session(

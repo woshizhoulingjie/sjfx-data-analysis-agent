@@ -1,4 +1,5 @@
 import errno
+import os
 import tempfile
 import sqlite3
 import time
@@ -18,10 +19,12 @@ from services.large_package_resources import (AdmissionGuard, ResourcePressure,
 
 
 class AdmissionTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'SQLite Windows VFS uses the native temp directory')
     def test_explicit_sqlite_temp_directory_precedes_python_default(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict('os.environ', {'SQLITE_TMPDIR':folder}):
             self.assertEqual(sqlite_temp_directory(),Path(folder).resolve())
 
+    @unittest.skipIf(os.name == 'nt', 'Unix VFS fallback order')
     def test_sqlite_unix_fallback_order_matches_official_vfs(self):
         with patch.dict('os.environ', {'SQLITE_TMPDIR':'','TMPDIR':''}), patch(
                 'services.large_package_resources.Path.is_dir',return_value=True), patch(
@@ -258,10 +261,14 @@ class PackageResourceTests(unittest.TestCase):
 
     def test_inventory_resource_stat_error_is_not_a_skipped_file(self):
         entry=MagicMock();entry.path=str(self.root/'source.txt')
-        entry.stat.side_effect=OSError(errno.ENOMEM,'memory')
         entries=MagicMock();entries.__iter__.return_value=iter([entry])
-        with patch('services.large_package_isolated.os.scandir',return_value=entries):
-            with self.assertRaises(OSError):list(iter_inventory(self.root))
+        # The shared no-follow boundary uses lstat on Windows and DirEntry.stat
+        # on POSIX. Inject resource pressure at that boundary on either OS.
+        with patch('services.large_package_isolated.os.scandir',return_value=entries), patch(
+                'services.large_package_isolated.nofollow_entry_stat',side_effect=OSError(errno.ENOMEM,'memory')):
+            with self.assertRaises(OSError) as caught:list(iter_inventory(self.root))
+        self.assertEqual(caught.exception.errno,errno.ENOMEM)
+        entries.close.assert_called_once()
 
     def test_inventory_permission_error_keeps_existing_visible_warning(self):
         warnings=[]
@@ -298,8 +305,11 @@ class PreviewProtocolTests(unittest.TestCase):
     def test_child_transports_resource_type_instead_of_only_string(self):
         connection=MagicMock()
         connection.recv.side_effect=[dict(root='/unused',item={}),EOFError()]
+        # This protocol test runs the child loop in the pytest process. Its
+        # real session/signal setup belongs to the spawned-process tests.
         with patch('services.large_package_preview.preview_file',side_effect=MemoryError()), patch(
-                'services.large_package_preview_runner.os.nice'):
+                'services.large_package_preview_runner.os.nice', create=True), patch(
+                'services.large_package_preview_runner.initialize_process_family'):
             _serve(connection)
         self.assertEqual(connection.send.call_args.args[0]['resource_code'],'memory_exhausted')
         connection.close.assert_called_once()

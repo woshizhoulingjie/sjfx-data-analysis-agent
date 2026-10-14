@@ -9,12 +9,27 @@ from collections import Counter
 VERSION = "mail-foundation-v4-reading"
 
 
-def source_inventory(source, policy, adapter):
+def source_inventory(source, policy, adapter, owner_id=None):
     """Retain non-mail and policy-rejected entries instead of hiding them."""
     from pathlib import Path
     from .models import MailMember
+    from .source import file_identity, open_authorized_file, authorized_source_snapshot, NativeAdapter, inventory_mbox
     import zipfile
     path = Path(source.path)
+    container_identity = None
+    if not path.is_dir():
+        container_identity = file_identity(path)
+        revision = str(source.source_revision or '')
+        # Real API file revisions are content hashes. Preserve named revisions
+        # used by historical integrations, while refusing changed API sources.
+        if re.fullmatch(r'sha256:[0-9a-f]{64}', revision):
+            digest = hashlib.sha256()
+            locator = {'kind':'file','path':str(path),'identity':container_identity}
+            with open_authorized_file(locator, policy, owner_id=owner_id) as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(block)
+            if revision != 'sha256:' + digest.hexdigest():
+                raise ValueError('邮件来源内容与创建时的版本不一致，请重新导入')
     if path.is_dir():
         candidates = []
         for candidate in path.rglob('*'):
@@ -31,15 +46,23 @@ def source_inventory(source, policy, adapter):
             name = p.relative_to(path).as_posix()
             error = None
             size = 0
+            locator = {'kind':'file','path':str(p)}
             try:
                 p.resolve().relative_to(path.resolve())
-                size=p.stat().st_size
+                locator = policy.resolve_locator(locator, owner_id=owner_id)
+                observed = p.stat()
+                locator['identity'] = {'size': int(observed.st_size),
+                                       'modified_at_ns': int(observed.st_mtime_ns),
+                                       'device': int(observed.st_dev),
+                                       'inode': int(observed.st_ino)}
+                size=observed.st_size
                 policy.validate_size(size,limit=policy.max_message_bytes,label='邮件')
             except (ValueError, OSError) as exc:
                 error = str(exc)
-            yield MailMember(name, ordinal, size, {'kind':'file','path':str(p)}), ('restricted' if error else 'pending' if p.suffix.casefold()=='.eml' else 'unsupported'), error
+            yield MailMember(name, ordinal, size, locator), ('restricted' if error else 'pending' if p.suffix.casefold()=='.eml' else 'unsupported'), error
     elif path.suffix.casefold()=='.zip':
-        with zipfile.ZipFile(path) as archive:
+        locator = {'kind':'zip','path':str(path),'identity':container_identity}
+        with open_authorized_file(locator, policy, owner_id=owner_id) as stream, zipfile.ZipFile(stream) as archive:
             infos = [i for i in archive.infolist() if not i.is_dir()]
             if len(infos) > policy.max_archive_entries:
                 raise ValueError('压缩包成员数超过限制')
@@ -54,10 +77,30 @@ def source_inventory(source, policy, adapter):
                     if total > policy.max_total_uncompressed_bytes:raise ValueError('压缩包解压总大小超过限制')
                 except ValueError as exc:
                     error = str(exc)
-                yield MailMember(info.filename, ordinal, info.file_size, {'kind':'zip','path':str(path),'member':info.filename,'header_offset':info.header_offset}), ('restricted' if error else 'pending' if info.filename.casefold().endswith('.eml') else 'unsupported'), error
+                yield MailMember(info.filename, ordinal, info.file_size, dict(locator, member=info.filename, header_offset=info.header_offset)), ('restricted' if error else 'pending' if info.filename.casefold().endswith('.eml') else 'unsupported'), error
+    elif source.kind == 'mbox':
+        identity = container_identity
+        locator = {'kind':'mbox', 'path':str(path), 'identity':identity}
+        with open_authorized_file(locator, policy, owner_id=owner_id) as stream:
+            for member in inventory_mbox(source, policy, stream, identity):
+                yield member,'pending',None
     else:
-        for member in adapter.inventory(source,policy):
-            yield member,'pending',None
+        from dataclasses import replace
+        # Capture the container object before adapter inventory.  The open
+        # phase compares against this identity and rejects replacement.
+        identity = container_identity
+        def members(inventory_source):
+            for member in adapter.inventory(inventory_source,policy):
+                locator = dict(member.locator)
+                locator['identity'] = (file_identity(locator['path'])
+                                       if source.kind in {'msg','pst'} else identity)
+                yield MailMember(member.name, member.ordinal, member.byte_size, locator),'pending',None
+        if isinstance(adapter, NativeAdapter):
+            locator = {'kind':'file','path':str(path),'identity':identity}
+            with authorized_source_snapshot(locator, policy, owner_id=owner_id) as snapshot:
+                yield from members(replace(source, path=str(snapshot)))
+        else:
+            yield from members(source)
 
 
 def dumps(value):
@@ -334,9 +377,11 @@ def backfill_slice(repository, package_id, owner_id, *, job_id=None, cancelled=l
         from .policy import MailPolicy
         from .source import AdapterRegistry
         from config import Config
-        source=SourceRef(package_id=package_id,kind=package['source_kind'],path=package['source_path'],source_revision=package['source_revision'])
+        policy = MailPolicy.from_config(Config)
+        source_path = policy.resolve_source(package['source_path'], owner_id=owner_id)
+        source=SourceRef(package_id=package_id,kind=package['source_kind'],path=str(source_path),source_revision=package['source_revision'])
         adapter=AdapterRegistry().resolve(source)
-        for member,status,error in source_inventory(source,MailPolicy.from_config(Config),adapter):
+        for member,status,error in source_inventory(source,policy,adapter,owner_id):
             with repository._connection() as c:
                 exists=c.execute('SELECT 1 FROM mail_import_entries WHERE package_id=? AND member_name=?',(package_id,member.name)).fetchone()
             if not exists:

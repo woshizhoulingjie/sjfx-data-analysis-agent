@@ -22,6 +22,10 @@ class MailServices:
     storage: object
 
 
+    def close(self):
+        self.repository.close()
+
+
 def build_mail_services(storage, *, parser=None, translation_service=None,
                         owner_resolver=None, job_factory=None, model=None):
     runtime_storage = storage.initialize() if hasattr(storage, "initialize") else storage

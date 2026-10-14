@@ -1,9 +1,19 @@
 """Small CPU OpenAI-compatible embedding server for SJFX."""
 
 import os
+import sys
+from pathlib import Path
 from typing import List, Union
 import threading
 _admission = threading.BoundedSemaphore(1)
+
+# Support both `python -m services.mail.embedding_server` and a direct script
+# launch from any working directory. Keep an explicitly exported legacy PORT;
+# the application's PORT loaded from .env must not move this separate server.
+_exported_port = os.environ.get("PORT")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from config import Config
+from services.embedding_backend import artifact_fingerprint
 
 import torch
 import uvicorn
@@ -12,10 +22,9 @@ from pydantic import BaseModel
 from transformers import AutoModel, AutoTokenizer
 
 
-MODEL_PATH = os.environ.get(
-    "SJFX_EMBED_MODEL_PATH", "/home/zhoulingjie/models/multilingual-e5-small"
-)
+MODEL_PATH = Config.EMBED_MODEL_PATH
 MODEL_NAME = os.environ.get("SJFX_EMBED_MODEL_NAME", "multilingual-e5-small")
+SERVER_PORT = int(os.environ.get("SJFX_EMBED_PORT", _exported_port or "18083"))
 MAX_LENGTH = int(os.environ.get("SJFX_EMBED_MAX_LENGTH", "512"))
 MAX_BATCH = int(os.environ.get("SJFX_EMBED_MAX_BATCH", "8"))
 THREADS = int(os.environ.get("OMP_NUM_THREADS", "1"))
@@ -25,6 +34,7 @@ torch.set_num_interop_threads(1)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
 model = AutoModel.from_pretrained(MODEL_PATH, local_files_only=True)
 model.eval()
+MODEL_IDENTITY = artifact_fingerprint(MODEL_PATH)
 
 app = FastAPI(title="SJFX Mail CPU Embeddings")
 
@@ -42,12 +52,12 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL_NAME, "device": "cpu"}
+    return {"status": "ok", "model": MODEL_NAME, "device": "cpu", "sjfx_identity": MODEL_IDENTITY}
 
 
 @app.get("/v1/models")
 async def models():
-    return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "sjfx"}]}
+    return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "sjfx", "sjfx_identity": MODEL_IDENTITY}]}
 
 
 @app.post("/v1/embeddings")
@@ -60,6 +70,10 @@ def embeddings(request: EmbeddingRequest):
         _admission.release()
 
 def _encode(request: EmbeddingRequest):
+    if request.model and request.model != MODEL_NAME:
+        raise HTTPException(status_code=404, detail="configured embedding model is not loaded")
+    if request.encoding_format not in {None, "float"}:
+        raise HTTPException(status_code=400, detail="only float encoding is supported")
     values = [request.input] if isinstance(request.input, str) else request.input
     if not values or len(values) > MAX_BATCH or any(not isinstance(x, str) for x in values):
         raise HTTPException(status_code=400, detail=f"input must contain 1-{MAX_BATCH} strings")
@@ -82,10 +96,11 @@ def _encode(request: EmbeddingRequest):
             {"object": "embedding", "embedding": vector.tolist(), "index": index}
             for index, vector in enumerate(vectors)
         ],
-        "model": request.model or MODEL_NAME,
+        "model": MODEL_NAME,
+        "sjfx_identity": MODEL_IDENTITY,
         "usage": {"prompt_tokens": token_count, "total_tokens": token_count},
     }
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", "18083")))
+    uvicorn.run(app, host="127.0.0.1", port=SERVER_PORT)

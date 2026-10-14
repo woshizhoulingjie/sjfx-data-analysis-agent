@@ -22,6 +22,10 @@ class MailPolicy:
     max_member_depth: int
     max_mime_parts: int
     max_nested_message_depth: int
+    # Reserved multi-user upload namespace.  Kept optional for small unit
+    # tests that construct MailPolicy directly.
+    upload_root: Path | None = None
+    native_cache_root: Path | None = None
 
     @classmethod
     def from_config(cls, config):
@@ -35,15 +39,39 @@ class MailPolicy:
             max_member_depth=int(getattr(config, "MAX_ARCHIVE_MEMBER_PATH_DEPTH", 32)),
             max_mime_parts=int(getattr(config, "MAIL_MAX_MIME_PARTS_PER_MESSAGE", 1000)),
             max_nested_message_depth=int(getattr(config, "MAIL_MAX_NESTED_MESSAGE_DEPTH", 3)),
+            upload_root=Path(config.OUTPUT_DIR) / "_uploads",
+            native_cache_root=Path(config.DATA_DIR) / "mail-native",
         )
 
-    def resolve_source(self, raw_path: str) -> Path:
+    def resolve_source(self, raw_path: str, *, owner_id: str | None = None,
+                       require_exists: bool = True) -> Path:
         value = str(raw_path or "").strip()
         if not value or "\x00" in value:
             raise MailPolicyError("邮件来源路径无效")
-        path = Path(value).expanduser().resolve(strict=True)
-        if not (path.is_file() or path.is_dir()):
+        # Uploads are a reserved tree.  Check lexical and resolved ownership
+        # before the general allow-list, otherwise an ordinary allowed root
+        # could be used to alias another user's private upload session.
+        uploaded = resolved_upload = None
+        if self.upload_root is not None:
+            try:
+                from sjfx_multiuser.scan_paths import authorize_uploaded_scan_path
+                uploaded = authorize_uploaded_scan_path(
+                    value, self.upload_root, owner_id, check_filesystem=True
+                )
+            except ValueError as exc:
+                raise MailPolicyError(str(exc)) from exc
+        path = Path(value).expanduser().resolve(strict=require_exists)
+        if self.upload_root is not None:
+            try:
+                resolved_upload = authorize_uploaded_scan_path(
+                    path, self.upload_root, owner_id, check_filesystem=True
+                )
+            except ValueError as exc:
+                raise MailPolicyError(str(exc)) from exc
+        if require_exists and not (path.is_file() or path.is_dir()):
             raise MailPolicyError("邮件来源不是文件或目录")
+        if uploaded is not None or resolved_upload is not None:
+            return path
         for root in self.allowed_roots:
             try:
                 path.relative_to(root)
@@ -51,6 +79,44 @@ class MailPolicy:
             except ValueError:
                 continue
         raise MailPolicyError("邮件来源不在服务器允许的资料目录内")
+
+    def resolve_locator(self, locator, *, owner_id=None, source_kind=None,
+                        source_revision=None):
+        """Re-authorize an adapter locator immediately before a source read."""
+        value = dict(locator or {})
+        kind = value.get("kind")
+        if kind == "nested":
+            value["parent"] = self.resolve_locator(
+                value.get("parent"), owner_id=owner_id,
+                source_kind=source_kind, source_revision=source_revision,
+            )
+            return value
+        if kind not in {"file", "zip", "mbox"} or not value.get("path"):
+            raise MailPolicyError("邮件来源定位器不可用")
+        if source_kind in {"msg", "pst"} and kind == "file":
+            # Native adapters emit EML files under this exact revision cache,
+            # which intentionally lives outside SCAN_ALLOWED_ROOTS.
+            import hashlib
+            from sjfx_multiuser.uploads import UploadError, _assert_no_links
+            if self.native_cache_root is None or not source_revision:
+                raise MailPolicyError("原生邮件转换缓存不可用")
+            cache = self.native_cache_root / hashlib.sha256(
+                str(source_revision).encode()
+            ).hexdigest()
+            candidate = Path(value["path"]).expanduser()
+            try:
+                candidate.absolute().relative_to(cache.absolute())
+                _assert_no_links(candidate)
+                candidate = candidate.resolve(strict=True)
+                candidate.relative_to(cache.resolve(strict=True))
+            except (ValueError, OSError, UploadError) as exc:
+                raise MailPolicyError("原生邮件来源越出转换缓存") from exc
+            if not candidate.is_file():
+                raise MailPolicyError("原生邮件转换缓存不是文件")
+        else:
+            candidate = self.resolve_source(value["path"], owner_id=owner_id)
+        value["path"] = str(candidate)
+        return value
 
     def validate_member_name(self, member_name: str) -> str:
         candidate = str(member_name or "").replace("\\", "/")

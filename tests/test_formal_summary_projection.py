@@ -141,7 +141,7 @@ def directory_response(branch,published=True):
     from pathlib import Path
     from unittest.mock import Mock
     from services.import_state_machine import summary_type
-    source=ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_text())
+    source=ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_text(encoding='utf-8'))
     defs=[node for node in source.body if isinstance(node,ast.FunctionDef)
           and node.name in {'formal_directory','evidence_is_formal'}]
     for node in defs: node.decorator_list=[]
@@ -164,10 +164,15 @@ def directory_response(branch,published=True):
     storage.package_processing_counts.return_value={}
     storage.list_tree_edits.return_value=[]
     storage.get_scan.return_value={'file_count':1}
+    storage.get_scan_identity.return_value={'_owner_id':'test'}
     env={'storage':storage,'require_scan':lambda _:None,'jsonify':lambda x:x,
          '_published_deep_scope':lambda _:({'a.txt'},published),
          '_build_candidate_preview_directory':lambda _:{'topics':[data] if branch in {'selected','preview'} else []},
-         '_effective_owner':lambda :'test','staged_summary_type':summary_type,
+         '_effective_owner':lambda :'test','_request_owner_id':lambda :'test',
+         'staged_summary_type':summary_type,
          'project_node_claims':project_node_claims,'hashlib':hashlib}
     exec(compile(module,'app.py','exec'),env)
-    return env['formal_directory']('test')
+    result=env['formal_directory']('test')
+    storage.get_scan_identity.assert_called_once_with('test',owner_id='test')
+    storage.list_tree_edits.assert_called_once_with('test','test',limit=500)
+    return result

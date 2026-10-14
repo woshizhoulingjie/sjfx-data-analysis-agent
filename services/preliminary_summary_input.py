@@ -1,8 +1,9 @@
 """Bounded source selection used only by ordinary preliminary summaries."""
 import json
 import re
+from services.research_elements import research_passages, LABELS
 
-INPUT_VERSION = "selective-6500-v2-source-ids"
+INPUT_VERSION = "selective-6500-v3-research-sections"
 
 
 def _clean(value):
@@ -52,11 +53,24 @@ def build_preliminary_input(document, max_chars=6500):
         parts.append(label + "：" + text)
 
     add("标题与章节", title + ("；" + "、".join(headings[:24]) if headings else ""), 500)
-    if raw and len(raw) + sum(len(p) + 2 for p in parts) + 4 <= limit:
-        add("正文", raw, limit)
+    short_ids = list(dict.fromkeys(
+        _clean(e.get("evidence_id")) for e in document.get("evidence") or []
+        if isinstance(e, dict) and _clean(e.get("evidence_id"))
+        and _clean(e.get("text")) and _clean(e.get("text")) in raw
+    ))[:12]
+    short_label = "正文" + ("(原文证据ID=" + ",".join(short_ids) + ")" if short_ids else "")
+    if raw and len(raw) + sum(len(p) + 2 for p in parts) + len(short_label) + 4 <= limit:
+        add(short_label, raw, limit)
         return "\n\n".join(parts)
-    add("正文开头", raw, 1200)
-    add("正文结尾", raw, 1300, tail=True)
+    # Scan chapters/elements before positional excerpts, without adding any
+    # external summary fields. Preserve complete source sentences and IDs.
+    for role, units in research_passages(document, per_role=1, max_chars=420).items():
+        for unit in units:
+            evidence_id = _clean(unit.get("evidence_id"))
+            label = LABELS[role] + ("(ID=" + evidence_id + ")" if evidence_id else "")
+            add(label, unit["text"], 420, exact=True)
+    add("正文开头", raw, 800)
+    add("正文结尾", raw, 850, tail=True)
     evidence = [e for e in document.get("evidence") or []
                 if isinstance(e, dict) and _clean(e.get("text"))]
     evidence.sort(key=lambda e: (int(e.get("page") or 0), int(e.get("char_start") or 0)))
@@ -74,7 +88,7 @@ def build_preliminary_input(document, max_chars=6500):
             start = int(len(raw) * ratio)
             mid_sources.append(("正文中部", raw[start:start + 850]))
     for label, text in mid_sources:
-        add(label, text, 550)
+        add(label, text, 380)
     profile = document.get("data_profile") or {}
     if profile:
         compact = {k: profile[k] for k in ("row_count", "column_count", "coverage", "limits") if k in profile}

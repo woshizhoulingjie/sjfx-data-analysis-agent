@@ -24,12 +24,16 @@ from web_compat import SJFXFastAPI
 class FoundationContentTests(unittest.TestCase):
     def setUp(self):
         self.tmp=TemporaryDirectory();self.root=Path(self.tmp.name)
+        allowed_roots=patch.object(Config,'SCAN_ALLOWED_ROOTS',[str(self.root.resolve())])
+        allowed_roots.start();self.addCleanup(allowed_roots.stop)
         self.storage=Storage(self.root/'test.db')
         self.services=build_mail_services(self.storage,job_factory=self.storage.create_or_get_typed_job,owner_resolver=lambda:'owner')
         self.r=self.services.repository;self.r.migrate()
         self.p,_=self.r.create_package(owner_id='owner',display_name='package',source_kind='directory',source_path=str(self.root),source_revision='v1',config={})
         self.pid=self.p['package_id'];self.n=0
-    def tearDown(self):self.tmp.cleanup()
+    def tearDown(self):
+        self.services.close()
+        self.tmp.cleanup()
     def ingest(self,body='new text\n> quoted\n-- \nsignature\n',*,mid=None,reply=None,attachment=False):
         m=EmailMessage();m['From']='alice@example.com';m['To']='bob@example.com';m['Cc']='bob@example.com';m['Subject']='Test'
         m['Date']='Thu, 10 Sep 2026 23:59:59 +0000';m['Message-ID']='<{}@example.com>'.format(mid or self.n)

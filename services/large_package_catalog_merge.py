@@ -256,6 +256,12 @@ def _validate(value, rows):
 
 
 def apply_merge(store, package_id, rows, result, model, cancelled=lambda:False):
+    from services.large_package_catalog_coordination import leaf_batch
+    with leaf_batch(store, package_id, 'leaf-merge-apply', cancelled) as allowed:
+        return _apply_merge(store, package_id, rows, result, model, cancelled) if allowed else 0
+
+
+def _apply_merge(store, package_id, rows, result, model, cancelled=lambda:False):
     if cancelled():
         return 0
     with store._lock, closing(store._connect()) as c:
@@ -447,6 +453,12 @@ def merge_size_ceiling(store, package_id):
 
 
 def merge_identical_names(store, package_id, cancelled=lambda: False):
+    from services.large_package_catalog_coordination import leaf_batch
+    with leaf_batch(store, package_id, 'leaf-merge-identical', cancelled) as allowed:
+        return _merge_identical_names(store, package_id, cancelled) if allowed else 0
+
+
+def _merge_identical_names(store, package_id, cancelled=lambda: False):
     """同名叶子直接合并（确定性、零模型调用、受规模上限约束）。
 
     为什么需要它：同名是"同一主题"最强的证据，不该再让模型判一次。生产实测一个包里
@@ -575,6 +587,12 @@ def merge_identical_names(store, package_id, cancelled=lambda: False):
 
 
 def consolidate(store, package_id, round_state, cancelled=lambda:False, model_client=None):
+    from services.large_package_catalog_coordination import leaf_batch
+    with leaf_batch(store, package_id, 'leaf-consolidation', cancelled) as allowed:
+        return _consolidate(store, package_id, round_state, cancelled, model_client) if allowed else 0
+
+
+def _consolidate(store, package_id, round_state, cancelled=lambda:False, model_client=None):
     if os.getenv('SJFX_LP_SEMANTIC_LEAF_MERGE','1').lower() in {'0','false','off'}:
         return 0
     # **同名叶子先确定性合并**（零模型调用）：同名是"同一主题"最强的证据，不该等模型判。
@@ -715,7 +733,8 @@ def consolidate(store, package_id, round_state, cancelled=lambda:False, model_cl
             kwargs = {'temperature':.1,'max_tokens':output,'retries':0,
                       'timeout':min(cfg['timeout'],max(1,int(round_state['deadline']-time.time())))}
             if getattr(model_client,'supports_json_response_format',False): kwargs['response_format']={'type':'json_object'}
-            with background_generation(stop): response=model_client.chat(SYSTEM,user,**kwargs)
+            with background_generation(stop, deadline=naming.round_generation_deadline(round_state)):
+                response=model_client.chat(SYSTEM,user,**kwargs)
             if response.get('finish_reason')=='length' or stop(): raise ValueError('Incomplete merge response')
             data = extract_json_value(response.get('content',''))
             if not isinstance(data,dict): raise ValueError('Invalid merge response')

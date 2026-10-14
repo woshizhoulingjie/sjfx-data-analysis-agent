@@ -827,7 +827,10 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
             )
             return {"text": "full"}
 
-        def translate(_scan_id, node_path, source_level, job_id=None, max_units=None):
+        def translate(_scan_id, node_path, source_level, job_id=None, max_units=None,
+                      job_progress_range=None):
+            self.assertEqual(source_level, "full")
+            self.assertIsNotNone(job_progress_range)
             result = {
                 "status": "completed", "source_level": source_level,
                 "full_translation": source_level == "full",
@@ -848,6 +851,7 @@ class WebWorkflowIntegrationTests(unittest.TestCase):
             for _iteration in range(10):
                 job = self.storage.get_job(job_id)
                 result = self.app_module._run_claimed_translation_job(job)
+                self.assertEqual(result["failed_files"], 0, result["failures"])
                 continuation = result.get("continuation_job_id")
                 if isinstance(continuation, (list, tuple)):
                     continuation = continuation[0]

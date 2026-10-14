@@ -1,6 +1,6 @@
 """Deterministic contracts for the staged import workflow."""
-from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
+from services.file_capabilities import TEXT_EXTENSIONS, IMAGE_EXTENSIONS, ARCHIVE_EXTENSIONS, file_extension
 
 PREVIEW_LEVEL = "preview"
 DEEP_LEVEL = "deep"
@@ -10,12 +10,13 @@ def parse_plan(file_node: Mapping[str, Any], preview: Optional[Mapping[str, Any]
     """Choose an auditable parser plan before expensive content I/O."""
     node = dict(file_node or {})
     preview = dict(preview or {})
-    ext = str(node.get("extension") or Path(str(node.get("path") or "")).suffix).lower()
+    detected = file_extension(node.get("path") or "")
+    ext = detected if detected in ARCHIVE_EXTENSIONS else str(node.get("extension") or detected).lower()
     size = max(0, int(node.get("size") or 0))
-    text_ext = {".txt", ".md", ".markdown", ".html", ".htm", ".xml", ".csv", ".tsv", ".json", ".jsonl"}
-    table_ext = {".csv", ".tsv", ".xlsx", ".xls", ".xlsm", ".ods"}
-    image_ext = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
-    archive_ext = {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".rar", ".7z"}
+    text_ext = TEXT_EXTENSIONS
+    table_ext = {".csv", ".tsv", ".xlsx", ".xls", ".xlsm"}
+    image_ext = IMAGE_EXTENSIONS
+    archive_ext = ARCHIVE_EXTENSIONS
     kind, parser, needs_ocr, needs_docling = "unknown", "metadata_only", False, False
     if ext in image_ext:
         kind, parser, needs_ocr = "image", "ocr", True
@@ -31,10 +32,12 @@ def parse_plan(file_node: Mapping[str, Any], preview: Optional[Mapping[str, Any]
         kind, parser = "table", "structured"
     elif ext in text_ext:
         kind, parser = "text", "text_full"
-    elif ext in {".doc", ".docx", ".ppt", ".pptx", ".odt", ".rtf"}:
+    elif ext in {".doc", ".docx", ".ppt", ".pptx", ".rtf"}:
         kind, parser = "office", "document_structure"
     elif ext in archive_ext:
         kind, parser = "archive", "archive_members"
+    elif ext == ".eml":
+        kind, parser = "email", "mail_document"
     return {"schema_version": "parse-plan/1.0", "kind": kind, "parser": parser, "size": size, "needs_ocr": needs_ocr, "needs_docling": needs_docling, "requires_full_text": kind in {"text", "pdf", "office"}, "requires_structure": kind in {"table", "office", "archive"}, "estimated_cost": "high" if needs_ocr or size >= 256 * 1024 * 1024 else ("medium" if size >= 16 * 1024 * 1024 else "low"), "selection_required": True}
 
 def coverage_contract(level: str, **extra: Any) -> Dict[str, Any]:

@@ -408,13 +408,16 @@ def test_semantic_missing_requirement_triggers_bounded_research_retrieval(phase2
         return {'items':[{**r,**repo.create_evidence(package['package_id'],'owner',r)} for r in rows[:limit]]}
     monkeypatch.setattr(MailResearchTools,'search_messages',selected_search)
     class GapModel(Phase2Model):
-        def __init__(self):super().__init__();self.judge_calls=0;self.narrative_judge_calls=0
+        def __init__(self):
+            super().__init__();self.judge_calls=0;self.narrative_judge_calls=0;self.judge_sources=[]
         def chat_json(self,system,prompt,**kwargs):
             result=super().chat_json(system,prompt,**kwargs)
             if kwargs['required_fields']==('verdicts',):
                 narrative=bool(json.loads(prompt).get('presentation_version'))
                 if narrative:self.narrative_judge_calls+=1
-                else:self.judge_calls+=1
+                else:
+                    self.judge_calls+=1
+                    self.judge_sources.append({e['message_key'] for e in json.loads(prompt)['evidence']})
                 if not narrative and self.judge_calls==1:
                     for row in result['json']['verdicts']:
                         for atom in row['atoms']:
@@ -422,7 +425,13 @@ def test_semantic_missing_requirement_triggers_bounded_research_retrieval(phase2
             return result
     model=GapModel();turn=create_phase2_turn(repo,package,max_gap_rounds=2)
     final=MailResearchRuntime(repo,model=model).run(turn['turn_id'],'owner')
-    assert model.judge_calls==2 and model.narrative_judge_calls==1 and any('回应' in query for query in searched)
+    # Gap retrieval changes the context binding, so the original source is
+    # rechecked and the new source receives its own atomic verification.
+    # The empty sentence response below uses verified atoms directly and does
+    # not dispatch an additional narrative judge.
+    assert model.judge_calls==3 and model.narrative_judge_calls==0
+    assert model.judge_sources==[{first},{first},{second}]
+    assert any('回应' in query for query in searched)
     assert final['claims'][0]['semantic_status']=='supported'
     assert len(final['gap_search']['rounds'])<=2
     assert final['gap_search']['scope_widened'] is False

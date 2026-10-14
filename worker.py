@@ -6,7 +6,6 @@ claiming safe even if an operator accidentally starts a second Worker.
 """
 
 import errno
-import ctypes
 import copy
 import json
 import logging
@@ -14,16 +13,17 @@ import logging.handlers
 import multiprocessing
 import os
 import re
-import signal
 import shutil
 import socket
-import subprocess
 import time
 import traceback
 from pathlib import Path
 
 from config import Config, ensure_runtime_directories
 from services.storage import LazyStorage, Storage
+from services.process_liveness import (
+    available_memory_bytes, initialize_process_family, own_process_tree, terminate_process_tree,
+)
 
 
 logger = logging.getLogger("sjfx.worker")
@@ -189,18 +189,13 @@ def _background_resource_state(job):
     except (AttributeError, OSError):
         pass
     try:
-        available_kib = None
-        with open("/proc/meminfo", "r", encoding="ascii") as handle:
-            for line in handle:
-                if line.startswith("MemAvailable:"):
-                    available_kib = int(line.split()[1])
-                    break
+        available_bytes = available_memory_bytes()
         if (
-            available_kib is not None
-            and available_kib < int(Config.BACKGROUND_MIN_AVAILABLE_MEMORY_MB) * 1024
+            available_bytes is not None
+            and available_bytes < int(Config.BACKGROUND_MIN_AVAILABLE_MEMORY_MB) * 1024 * 1024
         ):
             reasons.append("系统可用内存不足")
-    except (OSError, ValueError, IndexError):
+    except (ImportError, OSError, ValueError):
         pass
     return not reasons, reasons
 
@@ -301,32 +296,12 @@ def execute(job):
     raise ValueError("未知任务类型：{}".format(task_type))
 
 
-def _execute_job_child(job, sender):
+def _execute_job_child(job, sender, start_gate=None):
     """Run one task in a killable process and return a compact outcome."""
     try:
-        parent_pid = os.getppid()
-        if os.name != "nt" and hasattr(os, "setsid"):
-            # Docling isolation may create parser grandchildren. A dedicated
-            # process group lets timeout/cancellation terminate the complete
-            # task tree instead of leaving OCR/parser processes orphaned.
-            os.setsid()
-            if os.uname().sysname.lower() == "linux":
-                # Ensure a service restart cannot leave the supervised job (or
-                # its parser grandchildren) writing after the queue owner died.
-                def parent_exit_handler(_signum, _frame):
-                    try:
-                        os.killpg(os.getpgrp(), signal.SIGKILL)
-                    finally:
-                        os._exit(128 + signal.SIGTERM)
-
-                signal.signal(signal.SIGTERM, parent_exit_handler)
-                try:
-                    libc = ctypes.CDLL(None)
-                    libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
-                    if os.getppid() != parent_pid:
-                        parent_exit_handler(signal.SIGTERM, None)
-                except (AttributeError, OSError):
-                    pass
+        initialize_process_family()
+        if start_gate is not None and not start_gate.wait(timeout=30):
+            raise RuntimeError("任务子进程未获得启动授权")
         sender.send({"status": "ok", "result": execute(job)})
     except BaseException as exc:  # the parent owns final status publication
         try:
@@ -381,70 +356,9 @@ def _task_runtime_limit(job):
     return max(30, int(limit))
 
 
-def _stop_process(process):
-    if not process or not process.is_alive():
-        return
-    if os.name == "nt":
-        # multiprocessing.terminate() only targets the direct child on
-        # Windows. taskkill /T closes the complete supervised tree, including
-        # Docling/OCR parser grandchildren, so cancellation and timeout cannot
-        # leave invisible CPU/RAM/temp-disk consumers behind.
-        try:
-            result = subprocess.run(
-                ["taskkill", "/PID", str(int(process.pid)), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=max(5, int(Config.WORKER_TERMINATE_GRACE_SECONDS) + 2),
-                check=False,
-            )
-            process.join(timeout=2)
-            if result.returncode == 0 and not process.is_alive():
-                return
-        except (OSError, subprocess.SubprocessError, ValueError):
-            # Fall through to the direct-process fallback. A deployment with
-            # psutil gets one additional recursive attempt before that.
-            pass
-        try:
-            import psutil
-
-            parent = psutil.Process(int(process.pid))
-            descendants = parent.children(recursive=True)
-            for child in reversed(descendants):
-                child.terminate()
-            parent.terminate()
-            _gone, alive = psutil.wait_procs(
-                descendants + [parent], timeout=max(1, Config.WORKER_TERMINATE_GRACE_SECONDS)
-            )
-            for remaining in alive:
-                remaining.kill()
-            process.join(timeout=2)
-            if not process.is_alive():
-                return
-        except Exception:
-            pass
-    group_signalled = False
-    if os.name != "nt" and hasattr(os, "killpg"):
-        try:
-            if os.getpgid(process.pid) == process.pid:
-                os.killpg(process.pid, signal.SIGTERM)
-                group_signalled = True
-        except (ProcessLookupError, PermissionError, OSError):
-            group_signalled = False
-    if not group_signalled:
-        process.terminate()
-    process.join(timeout=Config.WORKER_TERMINATE_GRACE_SECONDS)
-    if process.is_alive() and hasattr(process, "kill"):
-        killed_group = False
-        if os.name != "nt" and hasattr(os, "killpg"):
-            try:
-                if os.getpgid(process.pid) == process.pid:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    killed_group = True
-            except (ProcessLookupError, PermissionError, OSError):
-                killed_group = False
-        if not killed_group:
-            process.kill()
-        process.join(timeout=2)
+def _stop_process(process, job_owner=None):
+    terminate_process_tree(process, Config.WORKER_TERMINATE_GRACE_SECONDS,
+                           job=job_owner, private_group=True)
 
 
 def _commit_preliminary_ready(job, ready):
@@ -517,9 +431,10 @@ def execute_supervised(job):
     """
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
+    start_gate = context.Event()
     process = context.Process(
         target=_execute_job_child,
-        args=(job, sender),
+        args=(job, sender, start_gate),
         name="sjfx-job-{}".format(job["id"]),
     )
     process.daemon = False
@@ -527,8 +442,13 @@ def execute_supervised(job):
     timeout = _task_runtime_limit(job)
     next_heartbeat = 0.0
     packet = None
+    job_owner = None
     try:
         process.start()
+        job_owner = own_process_tree(process.pid)
+        if os.name == "nt" and job_owner is None:
+            raise RuntimeError("无法建立 Windows 任务子进程回收边界")
+        start_gate.set()
         sender.close()
         while True:
             if receiver.poll(Config.WORKER_MONITOR_SECONDS):
@@ -543,11 +463,11 @@ def execute_supervised(job):
                 # Cooperative parser loops get a brief chance to close their
                 # own child process and sidecar files before the hard stop.
                 process.join(timeout=min(2.0, Config.WORKER_TERMINATE_GRACE_SECONDS))
-                _stop_process(process)
+                _stop_process(process, job_owner)
                 raise JobCancelled("任务已按用户请求终止")
             source = str((job.get("options") or {}).get("workflow_source") or "")
             if source in {"idle_deep_model_summary", "deep_node_rebuild"} and storage.has_queued_job_above_priority(job.get("priority") or 10):
-                _stop_process(process)
+                _stop_process(process, job_owner)
                 return {"_defer_slice": True, "_defer_seconds": 2,
                         "_defer_message": "深度摘要已让位于前台任务，已完成的模型分块已保存。"}
             now = time.monotonic()
@@ -555,7 +475,7 @@ def execute_supervised(job):
                 storage.heartbeat_job(job["id"], WORKER_ID)
                 next_heartbeat = now + Config.WORKER_HEARTBEAT_SECONDS
             if now - started > timeout:
-                _stop_process(process)
+                _stop_process(process, job_owner)
                 raise JobExecutionTimeout(
                     "{}任务运行超过 {} 秒，已终止当前任务进程；已完成检查点仍会保留".format(
                         job.get("task_type") or "分析", timeout,
@@ -581,8 +501,10 @@ def execute_supervised(job):
             packet.get("traceback") or "",
         )
     finally:
-        if process.is_alive():
-            _stop_process(process)
+        if process.pid is not None:
+            _stop_process(process, job_owner)
+        if job_owner is not None:
+            job_owner.close()
         try:
             receiver.close()
         except Exception:
@@ -787,6 +709,8 @@ def run_forever():
     _configure_worker_logging()
     storage.initialize()
     lock_handle = _acquire_worker_lock()
+    from services.managed_entry import mark_role_ready
+    mark_role_ready()
     recovered = storage.recover_orphaned_jobs_after_lock()
     reconciled_turns = storage.reconcile_conversation_turn_jobs()
     resumed_imports = _resume_strict_imports()

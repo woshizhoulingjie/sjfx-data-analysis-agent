@@ -74,9 +74,11 @@ def test_real_parsed_report_does_not_block_preliminary_summary_queue(tmp_path, m
     report = store.get_summary(result['scan_id'], '.', 'parsed_report')
     assert report and report['summary_stage'] == 'parsed'
     assert report['report_scope']['selected_paths'] == [path]
+    assert report['report_scope']['selected_bytes'] == len(content)
+    assert report['coverage']['selected_scope_bytes'] == len(content)
     assert output.is_file()
     paragraphs = ' '.join(p.text for p in Document(output).paragraphs)
-    assert human_size(len(content)) in paragraphs
+    assert '资料文件 1 个；已解析 1 个' in paragraphs
     summaries = [j for j in store.list_jobs(owner_id='report-contract-owner')
                  if j['task_type'] == 'generate_summary']
     assert len(summaries) == 1

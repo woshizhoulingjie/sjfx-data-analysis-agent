@@ -275,7 +275,7 @@ def _analysis_tree_direction_clusters(analysis):
     return clusters
 
 
-def _direction_candidates(scan, analysis, limit=5):
+def _legacy_direction_candidates(scan, analysis, limit=5):
     """Rank explainable local directions before optional model wording.
 
     The model may improve prose later, but it cannot invent the candidate,
@@ -460,8 +460,26 @@ def _direction_candidates(scan, analysis, limit=5):
     return deduplicated
 
 
-def _research_direction(_scan, _summaries, analysis):
-    candidates = _direction_candidates(_scan, analysis)
+def _direction_candidates(scan, analysis, limit=8):
+    from services.research_opportunities import discover_opportunities
+    clusters = (_analysis_tree_direction_clusters(analysis)
+                or analysis.get("semantic_topic_clusters")
+                or analysis.get("research_topic_clusters")
+                or analysis.get("topic_clusters") or [])
+    if not clusters:
+        # A single parsed paper can support replication without a directory.
+        clusters = [{"topic": (d.get("structure") or {}).get("title") or "当前资料关键判断",
+                     "members": [(d.get("source") or {}).get("path") or d.get("path")],
+                     "evidence_chain": d.get("evidence") or []}
+                    for d in analysis.get("document_index") or []
+                    if (d.get("source") or {}).get("path") or d.get("path")]
+    candidates, audit = discover_opportunities(analysis, clusters, limit=limit)
+    analysis["research_opportunity_audit"] = audit
+    return candidates
+
+
+def _research_direction(_scan, _summaries, analysis, candidates=None):
+    candidates = _direction_candidates(_scan, analysis) if candidates is None else candidates
     if candidates:
         return candidates[0]
     evidence = _analysis_evidence(analysis, 8)
@@ -472,6 +490,8 @@ def _research_direction(_scan, _summaries, analysis):
         "type": "推论",
         "priority": "低",
         "score": 0,
+        "evidence_status": "insufficient",
+        "quality_gate": {"status": "insufficient", "reason": "no_evidence_backed_opportunity"},
         "rationale": "当前尚未形成有足够正文证据支撑的稳定主题，不能强行推荐领域方向。",
         "basis": "先补充待分析或失败文件，再重新生成概览。",
         "research_questions": ["哪些文件可以形成稳定主题？", "当前证据是否足以回答客户指定问题？"],
@@ -491,7 +511,7 @@ def candidates_have_evidence(local_report):
     )
 
 
-def _aligned_evidence_catalog(analysis, local_report, categories, limit=16, per_candidate=3, candidates=5):
+def _aligned_evidence_catalog(analysis, local_report, categories, limit=40, per_candidate=5, candidates=8):
     """Evidence catalog aligned with the candidates the model must choose from.
 
     The first slots hold each top candidate's own verified evidence, so every
@@ -508,7 +528,17 @@ def _aligned_evidence_catalog(analysis, local_report, categories, limit=16, per_
         output.append(item)
         return True
 
-    for candidate in list(local_report.get("direction_candidates") or [])[:candidates]:
+    # One slot per evidence role before extra excerpts, across all registered
+    # candidates. Counterevidence must not be displaced by supporting snippets.
+    rows = list(local_report.get("direction_candidates") or [])[:candidates]
+    for role in ("counterevidence", "conditions", "prior_work", "resources", "support"):
+        for candidate in rows:
+            by_id = {str(e.get("evidence_id")): e for e in candidate.get("evidence_chain") or []}
+            for identity in (candidate.get("evidence_roles") or {}).get(role) or []:
+                if str(identity) in by_id:
+                    add(by_id[str(identity)])
+                    break
+    for candidate in rows:
         taken = 0
         for item in candidate.get("evidence_chain") or []:
             if taken >= per_candidate:
@@ -625,11 +655,27 @@ def build_report_analysis_prompt(scan, summaries, analysis, local_report, eviden
 
 
 def _build_aligned_report_prompt(scan, summaries, analysis, local_report, categories,
-                                 evidence_limit=16, excerpt_limit=420):
+                                 evidence_limit=40, excerpt_limit=650):
     raw_catalog = _aligned_evidence_catalog(analysis, local_report, categories, limit=evidence_limit)
     catalog = []
+    from services.research_elements import complete_excerpt, research_passages
     for item in raw_catalog:
-        catalog.append(dict(item, text=" ".join(str(item.get("text") or "").split())))
+        text = " ".join(str(item.get("text") or "").split())
+        excerpt = complete_excerpt(text, excerpt_limit)
+        if len(text) > excerpt_limit:
+            units = research_passages({"evidence": [item]}, per_role=1, max_chars=excerpt_limit)
+            for role in ("limitation", "condition", "result", "method"):
+                if units.get(role):
+                    excerpt = units[role][0]["text"]
+                    break
+        if not excerpt:
+            continue
+        # Verification uses exactly the passage supplied to the model. Full
+        # local chains remain in the server recommendation for source opening.
+        record = dict(item, text=excerpt)
+        if record.get("translated_text"):
+            record["translated_text"] = complete_excerpt(record["translated_text"], excerpt_limit)
+        catalog.append(record)
     catalog_ids = {str(item.get("evidence_id")) for item in catalog}
     prompt_catalog = [{
         "evidence_id": str(item.get("evidence_id")),
@@ -650,10 +696,19 @@ def _build_aligned_report_prompt(scan, summaries, analysis, local_report, catego
         })
 
     candidates = []
-    for item in list(local_report.get("direction_candidates") or [])[:5]:
+    for item in list(local_report.get("direction_candidates") or [])[:8]:
         breakdown = item.get("score_breakdown") or {}
         candidates.append({
             "candidate_rank": item.get("rank"),
+            "candidate_id": item.get("candidate_id"),
+            "quality_gate": item.get("quality_gate"),
+            "research_questions": item.get("research_questions"),
+            "known_work": item.get("known_work"),
+            "research_gap": item.get("research_gap"),
+            "hypothesis": item.get("hypothesis"),
+            "limitations": item.get("limitations"),
+            "selection_reason": item.get("selection_reason"),
+            "evidence_roles": {role: [i for i in ids if str(i) in catalog_ids] for role, ids in (item.get("evidence_roles") or {}).items()},
             "title": item.get("title"),
             "score": item.get("score"),
             "priority": item.get("priority"),
@@ -674,6 +729,11 @@ def _build_aligned_report_prompt(scan, summaries, analysis, local_report, catego
 5. 研究问题写明“研究哪个对象、比较什么维度、如何用原文验证”；只在证据明确提供时写机构、指标、时间区间或版本。不要仅写“趋势分析”“进一步研究”。
 6. 研究方法使用“具体动作 → 预期产物”的表达；产物是研究计划，不得把尚未执行的分析写成既成发现。
 7. key_findings 只写原文可直接核验的事实，每条必须带 1-2 个 evidence_id，数字必须与原文一致；没有把握就少写或不写。
+8. 比较明确问题、已有工作、条件、反证及资源；rationale 说明与最强备选的取舍，不能仅写文件数量或分数高。
+9. 方法迁移是待验证假设，反例未命中不代表不存在；当前资料未见不能写全球首次或填补领域空白。资源未确认先安排确认，不能虚构数据集、指标、算法名称或已完成实验。
+10. 从全部登记候选作一次有界比较与可行性审查，所有模型意见逐项经服务端核验后采用；不要输出新的候选或提高本地置信度。
+11. 五种证据角色来自每候选一次有界召回与全主题盘点的分桶，不代表五次独立检索或全量精查。比较范围仅限下列登记候选；待精查机会不能写成已经排除。
+12. 全部分析措辞、问题、方法及推荐理由用中文表达；英文原始术语仅保留在证据目录。推荐理由分清已有依据、具体待解问题、研究价值、与最强备选的取舍及资源限制。写明为什么先做这个、先查什么，避免只重复分数、文件数或原文长引文。
 
 输出一个合法 JSON 对象：
 {{
@@ -696,11 +756,12 @@ def _build_aligned_report_prompt(scan, summaries, analysis, local_report, catego
     "evidence_ids":["E-..."]
   }}]
 }}
-key_findings 不超过 3 条，directions 不超过 3 条。
+key_findings 不超过 3 条，directions 不超过 3 条。问题与方法引用候选的原文对象及条件。
 
 扫描统计：{scan}
 本地内容分类：{categories}
 本地评分候选：{candidates}
+机会盘点与精查范围：{research_audit}
 已有节点摘要：{summaries}
 证据目录：{evidence}""".format(
         scan=json.dumps({
@@ -713,6 +774,7 @@ key_findings 不超过 3 条，directions 不超过 3 条。
         }, ensure_ascii=False),
         categories=json.dumps(categories, ensure_ascii=False),
         candidates=json.dumps(candidates, ensure_ascii=False),
+        research_audit=json.dumps({key: (local_report.get("research_opportunity_audit") or {}).get(key) for key in ("discovered_count", "refined_count", "refinement_budget", "refinement_complete")}, ensure_ascii=False),
         summaries=json.dumps(summaries_context, ensure_ascii=False),
         evidence=json.dumps(prompt_catalog, ensure_ascii=False),
     )
@@ -1215,7 +1277,13 @@ def build_local_report(scan, summaries, analysis=None, content_findings=False):
     # The first four lines are pipeline counters, the rest are quality notices.
     pipeline_statistics, quality_notices = findings[:4], findings[4:]
     direction_candidates = _direction_candidates(scan, analysis)
-    direction = direction_candidates[0] if direction_candidates else _research_direction(scan, summaries, analysis)
+    direction = direction_candidates[0] if direction_candidates else _research_direction(scan, summaries, analysis, candidates=[])
+    research_audit = analysis.get("research_opportunity_audit") or {}
+    if research_audit:
+        direction["coverage_note"] = "已盘点 {} 个可用主题，发现 {} 项机会，精查 {} 项；研究比较限于当前登记并通过审查的候选。".format(
+            len(research_audit.get("topics") or []), research_audit.get("discovered_count", 0), research_audit.get("refined_count", 0))
+        if research_audit.get("deferred"):
+            direction["limitations"] = list(direction.get("limitations") or []) + ["部分机会尚未精查，当前首选限于已完成证据审查的候选，详见处理记录。"]
     dimensions = analysis.get("classification_dimensions", [])
     structured = analysis.get("structured_data_overview") or stats.get("structured_data") or {}
     intelligence_overview = {
@@ -1246,6 +1314,8 @@ def build_local_report(scan, summaries, analysis=None, content_findings=False):
     }
     report = {
         "schema_version": 5,
+        "research_version": research_audit.get("version"),
+        "research_opportunity_audit": research_audit,
         "title": "数据包情况概览报告",
         "basic_information": [
             "扫描根目录：{}".format(scan["root"]),
@@ -1411,6 +1481,19 @@ def merge_model_report_aligned(local_report, model_report, evidence_catalog=None
                 rejection_reason="模型未指明有效的本地候选编号。",
             )
         else:
+            proposal_review = None
+            if candidate.get("candidate_id"):
+                from services.research_opportunities import review_model_proposal
+                patch, proposal_review, valid = review_model_proposal(candidate, recommendation, evidence_catalog)
+                if not valid:
+                    adoption["recommendation"] = "rejected_proposal_review"
+                    merged["rejected_model_recommendation"] = dict(recommendation, proposal_review=proposal_review)
+                    recommendation = {}
+                else:
+                    recommendation = dict(recommendation, **patch)
+                    for field in ("research_questions", "methods"):
+                        if field not in patch:
+                            recommendation.pop(field, None)
             rationale = " ".join(str(recommendation.get("rationale") or "").split())
             claim = "{} {}".format(candidate.get("title") or "", rationale).strip()
             chain, source = _resolve_inference(
@@ -1447,12 +1530,19 @@ def merge_model_report_aligned(local_report, model_report, evidence_catalog=None
                 "support_status": record["evidence_status"],
                 "verification_contract": "inference-relevance/1.0",
             }]
+            if proposal_review is not None:
+                record["proposal_review"] = proposal_review
+                record["evidence_chain"] = list(candidate.get("evidence_chain") or [])
+                record["evidence_ids"] = list(candidate.get("evidence_ids") or [])
+                if adoption["recommendation"] == "rejected_proposal_review":
+                    chain = []
             if chain:
                 adoption["recommendation"] = "adopted"
                 chosen_rank = candidate.get("rank")
                 merged["recommended_research_direction"] = record
             else:
-                adoption["recommendation"] = "rejected_no_relevant_evidence"
+                if adoption["recommendation"] != "rejected_proposal_review":
+                    adoption["recommendation"] = "rejected_no_relevant_evidence"
                 record["rationale"] = "证据不足，当前不能形成可靠推荐。"
                 record.setdefault("limitations", [])
                 record["limitations"] = list(record["limitations"]) + ["模型推荐理由与该候选的正文证据不相关，未采纳。"]
@@ -1470,6 +1560,16 @@ def merge_model_report_aligned(local_report, model_report, evidence_catalog=None
         candidate, matched_by = _match_candidate(direction, by_rank, by_title)
         if candidate is None:
             continue
+        if candidate.get("candidate_id"):
+            from services.research_opportunities import review_model_proposal
+            patch, review, valid = review_model_proposal(candidate, {
+                "rationale": direction.get("basis") or direction.get("direction"),
+                "evidence_ids": direction.get("evidence_ids") or [],
+            }, evidence_catalog)
+            if not valid:
+                merged.setdefault("rejected_model_directions", []).append(dict(direction, proposal_review=review))
+                continue
+            direction = dict(direction, direction=candidate.get("title"), basis=patch["rationale"])
         basis = " ".join(str(direction.get("basis") or "").split())
         text = " ".join(str(direction.get("direction") or "").split()) or candidate.get("title")
         claim = "{} {} {}".format(candidate.get("title") or "", text, basis).strip()

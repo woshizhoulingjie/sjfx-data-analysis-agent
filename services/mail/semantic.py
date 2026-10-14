@@ -5,6 +5,7 @@ import json
 import time
 import numpy as np
 from config import Config
+from services.embedding_encoding import prefix as embedding_prefix, tokenizer as selected_embedding_tokenizer, encoding as embedding_encoding
 
 _projections = {}
 _tokenizer = None
@@ -12,11 +13,8 @@ _tokenizer_checked = False
 
 
 def embedding_client():
-    if not Config.MAIL_ENABLE_VECTOR_INDEX or not Config.ENABLE_VLLM_EMBEDDINGS:
-        return None
-    from services.vllm import VLLMEmbeddingClient
-    return VLLMEmbeddingClient(Config.MAIL_EMBED_BASE_URL, Config.MAIL_EMBED_MODEL,
-        timeout=12, max_batch_size=8, max_chars=1200, api_key=Config.VLLM_API_KEY)
+    from services.embedding_backend import create_embedding_client
+    return create_embedding_client(Config, lane='mail', max_batch_size=Config.MAIL_EMBED_BATCH)
 
 
 def normalize_vector(value):
@@ -36,16 +34,8 @@ def lsh_buckets(vector):
 
 def _window(text, prefix, headings=''):
     global _tokenizer, _tokenizer_checked
-    if not _tokenizer_checked:
-        _tokenizer_checked = True
-        try:
-            import os
-            from pathlib import Path
-            from tokenizers import Tokenizer
-            path = Path(os.getenv('SJFX_EMBED_MODEL_PATH',str(Path(Config.VLLM_MODEL_PATH).parent/'multilingual-e5-small')))/'tokenizer.json'
-            _tokenizer = Tokenizer.from_file(str(path))
-        except Exception:
-            pass
+    _tokenizer = selected_embedding_tokenizer(Config)
+    _tokenizer_checked = True
     import html
     text = html.unescape(str(text or ''))
     if _tokenizer:
@@ -63,24 +53,45 @@ def _window(text, prefix, headings=''):
 
 
 def passage_text(text, headings=None):
-    return _window(text,'passage: ',' / '.join(headings or []))
+    return _window(text,embedding_prefix('passage', Config),' / '.join(headings or []))
 
 
 def query_text(question):
-    return _window(question,'query: ')
+    return _window(question,embedding_prefix('query', Config))
 
 
 def model_key(client):
     # Encoding changes invalidate cached vectors, while model clients still use the actual model name.
-    return str(client.model)+':mail-e5-window-v1:'+str(Config.MAIL_EMBED_MAX_CHARS)
+    from services.embedding_backend import client_identity
+    policy = 'mail-e5-window-v1' if embedding_encoding(Config) == 'e5' else 'mail-plain-window-v1'
+    return client_identity(client)+':'+policy+':'+str(Config.MAIL_EMBED_MAX_CHARS)
+
+
+def _require_space(c, package_id, key, dimension=0):
+    from services.embedding_backend import require_index_identity
+    keys=[r[0] for r in c.execute('SELECT DISTINCT model FROM mail_embeddings WHERE package_id=?',(package_id,))]
+    require_index_identity(c,'mail',package_id,key,dimension,keys)
+    dimensions={r[0] for r in c.execute('SELECT DISTINCT dim FROM mail_embeddings WHERE package_id=?',(package_id,))}
+    if len(dimensions)>1 or (dimension and dimensions and dimensions!={dimension}):
+        from services.model_contract import LocalModelError
+        raise LocalModelError('邮件向量维度不一致，旧索引已保留，请重建',code='embedding_rebuild_required')
 
 
 def index_status(repository, package_id, owner_id, key=None):
     package=repository.get_package(package_id,owner_id)
     if not package:raise ValueError('邮件资料包不存在')
-    key=key or Config.MAIL_EMBED_MODEL+':mail-e5-window-v1:'+str(Config.MAIL_EMBED_MAX_CHARS)
+    if key is None:
+        try:
+            client=embedding_client()
+            if not client:return {'status':'disabled','total':0,'ready':0,'pending':0}
+            key=model_key(client)
+        except Exception as exc:
+            return {'status':'unavailable','total':0,'ready':0,'pending':0,'error':str(exc)}
     with repository._connection() as c:
         total=c.execute('SELECT COUNT(*) FROM mail_text_segments WHERE package_id=?',(package_id,)).fetchone()[0]
+        prior={r[0] for r in c.execute('SELECT DISTINCT model FROM mail_embeddings WHERE package_id=?',(package_id,))}
+        if prior and prior!={key}:
+            return {'total':total,'ready':0,'pending':total,'status':'embedding_rebuild_required','old_index_preserved':True,'rebuild_command':'python scripts/rebuild_embeddings.py --scope mail --package-id '+package_id}
         ready=c.execute('SELECT COUNT(*) FROM mail_text_segments s JOIN mail_embeddings e ON e.segment_id=s.segment_id AND e.package_id=s.package_id AND e.text_sha256=s.text_sha256 WHERE s.package_id=? AND e.model=?',(package_id,key)).fetchone()[0]
     return {'total':total,'ready':ready,'pending':max(0,total-ready),'status':'ready' if ready==total else 'partial' if ready else 'not_started'}
 
@@ -106,8 +117,10 @@ def embed_segments_batch(repository,package_id,owner_id,client=None,cancelled=la
     if Config.MAIL_EMBED_PAUSED:return {'paused':True,**index_status(repository,package_id,owner_id)}
     client=client or embedding_client()
     if not client:raise RuntimeError('邮件语义索引未启用或嵌入服务不可用')
-    ensure_header_segments(repository,package_id,owner_id)
     key=model_key(client)
+    with repository._connection() as c:
+        _require_space(c,package_id,key)
+    ensure_header_segments(repository,package_id,owner_id)
     with repository._connection() as c:
         rows=[dict(r) for r in c.execute('SELECT s.* FROM mail_text_segments s LEFT JOIN mail_embeddings e ON e.package_id=s.package_id AND e.segment_id=s.segment_id AND e.model=? AND e.text_sha256=s.text_sha256 WHERE s.package_id=? AND e.segment_id IS NULL ORDER BY s.segment_id LIMIT ?',(key,package_id,Config.MAIL_EMBED_BATCH))]
         cached={}
@@ -117,10 +130,15 @@ def embed_segments_batch(repository,package_id,owner_id,client=None,cancelled=la
     pending={r['text_sha256']:passage_text(r['text']) for r in rows if r['text_sha256'] not in cached}
     if pending:
         values=client.embed(list(pending.values()))
+        from services.embedding_backend import validate_vectors
+        validate_vectors(values,len(pending),len(next(iter(cached.values()))) if cached else getattr(client,'dimension',0))
         if len(values)!=len(pending):raise ValueError('嵌入响应数量不一致')
         cached.update(zip(pending,[normalize_vector(v) for v in values]))
     if cancelled():raise RuntimeError('邮件任务已取消')
     with repository._connection() as c:
+        dimensions={len(v) for v in cached.values()}
+        if len(dimensions)>1:raise ValueError('邮件向量维度不一致')
+        _require_space(c,package_id,key,next(iter(dimensions)) if dimensions else 0)
         for r in rows:
             current=c.execute('SELECT text_sha256 FROM mail_text_segments WHERE package_id=? AND segment_id=?',(package_id,r['segment_id'])).fetchone()
             if not current or current[0]!=r['text_sha256']:continue
@@ -146,6 +164,7 @@ def vector_search(repository,package_id,owner_id,question,*,limit=200,attachment
     query=normalize_vector(client.embed([query_text(question)])[0])
     # Scan moderate mail packages exactly; LSH is approximate only above 20k valid segments.
     with repository._connection() as c:
+        _require_space(c,package_id,key,len(query))
         ids=None
         scope_sql="";scope_args=[]
         if allowed_keys is not None:

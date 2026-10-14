@@ -12,6 +12,10 @@
   let retryTimer = null;
 
   function setText(id, value) { const el = $(id); if (el) el.textContent = value == null ? '' : value; }
+  function catalogStatusMessage(item, fallback) {
+    if (currentStage === 'catalog' && ['waiting_for_selection', 'completed'].includes(item.status) && String(item.message || '').includes('待确认')) return '内容目录可用，可查看和选择文件。';
+    return item.message || fallback;
+  }
   function setStage(stage) {
     ensureExplorer();
     currentStage = stage || 'overview';
@@ -78,11 +82,12 @@
     return button;
   }
   // Browsing state belongs only to this isolated large-package module.
-  const newBrowseState = () => ({ node: { type: 'all', value: '', label: '整个数据包' }, query: '', draft: '', category: '', offset: 0, expanded: new Set(['topics']), scroll: 0, listScroll: 0, file: null });
+  const newBrowseState = () => ({ node: { type: 'all', value: '', label: '整个数据包' }, query: '', draft: '', category: '', offset: 0, expanded: new Set(['topics', 'unclassified']), scroll: 0, listScroll: 0, file: null });
   let browseMode = 'physical';
   let browseStates = { physical: newBrowseState(), smart: newBrowseState() };
   let latestCatalog = null;
   let catalogFingerprint = '';
+  let catalogContentFingerprint = '';
   let fileFingerprint = '';
   let detailFingerprint = '';
   let fileRequestId = 0;
@@ -91,7 +96,7 @@
   let nodeInfo = new Map();
   const browse = () => browseStates[browseMode];
   const nodeKey = (type, value) => JSON.stringify([type, value || '']);
-  const scopeLabels = { all: '全部资料', directory: '原始目录', topic: '内容主题', group: '内容主题', category: '资料类别', role: '文档用途', project: '项目 / 编号', entity: '参与者', date: '样本时间' };
+  const scopeLabels = { all: '全部资料', directory: '原始目录', topic: '内容分组', group: '内容分组', category: '资料类别', role: '文档用途', project: '项目 / 编号', entity: '参与者', date: '样本时间' };
   const folderIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3Z"/></svg>';
   const topicIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m12 3 2.8 6.2L21 12l-6.2 2.8L12 21l-2.8-6.2L3 12l6.2-2.8Z"/></svg>';
 
@@ -181,7 +186,8 @@
 
   function nodeButton(type, value, label, count, info = {}) {
     nodeInfo.set(nodeKey(type, value), { ...info, type, value, label, count });
-    return `<button type="button" class="lp-node" data-lp-node="1" data-lp-type="${esc(type)}" data-lp-value="${esc(value)}" title="${esc(type === 'group' ? label : value || label)}">${type === 'directory' || type === 'all' ? folderIcon : topicIcon}<span>${esc(label)}</span>${count == null ? '' : `<small>${Number(count) || 0}</small>`}</button>`;
+    const status = window.SJFXLargePortrait?.nodeState(info) || '';
+    return `<button type="button" class="lp-node${status ? ' lp-node-has-state' : ''}" data-lp-node="1" data-lp-type="${esc(type)}" data-lp-value="${esc(value)}" title="${esc(type === 'group' ? label : value || label)}">${type === 'directory' || type === 'all' ? folderIcon : topicIcon}<span class="lp-node-copy"><span class="lp-node-label">${esc(label)}</span>${status ? `<em class="lp-node-state">${esc(status)}</em>` : ''}</span>${count == null ? '' : `<small aria-label="${Number(count) || 0} 个文件">${Number(count) || 0}</small>`}</button>`;
   }
 
   function originalNavigation(catalog) {
@@ -207,42 +213,60 @@
 
   function smartNavigation(catalog) {
     const smart = catalog.smart || {};
-    const labels = { pending: '待语义分组', grouped: '待主题命名', classified: '已按语义归类', deferred: '主题待确认', no_content: '待提取内容', legacy: '旧版目录', identified: '已识别主题', needs_more: '待补充采样', needs_ocr: '待 OCR', needs_review: '待核查', metadata_only: '仅元数据', restricted: '受限文件', unsupported: '暂不支持' };
-    const group = (key, title, content, count) => `<section class="lp-nav-group"><button type="button" class="lp-group-toggle" data-lp-group="${esc(key)}" aria-expanded="${browseStates.smart.expanded.has(key)}"><span class="lp-group-arrow" aria-hidden="true">›</span><span>${esc(title)}</span>${count == null ? '' : `<small>${count}</small>`}</button><div class="lp-group-content" ${browseStates.smart.expanded.has(key) ? '' : 'hidden'}>${content}</div></section>`;
+    const summary = window.SJFXLargePortrait.catalogSummary(catalog, latestStatus);
+    const labels = { pending: '待语义分组', grouped: '分组名称待完善', classified: '已按语义归类', no_content: '尚无可读内容', legacy: '尚无内容画像', identified: '已有内容线索', needs_more: '待补充采样', needs_ocr: '待文字识别', metadata_only: '尚无可读内容', restricted: '受限文件', unsupported: '暂不支持', failed: '快速解析失败' };
+    const group = (key, title, content, count) => `<section class="lp-nav-group"><button type="button" class="lp-group-toggle" data-lp-group="${esc(key)}" aria-expanded="${browseStates.smart.expanded.has(key)}"><span class="lp-group-arrow" aria-hidden="true">›</span><span>${esc(title)}</span>${count == null ? '' : `<small>${esc(count)}</small>`}</button><div class="lp-group-content" ${browseStates.smart.expanded.has(key) ? '' : 'hidden'}>${content}</div></section>`;
     const byId=new Map([...(smart.navigation || []),...(smart.topics || [])].map(item=>[item.node_id,item]));
     const branchesById=new Map((smart.branches || []).map(b=>[b.node_id,b]));
-    const nested=new Set();
+    const nested=new Set(), renderedBranches=new Set();
     const branchHTML=(branch,visited=new Set())=>{
-      if(visited.has(branch.node_id))return '';
+      if(visited.has(branch.node_id) || renderedBranches.has(branch.node_id))return '';
+      renderedBranches.add(branch.node_id);
       const seen=new Set(visited);seen.add(branch.node_id);
       const key='theme:'+branch.node_id;
       const open=browseStates.smart.expanded.has(key);
       const children=branch.child_nodes || branch.children || [];
-      const body=children.map(id=>{
+      const renderChild=id=>{
         const next=branchesById.get(id);
         if(next)return branchHTML(next,seen);
-        const child=byId.get(id);if(!child)return '';
+        const child=byId.get(id);if(!child || nested.has(id))return '';
         nested.add(id);
-        return nodeButton('group',id,child.topic || child.name,child.files,child);
-      }).join('');
-      const description=branch.status==='stale'?'内容已更新，主题名称正在复核。':branch.status==='needs_review'?'目录范围已整理，主题名称待完善。':'根据子目录共同内容组织，点击查看全部成员。';
-      const parent=nodeButton('group',branch.node_id,branch.name,branch.files,{description});
-      return `<div class="lp-content-branch"><div class="lp-nav-row"><button type="button" class="lp-expand" data-lp-expand="${esc(key)}" aria-expanded="${open}" aria-label="${open?'收起':'展开'} ${esc(branch.name)}"><span aria-hidden="true">›</span></button>${parent}</div><div class="lp-content-children" ${open?'':'hidden'}>${body}</div></div>`;
+        return nodeButton('group',id,window.SJFXLargePortrait.nodeLabel(child),child.files,{...child,node_kind:window.SJFXLargePortrait.nodeKind(child)});
+      };
+      const sections=window.SJFXLargePortrait.branchSections(branch,byId);
+      if (branch.node_id==='branch:unassigned' && sections.length) {
+        // These are display containers, never semantic nodes or file scopes.
+        // Keep an already-open aggregate scope valid across a catalog repaint.
+        nodeInfo.set(nodeKey('group',branch.node_id),{...branch,type:'group',value:branch.node_id,label:'独立与未归入主题的分组',count:branch.files,node_kind:'independent',description:'保留现有内容分组与文件范围。'});
+        return sections.map(s=>group('partition:'+s.key,s.label,s.ids.map(renderChild).join(''),`${s.files} 文件`)).join('');
+      }
+      const body=sections.length ? sections.map(s=>`<section><h5>${esc(s.label)} · ${s.files} 个文件</h5>${s.ids.map(renderChild).join('')}</section>`).join('') : children.map(renderChild).join('');
+      const description=branch.node_id==='branch:unassigned'?'保留现有内容分组与文件范围。':'根据子目录共同内容组织，点击查看全部成员。';
+      const parent=nodeButton('group',branch.node_id,window.SJFXLargePortrait.branchLabel(branch),branch.files,{...branch,description,node_kind:branch.kind==='independent'?'independent':'theme'});
+      return `<div class="lp-content-branch${branch.kind==='pending' || (branch.status==='pending' && branch.kind!=='independent') ? ' lp-branch-pending' : ''}"><div class="lp-nav-row"><button type="button" class="lp-expand" data-lp-expand="${esc(key)}" aria-expanded="${open}" aria-label="${open?'收起':'展开'} ${esc(branch.name)}"><span aria-hidden="true">›</span></button>${parent}</div><div class="lp-content-children" ${open?'':'hidden'}>${body}</div></div>`;
     };
-    const branches=(smart.branches || []).filter(b=>!b.parent_id).map(b=>branchHTML(b)).join('');
-    const topics=branches+[...byId.values()].filter(item=>!nested.has(item.node_id)).map(item=>nodeButton(item.node_id?'group':'topic',item.node_id || item.topic,item.topic || item.name,item.files,item)).join('');
+    const branches=(smart.branches || []).filter(b=>!b.parent_id || !branchesById.has(b.parent_id)).map(b=>branchHTML(b)).join('');
+    const loose=[...byId.values()].filter(item=>!nested.has(item.node_id));
+    const previews=loose.filter(item=>String(item.node_id || '').startsWith('preview:'));
+    const topics=branches+loose.filter(item=>!previews.includes(item)).map(item=>nodeButton(item.node_id?'group':'topic',item.node_id || item.topic,window.SJFXLargePortrait.nodeLabel(item),item.files,{...item,node_kind:window.SJFXLargePortrait.nodeKind(item)})).join('');
     const categories = (smart.categories || []).map(item => nodeButton('category', item.category, item.category || '未分类', item.files, item)).join('');
     const facets = Object.entries(smart.facets || {}).filter(([kind]) => ['role', 'project', 'entity', 'date'].includes(kind)).map(([kind, items]) => group('facet:' + kind, scopeLabels[kind] + '线索', (items || []).map(item => nodeButton(kind, item.value, item.value, item.files, item)).join(''), items.length)).join('');
-    const naming = smart.naming || {};
     const inventoryNotice = catalog.inventory?.inventory_error_count ? '<p class="lp-scope-notice">盘点有 ' + catalog.inventory.inventory_error_count + ' 处无法读取，当前目录仅覆盖已发现文件。</p>' : '';
-    const namingInfo = inventoryNotice + '<p class="lp-empty-note">内容预览 ' + (smart.content_files || 0) + ' 个文件；已命名 ' + (naming.named_nodes || 0) + ' 个主题，覆盖 ' + (naming.named_files || 0) + ' 个文件。' + (naming.active ? ' 正在完善。' : ' 目录已完善；其余主题保留可读的内容名称（单文件分组直接采用文件线索命名）。') + '</p><button type="button" data-lp-improve ' + (naming.active ? 'disabled' : '') + '>完善目录名称</button>';
-    const states = Object.entries(smart.catalog_states || smart.recognition || {}).map(([key, value]) => `<span>${esc(labels[key] || key)} <b>${Number(value) || 0}</b></span>`).join('');
-    return `<div class="lp-all-node">${nodeButton('all', '', '整个数据包', catalog.files_total)}</div>${namingInfo}${group('topics', '内容主题', (topics || '<p class="lp-empty-note">正在整理主题，已盘点文件可从原始目录查看。</p>') + (smart.topics_truncated ? '<button type="button" data-lp-more>查看更多内容主题</button>' : ''), smart.topic_total || 0)}${group('categories', '资料类别', categories, (smart.categories || []).length)}${facets}${group('states', '目录整理状态', `<div class="lp-catalog-states">${states || '等待内容识别。'}</div><p class="lp-empty-note">目录随内容识别与深度摘要更新。</p>`)} `;
+    const publicationNotice = summary.publicationText ? `<p class="lp-catalog-publication">${esc(summary.publicationText)}</p>` : '';
+    const namingInfo = inventoryNotice + publicationNotice + `<div class="lp-catalog-progress"><dl><div><dt>可读内容预览</dt><dd>${summary.content}<small>文件</small></dd></div><div><dt>叶子名称</dt><dd>${summary.named} / ${summary.leaves}<small>分组</small></dd></div><div><dt>主题构建</dt><dd>${summary.themes}<small>主题${summary.rootKnown ? ` · ${summary.roots} 顶层` : ''}</small></dd></div></dl><p class="lp-catalog-message" role="status">${esc(summary.message)}</p><p class="lp-catalog-coverage">文件归组 ${summary.grouped} / ${summary.total}${summary.ungrouped ? ` · 未归组 ${summary.ungrouped}` : ''}${summary.pending ? ` · 待上层主题整理 ${summary.pending}` : ''}${summary.stagingFiles ? ` · 暂存 ${summary.stagingFiles}` : ''}${summary.quickFailed ? ` · 快速解析失败 ${summary.quickFailed}` : ''}</p><button type="button" data-lp-improve ${summary.canImprove ? '' : 'disabled'}${summary.stopped ? ' title="继续处理数据包后可完善目录名称"' : ''}>完善目录名称</button></div><p class="lp-count-guide">主题 → 内容分组 → 文件。节点右侧为文件数，上下级数量不相加。</p>`;
+    const states = Object.entries(smart.catalog_states || smart.recognition || {}).filter(([key])=>!['deferred','needs_review'].includes(key)).map(([key, value]) => `<span>${esc(labels[key] || key)} <b>${Number(value) || 0}</b></span>`).join('');
+    const unknown = summary.ungrouped ? group('unclassified', '未归组文件', previews.map(item=>nodeButton('group',item.node_id,item.topic || item.name,item.files,{...item,node_kind:'unclassified'})).join('') || '<p class="lp-empty-note">未归组文件可从原始目录查看；更多条目详情尚未加载。</p>', `${summary.ungrouped} 文件`) : '';
+    return `<div class="lp-all-node">${nodeButton('all', '', '整个数据包', catalog.files_total)}</div>${namingInfo}${group('topics', '主题与分组', topics || '<p class="lp-empty-note">尚未生成内容分组，已盘点文件可从原始目录查看。</p>')}${unknown}${smart.topics_truncated ? '<button type="button" data-lp-more>加载更多分组详情</button>' : ''}${group('categories', '资料类别', categories, `${(smart.categories || []).length} 类`)}${facets}${group('states', '目录整理状态（文件数）', `<div class="lp-catalog-states">${states || '尚无内容识别结果。'}</div>`)} `;
   }
 
   function renderCatalog(catalog) {
     if (!catalog) return;
     ensureExplorer();
+    const contentFingerprint = JSON.stringify([catalog.smart?.navigation || [], catalog.smart?.branches || [], catalog.smart?.stats || {}, catalog.smart?.topic_total]);
+    // Loaded detail pages belong to this directory revision. Old pages must not
+    // override a renamed/merged live node or resurrect a removed preview scope.
+    if (catalogContentFingerprint && catalogContentFingerprint !== contentFingerprint) extraCatalogNodes = [];
+    catalogContentFingerprint = contentFingerprint;
     if (extraCatalogNodes.length) {
       const found = new Map((catalog.smart?.topics || []).map(n => [n.node_id || n.topic, n]));
       extraCatalogNodes.forEach(n => { if (!found.has(n.node_id || n.topic)) found.set(n.node_id || n.topic,n); });
@@ -251,8 +275,8 @@
     latestCatalog = catalog;
     setText('largeResultRootPath', catalog.root_path || '');
     setText('largeResultDirectoryStats', `${catalog.files_total || 0} 个文件 · ${(catalog.original?.directories || []).length} 个目录${catalog.original?.truncated ? '（部分显示）' : ''}`);
-    setText('largeResultSmartStats', `${catalog.smart?.theme_total || 0} 个主题 · ${catalog.smart?.leaf_total || catalog.smart?.topic_total || 0} 个叶子分组`);
-    const fingerprint = JSON.stringify(catalog);
+    setText('largeResultSmartStats', window.SJFXLargePortrait.catalogSummary(catalog, latestStatus).text);
+    const fingerprint = JSON.stringify([catalog, latestStatus.status]);
     if (fingerprint !== catalogFingerprint) {
       catalogFingerprint = fingerprint;
       nodeInfo = new Map();
@@ -262,7 +286,7 @@
       $('largeResultOriginalCatalog').innerHTML = originalNavigation(catalog);
       $('largeResultSmartCatalog').innerHTML = smartNavigation(catalog);
       const smartState = browseStates.smart;
-      if (smartState.node.type === 'topic' && !nodeInfo.has(nodeKey('topic', smartState.node.value)) && !catalog.smart?.topics_truncated) {
+      if (['topic','group'].includes(smartState.node.type) && !nodeInfo.has(nodeKey(smartState.node.type, smartState.node.value)) && !catalog.smart?.topics_truncated) {
         smartState.node = { type: 'all', value: '', label: '整个数据包' };
         smartState.offset = 0;
         smartState.notice = '原主题已重新整理，当前显示整个数据包。';
@@ -281,11 +305,12 @@
     if (total != null) state.total = total;
     const info = nodeInfo.get(nodeKey(state.node.type, state.node.value)) || state.node;
     const label = info.label || state.node.label;
-    const namingText = {model:'依据代表内容由模型命名',extractive:'原文内容名称，尚可完善',stale:'内容已更新，名称待复核',manual:'已人工确认',unread:'内容识别尚未完成'}[info.naming_status] || '';
-    const basis = [info.description || info.basis, namingText, info.needs_review ? '组内内容需要进一步复核' : ''].filter(Boolean).join(' · ') || (state.node.type === 'directory' ? '文件按原始路径归属，包含该目录下的子目录文件。' : '');
+    const namingText = {model:'依据代表内容由模型命名',extractive:'原文内容名称，尚可完善',stale:'内容已更新，名称待复核',manual:'已人工确认',unread:'尚未完成内容分组',failed:'快速解析失败；文件仍保留，可查看失败原因'}[info.naming_status] || '';
+    const basis = [info.description || info.basis, namingText].filter(Boolean).join(' · ') || (state.node.type === 'directory' ? '文件按原始路径归属，包含该目录下的子目录文件。' : '');
     const samples = (info.sample || []).map(item => typeof item === 'string' ? `<li>${esc(item)}</li>` : `<li><b>${esc(item.path)}</b>${item.basis ? `<p>${esc(item.basis)}</p>` : ''}${(item.evidence || []).map(e => `<p><span>${esc(e.location)}</span>：${esc(e.text)}</p>`).join('')}</li>`).join('');
     const details = basis || samples ? `<details class="lp-scope-evidence"><summary>节点信息与代表文件</summary>${basis ? `<p>${esc(basis)}</p>` : ''}${samples ? `<ul>${samples}</ul>` : ''}</details>` : '';
-    const content = `<div class="lp-scope-top"><div><span class="lp-scope-kind">${esc(scopeLabels[state.node.type] || '当前范围')}</span><h3 title="${esc(state.node.value || label)}">${esc(label)}</h3></div><button id="largeResultClearScope" type="button" class="ghost">查看全包</button></div>${state.node.value && state.node.type === 'directory' ? `<p class="lp-scope-path">${esc(state.node.value)}</p>` : ''}${info.description ? `<p class="lp-scope-description">${esc(info.description)}</p>` : ''}<p class="lp-scope-count">${state.total == null ? '正在读取文件…' : `当前范围匹配 ${state.total} 个文件`}${state.query || state.category ? ' · 已应用筛选' : ''}</p>${state.notice ? `<p class="lp-scope-notice">${esc(state.notice)}</p>` : ''}${details}${state.node.type === 'group' && !state.node.value.startsWith('preview:') && !state.node.value.startsWith('branch:') && !state.node.value.startsWith('topic:') ? '<button type="button" data-lp-rename>确认或修改名称</button>' : ''}`;
+    const kindLabel = {theme:'内容主题',leaf:'叶子分组',independent:'独立分组',unclassified:'未归组文件',staging:'暂存文件'}[info.node_kind] || scopeLabels[state.node.type] || '当前范围';
+    const content = `<div class="lp-scope-top"><div><span class="lp-scope-kind">${esc(kindLabel)}</span><h3 title="${esc(state.node.value || label)}">${esc(label)}</h3></div><button id="largeResultClearScope" type="button" class="ghost">查看全包</button></div>${state.node.value && state.node.type === 'directory' ? `<p class="lp-scope-path">${esc(state.node.value)}</p>` : ''}${info.description ? `<p class="lp-scope-description">${esc(info.description)}</p>` : ''}${info.error ? `<p class="lp-file-error">${esc(info.error)}</p>` : ''}<p class="lp-scope-count">${state.total == null ? '正在读取文件…' : `当前范围匹配 ${state.total} 个文件`}${state.query || state.category ? ' · 已应用筛选' : ''}</p>${state.notice ? `<p class="lp-scope-notice">${esc(state.notice)}</p>` : ''}${details}${state.node.type === 'group' && !state.node.value.startsWith('preview:') && !state.node.value.startsWith('branch:') && !state.node.value.startsWith('topic:') ? '<button type="button" data-lp-rename>确认或修改名称</button>' : ''}`;
     const host = $('largeResultNodeSummary');
     if (host && host._lpMarkup !== content) {
       const wasOpen = host.querySelector('details')?.open;
@@ -448,7 +473,7 @@
     selectedForSummary.clear();
     browseMode = 'physical'; browseStates = { physical: newBrowseState(), smart: newBrowseState() };
     latestCatalog = null; files = []; nodeInfo = new Map();
-    catalogFingerprint = ''; fileFingerprint = ''; detailFingerprint = '';
+    catalogFingerprint = ''; catalogContentFingerprint = ''; fileFingerprint = ''; detailFingerprint = '';
     fileRequestId++; loadRequestId++; clearTimeout(liveTimer); clearInterval(retryTimer);
     for (const id of ['largeResultOriginalCatalog', 'largeResultSmartCatalog', 'largeResultFiles']) if ($(id)) $(id).innerHTML = '<div class="large-empty">正在读取数据包…</div>';
     if ($('largeResultPager')) $('largeResultPager').innerHTML = '';
@@ -592,7 +617,7 @@
       status: snap.status, phase: snap.phase, progress: snap.progress, message: snap.message,
     } : {});
     renderControls(item, snap);
-    setText('largeResultStatus', `${item.message || '状态已更新'} · ${item.phase || '—'} · ${item.progress || 0}%`);
+    setText('largeResultStatus', `${catalogStatusMessage(item, '状态已更新')} · ${item.phase || '—'} · ${item.progress || 0}%`);
     if (endpoint === 'cancel') setText('largeResultDownloadStatus', '任务已停止，已完成结果仍然保留。');
     await load();
   }
@@ -660,7 +685,11 @@
         (snap.catalog_id ? `(${String(snap.catalog_id).slice(4, 12)})` : '') +
         (snap.catalog_degraded ? ` · ⚠ 降级目录（未经语义聚类）` : '')
       : '';
-    setText('largeResultStatus', `${item.message || '大数据包成果'} · ${item.phase || '—'} · ${item.progress || 0}%${pendingNote}${catalogNote}`);
+    const importState = snap || item;
+    const importNote = importState.import_completed
+      ? '大数据包导入已完成（100%）；深度摘要可按需选择' : `大数据包导入进度 ${importState.import_progress ?? item.progress ?? 0}%`;
+    const deepNote = item.phase === 'deep_parse' ? ` · 深度摘要进度 ${item.progress || 0}%` : '';
+    setText('largeResultStatus', `${importNote}${deepNote} · ${catalogStatusMessage(item, '大数据包成果')}${pendingNote}${catalogNote}`);
     setText('largeResultPackageId', packageId);
     const c = item.counts || {};
     const reportPayload = currentStage === 'catalog' ? {report:{coverage:{inventory_files:c.total_files,quick_completed:c.quick?.completed,deep_completed:c.deep?.completed},categories:c.categories || {}}} : await api()(`/api/large-packages/${encodeURIComponent(packageId)}/report`);
@@ -767,11 +796,11 @@
   document.addEventListener('click', async event => {
     const more = event.target.closest?.('[data-lp-more]');
     if (more && packageId) {
-      more.disabled=true;const id=packageId;
+      more.disabled=true;const id=packageId, revision=catalogContentFingerprint;
       try {
         const offset=(latestCatalog?.smart?.topics || []).length;
         const result=await api()('/api/large-packages/'+encodeURIComponent(id)+'/catalog/nodes?offset='+offset+'&limit=200');
-        if (id===packageId) { extraCatalogNodes.push(...result.topics);renderCatalog(latestCatalog); }
+        if (id===packageId && revision===catalogContentFingerprint) { extraCatalogNodes.push(...result.topics);renderCatalog(latestCatalog); }
       } catch(error) { setText('largeResultStatus',error.message);more.disabled=false; }
       return;
     }

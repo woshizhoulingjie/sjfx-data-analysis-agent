@@ -21,10 +21,13 @@ class CatalogPreparationPerformanceTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        # This performance contract packs four complete groups for a 32K
+        # service; the default 4K service is covered by CatalogBatchTests.
         for key, value in {'SCAN_ALLOWED_ROOTS': (), 'LP_CATALOG_MODEL_NAMING': True,
                            'LP_CATALOG_SECONDS': 60, 'LP_CATALOG_BATCH_SIZE': 4,
                            'LP_CATALOG_PREPARE_LIMIT': 4, 'LP_CATALOG_BATCH_INPUT_TOKENS': 20000,
-                           'LP_CATALOG_TOTAL_TOKENS': 100000}.items():
+                           'LP_CATALOG_TOTAL_TOKENS': 100000,
+                           'LLM_CONTEXT_TOKENS': 32768}.items():
             self.enterContext(patch.object(Config, key, value))
         self.store = LargePackageStore(self.root / 'state.db')
         self.pid = self.store.create(self.root)['id']

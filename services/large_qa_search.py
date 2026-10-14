@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from services.embedding_encoding import prefix as embedding_prefix
 import re
 import threading
 from collections import OrderedDict
@@ -10,11 +11,90 @@ from pathlib import Path
 import unicodedata
 
 from services.large_qa_index import LargeQAIndex, loads, tokens, plain_text
+from services.large_archive_members import IDENTITY_FIELDS, member_node, source_identity, source_signature
 from services import large_qa_thai as thai
+from services.package_questions import PACKAGE_OVERVIEW_RE
 
 LOGGER=logging.getLogger(__name__)
 _vectors=OrderedDict()
 _lock=threading.RLock()
+
+
+def _source_is_current(root, row):
+    """Validate logical members by their container, never by a synthetic path."""
+    row = dict(row)
+    try:
+        if row.get('sensitive'):
+            return False
+        if member_node(row) is not None:
+            source_identity(root, row)
+            return True
+        physical = (Path(root) / row['path']).resolve()
+        stat = physical.stat()
+        return (Path(root).resolve() in physical.parents
+                and (stat.st_size, stat.st_mtime_ns) == (row['size'], row['mtime']))
+    except (OSError, ValueError, TypeError, RuntimeError):
+        # Invalid metadata, removed/replaced containers and unsafe links are
+        # unusable evidence; the caller can still serve other current sources.
+        return False
+
+
+def _source_columns(connection):
+    # Read older disposable indexes without trying to migrate a read-only DB.
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(documents)')}
+    return ','.join('d.' + name if name in columns else "'" + default + "' AS " + name
+                    for name, default in (('source_kind', ''), ('source_metadata', '{}')))
+
+
+def _matches_current_source(document, current_source):
+    """The reader's caller supplies its authenticated, current manifest row."""
+    document = dict(document)
+    try:
+        if (current_source.get('path') != document['path']
+                or current_source.get('sensitive') or current_source.get('source_changed')):
+            return False
+        indexed_member = member_node(document)
+        current_member = member_node(current_source)
+        if indexed_member is not None or current_member is not None:
+            return (indexed_member is not None and current_member is not None
+                    and source_signature(document) == source_signature(current_source))
+        return (current_source.get('size'), current_source.get('modified_at_ns')) == (
+            document['size'], document['mtime'])
+    except (AttributeError, ValueError, TypeError):
+        return False
+
+
+def _current_member_paths(connection, allowed, root):
+    """Exclude stale members before ranking, coverage and topic-map reuse.
+
+    Members of the same verified container share one no-follow identity check
+    per filtering pass; no archive contents are extracted in the search process.
+    """
+    output = set(allowed)
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(documents)')}
+    if not {'source_kind', 'source_metadata'}.issubset(columns):
+        return {path for path in output if '::' not in path}
+    identities = {}
+    paths = list(allowed)
+    for start in range(0, len(paths), 500):
+        batch = paths[start:start + 500]
+        sql = '''SELECT path,size,mtime,sensitive,source_kind,source_metadata FROM documents
+                 WHERE (source_kind='archive_member' OR instr(path,'::')>0)
+                 AND path IN ({})'''.format(','.join('?' for _ in batch))
+        for row in connection.execute(sql, batch):
+            try:
+                node = member_node(dict(row))
+                if node is None:
+                    output.discard(row['path'])
+                    continue
+                key = tuple(node[field] for field in IDENTITY_FIELDS[:5])
+                if key not in identities:
+                    identities[key] = _source_is_current(root, row)
+                if not identities[key]:
+                    output.discard(row['path'])
+            except (ValueError, TypeError):
+                output.discard(row['path'])
+    return output
 
 
 def scope_filter(c, scope):
@@ -43,10 +123,13 @@ def current_paths(store, package_id, candidates):
     if not candidates:
         return output
     with store._connect() as src:
+        columns = {row[1] for row in src.execute('PRAGMA table_info(files)')}
         values=list(candidates)
         for start in range(0,len(values),500):
             batch=values[start:start+500]
             query='SELECT path FROM files WHERE package_id=? AND sensitive=0 AND path IN ({})'.format(','.join('?' for _ in batch))
+            if 'source_changed' in columns:
+                query += ' AND source_changed=0'
             output.update(r[0] for r in src.execute(query,[package_id]+batch))
     return output
 
@@ -56,25 +139,12 @@ def vector_search(c,index,query,allowed,meta,query_vector=None,limit=100):
     model=meta.get('embedding_model') or ''
     if query_vector is None:
         from services.large_package_semantic import embedding_client
-        from services.vllm import VLLMEmbeddingClient
+        from services.embedding_backend import client_identity
         base=embedding_client()
-        if not base or not model or model!=base.model:
-            return [],'unavailable_model'
-        endpoints=[getattr(base,'primary',base)]
-        if getattr(base,'secondary',None) is not None:
-            endpoints.append(base.secondary)
-        error=None
-        encoded=None
-        for endpoint in endpoints:
-            try:
-                client=VLLMEmbeddingClient(endpoint.base_url,model,timeout=4,max_batch_size=1,max_chars=1024,
-                                           api_key=getattr(endpoint,'api_key',''),semaphore_timeout=1,retries=0)
-                encoded=client.embed(['query: '+query[:1024]])
-                break
-            except Exception as exc:
-                error=exc
-        if encoded is None:
-            raise error or RuntimeError('No embedding endpoint')
+        if not base or not model or model!=client_identity(base):
+            return [],'embedding_rebuild_required'
+        client=base.with_options(timeout=4,max_batch_size=1,max_chars=1024,semaphore_timeout=1,retries=0)
+        encoded=client.embed([embedding_prefix('query', client=client)+query[:1024]])
         query_vector=np.asarray(encoded[0],dtype=np.float32)
     query_vector=np.asarray(query_vector,dtype=np.float32)
     if not np.isfinite(query_vector).all() or np.linalg.norm(query_vector)<1e-9:
@@ -139,6 +209,10 @@ def select_material(rows,query,limit=40,global_mode=False,tokenizer=tokens):
 
 def evidence(row,package_id,root):
     location=loads(row['location'],{})
+    node = member_node(dict(row))
+    if node is not None:
+        location = {**location, 'container_path': node['container_path'],
+                    'archive_member': node['member_name']}
     body=plain_text(row['text'])
     return {'evidence_id':'lpqa:{}:{}'.format(row['id'],row['version'][:16]),
             'source_path':row['path'],'text':body,'original_text':body,
@@ -150,7 +224,7 @@ def evidence(row,package_id,root):
             'match_reason':'大包持久化检索与主题覆盖选材'}
 
 
-def original_document(package_id, root, path, full=False, base=None):
+def original_document(package_id, root, path, full=False, base=None, *, current_source=None):
     """Serve the indexed original through the existing document-reader contract."""
     index=LargeQAIndex(package_id,base)
     if not index.exists:
@@ -159,14 +233,13 @@ def original_document(package_id, root, path, full=False, base=None):
         doc=c.execute('SELECT * FROM documents WHERE path=? AND sensitive=0',(path,)).fetchone()
         if not doc or doc['parse_status'] not in {'complete','partial'}:
             return None
-        physical=(Path(root)/path).resolve()
-        try:
-            st=physical.stat()
-            if Path(root).resolve() not in physical.parents or (st.st_size,st.st_mtime_ns)!=(doc['size'],doc['mtime']):
-                return None
-        except OSError:
+        if current_source is not None and not _matches_current_source(doc, current_source):
             return None
-        rows=[dict(r) for r in c.execute("SELECT c.*,d.topic FROM chunks c JOIN documents d USING(path) WHERE path=? AND kind='original' ORDER BY ordinal",(path,))]
+        if not _source_is_current(root, doc):
+            return None
+        source_columns = _source_columns(c)
+        rows=[dict(r) for r in c.execute("SELECT c.*,d.topic,d.size,d.mtime," + source_columns +
+              " FROM chunks c JOIN documents d USING(path) WHERE path=? AND kind='original' ORDER BY ordinal",(path,))]
         if not rows:
             return None
         # When a parser supplies both positioned evidence and full cached text,
@@ -189,8 +262,16 @@ def original_document(package_id, root, path, full=False, base=None):
         if clipped:
             warnings.append('阅读面板显示前 20 万字符；检索仍使用已建立的全部正文索引。')
         title=doc['name'] or Path(path).name
-        return {'schema_version':'large-document/2.0','source':{'path':path,'name':title,'physical_path':path},
-                'source_reference':{'logical_path':path,'physical_path':path,'location':{}},
+        node = member_node(dict(doc))
+        physical_path = node['container_path'] if node is not None else path
+        source = {'path': path, 'name': title, 'physical_path': physical_path}
+        location = {}
+        if node is not None:
+            source.update(logical_unit=True, logical_kind='archive_member',
+                          container_path=physical_path, archive_member=node['member_name'])
+            location = {'container_path': physical_path, 'archive_member': node['member_name']}
+        return {'schema_version':'large-document/2.0','source':source,
+                'source_reference':{'logical_path':path,'physical_path':physical_path,'location':location},
                 'analysis_level':'parsed','parser':{'name':'large-qa-original','mode':'cached_original','degraded':not bool(doc['parse_complete'])},
                 'structure':{'title':title,'headings':[]},'focus':{},'data_profile':None,'data_profiles':[],
                 'coverage':{'complete':bool(doc['parse_complete']) and not clipped,'parse_complete':bool(doc['parse_complete']),
@@ -207,14 +288,23 @@ def retrieve(store,request,base=None,query_vector=None):
     if not package:
         raise ValueError('大数据包不存在')
     query=request.query
-    overview=bool(re.search(r'整体介绍|总体介绍|概括|概览|综述|主要(?:内容|主题|方向)|资料.{0,16}(?:研究什么|讲什么)',query))
-    global_mode=(request.intent in {'summary','analysis','multi_task'} or overview) and not re.search(r'为什么|多少|付款|预算|第\d+|编号',query)
+    overview=bool(PACKAGE_OVERVIEW_RE.search(query) or re.search(r'整体介绍|总体介绍|概括|概览|综述|主要(?:内容|主题|方向)|资料.{0,16}(?:研究什么|讲什么)',query))
+    explicit_global=bool(re.search(r'综合.{0,16}(?:全部|所有|全包|整个)|(?:全部|所有|全包|整个).{0,20}(?:文件|资料|材料|数据包)|across all|all (?:files|documents)',query,re.I))
+    global_mode=explicit_global or ((request.intent in {'summary','analysis','multi_task'} or overview)
+                                    and not re.search(r'为什么|多少|付款|预算|第\d+|编号',query))
     warnings=[]
     with index.connect() as c:
         meta=index.meta(c)
+        source_columns = _source_columns(c)
         if not meta.get('synced_at'):
             return None
-        allowed=current_paths(store,request.scan_id,scope_filter(c,request.scope))
+        from services.large_qa_corpus import scope_manifest,fresh_paths
+        manifest=scope_manifest(store,index,request.scope)
+        allowed=fresh_paths(c,package['root_path'],manifest['indexed_paths'],
+                            current_sources=manifest.get('current_sources'))
+        # Topic reports and coverage counts must use current sources too, not
+        # only the few rows that happened to rank as retrieval candidates.
+        stale_paths=manifest['indexed_paths']-allowed
         global_mode=global_mode and len(allowed)>1
         # Store allowed membership in a TEMP table without mutating the persistent DB.
         # query_only disallows temp writes too; use bound IN clauses in manageable batches.
@@ -244,8 +334,20 @@ def retrieve(store,request,base=None,query_vector=None):
             paths=list(allowed)
             for start in range(0,len(paths),500):
                 batch=paths[start:start+500]
-                sql='''SELECT c.id,bm25(search,2.0,1.0) rank FROM search JOIN chunks c ON c.id=search.rowid
-                       WHERE search MATCH ? AND c.path IN ({}) ORDER BY rank LIMIT 100'''.format(','.join('?' for _ in batch))
+                # Rank within each authorized file BEFORE the global cap. A
+                # long contract otherwise fills all 100 hits and hides a short
+                # complementary acceptance document, even when it matches.
+                # LIMIT -1 keeps FTS bm25 in its own query context (SQLite's
+                # window functions cannot evaluate it after query flattening).
+                sql='''WITH matches AS (
+                         SELECT c.id,c.path,bm25(search,2.0,1.0) rank
+                         FROM search JOIN chunks c ON c.id=search.rowid
+                         WHERE search MATCH ? AND c.path IN ({}) ORDER BY rank LIMIT -1
+                       ), spread AS (
+                         SELECT id,rank,ROW_NUMBER() OVER (PARTITION BY path ORDER BY rank,id) file_rank
+                         FROM matches
+                       ) SELECT id,rank FROM spread WHERE file_rank<=4
+                       ORDER BY file_rank,rank,id LIMIT 100'''.format(','.join('?' for _ in batch))
                 lexical.extend((r['id'],r['rank']) for r in c.execute(sql,[expression]+batch))
             lexical.sort(key=lambda x:(x[1],x[0]))
             lexical=[x for x in lexical if not (x[0] in lexical_seen or lexical_seen.add(x[0]))][:150]
@@ -256,7 +358,8 @@ def retrieve(store,request,base=None,query_vector=None):
             LOGGER.info('large QA vector unavailable: %s',str(exc)[:120])
         rows={}
         def get_chunk(chunk_id):
-            row=c.execute('SELECT c.*,d.topic,d.topic_name,d.size,d.mtime FROM chunks c JOIN documents d USING(path) WHERE c.id=?',(chunk_id,)).fetchone()
+            row=c.execute('SELECT c.*,d.topic,d.topic_name,d.size,d.mtime,' + source_columns +
+                          ' FROM chunks c JOIN documents d USING(path) WHERE c.id=?',(chunk_id,)).fetchone()
             if row:
                 rows[chunk_id]=dict(row)
         for chunk_id,_ in lexical:
@@ -265,7 +368,8 @@ def retrieve(store,request,base=None,query_vector=None):
             get_chunk(chunk_id)
         vector_ids=[]
         for path,_ in vectors:
-            candidates=c.execute('SELECT c.*,d.topic,d.topic_name,d.size,d.mtime FROM chunks c JOIN documents d USING(path) WHERE path=? ORDER BY kind,ordinal',(path,)).fetchall()
+            candidates=c.execute('SELECT c.*,d.topic,d.topic_name,d.size,d.mtime,' + source_columns +
+                                 ' FROM chunks c JOIN documents d USING(path) WHERE path=? ORDER BY kind,ordinal',(path,)).fetchall()
             # Full cached file text is indexed; choose query-relevant windows,
             # not merely the first paragraph of a semantic file hit.
             q=set(tokenizer(query)) if tokenizer is not tokens else set(terms)
@@ -275,17 +379,28 @@ def retrieve(store,request,base=None,query_vector=None):
         topics=index.topic_material(c,allowed) if global_mode else []
         topic_ids=[]
         if global_mode:
+            fallback_per_topic=max(1,50//max(1,len(topics)))
             for topic in topics:
                 paths=[]
                 for report in topic['reports']:
                     for point in loads(report['text'],{}).get('points',[])[:4]:
                         paths.extend(point['sources'])
                 if not paths:
-                    paths=[r[0] for r in c.execute('SELECT path FROM documents WHERE topic=? AND summary!="" ORDER BY path',(topic['topic'],)) if r[0] in allowed][:2]
+                    # Historical indexes may not have published topic maps yet.
+                    # Their stored summaries still form a usable overview: a
+                    # small package can supply every file instead of only the
+                    # first two files of its single topic. Large packages keep
+                    # a bounded representative set, with honest coverage.
+                    for row in c.execute('SELECT path FROM documents WHERE topic=? AND summary!="" ORDER BY path',(topic['topic'],)):
+                        if row[0] in allowed:
+                            paths.append(row[0])
+                            if len(paths)>=fallback_per_topic:
+                                break
                 for path in dict.fromkeys(paths):
                     if path not in allowed:
                         continue
-                    row=c.execute('SELECT c.*,d.topic,d.topic_name,d.size,d.mtime FROM chunks c JOIN documents d USING(path) WHERE path=? ORDER BY kind,ordinal LIMIT 1',(path,)).fetchone()
+                    row=c.execute('SELECT c.*,d.topic,d.topic_name,d.size,d.mtime,' + source_columns +
+                                  " FROM chunks c JOIN documents d USING(path) WHERE path=? ORDER BY CASE WHEN kind='summary' THEN 0 ELSE 1 END,ordinal LIMIT 1",(path,)).fetchone()
                     if row:
                         rows[row['id']]=dict(row);topic_ids.append(row['id'])
         scores=rrf([[x[0] for x in lexical],vector_ids,topic_ids,[x[0] for x in thai_lexical]])
@@ -293,19 +408,15 @@ def retrieve(store,request,base=None,query_vector=None):
             row['fusion']=scores.get(key,0)
         # Physical changes invalidate both original excerpts and old summaries.
         fresh=[]
+        current={}
         for row in rows.values():
-            path=(Path(package['root_path'])/row['path']).resolve()
-            try:
-                stat=path.stat()
-                if Path(package['root_path']).resolve() not in path.parents:
-                    continue
-                if (stat.st_size,stat.st_mtime_ns)!=(row['size'],row['mtime']):
-                    continue
-            except OSError:
+            if row['path'] not in current:
+                current[row['path']] = _source_is_current(package['root_path'], row)
+            if not current[row['path']]:
                 continue
             fresh.append(row)
         chosen=select_material(fresh,query,50 if global_mode else max(10,min(40,request.top_k)),global_mode,tokenizer=tokenizer)
-        counts={'total':len(allowed),'summaries':0,'originals':0,'partial':0}
+        counts={'total':manifest['scope_files'],'summaries':0,'originals':0,'partial':0}
         for row in c.execute('SELECT path,summary!="" summary,parse_complete,parse_status FROM documents'):
             if row['path'] in allowed:
                 counts['summaries']+=bool(row['summary']);counts['originals']+=bool(row['parse_complete']);counts['partial']+=row['parse_status']=='partial'
@@ -315,6 +426,8 @@ def retrieve(store,request,base=None,query_vector=None):
             reports.append({'topic_id':topic['topic'],'name':topic['topic_name'],'files':topic['files'],
                             'input_files':len(topic['covered_paths']),'points':points[:24]})
         coverage={'scope':request.scope.kind,'total_files':counts['total'],'scope_files':counts['total'],
+                  'indexed_scope_files':len(allowed),'missing_index_files':len(manifest['missing_index_paths']),
+                  'stale_source_files':len(stale_paths),
                   'candidate_files':len({r['path'] for r in fresh}),'inspected_files':len({r['path'] for r in chosen}),
                   'query_coverage':None,'coverage_basis':'versioned_index_not_recall_estimate',
                   'summary_backed_files':counts['summaries'],'original_indexed_files':counts['originals'],
@@ -323,14 +436,21 @@ def retrieve(store,request,base=None,query_vector=None):
                   'index_generation':meta.get('generation'),'index_synced_at':meta.get('synced_at')}
         if counts['originals']<counts['total']:
             warnings.append('当前范围 {} 份文件中，{} 份已完成正文索引，其余依据已有摘要或部分正文。'.format(counts['total'],counts['originals']))
+        if manifest['missing_index_paths']:
+            warnings.append('当前范围有 {} 份文件尚未进入问答索引，本轮不能视为全包完整结论。'.format(len(manifest['missing_index_paths'])))
+        if stale_paths:
+            warnings.append('{} 份来源已变更，本轮已排除旧摘要和主题报告。'.format(len(stale_paths)))
         if global_mode and coverage['selected_topics']<len(topics):
             warnings.append('本轮具体证据涉及 {} / {} 个主题，主题概览不等于逐份全文阅读。'.format(coverage['selected_topics'],len(topics)))
         result={'results':[{**evidence(r,request.scan_id,package['root_path']),'large_global':global_mode} for r in chosen],
                 'index_mode':'large-qa-v1','retrieval_mode':'large_qa','warnings':warnings,'coverage':coverage,
-                'candidate_paths':list(dict.fromkeys(r['path'] for r in chosen)),
+                'candidate_paths':list(dict.fromkeys(r['path'] for r in fresh)),
+                'related_file_paths':list(dict.fromkeys(r['path'] for r in chosen)),
                 'package_context':{'package_type':'large','package_id':request.scan_id,'coverage':coverage,
-                                   'large_qa':{'global_mode':global_mode,'topics':reports,'generation':meta.get('generation'),'summary_generation':meta.get('summary_generation')},
-                                   'file_summaries':[],'reading_manifest':{'files_read':counts['total'],'summary_backed_files':counts['summaries'],
+                                   'large_qa':{'global_mode':global_mode,'topics':reports,'generation':meta.get('generation'),'summary_generation':meta.get('summary_generation'),
+                                               'scope':request.scope.as_dict(),
+                                               'source_db_path':str(getattr(store,'db_path',None) or getattr(store,'path',None) or getattr(store,'filename',None) or '')},
+                                   'file_summaries':[],'reading_manifest':{'files_read':len(allowed),'scope_files':counts['total'],'summary_backed_files':counts['summaries'],
                                    'files_without_summary':counts['total']-counts['summaries'],
                                    'summary_coverage':counts['summaries']/max(1,counts['total']),
                                    'complete':counts['summaries']==counts['total'],'basis':'summary_index_only'}},

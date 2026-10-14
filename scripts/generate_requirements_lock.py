@@ -20,13 +20,22 @@ from packaging.utils import canonicalize_name
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _root_requirements(path):
+def _root_requirements(path, _parents=()):
+    path = Path(path).resolve()
+    if path in _parents:
+        raise ValueError("Recursive requirements include: {}".format(path))
     requirements = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.split("#", 1)[0].strip()
-        if not line or line.startswith("-r "):
+        if not line:
             continue
-        requirements.append(Requirement(line))
+        if line.startswith(("-r ", "--requirement ")):
+            child = line.split(maxsplit=1)[1].strip()
+            requirements.extend(_root_requirements(path.parent / child, _parents + (path,)))
+            continue
+        requirement = Requirement(line)
+        if requirement.marker is None or requirement.marker.evaluate():
+            requirements.append(requirement)
     return requirements
 
 

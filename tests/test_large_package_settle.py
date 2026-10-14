@@ -139,7 +139,7 @@ class SystemBucketLabelTests(unittest.TestCase):
         self.assertEqual(got, 0, "有排队中的命名任务时不得抢写兜底标签")
         # 模型放弃（deferred）之后，兜底应当接手，而且此后不得再被回收
         with closing(self.store._connect()) as conn:
-            conn.execute("UPDATE lp_catalog_jobs SET status='deferred' "
+            conn.execute("UPDATE lp_catalog_jobs SET status='deferred',attempts=5 "
                          "WHERE package_id=? AND group_id='km-single-0002'", (self.pid,))
             conn.commit()
         self.worker._name_fallback(self.pid)

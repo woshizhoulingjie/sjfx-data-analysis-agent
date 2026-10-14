@@ -9,16 +9,23 @@ await page.evaluate(async source=>{
 const assert=Object.assign(ok=>{if(!ok)throw new Error('Assertion failed');},{equal:(a,b)=>{if(a!==b)throw new Error(`${a} != ${b}`);}});
 const wait=async(fn)=>{const until=Date.now()+6000;while(!fn()){if(Date.now()>until)throw new Error('Timed out waiting for UI');await new Promise(r=>setTimeout(r,20));}};
 const w=window,calls=[];let runningStatus='queued',networkStatus=200,holdNetwork=null,releaseNetwork=null;
+let sessionNames=['run','cancel','failed','complete'],newSessionCount=0,holdTurn=null,releaseTurn=null,holdResult=null,releaseResult=null,lateTurnError=false;
+let holdSessionList=null,releaseSessionList=null;
 w.matchMedia=()=>({matches:false,addEventListener(){}});w.HTMLElement.prototype.scrollIntoView=()=>{};
 w.fetch=async(raw,options={})=>{const u=new URL(raw,'http://test'),method=options.method||'GET';calls.push({path:u.pathname,method});let data;
 if(u.pathname==='/api/mail/workspace-guide')data={guide:{}};
 else if(u.pathname==='/api/mail/packages')data={packages:['p','q'].map(package_id=>({package_id,display_name:package_id,status:'ready'}))};
 else if(['/api/mail/packages/p','/api/mail/packages/q'].includes(u.pathname))data={overview:{counts:{}},coverage:{}};
 else if(u.pathname.endsWith('/messages'))data={messages:{items:[],total:0}};
-else if(u.pathname==='/api/mail/research-sessions')data={sessions:['run','cancel','failed','complete'].map(s=>({session_id:s,title:s}))};
+else if(u.pathname==='/api/mail/research-sessions'){
+  if(method==='POST'){const id='new-'+(++newSessionCount);sessionNames.push(id);data={session:{session_id:id}};}
+  else {if(holdSessionList){const pending=holdSessionList;holdSessionList=null;await pending;}data={sessions:sessionNames.map(s=>({session_id:s,title:s}))};}
+}
 else if(u.pathname.startsWith('/api/mail/research-sessions/')){const s=u.pathname.split('/').at(-1);data={turns:s==='run'?[{turn_id:'old',status:'completed',result_set_id:'r'},{turn_id:'run',status:runningStatus}]:[{turn_id:s,status:s==='complete'?'completed':s==='cancel'?'cancelled':'failed',result_set_id:s==='complete'?'r':null}]};}
-else if(u.pathname.startsWith('/api/mail/research-turns/')){const s=u.pathname.split('/').at(-1);data={turn:{turn_id:s,status:s==='run'?runningStatus:s==='complete'?'completed':s==='cancel'?'cancelled':'failed',progress:{phase:'context_review',model_calls:4},events:[],result_set_id:s==='complete'?'r':null,final:s==='complete'?{answer:'saved completed answer',result_set_id:'r',fields:[],evidence:[]}:null}};}
-else if(u.pathname==='/api/mail/result-sets/r')data={result_set:{result_set_id:'r',source_turn_id:'complete',item_count:0,items:[],definition:{},final:{answer:'saved completed answer',result_set_id:'r',fields:[],evidence:[]}}};
+else if(u.pathname.startsWith('/api/mail/research-turns/')){const s=u.pathname.split('/').at(-1);data={turn:{turn_id:s,status:s==='run'?runningStatus:s==='complete'?'completed':s==='cancel'?'cancelled':'failed',progress:{phase:'context_review',model_calls:4},events:[],result_set_id:s==='complete'?'r':null,final:s==='complete'?{answer:'saved completed answer',result_set_id:'r',fields:[],evidence:[]}:null}};
+  if(s==='run'&&holdTurn){const pending=holdTurn;holdTurn=null;await pending;if(lateTurnError)throw new Error('old turn unavailable');data.turn={turn_id:'run',status:'completed',result_set_id:'r',final:{answer:'late old turn answer',result_set_id:'r',fields:[],evidence:[]}};}
+}
+else if(u.pathname==='/api/mail/result-sets/r'){data={result_set:{result_set_id:'r',source_turn_id:'complete',item_count:0,items:[],definition:{},final:{answer:'saved completed answer',result_set_id:'r',fields:[],evidence:[]}}};if(holdResult){const pending=holdResult;holdResult=null;await pending;}}
 else if(u.pathname==='/api/mail/presentation')data={presentation:{status:'completed',values:{},metadata:{}}};
 else if(u.pathname.endsWith('/relations/communication'))data={communication:{items:[]}};
 else if(u.pathname.endsWith('/relations/threads'))data={threads:[]};
@@ -52,8 +59,32 @@ select('mail-session','failed');await wait(()=>by('mail-progress').textContent.i
 select('mail-session','complete');await wait(()=>by('mail-answer').textContent==='saved completed answer');assert(by('mail-progress').textContent.includes('已完成'));
 assert.equal(calls.filter(c=>c.method==='POST'&&!c.path.endsWith('/presentation')).length,0);
 select('mail-session','');await wait(()=>by('mail-progress').textContent==='尚无任务');
-console.log('PASS: latest queued/running session GET polling, read-only refresh, cancelled/failed/completed states, no recreated task');
+// A completed old polling response cannot repopulate a newly created session.
+select('mail-session','run');await wait(()=>by('mail-progress').textContent.includes('4 次分析'));
+holdTurn=new Promise(resolve=>{releaseTurn=resolve;});await wait(()=>holdTurn===null);
+const oldRequests=calls.filter(c=>c.path==='/api/mail/research-turns/run').length;
+by('mail-new-session').click();await wait(()=>by('mail-session').value==='new-1');
+assert.equal(by('mail-progress').textContent,'尚无任务');assert(!by('mail-start').disabled&&by('mail-cancel').disabled&&by('mail-export').disabled);
+releaseTurn();await new Promise(r=>setTimeout(r,1700));
+assert.equal(by('mail-session').value,'new-1');assert.equal(by('mail-progress').textContent,'尚无任务');assert.equal(by('mail-answer').textContent,'输入你要查找、比较或提取的内容。');
+assert.equal(calls.filter(c=>c.path==='/api/mail/research-turns/run').length,oldRequests);
+assert(!by('mail-start').disabled&&by('mail-cancel').disabled&&by('mail-export').disabled);
+// A result fetch already begun during restoration is invalidated as well.
+holdResult=new Promise(resolve=>{releaseResult=resolve;});select('mail-session','complete');await wait(()=>holdResult===null);
+by('mail-new-session').click();await wait(()=>by('mail-session').value==='new-2');releaseResult();await new Promise(r=>setTimeout(r,100));
+assert.equal(by('mail-answer').textContent,'输入你要查找、比较或提取的内容。');assert.equal(by('mail-progress').textContent,'尚无任务');
+assert(!by('mail-start').disabled&&by('mail-cancel').disabled&&by('mail-export').disabled&&by('mail-filter-result').disabled);
+// Delayed failures from the old poll must also leave the new session untouched.
+select('mail-session','run');await wait(()=>by('mail-progress').textContent.includes('4 次分析'));
+lateTurnError=true;holdTurn=new Promise(resolve=>{releaseTurn=resolve;});await wait(()=>holdTurn===null);
+by('mail-new-session').click();await wait(()=>by('mail-session').value==='new-3'&&by('mail-status').textContent.includes('已创建研究会话'));
+releaseTurn();await new Promise(r=>setTimeout(r,100));assert(by('mail-status').textContent.includes('已创建研究会话'));assert.equal(by('mail-progress').textContent,'尚无任务');
+// Changing the selection during a new session's list refresh must win.
+holdSessionList=new Promise(resolve=>{releaseSessionList=resolve;});by('mail-new-session').click();await wait(()=>holdSessionList===null);
+select('mail-session','cancel');await wait(()=>by('mail-progress').textContent.includes('已取消'));releaseSessionList();await new Promise(r=>setTimeout(r,100));
+assert.equal(by('mail-session').value,'cancel');assert(by('mail-progress').textContent.includes('已取消'));
+assert.equal(calls.filter(c=>c.method==='POST'&&!c.path.endsWith('/presentation')).length,4,'only the four explicit new-session clicks may create tasks');
 },fs.readFileSync(path.join(root,'static/mail-research.js'),'utf8'));
-console.log('PASS: latest queued/running session GET polling, read-only refresh, cancelled/failed/completed states, no recreated task');
+console.log('PASS: session restoration/refresh, terminal states, new session discards delayed old polling and results');
 }finally{await browser.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

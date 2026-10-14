@@ -188,8 +188,12 @@ class SegmentMemory:
     def connection(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         c=sqlite3.connect(str(self.path), timeout=5)
-        c.execute("CREATE TABLE IF NOT EXISTS translations (key TEXT PRIMARY KEY, value TEXT NOT NULL, created REAL NOT NULL)")
-        return c
+        try:
+            c.execute("CREATE TABLE IF NOT EXISTS translations (key TEXT PRIMARY KEY, value TEXT NOT NULL, created REAL NOT NULL)")
+            return c
+        except BaseException:
+            c.close()
+            raise
     def get(self, key):
         try:
             c=self.connection()

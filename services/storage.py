@@ -1490,6 +1490,7 @@ class Storage:
     def replace_evidence_index(self, scan_id, chunks):
         """Publish one canonical evidence catalog in a single transaction."""
         rows = []
+        fts_rows = []
         for item in chunks or []:
             payload = dict(item)
             source_path = str(payload.get("source_path") or "")
@@ -1505,16 +1506,28 @@ class Storage:
                 str(scan_id), index_key, source_path, archive_source,
                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             ))
+            if self.evidence_fts_available:
+                fts_rows.append((
+                    str(scan_id), index_key, source_path, archive_source,
+                    str(payload.get("section") or ""), str(payload.get("text") or ""),
+                ))
         with self.lock, self._connect() as conn:
             # Package-wide original-evidence rebuilds must not discard a valid
             # completed translation index. Per-document deep re-parses use
             # replace_document_evidence_index(), which removes both variants
             # for that source before the new source fingerprint is translated.
-            conn.execute(
+            deleted = conn.execute(
                 "DELETE FROM evidence_index WHERE scan_id=? AND index_key NOT LIKE 'translation:%'",
                 (str(scan_id),),
-            )
-            if self.evidence_fts_available:
+            ).rowcount
+            # Both catalogs are written in the same transaction by every
+            # supported writer. A new scan has no original FTS rows to remove.
+            # FTS5's unindexed scan_id otherwise makes even an empty DELETE
+            # scan all historical text while holding the database writer lock.
+            # Read the affected count after DELETE has acquired that lock, so
+            # a concurrent writer cannot race the first-publication decision.
+            # Existing catalogs retain the paired deletion/rebuild behavior.
+            if self.evidence_fts_available and deleted:
                 conn.execute(
                     "DELETE FROM evidence_fts WHERE scan_id=? AND index_key NOT LIKE 'translation:%'",
                     (str(scan_id),),
@@ -1525,13 +1538,6 @@ class Storage:
                     rows,
                 )
                 if self.evidence_fts_available:
-                    fts_rows = []
-                    for scan_value, index_key, source_path, archive_source, payload_json in rows:
-                        payload = json.loads(payload_json)
-                        fts_rows.append((
-                            scan_value, index_key, source_path, archive_source,
-                            str(payload.get("section") or ""), str(payload.get("text") or ""),
-                        ))
                     conn.executemany(
                         "INSERT INTO evidence_fts(scan_id,index_key,source_path,archive_source_path,section,text) "
                         "VALUES (?,?,?,?,?,?)",
@@ -1734,7 +1740,7 @@ class Storage:
         # Japanese kana and Korean syllables.  Punctuation is deliberately
         # excluded so it cannot become an FTS/LIKE wildcard-like term.
         values = re.findall(
-            r"[a-z][a-z0-9_.-]{1,}|"
+            r"[a-z0-9_\u00c0-\u024f\u0300-\u036f]{2,}|"
             r"[\u4e00-\u9fff]{2,}|"
             r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]{2,}|"
             r"[\u0e00-\u0e7f]{2,}|"
@@ -1792,15 +1798,27 @@ class Storage:
         scope = str(scope or ".")
         limit = max(50, min(5000, int(limit or 2500)))
         source_paths = sorted(set(str(item) for item in (source_paths or []) if item))
+        has_candidate_filter = candidate_evidence_ids is not None
         candidate_ids = set(str(item) for item in (candidate_evidence_ids or []) if item)
         terms = self._retrieval_terms(query)
         # An empty/whitespace query must never degrade into "first N rows";
         # callers can explicitly request a scope listing through the inventory
         # APIs instead.
-        if not terms and not candidate_ids:
+        if not terms and not has_candidate_filter:
+            return []
+        # An explicit empty candidate set is a valid scoped query and must not
+        # silently widen to the whole index.
+        if has_candidate_filter and not candidate_ids:
             return []
         rows = []
+
         with self._connect() as conn:
+            if has_candidate_filter:
+                conn.execute("CREATE TEMP TABLE retrieval_candidate_ids(id TEXT PRIMARY KEY)")
+                conn.executemany(
+                    "INSERT OR IGNORE INTO retrieval_candidate_ids(id) VALUES (?)",
+                    [(value,) for value in candidate_ids],
+                )
             if source_paths:
                 conn.execute("CREATE TEMP TABLE IF NOT EXISTS retrieval_allowed_sources(path TEXT PRIMARY KEY)")
                 conn.execute("DELETE FROM retrieval_allowed_sources")
@@ -1817,14 +1835,30 @@ class Storage:
                 if source_paths:
                     fts_scope.append(
                         "(EXISTS (SELECT 1 FROM retrieval_allowed_sources a "
-                        "WHERE a.path=f.source_path OR a.path=f.archive_source_path))"
+                        "WHERE a.path=f.source_path OR a.path=f.archive_source_path "
+                        "OR substr(f.source_path,1,length(a.path)+1)=a.path||'/' "
+                        "OR substr(f.source_path,1,length(a.path)+2)=a.path||'::' "
+                        "OR substr(f.archive_source_path,1,length(a.path)+1)=a.path||'/' "
+                        "OR substr(f.archive_source_path,1,length(a.path)+2)=a.path||'::'))"
                     )
-                elif scope != ".":
+                if scope != ".":
                     fts_scope.append(
-                        "(f.source_path=? OR f.source_path LIKE ? OR f.source_path LIKE ? "
-                        "OR f.archive_source_path=? OR f.archive_source_path LIKE ?)"
+                        "(f.source_path=? OR substr(f.source_path,1,length(?))=? "
+                        "OR substr(f.source_path,1,length(?))=? OR f.archive_source_path=? "
+                        "OR substr(f.archive_source_path,1,length(?))=? "
+                        "OR substr(f.archive_source_path,1,length(?))=?)"
                     )
-                    fts_values.extend((scope, scope.rstrip("/") + "/%", scope + "::%", scope, scope.rstrip("/") + "/%"))
+                    prefix, member_prefix = scope.rstrip("/") + "/", scope + "::"
+                    fts_values.extend((scope, prefix, prefix, member_prefix, member_prefix,
+                                       scope, prefix, prefix, member_prefix, member_prefix))
+                if has_candidate_filter:
+                    # A temporary table avoids SQLite's parameter/expression
+                    # limits and compares decoded identifiers exactly, including
+                    # IDs containing punctuation or Unicode JSON escapes.
+                    fts_scope.append(
+                        "EXISTS (SELECT 1 FROM retrieval_candidate_ids c "
+                        "WHERE c.id=json_extract(e.payload,'$.evidence_id'))"
+                    )
                 fts_values.append(limit)
                 try:
                     rows = conn.execute(
@@ -1846,14 +1880,27 @@ class Storage:
                 if source_paths:
                     clauses.append(
                         "(EXISTS (SELECT 1 FROM retrieval_allowed_sources a "
-                        "WHERE a.path=evidence_index.source_path OR a.path=evidence_index.archive_source_path))"
+                        "WHERE a.path=evidence_index.source_path OR a.path=evidence_index.archive_source_path "
+                        "OR substr(evidence_index.source_path,1,length(a.path)+1)=a.path||'/' "
+                        "OR substr(evidence_index.source_path,1,length(a.path)+2)=a.path||'::' "
+                        "OR substr(evidence_index.archive_source_path,1,length(a.path)+1)=a.path||'/' "
+                        "OR substr(evidence_index.archive_source_path,1,length(a.path)+2)=a.path||'::'))"
                     )
-                elif scope != ".":
+                if scope != ".":
                     clauses.append(
-                        "(source_path=? OR source_path LIKE ? OR source_path LIKE ? "
-                        "OR archive_source_path=? OR archive_source_path LIKE ?)"
+                        "(source_path=? OR substr(source_path,1,length(?))=? "
+                        "OR substr(source_path,1,length(?))=? OR archive_source_path=? "
+                        "OR substr(archive_source_path,1,length(?))=? "
+                        "OR substr(archive_source_path,1,length(?))=?)"
                     )
-                    values.extend((scope, scope.rstrip("/") + "/%", scope + "::%", scope, scope.rstrip("/") + "/%"))
+                    prefix, member_prefix = scope.rstrip("/") + "/", scope + "::"
+                    values.extend((scope, prefix, prefix, member_prefix, member_prefix,
+                                   scope, prefix, prefix, member_prefix, member_prefix))
+                if has_candidate_filter:
+                    clauses.append(
+                        "EXISTS (SELECT 1 FROM retrieval_candidate_ids c "
+                        "WHERE c.id=json_extract(evidence_index.payload,'$.evidence_id'))"
+                    )
                 values.append(limit)
                 rows = conn.execute(
                     "SELECT payload FROM evidence_index WHERE {} ORDER BY rowid LIMIT ?".format(
@@ -1867,15 +1914,25 @@ class Storage:
                 item = json.loads(row["payload"])
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            path = str(item.get("archive_source_path") or item.get("source_path") or "")
-            if scope != "." and not (path == scope or path.startswith(scope_prefix) or path.startswith(scope + "::")):
-                continue
-            if source_paths and not any(
-                path == source or path.startswith(source + "/") or path.startswith(source + "::")
-                for source in source_paths
+            logical_path = str(item.get("source_path") or "")
+            physical_path = str(item.get("archive_source_path") or "")
+            path = logical_path or physical_path
+            if scope != "." and not (
+                logical_path == scope or logical_path.startswith(scope_prefix)
+                or logical_path.startswith(scope + "::")
+                or physical_path == scope or physical_path.startswith(scope_prefix)
+                or physical_path.startswith(scope + "::")
             ):
                 continue
-            if candidate_ids and str(item.get("evidence_id") or "") not in candidate_ids:
+            if source_paths and not any(
+                candidate == source or candidate.startswith(source + "/")
+                or candidate.startswith(source + "::")
+                for source in source_paths
+                for candidate in (logical_path, physical_path)
+                if candidate
+            ):
+                continue
+            if has_candidate_filter and str(item.get("evidence_id") or "") not in candidate_ids:
                 continue
             output.append(item)
         return output
@@ -2889,6 +2946,19 @@ class Storage:
             return False
         return not owner_id or (row["owner_id"] or "legacy") == owner_id
 
+    def get_scan_identity(self, scan_id, owner_id=None):
+        """Authorize a scan without loading or migrating its inventory payload."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id,root_path,owner_id FROM scans WHERE id=?", (str(scan_id),)
+            ).fetchone()
+        if not row:
+            return None
+        stored_owner = row["owner_id"] or "legacy"
+        if owner_id is not None and stored_owner != owner_id:
+            return None
+        return {"root": row["root_path"], "_scan_id": row["id"], "_owner_id": stored_owner}
+
     def get_scan_overview(self, scan_id, owner_id=None):
         """Load bounded scan metadata and lazily migrate pre-index releases."""
         with self.lock, self._connect() as conn:
@@ -2946,6 +3016,15 @@ class Storage:
             )
             values.extend([pattern] * 4)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        # LIMIT is a query-planner boundary: resolve job histories only for the
+        # displayed page, rather than for scans discarded by the outer sort.
+        page_from = "FROM scans s "
+        if query:
+            page_from += "LEFT JOIN scan_overviews o ON o.scan_id=s.id "
+        page_sql = (
+            "SELECT s.id,s.root_path,s.created_at " + page_from + where +
+            " ORDER BY COALESCE(s.created_at,'') DESC,s.id DESC LIMIT ? OFFSET ?"
+        )
         projection = (
             "SELECT s.id,s.root_path,s.created_at,o.payload AS overview,"
             "a.scan_id AS analysis_id,a.created_at AS analysis_created_at,"
@@ -2953,39 +3032,46 @@ class Storage:
             "c.state AS control_state,c.reason AS control_reason,"
             "si.status AS index_status,si.expected_documents,si.processed_documents,"
             "si.failed_documents,si.evidence_records,si.updated_at AS index_updated_at,"
+            # Pre-ledger imports retain documents/evidence without a state row.
+            # Bounded EXISTS lookups use their scan indexes and never hydrate
+            # old payloads or scan complete corpora while loading a page.
+            "EXISTS(SELECT 1 FROM unified_documents ud WHERE ud.scan_id=s.id) AS has_documents,"
+            "EXISTS(SELECT 1 FROM evidence_index ei WHERE ei.scan_id=s.id) AS has_evidence,"
+            "EXISTS(SELECT 1 FROM file_previews fp WHERE fp.scan_id=s.id) AS has_previews,"
             "it.status AS import_status,it.current_phase AS import_phase,"
             "active.id AS active_job_id,active.status AS active_job_status,"
             "active.stage AS active_job_stage,active.progress AS active_job_progress,"
             "active.message AS active_job_message,"
             "last_job.status AS last_job_status,last_job.error AS last_job_error,"
             "last_job.updated_at AS last_job_updated_at "
-            "FROM scans s "
+            "FROM (" + page_sql + ") s "
             "LEFT JOIN scan_overviews o ON o.scan_id=s.id "
             "LEFT JOIN package_analyses a ON a.scan_id=s.id "
             "LEFT JOIN analysis_progress p ON p.scan_id=s.id "
             "LEFT JOIN package_processing_controls c ON c.scan_id=s.id "
             "LEFT JOIN search_index_states si ON si.scan_id=s.id "
             "LEFT JOIN import_tasks it ON it.scan_id=s.id "
-            "LEFT JOIN analysis_jobs active ON active.id=("
-            "SELECT j.id FROM analysis_jobs j WHERE j.scan_id=s.id "
+            # Every secondary SQLite index includes rowid. Selecting it keeps
+            # the candidate lookups covered by the existing job indexes, so
+            # sorting them never reads a job's potentially huge result blob.
+            "LEFT JOIN analysis_jobs active ON active.rowid=("
+            "SELECT j.rowid FROM analysis_jobs j WHERE j.scan_id=s.id "
             "AND j.task_type IN ('scan_and_analyze','analyze_package') "
             "AND j.status IN ('queued','running','cancelling') "
             "ORDER BY CASE WHEN j.status IN ('running','cancelling') THEN 0 ELSE 1 END,"
             "j.priority DESC,j.rowid LIMIT 1) "
-            "LEFT JOIN analysis_jobs last_job ON last_job.id=("
-            "SELECT j.id FROM analysis_jobs j WHERE j.scan_id=s.id "
+            "LEFT JOIN analysis_jobs last_job ON last_job.rowid=("
+            "SELECT j.rowid FROM analysis_jobs j WHERE j.scan_id=s.id "
             "AND j.task_type IN ('scan_and_analyze','analyze_package') "
             "ORDER BY j.rowid DESC LIMIT 1)"
         )
         with self._connect() as conn:
             total_row = conn.execute(
-                "SELECT COUNT(*) AS value FROM scans s "
-                "LEFT JOIN scan_overviews o ON o.scan_id=s.id{}".format(where),
+                "SELECT COUNT(*) AS value " + page_from + where,
                 values,
             ).fetchone()
             rows = conn.execute(
-                projection + where +
-                " ORDER BY COALESCE(s.created_at,'') DESC,s.id DESC LIMIT ? OFFSET ?",
+                projection + " ORDER BY COALESCE(s.created_at,'') DESC,s.id DESC",
                 values + [limit, offset],
             ).fetchall()
 
@@ -3045,8 +3131,13 @@ class Storage:
                 "root": root,
                 "created_at": item.get("created_at"),
                 "status": status,
+                # Selecting a persisted package to read its history is allowed
+                # even while its searchable material is unavailable.
+                "selectable": True,
                 "usable": bool(
                     item.get("evidence_records") or processed or analysis_ready
+                    or item.get("has_documents") or item.get("has_evidence")
+                    or item.get("has_previews")
                 ),
                 "analysis_ready": analysis_ready,
                 "analysis_updated_at": item.get("analysis_created_at"),
@@ -4153,13 +4244,13 @@ class Storage:
             finally:
                 cursor.close()
 
-    def save_translation(self, scan_id, node_path, payload):
+    def save_translation(self, scan_id, node_path, payload, index_evidence=True):
         payload = dict(payload or {})
         stored = self._store_translation_payload(scan_id, node_path, payload)
         scan_id = str(scan_id)
         node_path = str(node_path)
         index_rows = []
-        if payload.get("status") in {"completed", "not_required", "partial"}:
+        if index_evidence and payload.get("status") in {"completed", "not_required", "partial"}:
             for unit in payload.get("units") or []:
                 if not isinstance(unit, dict) or unit.get("status") not in {"completed", "not_required"}:
                     continue
@@ -4211,17 +4302,56 @@ class Storage:
                     str(payload.get("provider_id") or ""), stored,
                 ),
             )
-            conn.execute(
-                "DELETE FROM evidence_index WHERE scan_id=? AND source_path=? "
-                "AND index_key LIKE 'translation:%'",
-                (scan_id, node_path),
-            )
-            if self.evidence_fts_available:
-                conn.execute(
-                    "DELETE FROM evidence_fts WHERE scan_id=? AND source_path=? "
-                    "AND index_key LIKE 'translation:%'",
-                    (scan_id, node_path),
+            if not index_evidence:
+                return
+            previous_rows = conn.execute(
+                "SELECT index_key,payload FROM evidence_index WHERE scan_id=? AND source_path=? "
+                "AND index_key LIKE 'translation:%'", (scan_id, node_path),
+            ).fetchall()
+            previous_payloads = {row["index_key"]: row["payload"] for row in previous_rows}
+            indexed_payloads = {row[1]: row[4] for row in index_rows}
+            if previous_payloads == indexed_payloads:
+                return
+            # A resumed partial translation usually adds only a few completed
+            # units. Keep unchanged rows so legacy punctuation-only units do
+            # not trigger a metadata scan of the entire FTS catalog.
+            stale_rows = [row for row in previous_rows
+                          if indexed_payloads.get(row["index_key"]) != row["payload"]]
+            stale_keys = {row["index_key"] for row in stale_rows}
+            index_rows = [row for row in index_rows if previous_payloads.get(row[1]) != row[4]]
+            fts_rowids = set()
+            if self.evidence_fts_available and stale_rows:
+                fallback = False
+                for row in stale_rows:
+                    previous = json.loads(row["payload"])
+                    original = str(previous.get("original_text") or previous.get("text") or "")
+                    if not any(char.isalnum() for char in original):
+                        fallback = True
+                        continue
+                    phrase = '"' + original.replace('"', '""') + '"'
+                    matches = conn.execute(
+                        "SELECT rowid FROM evidence_fts WHERE evidence_fts MATCH ? "
+                        "AND scan_id=? AND source_path=? AND index_key=?",
+                        (phrase, scan_id, node_path, row["index_key"]),
+                    ).fetchall()
+                    if not matches:
+                        fallback = True
+                    fts_rowids.update(int(match[0]) for match in matches)
+                if fallback:
+                    # Resolve tokenless legacy entries once, then delete only
+                    # stale keys; unchanged units retain their FTS rowids.
+                    fts_rowids.update(int(row["rowid"]) for row in conn.execute(
+                        "SELECT rowid,index_key FROM evidence_fts WHERE scan_id=? AND source_path=? "
+                        "AND index_key LIKE 'translation:%'", (scan_id, node_path),
+                    ) if row["index_key"] in stale_keys)
+            if stale_rows:
+                conn.executemany(
+                    "DELETE FROM evidence_index WHERE scan_id=? AND source_path=? AND index_key=?",
+                    [(scan_id, node_path, row["index_key"]) for row in stale_rows],
                 )
+            if fts_rowids:
+                conn.executemany("DELETE FROM evidence_fts WHERE rowid=?",
+                                 [(rowid,) for rowid in sorted(fts_rowids)])
             if index_rows:
                 conn.executemany(
                     "INSERT INTO evidence_index(scan_id,index_key,source_path,archive_source_path,payload) "
@@ -4594,6 +4724,24 @@ class Storage:
             )
         return len(turn_ids)
 
+    def get_conversation_identity(self, session_id, owner_id=None, scan_id=None):
+        """Read only the session identity; None is an explicit all-owner filter."""
+        clauses = ["id=?"]
+        values = [str(session_id)]
+        if owner_id is not None:
+            clauses.append("owner_id=?")
+            values.append(str(owner_id))
+        if scan_id is not None:
+            clauses.append("scan_id=?")
+            values.append(str(scan_id))
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id,scan_id,owner_id FROM conversations WHERE {}".format(
+                    " AND ".join(clauses)
+                ), values,
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_conversation(self, session_id, owner_id, scan_id=None,
                          message_limit=100, before_sequence=None,
                          context_only=False):
@@ -4830,13 +4978,18 @@ class Storage:
 
     def list_conversations(self, scan_id, owner_id, limit=50):
         limit = max(1, min(200, int(limit or 50)))
+        owner_clause = " AND owner_id=?" if owner_id is not None else ""
+        values = [str(scan_id)]
+        if owner_id is not None:
+            values.append(str(owner_id))
+        values.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT c.id,c.title,c.status,c.payload,c.created_at,c.updated_at,"
                 "(SELECT COUNT(*) FROM conversation_messages m WHERE m.session_id=c.id) AS message_count "
                 "FROM conversations c "
-                "WHERE scan_id=? AND owner_id=? ORDER BY updated_at DESC LIMIT ?",
-                (str(scan_id), str(owner_id), limit),
+                "WHERE scan_id=?{} ORDER BY updated_at DESC LIMIT ?".format(owner_clause),
+                values,
             ).fetchall()
         items = []
         for row in rows:
@@ -4996,15 +5149,23 @@ class Storage:
             ).fetchone()
         return self._decode_conversation_turn(row)
 
-    def list_conversation_turns(self, session_id, owner_id, limit=100):
+    def list_conversation_turns(self, session_id, owner_id, limit=100, turn_ids=None):
         limit = max(1, min(500, int(limit or 100)))
+        clauses = ["session_id=?", "owner_id=?"]
+        values = [str(session_id), str(owner_id)]
+        if turn_ids is not None:
+            ids = list(dict.fromkeys(str(value) for value in turn_ids if value))[:500]
+            if not ids:
+                return []
+            clauses.append("id IN ({})".format(",".join("?" for _ in ids)))
+            values.extend(ids)
+        values.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM conversation_turns WHERE session_id=? AND owner_id=? "
-                "ORDER BY sequence LIMIT ?",
-                (str(session_id), str(owner_id), limit),
+                "SELECT * FROM conversation_turns WHERE {} "
+                "ORDER BY sequence DESC LIMIT ?".format(" AND ".join(clauses)), values,
             ).fetchall()
-        return [self._decode_conversation_turn(row) for row in rows]
+        return [self._decode_conversation_turn(row) for row in reversed(rows)]
 
     def update_conversation_turn(self, turn_id, status=None, stage=None, progress=None,
                                  message=None, plan=None, result=None, verification=None,

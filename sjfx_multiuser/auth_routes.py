@@ -66,6 +66,7 @@ def _adapter():
 # 已有的调用点。改调用点是纯风险，没有收益。
 
 from .auth_pages import (  # noqa: E402
+    _COMMON_JS,
     PASSWORD_MIN,
     change_password_page_html,
     login_page_html,
@@ -124,7 +125,7 @@ _ADMIN_EXTRA_CSS = """
 
 
 def admin_page_html():
-    """管理员控制台。纯前端调已有的 /api/admin/* 接口，不引入新后端逻辑。"""
+    """管理员控制台，账号管理与只读资料清单。"""
     body = """<div class="wrap">
   <div class="topbar">
     <div class="brand"><div class="mark">◆</div><h1>管理员控制台</h1></div>
@@ -136,7 +137,7 @@ def admin_page_html():
 
   <div class="panel">
     <h2>数据视角</h2>
-    <p class="sub">切换后，工作台里看到的数据包与历史记录会变成该用户的范围。存在服务端会话里，改不了。</p>
+    <p class="sub">切换后，工作台显示所选用户的数据包与历史记录。管理员选择自己的账号仍等价于全部用户。</p>
     <div class="row">
       <span class="who">当前视角：<b id="curView">…</b></span>
       <select id="viewSelect" style="padding:8px 10px;border-radius:8px;background:#0e1422;border:1px solid #263349;color:#e6ecf5;">
@@ -164,166 +165,51 @@ def admin_page_html():
       <table>
         <thead><tr>
           <th>账号</th><th>显示名</th><th>角色</th><th>状态</th>
-          <th>归属空间</th><th>最后登录</th><th>操作</th>
+          <th>归属空间</th><th>资料与历史</th><th>最后登录</th><th>操作</th>
         </tr></thead>
-        <tbody id="userRows"><tr><td colspan="7" class="hint">加载中…</td></tr></tbody>
+        <tbody id="userRows"><tr><td colspan="8" class="hint">加载中…</td></tr></tbody>
       </table>
     </div>
     <div class="msg" id="userMsg"></div>
   </div>
+  <div class="panel" id="materialPanel" hidden>
+    <h2 id="materialTitle">用户资料</h2>
+    <p class="sub" id="materialOwner"></p>
+    <div class="row" style="margin-bottom:12px;">
+      <select id="materialKind" class="btn">
+        <option value="ordinary">普通数据包</option><option value="large">大数据包</option>
+        <option value="conversations">问答历史</option><option value="translations">翻译历史</option>
+      </select>
+      <button class="btn" id="materialRefresh" type="button">刷新资料</button>
+      <button class="btn" id="materialWorkbench" type="button">切换视角并进入工作台</button>
+    </div>
+    <div id="materialStats" class="hint"></div>
+    <div style="overflow:auto;"><table>
+      <thead><tr><th>名称</th><th>资料标识 / 来源</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+      <tbody id="materialRows"></tbody>
+    </table></div>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn" id="materialPrev" type="button">上一页</button>
+      <span class="hint" id="materialPage"></span>
+      <button class="btn" id="materialNext" type="button">下一页</button>
+    </div>
+    <div class="msg" id="materialMsg"></div>
+    <div id="materialConversation" hidden>
+      <h3 id="materialConversationTitle"></h3>
+      <button class="btn" id="materialOlder" type="button">更早消息</button>
+      <div class="msg" id="materialConversationMsg"></div>
+      <div id="materialMessages"></div>
+    </div>
+  </div>
 </div>
 
-<script>
-function $(i){return document.getElementById(i);}
-function esc(t){return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-function say(el, text, cls){ var e=$(el); e.className='msg '+(cls||''); e.textContent=text||''; }
-
-async function api(path, opts){
-  var r = await fetch(path, Object.assign({headers:{'Accept':'application/json'}}, opts||{}));
-  if (r.status === 401) { location.href='/login'; throw new Error('未登录'); }
-  var d = null; try { d = await r.json(); } catch(e) { d = null; }
-  return {status: r.status, data: d};
-}
-
-var ME = null, USERS = [];
-
-async function loadMe(){
-  var r = await api('/api/auth/me');
-  if (!r.data || !r.data.ok) { location.href='/login'; return false; }
-  ME = r.data.user;
-  $('who').textContent = ME.display_name || ME.username;
-  if (ME.role !== 'admin') {
-    document.querySelector('.wrap').innerHTML =
-      '<div class="panel"><h2>需要管理员权限</h2><p class="sub">当前账号不是管理员。</p>' +
-      '<a class="btn" href="/">返回工作台</a></div>';
-    return false;
-  }
-  if (ME.must_change_pw) { location.href='/change-password'; return false; }
-  return true;
-}
-
-async function loadUsers(){
-  var r = await api('/api/admin/users');
-  if (!r.data || !r.data.ok) { say('userMsg', '加载失败：' + (r.data&&r.data.error||r.status), 'err'); return; }
-  USERS = r.data.users || [];
-  var rows = USERS.map(function(u){
-    var isMe = u.user_id === ME.user_id;
-    var tag = u.role === 'admin' ? '<span class="tag admin">管理员</span>' : '<span class="tag">普通用户</span>';
-    var st  = u.status === 'active' ? '<span class="tag on">正常</span>' : '<span class="tag off">已停用</span>';
-    var acts = [];
-    acts.push('<button class="btn" data-act="reset" data-id="'+u.user_id+'" data-name="'+esc(u.username)+'">重置密码</button>');
-    if (isMe) {
-      acts.push('<span class="hint">当前账号</span>');
-    } else if (u.status === 'active') {
-      acts.push('<button class="btn danger" data-act="disable" data-id="'+u.user_id+'" data-name="'+esc(u.username)+'">停用</button>');
-    } else {
-      acts.push('<button class="btn" data-act="enable" data-id="'+u.user_id+'">启用</button>');
-    }
-    return '<tr><td><b>'+esc(u.username)+'</b></td><td>'+esc(u.display_name)+'</td><td>'+tag+'</td><td>'+st+'</td>' +
-      '<td class="mono">'+esc(u.owner_id)+'</td><td class="hint">'+esc(u.last_login_utc||'从未登录')+'</td>' +
-      '<td><div class="row">'+acts.join(' ')+'</div></td></tr>';
-  }).join('');
-  $('userRows').innerHTML = rows || '<tr><td colspan="7" class="hint">没有用户</td></tr>';
-
-  var active = USERS.filter(function(u){return u.status==='active';}).length;
-  var admins = USERS.filter(function(u){return u.role==='admin' && u.status==='active';}).length;
-  $('stats').innerHTML =
-    '<div class="stat"><span>账号总数</span><b>'+USERS.length+'</b></div>' +
-    '<div class="stat"><span>活跃账号</span><b>'+active+'</b></div>' +
-    '<div class="stat"><span>活跃管理员</span><b>'+admins+'</b></div>' +
-    '<div class="stat"><span>数据空间</span><b>'+new Set(USERS.map(function(u){return u.owner_id;})).size+'</b></div>';
-
-  var sel = $('viewSelect');
-  var cur = sel.value;
-  sel.innerHTML = '<option value="">全部用户（管理员默认）</option>' +
-    USERS.map(function(u){
-      return '<option value="'+esc(u.owner_id)+'">'+esc(u.display_name||u.username)+'（'+esc(u.username)+'）</option>';
-    }).join('');
-  sel.value = cur;
-}
-
-async function loadView(){
-  var r = await api('/api/admin/view-as');
-  if (!r.data || !r.data.ok) return;
-  var v = r.data.viewing_owner;
-  $('curView').textContent = v ? v : '全部用户';
-  $('viewSelect').value = v || '';
-}
-
-async function applyView(){
-  var v = $('viewSelect').value || null;
-  var r = await api('/api/admin/view-as', {method:'POST', headers:{'Content-Type':'application/json'},
-                                           body: JSON.stringify({owner_id: v})});
-  if (r.status === 200 && r.data && r.data.ok) {
-    say('viewMsg', '已切换到：' + (v || '全部用户'), 'ok');
-    await loadView();
-  } else {
-    say('viewMsg', '切换失败：' + ((r.data&&r.data.error) || r.status), 'err');
-  }
-}
-
-async function resetPassword(id, name){
-  var pw = prompt('为「' + name + '」设置新密码（至少 8 位）。\\n该用户下次登录会被要求改密。');
-  if (!pw) return;
-  var r = await api('/api/admin/users/' + encodeURIComponent(id) + '/password',
-                    {method:'POST', headers:{'Content-Type':'application/json'},
-                     body: JSON.stringify({password: pw})});
-  if (r.status === 200 && r.data && r.data.ok) say('userMsg', '已重置「'+name+'」的密码，并作废其现有会话', 'ok');
-  else say('userMsg', '重置失败：' + ((r.data&&r.data.error) || r.status), 'err');
-}
-
-async function setStatus(id, status, name){
-  if (status === 'disabled' && !confirm('确定停用「' + name + '」？\\n该用户将立即无法登录，已有数据保留。')) return;
-  var r = await api('/api/admin/users/' + encodeURIComponent(id),
-                    {method:'DELETE', headers:{'Content-Type':'application/json'},
-                     body: JSON.stringify({status: status})});
-  if (r.status === 200 && r.data && r.data.ok) {
-    say('userMsg', (status==='disabled'?'已停用 ':'已启用 ') + name, 'ok');
-    await loadUsers();
-  } else {
-    say('userMsg', '操作失败：' + ((r.data&&r.data.error) || r.status), 'err');
-  }
-}
-
-async function createUser(){
-  var name = prompt('新账号名（3-32 位，字母开头）：');
-  if (!name) return;
-  var pw = prompt('为「' + name + '」设置初始密码（至少 8 位）：');
-  if (!pw) return;
-  var role = confirm('设为管理员吗？\\n确定=管理员，取消=普通用户') ? 'admin' : 'user';
-  var r = await api('/api/admin/users', {method:'POST', headers:{'Content-Type':'application/json'},
-                                         body: JSON.stringify({username:name, password:pw, role:role, must_change_pw:true})});
-  if (r.status === 200 && r.data && r.data.ok) {
-    say('userMsg', '已创建 ' + name + '（' + role + '），归属空间 ' + r.data.owner_id, 'ok');
-    await loadUsers();
-  } else {
-    say('userMsg', '创建失败：' + ((r.data&&r.data.error) || r.status), 'err');
-  }
-}
-
-document.addEventListener('click', function(e){
-  var b = e.target.closest('[data-act]');
-  if (!b) return;
-  var id = b.dataset.id, name = b.dataset.name, act = b.dataset.act;
-  if (act === 'reset') resetPassword(id, name);
-  else if (act === 'disable') setStatus(id, 'disabled', name);
-  else if (act === 'enable') setStatus(id, 'active', name);
-});
-
-$('applyView').addEventListener('click', applyView);
-$('refreshBtn').addEventListener('click', function(){ loadUsers(); loadView(); });
-$('newUserBtn').addEventListener('click', createUser);
-$('logoutBtn').addEventListener('click', async function(){
-  await fetch('/api/auth/logout', {method:'POST'}); location.href='/login';
-});
-
-(async function(){
-  if (!await loadMe()) return;
-  await loadUsers();
-  await loadView();
-})();
-</script>"""
-    return _page("管理员控制台", body).replace("</style>", _ADMIN_EXTRA_CSS + "</style>")
+<script src="/auth-static/admin-materials.js"></script>
+<script src="/auth-static/admin-console.js"></script>"""
+    # This page has no password fields/forms. Drop the auth-page common inline
+    # helpers so every admin script obeys the existing script-src 'self' CSP.
+    return (_page("管理员控制台", body)
+            .replace("<script>" + _COMMON_JS + "\n</script>", "")
+            .replace("</style>", _ADMIN_EXTRA_CSS + "</style>"))
 
 
 # --------------------------------------------------------------------------
@@ -331,7 +217,7 @@ $('logoutBtn').addEventListener('click', async function(){
 # --------------------------------------------------------------------------
 
 def register(app, user_store, config_owner_id=None, adapter=None,
-             register_limit_per_hour=REGISTER_LIMIT_PER_HOUR):
+             register_limit_per_hour=REGISTER_LIMIT_PER_HOUR, material_catalog=None):
     """把认证路由挂到 app 上。
 
     参数
@@ -497,6 +383,26 @@ def register(app, user_store, config_owner_id=None, adapter=None,
         # 显式给 JS 的 content-type：适配层默认是 html
         return ad.html(body, mime="application/javascript")
 
+    @app.route("/auth-static/admin-materials.js", methods=["GET"])
+    def sjfx_admin_materials_js():
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "web_assets", "admin-materials.js")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return ad.html(fh.read(), mime="application/javascript")
+        except OSError:
+            return ad.json({"ok": False, "error": "管理员资料脚本缺失"}, 404)
+
+    @app.route("/auth-static/admin-console.js", methods=["GET"])
+    def sjfx_admin_console_js():
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "web_assets", "admin-console.js")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return ad.html(fh.read(), mime="application/javascript")
+        except OSError:
+            return ad.json({"ok": False, "error": "管理员控制台脚本缺失"}, 404)
+
     @app.route("/admin", methods=["GET"])
     def sjfx_admin_page():
         """管理员控制台页面。
@@ -661,8 +567,59 @@ def register(app, user_store, config_owner_id=None, adapter=None,
         if err:
             return err
         users = user_store.list_users()
+        data_error = None
+        if material_catalog is not None:
+            try:
+                stats = material_catalog.summaries(u["owner_id"] for u in users)
+                for user in users:
+                    user["data_stats"] = stats.get(user["owner_id"])
+            except (sqlite3.Error, OSError, ValueError):
+                # Keep account management available during a catalog read error.
+                data_error = "资料统计暂不可用，请稍后刷新；账号管理仍可使用"
         return ad.json({"ok": True, "count": len(users), "users": users,
-                        "me": s["user_id"]})
+                        "me": s["user_id"], "data_error": data_error})
+
+    @app.route("/api/admin/users/<user_id>/materials", methods=["GET"])
+    def sjfx_admin_user_materials(user_id):
+        s, err = _require_admin()
+        if err:
+            return err
+        target = user_store.get_user(user_id)
+        if not target:
+            return ad.json({"ok": False, "error": "用户不存在"}, 404)
+        if material_catalog is None:
+            return ad.json({"ok": False, "error": "资料管理未配置"}, 503)
+        try:
+            result = material_catalog.list_materials(
+                target["owner_id"], kind=ad.query_arg("kind", "ordinary"),
+                limit=ad.query_arg("limit", 25), offset=ad.query_arg("offset", 0))
+        except (ValueError, TypeError):
+            return ad.json({"ok": False, "error": "资料类型或分页参数无效"}, 400)
+        except (sqlite3.Error, OSError):
+            return ad.json({"ok": False, "error": "资料读取失败，请稍后重试"}, 503)
+        return ad.json({"ok": True, "owner_id": target["owner_id"], **result})
+
+    @app.route("/api/admin/users/<user_id>/conversations/<session_id>", methods=["GET"])
+    def sjfx_admin_user_conversation(user_id, session_id):
+        s, err = _require_admin()
+        if err:
+            return err
+        target = user_store.get_user(user_id)
+        if not target:
+            return ad.json({"ok": False, "error": "用户不存在"}, 404)
+        if material_catalog is None:
+            return ad.json({"ok": False, "error": "资料管理未配置"}, 503)
+        try:
+            result = material_catalog.conversation(
+                target["owner_id"], session_id, limit=ad.query_arg("limit", 50),
+                offset=ad.query_arg("offset", 0))
+        except (ValueError, TypeError):
+            return ad.json({"ok": False, "error": "分页参数无效"}, 400)
+        except (sqlite3.Error, OSError):
+            return ad.json({"ok": False, "error": "历史消息读取失败，请稍后重试"}, 503)
+        if result is None:
+            return ad.json({"ok": False, "error": "该用户的会话不存在"}, 404)
+        return ad.json({"ok": True, "owner_id": target["owner_id"], **result})
 
     @app.route("/api/admin/users", methods=["POST"])
     def sjfx_admin_user_create():

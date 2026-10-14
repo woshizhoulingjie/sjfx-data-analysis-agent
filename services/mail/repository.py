@@ -66,6 +66,12 @@ class MailRepository:
         with self._connection() as connection:
             return migrate(connection)
 
+
+    def close(self):
+        """Release this database's process caches when its instance shuts down."""
+        from .network_service import close_database
+        close_database(self.storage.db_path)
+
     def create_package(self, *, owner_id, display_name, source_kind, source_path, source_revision, config, idempotency_key=None):
         with self._connection() as connection:
             if idempotency_key:
@@ -752,20 +758,31 @@ class MailRepository:
         return matches
 
     def create_evidence(self, package_id, owner_id, segment):
+        return self.create_evidence_batch(package_id, owner_id, [segment])[0]
+
+    def create_evidence_batch(self, package_id, owner_id, segments):
         package = self.get_package(package_id, owner_id)
         if not package:
             raise ValueError("邮件资料包不存在或不属于当前用户")
-        with self._connection() as connection:
-            occurrence = connection.execute("SELECT occurrence_id,raw_sha256 FROM mail_visible_occurrences WHERE package_id=? AND message_key=? ORDER BY source_member_ordinal LIMIT 1", (package_id, segment["message_key"])).fetchone()
-            evidence_id = _id("mev")
-            text = str(segment.get("text") or "")
-            if not occurrence:
-                raise ValueError("证据邮件不在当前资料包")
-            quote = text[:2000] if Config.MAIL_ENABLE_AGENT_MINING else text[:1000]
-            connection.execute("INSERT INTO mail_evidence(evidence_id,package_id,message_key,occurrence_id,mime_path,segment_id,page_number,sheet_name,char_start,char_end,quote_text,source_revision,index_epoch,source_sha256) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (evidence_id, package_id, segment["message_key"], occurrence["occurrence_id"] if occurrence else None, segment["mime_path"], segment.get("segment_id"), segment.get("page_number"), segment.get("sheet_name"), segment.get("char_start"), (segment.get("char_start") or 0) + len(quote), quote, package["source_revision"], package["index_epoch"], occurrence["raw_sha256"] if occurrence else ""))
-            part=connection.execute('SELECT payload_sha256 FROM mail_parts WHERE message_key=? AND mime_path=?',(segment['message_key'],segment['mime_path'])).fetchone()
-            connection.execute('UPDATE mail_evidence SET cell_range=?,payload_sha256=?,text_sha256=? WHERE evidence_id=?',(segment.get('cell_range'),part[0] if part else None,segment.get('text_sha256') or hashlib.sha256(text.encode()).hexdigest(),evidence_id))
-            provenance=self._text_provenance(connection,segment)
+        # Bounded transactions preserve ownership and original provenance rules.
+        values = []
+        for offset in range(0, len(segments), 100):
+            with self._connection() as connection:
+                for segment in segments[offset:offset + 100]:
+                    values.append(self._create_evidence(connection, package_id, package, segment))
+        return values
+
+    def _create_evidence(self, connection, package_id, package, segment):
+        occurrence = connection.execute("SELECT occurrence_id,raw_sha256 FROM mail_visible_occurrences WHERE package_id=? AND message_key=? ORDER BY source_member_ordinal LIMIT 1", (package_id, segment["message_key"])).fetchone()
+        evidence_id = _id("mev")
+        text = str(segment.get("text") or "")
+        if not occurrence:
+            raise ValueError("证据邮件不在当前资料包")
+        quote = text[:2000] if Config.MAIL_ENABLE_AGENT_MINING else text[:1000]
+        connection.execute("INSERT INTO mail_evidence(evidence_id,package_id,message_key,occurrence_id,mime_path,segment_id,page_number,sheet_name,char_start,char_end,quote_text,source_revision,index_epoch,source_sha256) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (evidence_id, package_id, segment["message_key"], occurrence["occurrence_id"] if occurrence else None, segment["mime_path"], segment.get("segment_id"), segment.get("page_number"), segment.get("sheet_name"), segment.get("char_start"), (segment.get("char_start") or 0) + len(quote), quote, package["source_revision"], package["index_epoch"], occurrence["raw_sha256"] if occurrence else ""))
+        part=connection.execute('SELECT payload_sha256 FROM mail_parts WHERE message_key=? AND mime_path=?',(segment['message_key'],segment['mime_path'])).fetchone()
+        connection.execute('UPDATE mail_evidence SET cell_range=?,payload_sha256=?,text_sha256=? WHERE evidence_id=?',(segment.get('cell_range'),part[0] if part else None,segment.get('text_sha256') or hashlib.sha256(text.encode()).hexdigest(),evidence_id))
+        provenance=self._text_provenance(connection,segment)
         return {"evidence_id": evidence_id, "quote_text": quote,**provenance}
 
     def _text_provenance(self,connection,segment):

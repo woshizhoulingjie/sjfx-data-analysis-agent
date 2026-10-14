@@ -62,5 +62,25 @@ class EvidencePrefetchTests(unittest.TestCase):
             __hash__=None
             def encode(self,*args,**kwargs): return type('Result',(),{'ids':[]})()
         with patch.object(naming,'_tokenizer',return_value=Encoder()): self.assertEqual(naming.token_count(''),0)
+    def test_unhashable_encoder_replacements_do_not_reuse_cached_counts(self):
+        class Encoder:
+            __hash__ = None
+            def __init__(self, count):
+                self.count = count
+                self.calls = 0
+            def encode(self, *args, **kwargs):
+                self.calls += 1
+                return type('Result', (), {'ids': list(range(self.count))})()
+        naming._TOKEN_COUNT_CACHE.clear()
+        text = '测试🙂'
+        with patch.object(naming, '_tokenizer', return_value=None):
+            self.assertEqual(naming.token_count(text), len(text.encode('utf-8')))
+        first, second = Encoder(3), Encoder(9)
+        with patch.object(naming, '_tokenizer', return_value=first):
+            self.assertEqual(naming.token_count(text), 3)
+            self.assertEqual(naming.token_count(text), 3)
+        self.assertEqual(first.calls, 2)
+        with patch.object(naming, '_tokenizer', return_value=second):
+            self.assertEqual(naming.token_count(text), 9)
 
 if __name__ == '__main__': unittest.main()

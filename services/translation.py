@@ -371,13 +371,13 @@ class ProtectedText:
     kinds: dict
     glossary_targets: list
 
-    def restore(self, translated):
+    def restore(self, translated, strict=True):
         output = str(translated or "")
-        # A placeholder that never appears cannot be restored and stays a hard
-        # failure.  A repeated placeholder still restores every occurrence, so
-        # the QA reports it as a warning instead of discarding the whole unit.
+        # Strict callers reject a missing token. Explicit file translation can
+        # retain the model's Chinese wording and report the difference in QA;
+        # restore only tokens actually present, without inventing missing text.
         missing = [token for token in self.replacements if token not in output]
-        if missing:
+        if missing and strict:
             raise TranslationQualityError(
                 "模型未完整保留保护标记：{}".format(", ".join(missing[:8])),
                 code="protected_token_mismatch",
@@ -682,6 +682,10 @@ class TranslationPolicy:
     # (mail/NLLB). Explicit file translation may opt into a lower gate because
     # its vLLM units are deliberately smaller and independently resumable.
     segmented_recovery_min_chars: int = 1200
+    # Explicit full-file translation accepts readable Chinese despite heuristic
+    # formatting, terminology or protection differences. Other callers retain
+    # the historical contract by default.
+    relaxed_quality_checks: bool = False
 
     def __post_init__(self):
         self.max_unit_chars = max(128, min(12000, int(self.max_unit_chars or 4800)))
@@ -704,6 +708,7 @@ class TranslationPolicy:
         )
         self.preserve_figure_blocks = bool(self.preserve_figure_blocks)
         self.preserve_untranslated_tail = bool(self.preserve_untranslated_tail)
+        self.relaxed_quality_checks = bool(self.relaxed_quality_checks)
 
 
 def translation_memory_key(source_text, source_language, glossary=None,
@@ -797,13 +802,14 @@ def _preserve_reviewed_source_units(units, max_share=_MAX_PRESERVED_SHARE):
 
 
 def validate_translation(source, protected, provider_output, restored,
-                         source_language, glossary=None, strict_layout=False):
+                         source_language, glossary=None, strict_layout=False,
+                         relaxed=False):
     """Return a machine-readable QA decision for one translated unit."""
     errors = []
     warnings = []
     raw_output = str(provider_output or "")
     restored = str(restored or "")
-    if not raw_output.strip():
+    if not raw_output.strip() or not restored.strip():
         errors.append("empty_translation")
     duplicated_tokens = 0
     for token in protected.replacements:
@@ -835,7 +841,10 @@ def validate_translation(source, protected, provider_output, restored,
         + len(_HANGUL_RE.findall(translatable)) + _other_alpha_count(translatable)
     )
     han_count = len(_HAN_RE.findall(restored))
-    if translatable_letters >= 8 and not han_count:
+    # In relaxed mode a glossary expansion alone must not make an echoed
+    # foreign paragraph look translated. Require Chinese in the actual output.
+    output_han_count = len(_HAN_RE.findall(_TOKEN_RE.sub("", raw_output)))
+    if translatable_letters >= 8 and not (output_han_count if relaxed else han_count):
         errors.append("target_missing_chinese")
 
     # Only prose is expected to become Chinese; labels, links and citations in
@@ -854,7 +863,12 @@ def validate_translation(source, protected, provider_output, restored,
 
     plain_source = re.sub(r"\s+", "", str(source or "")).casefold()
     plain_target = re.sub(r"\s+", "", restored).casefold()
-    if translatable_letters >= 6 and plain_source == plain_target:
+    protected_source = re.sub(r"\s+", "", protected.text).casefold()
+    protected_target = re.sub(r"\s+", "", raw_output).casefold()
+    if translatable_letters >= 6 and (
+        plain_source == plain_target
+        or (relaxed and protected_source == protected_target)
+    ):
         errors.append("source_copied_without_translation")
 
     source_length = max(1, len(str(source or "").strip()))
@@ -889,6 +903,17 @@ def validate_translation(source, protected, provider_output, restored,
     if structural_counts["table_pipes"] >= 2 and structural_counts["table_pipes"] != restored_counts["table_pipes"]:
         errors.append("table_structure_changed")
 
+    if relaxed:
+        # These heuristics cannot establish that an otherwise usable Chinese
+        # translation failed. Record them without discarding the output or
+        # spending further model attempts on the same text.
+        advisory_codes = {
+            "protected_token_mismatch", "glossary_term_missing",
+            "target_contains_untranslated_text", "implausible_length_ratio",
+            "table_structure_changed",
+        }
+        warnings.extend(code for code in errors if code in advisory_codes)
+        errors = [code for code in errors if code not in advisory_codes]
     errors = sorted(set(errors))
     warnings = sorted(set(warnings))
     score = max(0.0, 1.0 - len(errors) * 0.35 - len(warnings) * 0.08)
@@ -902,6 +927,10 @@ def validate_translation(source, protected, provider_output, restored,
         "glossary_occurrences": len(protected.glossary_targets),
         "source_structure": structural_counts,
         "target_structure": restored_counts,
+        "missing_protected_items": len([
+            token for token in protected.replacements if token not in raw_output
+        ]) if relaxed else 0,
+        "validation_mode": "relaxed" if relaxed else "strict",
     }
 
 
@@ -1436,11 +1465,14 @@ class TranslationService:
         last_error = None
 
         def validate_response(response):
-            restored_core = protected.restore(response.text).strip()
+            restored_core = protected.restore(
+                response.text, strict=not self.policy.relaxed_quality_checks,
+            ).strip()
             qa = validate_translation(
                 core, protected, response.text, restored_core,
                 unit["source_language"], glossary=glossary,
                 strict_layout=unit.get("block_kind") == "table",
+                relaxed=self.policy.relaxed_quality_checks,
             )
             if not qa["passed"]:
                 raise TranslationQualityError(
@@ -1502,10 +1534,13 @@ class TranslationService:
                 if not piece_core:
                     return item["source"], {"passed": True, "warnings": []}
                 protected_piece = item["protected"]
-                restored_piece_core = protected_piece.restore(response.text).strip()
+                restored_piece_core = protected_piece.restore(
+                    response.text, strict=not self.policy.relaxed_quality_checks,
+                ).strip()
                 piece_qa = validate_translation(
                     piece_core, protected_piece, response.text, restored_piece_core,
                     unit["source_language"], glossary=glossary, strict_layout=False,
+                    relaxed=self.policy.relaxed_quality_checks,
                 )
                 if not piece_qa["passed"]:
                     raise TranslationQualityError(
@@ -1735,6 +1770,57 @@ class TranslationService:
                 self.policy.contract_version,
             )
         resume_lookup = self._resume_lookup(resume_state)
+        if (
+            self.policy.relaxed_quality_checks
+            and isinstance(resume_state, dict)
+            and resume_state.get("provider_id") == self.provider.provider_id
+            and resume_state.get("target_language") == TARGET_LANGUAGE
+            and resume_state.get("glossary_fingerprint") == glossary_fingerprint(glossary)
+        ):
+            # A stricter accepted checkpoint is still acceptable when relaxing
+            # the same provider's file policy. Keep successful work; only retry
+            # failed units under the new contract. Shared strict callers never
+            # opt into this migration or consume relaxed translation memory.
+            for candidate in self._resume_lookup(resume_state).values():
+                if (candidate.get("qa") or {}).get("passed") is True:
+                    core = str(candidate.get("source_text") or "").strip()
+                    restored = str(candidate.get("target_text") or "").strip()
+                    protected = protect_text(core, glossary=glossary)
+                    # Old checkpoints do not store raw provider output. Map
+                    # restored spans back to tokens to check our basic Chinese
+                    # and echo guards instead of trusting glossary expansions.
+                    raw_output = restored
+                    reverse_tokens = {}
+                    for token, replacement in protected.replacements.items():
+                        reverse_tokens.setdefault(replacement, []).append(token)
+                    if reverse_tokens:
+                        pattern = re.compile("|".join(
+                            re.escape(value) for value in sorted(reverse_tokens, key=len, reverse=True)
+                        ))
+
+                        def reverse_span(match):
+                            tokens = reverse_tokens[match.group(0)]
+                            return tokens.pop(0) if tokens else match.group(0)
+
+                        # Scan only the original target. A later number must
+                        # never match the digits of a token already inserted.
+                        raw_output = pattern.sub(reverse_span, restored)
+                    qa = validate_translation(
+                        core, protected, raw_output, restored,
+                        candidate.get("source_language"), glossary=glossary,
+                        relaxed=True,
+                    )
+                    if not qa["passed"]:
+                        continue
+                    qa["warnings"] = sorted(set(qa["warnings"] + (
+                        (candidate.get("qa") or {}).get("warnings") or []
+                    )))
+                    candidate["qa"] = qa
+                    key = translation_memory_key(
+                        candidate.get("source_text"), candidate.get("source_language"),
+                        glossary=glossary, contract_version=self.policy.contract_version,
+                    )
+                    resume_lookup[key] = candidate
         for unit in units:
             if unit["translation_required"]:
                 self._reuse(unit, resume_lookup)

@@ -1,15 +1,10 @@
 import hashlib
-import errno
-import gzip
-import io
-import bz2
 import json
 import os
 import posixpath
 import re
 import threading
 import zipfile
-import tarfile
 import tempfile
 import shutil
 import struct
@@ -23,9 +18,13 @@ from xml.etree import ElementTree
 from config import Config, content_byte_limit
 from services.scanner import extract_text, is_sensitive_file
 from services.structured_profile import profile_path
+from services.process_liveness import pid_is_alive, try_lock_file
+from services.file_capabilities import (
+    ARCHIVE_EXTENSIONS, DOCUMENT_EXTENSIONS, TEXT_EXTENSIONS, IMAGE_EXTENSIONS,
+    MAIL_SOURCE_EXTENSIONS as ALL_MAIL_SOURCE_EXTENSIONS, file_extension,
+)
 
 
-ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".tar.gz", ".tar.bz2", ".rar", ".7z"}
 ARCHIVE_MAX_ENTRIES = Config.MAX_ARCHIVE_ENTRIES
 ARCHIVE_MAX_MEMBER_BYTES = Config.MAX_ARCHIVE_MEMBER_BYTES
 ARCHIVE_MAX_TOTAL_BYTES = Config.MAX_ARCHIVE_UNCOMPRESSED_BYTES
@@ -71,30 +70,69 @@ def _scratch_is_leased(child):
     therefore gives cleanup a reliable, process-independent liveness signal.
     """
     lease_path = child / ".lease"
-    if os.name == "nt" or not lease_path.exists():
+    if not lease_path.exists():
         return False
     try:
-        import fcntl
-        handle = lease_path.open("a+b")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            return False
-        except BlockingIOError:
-            return True
-        finally:
-            handle.close()
+        with lease_path.open("a+b") as handle:
+            return not try_lock_file(handle)
     except (ImportError, OSError):
         # On an uncertain filesystem, retain rather than delete active data.
         return True
 
-SUPPORTED_EXTENSIONS = {
-    ".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".doc", ".ppt", ".xls", ".rtf",
-    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
-    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
-    ".xml", ".html", ".htm", ".log", ".yaml", ".yml", ".eml",
-    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".rar", ".7z",
-}
+SUPPORTED_EXTENSIONS = DOCUMENT_EXTENSIONS | TEXT_EXTENSIONS | IMAGE_EXTENSIONS | ARCHIVE_EXTENSIONS
+MAIL_SOURCE_EXTENSIONS = ALL_MAIL_SOURCE_EXTENSIONS - {".eml"}
+
+
+def parse_failure_status(exc):
+    """Translate an unavailable parse into an explicit, compatible status."""
+    status = getattr(exc, "status", None)
+    if status in {"resource_limit", "unsafe_member"}:
+        return "partial"
+    if status in {"unsupported", "dependency_missing", "encrypted", "damaged", "timeout", "partial"}:
+        return status
+    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+        return "timeout"
+    if isinstance(exc, ImportError):
+        return "dependency_missing"
+    message = str(exc).lower()
+    if any(word in message for word in ("password", "encrypted", "加密", "密码")):
+        return "encrypted"
+    if any(word in message for word in ("未安装", "no module named", "unavailable", "dependency", "缺少组件")):
+        return "dependency_missing"
+    return "damaged"
+
+
+def _finalize_parse_status(base):
+    """Empty output and metadata never count as complete body extraction."""
+    coverage = base.setdefault("coverage", {})
+    text = str(base.get("text") or "").strip()
+    status = coverage.get("status") or base.get("parse_status")
+    if coverage.get("content_unsupported"):
+        status = "unsupported"
+    elif coverage.get("content_restricted") or coverage.get("limited_by_size"):
+        status = status or "partial"
+    elif text:
+        if status and status not in {"complete", "partial"}:
+            coverage["failure_status"] = status
+        status = "complete" if coverage.get("complete") else "partial"
+    else:
+        coverage.update(complete=False, coverage_ratio=0.0)
+        warnings = "；".join(str(x) for x in base.get("warnings") or [])
+        if not status and any(x in warnings for x in ("未安装", "需要安装", "模型不存在", "模型缺失")):
+            status = "dependency_missing"
+        if not status and (base.get("archive_manifest") or {}).get("encrypted_members"):
+            status = "encrypted"
+        if not status and "解析失败" in warnings:
+            status = "damaged"
+        status = status or "partial"
+        if not warnings:
+            base.setdefault("warnings", []).append("未提取到可读正文，仅保留元数据；不代表已完整解析。")
+    if status != "complete":
+        coverage["complete"] = False
+        if coverage.get("restriction_reason") != "sensitive_metadata_only":
+            base.setdefault("parser", {})["degraded"] = True
+    coverage["status"] = base["parse_status"] = status
+    return base
 
 
 def utc_now():
@@ -452,19 +490,7 @@ def _configured_parse_temp_root():
 
 
 def _pid_is_alive(pid):
-    if pid == os.getpid():
-        return True
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except ProcessLookupError:
-        return False
-    except OSError as exc:
-        return exc.errno not in {errno.ESRCH, errno.EINVAL}
+    return pid_is_alive(pid)
 
 
 def cleanup_stale_parse_temp_dirs(temp_root=None, stale_seconds=None):
@@ -704,6 +730,14 @@ class UnifiedDocumentParser:
         except TypeError:
             ocr_kwargs.pop("force_full_page_ocr", None)
             pdf_options.ocr_options = RapidOcrOptions(**ocr_kwargs)
+        pdf_format_kwargs = {"pipeline_options": pdf_options}
+        if os.name == "nt":
+            # docling-parse's native glyph resource loader can reject an
+            # existing file under a Unicode Windows Python installation path.
+            # PDFium supports those paths and retains Docling's local CPU
+            # layout, table structure and RapidOCR pipeline.
+            from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+            pdf_format_kwargs["backend"] = PyPdfiumDocumentBackend
         return DocumentConverter(
             allowed_formats=[
                 InputFormat.PDF, InputFormat.IMAGE, InputFormat.DOCX,
@@ -711,7 +745,7 @@ class UnifiedDocumentParser:
                 InputFormat.MD, InputFormat.CSV,
             ],
             format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
+                InputFormat.PDF: PdfFormatOption(**pdf_format_kwargs),
                 InputFormat.IMAGE: ImageFormatOption(pipeline_options=pdf_options),
             },
         )
@@ -813,9 +847,8 @@ class UnifiedDocumentParser:
     def parse(self, path, relative_path=None, mode="accurate", _archive_depth=0):
         path = Path(path).resolve()
         file_size = path.stat().st_size
-        ext = path.suffix.lower()
-        archive_name = path.name.lower()
-        is_archive = ext in ARCHIVE_EXTENSIONS or archive_name.endswith(".tar.gz") or archive_name.endswith(".tar.bz2")
+        ext = file_extension(path)
+        is_archive = ext in ARCHIVE_EXTENSIONS
         sensitive_content = is_sensitive_file(path.name)
         # Resolve the budgets at parse time so tests and supervised workers may
         # lower them without restarting. Both remain bounded by the central
@@ -846,7 +879,7 @@ class UnifiedDocumentParser:
                 "path": relative_path,
                 "absolute_path": str(path),
                 "name": path.name,
-                "extension": path.suffix.lower(),
+                "extension": ext,
                 "size": file_size,
                 "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
                 "sha256": source_hash,
@@ -881,7 +914,7 @@ class UnifiedDocumentParser:
             base["coverage"].update({"complete": False, "coverage_ratio": 0.0, "limited_by_size": True})
             limit_label = "压缩容器" if is_archive else "单文件"
             base["warnings"].append("文件超过{}解析上限（{} 字节），已在读取正文或计算哈希前拒绝。".format(limit_label, effective_file_limit))
-            return base
+            return _finalize_parse_status(base)
         if sensitive_content:
             base["parser"] = {"name": "metadata-only", "degraded": False, "ocr": False}
             base["coverage"].update({
@@ -891,7 +924,13 @@ class UnifiedDocumentParser:
                 "restriction_reason": "sensitive_metadata_only",
             })
             base["warnings"].append("敏感文件已纳入物理清单，但依据安全策略仅保留元数据和完整性哈希，不读取正文、不送入模型。")
-            return base
+            return _finalize_parse_status(base)
+        if ext in MAIL_SOURCE_EXTENSIONS:
+            base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
+            base["coverage"].update(complete=False, coverage_ratio=0.0,
+                content_unsupported=True, mail_source_required=True, route_hint="mail_import")
+            base["warnings"].append("该格式属于邮件完整来源，请使用邮件完整导入；普通文档解析未读取邮件正文。")
+            return _finalize_parse_status(base)
         if ext not in SUPPORTED_EXTENSIONS:
             base["parser"] = {"name": "metadata-only", "degraded": True, "ocr": False}
             base["coverage"].update({
@@ -901,17 +940,17 @@ class UnifiedDocumentParser:
                 "restriction_reason": "unsupported_extension",
             })
             base["warnings"].append("该文件类型暂不支持正文解析，仅保留元数据与源文件哈希。")
-            return base
+            return _finalize_parse_status(base)
 
         if ext == ".eml":
             from services.mail_document import project_eml
-            return project_eml(path, base, self.max_chars)
+            return _finalize_parse_status(project_eml(path, base, self.max_chars))
 
         if ext in {".csv", ".tsv"}:
             profile = profile_path(path)
             if profile and profile.get("row_count"):
                 from services.tabular_document import project_table
-                return project_table(path, base, profile)
+                return _finalize_parse_status(project_table(path, base, profile))
 
         # OOXML files are ZIP containers even though users perceive them as
         # documents. Validate their complete member inventory before any
@@ -926,13 +965,14 @@ class UnifiedDocumentParser:
                     "coverage_ratio": 0.0,
                     "content_restricted": True,
                     "restriction_reason": "unsafe_office_archive",
+                    "status": "damaged",
                 })
                 base["warnings"].append(
                     "Office 文档未通过压缩容器安全预检，未读取正文或送入模型：{}".format(
                         str(exc)[:300]
                     )
                 )
-                return base
+                return _finalize_parse_status(base)
 
         # A surprising number of field PDFs are interrupted copies: their page
         # streams may still be present, but the xref/trailer is missing.  Do
@@ -965,7 +1005,7 @@ class UnifiedDocumentParser:
             base["coverage"]["coverage_ratio"] = archive_manifest.get("member_coverage_ratio", 0.0)
             if not base["evidence"] and base["text"].strip():
                 self._add_fallback_evidence(base)
-            return base
+            return _finalize_parse_status(base)
 
         if ext in {".json", ".jsonl"}:
             # JSON and JSONL use the record projection in every parse mode.
@@ -1029,8 +1069,11 @@ class UnifiedDocumentParser:
             total_available = len(base["text"])
             base["coverage"]["extracted_characters"] = total_available
         base["coverage"]["complete"] = (
-            not base["coverage"].get("truncated_by_limit")
+            bool(base["text"].strip())
+            and not base["coverage"].get("truncated_by_limit")
             and not base["coverage"].get("limited_by_fast_mode")
+            and base["coverage"].get("structured_records_complete", True)
+            and not base["coverage"].get("limited_by_parser_failure")
             and len(base["text"]) >= total_available
         )
         if not base["coverage"].get("limited_by_fast_mode"):
@@ -1063,7 +1106,7 @@ class UnifiedDocumentParser:
         # that route was selected and is used by the UI/audit trail.
         base.setdefault("parser", {})["requested_mode"] = requested_mode
         base["parser"]["mode"] = str(base["parser"].get("mode") or mode)
-        return base
+        return _finalize_parse_status(base)
 
     def _select_auto_mode(self, path, ext):
         """Choose a bounded parser route without materialising the document.
@@ -1079,7 +1122,7 @@ class UnifiedDocumentParser:
             ".txt", ".md", ".markdown", ".html", ".htm", ".csv", ".tsv",
             ".json", ".jsonl", ".xml", ".docx", ".pptx", ".xlsx", ".xlsm", ".doc", ".ppt", ".xls", ".rtf",
         }
-        if ext in simple:
+        if ext in simple | TEXT_EXTENSIONS:
             return "fast"
         if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
             return "fast"
@@ -1094,7 +1137,7 @@ class UnifiedDocumentParser:
             except Exception:
                 pass
             return "accurate"
-        if ext in ARCHIVE_EXTENSIONS or path.name.lower().endswith((".tar.gz", ".tar.bz2")):
+        if ext in ARCHIVE_EXTENSIONS:
             return "auto"
         return "fast"
 
@@ -1222,64 +1265,30 @@ class UnifiedDocumentParser:
                         declared_total_members=declared_total,
                     )
                     return
-            if name.endswith(".gz") and not name.endswith((".tar.gz", ".tgz")):
-                self._parse_archive_entries(
-                    path, base,
-                    [{
-                        "name": Path(path.stem).name + ".txt",
-                        "declared_size": 0,
-                        "compressed_size": int(path.stat().st_size),
-                        "encrypted": False,
-                        "opener": lambda: gzip.open(str(path), "rb"),
-                    }],
-                    temp_root, mode, archive_depth,
-                )
-                return
-            if name.endswith(".bz2") and not name.endswith((".tar.bz2", ".tbz")):
-                self._parse_archive_entries(
-                    path, base,
-                    [{
-                        "name": Path(path.stem).name + ".txt",
-                        "declared_size": 0,
-                        "compressed_size": int(path.stat().st_size),
-                        "encrypted": False,
-                        "opener": lambda: bz2.open(str(path), "rb"),
-                    }],
-                    temp_root, mode, archive_depth,
-                )
-                return
-            if name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz")):
-                with tarfile.open(str(path), "r:*") as archive:
-                    # getmembers() materialises an unbounded TAR inventory.
-                    # Stop after the cap plus one sentinel and mark the count as
-                    # a lower bound when more members exist.
-                    entries = []
-                    for info in archive:
-                        if not info.isfile():
-                            continue
-                        entries.append({
-                            "name": info.name,
-                            "declared_size": int(info.size),
-                            "compressed_size": None,
-                            "encrypted": False,
-                            "opener": lambda info=info, archive=archive: archive.extractfile(info),
-                        })
-                        if len(entries) > ARCHIVE_MAX_ENTRIES:
-                            base["archive_manifest"]["inventory_truncated"] = True
-                            base["archive_manifest"]["total_members_is_lower_bound"] = True
-                            break
-                    self._parse_archive_entries(path, base, entries, temp_root, mode, archive_depth)
-                    return
+            from services.archive_formats import ArchiveLimits, ArchiveReader
+            with ArchiveReader(path, filename=path.name, limits=ArchiveLimits.from_config()) as archive:
+                entries = []
+                for info in archive.entries():
+                    if info.directory:
+                        continue
+                    entries.append({
+                        "name": info.name, "declared_size": info.size,
+                        "compressed_size": info.compressed_size, "encrypted": info.encrypted,
+                        "regular": info.regular,
+                        "opener": lambda info=info: archive.open_member(info),
+                    })
+                    if len(entries) > ARCHIVE_MAX_ENTRIES:
+                        base["archive_manifest"]["inventory_truncated"] = True
+                        base["archive_manifest"]["total_members_is_lower_bound"] = True
+                        break
+                self._parse_archive_entries(path, base, entries, temp_root, mode, archive_depth)
+        except Exception as exc:
+            from services.large_package_resources import resource_code
+            if resource_code(exc):
+                raise
             base["parser"]["degraded"] = True
-            base["warnings"].append("当前环境未安装 RAR/7z 解包组件；仅保留压缩包元数据。")
-        except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile, tarfile.TarError) as exc:
-            base["parser"]["degraded"] = True
-            if isinstance(exc, zipfile.BadZipFile):
-                base["warnings"].append(
-                    "ZIP 中央目录不可用：文件可能仍在复制、已经损坏、被加密或属于未收齐的分卷压缩包（{}）".format(exc)
-                )
-            else:
-                base["warnings"].append("压缩包展开失败：{}".format(exc))
+            base["coverage"]["status"] = parse_failure_status(exc)
+            base["warnings"].append("压缩包展开失败：{}".format(str(exc)[:300]))
         finally:
             shutil.rmtree(str(temp_root), ignore_errors=True)
 
@@ -1340,6 +1349,9 @@ class UnifiedDocumentParser:
             if max(0, len(member_parts) - 1) > ARCHIVE_MAX_MEMBER_PATH_DEPTH:
                 warn("已跳过目录层级超过安全上限的压缩包成员：{}".format(member_name))
                 record(member_name, "skipped", "member_path_depth_limit")
+                continue
+            if not entry.get("regular", True):
+                record(member_name, "skipped", "special_member")
                 continue
             if entry.get("encrypted"):
                 manifest["encrypted_members"] += 1
@@ -1430,9 +1442,9 @@ class UnifiedDocumentParser:
             copied_bytes = 0
             exceeded_stream_limit = False
             try:
-                with source, _open_archive_target(destination) as target:
+                with source as member_stream, _open_archive_target(destination) as target:
                     while True:
-                        chunk = source.read(min(1024 * 1024, allowed_member_bytes - copied_bytes + 1))
+                        chunk = member_stream.read(min(1024 * 1024, allowed_member_bytes - copied_bytes + 1))
                         if not chunk:
                             break
                         if copied_bytes + len(chunk) > allowed_member_bytes:
@@ -1442,6 +1454,7 @@ class UnifiedDocumentParser:
                         copied_bytes += len(chunk)
             except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile) as exc:
                 _unlink_quietly(destination)
+                base["coverage"]["status"] = parse_failure_status(exc)
                 message = str(exc).lower()
                 encrypted = isinstance(exc, RuntimeError) and ("password" in message or "encrypted" in message)
                 if encrypted:
@@ -1478,7 +1491,7 @@ class UnifiedDocumentParser:
             total_uncompressed += actual_size
             base["structure"]["archive_members"].append(member_name)
             base["structure"]["archive_member_count"] += 1
-            child_ext = destination.suffix.lower()
+            child_ext = file_extension(destination)
             if child_ext not in SUPPORTED_EXTENSIONS or child_ext in ARCHIVE_EXTENSIONS:
                 record(member_name, "skipped", "unsupported_or_nested_type")
                 _unlink_quietly(destination)
@@ -1497,6 +1510,10 @@ class UnifiedDocumentParser:
                 continue
             _unlink_quietly(destination)
 
+            if not str(child.get("text") or "").strip():
+                record(member_name, "skipped", child.get("parse_status") or "empty_body")
+                warn("成员 {} 未提取到正文：{}".format(member_name, "；".join(child.get("warnings") or [])[:160]))
+                continue
             record(member_name, "parsed")
             if not (child.get("coverage") or {}).get("complete", True):
                 manifest["truncated_members"] += 1
@@ -1585,8 +1602,13 @@ class UnifiedDocumentParser:
                 elif isinstance(value, dict):
                     list_values = [item for item in value.values() if isinstance(item, list)]
                     records = max(list_values, key=len) if list_values else [value]
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            base["coverage"].update(complete=False, limited_by_parser_failure=True, status="damaged")
+            base["warnings"].append("结构化 JSON 读取失败；仅保留可读原始文本，不代表结构解析成功：{}".format(str(exc)[:160]))
             return
+        if parse_errors:
+            base["coverage"].update(complete=False, limited_by_parser_failure=True, status="damaged")
+            base["warnings"].append("JSONL 存在 {} 条无效记录，未完整解析。".format(parse_errors))
         if not records:
             return
 
@@ -1801,6 +1823,7 @@ class UnifiedDocumentParser:
                         "扫描型 PDF 在快速模式下仅 OCR 前 {} 页；如需全文证据，请改用高精度解析。".format(processed)
                     )
             except Exception as exc:
+                base["coverage"]["status"] = parse_failure_status(exc)
                 base["warnings"].append("快速模式扫描 PDF 预览 OCR 失败：{}".format(exc))
         base["parser"]["degraded"] = False
         # ``fast_preview`` keeps its historical meaning of "a fast route left
@@ -2111,6 +2134,19 @@ class UnifiedDocumentParser:
     def _fallback(self, path, base, ocr_empty_pdf=True):
         extracted = extract_text(path, max_chars=self.max_chars)
         base["text"] = extracted.get("text", "")
+        metadata = extracted.get("metadata") or {}
+        # Native readers add page/slide/sheet labels even when no body exists.
+        body = base["text"]
+        if path.suffix.lower() in {".pdf", ".pptx", ".xlsx", ".xlsm"}:
+            body = re.sub(r"(?m)^\s*\[(?:第 \d+ 页|幻灯片 \d+|工作表 [^\]]+)\]\s*$", "", body)
+        if not body.strip():
+            base["text"] = ""
+            base["coverage"]["complete"] = False
+        if metadata.get("pages_omitted_by_limit"):
+            base["coverage"]["truncated_by_limit"] = True
+        if metadata.get("empty_text_pages") and metadata.get("text_pages"):
+            base["coverage"]["limited_by_fast_mode"] = True
+            base["warnings"].append("部分 PDF 页面无文本层，尚未完整提取正文。")
         base["coverage"]["extracted_characters"] = (
             extracted.get("char_count", len(base["text"])) if extracted.get("truncated") else len(base["text"])
         )
@@ -2160,6 +2196,7 @@ class UnifiedDocumentParser:
             elif ext == ".pdf" and not base["text"].strip() and ocr_empty_pdf:
                 self._rapidocr_pdf(path, base)
         except Exception as exc:
+            base["coverage"]["status"] = parse_failure_status(exc)
             base["warnings"].append("RapidOCR 兼容 OCR 失败：{}".format(exc))
         if base["text"].strip():
             base["warnings"] = [warning for warning in base["warnings"] if warning != "该文件类型尚未配置正文解析器"]

@@ -290,11 +290,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-生产服务器可以使用锁定依赖：
-
-```bash
-pip install -r requirements.lock.txt
-```
+`requirements.txt` 安装完整应用依赖。可选的 Linux vLLM 服务在另一个环境安装 `requirements-vllm.txt`，避免其 `lark` 固定版本与 MSG/RTFDE 依赖冲突。现有共用环境通过 `SJFX_MSG_PYTHON` 指定独立 MSG 解释器。`requirements.lock.txt` 是旧 Linux 共用服务器快照，缺少完整 MSG 依赖，不能作为新应用环境的完整安装入口。
 
 复制配置并至少修改访问令牌和扫描根目录：
 

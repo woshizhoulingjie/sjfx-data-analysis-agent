@@ -63,7 +63,7 @@
 
     if (me.role === 'admin') {
       bar.appendChild(el('span', 'tag', '管理员'));
-      var admin = el('a', 'opt', '控制台');
+      var admin = el('a', null, '账号与资料');
       admin.href = '/admin';
       bar.appendChild(admin);
     }

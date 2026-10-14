@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import json
 import re
-from functools import lru_cache
-from pathlib import Path
 from typing import Any, Mapping
 
 from config import Config
@@ -114,31 +112,14 @@ def extract_passage(text, query, limit=1800):
     return ''.join(result)[:limit]
 
 
-@lru_cache(maxsize=2)
-def _tokenizer(path):
-    try:
-        from tokenizers import Tokenizer
-        file = Path(path) / 'tokenizer.json'
-        if file.is_file():
-            return Tokenizer.from_file(str(file))
-    except (ImportError, OSError, ValueError):
-        pass
-    return None
-
-
 def count_tokens(text):
-    path = str(getattr(Config, 'CONVERSATION_TOKENIZER_PATH', '') or getattr(Config, 'VLLM_MODEL_PATH', ''))
-    tokenizer = _tokenizer(path)
-    if tokenizer is not None:
-        return len(tokenizer.encode(str(text), add_special_tokens=False).ids)
-    # Conservative byte bound for the deployed byte-level tokenizer. Report
-    # this fallback honestly rather than calling a chars/4 guess an exact count.
-    return len(str(text).encode('utf-8'))
+    from services.model_budget import count_tokens as selected_count
+    return selected_count(text, config=Config)
 
 
 def token_count_method():
-    path = str(getattr(Config, 'CONVERSATION_TOKENIZER_PATH', '') or getattr(Config, 'VLLM_MODEL_PATH', ''))
-    return 'local_tokenizer' if _tokenizer(path) is not None else 'utf8_byte_upper_bound'
+    from services.model_budget import token_count_method as selected_method
+    return selected_method(config=Config)
 
 
 def evidence_payload(item):

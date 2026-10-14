@@ -2,6 +2,8 @@
 from __future__ import annotations
 import json
 from .output_budget import retrieval_output_tokens
+from .execution import fingerprint
+from copy import deepcopy
 
 SYSTEM='''Determine relevance to the user's mail research criteria. Return JSON decisions,
 exactly one for each message_key: each decision MUST include message_key copied
@@ -75,8 +77,13 @@ def classify(runtime,tid,owner,state,spec,candidates):
             try:retrieval_output_tokens('relevance',{**base,'messages':messages})
             except (ValueError,TypeError):return False
         return True
+    partitions=[]
+    cache=state.setdefault('relevance_ledger',{})
+    message_signatures={}
     def flush():
-        if not pending or state['max_model_calls']-state['model_calls']<required_calls:return
+        if pending:partitions.append(list(pending));pending.clear()
+    def decide(messages):
+        pending=list(messages)
         payload={**base,'messages':list(pending)}
         value=runtime._model_call(tid,owner,state,'relevance',SYSTEM,json.dumps(payload,ensure_ascii=False),required_fields=('decisions',)) or {}
         raw=value.get('decisions',[])
@@ -140,12 +147,15 @@ def classify(runtime,tid,owner,state,spec,candidates):
                             'evidence_roles':list(dict.fromkeys(roles))}
             runtime.repository.record_research_step(tid,'relevance_decision',{'message_key':key},output_ref=json.dumps(decisions[key],ensure_ascii=False))
         pending.clear()
+    snapshots=runtime.repository.relevance_sources(list(by_message),include) if callable(getattr(runtime.repository,'relevance_sources',None)) else None
     for key in by_message:
-        if state['max_model_calls']-state['model_calls']<required_calls:break
-        with runtime.repository._connection() as c:
-            rows=[dict(r) for r in c.execute('SELECT * FROM mail_text_segments WHERE package_id=? AND message_key=? ORDER BY source_kind,mime_path,ordinal',(pid,key)) if include or r['source_kind']!='attachment']
-            missing=c.execute("SELECT COUNT(*) FROM mail_parts p WHERE p.message_key=? AND p.is_explicit_attachment=1 AND NOT EXISTS (SELECT 1 FROM mail_text_segments s WHERE s.package_id=? AND s.message_key=p.message_key AND s.mime_path=p.mime_path AND s.source_kind='attachment' AND LENGTH(s.text)>0)",(key,pid)).fetchone()[0] if include else 0
-            partial=c.execute("SELECT COUNT(*) FROM mail_part_processing WHERE message_key=? AND stage='basic_text' AND (status IN ('partial','failed','unsupported') OR coverage_ratio<1)",(key,)).fetchone()[0] if include else 0
+        if snapshots is not None:
+            rows=snapshots[key]['rows'];missing=snapshots[key]['missing'];partial=snapshots[key]['partial']
+        else:
+            with runtime.repository._connection() as c:
+                rows=[dict(r) for r in c.execute('SELECT * FROM mail_text_segments WHERE package_id=? AND message_key=? ORDER BY source_kind,mime_path,ordinal',(pid,key)) if include or r['source_kind']!='attachment']
+                missing=c.execute("SELECT COUNT(*) FROM mail_parts p WHERE p.message_key=? AND p.is_explicit_attachment=1 AND NOT EXISTS (SELECT 1 FROM mail_text_segments s WHERE s.package_id=? AND s.message_key=p.message_key AND s.mime_path=p.mime_path AND s.source_kind='attachment' AND LENGTH(s.text)>0)",(key,pid)).fetchone()[0] if include else 0
+                partial=c.execute("SELECT COUNT(*) FROM mail_part_processing WHERE message_key=? AND stage='basic_text' AND (status IN ('partial','failed','unsupported') OR coverage_ratio<1)",(key,)).fetchone()[0] if include else 0
         source=[];complete=any(r['source_kind']=='body' and r['text'].strip() for r in rows) and not missing and not partial
         message={'message_key':key,'complete_text':False,'evidence':source};source_by_id={}
         # Subject/date identify a terse reply or attachment-only update; they
@@ -153,8 +163,10 @@ def classify(runtime,tid,owner,state,spec,candidates):
         for target,field in (('subject','subject_raw'),('sent_at_utc','sent_at_utc')):
             value=next((r.get(field) for r in by_message[key] if r.get(field)),None)
             if value is not None:message[target]=value
-        for row in rows:
-            item={**row,**runtime.repository.create_evidence(pid,owner,row)}
+        writer=getattr(runtime.repository,'create_evidence_batch',None)
+        values=writer(pid,owner,rows) if callable(writer) else [runtime.repository.create_evidence(pid,owner,row) for row in rows]
+        for row,created in zip(rows,values):
+            item={**row,**created}
             entry={'evidence_id':item['evidence_id'],'text':item['quote_text']}
             if not fits([{**message,'evidence':source+[entry]}]):
                 complete=False
@@ -163,10 +175,32 @@ def classify(runtime,tid,owner,state,spec,candidates):
                 continue
             source.append(entry);source_by_id[item['evidence_id']]=item
         message['complete_text']=complete and bool(source)
+        sources[key]=source_by_id;completeness[key]=message['complete_text']
+        signature=fingerprint([base,message,source_by_id])
+        message_signatures[key]=signature
+        if signature in cache:
+            decisions[key]=deepcopy(cache[signature])
+            runtime.repository.event(tid,'relevance_reused',{'message_key':key,'source_fingerprint':signature})
+            continue
         if pending and (len(pending)>=6 or not fits(pending+[message])):flush()
-        if state['max_model_calls']-state['model_calls']<required_calls:break
-        sources[key]=source_by_id;completeness[key]=message['complete_text'];pending.append(message)
+        pending.append(message)
     flush()
+    for index,messages in enumerate(partitions):
+        prefetch=getattr(runtime,'_prefetch_model_call',None)
+        if callable(prefetch):
+            for part in partitions[index:index+2]:
+                if state['max_model_calls']-state['model_calls']>=required_calls:
+                    prefetch(tid,owner,state,'relevance',SYSTEM,json.dumps({**base,'messages':part},ensure_ascii=False),required_fields=('decisions',))
+        key_fn=getattr(runtime,'_request_key',None)
+        lanes=getattr(runtime,'_lanes',None)
+        pending_key=key_fn('relevance',SYSTEM,json.dumps({**base,'messages':messages},ensure_ascii=False),('decisions',),None,state) if callable(key_fn) else None
+        admitted=lanes is not None and pending_key in lanes.pending
+        cached=pending_key in getattr(runtime,'_response_cache',{}) if pending_key else False
+        if not admitted and not cached and state['max_model_calls']-state['model_calls']<required_calls:break
+        decide(messages)
+    for key,decision in decisions.items():
+        if decision['status']!='unknown' and key in message_signatures:
+            cache[message_signatures[key]]=deepcopy(decision)
     for key in by_message:decisions.setdefault(key,{'status':'unknown','rationale':'判定预算不足，保留候选'})
     state['relevance_decisions']=decisions
     state['analysis_anchor_keys']=[key for key,decision in decisions.items() if decision['status']!='not_matched']

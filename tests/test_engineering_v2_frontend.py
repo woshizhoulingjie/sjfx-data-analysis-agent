@@ -88,7 +88,10 @@ class EngineeringV2FrontendContractTests(unittest.TestCase):
         self.assertIn("v2-relationship-path", self.script)
         self.assertIn("关联文件", self.script)
         self.assertIn("packageOverviewScopeFiles", self.script)
-        self.assertIn("openBriefFile(path)", self.script)
+        self.assertIn("openBriefFile(file.dataset.briefFile)", self.script)
+        # Citation jumps must carry the citation package when the independent
+        # translation workbench currently points at another source.
+        self.assertIn("openBriefFile(path, button.dataset.translationPackage || chatScanId())", self.script)
         self.assertIn(".v2-relationship-node", self.style)
         self.assertIn(".v2-relationship-path", self.style)
 

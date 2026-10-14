@@ -7,12 +7,19 @@ _EXHAUSTIVE = ("所有", "全部", "逐封", "不能遗漏", "完整清单", "�
 _RESEARCH = ("原因", "过程", "对比", "确认", "风险", "梳理", "分析", "最早", "最终", "撤回", "变更")
 
 
-def build_task_spec(question, package_id, source_revision, index_epoch, *, scope=None, base_result_set_id=None, max_tool_calls=None, max_model_calls=None, max_seconds=None, research_version=None, max_tokens=None):
+def build_task_spec(question, package_id, source_revision, index_epoch, *, scope=None, base_result_set_id=None, max_tool_calls=None, max_model_calls=None, max_seconds=None, research_version=None, max_tokens=None, answer_mode=None):
     text = str(question or "").strip()
     if not text:
         raise ValueError("请输入邮件研究目标")
     from .multilingual import intent_mode
     mode = intent_mode(text)
+    # User-selected answer depth. 'fast' keeps a single verification pass and
+    # always answers from what was verified; 'deep' additionally allows the
+    # bounded gap search and second-pass re-verification. Absent keeps the
+    # previous full behavior for existing callers.
+    mode_value = 'deep' if answer_mode in (None, '') else str(answer_mode).strip().lower()
+    if mode_value not in ('fast', 'deep'):
+        raise ValueError('回答方式仅支持 fast（快速）或 deep（深度）')
     questions = ["匹配邮件与附件"]
     if mode == "research":
         questions.extend(["支持证据", "后续修改、撤回或反证", "资料覆盖缺口"])
@@ -23,6 +30,7 @@ def build_task_spec(question, package_id, source_revision, index_epoch, *, scope
     spec = {
         "analysis_version": 2,
         "mode": mode,
+        "answer_mode": mode_value,
         "objective": text,
         "package_id": package_id,
         "source_revision": source_revision,

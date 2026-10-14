@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 import logging
 import os
@@ -21,6 +21,8 @@ from services import large_qa_demand as demand
 from services.large_qa_extract import extract_document
 from services.large_qa_topics import refresh_maps, refine_one
 from services.large_qa_resources import DiskGuard, resource_code
+from services.process_liveness import try_lock_file
+from services.model_backend import create_model_client
 
 LOGGER = logging.getLogger('large_qa_worker')
 STOP = False
@@ -35,10 +37,10 @@ class ReadOnlyStore:
     @contextmanager
     def _connect(self):
         db = sqlite3.connect(self.path.as_uri()+'?mode=ro', uri=True, timeout=20)
-        db.row_factory = sqlite3.Row
-        db.execute('PRAGMA query_only=ON')
-        db.execute('BEGIN')
         try:
+            db.row_factory = sqlite3.Row
+            db.execute('PRAGMA query_only=ON')
+            db.execute('BEGIN')
             yield db
         finally:
             db.close()
@@ -50,7 +52,12 @@ class ReadOnlyStore:
 
     def packages(self):
         with self._connect() as db:
-            return [dict(r) for r in db.execute('SELECT id,root_path,owner_id FROM packages ORDER BY created_at DESC')]
+            # Preserve the cheap package stamp. Without these fields, an empty
+            # first inventory snapshot appears unchanged until the long forced
+            # sync interval, even after preview has populated the source rows.
+            return [dict(r) for r in db.execute(
+                'SELECT id,root_path,owner_id,updated_at,progress,counts,phase,status '
+                'FROM packages ORDER BY created_at DESC')]
 
 
 def foreground_busy():
@@ -58,7 +65,7 @@ def foreground_busy():
     if not path.exists():
         return True
     try:
-        with sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=2) as db:
+        with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=2)) as db:
             jobs = db.execute("SELECT 1 FROM analysis_jobs WHERE status='running' LIMIT 1").fetchone()
             turns = db.execute("SELECT 1 FROM conversation_turns WHERE status IN ('running','queued','waiting_for_deep_analysis') LIMIT 1").fetchone()
             return bool(jobs or turns)
@@ -100,14 +107,15 @@ def snapshot(index):
 
 
 def run(args):
-    import fcntl
     base = Path(args.base).expanduser().resolve()
     base.mkdir(mode=0o700,parents=True,exist_ok=True)
-    lock = (base/'worker.lock').open('a+')
-    try:
-        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise SystemExit('Another large QA worker owns this index directory')
+    with (base/'worker.lock').open('a+b') as lock:
+        if not try_lock_file(lock):
+            raise SystemExit('Another large QA worker owns this index directory')
+        return _run_locked(args, base)
+
+
+def _run_locked(args, base):
     store = ReadOnlyStore(args.source_db)
     states = {}
     last_sync = {}
@@ -117,6 +125,9 @@ def run(args):
     retry_after = {}
     disk = DiskGuard()
     agent_db = str(getattr(Config,'DB_PATH',''))
+    from services.managed_entry import mark_role_ready
+    store.packages()  # Report readiness only after the source schema is readable.
+    mark_role_ready()
     while not STOP and enabled():
         packages = store.packages()
         if args.package:
@@ -187,17 +198,17 @@ def run(args):
                             time.sleep(pause)
                 if (not args.summaries_only and not STOP and getattr(Config,'LARGE_QA_REFINE_TOPICS',False)
                         and time.monotonic()-last_refine>60 and not foreground_busy()):
-                    heartbeat(base,states,'refining_topic')
                     if model is None:
-                        from services.vllm import VLLMClient
-                        model = VLLMClient(Config.VLLM_BASE_URL,Config.VLLM_MODEL,timeout=90,api_key=Config.VLLM_API_KEY)
-                    from services.model_dispatch import background_generation
-                    cancelled=lambda: STOP or foreground_busy()
-                    with background_generation(cancelled):
-                        refined=refine_one(index,model,cancel_check=cancelled)
-                    if refined:
-                        refresh_maps(index)
-                        did_work = True
+                        model = create_model_client(Config, timeout=90, max_concurrency=1)
+                    if model is not None:
+                        heartbeat(base,states,'refining_topic')
+                        from services.model_dispatch import background_generation
+                        cancelled=lambda: STOP or foreground_busy()
+                        with background_generation(cancelled):
+                            refined=refine_one(index,model,cancel_check=cancelled)
+                        if refined:
+                            refresh_maps(index)
+                            did_work = True
                     last_refine = time.monotonic()
                 states.setdefault(package_id,{})
                 for key in ('error', 'resource_pause', 'retry_at'):
@@ -228,7 +239,6 @@ def run(args):
             time.sleep(1)
     heartbeat_ok = heartbeat(base,states,'stopped' if STOP else state_phase(states, 'idle'))
     print(json.dumps(states,ensure_ascii=False),flush=True)
-    lock.close()
     if args.once and (not heartbeat_ok or any(x.get('error') for x in states.values())):
         raise SystemExit(1)
 

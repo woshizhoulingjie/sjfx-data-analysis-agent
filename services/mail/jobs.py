@@ -14,7 +14,7 @@ from .extraction import extract_attachment
 from .models import SourceRef, MailMember
 from .parsers.eml import parse_eml
 from .research.runtime import MailResearchRuntime
-from .source import AdapterRegistry
+from .source import AdapterRegistry, open_locator
 
 
 MAIL_TASK_TYPES = {"mail_import", "mail_extract", "mail_ocr", "mail_research", "mail_export", "mail_foundation"}
@@ -99,10 +99,18 @@ def _source(package):
 
 def _import(job, services):
     from .foundation import source_inventory,inventory_entry,set_state
-    package=_package(services,job); owner_id=_owner(job); source=_source(package)
+    package=_package(services,job); owner_id=_owner(job)
+    # Re-authorize the persisted source in the worker process.  A package
+    # owner check alone is insufficient because the source path may point at
+    # another user's upload tree after a crafted create request.
+    source_path = services.policy.resolve_source(package["source_path"], owner_id=owner_id)
+    source=SourceRef(
+        package_id=package["package_id"], kind=package["source_kind"],
+        path=str(source_path), source_revision=package["source_revision"],
+    )
     try:
         adapter=AdapterRegistry().resolve(source)
-        entries=list(source_inventory(source,services.policy,adapter))
+        entries=list(source_inventory(source,services.policy,adapter,owner_id))
     except Exception as exc:
         set_state(services.repository,package['package_id'],'inventory','terminal_failed',error={'message':str(exc)[:500]})
         services.repository.update_package(package['package_id'],owner_id,status='failed',error={'message':str(exc)[:500]})
@@ -123,7 +131,19 @@ def _import(job, services):
         if processed and (processed>=max_messages or processed_bytes+member.byte_size>max_bytes):break
         if status=='pending':
             try:
-                with adapter.open_message(source,member) as stream:raw=stream.read(services.policy.max_message_bytes+1)
+                # Re-check immediately before opening each member so a
+                # replaced upload path is rejected during long imports too.
+                source_path = services.policy.resolve_source(source.path, owner_id=owner_id)
+                source = SourceRef(package_id=source.package_id, kind=source.kind,
+                                   path=str(source_path), source_revision=source.source_revision)
+                locator = services.policy.resolve_locator(
+                    member.locator, owner_id=owner_id, source_kind=source.kind,
+                    source_revision=source.source_revision,
+                )
+                member = MailMember(member.name, member.ordinal, member.byte_size, locator)
+                with open_locator(member.locator, policy=services.policy, owner_id=owner_id,
+                                  source_kind=source.kind, source_revision=source.source_revision) as stream:
+                    raw=stream.read(services.policy.max_message_bytes+1)
                 services.policy.validate_size(len(raw),limit=services.policy.max_message_bytes,label='邮件')
                 parsed=parse_eml(raw,max_parts=services.policy.max_mime_parts,max_nested_message_depth=services.policy.max_nested_message_depth)
                 row=services.repository.upsert_ingested_message(package_id=package['package_id'],source=source_record,member=member,raw=raw,parsed=parsed)

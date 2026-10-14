@@ -299,7 +299,28 @@ def build_reading_manifest(files: Sequence[Mapping[str, Any]]) -> Dict[str, Any]
     return _reading_manifest(files)
 
 
-def model_digest(context: Mapping[str, Any], max_chars: int = 36000, query: str = "") -> str:
+def synthesis_note_sources(context: Mapping[str, Any], citations: Sequence[Mapping[str, Any]] = ()) -> List[Dict[str, Any]]:
+    """Link synthesis notes to this turn's actual source evidence, never old labels."""
+    state = context.get("large_qa") or {}
+    provenance = defaultdict(list)
+    for row in state.get("notes_provenance") or []:
+        provenance[str(row.get("text") or "")].extend(str(path).replace("\\", "/") for path in row.get("sources") or [])
+    output = []
+    for note in state.get("map_notes") or []:
+        text = str(note)
+        paths = list(dict.fromkeys(provenance.get(text, [])))
+        matched = [item for item in citations if str(item.get("source_path") or "").replace("\\", "/") in paths]
+        output.append({"text": text, "sources": paths,
+                       "citations": [item["citation_label"] for item in matched[:4]],
+                       "source_kinds": [aq.source_kind(item) for item in matched[:4]]})
+    return output
+
+
+def model_digest(
+    context: Mapping[str, Any], max_chars: int = 36000, query: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+    citations: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> str:
     """Serialize an all-file reading layer without unsafe tail truncation.
 
     Every persisted summary is consumed by ``_reading_manifest``.  The prompt
@@ -327,34 +348,109 @@ def model_digest(context: Mapping[str, Any], max_chars: int = 36000, query: str 
             "若 all_file_reading.complete 为 false，必须明确有文件尚未完成可用摘要，不能称为全包完整结论。"
         ),
     }
-    base_size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     large_qa = context.get("large_qa") or {}
+    all_notes = [str(note) for note in large_qa.get("map_notes") or [] if str(note).strip()]
+    note_sources = synthesis_note_sources(context, citations or []) if citations is not None else []
+    links_by_text = {item["text"]: item for item in note_sources}
+    upstream_complete = bool(
+        large_qa.get("synthesis_complete", large_qa.get("map_complete", False))
+        and large_qa.get("source_snapshot_current") is not False
+    )
     if large_qa:
         payload["topic_overview"] = {
-            "instruction": "主题要点来自分批摘要，仅供组织脉络，具体事实仍须对应编号证据；未完成的主题不得宣称全面覆盖。",
-            "topic_count": len(large_qa.get("topics") or []),
+            "instruction": "扫描计数表示程序检查已有摘要和正文块的范围；模型分批归并后的要点用于组织脉络，具体事实仍须对应编号证据。摘要扫描不等于全文阅读；扫描、归并或本轮要点保留不完整时不得宣称全包完整结论。",
+            "topic_count": large_qa.get("map_topics_total", len(large_qa.get("topics") or [])),
             "map_topics_processed": large_qa.get("map_topics_processed"),
             "map_complete": large_qa.get("map_complete", False),
-            "notes": list(large_qa.get("map_notes") or [])[:48],
+            **{key: large_qa[key] for key in (
+                "source_files", "scope_files", "missing_index_files", "scanned_files",
+                "scanned_summary_files", "scanned_original_files", "scanned_chunks",
+                "model_mapped_files", "map_batches", "map_processed_batches", "map_failures",
+                "files_without_content", "stale_files", "scan_complete", "reduce_complete",
+                "reduce_levels", "source_snapshot_current",
+            ) if key in large_qa},
+            "total_notes": len(all_notes),
+            "retained_notes": len(all_notes),
+            "notes_complete": bool(all_notes),
+            "synthesis_complete": upstream_complete and bool(all_notes),
+            "notes": list(all_notes),
         }
-        base_size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        if note_sources:
+            payload["topic_overview"]["note_citations"] = [links_by_text.get(note, {}).get("citations", []) for note in all_notes]
+            payload["topic_overview"]["instruction"] += "note_citations与notes逐条对应，只能引用这些当前编号来源；编号是候选出处，事实必须核对对应证据原文。无编号的要点仅是组织线索，不能写成已核实结论；摘要出处只能表述为摘要记载。"
+    base_size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     payload["representative_file_capsules"] = _representative_capsules(
         files, max(0, int(max_chars) - base_size - 200), query=query
     )
     if aq.enabled():
-        payload["instruction"] = "账本表示程序遍历摘要的范围，不表示模型已阅读全部内容。以下仅为摘要样本与统计；具体事实以编号证据为准。不得把样本当成全包穷尽结论。"
+        payload["instruction"] = "账本表示程序扫描已有资料的范围，不表示模型已阅读全部全文。归并要点用于组织整体脉络，摘要样本与统计不能视为全包穷尽结论；具体事实以编号证据为准。"
         dump = lambda: json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         while len(dump()) > max_chars and payload["representative_file_capsules"]:
             payload["representative_file_capsules"].pop()
-        while len(dump()) > max_chars and (payload.get("topic_overview") or {}).get("notes"):
-            payload["topic_overview"]["notes"].pop()
         for key in ("directory_atlas", "semantic_signals", "missing_summary_sample"):
             while len(dump()) > max_chars and payload["all_file_reading"].get(key):
                 payload["all_file_reading"][key] = payload["all_file_reading"][key][:-1]
         for key in ("analysis_overview", "package_overview"):
             if len(dump()) > max_chars:
                 payload[key] = aq.extract_passage(payload[key], query, max(0, len(payload[key]) - (len(dump()) - max_chars) - 50))
+        # Final all-scope synthesis has priority over descriptive metadata and
+        # representative samples. Keep it whole whenever the budget permits.
         if len(dump()) > max_chars:
-            payload = {"instruction": "上下文预算不足，仅保留覆盖计数；不代表完整阅读。", "summary_records": len(files)}
-        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if large_qa:
+                payload = {
+                    "instruction": "程序扫描和摘要归并不等于逐份全文阅读；具体事实仍以编号证据为准。",
+                    "all_file_reading": {key: reading_manifest[key] for key in (
+                        "files_read", "summary_backed_files", "files_without_summary", "complete",
+                    ) if key in reading_manifest},
+                    "topic_overview": payload["topic_overview"],
+                }
+            else:
+                payload = {"instruction": "上下文预算不足，仅保留覆盖计数；不代表完整阅读。", "summary_records": len(files)}
+        if len(dump()) > max_chars and large_qa:
+            topic = payload["topic_overview"]
+            topic.update(notes=[], retained_notes=0, notes_complete=False, synthesis_complete=False,
+                         compression_incomplete=True)
+            if note_sources:
+                topic["note_citations"] = []
+            topic["instruction"] = "本轮预算无法保留全部归并要点，以下只是部分线索；不能宣称全包完整结论。具体事实以编号证据为准。"
+            # Alternate between early and late notes instead of silently
+            # preserving only a lexical prefix of the package.
+            order = []
+            left, right = 0, len(all_notes) - 1
+            while left <= right:
+                order.append(left)
+                if right != left:
+                    order.append(right)
+                left += 1
+                right -= 1
+            retained = []
+            for index in order:
+                candidate = sorted(retained + [index])
+                topic["notes"] = [all_notes[i] for i in candidate]
+                if note_sources:
+                    topic["note_citations"] = [links_by_text.get(all_notes[i], {}).get("citations", []) for i in candidate]
+                topic["retained_notes"] = len(candidate)
+                if len(dump()) <= max_chars:
+                    retained = candidate
+            topic["notes"] = [all_notes[i] for i in retained]
+            if note_sources:
+                topic["note_citations"] = [links_by_text.get(all_notes[i], {}).get("citations", []) for i in retained]
+            topic["retained_notes"] = len(retained)
+            if len(dump()) > max_chars:
+                payload = {"instruction": "本轮归并要点因预算不足未能保留，不代表全包完整结论。",
+                           "topic_overview": {"total_notes": len(all_notes), "retained_notes": 0,
+                                              "notes_complete": False, "synthesis_complete": False,
+                                              "compression_incomplete": True, "notes": []}}
+    topic = payload.get("topic_overview") or {}
+    if metadata is not None and large_qa.get("global_mode"):
+        metadata.update(final_synthesis_notes=len(topic.get("notes") or []),
+                        total_notes=len(all_notes),
+                        final_synthesis_complete=bool(topic.get("synthesis_complete")),
+                        final_synthesis_note_characters=sum(len(note) for note in topic.get("notes") or []))
+        if note_sources:
+            retained_sources = [links_by_text.get(note, {}) for note in topic.get("notes") or []]
+            linked = sum(bool(item.get("citations")) for item in retained_sources)
+            metadata.update(final_synthesis_notes_with_sources=linked,
+                            final_synthesis_notes_without_sources=len(retained_sources) - linked,
+                            final_synthesis_sources_complete=bool(retained_sources) and linked == len(retained_sources))
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
