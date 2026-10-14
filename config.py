@@ -226,6 +226,7 @@ _MODEL_ALLOWED_ENDPOINTS = normalize_allowed_endpoints(os.getenv("SJFX_MODEL_ALL
 
 
 class Config:
+    OFFLINE_INSTALLATION = os.getenv('SJFX_OFFLINE_INSTALLATION', '0').lower() in {'1','true','yes','on'}
     BASE_DIR = BASE_DIR
     DATA_DIR = _path_setting("SJFX_STATE_DIR", DEFAULT_STATE_DIR)
     OUTPUT_DIR = _path_setting("SJFX_OUTPUT_DIR", BASE_DIR / "outputs", "OUTPUT_DIR")
@@ -364,6 +365,13 @@ class Config:
     if EMBED_ENCODING not in {"e5", "plain"}:
         raise RuntimeError("SJFX_EMBED_ENCODING 只能是 e5 或 plain")
     EMBED_TOKENIZER_PATH = _optional_path_setting("SJFX_EMBED_TOKENIZER_PATH")
+    # Source deployments retain their existing external embedding services.
+    # Formal bundles opt in; selecting an external endpoint disables this child.
+    MANAGED_EMBEDDING = os.getenv('SJFX_MANAGED_EMBEDDING', '0').lower() in {'1', 'true', 'yes', 'on'}
+    MANAGED_EMBED_PORT = int(os.getenv('SJFX_MANAGED_EMBED_PORT', '18083'))
+    if not 1 <= MANAGED_EMBED_PORT <= 65535:
+        raise RuntimeError('SJFX_MANAGED_EMBED_PORT 必须是有效本机端口')
+    MANAGED_EMBED_MODEL_PATH = str(_path_setting('SJFX_MANAGED_EMBED_MODEL_PATH', _MODELS_DIR / 'multilingual-e5-small'))
     SHARED_OLLAMA_MAX_CHARS = max(4000, int(os.getenv("SHARED_OLLAMA_MAX_CHARS", "48000")))
     # A model's window must be configured for that model. Existing deployment
     # LLM_CONTEXT_TOKENS=32768 remains intact; an unknown model gets a cautious

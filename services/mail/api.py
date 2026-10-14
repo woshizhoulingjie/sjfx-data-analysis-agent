@@ -325,13 +325,18 @@ def register_mail_routes(app, services):
         if requested_kind and requested_kind not in {source_kind, "directory" if path.is_dir() else source_kind}:
             raise MailPolicyError("来源类型与服务器文件不匹配")
         config = dict(payload.get("options") or {})
+        from sjfx_protection.business import capture_import,enabled as protection_enabled
+        if protection_enabled():
+            captured=capture_import(owner_id,str(path),{})
+            config['protection_intake']=captured['protection_intake']
+            config.pop('protection_context',None)
         display_name = str(payload.get("display_name") or path.name or "邮件资料包").strip()[:200]
         package, created = services.repository.create_package(
             owner_id=owner_id,
             display_name=display_name or "邮件资料包",
             source_kind=source_kind,
             source_path=str(path),
-            source_revision=_source_revision(path, policy=services.policy, owner_id=owner_id),
+            source_revision='pending-inspection' if protection_enabled() else _source_revision(path, policy=services.policy, owner_id=owner_id),
             config=config,
             idempotency_key=str(payload.get("idempotency_key") or "").strip()[:200] or None,
         )

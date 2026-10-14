@@ -60,22 +60,70 @@ def test_pages_and_safe_payloads(env):
         async with client(env[0]) as c:
             page = await c.get('/protection')
             assert page.status_code == 200
-            assert '你需要授权什么' in page.text
+            assert '本地文件或目录完整路径' in page.text
+            assert 'name="local_path"' in page.text
+            assert page.text == (await c.get('/protection/packages')).text
+            assert page.text == (await c.get('/protection/setup')).text
             for technical in ['traceDetail', '本地文件与处置', '处置回执', '服务器上的资料目录', "api('events", "api('actions"]:
                 assert technical not in page.text
+            for obsolete in ['18766', 'enrollments', 'server_root', 'local_url', '双路径', '配对码']:
+                assert obsolete not in page.text
             assert 'no-store' in page.headers['cache-control']
             setup = (await c.get('/protection/api/setup?owner=admin-space')).json()
             assert setup['tasks'][0]['id'] == env[2]
             assert set(setup['tasks'][0]) == {'id', 'label', 'ready'}
             assert '/private/' not in json.dumps(setup)
             status = (await c.get('/protection/api/status')).json()
-            assert set(status) == {'ok', 'mode', 'access_version'}
+            # 矩阵 A03/E14：状态返回真实开关与策略修订，不再是固定三键。
+            assert {'ok', 'mode', 'access_version'} <= set(status)
+            assert status['access_version'] == 2
+            assert status['enabled'] is False and status['policy_revision'] == 0
+            assert status['registration_modes'] == ['local']
+            assert status['registration_url'] == '/protection/packages'
+            assert set(status) == {'ok', 'mode', 'access_version', 'enabled',
+                                   'policy_revision', 'registration_modes', 'registration_url'}
             session = (await c.get('/protection/api/session')).json()
             assert session['admin'] is False and 'owner' not in session
         async with client(env[0], 'admin') as c:
-            for path in ['/protection', '/protection/admin']:
-                assert '管理员专用' in (await c.get(path)).text
-            assert '你需要授权什么' in (await c.get('/protection/setup')).text
+            for path in ['/protection', '/protection/setup', '/protection/packages']:
+                response = await c.get(path)
+                assert response.status_code == 200 and response.text == page.text
+            admin = await c.get('/protection/admin')
+            assert admin.status_code == 200
+            assert '本地保护诊断与处置' in admin.text and 'traceDetail' in admin.text
+            for obsolete in ['18766', 'enrollments', 'server_root', 'local_url', '双路径', '配对码']:
+                assert obsolete not in admin.text
+            status = (await c.get('/protection/api/status')).json()
+            assert status['source_mode'] == 'local'
+            assert status['assistant_transport'] == 'authenticated_process_loopback'
+            assert status['registration_modes'] == ['local']
+            assert 'local_url' not in status and 'token' not in status
+    asyncio.run(run())
+
+
+def test_admin_diagnostics_remain_available_when_protection_is_off(env):
+    async def run():
+        app, p, _ = env
+        # Seed diagnostic records directly; browser pages do not enroll or pair an assistant.
+        p.store.enroll(p.store.enrollment('alice', 'u1'),
+                      base64.b64encode(bytes(range(32))).decode(), 'Alice local fixture')
+        p.store.enroll(p.store.enrollment('admin-space', 'a1'),
+                      base64.b64encode(bytes(range(1, 33))).decode(), 'Admin local fixture')
+        for session, name in [('admin', 'Admin local fixture'), ('view', 'Alice local fixture')]:
+            async with client(app, session) as c:
+                assert (await c.get('/protection/api/status')).json()['enabled'] is False
+                devices = await c.get('/protection/api/devices?owner=untrusted-owner')
+                assert devices.status_code == 200
+                assert [d['name'] for d in devices.json()['devices']] == [name]
+                ledger = await c.get('/protection/api/verify-ledger')
+                assert ledger.status_code == 200 and ledger.json()['ok'] is True
+                assert ledger.json()['count'] > 0
+                for endpoint in ['bindings', 'events', 'actions']:
+                    assert (await c.get('/protection/api/' + endpoint)).status_code == 200
+        async with client(app) as c:
+            for endpoint in ['devices', 'verify-ledger', 'bindings', 'events', 'actions', 'trace']:
+                response = await c.get('/protection/api/' + endpoint)
+                assert response.status_code == 403 and response.json()['code'] == 'admin_required'
     asyncio.run(run())
 
 

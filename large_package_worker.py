@@ -1,6 +1,8 @@
 """Dedicated worker for the isolated streaming large-package workflow."""
 from __future__ import annotations
 
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact, preview_context_kwargs, run_saved_lane
+from sjfx_protection.store import ProtectionError
 import hashlib
 import json
 import logging
@@ -49,6 +51,11 @@ class SourceChangedError(RuntimeError):
 
 
 def _source_snapshot(root, row):
+    from sjfx_protection.business import enabled,protected_path
+    if enabled() and row.get('source_kind')!='archive_member':
+        path=protected_path(Path(root)/row['path'])
+        stat=path.stat()
+        return path,(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns)
     if row.get('source_kind') == 'archive_member':
         from services.large_archive_members import source_identity
         return source_identity(root, row)
@@ -78,6 +85,7 @@ def _normalize_unicode(value):
     return value
 
 
+@package_lane
 def _counts(store, package_id):
     return store.counts(package_id)
 
@@ -235,6 +243,7 @@ class LargePackageWorker:
                 reserve_bytes=max(1024 ** 3, Config.PARSE_TEMP_DISK_RESERVE_BYTES))
         self._admission.check()
 
+    @package_lane
     def _defer_resource(self, package_id, path, stage, token, exc):
         if not resource_code(exc):
             return False
@@ -252,6 +261,7 @@ class LargePackageWorker:
                 pass
         return self._admission.defer(exc)
 
+    @package_lane
     def _interrupted(self, package_id):
         current = self.store.get(package_id)
         return self.stop_requested or not current or current["status"] in {"paused", "cancelled"}
@@ -264,6 +274,7 @@ class LargePackageWorker:
                                       message="资料来源授权失败")
             raise
 
+    @package_lane
     def _inventory_one(self, package):
         package_id = package["id"]
         self.store.update_package(package_id, status="running", phase="inventory", progress=1, message="正在流式盘点并建立内容画像")
@@ -303,6 +314,8 @@ class LargePackageWorker:
             if not self._interrupted(package_id):
                 self.store.update_package(package_id, status="running", phase="quick_parse", progress=20, message="盘点有 {} 处无法读取，继续识别已发现文件".format(inventory_error_count) if inventory_error_count else "盘点完成，按格式识别文件内容", counts={"discovered_files": discovered, "total_bytes": total_bytes, "total_size_human": _human(total_bytes), "type_counts": type_counts, "inventory_complete": inventory_error_count == 0, "inventory_error_count": inventory_error_count, "inventory_errors": inventory_errors, "logical_member_count": logical_members, "logical_member_bytes": logical_bytes})
             return True
+        except ProtectionError:
+            raise
         except Exception as exc:
             if resource_code(exc):
                 raise
@@ -310,6 +323,7 @@ class LargePackageWorker:
             self.store.update_package(package_id, status="failed", phase="inventory", error=str(exc), message="目录盘点失败")
             return False
 
+    @package_lane
     def _save_preview(self, package_id, path, summary, refine=False):
         if summary.get("status") == "failed":
             raise RuntimeError(summary.get("error") or "轻量解析失败")
@@ -343,6 +357,7 @@ class LargePackageWorker:
             "error": None,
         }
 
+    @package_lane
     def _commit_preview(self, package_id, path, summary, token, refine=False):
         """**原子提交预览结果**：租约校验 + 写文件 + 队列终态在同一个事务里。
 
@@ -373,10 +388,13 @@ class LargePackageWorker:
             try:
                 if (summary.get("portrait") or {}).get("needs_refine"):
                     self.store.enqueue_recognition(package_id, path)
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception("enqueue_recognition failed: %s", path)
         return True, ""
 
+    @package_lane
     @_leaf_mutation
     def _catalog_incremental(self, package_id):
         from services.large_package_semantic import embed_batch, name_batch
@@ -402,6 +420,8 @@ class LargePackageWorker:
             if not getattr(Config, 'LP_CATALOG_MODEL_NAMING', False):
                 name_batch(self.store, package_id, cancelled=cancelled)
             _stage['name_batch'] = time.monotonic() - _s
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("large semantic catalog deferred: %s", package_id)
         else:
@@ -413,6 +433,7 @@ class LargePackageWorker:
                 LOGGER.info("catalog incremental lane package=%s seconds=%.2f claimed=%s stages=%s",
                             package_id, _dt, claimed,
                             {k: round(v, 3) for k, v in _stage.items()})
+    @package_lane
     def _record_rebuild(self, package_id, trigger, changed):
         """方案 §6.1 第 2 条：只在成员真的被改动时记一次触发源。
 
@@ -424,9 +445,12 @@ class LargePackageWorker:
             from services.large_package_catalog_naming import record_rebuild_event
             touched = int(changed) if not isinstance(changed, bool) else int(bool(changed))
             record_rebuild_event(self.store, package_id, trigger, touched)
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('rebuild event failed: %s/%s', package_id, trigger)
 
+    @package_lane
     @_leaf_mutation
     def _ensure_km_finalized(self, package_id, claimed=None, force=False):
         """等**所有有素材的文件都拿到向量**之后，做一次全局 k-means 分组。
@@ -481,6 +505,8 @@ class LargePackageWorker:
                         if _v.get("blocked_by"):
                             LOGGER.debug("km finalize: package=%s advance blocked_by=%s",
                                          package_id, _v.get("blocked_by"))
+                    except ProtectionError:
+                        raise
                     except Exception:
                         pass
                     quick = self.store.stage_counts(package_id, "quick")
@@ -516,6 +542,8 @@ class LargePackageWorker:
                 if _v.get("blocked_by"):
                     LOGGER.debug("km finalize: package=%s advance blocked_by=%s",
                                  package_id, _v.get("blocked_by"))
+            except ProtectionError:
+                raise
             except Exception:
                 pass
             quick = self.store.stage_counts(package_id, "quick")
@@ -557,6 +585,8 @@ class LargePackageWorker:
                 # 出现"Frontiers in Public Health 01 frontiersi"这种名字）。
                 # 兜底必须留到命名轮次真正排空之后再执行，见 _submit_naming 的 run_slice。
             return bool(changed)
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("k-means finalize failed: %s", package_id)
             return False
@@ -565,6 +595,7 @@ class LargePackageWorker:
     CATALOG_REFINED_MESSAGE = '智能目录已生成，大数据包导入已完成；可按需选择深度摘要范围'
     CATALOG_REVIEW_MESSAGE = '智能目录已生成，大数据包导入已完成；部分范围与名称待确认，可按需选择深度摘要范围'
 
+    @package_lane
     def _mark_catalog_refined(self, package_id):
         """目录真的收尾后，把包消息从"正在后台完善"改成"已完善"。
 
@@ -626,10 +657,13 @@ class LargePackageWorker:
                 return False
             LOGGER.info('large package %s catalog refinement status: %s', package_id, message)
             return True
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('mark catalog refined failed: %s', package_id)
             return False
 
+    @package_lane
     @_leaf_mutation
     def _name_fallback(self, package_id):
         """给仍拿不到模型名称的叶组写一个确定性标签，保证目录不留空名。
@@ -678,6 +712,8 @@ class LargePackageWorker:
                         #      才改成不给异类起名，描述当然也不能编。
                         try:
                             hold = json.loads(result or "{}").get("hold_reason")
+                        except ProtectionError:
+                            raise
                         except Exception:
                             hold = None
                         if hold == "outliers":
@@ -702,6 +738,8 @@ class LargePackageWorker:
                         if not name:
                             name = str((row or {}).get("name") or rep or "").rsplit("/", 1)[-1]
                             name = re.sub(r"\.[A-Za-z0-9]{1,6}$", "", name)
+                    except ProtectionError:
+                        raise
                     except Exception:
                         name = ""
                     name = re.sub(r"\s+", " ", name).strip(" #*：:")[:40] or "未命名资料"
@@ -722,10 +760,13 @@ class LargePackageWorker:
                     LOGGER.info("large package %s name fallback applied to %d groups",
                                 package_id, len(rows))
                 return len(rows)
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("name fallback failed: %s", package_id)
             return 0
 
+    @package_lane
     def _catalog_settle_signature(self, package_id):
         """目录"是否还有新变化"的签名：叶组数 / 成员数之和 / 最大内容修订 / 已有标签数。
 
@@ -764,9 +805,12 @@ class LargePackageWorker:
                     (package_id,)).fetchone()
             values = tuple(int(x or 0) for x in (row or (0, 0, 0)))
             return values + (int((labels or (0,))[0] or 0),)
+        except ProtectionError:
+            raise
         except Exception:
             return None
 
+    @package_lane
     def _schedule_catalog_incremental(self, package_id):
         """把目录增量放到独立后台车道，不阻塞预览车道。
 
@@ -787,6 +831,8 @@ class LargePackageWorker:
         def run():
             try:
                 self._catalog_incremental(package_id)
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception("catalog lane failed: %s", package_id)
             finally:
@@ -803,9 +849,12 @@ class LargePackageWorker:
             return
         try:
             future.result()
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("catalog lane drain failed")
 
+    @package_lane
     def _quick_one(self, package):
         from services.large_package_catalog_coordination import leaf_batch
         with leaf_batch(self.store, package['id'], 'quick_preview',
@@ -856,7 +905,7 @@ class LargePackageWorker:
                             _submit_start=time.monotonic()
                             root = self._source_root(package)
                             future=pool.submit(runner.run,str(root),items.get(path) or {'path':path},
-                                               cancel_check=lambda:self._interrupted(package_id))
+                                               cancel_check=lambda:self._interrupted(package_id), **preview_context_kwargs())
                             _lap('submit', _submit_start)
                             inflight[future]=(path,runner,lease)
                     if not inflight:
@@ -885,6 +934,8 @@ class LargePackageWorker:
                             followups.append((path,bool((summary.get('portrait') or {}).get('needs_refine'))))
                         except PreviewCancelled:
                             self.store.requeue(package_id,path,'quick',token=lease)
+                        except ProtectionError:
+                            raise
                         except Exception as exc:
                             if self._defer_resource(package_id,path,'quick',lease,exc):
                                 resource_failure=pressure(exc)
@@ -896,6 +947,8 @@ class LargePackageWorker:
                     if commits:
                         try:
                             outcomes=self.store.commit_stage_batch(commits)
+                        except ProtectionError:
+                            raise
                         except Exception as exc:
                             if resource_code(exc):
                                 self._check_guard_defer(exc)
@@ -928,6 +981,8 @@ class LargePackageWorker:
                     self._commit_preview(package_id, path, summary, lease)
                 except PreviewCancelled:
                     self.store.requeue(package_id, path, 'quick', token=lease)
+                except ProtectionError:
+                    raise
                 except Exception as exc:
                     if self._defer_resource(package_id,path,'quick',lease,exc):
                         continue
@@ -955,6 +1010,7 @@ class LargePackageWorker:
                     _prof.get('n_wait', 0), _prof.get('n_batch', 0))
         return True
 
+    @package_lane
     def _catalog_one(self, package):
         package_id = package['id']
         if self._interrupted(package_id):
@@ -976,6 +1032,7 @@ class LargePackageWorker:
             message='目录向量处理结束，正在补充识别并生成主题和叶子目录')
         return True
 
+    @package_lane
     def _catalog_counts(self, package_id):
         """包 counts + 目录算法标注。
 
@@ -992,12 +1049,15 @@ class LargePackageWorker:
             try:
                 from services.large_package_semantic import repair_member_counts
                 repair_member_counts(self.store, package_id)
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception("member count repair deferred: %s", package_id)
         counts = self.store.counts(package_id)
         counts["catalog_mode"] = getattr(self, "catalog_mode", "kmeans")
         return counts
 
+    @package_lane
     def _recognize_one(self, package):
         from services.large_package_catalog_coordination import leaf_batch
         with leaf_batch(self.store, package['id'], 'supplemental_preview',
@@ -1029,11 +1089,13 @@ class LargePackageWorker:
             try:
                 item = self.store.get_file(package_id, path)
                 root = self._source_root(package)
-                summary, _ = self.preview_runner.run(str(root), item, refine=True, cancel_check=lambda: self._interrupted(package_id) or time.monotonic() >= end)
+                summary, _ = self.preview_runner.run(str(root), item, refine=True, cancel_check=lambda: self._interrupted(package_id) or time.monotonic() >= end, **preview_context_kwargs())
                 self._commit_preview(package_id, path, summary, lease, refine=True)
             except PreviewCancelled:
                 self.store.requeue(package_id, path, "recognize", token=lease)
                 break
+            except ProtectionError:
+                raise
             except Exception as exc:
                 if self._defer_resource(package_id,path,'recognize',lease,exc):
                     raise pressure(exc) from exc
@@ -1070,6 +1132,7 @@ class LargePackageWorker:
             self._mark_catalog_refined(package_id)
         return True
 
+    @package_lane
     def _naming_one(self, package):
         # Resume older packages without making optional wording block selection.
         from services.large_package_catalog_naming import queue_groups, ensure_round
@@ -1085,6 +1148,8 @@ class LargePackageWorker:
         verdict = {}
         try:
             verdict = self.store.advance(package_id) or {}
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('advance() failed: %s', package_id)
         blocked = verdict.get('blocked_by') or []
@@ -1143,6 +1208,7 @@ class LargePackageWorker:
             out.append((pid, lane, future))
         return out
 
+    @package_lane
     def _naming_future_for(self, package_id):
         """这个包**最近提交**的那一路 future（兼容单路语义时就是唯一那一路）。"""
         found = None
@@ -1152,6 +1218,7 @@ class LargePackageWorker:
                 found = self._naming_futures[key]
         return found
 
+    @package_lane
     def _package_lanes_inflight(self, package_id):
         return sum(1 for pid, _lane, _f in self._live_lanes() if pid == str(package_id))
 
@@ -1177,17 +1244,25 @@ class LargePackageWorker:
                 from services.model_dispatch import _borrow_idle_seconds
                 if _borrow_idle_seconds() > 0:
                     gate = max(1, int(_concurrency_limit()))
+            except ProtectionError:
+                raise
             except Exception:
                 pass
+        except ProtectionError:
+            raise
         except Exception:
             gate = 1
         try:
             wanted = int(getattr(Config, 'LP_NAMING_PARALLEL_LANES', 2) or 2)
+        except ProtectionError:
+            raise
         except Exception:
             wanted = 2
         try:
             from services.large_package_catalog_naming import naming_concurrency
             wanted = min(wanted, naming_concurrency())
+        except ProtectionError:
+            raise
         except Exception:
             pass
         lanes = max(1, min(gate, wanted))
@@ -1218,6 +1293,7 @@ class LargePackageWorker:
             LOGGER.info('naming same-package lanes: %d (SJFX_LP_NAMING_SAME_PACKAGE_LANES)', value)
         return value
 
+    @package_lane
     def _free_lane(self, package_id):
         """这个包还能起的下一个车道号；没有空位返回 None。
 
@@ -1248,6 +1324,7 @@ class LargePackageWorker:
                 seen.append(pid)
         return seen
 
+    @package_lane
     def _naming_slot_free(self, package_id):
         """还能不能再起一路（给这个包）。"""
         return self._free_lane(package_id) is not None
@@ -1260,6 +1337,8 @@ class LargePackageWorker:
                 continue
             try:
                 future.result()
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception('catalog naming task failed')
             self._naming_futures.pop(key, None)
@@ -1269,6 +1348,7 @@ class LargePackageWorker:
             if not self._package_lanes_inflight(pid) and pid in self._naming_order:
                 self._naming_order.remove(pid)
 
+    @package_lane
     def _submit_naming(self, package_id):
         from services.large_package_catalog_batch import process_batch
         self._reap_naming()
@@ -1347,6 +1427,8 @@ class LargePackageWorker:
             # （改动前只看签名，于是"签名没变但还有待办"会被误判为定稿）。
             try:
                 _verdict = self.store.advance(package_id) or {}
+            except ProtectionError:
+                raise
             except Exception:
                 _verdict = {}
             if _verdict and not _verdict.get('can_finish') and _verdict.get('blocked_by'):
@@ -1385,6 +1467,8 @@ class LargePackageWorker:
                                 from services.large_package_semantic import maybe_escalate_k
                                 if maybe_escalate_k(self.store, package_id):
                                     self._catalog_settled.pop(package_id, None)
+                            except ProtectionError:
+                                raise
                             except Exception:
                                 LOGGER.exception("k escalation check failed: %s", package_id)
                             # 兜底命名（2026-09-20）：**重试耗尽**的组如果一直没有标签，
@@ -1395,6 +1479,8 @@ class LargePackageWorker:
                                 fixed = fallback_name_exhausted(self.store, package_id)
                                 if fixed:
                                     self._catalog_settled.pop(package_id, None)
+                            except ProtectionError:
+                                raise
                             except Exception:
                                 LOGGER.exception("fallback naming check failed: %s", package_id)
             # 里程碑 1：智能目录（含主题层）确定 → 生成第一版情报概览。
@@ -1414,10 +1500,12 @@ class LargePackageWorker:
                 from services.large_package_catalog_naming import settle_round
                 settle_round(self.store, package_id)
                 self.store.reconcile_recognition(package_id)
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception('settle_round failed: %s', package_id)
             self._mark_catalog_refined(package_id)
-        self._naming_futures[(package_id, lane)] = self._naming_executor.submit(run_lane)
+        self._naming_futures[(package_id, lane)] = self._naming_executor.submit(run_saved_lane,self.store,package_id,run_lane)
         if package_id in self._naming_order:
             self._naming_order.remove(package_id)
         self._naming_order.append(package_id)
@@ -1479,11 +1567,15 @@ class LargePackageWorker:
                         # 所以必须在这里自己排。
                         queue_groups(self.store, package_id)
                     LOGGER.info('solo catchup queued naming for packages: %s', stale)
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception('solo queue_groups failed')
             if made:
                 LOGGER.info('solo catchup created single-file groups: %s', made)
             return sum(made.values())
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('solo catchup failed')
             return 0
@@ -1519,10 +1611,13 @@ class LargePackageWorker:
                                 package_id)
                     self._merge_topics_once(package_id)
                     return True
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("topic catchup failed")
         return False
 
+    @package_lane
     def _topic_layer_stale(self, package_id):
         """主题层是否**落后于叶组** —— 有真实叶组没被任何主题覆盖。
 
@@ -1599,10 +1694,13 @@ class LargePackageWorker:
                     return True
             # 全部叶组都在某个主题下 —— 再做一次修订号一致性检查（覆盖通过但内容变过的情形）
             return False
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("topic staleness check failed: %s", package_id)
             return False
 
+    @package_lane
     def _topic_rebuild_owed(self, package_id):
         """去抖推迟掉、但**还没有补做**的主题层重建。
 
@@ -1628,6 +1726,7 @@ class LargePackageWorker:
             return False
         return self._topics_merged.get(package_id) != pending[0]
 
+    @package_lane
     def _merge_topics_once(self, package_id):
         """叶组命名收尾后归并一次上位主题（默认关闭；失败不影响叶组目录）。"""
         try:
@@ -1799,10 +1898,13 @@ class LargePackageWorker:
                     self._topics_pending[package_id] = (signature, time.monotonic())
             LOGGER.info("large package %s topic merge done=%s", package_id, bool(ok))
             return bool(ok)
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("topic merge failed: %s", package_id)
             return False
 
+    @package_lane
     def _build_overview(self, package_id, milestone):
         """里程碑处主动生成/更新情报概览（方案 A）。**失败绝不影响主流程。**
 
@@ -1919,6 +2021,8 @@ class LargePackageWorker:
                 if _vo.get('blocked_by'):
                     note = (note + '；' if note else '') + '仍有未完成事项：%s' % '、'.join(
                         str(b) for b in _vo.get('blocked_by') or [])
+            except ProtectionError:
+                raise
             except Exception:
                 pass
             # Refreshing directory names must never downgrade completed deep evidence.
@@ -1931,19 +2035,25 @@ class LargePackageWorker:
             self._overview_blocked.pop(package_id, None)
             LOGGER.info("large package %s overview built milestone=%s", package_id, milestone)
             return True
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("overview build failed: %s/%s", package_id, milestone)
             return False
 
+    @package_lane
     def _overview_content_key(self, package_id):
         """退避用的目录内容签名：与发布事务比对的是同一个 catalog_input_revision。"""
         try:
             from services.large_package_reporting import catalog_input_revision
             with closing(self.store._connect()) as conn:
                 return catalog_input_revision(conn, package_id)
+        except ProtectionError:
+            raise
         except Exception:
             return None
 
+    @package_lane
     def _note_overview_blocked(self, package_id):
         """发布没成功：按指数退避推迟下一次尝试（2 s → 上限 LP_OVERVIEW_BLOCKED_BACKOFF_MAX）。
 
@@ -2014,10 +2124,13 @@ class LargePackageWorker:
                 if self._build_overview(package_id, milestone):
                     return True
             return False
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("overview catch-up failed")
             return False
 
+    @package_lane
     def _claim_deep(self, package_id, limit):
         """领取 1~limit 个待深度解析的文件。
 
@@ -2030,6 +2143,7 @@ class LargePackageWorker:
         leases = [(item[1], item[2]) for item in claimed]
         return leases[0] if int(limit) == 1 else leases
 
+    @package_lane
     def _deep_worker(self, package_id, root, path, lease=None):
         from services.large_package_catalog_coordination import leaf_batch
         with leaf_batch(self.store, package_id, 'deep_preview',
@@ -2052,6 +2166,8 @@ class LargePackageWorker:
                 try:
                     if not self.store.renew_lease(package_id, path, 'deep', lease):
                         break
+                except ProtectionError:
+                    raise
                 except Exception:
                     LOGGER.exception('deep lease heartbeat failed: %s', path)
         heartbeat = threading.Thread(target=keep_lease, daemon=True) if lease else None
@@ -2093,6 +2209,8 @@ class LargePackageWorker:
                 return path, False, "结果被拒绝：" + why
             self._catalog_incremental(package_id)
             return path, True, ""
+        except ProtectionError:
+            raise
         except Exception as exc:
             if self._defer_resource(package_id,path,'deep',lease,exc):
                 raise pressure(exc) from exc
@@ -2110,6 +2228,7 @@ class LargePackageWorker:
             if heartbeat:
                 heartbeat.join(timeout=2)
 
+    @package_lane
     def _finish_selection(self, package_id, force=False):
         # 收尾点 5/5：批次结算同样向唯一判定口取证并记日志。
         # 批次自己的终态只看本批 paths（那是它的权威），但"包能不能往前走"
@@ -2120,6 +2239,8 @@ class LargePackageWorker:
                 LOGGER.info('selection settle: package=%s phase=%s can_finish=%s blocked_by=%s',
                             package_id, _vs.get('phase'), _vs.get('can_finish'),
                             _vs.get('blocked_by'))
+        except ProtectionError:
+            raise
         except Exception:
             pass
         """把**本批** selection 标成终态；统计只来自本批的文件。
@@ -2207,10 +2328,13 @@ class LargePackageWorker:
                     changed += 1
                 conn.commit()
             return bool(changed)
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("selection finish failed: %s", package_id)
             return False
 
+    @package_lane
     def _deep_finish(self, package_id):
         """深度解析阶段的收尾：确认没有待办后，排队命名并置为完成。"""
         counts = _counts(self.store, package_id)
@@ -2221,6 +2345,8 @@ class LargePackageWorker:
         # 这里不再自己拼一套判据（改动前正是六处各写一份，才有了假完成那类缺陷）。
         try:
             verdict = self.store.advance(package_id) or {}
+        except ProtectionError:
+            raise
         except Exception:
             verdict = {}
         if verdict.get("ok") and verdict.get("blocked_by"):
@@ -2246,6 +2372,8 @@ class LargePackageWorker:
                     "SELECT COALESCE(NULLIF(summary_quality,''),'unknown'),COUNT(*) "
                     "FROM files WHERE package_id=? AND deep_status='completed' "
                     "GROUP BY 1", (package_id,)).fetchall()}
+        except ProtectionError:
+            raise
         except Exception:
             q = {}
         deg = sum(v for k, v in q.items() if k in ("truncated", "degraded", "empty", "partial"))
@@ -2294,6 +2422,7 @@ class LargePackageWorker:
             self._build_overview(package_id, "deep")
         return True
 
+    @package_lane
     def _naming_jobs_pending(self, package_id):
         """Unfinished jobs, including delayed retries, excluding exhausted retries."""
         try:
@@ -2304,9 +2433,12 @@ class LargePackageWorker:
                     "AND (status IN ('queued','running','retry') "
                     "     OR (status='deferred' AND attempts<?))",
                     (package_id, max_attempts)).fetchone()[0] or 0)
+        except ProtectionError:
+            raise
         except Exception:
             return 0
 
+    @package_lane
     def _deep_one(self, package):
         package_id = package["id"]
         root = package["root_path"]
@@ -2357,6 +2489,8 @@ class LargePackageWorker:
                     return False
                 try:
                     list(pool.map(lambda item: self._deep_worker(package_id, root, item[0], item[1]), leases))
+                except ProtectionError:
+                    raise
                 except Exception as exc:
                     if resource_code(exc):
                         raise
@@ -2441,6 +2575,8 @@ class LargePackageWorker:
             if final_path != path or final_source != before_source:
                 raise SourceChangedError('源文件在摘要期间发生变化，已丢弃结果')
             return _normalize_unicode(summary)
+        except ProtectionError:
+            raise
         except Exception as exc:
             if resource_code(exc):
                 raise
@@ -2464,7 +2600,7 @@ class LargePackageWorker:
             # 提示词本身要求的就是"轻度摘要"，500 的上限本就在浪费。
             # 回滚：SJFX_LP_DEEP_SUMMARY_MAX_TOKENS=500。
             limit = max(128, min(2000, int(os.getenv("SJFX_LP_DEEP_SUMMARY_MAX_TOKENS", "400"))))
-            result = client.chat("你是资料摘要助手，只输出简洁中文摘要。" + SUMMARY_QUALIFIER_INSTRUCTION, "请为文件 {} 生成轻度摘要，包含主题、关键事实、风险和后续建议：\n{}".format(path, text), temperature=0.1, max_tokens=limit)
+            result = guarded_model_call(client,"chat","你是资料摘要助手，只输出简洁中文摘要。" + SUMMARY_QUALIFIER_INSTRUCTION, "请为文件 {} 生成轻度摘要，包含主题、关键事实、风险和后续建议：\n{}".format(path, text), temperature=0.1, max_tokens=limit)
             # finish_reason 必须检查。改动前完全不看，而实测 p50 18.51 s 恰好等于
             # 500 token 的生成时间，说明大部分文件正在撞上限、摘要是被截断的。
             # 截断结果仍然保存（它是有用的事实层产物），但显式标注出来，
@@ -2493,6 +2629,8 @@ class LargePackageWorker:
                 "evidence_id": "SUMMARY-INPUT-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
             }]))
             return payload
+        except ProtectionError:
+            raise
         except Exception as exc:
             if resource_code(exc):
                 raise
@@ -2505,6 +2643,8 @@ class LargePackageWorker:
             self._check_resources()
             self._resource_warning = None
             return self._run_admitted_once()
+        except ProtectionError:
+            return True
         except Exception as exc:
             if not resource_code(exc):
                 raise
@@ -2513,6 +2653,8 @@ class LargePackageWorker:
             if not package_id:
                 try:
                     package_id = next(iter(self._packages()), {}).get('id')
+                except ProtectionError:
+                    raise
                 except Exception:
                     LOGGER.exception('Cannot read package while under resource pressure')
             warning = (package_id, failure.code)
@@ -2532,6 +2674,12 @@ class LargePackageWorker:
             self._resource_package_id = None
             return self._catalog_background()
         self._resource_package_id = package['id']
+        from sjfx_protection.business import enabled as protection_enabled
+        if protection_enabled():
+            try:package=self.store.admit_protection(package['id'],wait=False)
+            except ProtectionError as exc:
+                if exc.code!='inspection_pending':self.store.update_package(package['id'],status='paused',message='安全检查暂停：'+str(exc))
+                return False
         if package["phase"] in {"quick_parse", "recognize", "recognize_completed", "deep_parse"}:
             try:
                 self._source_root(package)
@@ -2617,6 +2765,8 @@ class LargePackageWorker:
                                 row, info.get('groups'), info.get('fragment_groups'),
                                 info.get('fragment_max_members'),
                                 100.0 * float(info.get('fragment_ratio') or 0))
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception('degraded catalog scan failed')
         if not pending and not naming:
@@ -2664,19 +2814,32 @@ class LargePackageWorker:
             now = time.monotonic()
             if now >= self._stall_scan_at:
                 self._stall_scan_at = now + self._stall_retry_seconds
-                with closing(self.store._connect()) as conn:
-                    stalled = conn.execute(
-                        "SELECT f.package_id FROM files f JOIN packages p ON p.id=f.package_id "
-                        "WHERE p.status IN ('waiting_for_selection','completed') "
-                        "AND p.control_state='active' "
-                        "AND COALESCE(json_extract(f.local_summary,'$.portrait.catalog_status'),'') "
-                        "    NOT IN ('classified','no_content','deferred','restricted') "
-                        "ORDER BY f.package_id LIMIT 1").fetchone()
+                from sjfx_protection.business import enabled
+                if enabled():
+                    stalled=None
+                    with closing(self.store._connect()) as conn:
+                        candidates=conn.execute("SELECT id FROM packages WHERE status IN ('waiting_for_selection','completed') AND control_state='active' ORDER BY updated_at DESC LIMIT 40").fetchall()
+                    for candidate in candidates:
+                        try:
+                            if self._package_stalled(candidate['id']):
+                                stalled=(candidate['id'],);break
+                        except ProtectionError:continue
+                else:
+                    with closing(self.store._connect()) as conn:
+                        stalled = conn.execute(
+                            "SELECT f.package_id FROM files f JOIN packages p ON p.id=f.package_id "
+                            "WHERE p.status IN ('waiting_for_selection','completed') "
+                            "AND p.control_state='active' "
+                            "AND COALESCE(json_extract(f.local_summary,'$.portrait.catalog_status'),'') "
+                            "    NOT IN ('classified','no_content','deferred','restricted') "
+                            "ORDER BY f.package_id LIMIT 1").fetchone()
                 if stalled:
                     pid2 = str(stalled[0])
                     scheduled = False
                     try:
                         scheduled = self._schedule_catalog_incremental(pid2)
+                    except ProtectionError:
+                        raise
                     except Exception:
                         LOGGER.exception('catalog incremental failed: %s', pid2)
                     # 只有**真的排上了活**才立刻再转一圈；排不上就继续往下走，
@@ -2718,6 +2881,8 @@ class LargePackageWorker:
         try:
             self._schedule_catalog_incremental(package_id)
             ok = True
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('catalog incremental dispatch failed: %s', package_id)
         # 这个后台循环是 waiting_for_selection 之后唯一还在消费 catalog 队列的地方：
@@ -2726,6 +2891,11 @@ class LargePackageWorker:
         # 判定条件与快速解析阶段完全相同，所以不会提前聚类。
         self._ensure_km_finalized(package_id)
         return ok
+
+    @package_lane
+    def _package_stalled(self,package_id):
+        with closing(self.store._connect()) as conn:
+            return conn.execute("SELECT 1 FROM files WHERE package_id=? AND COALESCE(json_extract(local_summary,'$.portrait.catalog_status'),'') NOT IN ('classified','no_content','deferred','restricted') LIMIT 1",(package_id,)).fetchone() is not None
 
     def _degraded_report_candidates(self):
         """扫描"已定稿但可能没聚类过"的包（只读，供降级告警用）。"""
@@ -2741,6 +2911,8 @@ class LargePackageWorker:
             try:
                 from config import Config as _Cfg
                 served = int(getattr(_Cfg, 'LP_WORKFLOW_VERSION', 1) or 1)
+            except ProtectionError:
+                raise
             except Exception:
                 served = 1
             # 阶段白名单**从 store.PHASES 派生**，不再在这里另写一份
@@ -2792,6 +2964,8 @@ def stage_record(stage, seconds, **fields):
             bucket.append((round(float(seconds), 4), fields))
             if len(bucket) > STAGE_SAMPLE_LIMIT:
                 del bucket[:len(bucket) - STAGE_SAMPLE_LIMIT]
+    except ProtectionError:
+        raise
     except Exception:
         pass
 
@@ -2833,9 +3007,13 @@ def code_version():
                         'services/large_package_semantic.py'):
                 try:
                     digest.update(Path(base, rel).read_bytes())
+                except ProtectionError:
+                    raise
                 except Exception:
                     digest.update(rel.encode())
             _CODE_VERSION = digest.hexdigest()[:12]
+        except ProtectionError:
+            raise
         except Exception:
             _CODE_VERSION = 'unknown'
     return _CODE_VERSION
@@ -2869,6 +3047,8 @@ class StageTimer(object):
     def __exit__(self, exc_type, exc, tb):
         try:
             stage_record(self._name, time.monotonic() - self._t0, **self._fields)
+        except ProtectionError:
+            raise
         except Exception:
             pass
         return False
@@ -2878,6 +3058,8 @@ def _human(value):
     try:
         from services.scanner import human_size
         return human_size(value)
+    except ProtectionError:
+        raise
     except Exception:
         return str(value)
 

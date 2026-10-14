@@ -96,6 +96,18 @@ def nofollow_entry_stat(entry, path):
     return entry.stat(follow_symlinks=False)
 
 
+def local_host_path(value):
+    """A client's path string is valid only in this host's filesystem syntax."""
+    from pathlib import PureWindowsPath
+    value = str(value or '').strip()
+    windows = PureWindowsPath(value)
+    if os.name != 'nt' and (windows.drive or value.startswith('\\\\')):
+        raise ValueError('SJFX 当前运行在另一台电脑，不能直接读取此 Windows 本地路径；请在资料所在电脑运行 SJFX')
+    if os.name == 'nt' and (not windows.is_absolute() or value.startswith(('\\\\?\\', '\\\\.\\'))):
+        raise ValueError('请输入这台电脑的完整本地目录路径，不支持相对路径或设备命名空间')
+    return Path(value).expanduser()
+
+
 def _file_metadata(path, root, stat_result=None):
     # The caller normally supplies DirEntry.lstat() data. Reopening a path
     # here would create a type-check/open race if a writable NAS entry is
@@ -666,7 +678,8 @@ def _decode_bytes(data):
 
 
 def extract_text(path, max_chars=60000):
-    path = Path(path)
+    from sjfx_protection.business import protected_path
+    path = protected_path(path, operation='read')
     ext = path.suffix.lower()
     text = ""
     parser = "unsupported"

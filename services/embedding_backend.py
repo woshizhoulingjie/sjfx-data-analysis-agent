@@ -286,6 +286,8 @@ class OpenAIEmbeddingClient:
         return [r.get('embedding') for r in sorted(rows, key=lambda r: r['index'])]
 
     def embed(self, texts, retries=None):
+        from sjfx_protection.business import recheck_active_sources
+        recheck_active_sources()
         values = [str(value or '').strip()[:self.max_chars] for value in texts or []]
         if not values:
             return []
@@ -300,7 +302,9 @@ class OpenAIEmbeddingClient:
             for offset in range(0, len(values), self.max_batch_size):
                 batch = values[offset:offset+self.max_batch_size]
                 path, payload = self._payload(batch)
+                recheck_active_sources()
                 data = self._request(path, payload, retries=retries)
+                recheck_active_sources()
                 vectors = validate_vectors(self._vectors(data, len(batch)), len(batch), self.dimension)
                 if vectors and not self.dimension:
                     self.dimension = len(vectors[0])

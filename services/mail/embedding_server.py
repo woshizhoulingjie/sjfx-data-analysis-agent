@@ -3,15 +3,21 @@
 import os
 import sys
 from pathlib import Path
+# A direct script launch must not expose services/mail/threading.py as the
+# standard-library threading module during Torch/FastAPI imports.
+_script_dir = Path(__file__).resolve().parent
+if sys.path and Path(sys.path[0]).resolve() == _script_dir:
+    sys.path.pop(0)
+sys.path.insert(0, str(_script_dir.parents[1]))
 from typing import List, Union
 import threading
+from contextlib import asynccontextmanager
 _admission = threading.BoundedSemaphore(1)
 
 # Support both `python -m services.mail.embedding_server` and a direct script
 # launch from any working directory. Keep an explicitly exported legacy PORT;
 # the application's PORT loaded from .env must not move this separate server.
 _exported_port = os.environ.get("PORT")
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config import Config
 from services.embedding_backend import artifact_fingerprint
 
@@ -22,7 +28,8 @@ from pydantic import BaseModel
 from transformers import AutoModel, AutoTokenizer
 
 
-MODEL_PATH = Config.EMBED_MODEL_PATH
+MODEL_PATH = (Config.MANAGED_EMBED_MODEL_PATH if os.environ.get('SJFX_ROLE') == 'embedding'
+              else Config.EMBED_MODEL_PATH)
 MODEL_NAME = os.environ.get("SJFX_EMBED_MODEL_NAME", "multilingual-e5-small")
 SERVER_PORT = int(os.environ.get("SJFX_EMBED_PORT", _exported_port or "18083"))
 MAX_LENGTH = int(os.environ.get("SJFX_EMBED_MAX_LENGTH", "512"))
@@ -31,12 +38,19 @@ THREADS = int(os.environ.get("OMP_NUM_THREADS", "1"))
 
 torch.set_num_threads(max(1, THREADS))
 torch.set_num_interop_threads(1)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
-model = AutoModel.from_pretrained(MODEL_PATH, local_files_only=True)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True, trust_remote_code=False)
+model = AutoModel.from_pretrained(MODEL_PATH, local_files_only=True, trust_remote_code=False, use_safetensors=True)
 model.eval()
 MODEL_IDENTITY = artifact_fingerprint(MODEL_PATH)
 
-app = FastAPI(title="SJFX Mail CPU Embeddings")
+@asynccontextmanager
+async def lifespan(app):
+    from services.managed_entry import mark_role_ready
+    mark_role_ready()
+    yield
+
+
+app = FastAPI(title="SJFX CPU Embeddings", lifespan=lifespan)
 
 
 class EmbeddingRequest(BaseModel):

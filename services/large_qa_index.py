@@ -1,6 +1,10 @@
 """Versioned, disposable large-package QA indexes. Source databases are read-only."""
 from __future__ import annotations
 
+from services.large_qa_protection import qa_lane
+from services.large_package_protection import recheck_active,current_provenance
+from sjfx_protection import business
+from sjfx_protection.store import ProtectionError
 import hashlib
 import json
 import logging
@@ -136,6 +140,8 @@ def _safe_text(value):
 
 class LargeQAIndex:
     def __init__(self, package_id, base=None, create=False):
+        self._protection_initializing=True
+        if create:recheck_active()
         self.package_id = str(package_id)
         self.path = index_path(package_id, base)
         if create:
@@ -161,12 +167,15 @@ class LargeQAIndex:
                   children TEXT,paths TEXT,text TEXT,status TEXT,updated REAL,attempts INTEGER DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS nodes_level ON topic_nodes(level,status);
                 CREATE TABLE IF NOT EXISTS events(at REAL,kind TEXT,payload TEXT);
+                CREATE TABLE IF NOT EXISTS map_cache(key TEXT PRIMARY KEY,payload TEXT,created REAL);
                 ''')
                 self.set_meta(c, 'schema', SCHEMA)
                 self._ensure_member_columns(c)
                 if not self.meta(c).get('index_epoch'):
                     self.set_meta(c, 'index_epoch', digest(time.time_ns()))
                 thai.ensure(c)
+
+        self._protection_initializing=False
 
     @property
     def exists(self):
@@ -183,15 +192,26 @@ class LargeQAIndex:
     @contextmanager
     def connect(self, write=False):
         c = sqlite3.connect(str(self.path) if write else self.path.as_uri()+'?mode=ro', uri=not write, timeout=20)
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA busy_timeout=20000')
+        if not write and not business.enabled():
+            c.execute('PRAGMA query_only=ON')
+            c.execute('BEGIN')
         try:
-            c.row_factory = sqlite3.Row
-            c.execute('PRAGMA busy_timeout=20000')
-            if not write:
-                c.execute('PRAGMA query_only=ON')
-                c.execute('BEGIN')
-            yield c
-            if write:
-                c.commit()
+            if business.enabled() and not self._protection_initializing:
+                recheck_active()
+                from services.large_qa_sql_cache import QAConnection
+                checked=QAConnection(c,self)
+                try:
+                    if not write:c.execute('BEGIN')
+                    yield checked
+                    if write:checked.commit()
+                    else:c.rollback()
+                except BaseException:checked.rollback();raise
+                finally:checked.cleanup()
+            else:
+                yield c
+                if write:c.commit()
         except BaseException:
             c.rollback()
             raise
@@ -230,11 +250,14 @@ class LargeQAIndex:
         c.execute('INSERT INTO search(rowid,title,body) VALUES(?,?,?)', (cur.lastrowid, ' '.join(tokens(Path(path).name+' '+path)), ' '.join(tokens(text))))
         thai.add_chunk(c, cur.lastrowid, path, text)
 
+    @qa_lane
     def sync_rows(self, rows, package, model='', *, _source_state=None):
         """One transaction publishes summary/membership changes and invalidates ancestors."""
         # Stage on the index volume, not /tmp: a large package must not require
         # two complete Python dictionaries (including every vector/summary).
         # UPSERT retains first-seen order and last-value-wins duplicate semantics.
+        if business.enabled() and not (_source_state or {}).get('checked_source_rows'):
+            raise ProtectionError('历史问答输入未经过实际大包内容核验，需从源重新构建',423,'cache_provenance_missing')
         fields = ('path', 'name', 'topic', 'topic_name', 'version', 'source_version',
                   'summary', 'size', 'mtime', 'sensitive', 'vector', 'source_kind', 'source_metadata')
         with tempfile.TemporaryDirectory(prefix='sync-', dir=self.path.parent) as staging:
@@ -397,6 +420,7 @@ class LargeQAIndex:
             self._set_source_stamp(c, source_stamp)
         return True
 
+    @qa_lane
     def sync_store(self, store):
         # No LIMIT, no per-row decoration, no full text loaded in an HTTP turn.
         with ExitStack() as stack:
@@ -436,7 +460,7 @@ class LargeQAIndex:
                     return 0
                 src.execute('BEGIN')
                 package, model, stamp = source_context()
-            state = {'source_stamp': stamp}
+            state = {'source_stamp': stamp,'checked_source_rows':business.enabled()}
             cacheable = package.get('status') in (None, 'completed', 'waiting_for_selection', 'paused')
             # A changed package stamp/model is only a reason to BYPASS the
             # fast check, never proof of equality. Active ingestion should not
@@ -459,7 +483,7 @@ class LargeQAIndex:
                     # snapshot rather than reusing rows from a released one.
                     src.execute('BEGIN')
                     package, model, stamp = source_context()
-                    state = {'source_stamp': stamp}
+                    state = {'source_stamp': stamp,'checked_source_rows':business.enabled()}
                     cacheable = package.get('status') in (None, 'completed', 'waiting_for_selection', 'paused')
                 else:
                     # Reuse the full fingerprint within this SAME source
@@ -478,6 +502,7 @@ class LargeQAIndex:
                     src.rollback()
             return self.sync_rows(snapshot_rows(), package, model, _source_state=state)
 
+    @qa_lane
     def put_original(self, path, source_version, records, complete, note=''):
         with self.connect(write=True) as c:
             c.execute('BEGIN IMMEDIATE')
@@ -494,6 +519,8 @@ class LargeQAIndex:
                         location.update(source='original', segment_char_start=start, segment_char_end=end)
                         self._add_chunk(c,path,doc['name'],ordinal,'original',text,location,source_version)
                         ordinal += 1
+                except ProtectionError:
+                    raise
                 except Exception as exc:                 # noqa: BLE001
                     if resource_code(exc) or isinstance(exc, thai.ThaiIndexError):
                         # Infrastructure exhaustion must roll back deletion and all
@@ -512,17 +539,20 @@ class LargeQAIndex:
             # Topic reports based on summaries remain valid; query-time facts use originals.
         return True
 
+    @qa_lane
     def enqueue(self, paths):
         if not paths:
             return
         with self.connect(write=True) as c:
             c.executemany("UPDATE documents SET priority=priority+1 WHERE path=? AND parse_status='pending'", [(p,) for p in paths])
 
+    @qa_lane
     def next_parse(self):
         with self.connect() as c:
             row = c.execute("SELECT * FROM documents WHERE parse_status='pending' ORDER BY priority DESC,path LIMIT 1").fetchone()
             return dict(row) if row else None
 
+    @qa_lane
     def build_topic_leaves(self):
         """Each summary participates in exactly one bounded leaf; never sampled-complete."""
         with self.connect(write=True) as c:
@@ -545,6 +575,7 @@ class LargeQAIndex:
                 if batch:
                     save(batch,batch_num)
 
+    @qa_lane
     def topic_material(self, c, allowed=None):
         rows = c.execute('SELECT topic,topic_name,COUNT(*) files,SUM(summary!="") summaries FROM documents GROUP BY topic ORDER BY topic').fetchall()
         result=[]

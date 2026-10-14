@@ -8,6 +8,8 @@ from services.large_package_resources import ResourcePressure, resource_code
 from services.process_liveness import (
     initialize_process_family, own_process_tree, process_rss_bytes, terminate_process_tree,
 )
+from sjfx_protection.store import ProtectionError
+from services.large_package_protection import recheck_active
 
 
 class PreviewCancelled(Exception):
@@ -30,7 +32,16 @@ def _serve(connection, start_gate=None):
         while True:
             request = connection.recv()
             try:
-                connection.send({"result": preview_file(**request)})
+                from sjfx_protection.business import activate
+                protection_context=request.pop('protection_context',None)
+                task_id=request.pop('task_id','')
+                with activate(protection_context,task_id=task_id):
+                    recheck_active()
+                    result=preview_file(**request)
+                    recheck_active()
+                    connection.send({"result": result})
+            except ProtectionError as exc:
+                connection.send({'protection_error': str(exc),'protection_code':exc.code,'protection_status':exc.status})
             except Exception as exc:
                 code = resource_code(exc)
                 connection.send({"error": "{}: {}".format(type(exc).__name__, str(exc)[:300]),
@@ -93,7 +104,12 @@ class PreviewRunner:
             child.close()
             self.connection = parent
 
-    def run(self, root, item, refine=False, cancel_check=None):
+    def run(self, root, item, refine=False, cancel_check=None, protection_context=None):
+        from sjfx_protection.business import enabled, activate, current_task_id
+        if enabled() and not isinstance(protection_context, dict):
+            raise ProtectionError('预览进程缺少显式核准版本', 423, 'protection_context_required')
+        with activate(protection_context):
+            recheck_active()
         from services.large_package_preview import settings, portrait, SCHEMA
         options = settings(refine)
         started = time.monotonic()
@@ -120,6 +136,8 @@ class PreviewRunner:
                     self.close()
                     break
                 request = {"root": str(root), "item": {key: item[key] for key in ("path", "name", "size", "modified_at_ns", "sensitive", "extension", "source_kind", "source_metadata") if key in item}, "refine": refine,
+                           'protection_context': protection_context if enabled() else None,
+                           'task_id': current_task_id(),
                            'seconds_remaining': max(0, attempt_deadline - time.monotonic())}
                 if engine:
                     request['pdf_engine'] = engine
@@ -136,7 +154,11 @@ class PreviewRunner:
                         break
                     if self.connection.poll(min(.15, remaining)):
                         response = self.connection.recv()
+                        if response.get('protection_error'):
+                            raise ProtectionError(response['protection_error'], response.get('protection_status', 423), response.get('protection_code', 'protection_denied'))
                         if "result" in response:
+                            with activate(protection_context):
+                                recheck_active()
                             summary, digest = response['result']
                             coverage = summary.setdefault('coverage', {})
                             if (coverage.get('pdf_primary_timeout') and is_pdf and engine is None

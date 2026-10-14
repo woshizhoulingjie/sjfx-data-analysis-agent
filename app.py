@@ -16,6 +16,7 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -252,6 +253,11 @@ def _bootstrap_multiuser_admin():
     这样现有的 295 个扫描 / 409 个产物直接归管理员，**零迁移**。
     """
     if not _MULTIUSER_AVAILABLE or _multi_user_store is None:
+        return None
+    if getattr(Config, 'OFFLINE_INSTALLATION', False):
+        if not _multi_user_store.admin_count():
+            raise RuntimeError('请先用此实例配置运行 sjfxctl.py init-admin，交互设置管理员密码')
+        # Formal offline installs never generate or log a plaintext password.
         return None
     try:
         boot = _multi_user_store.bootstrap_first_admin(owner_id=_configured_owner_id)
@@ -600,9 +606,10 @@ def _validate_scan_path_request(raw_path):
     value = str(raw_path or "").strip()
     if not value or "\x00" in value:
         raise ValueError("请输入有效的本地目录")
-    candidate = Path(value).expanduser()
+    from services.scanner import local_host_path
+    candidate = local_host_path(value)
     if not candidate.is_absolute():
-        raise ValueError("扫描目录必须使用服务器绝对路径")
+        raise ValueError("扫描目录必须使用运行 SJFX 的这台电脑上的绝对路径")
     return str(candidate)
 
 
@@ -4194,6 +4201,9 @@ def _run_claimed_summary_job(job):
                         storage, job,
                         limit=int(getattr(Config, "PRELIMINARY_SUMMARY_BATCH_SIZE", 4)),
                     )
+                    from sjfx_protection.cache import capture_sources
+                    from sjfx_protection.ready import publish_many
+                    batch_sources = capture_sources()
                     batch_result, batch_ids = analyze_preliminary_batch(
                         llm,
                         storage,
@@ -4202,6 +4212,7 @@ def _run_claimed_summary_job(job):
                         context_window_tokens=Config.LLM_CONTEXT_TOKENS,
                         output_tokens_per_file=int(getattr(Config, "CANDIDATE_PREVIEW_OUTPUT_TOKENS", 240)),
                     )
+                    publish_many(storage.db_path, 'preliminary-legacy-ready', batch_result, batch_sources)
                     lead = batch_result.get(str(job.get("id") or ""))
                     if lead:
                         prepared = dict(job)
@@ -4478,7 +4489,7 @@ def _start_node_summary_prefetch(scan_id, job_id, node_llm):
         return None
     try:
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sjfx-node-prefetch")
-        future = pool.submit(_prefetch_node_summary, scan_id, sibling, node_llm)
+        future = pool.submit(copy_context().run, _prefetch_node_summary, scan_id, sibling, node_llm)
     except Exception:
         logger.warning("节点摘要预取：启动失败，退回串行 scan_id=%s", scan_id, exc_info=True)
         return None
@@ -4513,6 +4524,9 @@ def _execute_summary_job(job):
     scan_id = job["scan_id"]
     workflow_source = str(payload.get("workflow_source") or "")
     prefetched_summary = payload.pop("_preliminary_prefetched_summary", None)
+    if prefetched_summary:
+        from sjfx_protection.ready import require as require_ready
+        require_ready(storage.db_path, 'preliminary-legacy-ready', job_id, prefetched_summary)
     preview_mode = (
         str(payload.get("workflow_source") or "") == "candidate_preview_model_summary"
         or (
@@ -5977,7 +5991,7 @@ class _ImportTranslationPipeline:
             self._reserved_characters += source_chars
             self._summary["source_characters"] += source_chars
             future = self._executor.submit(
-                self._translate_one, str(path), source_document, analysis_document,
+                copy_context().run, self._translate_one, str(path), source_document, analysis_document,
                 source_chars,
             )
             self._futures.append(future)
@@ -7241,7 +7255,6 @@ def scan():
                 owner_id = upload_owner
         except ValueError as exc:
             return api_error(str(exc), 403)
-        _file_protection.guard_root(root)
         job_id = storage.create_scan_job(
             root, payload.get("max_files", Config.MAX_SCAN_FILES), parse_mode,
             payload.get("max_depth", Config.MAX_SCAN_DEPTH),
@@ -7256,7 +7269,7 @@ def scan():
             "analysis_job_id": job_id,
             "status_url": "/api/jobs/{}".format(job_id),
         }), 202
-    except HTTPException:
+    except (HTTPException, _ProtectionError):
         raise
     except Exception as exc:
         return api_error(str(exc))
@@ -12475,10 +12488,11 @@ def create_download_ticket():
     output_path = _resolve_output_file(filename, owner_id)
     if output_path is None:
         return api_error("输出文件不存在或已被清理", 404)
-    ticket = storage.create_download_ticket(
-        filename, owner_id, ttl_seconds=Config.DOWNLOAD_TICKET_TTL_SECONDS
-    )
-    _file_protection.bind_download(filename, ticket, Config.DOWNLOAD_TICKET_TTL_SECONDS)
+    if _file_protection.enabled:
+        ticket = _file_protection.issue_download(owner_id, filename, Config.DOWNLOAD_TICKET_TTL_SECONDS)
+    else:
+        ticket = storage.create_download_ticket(filename, owner_id, ttl_seconds=Config.DOWNLOAD_TICKET_TTL_SECONDS)
+        _file_protection.bind_download(filename, ticket, Config.DOWNLOAD_TICKET_TTL_SECONDS)
     return jsonify({
         "ok": True,
         "download_url": "/outputs/{}?ticket={}".format(
@@ -12513,6 +12527,14 @@ def outputs(filename):
     if registered_owner != owner_id:
         return api_error("输出文件不存在或不属于当前访问用户", 404)
     ticket = str(request.args.get("ticket") or "")
+    if _file_protection.enabled:
+        from sjfx_protection.business import context
+        ctx=context() or {}
+        if not ctx.get('artifact_authorized'):
+            raise _ProtectionError('下载未取得版本准入',423,'download_ticket_required')
+        artifact=ctx['artifact']
+        # Return the verified artifact target, bound to the account and ticket.
+        return send_from_directory(str(Path(artifact['path']).parent),Path(artifact['path']).name,as_attachment=True)
     if ticket:
         if not storage.consume_download_ticket(ticket, filename, owner_id):
             return api_error("下载票据无效、已使用或已过期，请重新发起下载", 401)
@@ -13044,7 +13066,7 @@ def formal_directory(scan_id):
 def create_large_package():
     payload = request.get_json(silent=True) or {}
     try:
-        root = str(payload.get("path") or "").strip()
+        root = _validate_scan_path_request(payload.get("path"))
         if not root:
             raise ValueError("请输入要处理的大数据包目录")
         owner_id = _effective_owner()
@@ -13052,7 +13074,6 @@ def create_large_package():
         # reserved upload namespace.  Package ownership cannot substitute for
         # source-directory ownership.
         root = str(_resolve_allowed_scan_root(root, owner_id))
-        _file_protection.guard_root(root)
         item = large_package_store.create(root, owner_id=owner_id)
         return jsonify({"ok": True, "large_package": item, "package_id": item["id"]}), 202
     except (ValueError, OSError) as exc:
@@ -13897,6 +13918,9 @@ def resume_large_package(package_id):
     """恢复到**暂停前记录的目标状态**，不再一律写 queued。"""
     try:
         item = _large_package_owned(package_id)
+        from sjfx_protection.business import enabled as protection_enabled
+        if protection_enabled():
+            large_package_store.refresh_protection_context(package_id, item['owner_id'])
         if item.get("status") != "paused":
             return jsonify({"ok": True, "resumed": False,
                             "snapshot": large_package_store.workflow_snapshot(package_id)})
@@ -13935,10 +13959,16 @@ def cancel_large_package(package_id):
 
 # Isolated file protection: off by default, separate state and no model/runtime initialization.
 from sjfx_protection.integration import install as _install_file_protection
+from sjfx_protection.store import ProtectionError as _ProtectionError
+from sjfx_protection.business import BusinessAdapter as _ProtectionBusinessAdapter
+_protection_adapter = _ProtectionBusinessAdapter(Config.DB_PATH, Config.DATA_DIR/'large_package.db', Config.OUTPUT_DIR)
 _file_protection = _install_file_protection(
     app, state_dir=Config.DATA_DIR / "file_protection",
     allowed_roots=Config.SCAN_ALLOWED_ROOTS,
     session_resolver=lambda sid: _multi_user_store.resolve_session(sid) if _multi_user_store else None,
+    authorize_root=_protection_adapter.authorize_root,
+    authorize_owner=_protection_adapter.authorize_owner,
+    resource_resolver=_protection_adapter.resolve,
 )
 
 

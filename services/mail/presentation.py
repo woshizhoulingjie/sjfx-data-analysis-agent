@@ -156,10 +156,14 @@ def _worker():
                     continue
                 job["phase"]="translating"
             # One iterator step is at most one bounded model call. Requeue afterwards.
-            try:
-                values = next(job["_steps"])
-            except StopIteration:
-                values = job["values"]
+            from sjfx_protection.business import saved_execution
+            with saved_execution(job.get('_owner'),[job.get('_root')],job.get('_protection_context'),'analyze'):
+                try:
+                    values = next(job["_steps"])
+                except StopIteration:
+                    values = job["values"]
+                from sjfx_protection import cache
+                cache.record_payload(job['_cache_key'], values, job.get('_cache_sources'), owner=job['_owner'])
             with _LOCK:
                 job["values"] = values
                 done = sum(v["status"] in {"completed","not_required"} for v in values.values())
@@ -182,17 +186,25 @@ def _worker():
 
 def request_presentation(services, owner_id, payload):
     global _THREAD
+    from sjfx_protection.business import enabled,require_root
+    package=services.repository.get_package(str(payload.get('package_id') or ''),owner_id)
+    protected=require_root(owner_id,package['source_path'],'analyze') if enabled() and package else None
     package_id, entries, metadata = source_bundle(services, owner_id, payload)
     model = getattr(services,"model",None)
     transport = getattr(model,"transport",model)
     model_id = str(getattr(transport,"model",None) or type(model).__name__)
     context = metadata.get("contexts") or {}
     raw = json.dumps([_VERSION,GLOSSARY_VERSION,owner_id,package_id,model_id,entries,context], ensure_ascii=False, sort_keys=True)
+    if protected:
+        stable = {k:v for k,v in protected.items() if k != 'decision_id'}
+        raw += json.dumps(stable,sort_keys=True,ensure_ascii=False)
     key = hashlib.sha256(raw.encode()).hexdigest()
     priority = {"message":0,"evidence":0,"attachment":1,"result":2,"titles":5}.get(payload.get("kind"),5)
     with _LOCK:
         current = _JOBS.get(key)
         if current and not (payload.get("retry") is True and current["status"] in {"failed","partial"}):
+            from sjfx_protection import cache
+            cache.require_payload(current['_cache_key'], current['values'], owner=owner_id)
             current["_seen"] = time.monotonic()
             if current["status"] == "paused":
                 current.update(status="pending",phase="queued")
@@ -207,9 +219,17 @@ def request_presentation(services, owner_id, payload):
         memory = SegmentMemory(Path(Config.DATA_DIR)/"mail_chinese_cache"/"segments-v3.sqlite3", [owner_id,package_id], model_id)
         steps = translation_steps(services,entries,contexts=context,memory=memory)
         # First step only resolves cache and original-Chinese segments: no model work.
-        values = next(steps)
+        from sjfx_protection import cache
+        from sjfx_protection.business import saved_execution
+        with saved_execution(owner_id, [(package or {}).get('source_path')], protected, 'analyze'):
+            values = next(steps)
+            sources = cache.capture_sources()
+        proof_key = cache.resource_key(Config.DATA_DIR / 'mail_chinese_cache', 'mail-presentation', package_id, key)
+        cache.record_payload(proof_key, values, sources, owner=owner_id)
         done=sum(v["status"] in {"completed","not_required"} for v in values.values())
         job={"status":"completed" if done==len(entries) else "pending","phase":"cached" if done==len(entries) else "queued","values":values,"completed":done,"total":len(entries),"target_language":"zh-CN","completed_segments":sum(v.get("completed_segments",0) for v in values.values()),"total_segments":sum(v.get("total_segments",0) for v in values.values()),"_priority":priority,"_seen":time.monotonic(),"_steps":steps}
+        job.update(_owner=owner_id,_root=(package or {}).get('source_path'),_protection_context=protected,
+                   _cache_key=proof_key, _cache_sources=sources)
         _JOBS[key]=job
         if job["status"] == "pending":_QUEUE.put((priority,next(_SEQUENCE),key))
         if _THREAD is None or not _THREAD.is_alive():

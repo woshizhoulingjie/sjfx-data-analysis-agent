@@ -19,6 +19,8 @@ embeddings are disabled, slow or unavailable, which leaves every existing
 behaviour exactly as it was.
 """
 
+from services.large_package_protection import package_lane, active_lane, recheck_active, guarded_model_call
+from sjfx_protection.store import ProtectionError
 import json
 from services.embedding_encoding import prefix as embedding_prefix
 import os
@@ -169,6 +171,7 @@ def summary_quality(row: Mapping[str, Any]) -> float:
     return 0.5 * length_score + 0.5 * status_score
 
 
+@package_lane
 def embedding_calibration(store: Any, package_id: str, model: str):
     """Return (centre, threshold) for one package, without writing anything.
 
@@ -225,6 +228,7 @@ def embedding_calibration(store: Any, package_id: str, model: str):
     return center, max(0.30, min(0.90, threshold))
 
 
+@package_lane
 def embedding_similarity(store: Any, package_id: str, query: str,
                          paths: Sequence[str], logger: Any = None) -> Dict[str, float]:
     """Semantic similarity per file, used only to strengthen recall.
@@ -242,6 +246,8 @@ def embedding_similarity(store: Any, package_id: str, query: str,
         from config import Config
         if getattr(Config, 'EMBED_BACKEND', 'openai_compatible' if getattr(Config, 'ENABLE_VLLM_EMBEDDINGS', False) else 'disabled') == 'disabled':
             return {}
+    except ProtectionError:
+        raise
     except Exception:
         return {}
     question = str(query or "").strip()
@@ -283,7 +289,7 @@ def embedding_similarity(store: Any, package_id: str, query: str,
         # a slow embedding service can never stall a question.
         client = base.with_options(timeout=EMBED_TIMEOUT_SECONDS, max_batch_size=1,
                                    max_chars=512, semaphore_timeout=1, retries=0)
-        encoded = client.embed([embedding_prefix('query', client=client) + question[:512]])
+        encoded = guarded_model_call(client,"embed",[embedding_prefix('query', client=client) + question[:512]])
         if not encoded:
             return {}
         query_vector = _project(
@@ -311,6 +317,8 @@ def embedding_similarity(store: Any, package_id: str, query: str,
                 * (EMBED_SEMANTIC_TOP - EMBED_SEMANTIC_BASE),
             )
         return scores
+    except ProtectionError:
+        raise
     except Exception as exc:  # semantic recall is optional, never fatal
         if logger is not None:
             logger.info(
@@ -374,6 +382,8 @@ def _rerank_endpoint() -> tuple:
     """Expose only the explicitly selected generation service."""
     try:
         from config import Config
+    except ProtectionError:
+        raise
     except Exception:
         return "", ""
     if not getattr(Config, "LLM_ENABLED", False):
@@ -397,6 +407,7 @@ def _parse_order(raw: str, size: int) -> List[int]:
     return order
 
 
+@active_lane
 def rerank_candidates(query: str, results: Sequence[Mapping[str, Any]],
                       logger: Any = None) -> List[Mapping[str, Any]]:
     """Reorder candidates with the local model; never drops any of them."""
@@ -418,6 +429,7 @@ def rerank_candidates(query: str, results: Sequence[Mapping[str, Any]],
         for position, item in enumerate(pool, 1)
     )
     try:
+        recheck_active()
         from config import Config
         from services.model_backend import create_model_client
         client = create_model_client(Config, timeout=RERANK_TIMEOUT_SECONDS, max_concurrency=1)
@@ -430,6 +442,9 @@ def rerank_candidates(query: str, results: Sequence[Mapping[str, Any]],
             timeout=RERANK_TIMEOUT_SECONDS, retries=0,
         )
         raw = body.get("content") or ""
+        recheck_active()
+    except ProtectionError:
+        raise
     except Exception as exc:  # reranking is optional, never fatal
         if logger is not None:
             logger.info("large-package rerank unavailable: %s", str(exc)[:160])
@@ -443,6 +458,7 @@ def rerank_candidates(query: str, results: Sequence[Mapping[str, Any]],
     return ordered + [item for item in items if id(item) not in chosen]
 
 
+@active_lane
 def collect_evidence(retrieval_request: Any, query: str, files: Sequence[Mapping[str, Any]],
                      store: Any, retrieve_evidence: Any, logger: Any = None,
                      relaxed: bool = False) -> Dict[str, Any]:

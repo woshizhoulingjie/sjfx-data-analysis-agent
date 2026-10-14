@@ -318,8 +318,26 @@ def deployment_report(config, runtime_modules, model_health, *, scope='full', re
     if scope == 'full' and optional['pst']['required']:
         optional['pst'].update(tool_probe(pst_binary, ['-V'], required=True,
             env=readpst_environment(pst_binary, config)))
+    from services.managed_embedding import selected as managed_embedding_selected
+    managed = managed_embedding_selected(config)
+    if managed:
+        bundled = Path(config.MANAGED_EMBED_MODEL_PATH)
+        resources['bundled_embedding'] = resource_group([
+            file_check(bundled/name, json_object=name.endswith('.json')) for name in
+            ('config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json')]
+            + [file_check(bundled/'model.safetensors', 400*1024*1024),
+               file_check(bundled/'sentencepiece.bpe.model', 1024*1024)],
+            reason='supervisor-owned offline CPU E5; inference checked after start')
+        missing = list(dict.fromkeys(missing + [name for name in ('torch','transformers','sentencepiece')
+                                               if not module_present(name)]))
+    # A managed child is a local startup prerequisite rather than a service the
+    # user must launch before doctor. External selections retain their checks.
     endpoints_ready = all(r.get('reachable') and r.get('configured_model_present') is True
-                          for r in model_health.values() if r.get('enabled'))
+                          for name,r in model_health.items() if r.get('enabled')
+                          and not (managed and name == 'embedding')
+                          and not (managed and name == 'mail_embedding'
+                                   and getattr(config,'MAIL_EMBED_BASE_URL',None) == config.EMBED_BASE_URL
+                                   and getattr(config,'MAIL_EMBED_MODEL',None) == config.EMBED_MODEL))
     full_ready = (runtime_ready and not missing and endpoints_ready
                   and all(r['ok'] for r in resources.values() if r['required'])
                   and bool(tools) and all(r['ok'] for r in tools.values() if r['required'])
@@ -331,4 +349,6 @@ def deployment_report(config, runtime_modules, model_health, *, scope='full', re
             'full_dependencies_available': not missing, 'full_prerequisites_ready': full_ready,
             'complete_functional_readiness': None, 'functional_verification': 'not_tested',
             'local_model_services': model_health, 'model_services_prerequisites_ready': endpoints_ready,
+            'managed_embedding_selected': managed,
+            'managed_embedding_verification': 'local files and imports; actual inference requires startup' if managed else 'not_selected',
             'ok': runtime_ready if scope == 'runtime' else full_ready}

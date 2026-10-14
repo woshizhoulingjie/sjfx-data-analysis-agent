@@ -255,6 +255,12 @@ def _mark_source_changes_once(job):
 
 
 def execute(job):
+    from sjfx_protection.business import job_execution
+    with job_execution(job, record_result=False):
+        return _execute_protected_job(job)
+
+
+def _execute_protected_job(job):
     task_type = job.get("task_type")
     if task_type in {"mail_foundation", "mail_import", "mail_extract", "mail_ocr", "mail_research", "mail_export", "mail_embed", "mail_factextract"}:
         from services.mail.jobs import run_claimed_mail_job
@@ -376,7 +382,48 @@ def _commit_preliminary_ready(job, ready):
     return result
 
 
-def execute_with_preliminary_cache(job, cache):
+def execute_with_preliminary_cache(job,cache):
+    from sjfx_protection.business import job_execution
+    with job_execution(job, record_result=False):
+        return _execute_approved_preliminary_cache(job,cache)
+
+
+def _finalize_job_result(job, result=None, error=None, *, already_committed=False):
+    """Publish under the same frozen admission used to produce this result."""
+    from sjfx_protection import business
+    from sjfx_protection.store import ProtectionError
+    frozen = (job.get('options') or {}).get('protection_context')
+    protected = business.enabled()
+    owned = isinstance(frozen, dict) and frozen.get('owner') == job.get('owner_id')
+    publishing = result is not None or already_committed
+    if protected and publishing and not owned:
+        raise ProtectionError('任务结果发布缺少原有冻结归属', 423, 'protection_context_required')
+    with business.activate(frozen if owned else None, task_id=job.get('id', '')):
+        if protected and publishing:
+            business.recheck_active_sources(business.job_operation(job.get('task_type')))
+        if already_committed:
+            final = storage.get_job(job['id'])
+        else:
+            arguments = {}
+            if result is not None:
+                arguments['result'] = result
+            if error is not None:
+                arguments['error'] = error
+            final = storage.finalize_job(job['id'], **arguments)
+        if protected and owned and isinstance(final, dict) and final.get('status') in {'completed', 'failed', 'cancelled'}:
+            try:
+                business.record_execution_result(frozen, business.job_operation(job.get('task_type')),
+                                                 final['status'], job['id'], phase='publication')
+            except Exception:
+                # Queue publication already committed. Keep that truthful state
+                # and report the audit failure explicitly instead of inventing
+                # a second failed business execution or stopping the daemon.
+                logger.error('Task finalized but publication receipt failed id=%s status=%s',
+                             job['id'], final['status'], exc_info=True)
+        return final
+
+
+def _execute_approved_preliminary_cache(job, cache):
     prefetched = cache.pop(str(job["id"]), None)
     fast_candidate = (Config.PRELIMINARY_SUMMARY_OPTIMIZATION_ENABLED
                       and (job.get("options") or {}).get("workflow_source") == "preliminary_model_summary")
@@ -417,7 +464,8 @@ def execute_with_preliminary_cache(job, cache):
     if isinstance(result, dict):
         for sibling_id, sibling_result in (result.pop("_preliminary_batch_prefetch", None) or {}).items():
             if sibling_result and str(sibling_id) != str(job["id"]):
-                cache[str(sibling_id)] = {**dict(sibling_result), "created_at": time.time()}
+                cache[str(sibling_id)] = dict(sibling_result)
+                cache[str(sibling_id)].setdefault('created_at', time.time())
     return result
 
 
@@ -846,8 +894,8 @@ def run_forever():
                         logger.info("Worker yielded checkpointed slice id=%s", job_id)
                         yielded_job_id = job_id
                         continue
-                if not (isinstance(result, dict) and result.pop("_preliminary_committed", False)):
-                    storage.finalize_job(job_id, result=result)
+                preliminary_committed = isinstance(result, dict) and result.pop("_preliminary_committed", False)
+                _finalize_job_result(job, result=result, already_committed=preliminary_committed)
                 if job.get("task_type") == "generate_report":
                     try:
                         source = str((job.get("options") or {}).get("workflow_source") or "")
@@ -998,7 +1046,7 @@ def run_forever():
                         storage.update_analysis_progress_status(
                             job.get("scan_id"), "cancelled", "分析已取消；已完成的文件检查点仍保留。", "cancelled"
                         )
-                    storage.finalize_job(job_id)
+                    _finalize_job_result(job)
                     continue
                 if isinstance(exc, JobExecutionTimeout) and job.get("task_type") in {"scan_and_analyze", "analyze_package"}:
                     attempts = int(job.get("attempt_count") or 1)
@@ -1027,7 +1075,7 @@ def run_forever():
                                     job.get("scan_id"), "cancelled",
                                     "分析已取消；已完成的文件检查点仍保留。", "cancelled",
                                 )
-                            storage.finalize_job(job_id)
+                            _finalize_job_result(job)
                             continue
                 # SQLite uses a single writer even in WAL mode.  Under a
                 # large import the app, worker and supervised child can
@@ -1056,12 +1104,18 @@ def run_forever():
                         )
                 if batch_id:
                     storage.update_deep_parse_batch(batch_id, "failed", error_code=exc.__class__.__name__, error_message=str(exc))
-                if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
-                    storage.update_analysis_progress_status(
-                        job.get("scan_id"), "failed",
-                        "分析失败：{}".format(str(exc)[:500]), "failed",
-                    )
-                storage.finalize_job(job_id, error=exc)
+                try:
+                    if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
+                        storage.update_analysis_progress_status(
+                            job.get("scan_id"), "failed",
+                            "分析失败，请查看任务错误状态。", "failed",
+                        )
+                except Exception:
+                    # Execution has left its admission context. Advisory
+                    # progress must not prevent queue finalization or kill the
+                    # daemon; the original failure was already logged above.
+                    logger.warning("Deferred failed progress publication scan_id=%s", job.get("scan_id"), exc_info=True)
+                _finalize_job_result(job, error=exc)
     finally:
         try:
             lock_handle.close()

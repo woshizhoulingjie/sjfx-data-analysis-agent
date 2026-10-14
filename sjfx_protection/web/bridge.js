@@ -1,40 +1,46 @@
-/* Device proof is obtained from the user's installed assistant, never from another account device. */
+/* Attach package approvals; the local runtime rechecks every operation. */
 (() => {
   'use strict';
-  const originalFetch = window.fetch.bind(window);
-  const config = originalFetch('/protection/api/status', {credentials:'same-origin'})
-    .then(r => r.ok ? r.json() : {mode:'off'}).catch(() => ({mode:'unknown'}));
-  window.fetch = async function(input, init) {
-    const request = new Request(input, init);
-    const url = new URL(request.url);
-    if (url.origin !== location.origin || !(/^\/api\//.test(url.pathname) || /^\/outputs\//.test(url.pathname)) ||
-        /^\/api\/(auth|admin)\//.test(url.pathname)) return originalFetch(request);
-    const status = await config;
-    if (status.mode !== 'enforce') return originalFetch(request);
-    const sr = await originalFetch('/protection/api/session', {credentials:'same-origin'});
-    if (!sr.ok) return new Response(JSON.stringify({ok:false,error:'请先登录',code:'login_required'}),
-      {status:401,headers:{'Content-Type':'application/json'}});
-    const session = await sr.json();
+  const nativeFetch = window.fetch.bind(window);
+  const storageKey = 'sjfx-operation-approvals';
+  function selectedApprovals() {
     try {
-      const pr = await originalFetch('http://127.0.0.1:18765/sign', {
-        method:'POST',credentials:'omit',headers:{'Content-Type':'application/json','X-SJFX-Client':'1'},
-        body:JSON.stringify({session_tag:session.session_tag,method:request.method,target:url.pathname+url.search})
-      });
-      const proof = await pr.json();
-      if (!pr.ok || !proof.ok) throw new Error(proof.error || '助手尚未就绪');
-      const headers = new Headers(request.headers);
-      Object.entries(proof.headers).forEach(([k,v]) => headers.set(k,v));
-      return originalFetch(request, {headers});
-    } catch (err) {
-      return new Response(JSON.stringify({ok:false,error:'需要启动本地文件助手：'+err.message,
-        code:'device_proof_required',protection_url:'/protection'}),
-        {status:423,headers:{'Content-Type':'application/json'}});
+      const selected = JSON.parse(sessionStorage.getItem(storageKey) || '{}');
+      if (!selected || typeof selected !== 'object' || Array.isArray(selected)) throw Error('Invalid map');
+      const valid = {}, header = {};
+      for (const [registration, approval] of Object.entries(selected)) {
+        if (registration && approval && typeof approval.approval_id === 'string' && approval.approval_id &&
+            Number.isFinite(approval.expires) && approval.expires > Date.now() / 1000) {
+          valid[registration] = approval;
+          header[registration] = approval.approval_id;
+        }
+      }
+      sessionStorage.setItem(storageKey, JSON.stringify(valid));
+      return header;
+    } catch {
+      sessionStorage.removeItem(storageKey);
+      return {};
     }
+  }
+  window.fetch = function(input, init) {
+    const request = new Request(input, init), url = new URL(request.url);
+    if (url.origin !== location.origin || !(/^\/api\//.test(url.pathname) || /^\/outputs\//.test(url.pathname)) ||
+        /^\/api\/(?:auth|admin)(?:\/|$)/.test(url.pathname)) return nativeFetch(request);
+    const approvals = selectedApprovals();
+    if (!Object.keys(approvals).length || request.headers.has('X-SJFX-Approvals')) return nativeFetch(request);
+    const headers = new Headers(request.headers);
+    headers.set('X-SJFX-Approvals', JSON.stringify(approvals));
+    // Send once. Local admission does not require a retry for device proof.
+    return nativeFetch(new Request(request, {headers}));
   };
-  const addNavigation = () => config.then(status => {
-    if (status.mode === 'off') return;
-    const nav=document.querySelector('.side-nav');
-    if(nav){const a=document.createElement('a');a.className='nav-item';a.href='/protection';a.textContent='文件保护';nav.appendChild(a);}
-  }).catch(() => {});
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded',addNavigation); else addNavigation();
+  function navigation() {
+    const nav = document.querySelector('.side-nav');
+    if (nav && !nav.querySelector('[data-package-protection]')) {
+      const link = document.createElement('a');
+      link.href = '/protection/packages';link.className = 'nav-item';
+      link.dataset.packageProtection = '1';link.textContent = '本地资料保护';nav.append(link);
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', navigation);
+  else navigation();
 })();

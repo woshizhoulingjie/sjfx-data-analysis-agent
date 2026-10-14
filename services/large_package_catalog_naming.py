@@ -3,6 +3,8 @@
 Labels are stored once per stable group. No source, summary, selection or ordinary
 analysis row is modified. All reservations and updates use short transactions.
 """
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact
+from sjfx_protection.store import ProtectionError
 from contextlib import closing
 import hashlib
 import json
@@ -263,10 +265,13 @@ def _usable(row, min_seconds=0):
                 and row['deadline'] - time.time() >= float(min_seconds)
                 and int(row['requests']) < int(row['max_requests'])
                 and int(row['tokens']) < int(row['max_tokens']))
+    except ProtectionError:
+        raise
     except Exception:
         return False
 
 
+@package_lane
 def _budget_for_groups(store, package_id, cfg):
     """按**实际工作量**（需要命名的组数）推导轮次预算，不再用固定值。
 
@@ -280,6 +285,8 @@ def _budget_for_groups(store, package_id, cfg):
     """
     try:
         from config import Config
+    except ProtectionError:
+        raise
     except Exception:
         Config = None
 
@@ -292,6 +299,8 @@ def _budget_for_groups(store, package_id, cfg):
                 'SELECT COUNT(*) FROM large_catalog_groups WHERE package_id=? '
                 "AND id NOT LIKE 'km-other-%' AND id NOT LIKE 'km-pending-%'",
                 (package_id,)).fetchone()[0] or 0)
+    except ProtectionError:
+        raise
     except Exception:
         groups = 0
     batch = max(1, int(g('LP_CATALOG_BATCH_SIZE', 4)))
@@ -320,6 +329,7 @@ def _upsert_round_key(c, package_id, request_key, round_id):
               (package_id, request_key, round_id))
 
 
+@package_lane
 def ensure_round(store, package_id, request_key='initial', min_seconds=0):
     """取得一个**可用于本次任务**的轮次；不够用就新建或续期。
 
@@ -435,6 +445,7 @@ def _singleton_name(row):
     return (topic or '未命名资料')[:120]
 
 
+@package_lane
 def label_singletons(store, package_id):
     """Return legacy deterministic singleton labels to the model naming queue.
 
@@ -507,6 +518,7 @@ def _normalize_name(value):
     return t
 
 
+@package_lane
 def duplicate_name_groups(store, package_id):
     """返回 {归一化名: [group_id, ...]}，只包含**有 ≥2 个叶组**的键。
 
@@ -539,6 +551,7 @@ def duplicate_name_groups(store, package_id):
 _ORDINALS = ("其二", "其三", "其四", "其五", "其六", "其七", "其八", "其九", "其十")
 
 
+@package_lane
 def _disambiguate_incompatible(store, package_id, incompatible,
                                reason="同名叶组内容不相容、不能合并：改名消歧（%s）"):
     """给"同一主题内同名、但内容不相容无法合并"的叶组改一个可区分的名字。返回改名数。
@@ -605,6 +618,8 @@ def _disambiguate_incompatible(store, package_id, incompatible,
                                   reason % gid,
                                   "normalize_leaves", now))
             conn.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception("disambiguate incompatible duplicates failed: %s", package_id)
         return 0
@@ -615,6 +630,7 @@ def _disambiguate_incompatible(store, package_id, incompatible,
     return renamed
 
 
+@package_lane
 def normalize_leaves(store, package_id, max_rounds=6, cap=None):
     """叶层**唯一的收缩入口**：把同一主题内"归一化后同名"的叶子合并成一个。
 
@@ -672,6 +688,8 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
     try:
         from services.large_package_semantic import effective_group_max
         cap = int(cap or effective_group_max(store, package_id) or 0)
+    except ProtectionError:
+        raise
     except Exception:
         cap = int(getattr(Config, 'LP_CATALOG_GROUP_MAX', 60) or 60)
 
@@ -776,6 +794,8 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
                                 "SELECT name FROM lp_catalog_labels WHERE package_id=? "
                                 "AND group_id IN (" + _ph + ")",
                                 tuple([package_id] + list(alive)))]
+                        except ProtectionError:
+                            raise
                         except Exception:
                             _names = []
                         same_name = (len(_names) == len(alive) and len(alive) >= 2
@@ -832,6 +852,8 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
                     events.append((package_id, "catalog.leaf", key[:60], host,
                                    "同名叶子归一：并入 %d 组、迁移 %d 个成员、宿主共 %d 个成员"
                                    % (len(others), moved, total), "normalize_leaves", now))
+                except ProtectionError:
+                    raise
                 except Exception:
                     LOGGER.exception("normalize merge failed: %s/%s", package_id, key)
         if not progressed:
@@ -871,6 +893,8 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
                     "SELECT id FROM large_catalog_groups WHERE package_id=? AND member_count>? "
                     "ORDER BY member_count DESC LIMIT 4",
                     (package_id, int(cap * 2))).fetchall()]
+        except ProtectionError:
+            raise
         except Exception:
             big = []
         stats["over_cap"] = len(big)
@@ -878,6 +902,8 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
             try:
                 from services import large_package_semantic as semantic
                 semantic.split_oversized(store, package_id, max_size=cap, max_rounds=2)
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception("normalize post-split failed: %s", package_id)
 
@@ -887,6 +913,8 @@ def normalize_leaves(store, package_id, max_rounds=6, cap=None):
                 conn.executemany("INSERT INTO lp_workflow_events(package_id,object,old_state,"
                                  "new_state,reason,source,created) VALUES(?,?,?,?,?,?,?)", events)
                 conn.commit()
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("normalize events failed: %s", package_id)
     LOGGER.info("normalize_leaves package=%s rounds=%d merged_groups=%d merged_members=%d "
@@ -901,10 +929,13 @@ def _validate_fix_enabled():
     try:
         from config import Config
         return bool(getattr(Config, 'LP_CATALOG_VALIDATE_FIX', False))
+    except ProtectionError:
+        raise
     except Exception:
         return False
 
 
+@package_lane
 def validate_catalog(store, package_id):
     """目录发布前的不变量校验。返回 {"ok":bool,"checks":{...},"violations":[...]}。
 
@@ -1054,6 +1085,8 @@ def validate_catalog(store, package_id):
     try:
         from services.large_package_semantic import leaf_growth_cap
         growth = int(leaf_growth_cap(store))
+    except ProtectionError:
+        raise
     except Exception:
         growth = 240
     dups = duplicate_name_groups(store, package_id)
@@ -1085,6 +1118,8 @@ def validate_catalog(store, package_id):
                     kids = []
                 for gid in kids:
                     topic_of[str(gid)] = str(b["id"])
+        except ProtectionError:
+            raise
         except Exception:
             topic_of = {}
     same_topic_keys = {}
@@ -1169,6 +1204,8 @@ def validate_catalog(store, package_id):
                 "SELECT 1 FROM lp_catalog_jobs j WHERE j.package_id=g.package_id "
                 "AND j.group_id=g.id AND j.status IN ('queued','running','retry'))",
                 (package_id,)).fetchone()[0] or 0)
+        except ProtectionError:
+            raise
         except Exception:
             awaiting = 0
     checks["INV7_unnamed"] = {"groups_without_name": unnamed, "awaiting_naming": awaiting}
@@ -1299,11 +1336,14 @@ def _write_evidence_snapshot(conn, package_id, catalog_id, labels, branches, val
             "payload=excluded.payload,catalog_id=excluded.catalog_id",
             (evidence_id, str(package_id), str(catalog_id), stats,
              json.dumps(payload, ensure_ascii=False), time.time()))
+    except ProtectionError:
+        raise
     except Exception:
         # 快照写不进去绝不能让发布失败 —— 但要留下痕迹。
         LOGGER.exception('evidence snapshot write failed: %s/%s', package_id, catalog_id)
 
 
+@package_lane
 def ensure_catalog_version(store, package_id, connection=None, allow_previous=True):
     """Record a content/revision-specific version using the caller's transaction."""
     from contextlib import nullcontext
@@ -1396,6 +1436,7 @@ def ensure_catalog_version(store, package_id, connection=None, allow_previous=Tr
         if own_transaction:
             conn.commit()
         return catalog_id
+@package_lane
 def prune_history(store, package_id, keep=None):
     """把标签历史裁剪到「每组最近 keep 个版本 + 恒留第 1 版」。
 
@@ -1414,6 +1455,8 @@ def prune_history(store, package_id, keep=None):
         # 于是 SJFX_LP_LABEL_HISTORY_KEEP 永远不生效（对一张曾占整库 41% 的表失去调控）。
         from config import Config
         keep = int(keep if keep is not None else getattr(Config, 'LP_LABEL_HISTORY_KEEP', 5))
+    except ProtectionError:
+        raise
     except Exception:
         keep = 5
     keep = max(1, min(200, keep))
@@ -1436,6 +1479,8 @@ def prune_history(store, package_id, keep=None):
         if removed:
             LOGGER.info('label history pruned package=%s removed=%d keep=%d', package_id, removed, keep)
         return removed
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('label history prune failed: %s', package_id)
         return 0
@@ -1446,6 +1491,7 @@ _MAINTENANCE_STATE = {}
 MAINTENANCE_MIN_SECONDS = 30.0
 
 
+@package_lane
 def catalog_mutation_signature(store, package_id):
     """目录结构签名：(组数, 修订号之和, 最近更新时间)。只读、单条聚合查询。"""
     try:
@@ -1454,6 +1500,8 @@ def catalog_mutation_signature(store, package_id):
                             'COALESCE(MAX(updated_at),0) FROM large_catalog_groups '
                             'WHERE package_id=?', (package_id,)).fetchone()
         return (int(row[0] or 0), int(row[1] or 0), round(float(row[2] or 0), 3))
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('catalog signature failed: %s', package_id)
         return None
@@ -1466,6 +1514,7 @@ def catalog_mutation_signature(store, package_id):
 ROUND_HISTORY_KEEP = max(0, int(os.getenv('SJFX_LP_CATALOG_ROUND_KEEP', '24') or 0))
 
 
+@package_lane
 def prune_round_history(store, package_id, keep=None):
     """只删"已经不会被读到的历史轮次"，返回删除的轮次数。按 package 隔离。"""
     keep = ROUND_HISTORY_KEEP if keep is None else max(0, int(keep or 0))
@@ -1497,11 +1546,14 @@ def prune_round_history(store, package_id, keep=None):
             LOGGER.info('catalog round history pruned package=%s removed=%d keep=%d',
                         package_id, len(doomed), keep)
         return len(doomed)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('round history prune failed: %s', package_id)
         return 0
 
 
+@package_lane
 def maintain_catalog(store, package_id, force=False):
     from services.large_package_catalog_coordination import leaf_batch
     with leaf_batch(store, package_id, 'catalog-maintenance') as allowed:
@@ -1540,11 +1592,15 @@ def _maintain_catalog(store, package_id, force=False):
         if (os.getenv('SJFX_LP_SEMANTIC_LEAF_MERGE', '1').lower() not in {'0', 'false', 'off'}
                 and duplicate_name_groups(store, package_id)):
             normalize_leaves(store, package_id)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('normalize_leaves deferred: %s', package_id)
     try:
         from services import large_package_semantic as semantic
         semantic.split_oversized(store, package_id)
+    except ProtectionError:
+        raise
     except Exception:
         # 修补 5：原来静默 pass，结构维护失败零日志，只能从"目录没变好"反推。
         LOGGER.exception('split_oversized deferred: %s', package_id)
@@ -1552,10 +1608,14 @@ def _maintain_catalog(store, package_id, force=False):
     # 不影响当前标签，也不改变任何命名结果。
     try:
         prune_history(store, package_id)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('prune_history deferred: %s', package_id)
     try:
         label_singletons(store, package_id)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('label_singletons deferred: %s', package_id)
     # B1：台账有界保留（只删不会再被读到的历史轮次；SJFX_LP_CATALOG_ROUND_KEEP=0 关闭）。
@@ -1565,6 +1625,7 @@ def _maintain_catalog(store, package_id, force=False):
     return True
 
 
+@package_lane
 def queue_groups(store, package_id):
     from services.large_package_catalog_coordination import leaf_batch
     with leaf_batch(store, package_id, 'catalog-queue') as allowed:
@@ -1628,6 +1689,7 @@ def _current_topic_publication(conn, package_id):
         return {'complete':False, 'valid_node_ids':[], 'validation_error':'主题依赖快照无效'}
 
 
+@package_lane
 def state(store, package_id, settle=False):
     """读轮次状态。**默认不写任何东西。**
 
@@ -1704,6 +1766,7 @@ def state(store, package_id, settle=False):
                 'seconds_remaining':max(0,round(result.get('deadline',0)-time.time()))}
 
 
+@package_lane
 def naming_work_pending(store, package_id):
     """这个包**此刻**是否还有需要命名轮次的活（纯读）。
 
@@ -1734,11 +1797,14 @@ def naming_work_pending(store, package_id):
             if latest['hierarchy_status'] in {'queued', 'running'}:
                 from services.large_package_catalog_hierarchy import needed
                 return bool(needed(c, package_id))
+        except ProtectionError:
+            raise
         except Exception:
             return False
     return False
 
 
+@package_lane
 def settle_round(store, package_id):
     """把轮次的有效状态**持久化**（唯一的写入点，由 Worker 调用）。
 
@@ -1747,11 +1813,14 @@ def settle_round(store, package_id):
     """
     try:
         return state(store, package_id, settle=True)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('settle_round failed: %s', package_id)
         return {}
 
 
+@package_lane
 def rebuild_catalog(store, package_id):
     """**显式**重建语义目录：解除冻结、重跑 k-means、重排命名任务。
 
@@ -1834,6 +1903,8 @@ def _sample_policy():
     """返回 (最少份数, 最多份数, 每份正文 token 上限, MMR λ)。"""
     try:
         from config import Config
+    except ProtectionError:
+        raise
     except Exception:
         Config = None
 
@@ -1855,6 +1926,7 @@ _BASELINE_CACHE = {}
 BASELINE_SAMPLE = 300
 
 
+@package_lane
 def package_baseline_coherence(store, package_id, dimension):
     """包内"典型相似度"基线：采样成员的向量到**包质心**的平均余弦。
 
@@ -1875,6 +1947,8 @@ def package_baseline_coherence(store, package_id, dimension):
                 return cached
             rows = c.execute('SELECT vector FROM large_catalog_members '
                              'WHERE package_id=? LIMIT ?', (package_id, BASELINE_SAMPLE)).fetchall()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('package baseline failed: %s', package_id)
         return None
@@ -1998,6 +2072,7 @@ def select_evidence(matrix, relevance, want, lam, min_gap=0.10):
     return selected
 
 
+@package_lane
 def representatives(store, package_id, group_id, limit=None):
     """为命名挑选代表文件：中心 + 边界 + 覆盖各子区域的 MMR 选样。
 
@@ -2052,6 +2127,8 @@ def representatives(store, package_id, group_id, limit=None):
     baseline = package_baseline_coherence(store, package_id, dimension)
     try:
         budget = int(settings()['input'])
+    except ProtectionError:
+        raise
     except Exception:
         budget = 0
     affordable = high
@@ -2199,6 +2276,7 @@ def bundle_key(package_id, group_id, revision, owner_id):
     return hashlib.sha256('\0'.join(parts).encode('utf-8')).hexdigest()
 
 
+@package_lane
 def _neighbor_context(store, package_id, group_id, anchor_bytes, model):
     """相邻组的名称（有界消歧线索）：每次现取，改名立刻反映，但不进缓存键。"""
     import numpy as np
@@ -2220,11 +2298,14 @@ def _neighbor_context(store, package_id, group_id, anchor_bytes, model):
                                   (package_id, other['id'])).fetchone()
                 if named:
                     neighbors.append(dict(named))
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('neighbor context failed: %s/%s', package_id, group_id)
     return neighbors
 
 
+@package_lane
 def held_out_members(store, package_id, group_id, used, want=4, max_tokens=200):
     """取**没有参与起草名称**的成员短片段，只供校验，绝不进模型 payload。
 
@@ -2323,10 +2404,13 @@ def _stage_probe(stage, seconds, **fields):
         rec = getattr(mod, 'stage_record', None) if mod is not None else None
         if rec is not None:
             rec(stage, seconds, **fields)
+    except ProtectionError:
+        raise
     except Exception:
         pass
 
 
+@package_lane
 def _bundle_core(store, package_id, group_id):
     # §4.1：组包是纯 CPU 段（选代表/画像/证据/token 裁剪），它与模型调用之间的空档
     # 正是"命名双缓冲"（§4.2）要消除的对象。先量它，再决定要不要做双缓冲。
@@ -2337,6 +2421,7 @@ def _bundle_core(store, package_id, group_id):
         _stage_probe('naming.bundle', time.monotonic() - _bt0, group=group_id[:18])
 
 
+@package_lane
 def _bundle_core_impl(store, package_id, group_id):
     from services import large_package_evidence as source_evidence
     from services.large_package_catalog_profile import group_profile, filter_meta, strip_templates
@@ -2380,6 +2465,8 @@ def _bundle_core_impl(store, package_id, group_id):
                 stripped=strip_templates(text,meta_block)
                 if len(stripped)>=20:
                     text=stripped
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception('evidence template strip skipped: %s/%s',package_id,group_id)
         if not text.strip():
@@ -2457,6 +2544,7 @@ def _bundle_core_impl(store, package_id, group_id):
             'tokens':token_count(_system+'\n'+user)+64}
 
 
+@package_lane
 def bundle(store, package_id, group_id):
     """证据包 = 按修订号缓存的**核心** + 每次现取的**邻组名**。
 
@@ -2913,6 +3001,7 @@ def validate(content, material):
             'review_reasons':list(dict.fromkeys(reasons))}
 
 
+@package_lane
 def reserve(store,package_id,round_id,group_id,tokens,group_scope=None):
     # A2：`label_group` 是写进台账 group_id 列的**短标签**；`group_scope` 存全量组列表。
     # 两者分开之后，按 group_id 的聚合不再被逗号串污染。
@@ -2978,6 +3067,8 @@ def output_budget_for(material):
     try:
         from services.large_package_catalog_schema import output_budget
         return output_budget(settings(), material)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('output_budget_for failed')
         return 0
@@ -2989,6 +3080,7 @@ _JACCARD_CACHE = {}
 _JACCARD_CACHE_LIMIT = 4096
 
 
+@package_lane
 def _member_paths(store, package_id, group_id):
     with closing(store._connect()) as c:
         return [str(r[0]) for r in c.execute(
@@ -3047,6 +3139,7 @@ def estimate_jaccard(left, right):
     return same / float(size)
 
 
+@package_lane
 def fingerprint_for_group(store, package_id, group_id, paths=None):
     """取（带缓存的）成员指纹。缓存键含成员数，成员一变就自然失效。"""
     if paths is None:
@@ -3062,6 +3155,7 @@ def fingerprint_for_group(store, package_id, group_id, paths=None):
     return value
 
 
+@package_lane
 def record_label_members(store, package_id, group_id, revision, paths=None):
     """发布一个模型名字之后，把当时的成员指纹写一行（方案 §6.1 第 1 条）。
 
@@ -3079,11 +3173,14 @@ def record_label_members(store, package_id, group_id, revision, paths=None):
             c.commit()
         _JACCARD_CACHE.pop((str(package_id), str(group_id), len(paths)), None)
         return blob
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('label member fingerprint write failed: %s/%s', package_id, group_id)
         return None
 
 
+@package_lane
 def record_rebuild_event(store, package_id, trigger, groups_touched=0):
     """记一次"成员表被谁改了"（方案 §6.1 第 2 条）。只测量，不阻断。"""
     try:
@@ -3092,10 +3189,13 @@ def record_rebuild_event(store, package_id, trigger, groups_touched=0):
                       '(package_id,trigger,groups_touched,at) VALUES(?,?,?,?)',
                       (str(package_id), str(trigger), int(groups_touched or 0), time.time()))
             c.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('rebuild event write failed: %s/%s', package_id, trigger)
 
 
+@package_lane
 def group_revision(store, package_id, group_id):
     with closing(store._connect()) as c:
         row = c.execute('SELECT content_revision FROM large_catalog_groups '
@@ -3133,6 +3233,7 @@ def _leaf_inherit_max_streak():
     return max(1, min(20, value))
 
 
+@package_lane
 def _inherit_streak(store, package_id, group_id):
     try:
         with closing(store._connect()) as c:
@@ -3140,10 +3241,13 @@ def _inherit_streak(store, package_id, group_id):
                             'WHERE package_id=? AND group_id=?',
                             (package_id, group_id)).fetchone()
         return int(row[0]) if row else 0
+    except ProtectionError:
+        raise
     except Exception:
         return 0
 
 
+@package_lane
 def _resolve_revisions(store, package_id, rows):
     """把这一批组的真实修订号补上，并**完整保留**判定要用的 model/digest/locked。
 
@@ -3173,6 +3277,7 @@ def _resolve_revisions(store, package_id, rows):
     return out
 
 
+@package_lane
 def inherit_leaf_names(store, package_id):
     """把"内容没怎么变、只是修订号变了"的叶组**直接沿用原名**，不排命名任务。
 
@@ -3189,6 +3294,8 @@ def inherit_leaf_names(store, package_id):
                 "  ON g.package_id=l.package_id AND g.id=l.group_id "
                 "WHERE l.package_id=? AND l.revision!=g.content_revision AND l.locked=0",
                 (package_id,)) if not _review_pending(r['group_result'])]
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('leaf name inheritance scan failed: %s', package_id)
         return 0, 0
@@ -3214,6 +3321,8 @@ def inherit_leaf_names(store, package_id):
                 old = c.execute('SELECT member_count,minhash FROM lp_catalog_label_members '
                                 'WHERE package_id=? AND group_id=?',
                                 (package_id, gid)).fetchone()
+        except ProtectionError:
+            raise
         except Exception:
             old = None
         if not old or not old['minhash']:
@@ -3242,6 +3351,7 @@ def inherit_leaf_names(store, package_id):
     return len(rows), inherited
 
 
+@package_lane
 def _apply_inheritance(store, package_id, group_id, new_revision, old_revision,
                        similarity, streak):
     """只改标签行与继承计数：**不排命名任务**，也不动成员。
@@ -3295,6 +3405,8 @@ def _apply_inheritance(store, package_id, group_id, new_revision, old_revision,
             c.commit()
         store._catalog_cache.pop(package_id, None)
         return True
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('leaf name inheritance failed: %s/%s', package_id, group_id)
         return False
@@ -3319,6 +3431,7 @@ def same_package_lanes_enabled():
         return False
 
 
+@package_lane
 def lease_renewal(store, package_id, group_ids, stop=None, interval=30.0):
     """`background_generation` 期间每 `interval` 秒把**本次领取**的租约往后推一次。
 
@@ -3368,6 +3481,8 @@ def lease_renewal(store, package_id, group_ids, stop=None, interval=30.0):
                 try:
                     if cancelled():
                         return
+                except ProtectionError:
+                    raise
                 except Exception:
                     # 判据本身出错不该让续期线程静默死掉：按"继续续期"处理更安全，
                     # 因为续期多做一次只是写一列，漏做则会让任务被另一条车道抢回。
@@ -3379,6 +3494,8 @@ def lease_renewal(store, package_id, group_ids, stop=None, interval=30.0):
                             "AND status='running' AND group_id IN (%s)" % placeholders,
                             tuple([time.time(), package_id] + wanted))
                         c.commit()
+                except ProtectionError:
+                    raise
                 except Exception:
                     LOGGER.exception('naming lease renewal failed: %s', package_id)
 
@@ -3435,6 +3552,7 @@ def _looks_like_title(text):
     return not re.fullmatch(r'[A-Za-z0-9._\-]+', text)
 
 
+@package_lane
 def _fallback_name(store, package_id, group_id, member_count=0):
     """兜底名的取法：**组内代表文件的标题**（抽取式，零模型调用）。
 
@@ -3461,6 +3579,8 @@ def _fallback_name(store, package_id, group_id, member_count=0):
                 paths.append(path)
             if isinstance(value, dict):
                 materials.append(value)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('fallback naming: representatives failed %s/%s', package_id, group_id)
     with closing(store._connect()) as c:
@@ -3502,6 +3622,7 @@ def _clean_title(text):
     return text.strip(' #*：:_-—·')[:40]
 
 
+@package_lane
 def fallback_name_exhausted(store, package_id, cancelled=lambda: False, limit=64):
     """给**重试耗尽**的组写一个抽取式兜底名，保证目录覆盖不留窟窿。
 
@@ -3524,6 +3645,8 @@ def fallback_name_exhausted(store, package_id, cancelled=lambda: False, limit=64
         if not getattr(_Cfg, 'LP_NAME_FALLBACK', True):
             return 0
         max_attempts = max(1, int(getattr(_Cfg, 'LP_NAME_MAX_ATTEMPTS', 5) or 5))
+    except ProtectionError:
+        raise
     except Exception:
         max_attempts = 5
     if cancelled():
@@ -3552,6 +3675,8 @@ def fallback_name_exhausted(store, package_id, cancelled=lambda: False, limit=64
         gid = row['group_id']
         try:
             name, description = _fallback_name(store, package_id, gid, row['member_count'])
+        except ProtectionError:
+            raise
         except Exception as exc:
             LOGGER.info('fallback naming skipped package=%s group=%s: %s', package_id, gid, exc)
             continue
@@ -3587,11 +3712,14 @@ def fallback_name_exhausted(store, package_id, cancelled=lambda: False, limit=64
             done += 1
             LOGGER.info('fallback naming package=%s group=%s name=%s (attempts=%d)',
                         package_id, gid, name[:30], max_attempts)
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('fallback naming failed: %s/%s', package_id, gid)
     return done
 
 
+@package_lane
 def release_job(store, package_id, group_id, revision, attempts=0, error='', category=None,
                 expect_status='running'):
     """统一的失败/释放收口，返回新的任务状态。**两条命名路径都走这里。**
@@ -3633,6 +3761,8 @@ def release_job(store, package_id, group_id, revision, attempts=0, error='', cat
         try:
             from config import Config as _Cfg
             backoff = max(30.0, float(getattr(_Cfg, 'LP_NAME_INFRA_BACKOFF_SECONDS', 120.0) or 120.0))
+        except ProtectionError:
+            raise
         except Exception:
             backoff = 120.0
         status, delta, next_at = 'deferred', 0, now + backoff
@@ -3655,6 +3785,7 @@ def release_job(store, package_id, group_id, revision, attempts=0, error='', cat
     return status
 
 
+@package_lane
 def cache_miss_reason(store, package_id, group_id, digest, model):
     """缓存没命中时，说明**为什么**要重新调用模型（提速方案 v2 §P4-1，只测量）。
 
@@ -3696,6 +3827,8 @@ def cache_miss_reason(store, package_id, group_id, digest, model):
         else:
             out['reason'] = 'cache_key_absent'
         return out
+    except ProtectionError:
+        raise
     except Exception:
         return {'reason': 'unknown'}
 
@@ -3738,6 +3871,8 @@ def _leaf_split_enabled():
         if limit <= 0:
             limit = max(50, 2 * int(getattr(Config, 'LP_KM_TARGET_LEAVES', 120) or 120))
         return limit
+    except ProtectionError:
+        raise
     except Exception:
         return 0
 
@@ -3757,6 +3892,8 @@ def _split_creates_named_group():
     try:
         from config import Config
         return bool(getattr(Config, 'LP_LEAF_SPLIT_NAMED', False))
+    except ProtectionError:
+        raise
     except Exception:
         return False
 
@@ -3770,6 +3907,8 @@ def _subtopic_split_enabled():
     try:
         from config import Config
         return bool(getattr(Config, 'LP_LEAF_SPLIT_SUBTOPICS', True))
+    except ProtectionError:
+        raise
     except Exception:
         return True
 
@@ -3850,6 +3989,7 @@ def _subgroup_geometry(conn, package_id, paths, parent_center):
     return check
 
 
+@package_lane
 def split_off_outliers(store, package_id, group_id, material, result):
     """把模型指出的"明显不属于本组"的少数成员摘出去，放进本包的"待归并"桶。
 
@@ -3994,6 +4134,8 @@ def split_off_outliers(store, package_id, group_id, material, result):
                                      'WHERE package_id=? AND id=?', (package_id, gid)).fetchone()
                 try:
                     payload = json.loads(existing[0]) if existing and existing[0] else {}
+                except ProtectionError:
+                    raise
                 except Exception:
                     payload = {}
                 if not isinstance(payload, dict):
@@ -4059,6 +4201,8 @@ def split_off_outliers(store, package_id, group_id, material, result):
                       'updated_at=excluded.updated_at',
                       (package_id, used + 1, now))
             c.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('leaf split failed: %s/%s', package_id, group_id)
         return False
@@ -4097,6 +4241,7 @@ def _subtopic_split_allowed(total, sizes):
     return True
 
 
+@package_lane
 def split_into_subtopics(store, package_id, group_id, material, result):
     """把 purity=mixed 的组按 subtopics 拆成真实分组，各自带上模型给的名字。
 
@@ -4253,6 +4398,8 @@ def split_into_subtopics(store, package_id, group_id, material, result):
                       'ON CONFLICT(package_id) DO UPDATE SET splits=excluded.splits,'
                       'updated_at=excluded.updated_at', (package_id, used + 1, now))
             c.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('subtopic split failed: %s/%s', package_id, group_id)
         return False
@@ -4274,6 +4421,7 @@ def _subtopic_name(value):
     return text
 
 
+@package_lane
 def apply_topic_split(store, package_id, group_id, material, result):
     """拆分的唯一入口：先看"是不是跨领域拼凑"，否则再看"有没有少数异类"。
 
@@ -4287,11 +4435,14 @@ def apply_topic_split(store, package_id, group_id, material, result):
             if split_into_subtopics(store, package_id, group_id, material, result):
                 return True
         return split_off_outliers(store, package_id, group_id, material, result)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('topic split dispatch failed: %s/%s', package_id, group_id)
         return False
 
 
+@package_lane
 def apply(store,package_id,group_id,material,result,model):
     # **过期判定的基准必须在"摘除异类"之前取。**
     #
@@ -4306,6 +4457,8 @@ def apply(store,package_id,group_id,material,result,model):
                                  'WHERE package_id=? AND id=?',
                                  (package_id, group_id)).fetchone()
         revision_at_entry = int(_row[0]) if _row else None
+    except ProtectionError:
+        raise
     except Exception:
         revision_at_entry = None
     # 拆分收口点（批量与单组两条路径共用）：
@@ -4397,6 +4550,8 @@ def apply(store,package_id,group_id,material,result,model):
             # 不清零的话，一个组被沿用满 3 次后即使重新命名过，也永远不能再沿用。
             c.execute('DELETE FROM lp_catalog_label_inherit WHERE package_id=? AND group_id=?',
                       (package_id, group_id))
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('fingerprint write failed: %s/%s', package_id, group_id)
         # k 自适应的反馈信号：把模型对**这一组**的纯度判定落进组的 result JSON。
@@ -4414,6 +4569,8 @@ def apply(store,package_id,group_id,material,result,model):
                 meta['naming_status'] = str(result['naming_status'])
             c.execute('UPDATE large_catalog_groups SET result=? WHERE package_id=? AND id=?',
                       (json.dumps(meta, ensure_ascii=False), package_id, group_id))
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('purity feedback write failed: %s/%s', package_id, group_id)
         # **这里刻意不把标签投影进 `files.local_summary`。**
@@ -4462,6 +4619,8 @@ def apply(store,package_id,group_id,material,result,model):
             return True
         from services.large_package_catalog_refine import request as request_refine
         request_refine(store,package_id,group_id,material,result)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('optional bounded refinement deferred: %s/%s',package_id,group_id)
     return True
@@ -4479,6 +4638,8 @@ def naming_concurrency():
     try:
         from config import Config
         return max(1, min(4, int(getattr(Config, 'LP_NAMING_CONCURRENCY', 2) or 2)))
+    except ProtectionError:
+        raise
     except Exception:
         return 2
 
@@ -4524,6 +4685,8 @@ def _is_infrastructure_error(exc):
     """
     try:
         from services.ollama import LocalModelError
+    except ProtectionError:
+        raise
     except Exception:                                   # 依赖缺失时退化为文本判断
         LocalModelError = None
     if LocalModelError is not None and isinstance(exc, LocalModelError):
@@ -4553,10 +4716,13 @@ def refund_call(store, call_id):
                           "WHERE package_id=? AND id=?", (row['package_id'], row['round_id']))
                 c.execute("UPDATE lp_catalog_calls SET status='refunded' WHERE id=?", (call_id,))
             c.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('refund_call failed: %s', call_id)
 
 
+@package_lane
 def process_one(store,package_id,cancelled=lambda:False,model_client=None,repair_only=False):
     from services.large_package_catalog_coordination import leaf_batch
     with leaf_batch(store, package_id, 'naming-single', cancelled) as allowed:
@@ -4691,7 +4857,7 @@ def _process_one(store,package_id,cancelled=lambda:False,model_client=None,repai
                 if getattr(model_client,'supports_json_response_format',False):
                     from services.large_package_catalog_schema import response as schema_response
                     kwargs['response_format']=schema_response(material)
-                response=model_client.chat(material['system'],material['user'],**kwargs)
+                response=guarded_model_call(model_client,"chat",material['system'],material['user'],**kwargs)
             if response.get('finish_reason')=='length':raise ValueError('命名输出被截断')
             result=validated(response.get('content',''),material)
         if not stop() and published(material,result,model):
@@ -4700,6 +4866,8 @@ def _process_one(store,package_id,cancelled=lambda:False,model_client=None,repai
             status='stale'
             release_job(store,package_id,gid,revision,attempts=job['attempts'],
                         error='结果作废（命名暂停或修订已变）',category=FAILURE_STALE)
+    except ProtectionError:
+        raise
     except Exception as exc:
         status='failed'
         _category = classify_failure(exc)
@@ -4730,6 +4898,7 @@ def _process_one(store,package_id,cancelled=lambda:False,model_client=None,repai
     return True
 
 
+@package_lane
 def _leaf_centroids(store, package_id, leaves):
     # UNWIRED（修补 12 标记）：无调用者。早期 merge_topics 自研聚类的遗留，
     # 现由 services/large_package_catalog_merge.py 与 large_package_catalog_tree 承担。
@@ -4800,6 +4969,7 @@ def _cluster_vectors(vectors, k, iters=30, seed=11):
     return [int(x) for x in lab]
 
 
+@package_lane
 def merge_topics(store, package_id, round_state, cancelled=lambda: False, model_client=None):
     from config import Config
     if not getattr(Config,'LP_TOPIC_MERGE',False):return False
@@ -4812,6 +4982,7 @@ def merge_topics(store, package_id, round_state, cancelled=lambda: False, model_
 
 
 
+@package_lane
 def rename_node(store,package_id,group_id,name,description='',restore_version=None):
     name=re.sub(r'\s+',' ',str(name or '')).strip()
     with store._lock,closing(store._connect()) as c:

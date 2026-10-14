@@ -47,6 +47,23 @@ def binding_row(store, bid):
     return next(b for b in store.list_rows('bindings', 'alice') if b['id'] == bid)
 
 
+def enable_auto_quarantine(store):
+    """矩阵 A05：自动处置必须由管理员策略显式启用，观察模式默认不排队。"""
+    from sjfx_protection.policy import write_policy
+    write_policy(store.directory, 'admin', True,
+                 {'enabled': True,
+                  'operation_policy': {'observation_only': False, 'automatic_quarantine': True}},
+                 '测试：启用自动隔离')
+
+
+def quarantine_receipt(store, bid, aid):
+    """矩阵 E07/E09：完成回执必须携带与冻结目标一致的真实实例。"""
+    row = binding_row(store, bid)
+    parent, _, name = row['local_path'].replace('\\', '/').rpartition('/')
+    return {'action_id': aid, 'local_path': parent + '/.sjfx-quarantine/' + name,
+            'local_identity': row['local_identity'], 'sha256': row['sha256']}
+
+
 @pytest.mark.parametrize('path', ['relative.txt', 'C:relative', '../secret', '/a/../b', 'C:/x/../b', 'C:/file:stream', '//./C:/file', '//?/C:/file', '/tmp/bad' + chr(0), ''])
 def test_invalid_local_paths(path):
     with pytest.raises(ProtectionError):
@@ -103,6 +120,7 @@ def test_older_event_cannot_rewind_binding(scenario):
 
 def test_dangerous_identical_copy_is_queued(scenario):
     store, device, _, _, file, record, bid = scenario
+    enable_auto_quarantine(store)
     with store.db(True) as db:
         db.execute("UPDATE files SET risk='dangerous' WHERE id=?", (file['id'],))
     store.bind(device, [record])
@@ -127,8 +145,10 @@ def test_changed_file_invalidates_pending_action(scenario):
 def test_known_dangerous_file_cannot_be_restored(scenario):
     store, device, _, _, file, _, bid = scenario
     aid = store.command('alice', bid, 'quarantine', 'test')
-    store.action_result(device, aid, {'status': 'completed'})
-    assert binding_row(store, bid)['state'] == 'protected'
+    # 矩阵 E07：完成回执必须带真实实例；状态按动作分类，不再是统一 protected。
+    store.action_result(device, aid,
+                        {'status': 'completed', 'actual': quarantine_receipt(store, bid, aid)})
+    assert binding_row(store, bid)['state'] == 'quarantined'
     with store.db(True) as db:
         db.execute("UPDATE files SET risk='dangerous' WHERE id=?", (file['id'],))
     with pytest.raises(ProtectionError, match='危险'):
@@ -140,9 +160,15 @@ def test_safe_action_restore_and_idempotence(scenario):
     aid = store.command('alice', bid, 'deny_read', 'test')
     assert aid == store.command('alice', bid, 'deny_read', 'test repeated')
     store.action_result(device, aid, {'status': 'completed'})
+    # 矩阵 E07：读锁按动作分类记录。
+    assert binding_row(store, bid)['state'] == 'read_locked'
     rid = store.command('alice', bid, 'restore', 'undo', aid)
-    store.action_result(device, rid, {'status': 'completed'})
-    assert binding_row(store, bid)['state'] == 'watching'
+    row = binding_row(store, bid)
+    store.action_result(device, rid, {'status': 'completed', 'actual': {
+        'action_id': rid, 'local_path': row['local_path'],
+        'local_identity': row['local_identity'], 'sha256': row['sha256']}})
+    # 矩阵 E09：恢复后必须重新核验，不能直接当作 watching。
+    assert binding_row(store, bid)['state'] == 'unverified'
     assert store.verify_chain()['ok']
 
 
@@ -231,7 +257,7 @@ def test_credential_harvesting_html_passively_detected(tmp_path):
     path.write_text('<form action="https://example.invalid/collect"><input type=password></form>')
     result = inspect_file(path, clam='missing-test-scanner')
     assert result['risk'] == 'dangerous'
-    assert 'credential_form_attachment' in {f['rule'] for f in result['findings']}
+    assert 'credential_form' in {f['rule'] for f in result['findings']}
 
 
 def test_html_mail_attachment_checked(tmp_path):
@@ -272,7 +298,8 @@ def test_unknown_charset_preview_and_scan_fail_safely(tmp_path):
     path = tmp_path / 'mail.eml'
     path.write_bytes(bytes([10]).join([b'Subject: test', b'Content-Type: text/plain; charset=no-such-codec', b'', b'hello']))
     assert 'hello' in safe_mail_preview(path)['text']
-    assert inspect_file(path, clam='missing-test-scanner')['risk'] == 'unchecked'
+    # 矩阵 C05/C01：必要引擎缺失记 incomplete，不能当作普通未检查状态。
+    assert inspect_file(path, clam='missing-test-scanner')['risk'] == 'incomplete'
 
 
 def test_api_trace_csrf_and_block_audit(tmp_path):
@@ -283,8 +310,9 @@ def test_api_trace_csrf_and_block_audit(tmp_path):
         def business():
             return {'must_not_run': True}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test', cookies={'sjfx_session': 'valid'}) as client:
-            assert (await client.get('/api/protected-file')).status_code == 403
-            assert any(e['action'] == 'system.blocked' for e in p.store.list_rows('events', 'alice'))
+            # 矩阵 A02/A06/D01：关闭保护时原业务直通；全局按路由拦截已由按数据包准入取代。
+            assert (await client.get('/api/protected-file')).status_code == 200
+            assert not any(e['action'] == 'system.blocked' for e in p.store.list_rows('events', 'alice'))
             assert (await client.get('/protection/api/trace?file_id=unknown')).status_code == 404
             response = await client.post('/protection/api/actions', json={}, headers={'X-SJFX-Protection': '1', 'Origin': 'https://evil.invalid'})
             assert response.status_code == 403
@@ -300,7 +328,12 @@ def test_audit_guard_schedules_verification_without_blocking(scenario):
     token = current.set({'owner': 'alice', 'device': '', 'enforced': False})
     try:
         with patch('sjfx_protection.integration.subprocess.Popen') as launch:
+            # 矩阵 A02/E04：总开关关闭时不启动核验进程，也不阻塞原业务。
             p.guard_root(str(root))
+            launch.assert_not_called()
+            # 开启后核验异步进行（不等结果即返回），矩阵 E04/E05。
+            enable_auto_quarantine(store)
+            p.schedule_verification(cid)
             launch.assert_called_once()
             assert '--verify' in launch.call_args[0][0]
     finally:
@@ -345,11 +378,13 @@ def test_health_string_is_not_true(scenario):
 
 def test_file_reappearance_requeues_dangerous_quarantine(scenario):
     store, device, _, _, file, record, bid = scenario
+    enable_auto_quarantine(store)
     with store.db(True) as db:
         db.execute("UPDATE files SET risk='dangerous' WHERE id=?", (file['id'],))
     store.bind(device, [record])
     aid = store.pending_actions(device['id'])[0]['id']
-    store.action_result(device, aid, {'status': 'completed'})
+    store.action_result(device, aid,
+                        {'status': 'completed', 'actual': quarantine_receipt(store, bid, aid)})
     store.ingest(device, [event(bid, 'file.reappeared', sha256=file['sha256'], identity='v:new')])
     assert len(store.pending_actions(device['id'])) == 1
     assert store.pending_actions(device['id'])[0]['id'] != aid
@@ -361,6 +396,9 @@ def test_background_observer_detects_changes_without_requests(scenario):
     with store.db(True) as db:
         db.execute('DELETE FROM settings WHERE key=?', ('verified:'+cid,))
     (root/'source.txt').write_text('different', encoding='utf-8')
+    # 矩阵 E04/A02：关闭保护时不启动服务器观察。
+    assert observe_once(store, interval=30) == 0
+    enable_auto_quarantine(store)
     assert observe_once(store, interval=30) == 1
     assert store.collection('alice', cid)['state'] == 'failed'
     assert observe_once(store, interval=30) == 0
@@ -374,11 +412,15 @@ def test_distinct_file_reads_not_collapsed_and_status_capability(tmp_path):
         def business():
             return {'ok': True}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test', cookies={'sjfx_session': 'valid'}) as client:
+            # 矩阵 A02：关闭保护时原业务直通，且不写入保护事件、不初始化保护库。
             assert (await client.get('/api/items?path=a')).status_code == 200
             assert (await client.get('/api/items?path=b')).status_code == 200
-            assert len([e for e in p.store.list_rows('events', 'alice') if e['action'] == 'system.request']) == 2
+            assert [e for e in p.store.list_rows('events', 'alice') if e['action'] == 'system.request'] == []
             status = (await client.get('/protection/api/status')).json()
-            assert status['protection_version'] == '2.1'
+            # 矩阵 E14：状态暴露真实开关与能力（管理员视角）。
+            assert status['protection_version'] == '4.0-local-candidate'
+            assert status['access_version'] == 1
+            assert status['enabled'] is False
             assert status['capabilities']['file_trace'] is True
     asyncio.run(run())
 
@@ -402,5 +444,7 @@ def test_protection_event_does_not_fake_completed_receipt(scenario):
     store.ingest(device, [event(bid, 'file.protected')])
     assert binding_row(store, bid)['state'] == 'watching'
     assert store.pending_actions(device['id'])[0]['id'] == aid
-    store.action_result(device, aid, {'status': 'completed'})
-    assert binding_row(store, bid)['state'] == 'protected'
+    # 矩阵 E07：只有带真实实例的 action_result 才算成功，观察事件不能伪造完成。
+    store.action_result(device, aid,
+                        {'status': 'completed', 'actual': quarantine_receipt(store, bid, aid)})
+    assert binding_row(store, bid)['state'] == 'quarantined'

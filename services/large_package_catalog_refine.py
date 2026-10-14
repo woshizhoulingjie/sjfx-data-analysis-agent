@@ -1,4 +1,6 @@
 """Small durable budgets for difficult catalog evidence; never full-document enrichment."""
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact, preview_context_kwargs
+from sjfx_protection.store import ProtectionError
 import hashlib
 import json
 import time
@@ -12,6 +14,7 @@ def source_key(row):
          row.get('deep_summary'),row.get('deep_status')],ensure_ascii=False,sort_keys=True).encode()).hexdigest()
 
 
+@package_lane
 def request(store,package_id,group_id,material,result):
     if not result.get('needs_review') and result.get('purity')=='same':return 0
     profile=material.get('profile') or {}
@@ -63,6 +66,7 @@ def process_one(worker):
         return _process_claimed(worker, package_id, path, token)
 
 
+@package_lane
 def _process_claimed(worker, package_id, path, token):
     store=worker.store
     worker._resource_package_id=package_id
@@ -74,7 +78,7 @@ def _process_claimed(worker, package_id, path, token):
         if not row or not package or not job or source_key(row)!=job[0]:
             outcome='stale';return True
         from services.large_package_preview_runner import PreviewCancelled
-        summary,_=worker.preview_runner.run(package['root_path'],row,refine=True,cancel_check=lambda:worker._interrupted(package_id))
+        summary,_=worker.preview_runner.run(package['root_path'],row,refine=True,cancel_check=lambda:worker._interrupted(package_id),**preview_context_kwargs())
         if summary.get('status')=='failed' or not summary.get('sample'):
             outcome='no_gain';return True
         fields=worker._preview_fields(summary,row,True)
@@ -89,6 +93,8 @@ def _process_claimed(worker, package_id, path, token):
                 c.execute("UPDATE lp_catalog_refine SET status='completed' WHERE package_id=? AND path=?",(package_id,path))
                 c.commit();outcome='completed';finished=True
             else:c.rollback();outcome='stale'
+    except ProtectionError:
+        raise
     except Exception as exc:
         if resource_code(exc):
             # Keep the existing bounded reservation; only refund this lease

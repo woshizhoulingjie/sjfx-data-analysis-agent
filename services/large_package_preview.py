@@ -826,6 +826,11 @@ def _preview_path(root, item, refine=False, logical_source=None, *, pdf_engine=N
 
 
 def preview_file(root, item, refine=False, *, pdf_engine=None, seconds_remaining=None):
+    from sjfx_protection.business import enabled, file_execution
+    if enabled() and item.get('source_kind') != 'archive_member':
+        with file_execution(Path(root) / item['path'], operation='preview') as snapshot:
+            protected_item = {**item, 'path': snapshot.name, 'modified_at_ns': snapshot.stat().st_mtime_ns}
+            return _preview_path(snapshot.parent, protected_item, refine, pdf_engine=pdf_engine, seconds_remaining=seconds_remaining)
     if item.get('source_kind') != 'archive_member' or item.get('sensitive'):
         return _preview_path(root, item, refine, pdf_engine=pdf_engine, seconds_remaining=seconds_remaining)
     from services.large_archive_members import member_node, member_snapshot
@@ -841,7 +846,7 @@ def preview_file(root, item, refine=False, *, pdf_engine=None, seconds_remaining
                 'notice': warning, 'complete': False, 'source_hash_kind': 'pending',
                 'portrait': info, 'coverage': {'complete': False, 'preview_only': True,
                                              'member_snapshot_limit': limit}}, None
-    with member_snapshot(root, item, prefix_bytes=limit) as path:
+    with member_snapshot(root, item, prefix_bytes=None if enabled() else limit) as path:
         st = path.stat()
         physical = {**item, 'path': path.name, 'source_kind': 'physical_file',
                     'size': st.st_size, 'modified_at_ns': st.st_mtime_ns}

@@ -1,6 +1,8 @@
 """Large-package research briefs and exports; no ordinary storage or model calls."""
 from __future__ import annotations
 
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact
+from sjfx_protection.store import ProtectionError
 import hashlib
 import json
 import math
@@ -58,10 +60,12 @@ def _atomic(path, data):
     try:
         temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         os.replace(temporary, path)
+        record_report_artifact(path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
+@package_lane
 def report_directory(store, package_id):
     if not re.fullmatch(r"lp-[A-Za-z0-9_-]+", package_id):
         raise ValueError("大数据包编号无效")
@@ -245,6 +249,7 @@ def _pick_examples(pool, limit):
     return chosen
 
 
+@package_lane
 def build_report(store, item, model_directions=True):
     """One streaming database pass; retain only bounded representative excerpts.
 
@@ -267,6 +272,8 @@ def build_report(store, item, model_directions=True):
         model_dirs, direction_reason = _model_directions(
             store, item["id"], pending["groups"], pending["coverage"],
             pending["total_bytes"], int(pending["coverage"].get("inventory_files") or 0))
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception("model directions failed: %s", item["id"])
         model_dirs, direction_reason = [], "exception"
@@ -307,6 +314,8 @@ def _direction_fields(model_dirs, direction_reason, template, brief_ready, categ
         direction_source = "template"
     try:
         _max_dirs = max(1, int(_Cfg.LP_DIRECTION_MAX))
+    except ProtectionError:
+        raise
     except Exception:
         _max_dirs = 3
     candidates = list(candidates)[:_max_dirs]
@@ -328,6 +337,7 @@ def _direction_fields(model_dirs, direction_reason, template, brief_ready, categ
     }
 
 
+@package_lane
 def _build_report_locked(store, item, cache_fix=False, want_model=True):
     """build_report 的主体。返回 ``(report, pending)``；``pending`` 非空表示
     方向模型调用被推迟到锁外（仅 cache_fix 且 want_model 时）。"""
@@ -345,12 +355,16 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
         try:
             branch_rev = list(conn.execute("SELECT COUNT(*),MAX(updated) FROM lp_catalog_branches "
                                            "WHERE package_id=?", (package_id,)).fetchone())
+        except ProtectionError:
+            raise
         except Exception:
             branch_rev = [0, 0]
         try:
             member_rev = list(conn.execute("SELECT COUNT(*),COALESCE(SUM(content_revision),0) "
                                            "FROM large_catalog_groups WHERE package_id=?",
                                            (package_id,)).fetchone())
+        except ProtectionError:
+            raise
         except Exception:
             member_rev = [0, 0]
         # P1：updated_at 随进度/消息每次写入都会变，页面轮询因此让缓存全部失效；
@@ -363,7 +377,7 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
             branch_rev, member_rev, catalog_revision]).encode()).hexdigest()[:20]
         cached = directory / "overview.json"
         try:
-            report = json.loads(cached.read_text(encoding="utf-8"))
+            report = json.loads(require_report_artifact(cached).read_text(encoding="utf-8"))
             if report.get("revision") == cache_key and (
                     not cache_fix or not want_model
                     or report.get("model_directions_attempted")
@@ -391,6 +405,8 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
                         topic_of_group[str(gid)] = prow[1]
                 except (ValueError, TypeError):
                     continue
+        except ProtectionError:
+            raise
         except Exception:
             topic_of_group = {}
         skeleton = "topic" if topic_of_group else "category"
@@ -527,6 +543,8 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
                 model_dirs, direction_reason = _model_directions(
                     store, package_id, groups, coverage, total_bytes,
                     int(coverage.get("inventory_files") or 0))
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception("model directions failed: %s", package_id)
                 model_dirs, direction_reason = [], "exception"
@@ -539,6 +557,8 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
             direction_source = "template"
         try:
             _max_dirs = max(1, int(_Cfg.LP_DIRECTION_MAX))
+        except ProtectionError:
+            raise
         except Exception:
             _max_dirs = 3
         candidates = list(candidates)[:_max_dirs]
@@ -841,11 +861,14 @@ def _direction_client():
         from services.model_backend import create_model_client
         return create_model_client(Config, timeout=Config.LP_DIRECTION_TIMEOUT,
                                    max_concurrency=1)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception("direction client unavailable")
     return None
 
 
+@package_lane
 def _direction_budget_ok(store, package_id):
     """每包每日的独立预算硬顶（与目录轮次预算分开，但共用 lp_catalog_calls 计量）。"""
     from config import Config
@@ -854,11 +877,14 @@ def _direction_budget_ok(store, package_id):
             n = conn.execute(
                 "SELECT COUNT(*) FROM lp_catalog_calls WHERE package_id=? AND round_id='direction' "
                 "AND started>?", (package_id, time.time() - 86400)).fetchone()[0]
+    except ProtectionError:
+        raise
     except Exception:
         return True
     return int(n or 0) < int(Config.LP_DIRECTION_REQUESTS_PER_DAY)
 
 
+@package_lane
 def _model_directions(store, package_id, groups, coverage, total_bytes, total_files):
     """基于证据让模型提出 1 主 + 2 次研究方向；失败一律回落模板，绝不影响主流程。"""
     from config import Config
@@ -882,7 +908,7 @@ def _model_directions(store, package_id, groups, coverage, total_bytes, total_fi
         kwargs = {"temperature": 0.2, "max_tokens": Config.LP_DIRECTION_MAX_TOKENS, "retries": 0}
         if getattr(client, "supports_json_response_format", False):
             kwargs["response_format"] = {"type": "json_object"}
-        resp = client.chat(system, user, **kwargs)
+        resp = guarded_model_call(client,"chat",system, user, **kwargs)
         usage_ = resp.get("usage") or {}
         n_tok = int(usage_.get("total_tokens") or 0)
         return resp, n_tok
@@ -903,6 +929,8 @@ def _model_directions(store, package_id, groups, coverage, total_bytes, total_fi
             response, n_tok = _call(payload_items, strict)
             actual += n_tok
             _record_direction_call(store, call_id, package_id, n_tok, n_tok, started, "completed")
+        except ProtectionError:
+            raise
         except Exception as exc:
             LOGGER.warning("direction call failed package=%s strict=%s: %s",
                            package_id, strict, str(exc)[:200])
@@ -911,6 +939,8 @@ def _model_directions(store, package_id, groups, coverage, total_bytes, total_fi
         content = response.get("content", "")
         try:
             cand = extract_json_value(content)
+        except ProtectionError:
+            raise
         except Exception:
             cand = _loose_json(content)
         if isinstance(cand, dict) and isinstance(cand.get("directions"), list):
@@ -990,6 +1020,7 @@ def _model_directions(store, package_id, groups, coverage, total_bytes, total_fi
     return out, ("ok" if out else "rejected")
 
 
+@package_lane
 def _record_direction_call(store, call_id, package_id, reserved, actual, started, status):
     """把研究方向调用记进**共用**的 lp_catalog_calls 计量表（round_id='direction'）。"""
     try:
@@ -999,6 +1030,8 @@ def _record_direction_call(store, call_id, package_id, reserved, actual, started
                          (call_id, package_id, "direction", "research-direction",
                           int(reserved), int(actual), started, time.time() - started, status))
             conn.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception("record direction call failed: %s", package_id)
 
@@ -1042,6 +1075,7 @@ def _holistic_placeholder(name):
         token in name for token in _HOLISTIC_UNKNOWN_LEAVES)
 
 
+@package_lane
 def _catalog_descriptions(store, package_id):
     """叶组名 → 最长描述（只读）。目录表缺失时返回空，不影响主流程。"""
     output = {}
@@ -1053,6 +1087,8 @@ def _catalog_descriptions(store, package_id):
                 description = _text(description, 200)
                 if name and len(description) > len(output.get(name, "")):
                     output[name] = description
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.debug("catalog descriptions unavailable: %s", package_id, exc_info=True)
     return output
@@ -1264,6 +1300,7 @@ def _holistic_directions_from(data, groups, total_files, min_share=0.3, limit=3)
     return output, "ok"
 
 
+@package_lane
 def _holistic_model_directions(store, package_id, groups, coverage, total_files, client=None):
     """一次模型调用读完整目录；格式失败时用压缩一半的目录重试一次。"""
     from config import Config
@@ -1293,12 +1330,14 @@ def _holistic_model_directions(store, package_id, groups, coverage, total_files,
         started = time.time()
         try:
             try:
-                response = client.chat(system, user, **kwargs)
+                response = guarded_model_call(client,"chat",system, user, **kwargs)
             except TypeError:
                 kwargs.pop("timeout", None)
-                response = client.chat(system, user, **kwargs)
+                response = guarded_model_call(client,"chat",system, user, **kwargs)
             used = int((response.get("usage") or {}).get("total_tokens") or 0)
             _record_direction_call(store, call_id, package_id, used, used, started, "completed")
+        except ProtectionError:
+            raise
         except Exception as exc:
             LOGGER.warning("holistic direction call failed package=%s strict=%s: %s", package_id, strict, str(exc)[:200])
             _record_direction_call(store, call_id, package_id, 0, 0, started, "failed")
@@ -1306,6 +1345,8 @@ def _holistic_model_directions(store, package_id, groups, coverage, total_files,
         content = response.get("content", "")
         try:
             candidate = extract_json_value(content)
+        except ProtectionError:
+            raise
         except Exception:
             candidate = _loose_json(content)
         if isinstance(candidate, dict) and isinstance(candidate.get("directions"), list):
@@ -1331,6 +1372,7 @@ def _dedup_retry_wanted(rejection):
     return bool(violations) and all(v.startswith("INV-3") for v in violations)
 
 
+@package_lane
 def _dedup_for_retry(store, package_id):
     """在发布事务**之外**跑一次同名归一；返回是否真的改动了目录（值得重试）。"""
     from config import Config
@@ -1341,6 +1383,8 @@ def _dedup_for_retry(store, package_id):
     try:
         from services.large_package_catalog_naming import normalize_leaves
         stats = normalize_leaves(store, package_id) or {}
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception("publish dedup normalize failed: %s", package_id)
         return False
@@ -1353,6 +1397,7 @@ def _dedup_for_retry(store, package_id):
     return changed > 0
 
 
+@package_lane
 def build_overview(store, item, milestone="catalog", note="", _dedup_retry=True):
     """在里程碑处主动生成/更新情报概览（方案 A）。
 
@@ -1461,6 +1506,8 @@ def build_overview(store, item, milestone="catalog", note="", _dedup_retry=True)
                 snapshot = directory / "overview-v1.json"
                 if not snapshot.exists():
                     _atomic(snapshot, report)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception("publish overview failed: %s", item.get("id"))
     if (_dedup_retry and not report.get("published") and _dedup_retry_wanted(rejection)):
@@ -1507,6 +1554,7 @@ def _overview_publication_preflight(store, package_id):
     return None
 
 
+@package_lane
 def _publish_overview(store, item, report, milestone, rejection=None):
     """把 report 落成不可变产物，并登记 overview 版本与发布视图指针。
 
@@ -1581,6 +1629,8 @@ def _publish_overview(store, item, report, milestone, rejection=None):
                 try:
                     from services.large_package_catalog_naming import validate_catalog
                     violations = list((validate_catalog(store, package_id) or {}).get('violations') or [])
+                except ProtectionError:
+                    raise
                 except Exception:
                     violations = []
                 if isinstance(rejection, dict):
@@ -1593,6 +1643,8 @@ def _publish_overview(store, item, report, milestone, rejection=None):
                          '发布被目录校验阻断：' + '；'.join(violations)[:300],
                          'publish_overview', time.time()))
                     econn.commit()
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception("rejected event write failed: %s", package_id)
             return None
@@ -1672,6 +1724,8 @@ def _publish_overview(store, item, report, milestone, rejection=None):
                           % (milestone, SCHEMA, catalog_id or "（校验未通过）"),
                           "build_overview", now))
             conn.commit()
+        except ProtectionError:
+            raise
         except Exception:
             conn.rollback()
             if written:
@@ -1700,10 +1754,13 @@ def _sweep_orphans(directory, conn, package_id):
             if stale.name not in published:
                 stale.unlink(missing_ok=True)
                 LOGGER.info("removed orphan overview artefact %s/%s", package_id, stale.name)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception("overview orphan sweep failed: %s", package_id)
 
 
+@package_lane
 def published_report(store, item):
     """读取**当前已发布**的正式报告；没有就返回 None。
 
@@ -1717,13 +1774,15 @@ def published_report(store, item):
                                "evidence_id,rules_version "
                                "FROM lp_overview_versions WHERE package_id=? AND status='published' "
                                "ORDER BY created DESC LIMIT 1", (package_id,)).fetchone()
+    except ProtectionError:
+        raise
     except Exception:
         return None
     if not row or not row["payload"]:
         return None
     path = report_directory(store, package_id) / str(row["payload"])
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(require_report_artifact(path).read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return None
     if isinstance(data, dict):
@@ -1741,6 +1800,7 @@ def published_report(store, item):
     return data
 
 
+@package_lane
 def export_report(store, item, file_format="docx"):
     if file_format not in {"docx", "json"}:
         raise ValueError("仅支持 Word 或 JSON 概览下载")
@@ -1770,9 +1830,10 @@ def export_report(store, item, file_format="docx"):
                 try:
                     write_docx(report, temporary)
                     os.replace(temporary, target)
+                    record_report_artifact(target)
                 finally:
                     temporary.unlink(missing_ok=True)
-    return target
+    return require_report_artifact(target,operation="export")
 
 
 def write_docx(report, path):

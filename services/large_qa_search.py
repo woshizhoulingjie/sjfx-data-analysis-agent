@@ -14,6 +14,8 @@ from services.large_qa_index import LargeQAIndex, loads, tokens, plain_text
 from services.large_archive_members import IDENTITY_FIELDS, member_node, source_identity, source_signature
 from services import large_qa_thai as thai
 from services.package_questions import PACKAGE_OVERVIEW_RE
+from services.large_qa_protection import qa_lane
+from sjfx_protection.store import ProtectionError
 
 LOGGER=logging.getLogger(__name__)
 _vectors=OrderedDict()
@@ -224,6 +226,7 @@ def evidence(row,package_id,root):
             'match_reason':'大包持久化检索与主题覆盖选材'}
 
 
+@qa_lane
 def original_document(package_id, root, path, full=False, base=None, *, current_source=None):
     """Serve the indexed original through the existing document-reader contract."""
     index=LargeQAIndex(package_id,base)
@@ -280,6 +283,7 @@ def original_document(package_id, root, path, full=False, base=None, *, current_
                 'text_char_count':len(body),'evidence':[evidence(r,package_id,root) for r in rows[:100]],'evidence_count':len(rows)}
 
 
+@qa_lane
 def retrieve(store,request,base=None,query_vector=None):
     index=LargeQAIndex(request.scan_id,base)
     if not index.exists:
@@ -324,6 +328,8 @@ def retrieve(store,request,base=None,query_vector=None):
                     def tokenizer(text):
                         normalized=unicodedata.normalize('NFC',text)
                         return tokens(text)+thai.thai_tokens(text)+[term for term,word in query_words if word in normalized]
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.warning('Thai lexical retrieval unavailable',exc_info=True)
                 warnings.append('泰文关键词检索暂不可用；本轮仍使用已有检索，可能遗漏泰文材料。')
@@ -353,6 +359,8 @@ def retrieve(store,request,base=None,query_vector=None):
             lexical=[x for x in lexical if not (x[0] in lexical_seen or lexical_seen.add(x[0]))][:150]
         try:
             vectors,backend=vector_search(c,index,query,allowed,meta,query_vector)
+        except ProtectionError:
+            raise
         except Exception as exc:
             vectors=[];backend='unavailable'; warnings.append('语义检索暂不可用，本轮使用关键词和主题材料。')
             LOGGER.info('large QA vector unavailable: %s',str(exc)[:120])
@@ -459,6 +467,8 @@ def retrieve(store,request,base=None,query_vector=None):
                                    'selected_evidence':len(chosen),'scope_files':len(allowed)}}
     try:
         index.enqueue([r['path'] for r in chosen])
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.warning('Could not prioritize large QA extraction',exc_info=True)
     return result

@@ -1,0 +1,561 @@
+{
+  "passed": true,
+  "binary": "sjfx-assistant.exe",
+  "binary_sha256": "3dfe04f5185cd232b055b81a39c63dc178b5cd2ef94c4f8bdffdf694f3637b50",
+  "binary_bytes": 18027008,
+  "toolchain": "go1.27.2 windows/amd64",
+  "build": {
+    "CGO_ENABLED": "0",
+    "GOOS": "windows",
+    "GOARCH": "amd64",
+    "trimpath": true,
+    "offline_rebuild_byte_identical": true
+  },
+  "source_files": [
+    {
+      "path": "cmd/sjfx-agent/main.go",
+      "bytes": 11885,
+      "sha256": "80757f603187e04b1f8f75797bd645e496ce0ee80a8862700d0c89120bf4e2ca"
+    },
+    {
+      "path": "cmd/sjfx-assistant/main.go",
+      "bytes": 5094,
+      "sha256": "648be47b0ad7823c3d053e0a67b0928a86821783a4b4e1c992b324da0e8bb543"
+    },
+    {
+      "path": "go.mod",
+      "bytes": 1066,
+      "sha256": "f0f07c1ece2897a7edaf19d5aa1b58616056bc57f83e93f5bc2abb1989341507"
+    },
+    {
+      "path": "go.sum",
+      "bytes": 4465,
+      "sha256": "fe88e7506b930c282eb8d362d6f2ba832c17742a1ddadf3bc5e9392093e2e543"
+    },
+    {
+      "path": "internal/agent/agent.go",
+      "bytes": 29733,
+      "sha256": "1fee4ec72065176650218f2309fa2820a98c2cc742bfaa821a9776cc1963e610"
+    },
+    {
+      "path": "internal/agent/agent_test.go",
+      "bytes": 7671,
+      "sha256": "321dd6065e98bc1355330d6f1f07a178cbd83ec027280f3a14f034f614582c57"
+    },
+    {
+      "path": "internal/endpoint/access_audit.ps1",
+      "bytes": 8384,
+      "sha256": "e495a8e2cf49a69937ccfab3dba767bded6e3cdad909130018fa1df7678e9e55"
+    },
+    {
+      "path": "internal/endpoint/actions_windows.go",
+      "bytes": 18690,
+      "sha256": "d318bf0111915103c21ded1af35806c1db44ce52301f8a55304d9267c4658622"
+    },
+    {
+      "path": "internal/endpoint/audit_restore_windows_test.go",
+      "bytes": 1868,
+      "sha256": "40695581917fd79263109c150c5b8a29e068108aecfc362fbfd2f50297de4e6d"
+    },
+    {
+      "path": "internal/endpoint/audit_windows.go",
+      "bytes": 10270,
+      "sha256": "8fe4745b8143c156004ea08e3b6ce5e6cae1feb6fbdf27c870e595ffcf70d5f0"
+    },
+    {
+      "path": "internal/endpoint/client.go",
+      "bytes": 2378,
+      "sha256": "383f011d083282e0db2735cc4da27de930e053463ab4dd69de54b93cbdc1bfaf"
+    },
+    {
+      "path": "internal/endpoint/control_windows.go",
+      "bytes": 4357,
+      "sha256": "cae85ace11b09013f7aff9e9d3dd6a23a04f219381048351e643a4160ab71e4e"
+    },
+    {
+      "path": "internal/endpoint/copies_windows.go",
+      "bytes": 2510,
+      "sha256": "67fcdf3b7cc396a159c4c4c3f36e446a563ffa784941ecba0f962d089992d63d"
+    },
+    {
+      "path": "internal/endpoint/database.go",
+      "bytes": 12614,
+      "sha256": "d359cbded94ae420d884db4fd61f17bfffed8b5842180cb0c605ae983a354e5b"
+    },
+    {
+      "path": "internal/endpoint/desktop_transaction_windows_test.go",
+      "bytes": 4187,
+      "sha256": "b2ad5b565af282e124b94fa8518c21625bf5558e64320f507af02c0c02d52103"
+    },
+    {
+      "path": "internal/endpoint/endpoint_windows_test.go",
+      "bytes": 10531,
+      "sha256": "f787165b60c1029de68facd875ebce0c16f56a576f5d1ebaf0b034ad7773c8fb"
+    },
+    {
+      "path": "internal/endpoint/local_agent_windows.go",
+      "bytes": 16047,
+      "sha256": "fc700327dc05c84ee1878211e65e29b5b509eceb9516cd2d11c3451819028944"
+    },
+    {
+      "path": "internal/endpoint/local_agent_windows_test.go",
+      "bytes": 8691,
+      "sha256": "1fc2740d83b4dee0681fa316b202085e6b1e1c18c3379a987769d1dfaea641a7"
+    },
+    {
+      "path": "internal/endpoint/local_transaction_windows.go",
+      "bytes": 10780,
+      "sha256": "1fc1aa41971fe5552681ac40922971f120a188fa3636fdccf62f3774f1364272"
+    },
+    {
+      "path": "internal/endpoint/local_ui.html",
+      "bytes": 6198,
+      "sha256": "f6f2ee27be3b4d18409a19507a8aea8337f59ee405ccc20307b92ec7cec7247b"
+    },
+    {
+      "path": "internal/endpoint/local_ui_windows.go",
+      "bytes": 100,
+      "sha256": "6c32eae252cc5d3d86ab2335b9d7b6e753c982ad9c1949f34c13c1816f9ec7a9"
+    },
+    {
+      "path": "internal/endpoint/manifest_windows.go",
+      "bytes": 19241,
+      "sha256": "acdf70de7be771588474ca5775b6af3424240e39c34660e2ba36ea749a3ef080"
+    },
+    {
+      "path": "internal/endpoint/platform_windows.go",
+      "bytes": 7526,
+      "sha256": "845c5afb2b40c870335d218ad331818bc765feac4ed34bb228fd6f8c1417e654"
+    },
+    {
+      "path": "internal/endpoint/policy_privilege_windows_test.go",
+      "bytes": 4064,
+      "sha256": "c747e38fd2d7a64a9447dbf7cb5f40d3b95e8067b52f8ecce6e0ecff01341faa"
+    },
+    {
+      "path": "internal/endpoint/policy_windows.go",
+      "bytes": 6964,
+      "sha256": "061f2e7f7bc0c1932db9e481706001f1414974af12ac9162aa5a22a79b2c4f81"
+    },
+    {
+      "path": "internal/endpoint/protocol_local_windows_test.go",
+      "bytes": 3585,
+      "sha256": "6121c0adff3d2d99bad8cebff1f5f16303e338a8ea08cca27a334d3300ccbae3"
+    },
+    {
+      "path": "internal/endpoint/reliability_windows_test.go",
+      "bytes": 13558,
+      "sha256": "1d04f97a4a259b3814c058f49e8efe89149debb431150ecc102b140a9a4a54c9"
+    },
+    {
+      "path": "internal/endpoint/runtime_windows.go",
+      "bytes": 22217,
+      "sha256": "a3ebbc345b2d5bda5dd2713e107b379fdcf0c7e0c96021cd2c9d6a8c12e51c5c"
+    },
+    {
+      "path": "internal/endpoint/upgrade_windows_test.go",
+      "bytes": 16642,
+      "sha256": "d755669d4cf7207ed64be20556bd1e0f568dfd7547c16fb3299e0dbf0c668dc5"
+    },
+    {
+      "path": "internal/endpoint/watch_observation_windows.go",
+      "bytes": 2183,
+      "sha256": "312332b6d83ccb41b89396b489fb4a00e2df70631e5367d6de907dd8fd2ef690"
+    },
+    {
+      "path": "internal/endpoint/watch_observation_windows_test.go",
+      "bytes": 5203,
+      "sha256": "bb9407c1557022706641df5e1ed3b32cceb3bd223a3e0eee0a55894c7d8e2928"
+    },
+    {
+      "path": "internal/enforce/enforcer.go",
+      "bytes": 4859,
+      "sha256": "0e793b830650a00729a926d01d13aee7a3b2e469a03e784659f08d29fc6f8a36"
+    },
+    {
+      "path": "internal/enforce/enforcer_windows.go",
+      "bytes": 8487,
+      "sha256": "6726c514a11d4852095f9effbf201fc58386e3b907a8c3099ac19fdb6ff35a21"
+    },
+    {
+      "path": "internal/enforce/platform.go",
+      "bytes": 2301,
+      "sha256": "ff5a6709d2e7a15844c24a40aa7aec1c367f52a6208c26bffcd1bcfc7757e8aa"
+    },
+    {
+      "path": "internal/hash/hash.go",
+      "bytes": 3053,
+      "sha256": "ebf58dee15f29d048b5f71d2c59ef571a13e46ae8dd728d71560925d86ad9206"
+    },
+    {
+      "path": "internal/hash/hash_test.go",
+      "bytes": 3876,
+      "sha256": "d2de66a3bba0d353eabaa4e487711aa931649fed6f1b284bba9324379328125a"
+    },
+    {
+      "path": "internal/identity/file_store.go",
+      "bytes": 2691,
+      "sha256": "0d11a76e6b7efad47c4f4d96b2fdc45647903e1a67fd57c8e41164a91eceed06"
+    },
+    {
+      "path": "internal/identity/identity.go",
+      "bytes": 2703,
+      "sha256": "7c47328e102a83a543e1d6f798da827d697521b88256d959dfdfea0f91f98fd1"
+    },
+    {
+      "path": "internal/idgen/idgen.go",
+      "bytes": 4320,
+      "sha256": "41a8dcc92f4784a53f0dfb4de9601ffa0d581bb359e2e051329806ffc4a0dee0"
+    },
+    {
+      "path": "internal/idgen/idgen_test.go",
+      "bytes": 2978,
+      "sha256": "5e83295a19ddf1517dbedd2b9af29d6cabb3b835025b5221090031cad43d6787"
+    },
+    {
+      "path": "internal/model/event.go",
+      "bytes": 8432,
+      "sha256": "efe3a7c8aca43a0cdad5fbf72428bbc82c72a0c8ae04d77b4d6998abb7dfd0bd"
+    },
+    {
+      "path": "internal/service/service_other.go",
+      "bytes": 574,
+      "sha256": "5963456211b6b5c924ce704002dac3c7cdd666f6e0c2946688eff5dcb8475649"
+    },
+    {
+      "path": "internal/service/service_windows.go",
+      "bytes": 7554,
+      "sha256": "ce695221892b74444175c8452cdbf103af9b404aebeca48e8620e5e06105166e"
+    },
+    {
+      "path": "internal/store/memory.go",
+      "bytes": 8157,
+      "sha256": "94322ee04678f849480068dfb16d1909786230d27559169c9a06a252d8bd3ca7"
+    },
+    {
+      "path": "internal/store/sqlite.go",
+      "bytes": 8757,
+      "sha256": "ea7198cbf9bcb13b99b2475ef08d742ad57f6e30aa9d620cf86549ffbf8f827a"
+    },
+    {
+      "path": "internal/store/store.go",
+      "bytes": 5889,
+      "sha256": "44b8dc0afe6f8f9f2c6bc51f8accc9c56d289c9e2b7f324a713356e0a64a5c6f"
+    },
+    {
+      "path": "internal/store/store_test.go",
+      "bytes": 6118,
+      "sha256": "f6da05ca7be35dc380cb0c09541fc40d150890b98a05d15bce2231a79d063552"
+    },
+    {
+      "path": "internal/sweep/roots_other.go",
+      "bytes": 1051,
+      "sha256": "24bc454812b3b27ce66c38c6d8534b316c39a4a3207a329c65f0347693841f3e"
+    },
+    {
+      "path": "internal/sweep/roots_windows.go",
+      "bytes": 1687,
+      "sha256": "4c4325d313dfca2407cbb596e492d0f971a4d8175ac48f6c883eecdefbf598f2"
+    },
+    {
+      "path": "internal/sweep/sweep.go",
+      "bytes": 4850,
+      "sha256": "3df22093e1b98575a7ec7668677e3ab28d1f65913715536d5a735b8abd11c88d"
+    },
+    {
+      "path": "internal/sweep/sweep_test.go",
+      "bytes": 4380,
+      "sha256": "4b2c7dcc0e34d2254a65753be9ce5af14c52025ccec27db5582e98f56266997a"
+    },
+    {
+      "path": "internal/syncer/client.go",
+      "bytes": 6463,
+      "sha256": "482fb57580e9832575fd6c73b19b9a7697ececf69d3999c36f69cfe447dafb1c"
+    },
+    {
+      "path": "internal/watch/watcher.go",
+      "bytes": 8548,
+      "sha256": "29c3c4ec3a63f2cd18f2b99b8db0fa90d47d625837d4ba4ce923af3029b89655"
+    },
+    {
+      "path": "internal/watch/watcher_test.go",
+      "bytes": 5962,
+      "sha256": "d0125712e83143c492edb9399bdfd256a3569c1b18ed88f5feaa317c5e29eb4c"
+    }
+  ],
+  "modules": [
+    {
+      "name": "github.com/dustin/go-humanize",
+      "version": "v1.0.1",
+      "h1": "h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=",
+      "zip_sha256": "319404ea84c8a4e2d3d83f30988b006e7dd04976de3e1a1a90484ad94679fa46",
+      "zip_bytes": 27015,
+      "source": "https://proxy.golang.org/github.com/dustin/go-humanize/@v/v1.0.1.zip"
+    },
+    {
+      "name": "github.com/fsnotify/fsnotify",
+      "version": "v1.10.1",
+      "h1": "h1:b0/UzAf9yR5rhf3RPm9gf3ehBPpf0oZKIjtpKrx59Ho=",
+      "zip_sha256": "b2c6a334e0d518da2e046066bdd9da34cb26bad6df9f17701802d3de522ab016",
+      "zip_bytes": 120092,
+      "source": "https://proxy.golang.org/github.com/fsnotify/fsnotify/@v/v1.10.1.zip"
+    },
+    {
+      "name": "github.com/google/uuid",
+      "version": "v1.6.0",
+      "h1": "h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=",
+      "zip_sha256": "d0f02f377217f42702e259684e06441edbf5140dddcc34ba9bea56038b38a6ed",
+      "zip_bytes": 31981,
+      "source": "https://proxy.golang.org/github.com/google/uuid/@v/v1.6.0.zip"
+    },
+    {
+      "name": "github.com/mattn/go-isatty",
+      "version": "v0.0.24",
+      "h1": "h1:tGZZoVgT/KiqK1c8ocVLeDS8BSWMRd47J3Lbz7vsReI=",
+      "zip_sha256": "4fcffec0bae0ad4af7bf96e2497a817d85de64af19ffe31d82bda362148234b8",
+      "zip_bytes": 9195,
+      "source": "https://proxy.golang.org/github.com/mattn/go-isatty/@v/v0.0.24.zip"
+    },
+    {
+      "name": "github.com/ncruces/go-strftime",
+      "version": "v1.0.0",
+      "h1": "h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOFAw7w=",
+      "zip_sha256": "c1a7e718dbf5f779e9fc98b7354ed4d98de2949b83b65837c429b4b2c8c27686",
+      "zip_bytes": 16160,
+      "source": "https://proxy.golang.org/github.com/ncruces/go-strftime/@v/v1.0.0.zip"
+    },
+    {
+      "name": "github.com/remyoudompheng/bigfft",
+      "version": "v0.0.0-20230129092748-24d4a6f8daec",
+      "h1": "h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=",
+      "zip_sha256": "9be16c32c384d55d0f7bd7b03f1ff1e9a4e4b91b000f0aa87a567a01b9b82398",
+      "zip_bytes": 20779,
+      "source": "https://proxy.golang.org/github.com/remyoudompheng/bigfft/@v/v0.0.0-20230129092748-24d4a6f8daec.zip"
+    },
+    {
+      "name": "golang.org/x/sys",
+      "version": "v0.48.0",
+      "h1": "h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=",
+      "zip_sha256": "3a47e06431ba1e24d5b2aca3a7ce31fd13faff34df3e5d8e63f105ff9d0c1786",
+      "zip_bytes": 2094772,
+      "source": "https://proxy.golang.org/golang.org/x/sys/@v/v0.48.0.zip"
+    },
+    {
+      "name": "modernc.org/libc",
+      "version": "v1.75.7",
+      "h1": "h1:o3DTP9/0p9pKmY2WCKQaySW6wIiZhNM7wc2lUoyhfew=",
+      "zip_sha256": "12e6cd838631923dcc4ca4a40dd7f4f66b9f1ef58c322f861545182defa84bb6",
+      "zip_bytes": 18883219,
+      "source": "https://proxy.golang.org/modernc.org/libc/@v/v1.75.7.zip"
+    },
+    {
+      "name": "modernc.org/mathutil",
+      "version": "v1.7.1",
+      "h1": "h1:GCZVGXdaN8gTqB1Mf/usp1Y/hSqgI2vAGGP4jZMCxOU=",
+      "zip_sha256": "5be0da18eb557a1198bfe370e37022f2dbdb9cdc5d63130fc8e8330ab240bd2e",
+      "zip_bytes": 133068,
+      "source": "https://proxy.golang.org/modernc.org/mathutil/@v/v1.7.1.zip"
+    },
+    {
+      "name": "modernc.org/memory",
+      "version": "v1.12.1",
+      "h1": "h1:nFMiWrpStgZczNl6XI9GnIk/rWhYIyHGUaR04pGbp9g=",
+      "zip_sha256": "e25588f100d976fb75ff91edb8b4ea6ed837d67ff5aa5d42e6a8893fb30790ac",
+      "zip_bytes": 44915,
+      "source": "https://proxy.golang.org/modernc.org/memory/@v/v1.12.1.zip"
+    },
+    {
+      "name": "modernc.org/sqlite",
+      "version": "v1.59.0",
+      "h1": "h1:X1es1GpqBlS/5T+vbM4HLUdaa8OtQx468DF2vrx+38A=",
+      "zip_sha256": "8e646f84246e4abdc01aa27fa13f94e6aac2786f4fe4d395901407166d7ac4a9",
+      "zip_bytes": 23124603,
+      "source": "https://proxy.golang.org/modernc.org/sqlite/@v/v1.59.0.zip"
+    }
+  ],
+  "licenses": [
+    {
+      "module": "github.com/dustin/go-humanize",
+      "version": "v1.0.1",
+      "path": "licenses/github.com_dustin_go-humanize@v1.0.1/LICENSE",
+      "sha256": "a973b4498c13eb74baa2a8e5c351426a6826f2fcdd909916dbe53ee2e755fd71"
+    },
+    {
+      "module": "github.com/fsnotify/fsnotify",
+      "version": "v1.10.1",
+      "path": "licenses/github.com_fsnotify_fsnotify@v1.10.1/LICENSE",
+      "sha256": "2dfbe6d2b5eb18b55148f3805d88648a09e0d17e38428123259afb08c8996e37"
+    },
+    {
+      "module": "github.com/google/uuid",
+      "version": "v1.6.0",
+      "path": "licenses/github.com_google_uuid@v1.6.0/LICENSE",
+      "sha256": "0a8d61ed3cbfd5312326e8126c31ce9c627a283adc99131b56896d29ada04b2d"
+    },
+    {
+      "module": "github.com/mattn/go-isatty",
+      "version": "v0.0.24",
+      "path": "licenses/github.com_mattn_go-isatty@v0.0.24/LICENSE",
+      "sha256": "08eab1118c80885fa1fa6a6dd7303f65a379fcb3733e063d20d1bbc2c76e6fa1"
+    },
+    {
+      "module": "github.com/ncruces/go-strftime",
+      "version": "v1.0.0",
+      "path": "licenses/github.com_ncruces_go-strftime@v1.0.0/LICENSE",
+      "sha256": "38ae43959daf953a393a585b2988672cb65a5a541aca0d0be5e72595a0a16883"
+    },
+    {
+      "module": "github.com/remyoudompheng/bigfft",
+      "version": "v0.0.0-20230129092748-24d4a6f8daec",
+      "path": "licenses/github.com_remyoudompheng_bigfft@v0.0.0-20230129092748-24d4a6f8daec/LICENSE",
+      "sha256": "dd26a7abddd02e2d0aba97805b31f248ef7835d9e10da289b22e3b8ab78b324d"
+    },
+    {
+      "module": "golang.org/x/sys",
+      "version": "v0.48.0",
+      "path": "licenses/golang.org_x_sys@v0.48.0/LICENSE",
+      "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+    },
+    {
+      "module": "golang.org/x/sys",
+      "version": "v0.48.0",
+      "path": "licenses/golang.org_x_sys@v0.48.0/PATENTS",
+      "sha256": "96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc"
+    },
+    {
+      "module": "modernc.org/libc",
+      "version": "v1.75.7",
+      "path": "licenses/modernc.org_libc@v1.75.7/AUTHORS",
+      "sha256": "40224528f3c7363534f59521d803a4eb627966b334d732bfc68a788655cb2545"
+    },
+    {
+      "module": "modernc.org/libc",
+      "version": "v1.75.7",
+      "path": "licenses/modernc.org_libc@v1.75.7/LICENSE",
+      "sha256": "95ff867eb55a56935fa7492406cfa953fb7c13ca73f4c0a86ae05756b4605600"
+    },
+    {
+      "module": "modernc.org/libc",
+      "version": "v1.75.7",
+      "path": "licenses/modernc.org_libc@v1.75.7/LICENSE-3RD-PARTY.md",
+      "sha256": "f597097efe3d97021f89170746bd3a0fb9a8b6fb26b82043ed68a4e0283bee6c"
+    },
+    {
+      "module": "modernc.org/libc",
+      "version": "v1.75.7",
+      "path": "licenses/modernc.org_libc@v1.75.7/testdata/nsz.repo.hu/libc-test/AUTHORS",
+      "sha256": "d04faa7fbed5d7e30d5f55c014c0f5e702245ca5ba62a39c7bc4df8724853a6c"
+    },
+    {
+      "module": "modernc.org/libc",
+      "version": "v1.75.7",
+      "path": "licenses/modernc.org_libc@v1.75.7/testdata/nsz.repo.hu/libc-test/COPYRIGHT",
+      "sha256": "41b8f2e2706012eb534f89e72ff547308cb81dcb9acf077c40a9058a7c06088d"
+    },
+    {
+      "module": "modernc.org/libc",
+      "version": "v1.75.7",
+      "path": "licenses/modernc.org_libc@v1.75.7/testdata/nsz.repo.hu/libc-test/src/math/crlibm/COPYING",
+      "sha256": "dcc100d4161cc0b7177545ab6e47216f84857cda3843847c792a25289852dcaa"
+    },
+    {
+      "module": "modernc.org/mathutil",
+      "version": "v1.7.1",
+      "path": "licenses/modernc.org_mathutil@v1.7.1/AUTHORS",
+      "sha256": "51fcdd68bb605f080283bb6eabb72452591289650599d3d67603381834e536af"
+    },
+    {
+      "module": "modernc.org/mathutil",
+      "version": "v1.7.1",
+      "path": "licenses/modernc.org_mathutil@v1.7.1/LICENSE",
+      "sha256": "bfa9bf72a72ca009fd62a8f84fca3dca67e51d93af96352723646599898b6cf5"
+    },
+    {
+      "module": "modernc.org/mathutil",
+      "version": "v1.7.1",
+      "path": "licenses/modernc.org_mathutil@v1.7.1/mersenne/AUTHORS",
+      "sha256": "f79ff8b413938c3ce7c60db12242a663d8e840249bd838fcf58f4aaccfec5454"
+    },
+    {
+      "module": "modernc.org/mathutil",
+      "version": "v1.7.1",
+      "path": "licenses/modernc.org_mathutil@v1.7.1/mersenne/LICENSE",
+      "sha256": "c05630f9ca899ea094620d37daea6ba66f99adbf9268ea5fea9db607e1102bd9"
+    },
+    {
+      "module": "modernc.org/memory",
+      "version": "v1.12.1",
+      "path": "licenses/modernc.org_memory@v1.12.1/AUTHORS",
+      "sha256": "df1f424436f279309de85b82e494d548297a2570e9b5794630d7e72c9eb50b6a"
+    },
+    {
+      "module": "modernc.org/memory",
+      "version": "v1.12.1",
+      "path": "licenses/modernc.org_memory@v1.12.1/LICENSE",
+      "sha256": "59895e669f48f168b6b858358f6005779cdf40a265f7828813061b56af67b496"
+    },
+    {
+      "module": "modernc.org/memory",
+      "version": "v1.12.1",
+      "path": "licenses/modernc.org_memory@v1.12.1/LICENSE-GO",
+      "sha256": "2d36597f7117c38b006835ae7f537487207d8ec407aa9d9980794b2030cbc067"
+    },
+    {
+      "module": "modernc.org/memory",
+      "version": "v1.12.1",
+      "path": "licenses/modernc.org_memory@v1.12.1/LICENSE-LOGO",
+      "sha256": "5ae5bee3072a841376451b48d8cfcec7188e10543926d5870828d36c8a750dc5"
+    },
+    {
+      "module": "modernc.org/memory",
+      "version": "v1.12.1",
+      "path": "licenses/modernc.org_memory@v1.12.1/LICENSE-MMAP-GO",
+      "sha256": "c2eba69f20d05414538c3a5df7694dde392e065ff70882e1625e90f5d6659fff"
+    },
+    {
+      "module": "modernc.org/sqlite",
+      "version": "v1.59.0",
+      "path": "licenses/modernc.org_sqlite@v1.59.0/AUTHORS",
+      "sha256": "6bff0356ad7a2aee1961df765de4c5beef4b1d0a00fa2d8704ecb6b6043b4922"
+    },
+    {
+      "module": "modernc.org/sqlite",
+      "version": "v1.59.0",
+      "path": "licenses/modernc.org_sqlite@v1.59.0/LICENSE",
+      "sha256": "c6fe05491a60ae13bcd223088d2705e36dede24e5587226231d2459ada5c4822"
+    },
+    {
+      "module": "modernc.org/sqlite",
+      "version": "v1.59.0",
+      "path": "licenses/modernc.org_sqlite@v1.59.0/LICENSE-SQLITE",
+      "sha256": "8438c9c89b849131ead81d5435cb97fcf052df5b0b286dda8a2d4c29e6cb3fd0"
+    },
+    {
+      "module": "modernc.org/sqlite",
+      "version": "v1.59.0",
+      "path": "licenses/modernc.org_sqlite@v1.59.0/LICENSE-SQLITE_VEC",
+      "sha256": "6ce72bbe12d975bd5286e5ab0a064c069693300c47bccbc57bec18485f1621ea"
+    },
+    {
+      "module": "Go runtime",
+      "version": "1.27.2",
+      "path": "licenses/go-1.27.2/LICENSE",
+      "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+    },
+    {
+      "module": "Go runtime",
+      "version": "1.27.2",
+      "path": "licenses/go-1.27.2/PATENTS",
+      "sha256": "96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc"
+    }
+  ],
+  "runtime_data_included": false,
+  "excluded": [
+    "bin/endpoint-admin-test.exe",
+    "state",
+    "identity",
+    "credentials",
+    "installation tokens",
+    "acceptance state"
+  ]
+}

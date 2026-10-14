@@ -96,3 +96,10 @@ backups/
 # Local catalog/performance rollback snapshots, never source deliverables.
 /.catalog-repair*-backup-*/
 /.speedup-*-backup-*/
+
+# Local package builds and temporary pip/pytest working directories.
+/dist/
+/build/
+/pip-*/
+/pytest-of-*/
+/topic-*/

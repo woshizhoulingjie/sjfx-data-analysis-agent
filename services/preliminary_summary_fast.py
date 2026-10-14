@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import datetime
 
 from config import Config
@@ -257,6 +258,9 @@ def _collect_groups(storage, jobs, per_call, width):
 
 
 def generate_ready_results(llm, storage, lead_job, fallback):
+    from sjfx_protection.cache import capture_sources
+    from sjfx_protection.ready import publish_many
+    approved_sources = capture_sources()
     width = _batch_width()
     per_call = max(1, int(Config.PRELIMINARY_SUMMARY_BATCH_SIZE))
     jobs = collect_jobs(storage, lead_job, limit=per_call * width)
@@ -278,7 +282,8 @@ def generate_ready_results(llm, storage, lead_job, fallback):
         # 单卡解码受显存带宽限制（读权重），K 路请求共享同一次权重读取，
         # 因此并发 K 路能把解码吞吐提高到约 K 倍；预填充是算力瓶颈，总时长不变。
         with ThreadPoolExecutor(max_workers=len(groups)) as pool:
-            outcomes = list(pool.map(run, groups))
+            futures = [pool.submit(copy_context().run, run, group) for group in groups]
+            outcomes = [future.result() for future in futures]
 
     responses = {}
     for group, response, error in outcomes:
@@ -309,4 +314,5 @@ def generate_ready_results(llm, storage, lead_job, fallback):
         ready["result"]["preliminary_timing"]["model_calls"] = list(ledger)
     if str(lead_job["id"]) in output:
         output[str(lead_job["id"])]["result"]["_preliminary_batch_size"] = len(rows)
+    publish_many(storage.db_path, 'preliminary-fast-ready', output, approved_sources)
     return {"_preliminary_ready_results": output, "_preliminary_batch_size": len(rows)}

@@ -91,7 +91,9 @@ class Storage:
         self.sqlite_checkpoint_interval = self._env_int(
             "SJFX_SQLITE_CHECKPOINT_INTERVAL", 60, minimum=10, maximum=3600
         )
+        self._protection_schema_ready = False
         self._init_db()
+        self._protection_schema_ready = True
         if os.name != "nt":
             try:
                 Path(self.db_path).chmod(0o600)
@@ -130,7 +132,14 @@ class Storage:
             connection.execute(
                 "PRAGMA journal_size_limit={}".format(self.sqlite_journal_size_limit)
             )
-            yield connection
+            if getattr(self, '_protection_schema_ready', False):
+                from sjfx_protection.storage_cache import connection as protected_connection
+                with protected_connection(connection, self.db_path) as checked:
+                    yield checked
+            else:
+                # Schema migrations contain no producer content. Existing rows
+                # remain without provenance until explicitly regenerated.
+                yield connection
             connection.commit()
         except Exception:
             connection.rollback()
@@ -956,12 +965,41 @@ class Storage:
         return json.dumps({
             "__preview_sidecar__": True,
             "file": str(target.relative_to(self.sidecar_dir)).replace("\\", "/"),
+            **self._sidecar_integrity(raw),
             "schema_version": payload.get("schema_version"),
             "path": payload.get("path"),
             "status": payload.get("status"),
             "size": payload.get("size"),
             "modified_at_ns": payload.get("modified_at_ns"),
         }, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _sidecar_integrity(raw):
+        from sjfx_protection.business import enabled
+        if not enabled():
+            return {}
+        return {'__protection_sha256': hashlib.sha256(raw).hexdigest(),
+                '__protection_bytes': len(raw)}
+
+    def _read_verified_sidecar(self, payload):
+        from sjfx_protection.business import enabled
+        from sjfx_protection.store import ProtectionError
+        target = (self.sidecar_dir / str(payload.get('file') or '')).resolve()
+        try:
+            target.relative_to(self.sidecar_dir.resolve())
+            expected = payload.get('__protection_sha256')
+            size = payload.get('__protection_bytes')
+            if enabled() and (not expected or isinstance(size, bool) or not isinstance(size, int) or size < 0):
+                raise ProtectionError('历史正文缓存缺少完整内容证据，请重新解析', 423, 'cache_provenance_missing')
+            with gzip.open(str(target), 'rb') as stream:
+                raw = stream.read(size + 1) if enabled() else stream.read()
+            if enabled() and (len(raw) != size or hashlib.sha256(raw).hexdigest() != expected):
+                raise ProtectionError('正文缓存内容与生产版本不一致', 423, 'cache_output_changed')
+            return json.loads(raw.decode('utf-8'))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if enabled():
+                raise ProtectionError('核准正文缓存不可用，请重新生成', 423, 'cache_unavailable') from exc
+            raise
 
     def _load_preview_payload(self, stored):
         payload = json.loads(stored)
@@ -970,8 +1008,7 @@ class Storage:
         target = (self.sidecar_dir / str(payload.get("file") or "")).resolve()
         try:
             target.relative_to(self.sidecar_dir.resolve())
-            with gzip.open(str(target), "rb") as stream:
-                return json.loads(stream.read().decode("utf-8"))
+            return self._read_verified_sidecar(payload)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             return {
                 "schema_version": payload.get("schema_version"),
@@ -1135,6 +1172,7 @@ class Storage:
         return json.dumps({
             "__sidecar_payload__": True,
             "file": str(target.relative_to(self.sidecar_dir)).replace("\\", "/"),
+            **self._sidecar_integrity(raw),
             "source": payload.get("source", {}),
             "parser": payload.get("parser", {}),
             "coverage": payload.get("coverage", {}),
@@ -1162,8 +1200,7 @@ class Storage:
         target = (self.sidecar_dir / relative).resolve()
         try:
             target.relative_to(self.sidecar_dir.resolve())
-            with gzip.open(str(target), "rb") as stream:
-                return json.loads(stream.read().decode("utf-8"))
+            return self._read_verified_sidecar(payload)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             return {
                 "source": payload.get("source", {}),
@@ -1229,6 +1266,7 @@ class Storage:
         return json.dumps({
             "__translation_sidecar__": True,
             "file": str(target.relative_to(self.sidecar_dir)).replace("\\", "/"),
+            **self._sidecar_integrity(raw),
             "projection": self._translation_projection(payload),
         }, ensure_ascii=False)
 
@@ -1241,8 +1279,7 @@ class Storage:
         target = (self.sidecar_dir / str(payload.get("file") or "")).resolve()
         try:
             target.relative_to(self.sidecar_dir.resolve())
-            with gzip.open(str(target), "rb") as stream:
-                return json.loads(stream.read().decode("utf-8"))
+            return self._read_verified_sidecar(payload)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             projection = dict(payload.get("projection") or {})
             projection["status"] = "cache_unavailable"
@@ -2844,6 +2881,8 @@ class Storage:
     def save_artifact(self, filename, owner_id, scan_id=None, job_id=None, kind="result"):
         if not filename or not owner_id:
             return
+        from sjfx_protection.business import record_business_artifact
+        record_business_artifact(str(filename),str(owner_id))
         with self.lock, self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO output_artifacts(filename,owner_id,scan_id,job_id,kind) VALUES (?,?,?,?,?)",
@@ -3388,6 +3427,8 @@ class Storage:
         from services.preliminary_summary_fast import enabled, ready_matches
         if not enabled(job) or not ready_matches(job, ready):
             return "stale"
+        from sjfx_protection.ready import require as require_ready
+        require_ready(self.db_path, 'preliminary-fast-ready', job['id'], ready)
         result = ready.get("result") or {}
         summary = result.get("summary") or {}
         path = str((job.get("options") or {}).get("path") or "")
@@ -5114,7 +5155,8 @@ class Storage:
                 "WHERE id=? AND scan_id=? AND owner_id=?",
                 (json.dumps(session_payload, ensure_ascii=False), session_id, scan_id, owner_id),
             )
-            options = json.dumps({"turn_id": turn_id}, ensure_ascii=False)
+            from sjfx_protection.business import capture_resource_job
+            options = json.dumps(capture_resource_job(owner_id,scan_id,{"turn_id":turn_id},'conversation_turn'), ensure_ascii=False)
             conn.execute(
                 "INSERT INTO analysis_jobs("
                 "id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at"
@@ -5201,17 +5243,17 @@ class Storage:
                 "SELECT * FROM conversation_turns WHERE id=?", (str(turn_id),)
             ).fetchone()
             if row and message is not None:
-                conn.execute(
-                    "INSERT INTO conversation_turn_events("
-                    "turn_id,event_type,stage,progress,message,payload"
-                    ") VALUES (?,?,?,?,?,?)",
-                    (
-                        str(turn_id), str(event_type or "status"),
-                        stage or row["stage"],
-                        max(0, min(100, int(progress if progress is not None else row["progress"] or 0))),
-                        str(message), "{}",
-                    ),
-                )
+                from sjfx_protection.business import metadata_projection
+                values={"turn_id":str(turn_id),"event_type":str(event_type or "status"),
+                    "stage":stage or row["stage"],
+                    "progress":max(0,min(100,int(progress if progress is not None else row["progress"] or 0))),
+                    "message":str(message),"payload":"{}"}
+                if metadata_projection.get():
+                    conn.metadata_insert('conversation_turn_events',values)
+                else:
+                    conn.execute("INSERT INTO conversation_turn_events("
+                        "turn_id,event_type,stage,progress,message,payload) VALUES(?,?,?,?,?,?)",
+                        tuple(values.values()))
         return self._decode_conversation_turn(row)
 
     def replace_conversation_turn_steps(self, turn_id, steps):
@@ -5398,6 +5440,11 @@ class Storage:
 
     def set_conversation_turn_message(self, turn_id, content, status, stage,
                                       progress, error=None):
+        from sjfx_protection.business import metadata_projection
+        if metadata_projection.get():
+            # Cancel/pause updates status without rewriting or authenticating
+            # historical assistant content under a new registration.
+            return False
         with self.lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT session_id,assistant_message_id FROM conversation_turns WHERE id=?",
@@ -5450,13 +5497,14 @@ class Storage:
             if active:
                 return active["id"]
             job_id = uuid.uuid4().hex[:12]
+            from sjfx_protection.business import capture_resource_job
             conn.execute(
                 "INSERT INTO analysis_jobs("
                 "id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at"
                 ") VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
                 (
                     job_id, row["scan_id"], "conversation_turn", "queued", "queued", 0,
-                    str(message), json.dumps({"turn_id": str(turn_id)}, ensure_ascii=False),
+                    str(message), json.dumps(capture_resource_job(owner_id,row['scan_id'],{"turn_id":str(turn_id)},'conversation_turn'), ensure_ascii=False),
                     str(owner_id), self._job_priority("conversation_turn", {"turn_id": str(turn_id)}),
                 ),
             )
@@ -7551,9 +7599,11 @@ class Storage:
         }.get(str(task_type or ""), 50)
 
     def create_job(self, scan_id, options=None, task_type="analyze_package", owner_id="legacy"):
+        from sjfx_protection.business import capture_resource_job
+        options=capture_resource_job(owner_id,scan_id,options,task_type)
         job_id = uuid.uuid4().hex[:12]
         priority = self._job_priority(task_type, options)
-        with self.lock, self._connect() as conn:
+        with self.lock, (self._queue_metadata_connection() if (options or {}).get('protection_intake') and not (options or {}).get('protection_context') else self._connect()) as conn:
             conn.execute(
                 "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
@@ -7566,7 +7616,9 @@ class Storage:
 
     def create_or_get_typed_job(self, scan_id, task_type, options=None, owner_id="legacy"):
         """Deduplicate only equivalent active work for the same data package."""
-        with self.lock, self._connect() as conn:
+        from sjfx_protection.business import capture_resource_job
+        options=capture_resource_job(owner_id,scan_id,options,task_type)
+        with self.lock, (self._queue_metadata_connection() if (options or {}).get('protection_intake') and not (options or {}).get('protection_context') else self._connect()) as conn:
             options_json = json.dumps(options or {}, ensure_ascii=False, sort_keys=True)
             # Scope-aware deduplication: two different topic selections must
             # never reuse one another's active supplement task. Priority source
@@ -7643,6 +7695,13 @@ class Storage:
                     )
                 )
                 candidate_owner = candidate["owner_id"] or "legacy"
+                # Equivalent business scopes cannot deduplicate work created
+                # for a different checked revision or monitor gap generation.
+                current_proof=(options or {}).get('protection_context')
+                prior_proof=candidate_options.get('protection_context')
+                proof_fields=('owner','registration_id','manifest_revision','policy_revision','gap_epoch','versions','package_contexts')
+                if current_proof and (not isinstance(prior_proof,dict) or any(current_proof.get(key)!=prior_proof.get(key) for key in proof_fields)):
+                    continue
                 if candidate_scope == scope_key and (not owner_id or candidate_owner == owner_id):
                     row = candidate
                     break
@@ -7683,13 +7742,17 @@ class Storage:
             "preprocess_only": True,
             "continue_full": False,
         }
+        from sjfx_protection.business import capture_import
+        options=capture_import(owner_id,root_path,options)
         priority = self._job_priority("scan_and_analyze", options)
         self.create_import_task(job_id, root_path, owner_id=owner_id)
-        with self.lock, self._connect() as conn:
+        # This connection writes only a new queue receipt and its control row.
+        # No result/content/cache is written before inspection has completed.
+        with self.lock, self._queue_metadata_connection() as conn:
             conn.execute(
                 "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
-                (job_id, job_id, "scan_and_analyze", "queued", "queued", 0, "等待扫描目录", json.dumps(options, ensure_ascii=False), owner_id or "legacy", priority),
+                (job_id, job_id, "scan_and_analyze", "queued", "security_inspection" if options.get('protection_intake') else "queued", 0, "等待安全检查" if options.get('protection_intake') else "等待扫描目录", json.dumps(options, ensure_ascii=False), owner_id or "legacy", priority),
             )
             conn.execute(
                 "INSERT OR IGNORE INTO package_processing_controls("
@@ -7697,6 +7760,30 @@ class Storage:
                 (job_id,),
             )
         return job_id
+
+    @contextmanager
+    def _queue_metadata_connection(self):
+        conn=sqlite3.connect(self.db_path,timeout=self.sqlite_busy_timeout_ms/1000)
+        conn.row_factory=sqlite3.Row
+        try:
+            with conn:yield conn
+        finally:conn.close()
+
+    @staticmethod
+    def _job_metadata_row(conn,job_id):
+        # Enumerate current schema fields but omit the protected result column.
+        columns=[row[1] for row in conn.execute('PRAGMA table_info(analysis_jobs)') if row[1]!='result']
+        selected=','.join('"'+name.replace('"','""')+'"' for name in columns)
+        return conn.execute('SELECT '+selected+',NULL AS result FROM analysis_jobs WHERE id=?',(job_id,)).fetchone()
+
+    def save_protection_intake(self,job_id,options):
+        """Freeze the checked versions before the first business read."""
+        with self.lock,self._connect() as conn:
+            result=conn.execute("UPDATE analysis_jobs SET options=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND cancel_requested=0 AND status NOT IN ('cancelled','cancelling')",
+                (json.dumps(options,ensure_ascii=False),job_id))
+            if result.rowcount!=1:
+                from sjfx_protection.store import ProtectionError
+                raise ProtectionError('导入任务在安全检查后已经取消',409,'import_cancelled')
 
     def cancel_queued_jobs(self, except_scan_id=None):
         """Deprecated compatibility method; a new scan must never cancel another.
@@ -7709,9 +7796,10 @@ class Storage:
     def get_running_job(self):
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM analysis_jobs WHERE status IN ('running','cancelling') "
+                "SELECT id FROM analysis_jobs WHERE status IN ('running','cancelling') "
                 "ORDER BY started_at DESC LIMIT 1"
             ).fetchone()
+            if row:row=self._job_metadata_row(conn,row['id'])
         if not row:
             return None
         return self._decode_job(dict(row))
@@ -7822,8 +7910,14 @@ class Storage:
                 "WHERE id=? AND status IN ('running','cancelling')",
                 ("正在停止当前步骤，已完成的检查点会保留。", "正在取消", job_id),
             )
-            row = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone()
-        return self._decode_job(dict(row)) if row else None
+            row = self._job_metadata_row(conn,job_id)
+        result=self._decode_job(dict(row)) if row else None
+        if result:
+            from sjfx_protection.business import enabled,protection
+            receipt=(result.get('options') or {}).get('protection_intake')
+            if receipt and enabled():
+                protection().store.event(result.get('owner_id'),'import.cancelled',payload={'job_id':job_id,'selection_id':receipt.get('selection_id'),'registration_id':receipt.get('registration_id')})
+        return result
 
     def finalize_job(self, job_id, result=None, error=None):
         """Atomically resolve completion/cancellation races.
@@ -7943,7 +8037,7 @@ class Storage:
             )
             if cursor.rowcount != 1:
                 return None
-            claimed = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (row["id"],)).fetchone()
+            claimed = self._job_metadata_row(conn,row['id'])
         return self._decode_job(dict(claimed)) if claimed else None
 
     def wake_due_file_retries(self, limit=200):
@@ -7982,8 +8076,18 @@ class Storage:
                     continue
                 options = {"workflow_source": "retry_scheduler", "target_paths": paths}
                 job_id = uuid.uuid4().hex[:12]
-                options_json = json.dumps(options, ensure_ascii=False)
                 owner_id = str(scan["owner_id"] or "legacy")
+                from sjfx_protection.business import capture_resource_job,enabled
+                from sjfx_protection.store import ProtectionError
+                if enabled():
+                    previous=conn.execute("SELECT options FROM analysis_jobs WHERE scan_id=? AND owner_id=? ORDER BY created_at DESC LIMIT 1",(scan_id,owner_id)).fetchone()
+                    saved=json.loads(previous['options'] or '{}').get('protection_context') if previous else None
+                    if not saved:continue
+                    try:
+                        from sjfx_protection.business import activate
+                        with activate(saved):options=capture_resource_job(owner_id,scan_id,options)
+                    except ProtectionError:continue
+                options_json = json.dumps(options, ensure_ascii=False)
                 conn.execute(
                     "INSERT INTO analysis_jobs(id,scan_id,task_type,status,stage,progress,message,options,owner_id,priority,created_at) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
@@ -8040,7 +8144,10 @@ class Storage:
 
     def get_job(self, job_id, owner_id=None):
         with self.lock, self._connect() as conn:
-            row = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone()
+            # Pending work has no content result to authenticate. It remains
+            # visible as queue metadata; nonempty results keep the cache gate.
+            present=getattr(conn,'raw',conn).execute('SELECT result IS NOT NULL AND result NOT IN (\'null\',\'\') FROM analysis_jobs WHERE id=?',(job_id,)).fetchone()
+            row = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone() if present and present[0] else self._job_metadata_row(conn,job_id)
             if not row:
                 return None
             stored_owner = row["owner_id"] or "legacy"

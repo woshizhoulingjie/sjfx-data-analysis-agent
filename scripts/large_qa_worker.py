@@ -23,6 +23,9 @@ from services.large_qa_topics import refresh_maps, refine_one
 from services.large_qa_resources import DiskGuard, resource_code
 from services.process_liveness import try_lock_file
 from services.model_backend import create_model_client
+from sjfx_protection import business
+from sjfx_protection.store import ProtectionError
+from services.large_qa_protection import qa_store_execution
 
 LOGGER = logging.getLogger('large_qa_worker')
 STOP = False
@@ -37,13 +40,20 @@ class ReadOnlyStore:
     @contextmanager
     def _connect(self):
         db = sqlite3.connect(self.path.as_uri()+'?mode=ro', uri=True, timeout=20)
+        checked = db
         try:
             db.row_factory = sqlite3.Row
-            db.execute('PRAGMA query_only=ON')
-            db.execute('BEGIN')
-            yield db
+            if business.enabled():
+                # Main database stays mode=ro; protected TEMP views and row
+                # proofs must remain writable before reading cached content.
+                from services.large_package_sql_cache import protect_connection
+                checked = protect_connection(db, self.path)
+            else:
+                db.execute('PRAGMA query_only=ON')
+            checked.execute('BEGIN')
+            yield checked
         finally:
-            db.close()
+            checked.close()
 
     def get(self, package_id):
         with self._connect() as db:
@@ -163,57 +173,60 @@ def _run_locked(args, base):
                 continue
             try:
                 # Check capacity before constructor migrations or any package writes.
-                disk.check([('问答索引磁盘', base)])
-                index = LargeQAIndex(package_id,base,create=True)
-                stamp = demand.package_stamp(package)
-                if demand.should_sync(time.monotonic(),last_sync.get(package_id),
-                                      stamps.get(package_id),stamp):
-                    heartbeat(base,states,'syncing_summaries')
-                    changed = index.sync_store(store)
-                    if changed or package_id not in last_sync:
-                        refresh_maps(index)
-                    last_sync[package_id] = time.monotonic()
-                    stamps[package_id] = stamp
-                    states[package_id] = snapshot(index)
-                    LOGGER.info('summary sync package=%s changed=%s files=%s',package_id,changed,states[package_id]['files'])
-                    did_work |= bool(changed)
-                if not args.summaries_only and extracted<budget and not foreground_busy():
-                    doc = index.next_parse()
-                    if doc:
-                        disk.check([('问答索引磁盘', base),
-                                    ('原文解析结果磁盘', Config.DATA_DIR/'large_qa'/'parse_artifacts'),
-                                    ('解析临时磁盘', os.getenv('SJFX_PARSE_TEMP_DIR', str(Config.PARSE_TEMP_DIR)))])
-                        heartbeat(base,states,'indexing_originals')
-                        try:
-                            records,complete,note = extract_document(package['root_path'],doc)
-                        except Exception as exc:
-                            if resource_code(exc):
-                                raise
-                            records,complete,note = [],False,str(exc)
-                        index.put_original(doc['path'],doc['source_version'],records,complete,note)
-                        did_work = True
-                        extracted += 1
-                        states[package_id] = snapshot(index)
-                        if pause:
-                            time.sleep(pause)
-                if (not args.summaries_only and not STOP and getattr(Config,'LARGE_QA_REFINE_TOPICS',False)
-                        and time.monotonic()-last_refine>60 and not foreground_busy()):
-                    if model is None:
-                        model = create_model_client(Config, timeout=90, max_concurrency=1)
-                    if model is not None:
-                        heartbeat(base,states,'refining_topic')
-                        from services.model_dispatch import background_generation
-                        cancelled=lambda: STOP or foreground_busy()
-                        with background_generation(cancelled):
-                            refined=refine_one(index,model,cancel_check=cancelled)
-                        if refined:
+                with qa_store_execution(store, package_id):
+                    disk.check([('问答索引磁盘', base)])
+                    index = LargeQAIndex(package_id,base,create=True)
+                    stamp = demand.package_stamp(package)
+                    if demand.should_sync(time.monotonic(),last_sync.get(package_id),
+                                          stamps.get(package_id),stamp):
+                        heartbeat(base,states,'syncing_summaries')
+                        changed = index.sync_store(store)
+                        if changed or package_id not in last_sync:
                             refresh_maps(index)
+                        last_sync[package_id] = time.monotonic()
+                        stamps[package_id] = stamp
+                        states[package_id] = snapshot(index)
+                        LOGGER.info('summary sync package=%s changed=%s files=%s',package_id,changed,states[package_id]['files'])
+                        did_work |= bool(changed)
+                    if not args.summaries_only and extracted<budget and not foreground_busy():
+                        doc = index.next_parse()
+                        if doc:
+                            disk.check([('问答索引磁盘', base),
+                                        ('原文解析结果磁盘', Config.DATA_DIR/'large_qa'/'parse_artifacts'),
+                                        ('解析临时磁盘', os.getenv('SJFX_PARSE_TEMP_DIR', str(Config.PARSE_TEMP_DIR)))])
+                            heartbeat(base,states,'indexing_originals')
+                            try:
+                                records,complete,note = extract_document(package['root_path'],doc)
+                            except ProtectionError:
+                                raise
+                            except Exception as exc:
+                                if resource_code(exc):
+                                    raise
+                                records,complete,note = [],False,str(exc)
+                            index.put_original(doc['path'],doc['source_version'],records,complete,note)
                             did_work = True
-                    last_refine = time.monotonic()
-                states.setdefault(package_id,{})
-                for key in ('error', 'resource_pause', 'retry_at'):
-                    states[package_id].pop(key, None)
-                retry_after.pop(package_id, None)
+                            extracted += 1
+                            states[package_id] = snapshot(index)
+                            if pause:
+                                time.sleep(pause)
+                    if (not args.summaries_only and not STOP and getattr(Config,'LARGE_QA_REFINE_TOPICS',False)
+                            and time.monotonic()-last_refine>60 and not foreground_busy()):
+                        if model is None:
+                            model = create_model_client(Config, timeout=90, max_concurrency=1)
+                        if model is not None:
+                            heartbeat(base,states,'refining_topic')
+                            from services.model_dispatch import background_generation
+                            cancelled=lambda: STOP or foreground_busy()
+                            with background_generation(cancelled):
+                                refined=refine_one(index,model,cancel_check=cancelled)
+                            if refined:
+                                refresh_maps(index)
+                                did_work = True
+                        last_refine = time.monotonic()
+                    states.setdefault(package_id,{})
+                    for key in ('error', 'resource_pause', 'retry_at'):
+                        states[package_id].pop(key, None)
+                    retry_after.pop(package_id, None)
             except Exception as exc:
                 state = states.setdefault(package_id,{})
                 code = resource_code(exc)

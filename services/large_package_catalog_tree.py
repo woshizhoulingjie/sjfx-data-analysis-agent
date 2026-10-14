@@ -1,4 +1,6 @@
 """Versioned multilevel navigation; every leaf has one parent and keeps its files."""
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact
+from sjfx_protection.store import ProtectionError
 import hashlib
 import json
 import math
@@ -255,6 +257,7 @@ def _scope_support(ids, vectors, leaf_mean, centered_mode, threshold, corpus_siz
     return raw, centered, margins
 
 
+@package_lane
 def build(store,package_id,round_state,cancelled=lambda:False,model_client=None):
     from services.large_package_catalog_coordination import topic_window
     with topic_window(store, package_id, round_state, cancelled) as window:
@@ -900,6 +903,8 @@ def _build(store,package_id,round_state,cancelled=lambda:False,model_client=None
                                            'rounds':coverage_rounds},ensure_ascii=False),
                                'catalog_tree',time.time()))
                     c.commit()
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception('coverage event failed: %s', package_id)
             LOGGER.warning('theme coverage low package=%s acceptance=%.2f k=%d '

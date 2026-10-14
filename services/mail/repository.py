@@ -53,17 +53,26 @@ class MailRepository:
         )
 
     @contextmanager
-    def _connection(self):
+    def _connection(self, *, schema=False):
+        from sjfx_protection.mail_cache import connection as protected_connection
         lock = getattr(self.storage, "lock", None)
         if lock:
             with lock, self.storage._connect() as connection:
-                yield connection
+                if schema:
+                    yield getattr(connection, 'raw', connection)
+                else:
+                    with protected_connection(connection, self.storage.db_path) as checked:
+                        yield checked
         else:
             with self.storage._connect() as connection:
-                yield connection
+                if schema:
+                    yield getattr(connection, 'raw', connection)
+                else:
+                    with protected_connection(connection, self.storage.db_path) as checked:
+                        yield checked
 
     def migrate(self):
-        with self._connection() as connection:
+        with self._connection(schema=True) as connection:
             return migrate(connection)
 
 
@@ -167,7 +176,9 @@ class MailRepository:
             preferred = next((part.mime_path for part in parsed.parts if part.part_role == "body_html" and (part.text or "").strip()), None)
         plain = next((part.mime_path for part in parsed.parts if part.part_role == "body_plain"), None)
         html = next((part.mime_path for part in parsed.parts if part.part_role == "body_html"), None)
-        with self._connection() as connection:
+        from sjfx_protection.business import enabled as protection_enabled
+        from sjfx_protection.mail_cache import raw_production
+        with self._connection() as connection, raw_production(connection, raw, member.name):
             source_id = _id("ms")
             connection.execute(
                 "INSERT OR IGNORE INTO mail_sources(source_id,package_id,locator_type,root_path,container_path,container_sha256,member_name,member_ordinal,source_size,source_revision,locator_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -176,7 +187,7 @@ class MailRepository:
             source_row = connection.execute("SELECT source_id FROM mail_sources WHERE package_id=? AND member_name=? AND member_ordinal=?", (package_id, member.name, member.ordinal)).fetchone()
             source_id = source_row["source_id"]
             existing = connection.execute("SELECT message_key,raw_sha256 FROM mail_messages WHERE raw_sha256=?", (raw_sha,)).fetchone()
-            if not existing:
+            if not existing and not protection_enabled():
                 # A transport/export copy can differ in Received or mailbox
                 # flags. Never collapse a Message-ID conflict on that ID alone.
                 from .deduplication import copy_fingerprint
@@ -203,8 +214,9 @@ class MailRepository:
                     "INSERT INTO mail_messages(message_key,raw_sha256,canonical_message_id_raw,canonical_message_id_normalized,subject_raw,subject_normalized,date_raw,sent_at_utc,timezone_offset_minutes,body_preferred_part,body_plain_part,body_html_part,body_language,parse_status,parser_version,source_revision,headers_json,warnings_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (message_key, raw_sha, message_id, normalize_message_id(message_id), self._header(parsed, "subject"), normalized_subject(self._header(parsed, "subject")), parsed.date_raw, parsed.sent_at_utc, parsed.timezone_offset_minutes, preferred, plain, html, self._language("\n".join(part.text or "" for part in parsed.parts if part.part_role.startswith("body_"))), parsed.parse_status, "mail-eml-v3", source["source_revision"], _json(parsed.headers_raw), _json(parsed.warnings)),
                 )
-                self._insert_participants(connection, message_key, parsed.participants)
-                self._insert_parts(connection, message_key, parsed.parts)
+                if not protection_enabled():
+                    self._insert_participants(connection, message_key, parsed.participants)
+                    self._insert_parts(connection, message_key, parsed.parts)
             occurrence_id = _id("mo")
             connection.execute(
                 "INSERT OR IGNORE INTO mail_occurrences(occurrence_id,package_id,source_id,message_key,source_member_name,source_member_ordinal,raw_sha256) VALUES (?,?,?,?,?,?,?)",
@@ -213,6 +225,13 @@ class MailRepository:
             occurrence = connection.execute("SELECT occurrence_id,raw_sha256 FROM mail_occurrences WHERE package_id=? AND source_id=? AND source_member_name=?", (package_id, source_id, member.name)).fetchone()
             if occurrence['raw_sha256'] != raw_sha:
                 raise ValueError('邮件来源条目内容已变化；请作为新的资料包版本导入')
+            if protection_enabled():
+                # Reconstruct every header field from the verified original.
+                connection.execute('UPDATE mail_messages SET canonical_message_id_raw=?,canonical_message_id_normalized=?,subject_raw=?,subject_normalized=?,date_raw=?,sent_at_utc=?,headers_json=? WHERE message_key=?',
+                    (message_id, normalize_message_id(message_id), self._header(parsed, 'subject'), normalized_subject(self._header(parsed, 'subject')), parsed.date_raw, parsed.sent_at_utc, _json(parsed.headers_raw), message_key))
+                connection.execute('DELETE FROM mail_message_participants WHERE message_key=?', (message_key,))
+                self._insert_participants(connection, message_key, parsed.participants)
+                self._insert_parts(connection, message_key, parsed.parts)
             from .foundation import retain_content
             if not existing or existing['raw_sha256'] == raw_sha:
                 retain_content(connection, message_key, raw, parsed)
@@ -227,7 +246,7 @@ class MailRepository:
             first = connection.execute('SELECT source_member_name,source_member_ordinal FROM mail_visible_occurrences WHERE package_id=? AND message_key=? ORDER BY source_member_ordinal,source_member_name LIMIT 1', (package_id, message_key)).fetchone()
             if first:
                 connection.execute("UPDATE mail_import_entries SET status=CASE WHEN member_name=? AND member_ordinal=? THEN 'ready' ELSE 'duplicate' END WHERE package_id=? AND message_key=? AND status IN ('ready','duplicate')", (first['source_member_name'], first['source_member_ordinal'], package_id, message_key))
-            if new_message:
+            if new_message or protection_enabled():
                 self._insert_body_segments(connection, package_id, message_key, parsed.parts, source["source_revision"])
             elif not connection.execute(
                 "SELECT 1 FROM mail_text_segments WHERE package_id=? AND message_key=? LIMIT 1",
@@ -269,6 +288,11 @@ class MailRepository:
             address_id = row["address_id"] if row else _id("ma")
             if not row:
                 connection.execute("INSERT INTO mail_addresses(address_id,normalized_address,raw_address_sample,display_name_sample) VALUES (?,?,?,?)", (address_id, normalized, raw_address, display_name))
+            else:
+                from sjfx_protection.business import enabled
+                if enabled():
+                    connection.execute("INSERT OR IGNORE INTO mail_message_participants(message_key,address_id,role,position) VALUES (?,?,?,?)", (message_key, address_id, role, position))
+                    connection.execute('UPDATE mail_addresses SET raw_address_sample=?,display_name_sample=? WHERE address_id=?', (raw_address, display_name, address_id))
             connection.execute("INSERT OR IGNORE INTO mail_message_participants(message_key,address_id,role,position) VALUES (?,?,?,?)", (message_key, address_id, role, position))
 
     def _insert_parts(self, connection, message_key, parts):
@@ -281,11 +305,13 @@ class MailRepository:
                 connection.execute("UPDATE mail_parts SET part_role='retired',is_explicit_attachment=0,is_inline_resource=0 WHERE message_key=? AND mime_path=?", (message_key, row['mime_path']))
         for part in parts:
             connection.execute(
-                "INSERT INTO mail_parts(part_id,message_key,mime_path,parent_mime_path,content_type,content_disposition,content_id,filename_raw,transfer_encoding,byte_size,payload_sha256,part_role,is_explicit_attachment,is_inline_resource,locator_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(message_key,mime_path) DO UPDATE SET content_type=excluded.content_type,content_disposition=excluded.content_disposition,filename_raw=excluded.filename_raw,byte_size=excluded.byte_size,payload_sha256=excluded.payload_sha256,part_role=excluded.part_role,is_explicit_attachment=excluded.is_explicit_attachment,is_inline_resource=excluded.is_inline_resource",
+                "INSERT INTO mail_parts(part_id,message_key,mime_path,parent_mime_path,content_type,content_disposition,content_id,filename_raw,transfer_encoding,byte_size,payload_sha256,part_role,is_explicit_attachment,is_inline_resource,locator_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(message_key,mime_path) DO UPDATE SET content_type=excluded.content_type,content_disposition=excluded.content_disposition,content_id=excluded.content_id,filename_raw=excluded.filename_raw,byte_size=excluded.byte_size,payload_sha256=excluded.payload_sha256,part_role=excluded.part_role,is_explicit_attachment=excluded.is_explicit_attachment,is_inline_resource=excluded.is_inline_resource",
                 (_id("mpart"), message_key, part.mime_path, part.parent_mime_path, part.content_type, part.content_disposition, part.content_id, part.filename_raw, part.transfer_encoding, part.byte_size, part.payload_sha256, part.part_role, int(part.is_explicit_attachment), int(part.is_inline_resource), _json({})),
             )
 
     def _insert_body_segments(self, connection, package_id, message_key, parts, revision):
+        from sjfx_protection.business import enabled
+        protected = enabled()
         length = self.text_segment_chars
         # Plain and HTML are alternate representations, not duplicate messages.
         selected = [p for p in parts if p.part_role == 'body_plain' and (p.text or '').strip()]
@@ -299,14 +325,19 @@ class MailRepository:
                 fragment = text[start:start + length]
                 segment_id = 'mseg_' + hashlib.sha256(_json([package_id,message_key,part.mime_path,'body',ordinal,fragment]).encode()).hexdigest()
                 connection.execute(
-                    "INSERT OR IGNORE INTO mail_text_segments(segment_id,package_id,message_key,mime_path,source_kind,language,ordinal,page_number,sheet_name,char_start,char_end,text,text_sha256,source_revision,index_epoch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("INSERT OR REPLACE" if protected else "INSERT OR IGNORE") + " INTO mail_text_segments(segment_id,package_id,message_key,mime_path,source_kind,language,ordinal,page_number,sheet_name,char_start,char_end,text,text_sha256,source_revision,index_epoch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (segment_id, package_id, message_key, part.mime_path, "body", self._language(fragment), ordinal, None, None, start, start + len(fragment), fragment, hashlib.sha256(fragment.encode("utf-8")).hexdigest(), revision, 0),
                 )
-                if not connection.execute('SELECT 1 FROM mail_search_fts WHERE segment_id=?',(segment_id,)).fetchone():
+                if protected:
+                    connection.execute('DELETE FROM mail_search_fts WHERE segment_id=?', (segment_id,))
+                if protected or not connection.execute('SELECT 1 FROM mail_search_fts WHERE segment_id=?',(segment_id,)).fetchone():
                     connection.execute("INSERT INTO mail_search_fts(segment_id,package_id,message_key,mime_path,field,language,text) VALUES (?,?,?,?,?,?,?)", (segment_id, package_id, message_key, part.mime_path, "body", self._language(fragment), fragment))
 
     def _copy_segments_to_package(self, connection, package_id, message_key):
         """Copy existing derived text into a package-local search projection."""
+        from sjfx_protection.business import enabled
+        if enabled():
+            return 0
         package = connection.execute(
             "SELECT source_revision,index_epoch FROM mail_packages WHERE package_id=?",
             (package_id,),
@@ -855,6 +886,9 @@ class MailRepository:
             with self._connection() as c:
                 return self.replace_attachment_segments(package_id,owner_id,message_key,mime_path,text,page_number=page_number,sheet_name=sheet_name,units=units,connection=c)
         targets=connection.execute("SELECT DISTINCT p.package_id,p.source_revision,p.index_epoch FROM mail_packages p JOIN mail_visible_occurrences o ON o.package_id=p.package_id JOIN mail_parts part ON part.message_key=o.message_key WHERE o.message_key=? AND part.mime_path=? AND part.is_explicit_attachment=1",(message_key,mime_path)).fetchall()
+        from sjfx_protection.business import enabled
+        if enabled():
+            targets = [target for target in targets if target['package_id'] == package_id]
         for target in targets:
             self._replace_attachment_segments_for_package(connection,target,message_key,mime_path,text,page_number=page_number,sheet_name=sheet_name,units=units)
 
@@ -1047,6 +1081,14 @@ class MailRepository:
     def event(self, turn_id, event_type, payload):
         with self._connection() as connection:
             sequence = connection.execute("SELECT COALESCE(MAX(sequence),0)+1 value FROM mail_research_events WHERE turn_id=?", (turn_id,)).fetchone()["value"]
+            from sjfx_protection import business
+            projection = getattr(business, 'metadata_projection', None)
+            if (business.enabled() and projection is not None and projection.get() and
+                    event_type in {'cancel_requested', 'paused', 'cancelled'}):
+                connection.metadata_insert('mail_research_events', {
+                    'event_id': _id('mre'), 'turn_id': turn_id, 'sequence': sequence,
+                    'event_type': event_type, 'payload_json': _json(payload)})
+                return
             connection.execute("INSERT INTO mail_research_events(event_id,turn_id,sequence,event_type,payload_json) VALUES (?,?,?,?,?)", (_id("mre"), turn_id, sequence, event_type, _json(payload)))
 
     def create_result_set(self, package_id, owner_id, items, definition, coverage, parent_result_set_id=None):

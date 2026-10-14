@@ -5,7 +5,7 @@ revision/owner keys and final application guards remain in the naming module.
 """
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 import logging
 import threading
 
@@ -61,7 +61,7 @@ def start(store, package_id, group_ids, cancelled=lambda: False, limit=4):
                 except Exception:
                     # Foreground preparation owns retry/status; warming is optional.
                     LOGGER.debug('Evidence prefetch skipped for %s/%s', package_id, group_id, exc_info=True)
-        _future = _executor.submit(warm)
+        _future = _executor.submit(copy_context().run, warm)
         owned = _owned.get()
         if owned is not None:
             owned.append(_future)

@@ -1,5 +1,7 @@
 """Incremental semantic groups for the isolated large-package directory only."""
 from __future__ import annotations
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact
+from sjfx_protection.store import ProtectionError
 import hashlib
 import math
 import json
@@ -107,6 +109,8 @@ def embed_batch_size():
         from config import Config
         return max(1, min(64, int(os.getenv('SJFX_LP_EMBED_MAX_BATCH_SIZE', '').strip() or
             getattr(Config, 'VLLM_EMBED_MAX_BATCH_SIZE', 8) or 8)))
+    except ProtectionError:
+        raise
     except Exception:
         return 8
 
@@ -124,6 +128,8 @@ def embed_timeout():
         value = getattr(Config, 'LP_EMBED_TIMEOUT_SECONDS', None)
         if value:
             return max(5, min(600, int(value)))
+    except ProtectionError:
+        raise
     except Exception:
         pass
     return 60
@@ -165,7 +171,7 @@ class FallbackEmbeddingClient:
         from services.model_contract import LocalModelError
         kwargs = {} if retries is None else {'retries': retries}
         try:
-            return self.primary.embed(texts, **kwargs)
+            return guarded_model_call(self.primary,"embed",texts, **kwargs)
         except LocalModelError as exc:
             if not exc.retryable or exc.code not in {'unavailable', 'timeout', 'busy', 'resource_exhausted'}:
                 raise
@@ -173,7 +179,7 @@ class FallbackEmbeddingClient:
             self.fallbacks += 1
             LOGGER.warning('embedding primary temporarily unavailable [%s]; using verified backup %s',
                            exc.code, self.secondary.base_url)
-            values = self.secondary.embed(texts, **kwargs)
+            values = guarded_model_call(self.secondary,"embed",texts, **kwargs)
             return validate_vectors(values, dimension=self.primary.dimension)
 
     def with_options(self, **options):
@@ -353,6 +359,7 @@ def evidence_quality(value):
     return True, ''
 
 
+@package_lane
 def _mark_unusable(store, package_id, path, reason, token):
     """如实记录"正文不可用于语义归纳"，并结束该文件的 catalog 队列项。
 
@@ -402,6 +409,8 @@ def _mark_unusable(store, package_id, path, reason, token):
                 conn.rollback()
                 return False
             conn.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('mark unusable failed: %s/%s', package_id, path)
 
@@ -468,6 +477,8 @@ def _card_readable(conn, package_id, path):
         row = conn.execute(
             'SELECT card FROM lp_naming_features WHERE package_id=? AND path=? AND version=?',
             (package_id, path, FEATURE_VERSION)).fetchone()
+    except ProtectionError:
+        raise
     except Exception:
         return False
     if not row or not row['card']:
@@ -499,6 +510,7 @@ FRAGMENT_MAX_MEMBERS = 3
 DEGRADED_MIN_GROUPS = 10
 
 
+@package_lane
 def catalog_degraded(store, package_id):
     """这个包的目录是不是"降级模式"（固定 cap 切碎、从未做过语义聚类）。
 
@@ -543,6 +555,8 @@ def catalog_degraded(store, package_id):
                 'groups': groups, 'fragment_groups': small,
                 'fragment_ratio': round(small / float(groups), 3) if groups else 0.0,
                 'fragment_max_members': FRAGMENT_MAX_MEMBERS}
+    except ProtectionError:
+        raise
     except Exception:
         return {'degraded': False, 'reason': 'check_failed'}
 
@@ -571,11 +585,14 @@ def repair_member_counts(store, package_id=None):
                 conn.execute(sql)
             conn.commit()
         return True
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('member count repair failed: %s', package_id)
         return False
 
 
+@package_lane
 def calibrate(store, package_id, model, force=False):
     """Return (centre, threshold) for one package, cached between batches.
 
@@ -657,6 +674,7 @@ def _complete_catalog_queue(conn, package_id, path, lease=None):
                      "WHERE package_id=? AND path=? AND stage='catalog'", (now, package_id, path))
 
 
+@package_lane
 def _group(store, package_id, path, digest, vector, model, calibration=None, lease=None):
     from config import Config
     with store._lock, closing(store._connect()) as conn:
@@ -770,6 +788,7 @@ def _group(store, package_id, path, digest, vector, model, calibration=None, lea
     store._catalog_cache.pop(package_id, None)
 
 
+@package_lane
 def _split_one(store, package_id, group, limit):
     """Binary split of one oversized group; returns 1 when it actually split."""
     group_id = str(group['id'])
@@ -792,6 +811,8 @@ def _split_one(store, package_id, group, limit):
     matrix = np.vstack(vectors)
     try:
         center, _threshold = calibrate(store, package_id, model)
+    except ProtectionError:
+        raise
     except Exception:
         center = None
     projected = np.vstack([_project(value, center) for value in matrix])
@@ -845,6 +866,7 @@ def _split_one(store, package_id, group, limit):
     return 1
 
 
+@package_lane
 def _km_boost_get(store, package_id):
     """该包已经升过几档 k（k 自适应的持久化计数；重启后仍然生效）。"""
     try:
@@ -852,10 +874,13 @@ def _km_boost_get(store, package_id):
             row = conn.execute('SELECT k_boost FROM large_catalog_km_state WHERE package_id=?',
                                (package_id,)).fetchone()
         return int(row[0]) if row and row[0] is not None else 0
+    except ProtectionError:
+        raise
     except Exception:
         return 0
 
 
+@package_lane
 def _km_boost_set(store, package_id, value):
     try:
         with store._lock, closing(store._connect()) as conn:
@@ -867,11 +892,14 @@ def _km_boost_set(store, package_id, value):
                          (package_id, '', 0, time.time(), int(value), ''))
             conn.commit()
         return True
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('k boost write failed: %s', package_id)
         return False
 
 
+@package_lane
 def adaptive_k(store, package_id, base_k, n_paths, cfg):
     """k 自适应的实际取值：基础 k × factor^已升档数，仍受 kmin/kmax 约束。
 
@@ -884,6 +912,8 @@ def adaptive_k(store, package_id, base_k, n_paths, cfg):
             return int(base_k)
         factor = float(getattr(Config, 'LP_KM_ESCALATE_FACTOR', 2.0) or 2.0)
         top = max(0, int(getattr(Config, 'LP_KM_ESCALATE_MAX', 0) or 0))
+    except ProtectionError:
+        raise
     except Exception:
         return int(base_k)
     boost = min(top, _km_boost_get(store, package_id)) if top else 0
@@ -891,6 +921,7 @@ def adaptive_k(store, package_id, base_k, n_paths, cfg):
     return max(cfg['kmin'], min(cfg['kmax'], k, int(n_paths)))
 
 
+@package_lane
 def catalog_mixed_share(store, package_id):
     """叶组里"模型自认跨领域拼凑(mixed)"的占比 —— k 自适应的反馈信号。
 
@@ -918,6 +949,8 @@ def catalog_mixed_share(store, package_id):
                     'WHERE g.package_id=? AND g.member_count>0', (package_id,)):
                 try:
                     meta = json.loads(row[0] or '{}')
+                except ProtectionError:
+                    raise
                 except Exception:
                     continue
                 purity = str(meta.get('purity') or '').strip().lower()
@@ -942,6 +975,8 @@ def catalog_mixed_share(store, package_id):
                         if content_rev > 0 and (result_rev <= 0 or result_rev < content_rev):
                             stale += 1
                         mixed += 1
+    except ProtectionError:
+        raise
     except Exception:
         return 0, 0, None
     if stale:
@@ -950,12 +985,14 @@ def catalog_mixed_share(store, package_id):
     return mixed, known, (mixed / float(known)) if known else None
 
 
+@package_lane
 @_leaf_batch
 def maybe_escalate_k(store, package_id, force=False):
     from services.large_package_catalog_quality import repair_mixed
     return repair_mixed(store,package_id)
 
 
+@package_lane
 def effective_group_max(store, package_id, override=None):
     """叶子大小的**自适应上限**：由目标叶组数反推，而不是固定值。
 
@@ -980,6 +1017,8 @@ def effective_group_max(store, package_id, override=None):
         with closing(store._connect()) as conn:
             n = conn.execute("SELECT COUNT(*) FROM large_catalog_members "
                              "WHERE package_id=? AND LENGTH(vector)>0", (package_id,)).fetchone()[0]
+    except ProtectionError:
+        raise
     except Exception:
         n = 0
     if not n:
@@ -995,6 +1034,7 @@ def leaf_growth_cap(store):
     return max(8, int(math.ceil(target * factor)))
 
 
+@package_lane
 @_leaf_batch
 def split_oversized(store, package_id, max_size=None, max_rounds=6):
     """Split groups that grew past the configured size into coherent halves.
@@ -1026,6 +1066,8 @@ def split_oversized(store, package_id, max_size=None, max_rounds=6):
                                         "WHERE package_id=?", (package_id,)).fetchone()[0]
                 biggest = conn.execute("SELECT COALESCE(MAX(member_count),0) FROM large_catalog_groups "
                                        "WHERE package_id=?", (package_id,)).fetchone()[0]
+        except ProtectionError:
+            raise
         except Exception:
             n_groups = 0
             biggest = 0
@@ -1069,6 +1111,8 @@ def split_oversized(store, package_id, max_size=None, max_rounds=6):
                 break
             try:
                 progress += _split_one(store, package_id, group, limit)
+            except ProtectionError:
+                raise
             except Exception:
                 continue
         created += progress
@@ -1077,6 +1121,7 @@ def split_oversized(store, package_id, max_size=None, max_rounds=6):
     return created
 
 
+@package_lane
 def _apply_member(store, package_id, path, digest, result, score=1.0, lease=None):
     row = catalog.get_file(store, package_id, path)
     source = catalog.material(row) if row else None
@@ -1167,6 +1212,8 @@ def _km_settings():
     """读取 k-means 相关配置；Config 缺失时回退到安全默认值。"""
     try:
         from config import Config
+    except ProtectionError:
+        raise
     except Exception:
         Config = None
 
@@ -1195,6 +1242,8 @@ def _km_enabled():
     try:
         from config import Config
         return bool(getattr(Config, 'LP_CATALOG_KMODE', False))
+    except ProtectionError:
+        raise
     except Exception:
         return False
 
@@ -1272,6 +1321,8 @@ def _kmeans_fit(X, k, iters, seed=7):
                 sums = np.add.reduceat(X[order], starts, axis=0)
                 sums /= np.maximum(np.linalg.norm(sums, axis=1, keepdims=True), 1e-8)
                 centers[ordered[starts]] = sums
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception("catalog clustering accelerator failed; using legacy fit")
         return _kmeans_fit_legacy(X, k, iters, seed)
@@ -1334,6 +1385,8 @@ def _balanced_labels(X, k, cap, iters, seed=7, depth=0):
     k = max(2, min(int(k), max(2, n // 2)))
     try:
         C = _kmeans_fit(X, k, iters, seed=seed + depth)
+    except ProtectionError:
+        raise
     except Exception:
         return [0] * n
     lab = (X @ C.T).argmax(axis=1)
@@ -1434,12 +1487,14 @@ def absorb_undersized(labels, vectors, floor, cap):
     return [order[x] for x in labels], order
 
 
+@package_lane
 def _km_signature(store, package_id):
     from services.large_package_catalog_quality import vector_signature
     with closing(store._connect()) as conn:
         return vector_signature(conn,package_id)
 
 
+@package_lane
 def _km_state_get(store, package_id):
     with closing(store._connect()) as conn:
         row = conn.execute('SELECT signature FROM large_catalog_km_state WHERE package_id=?',
@@ -1447,6 +1502,7 @@ def _km_state_get(store, package_id):
     return str(row[0]) if row and row[0] else ''
 
 
+@package_lane
 def _km_state_put(store, package_id, signature, vectors):
     now = time.time()
     with store._lock, closing(store._connect()) as conn:
@@ -1457,6 +1513,7 @@ def _km_state_put(store, package_id, signature, vectors):
         conn.commit()
 
 
+@package_lane
 def material_pending_count(store, package_id):
     """还有多少个"有素材"的文件没有向量。**只有 0 才允许做全局聚类。**
 
@@ -1490,6 +1547,8 @@ def material_pending_count(store, package_id):
             try:
                 if catalog.material(row):
                     total += 1
+            except ProtectionError:
+                raise
             except Exception:
                 total += 1
     return total
@@ -1519,11 +1578,14 @@ def solo_group_candidates(package_id, conn, limit=500):
             "ORDER BY f.path LIMIT ?",
             (FEATURE_VERSION, package_id, int(limit))).fetchall()
         return [r[0] for r in rows]
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('solo candidate scan failed: %s', package_id)
         return []
 
 
+@package_lane
 @_leaf_batch
 def assign_solo_groups(store, package_id, limit=500):
     """把候选各自落成一个单文件条目，交给现有命名链路（queue_groups→命名）起名。
@@ -1569,6 +1631,8 @@ def assign_solo_groups(store, package_id, limit=500):
                 conn.execute(_MEMBER_UPSERT, (package_id, path, gid, '', b''))
                 created += 1
             conn.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('solo group assign failed: %s', package_id)
         return 0
@@ -1587,11 +1651,14 @@ def maintain_ungrouped(store, package_ids, limit=500):
             n = assign_solo_groups(store, str(package_id), limit)
             if n:
                 out[str(package_id)] = n
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('maintain_ungrouped failed: %s', package_id)
     return out
 
 
+@package_lane
 @_leaf_batch
 def kmeans_recluster(store, package_id, force=False):
     """把已落库的全部向量一次性用 k-means 重新分组。
@@ -1637,6 +1704,8 @@ def kmeans_recluster(store, package_id, force=False):
         if r['group_id'] in locked:continue
         try:
             v = _vector(np.frombuffer(r['vector'], dtype=np.float32))
+        except ProtectionError:
+            raise
         except Exception:
             continue
         paths.append(r['path'])
@@ -1694,6 +1763,8 @@ def kmeans_recluster(store, package_id, force=False):
                         'floor=%d groups_after=%d',
                         package_id, len(sizes), singles, share, rescue_floor,
                         len({int(value) for value in labels}))
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('k-means fit failed: %s', package_id)
         return 0
@@ -1717,6 +1788,8 @@ def kmeans_recluster(store, package_id, force=False):
                     "deep_summary,'$.text_preview'),'')) AS m FROM files WHERE package_id=?",
                     (package_id,)).fetchall():
                 richness[r[0]] = max(int(r[1] or 0), int(r[2] or 0))
+    except ProtectionError:
+        raise
     except Exception:
         richness = {}
 
@@ -1871,6 +1944,8 @@ def kmeans_recluster(store, package_id, force=False):
             conn.execute('DELETE FROM lp_catalog_removed_groups WHERE package_id=?',(package_id,))
             save_signature(conn,package_id,len(paths))
             conn.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('k-means assign failed: %s', package_id)
         return 0
@@ -1881,6 +1956,7 @@ def kmeans_recluster(store, package_id, force=False):
     return changed
 
 
+@package_lane
 def _km_model_name(store, package_id):
     try:
         with closing(store._connect()) as conn:
@@ -1889,12 +1965,16 @@ def _km_model_name(store, package_id):
                 (package_id,)).fetchone()
         if row and row[0]:
             return row[0]
+    except ProtectionError:
+        raise
     except Exception:
         pass
     try:
         from services.embedding_backend import client_identity
         client = embedding_client()
         return client_identity(client) if client else ''
+    except ProtectionError:
+        raise
     except Exception:
         return 'multilingual-e5-small'
 
@@ -1926,8 +2006,12 @@ def embed_many(client, texts, factory=None):
     size = max(1, int(getattr(client, 'max_batch_size', 8) or 8))
     chunks = [values[i:i + size] for i in range(0, len(values), size)]
     width = max(1, min(int(embed_concurrency()), len(chunks)))
+    from sjfx_protection.business import enabled,context,activate
+    protection_context=dict(context() or {}) if enabled() else None
+    recheck_active()
     def checked_embed(instance, chunk):
-        result = list(instance.embed(chunk))
+        with activate(protection_context):
+            result = list(guarded_model_call(instance,"embed",chunk))
         if len(result) != len(chunk):
             raise ValueError('语义向量数量不一致')
         return result
@@ -1942,6 +2026,8 @@ def embed_many(client, texts, factory=None):
     for _ in range(width):
         try:
             made = factory()
+        except ProtectionError:
+            raise
         except Exception:
             made = None
         # A missing/aliased client cannot provide an independent request lane.
@@ -1983,10 +2069,13 @@ def embed_concurrency():
     try:
         from config import Config
         return max(1, min(4, int(getattr(Config, 'LP_EMBED_CONCURRENCY', 2) or 2)))
+    except ProtectionError:
+        raise
     except Exception:
         return 1
 
 
+@package_lane
 @_leaf_batch
 def embed_batch(store, package_id, client=None, cancelled=lambda: False):
     if cancelled():
@@ -2067,6 +2156,8 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
                     _require_space(conn, package_id, client, len(next(iter(fresh.values()))))
                     conn.executemany('INSERT OR REPLACE INTO large_catalog_embeddings VALUES(?,?,?)', [(model,k,fresh[k].tobytes()) for k in keys])
                     conn.commit()
+                except ProtectionError:
+                    raise
                 except Exception:
                     conn.rollback()
                     raise
@@ -2132,6 +2223,8 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
                         [(now, package_id, path, str(leases.get(path) or ''))
                          for path, value, digest in rows])
                     conn.commit()
+            except ProtectionError:
+                raise
             except Exception:
                 LOGGER.exception('k-means staging failed: %s', package_id)
                 for path, value, digest in rows:
@@ -2142,10 +2235,14 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
         # One calibration per batch keeps the write lock out of the cosine math.
         try:
             calibration = calibrate(store, package_id, model)
+        except ProtectionError:
+            raise
         except Exception:
             calibration = (None, SIMILARITY)
         for path, value, digest in rows:
             _group(store,package_id,path,digest,vectors[digest],model,calibration,leases.get(path))
+    except ProtectionError:
+        raise
     except Exception as exc:
         for path, value, digest in rows:
             catalog._save(store,package_id,path,digest,
@@ -2154,6 +2251,7 @@ def embed_batch(store, package_id, client=None, cancelled=lambda: False):
     return len(claimed)
 
 
+@package_lane
 @_leaf_batch
 def name_batch(store, package_id, cancelled=lambda: False):
     if cancelled():

@@ -29,6 +29,7 @@ class MailServices:
 def build_mail_services(storage, *, parser=None, translation_service=None,
                         owner_resolver=None, job_factory=None, model=None):
     runtime_storage = storage.initialize() if hasattr(storage, "initialize") else storage
+    from sjfx_protection.mail_cache import protected_model
     return MailServices(
         repository=MailRepository(runtime_storage),
         policy=MailPolicy.from_config(Config),
@@ -36,7 +37,7 @@ def build_mail_services(storage, *, parser=None, translation_service=None,
         translation_service=translation_service,
         owner_resolver=owner_resolver,
         job_factory=job_factory,
-        model=model,
+        model=protected_model(model),
         storage=runtime_storage,
     )
 

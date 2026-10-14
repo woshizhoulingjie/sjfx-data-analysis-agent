@@ -466,7 +466,10 @@ def serialized_generation(func):
                                                  parent_deadline if parent_deadline is not None else deadline))
                 kwargs['timeout'] = generation_timeout(requested)
                 generated = time.monotonic()
+                from sjfx_protection.business import recheck_active_sources
+                recheck_active_sources()
                 result = func(self,*args,**kwargs)
+                recheck_active_sources()
                 if isinstance(result, dict):
                     result = dict(result)
                     timing = dict(result.get('timing') or {})

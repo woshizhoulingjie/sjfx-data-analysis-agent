@@ -1,4 +1,6 @@
 """Bounded, cached theme naming. Never changes leaf or file membership."""
+from services.large_package_protection import package_lane, active_lane, recheck_active, guarded_model_call
+from sjfx_protection.store import ProtectionError
 from contextlib import closing
 import hashlib
 from services.embedding_encoding import prefix as embedding_prefix
@@ -36,11 +38,14 @@ def adaptive_labels(vectors, target, cancelled=lambda:False):
                 if value>score+1e-6:
                     best,score=labels.tolist(),value
         return best if score>0 else None
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('adaptive theme count unavailable; using bounded legacy grouping')
         return None
 
 
+@package_lane
 def semantic_centroids(store, package_id, leaves, fallback, cancelled=lambda:False):
     """Cluster themes by verified leaf scope, not template-heavy source centroids."""
     if len(leaves)<4 or os.getenv('SJFX_LP_TOPIC_SCOPE_VECTORS','1').lower() in {'0','false','off'}:
@@ -70,7 +75,7 @@ def semantic_centroids(store, package_id, leaves, fallback, cancelled=lambda:Fal
             if cancelled():
                 return fallback
             batch = missing[offset:offset+32]
-            encoded = client.embed([pending[k] for k in batch])
+            encoded = guarded_model_call(client,"embed",[pending[k] for k in batch])
             validate_vectors(encoded, len(batch), len(next(iter(vectors.values()))) if vectors else getattr(client, 'dimension', 0))
             if len(encoded)!=len(batch):
                 raise ValueError('Incomplete theme scope embeddings')
@@ -80,6 +85,8 @@ def semantic_centroids(store, package_id, leaves, fallback, cancelled=lambda:Fal
                 c.executemany('INSERT OR REPLACE INTO large_catalog_embeddings VALUES(?,?,?)',
                               [(identity,k,vectors[k].tobytes()) for k in batch])
         return {gid:vectors[key] for gid,key in keys.items()}
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('theme scope embedding failed; retaining source centroids package=%s',package_id)
         return fallback
@@ -278,7 +285,7 @@ def verify_secondary(store, package_id, members, round_state, cancelled, model_c
             if stop():
                 raise ValueError('Secondary window cancelled')
             kwargs['timeout'] = min(float(cfg['timeout']), max(.001, round_state['deadline']-time.time()))
-            response = model_client.chat(SECONDARY_SYSTEM, user, **kwargs)
+            response = guarded_model_call(model_client, 'chat', SECONDARY_SYSTEM, user, **kwargs)
         if stop() or response.get('finish_reason') == 'length':
             raise ValueError('Incomplete secondary verdict')
         value = extract_json_value(response.get('content', ''))
@@ -292,6 +299,8 @@ def verify_secondary(store, package_id, members, round_state, cancelled, model_c
                         'input_tokens':tokens, 'timing':response.get('timing') or {},
                         'validated_needs_review': result.get('needs_review') if result else None,
                         'validated_purity': result.get('purity') if result else None}
+    except ProtectionError:
+        raise
     except Exception as exc:
         return None, {'reason':naming.classify_failure(exc), 'error':str(exc)[:160]}
     finally:
@@ -300,6 +309,7 @@ def verify_secondary(store, package_id, members, round_state, cancelled, model_c
                                    'timing':response.get('timing') or {}, 'finish_reason':response.get('finish_reason')})
 
 
+@package_lane
 def name_topics(store, package_id, buckets, centroids, round_state, cancelled, model_client):
     """给上层簇起名。
 
@@ -365,6 +375,8 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
                 except (ValueError, TypeError, KeyError):
                     pass
             pending.append(item)
+        except ProtectionError:
+            raise
         except Exception as exc:
             LOGGER.warning('theme evidence failed package=%s cluster=%s: %s', package_id, lab, exc)
 
@@ -392,6 +404,8 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
                     _row = _c.execute('SELECT status,requests,max_requests,tokens,max_tokens '
                                       'FROM lp_catalog_rounds WHERE package_id=? AND id=?',
                                       (package_id, round_state['id'])).fetchone()
+            except ProtectionError:
+                raise
             except Exception:
                 pass
             LOGGER.warning('theme naming reservation refused package=%s round=%s status=%s '
@@ -416,7 +430,7 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
                 if stop():
                     raise ValueError('Theme window cancelled')
                 kwargs['timeout'] = min(float(cfg['timeout']), max(.001, round_state['deadline']-time.time()))
-                response = model_client.chat(SYSTEM, payload_for(items), **kwargs)
+                response = guarded_model_call(model_client,"chat",SYSTEM, payload_for(items), **kwargs)
             report['timings']['model_request_wall_seconds'] += time.monotonic()-request_started
             validate_started = time.monotonic()
             if response.get('finish_reason') == 'length':
@@ -456,6 +470,8 @@ def name_topics(store, package_id, buckets, centroids, round_state, cancelled, m
                     failed.append(item)
             outcome = 'completed' if not failed else 'partial'
             report['timings']['validation_seconds'] += time.monotonic()-validate_started
+        except ProtectionError:
+            raise
         except Exception as exc:
             LOGGER.warning('theme naming failed package=%s: %s', package_id, exc)
         finally:

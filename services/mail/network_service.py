@@ -205,6 +205,17 @@ def _index(repository, package_id, owner_id, *, view='mailbox', issue_id=None, a
         revision = _watch(repository)
         cache_key = (revision[0], str(owner_id), package_id, view, _json(applied))
         cached = _CACHE.get(cache_key)
+        from sjfx_protection import business, cache
+        proof_key = cache.resource_key(repository.storage.db_path, 'mail-network', package_id, view, _json(applied))
+        if cached and cached[0] == revision and business.enabled():
+            from sjfx_protection.store import ProtectionError
+            try:
+                cache.require_payload(proof_key, cached[1], owner=owner_id)
+            except ProtectionError as exc:
+                if exc.code not in {'cache_provenance_missing', 'context_stale'}:
+                    raise
+                _CACHE.pop(cache_key, None)
+                cached = None
         if cached and cached[0] == revision:
             index = cached[1]
             _CACHE.move_to_end(cache_key)
@@ -221,6 +232,7 @@ def _index(repository, package_id, owner_id, *, view='mailbox', issue_id=None, a
             index = _build_index(repository, package_id, owner_id, view, scope, args, applied, revision)
             if _watch(repository) != revision:
                 raise RuntimeError('资料正在变化，请重新加载图谱')
+            cache.record_payload(proof_key, index, owner=owner_id)
             _CACHE[cache_key] = (revision, index)
             _CACHE.move_to_end(cache_key)
             while len(_CACHE) > 4:

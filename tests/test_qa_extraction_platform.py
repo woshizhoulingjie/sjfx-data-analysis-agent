@@ -17,7 +17,7 @@ from services.process_liveness import (
 )
 
 
-def _qa_native_child(connection, path, relative, max_chars, root=None, doc=None, gate=None, parent_pid=None):
+def _qa_native_child(connection, path, relative, max_chars, root=None, doc=None, gate=None, parent_pid=None, protection_context=None):
     initialize_process_family()
     gate.wait(10)
     native = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])

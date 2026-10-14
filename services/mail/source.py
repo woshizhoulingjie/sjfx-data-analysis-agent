@@ -68,6 +68,14 @@ def open_authorized_file(locator, policy, *, owner_id=None, source_kind=None, so
                                    source_revision=source_revision)
     candidate = Path(value["path"])
     identity = value.get("identity") or file_identity(candidate)
+    from sjfx_protection.business import enabled, protected_path
+    if enabled():
+        # Ownership and the original occurrence identity were validated above.
+        # Only a checked immutable snapshot reaches the message parser.
+        approved = protected_path(candidate, owner=owner_id, operation='read')
+        with approved.open('rb') as stream:
+            yield stream
+        return
     node = dict(identity, path=candidate.name)
     try:
         descriptor, before = _open_inventory_source(candidate.parent, node)
@@ -369,25 +377,32 @@ def open_locator(locator, *, policy=None, owner_id=None, source_kind=None, sourc
     if kind == "nested":
         from .parsers.eml import parse_eml
         with open_locator(locator["parent"]) as stream:
-            parsed=parse_eml(stream.read())
+            parent_raw=stream.read()
+            parsed=parse_eml(parent_raw)
         part=next((p for p in parsed.parts if p.mime_path==locator["mime_path"] and p.part_role=="nested_message"),None)
         if not part:raise MailPolicyError("嵌套邮件来源不可用")
-        return io.BytesIO(part.raw_payload or b"")
+        from sjfx_protection.business import inspect_bytes
+        return io.BytesIO(inspect_bytes(part.raw_payload or b"",str(locator["mime_path"])+".eml",hashlib.sha256(parent_raw).hexdigest()))
     if kind == "file":
-        return Path(locator["path"]).open("rb")
+        from sjfx_protection.business import protected_path
+        return protected_path(locator["path"]).open("rb")
     if kind == "zip":
-        with zipfile.ZipFile(locator["path"]) as archive:
-            member=locator['member']
-            if 'header_offset' in locator:
-                member=next((info for info in archive.infolist() if info.header_offset==locator['header_offset'] and info.filename==locator['member']),None)
-                if member is None:raise MailPolicyError('压缩包来源条目已变化')
-            return io.BytesIO(archive.read(member))
+        from sjfx_protection.business import file_execution,inspect_bytes
+        with file_execution(locator['path']) as approved:
+            with zipfile.ZipFile(approved) as archive:
+                member=locator['member']
+                if 'header_offset' in locator:
+                    member=next((info for info in archive.infolist() if info.header_offset==locator['header_offset'] and info.filename==locator['member']),None)
+                    if member is None:raise MailPolicyError('压缩包来源条目已变化')
+                return io.BytesIO(inspect_bytes(archive.read(member),locator['member']))
     if kind == "mbox":
-        box = mailbox.mbox(locator["path"], create=False)
-        try:
-            return io.BytesIO(box.get_bytes(int(locator["key"]), from_=False))
-        finally:
-            box.close()
+        from sjfx_protection.business import file_execution,inspect_bytes
+        with file_execution(locator['path']) as approved:
+            box = mailbox.mbox(str(approved), create=False)
+            try:
+                return io.BytesIO(inspect_bytes(box.get_bytes(int(locator["key"]), from_=False),str(locator['key'])+'.eml'))
+            finally:
+                box.close()
     raise MailPolicyError("邮件来源定位器不可用")
 
 
@@ -438,6 +453,34 @@ def _open_authorized_locator(locator, policy, **authorization):
                 yield result
     else:
         raise MailPolicyError("邮件来源定位器不可用")
+
+
+class ProtectedAdapter(MailContainerAdapter):
+    """Business parsing receives approved snapshots and separately checked members."""
+    def __init__(self,adapter):self.adapter=adapter;self.format_name=adapter.format_name
+    def supports(self,source):return self.adapter.supports(source)
+    def inventory(self,source,policy):
+        from sjfx_protection.business import file_execution
+        if self.format_name=='directory':
+            yield from self.adapter.inventory(source,policy)
+        else:
+            with file_execution(source.path,operation='read') as snapshot:
+                approved=SourceRef(source.package_id,source.kind,str(snapshot),source.source_revision)
+                yield from self.adapter.inventory(approved,policy)
+    def open_message(self,source,member):
+        from sjfx_protection.business import file_execution,inspect_bytes
+        parent=member.locator.get('path') if self.format_name=='directory' else source.path
+        with file_execution(parent,operation='read') as snapshot:
+            locator=dict(member.locator)
+            if self.format_name in {'directory','eml'}:
+                raw=snapshot.read_bytes()
+            else:
+                locator['path']=str(snapshot)
+                approved_member=MailMember(member.name,member.ordinal,member.byte_size,locator)
+                approved=SourceRef(source.package_id,source.kind,str(snapshot),source.source_revision)
+                with self.adapter.open_message(approved,approved_member) as stream:raw=stream.read()
+                raw=inspect_bytes(raw,member.name)
+            return io.BytesIO(raw)
 
 
 def safe_copy_mbox_message(cache_root: Path, package_id: str, occurrence_id: str, stream) -> str:

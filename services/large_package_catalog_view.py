@@ -1,4 +1,6 @@
 """Stable node identities and read-time model labels for the isolated catalog."""
+from services.large_package_protection import package_lane
+from sjfx_protection.store import ProtectionError
 from contextlib import closing
 import json
 import os
@@ -64,6 +66,7 @@ CATALOG_STATE_SQL = """CASE
  ELSE COALESCE(json_extract(f.local_summary,'$.portrait.catalog_status'),'legacy') END"""
 
 
+@package_lane
 def decorate_files(store, package_id, files):
     if not files:return files
     paths=[f['path'] for f in files]
@@ -282,6 +285,7 @@ def _publication_metadata(c, package_id):
             'current_snapshot_id': state['current_snapshot_id']}
 
 
+@package_lane
 def enhance_catalog(store,package_id,result,limit=200,offset=0,query=''):
     # 批1 第 32 条：每个叶组的样本数。改动前对每个 group 单独发一条
     # `SELECT ... LIMIT 3`（默认 limit=200 → 200 次额外查询），这里改成
@@ -440,6 +444,7 @@ def enhance_catalog(store,package_id,result,limit=200,offset=0,query=''):
     return result
 
 
+@package_lane
 def catalog_tree(store, package_id):
     """轻量智能目录骨架：主题 → 叶组，供导出中心的文件选择树使用。
 
@@ -520,6 +525,8 @@ def catalog_tree(store, package_id):
     themes=[by_id[b['node_id']] for b in branches if not b.get('parent_id') and b['node_id'] in by_id]
     try:
         counts = store.counts(package_id) or {}
+    except ProtectionError:
+        raise
     except Exception:
         counts = {}
     return {

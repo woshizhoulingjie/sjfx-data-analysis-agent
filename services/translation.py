@@ -414,7 +414,8 @@ def _candidate_spans(text, glossary):
         (r"(?<![\w])[-+]?\d+(?:[,.]\d+)*(?:%|[A-Za-z]{1,5})?(?![\w])", "number"),
         (r"\b[A-Z][A-Z0-9&.-]{1,}\b", "acronym"),
         (r"\b[A-Z][a-z]+(?:[A-Z][A-Za-z0-9]*)+\b", "proper_name"),
-        (r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){1,3}\b", "proper_name"),
+        # A capitalized word in the next row/cell is not part of this name.
+        (r"\b[A-Z][a-z]{2,}(?:[^\S\r\n\t]+[A-Z][a-z]{2,}){1,3}\b", "proper_name"),
     ]
     for pattern, kind in patterns:
         for match in re.finditer(pattern, text, re.UNICODE):

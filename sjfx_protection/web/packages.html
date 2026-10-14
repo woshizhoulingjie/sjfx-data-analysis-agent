@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SJFX · 本地资料保护</title>
+<style>
+:root{font:15px/1.65 system-ui,"Microsoft YaHei",sans-serif;color:#203749;background:#f3f6f8}body{margin:0}
+main{max-width:1160px;margin:30px auto;padding:0 24px}header,.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}header{justify-content:space-between}h1{font-size:27px;margin:0}h2{font-size:19px}
+section{background:white;border:1px solid #dce5eb;border-radius:12px;padding:22px;margin:18px 0}label{display:block;margin:12px 0}
+input,select,button,textarea{font:inherit;padding:9px;border:1px solid #becdd8;border-radius:6px}input[type=text],textarea{width:min(680px,90%)}button{background:#174d65;color:white;cursor:pointer}button:disabled{opacity:.5}a{color:#174d65}
+.muted{color:#607586}.notice{background:#e6f0f4;border-radius:8px;padding:14px}.actions{display:flex;gap:8px;flex-wrap:wrap}.scroll{overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:10px;text-align:left;border-bottom:1px solid #e3ebf0;overflow-wrap:anywhere;white-space:pre-line}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f6f8;padding:16px;max-height:400px;overflow:auto}details{margin:12px 0}[hidden]{display:none!important}
+</style></head><body><main>
+<header><div><h1>本地资料保护</h1><div class="muted">选择电脑上的资料位置，检查当前内容版本，再使用资料。</div></div><div class="row"><a href="/protection/admin" id="adminLink" hidden>监视与处置</a><a href="/">工作台</a></div></header>
+<p id="notice" class="notice" role="status" aria-live="polite">正在读取状态…</p>
+<section id="admin" hidden><h2>保护设置</h2><label><input id="enabled" type="checkbox"> 启用本地资料保护</label>
+<p class="muted">开启后，SJFX 在使用资料前核对本地文件身份、当前内容版本和必要检查。关闭后保留检查与处置历史。</p>
+<div class="row"><label>删除 <select id="deletePolicy"></select></label><label>批量删除 <select id="bulkDeletePolicy"></select></label><label>改写 <select id="rewritePolicy"></select></label><label>批量改写 <select id="bulkRewritePolicy"></select></label><label>敏感导出 <select id="exportPolicy"></select></label></div>
+<label>危险版本处置 <select id="responsePolicy"><option value="observe">记录并暂停 SJFX 使用</option><option value="quarantine">交由已连接助手隔离确认危险的版本</option></select></label>
+<label>变更理由 <input id="policyReason" type="text" maxlength="2000"></label><button id="savePolicy">保存设置</button>
+<details><summary>账号本地资料位置授权</summary><p class="muted">在账号管理切换用户视角后，填写该账号允许访问的本地位置，每行一个绝对路径。</p><textarea id="grantRoots" rows="3" aria-label="允许访问的本地路径" placeholder="D:\资料\项目A"></textarea><label>授权理由 <input id="grantReason" type="text" maxlength="2000"></label><button id="saveGrants">保存位置授权</button><p id="grantOwner"></p></details></section>
+<section><h2>1 · 登记本地资料</h2><form id="form"><label>资料名称 <input id="name" type="text" required maxlength="160"></label>
+<label>本地文件或目录完整路径 <input id="localPath" name="local_path" type="text" required placeholder="例如 D:\资料\项目A 或 /home/user/资料" autocomplete="off" spellcheck="false"></label>
+<p class="muted">使用与分析输入相同的电脑本地路径。目录包含其当前成员；文件只登记该文件。编辑或替换后需要检查新版本。</p><button id="register" type="submit">登记并开始检查</button></form></section>
+<section><div class="row"><h2>2 · 当前检查与使用条件</h2><button id="refresh">刷新</button></div><div class="scroll"><table><thead><tr><th>资料与本地位置</th><th>状态</th><th>操作</th></tr></thead><tbody id="packages"></tbody></table></div></section>
+<section id="detailSection" hidden><details><summary>所选文件履历</summary><pre id="fileTrace">请在成员列表选择“履历”。</pre></details><h2>当前检查详情</h2><p id="detailSummary"></p><pre id="conditions"></pre><div id="jobs"></div><details><summary>本地目录监视、内容准入与程序访问审计覆盖</summary><pre id="coverage"></pre></details>
+<div class="scroll"><table><thead><tr><th>本地成员</th><th>当前版本与判断</th><th>必要检查覆盖</th><th>大小</th><th>复核</th></tr></thead><tbody id="files"></tbody></table></div><div class="row"><button id="previous">上一页</button><button id="next">下一页</button><span id="page"></span></div>
+<p class="muted">检查失败、超限、加密或格式不支持时暂停使用。管理员可以复核检查完整的可疑版本；确认危险的版本不能批准使用。</p>
+<div id="detailAdmin" hidden><label>管理理由 <input id="detailReason" type="text" maxlength="2000"></label><div class="row"><label>敏感分类 <select id="sensitivity"><option value="normal">普通资料</option><option value="sensitive">敏感资料</option><option value="restricted">限制资料</option></select></label><button id="saveSensitivity">保存分类</button></div></div>
+<details><summary>申请操作审批</summary><p class="muted">审批绑定操作及具体版本集合。执行时重新确认目标、策略和有效期。</p><label>操作 <select id="approvalOperation"><option value="delete">删除资料</option><option value="bulk_delete">批量删除</option><option value="rewrite">改写资料</option><option value="bulk_rewrite">批量改写</option><option value="export">敏感导出</option><option value="open">打开资料</option></select></label><label>申请理由 <input id="approvalReason" type="text" maxlength="2000"></label><button id="requestApproval">提交申请</button></details></section>
+<section><div class="row"><h2>3 · 操作审批</h2><button id="refreshApprovals">刷新审批</button><button id="clearApprovals">清除本次选择</button></div><p id="approvalNotice" class="muted">未选择审批。涉及多个资料包的操作，可以分别选择各包的对应审批。</p><div class="scroll"><table><thead><tr><th>资料与操作</th><th>申请与状态</th><th>操作</th></tr></thead><tbody id="approvals"></tbody></table></div></section>
+<p class="muted">本地内容核验用于 SJFX 的使用准入。电脑上的第三方程序访问记录以实际采集证据为准；访问审计和目录观察不能事前阻止所有电脑操作。隔离、锁定和恢复以助手实际回执为准。</p>
+</main><script src="/protection/packages.js"></script></body></html>

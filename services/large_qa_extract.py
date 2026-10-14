@@ -146,7 +146,7 @@ def _extract(path, relative, max_chars):
     return records,complete,note
 
 
-def _child(connection,path,relative,max_chars,root=None,doc=None,start_gate=None,parent_pid=None):
+def _child(connection,path,relative,max_chars,root=None,doc=None,start_gate=None,parent_pid=None,protection_context=None,task_id=''):
     os.environ['CUDA_VISIBLE_DEVICES']=''
     for name in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS'):
         os.environ[name]='1'
@@ -161,14 +161,24 @@ def _child(connection,path,relative,max_chars,root=None,doc=None,start_gate=None
                 raise RuntimeError('后台解析所属进程已退出')
             if not start_gate.wait(timeout=30):
                 raise RuntimeError('后台解析子进程未获得启动授权')
-        if doc and doc.get('source_kind') == 'archive_member':
-            from services.large_archive_members import member_snapshot
-            with member_snapshot(root, doc) as member_path:
-                result = _extract(str(member_path), relative, max_chars)
+        from sjfx_protection.business import activate, file_execution
+        from services.large_package_protection import recheck_active
+        with activate(protection_context,task_id=task_id):
+            recheck_active()
+            if doc and doc.get('source_kind') == 'archive_member':
+                from services.large_archive_members import member_snapshot
+                with member_snapshot(root, doc) as member_path:
+                    result = _extract(str(member_path), relative, max_chars)
+            else:
+                with file_execution(path, operation='parse') as approved:
+                    result = _extract(str(approved), relative, max_chars)
+            recheck_active()
             connection.send(('ok', result))
-        else:
-            connection.send(('ok',_extract(path,relative,max_chars)))
     except BaseException as exc:
+        from sjfx_protection.store import ProtectionError
+        if isinstance(exc, ProtectionError):
+            connection.send(('protection_denied', {'message': str(exc), 'code': exc.code, 'status': exc.status}))
+            return
         code = resource_code(exc)
         if code:
             connection.send(('resource_pressure', {'code': code, 'message': str(exc)[:400]}))
@@ -179,6 +189,10 @@ def _child(connection,path,relative,max_chars,root=None,doc=None,start_gate=None
 
 
 def extract_document(root,doc,timeout=90,memory_mb=1536,max_chars=2_000_000):
+    from sjfx_protection.business import context, enabled
+    from sjfx_protection.store import ProtectionError
+    from services.large_package_protection import recheck_active
+    recheck_active()
     root=Path(root).resolve()
     logical = doc.get('source_kind') == 'archive_member'
     if logical:
@@ -197,7 +211,10 @@ def extract_document(root,doc,timeout=90,memory_mb=1536,max_chars=2_000_000):
     parent,child=ctx.Pipe()
     start_gate = ctx.Event()
     args = (child,str(path),doc['path'],max_chars,
-            str(root) if logical else None, dict(doc) if logical else None, start_gate, os.getpid())
+            str(root) if logical else None, dict(doc) if logical else None, start_gate, os.getpid(),
+            dict(context() or {}) if enabled() else None)
+    from sjfx_protection.business import current_task_id
+    if enabled() and current_task_id():args += (current_task_id(),)
     process=ctx.Process(target=_child,args=args,daemon=True)
     started = False
     job_owner = None
@@ -215,6 +232,8 @@ def extract_document(root,doc,timeout=90,memory_mb=1536,max_chars=2_000_000):
         while time.monotonic()-start<timeout:
             if parent.poll(.15):
                 status,value=parent.recv()
+                if status=='protection_denied':
+                    raise ProtectionError(value['message'], value['status'], value['code'])
                 if status=='resource_pressure':
                     raise ResourcePressure(value['message'], value['code'])
                 if status!='ok':
@@ -224,6 +243,7 @@ def extract_document(root,doc,timeout=90,memory_mb=1536,max_chars=2_000_000):
                     raise ValueError('归档在提取期间变化，已丢弃结果')
                 if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):
                     raise ValueError('提取过程中源文件变化，已丢弃结果')
+                recheck_active()
                 return value
             if not process.is_alive():
                 raise ValueError('解析进程退出')

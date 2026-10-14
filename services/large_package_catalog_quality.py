@@ -1,4 +1,6 @@
 """Content checks for catalog mutations; no generative calls or source reads."""
+from services.large_package_protection import package_lane
+from sjfx_protection.store import ProtectionError
 import hashlib
 import json
 import re
@@ -73,6 +75,7 @@ def partition_members(rows, seeds, terms=None):
     return buckets
 
 
+@package_lane
 def split_assignment(store, package_id, group_id, seeds):
     from services import large_package_evidence_store as features
     cards = dict(features.group_cards(store, package_id, group_id))
@@ -246,6 +249,7 @@ def init(c):
     ''')
 
 
+@package_lane
 def representation(store, package_id):
     with store._lock, closing(store._connect()) as c:
         c.execute('INSERT OR IGNORE INTO lp_catalog_policy SELECT ?,CASE WHEN EXISTS('
@@ -254,6 +258,7 @@ def representation(store, package_id):
         return int(c.execute('SELECT representation FROM lp_catalog_policy WHERE package_id=?',(package_id,)).fetchone()[0])
 
 
+@package_lane
 def _repair_event(store, package_id, state, reason):
     """批3 第 15 条：把「增量修复没做/放弃了」如实写进工作流事件。"""
     import json as _json
@@ -264,10 +269,13 @@ def _repair_event(store, package_id, state, reason):
                       (package_id, 'catalog.repair', '', state,
                        _json.dumps(reason, ensure_ascii=False), 'repair_changed', time.time()))
             c.commit()
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('repair event failed: %s', package_id)
 
 
+@package_lane
 def repair_changed(store, package_id):
     """A completed catalog can absorb a bounded delta without rebuilding stable groups.
 
@@ -374,6 +382,8 @@ def repair_changed(store, package_id):
             c.execute('DELETE FROM lp_catalog_removed_groups WHERE package_id=?',(package_id,))
             save_signature(c,package_id,total)
             c.commit()
+        except ProtectionError:
+            raise
         except Exception:
             c.rollback();raise
     store._catalog_cache.pop(package_id,None)
@@ -399,6 +409,7 @@ def save_signature(c,package_id,total):
               (package_id,vector_signature(c,package_id),total,time.time()))
 
 
+@package_lane
 def repair_mixed(store,package_id):
     """混合组的局部修复调度（把"最该切、又还没切够"的组挑出来切一刀）。
 
@@ -428,6 +439,8 @@ def repair_mixed(store,package_id):
     with closing(store._connect()) as c:
         try:
             cap = int(semantic.effective_group_max(store, package_id) or 0)
+        except ProtectionError:
+            raise
         except Exception:
             cap = 0
         groups = [dict(r) for r in c.execute(
@@ -499,6 +512,7 @@ def repair_mixed(store,package_id):
     return bool(changed)
 
 
+@package_lane
 def _repair_split_point(store, package_id, group, failed_split):
     """切分点：没失败过用二分（保持既有行为）；失败过改成"按到质心距离的分位切"。
 
@@ -525,6 +539,7 @@ def _repair_split_point(store, package_id, group, failed_split):
     return max(2, min(len(order) - 2, cut))
 
 
+@package_lane
 def _group_purity(store, package_id, group_id):
     """当前组的纯度代理：成员到质心的平均余弦（判断切分有没有**真的**改善）。"""
     with closing(store._connect()) as c:

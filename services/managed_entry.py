@@ -10,6 +10,7 @@ import time
 ROLES = {
     'web': 'app.py', 'worker': 'worker.py',
     'large-worker': 'large_package_worker.py', 'qa-worker': 'scripts/large_qa_worker.py',
+    'embedding': 'services/mail/embedding_server.py',
 }
 
 def mark_role_ready():

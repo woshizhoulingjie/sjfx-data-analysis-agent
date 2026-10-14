@@ -1,4 +1,6 @@
 """Changed-path feature extraction, transactional document frequencies, round snapshots."""
+from services.large_package_protection import package_lane
+from sjfx_protection.store import ProtectionError
 import json
 import threading
 from collections import Counter
@@ -49,14 +51,17 @@ def init(c):
       DELETE FROM lp_feature_snapshot WHERE package_id=OLD.id; END;
     ''')
 
+@package_lane
 def identity(store,package_id):
     return str(store.db_path),str(package_id),FEATURE_VERSION
 
+@package_lane
 def revision(store,package_id):
     with closing(store._connect()) as c:
         row=c.execute('SELECT revision FROM lp_naming_feature_state WHERE package_id=?',(package_id,)).fetchone()
     return int(row[0]) if row else 0
 
+@package_lane
 def _seed(store,package_id):
     with store._lock,closing(store._connect()) as c:
         row=c.execute('SELECT version FROM lp_feature_meta WHERE package_id=?',(package_id,)).fetchone()
@@ -70,8 +75,11 @@ def _seed(store,package_id):
                       'ON CONFLICT(package_id,path) DO UPDATE SET generation=generation+1',(package_id,))
             c.execute('INSERT OR REPLACE INTO lp_feature_meta VALUES(?,?,0,0,0)',(package_id,FEATURE_VERSION))
             c.commit()
+        except ProtectionError:
+            raise
         except Exception:c.rollback();raise
 
+@package_lane
 def ensure_package(store,package_id,max_batches=None):
     with _LOCK:
         _seed(store,package_id)
@@ -123,10 +131,13 @@ def ensure_package(store,package_id,max_batches=None):
                     c.execute('UPDATE lp_feature_meta SET files=files+?,readable=readable+?,revision=revision+? WHERE package_id=?',
                               (files_delta,read_delta,changed,package_id))
                     c.commit()
+                except ProtectionError:
+                    raise
                 except Exception:c.rollback();raise
             cursor=rows[-1]['path'];batch_no+=1
         return revision(store,package_id)
 
+@package_lane
 def group_cards(store,package_id,group_id):
     ensure_package(store,package_id)
     with closing(store._connect()) as c:
@@ -136,11 +147,13 @@ def group_cards(store,package_id,group_id):
           WHERE m.package_id=? AND m.group_id=? ORDER BY m.path''',(FEATURE_VERSION,package_id,group_id)).fetchall()
     return [(r['path'],json.loads(r['card']) if r['card'] else None) for r in rows]
 
+@package_lane
 def snapshot_key(store,package_id):
     with closing(store._connect()) as c:
         row=c.execute('SELECT id FROM lp_catalog_rounds WHERE package_id=? ORDER BY started DESC LIMIT 1',(package_id,)).fetchone()
     return row[0] if row else 'initial'
 
+@package_lane
 def _meta_df(store,package_id):
     """包级**元数据**文档频次（headings/fields），供 profile.meta_templates 判版式。
 
@@ -168,6 +181,7 @@ def _meta_df(store,package_id):
     return df
 
 
+@package_lane
 def background(store,package_id):
     ensure_package(store,package_id)
     key=identity(store,package_id)+(snapshot_key(store,package_id),)

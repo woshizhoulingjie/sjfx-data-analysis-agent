@@ -226,8 +226,20 @@ async function api(url, options = {}) {
     // process restarts. Keep the HTTP status so polling can retry safely.
   }
   if (!response.ok || !data.ok) {
+    // Progress and cancellation stay available while content admission is
+    // paused. The server applies its bounded metadata projection to this call.
+    if (response.status === 423 && (!options.method || options.method === 'GET')
+        && /^\/api\/(jobs|large-packages)\/[^/?]+(?:\/workflow)?(?:\?|$)/.test(url)
+        && !url.includes('protection_metadata=')) {
+      const metadataUrl = url + (url.includes('?') ? '&' : '?') + 'protection_metadata=1';
+      const metadata = await api(metadataUrl, options);
+      const item = metadata.job || metadata.large_package;
+      if (item) { item.protection_stage = data.code; item.blocking_reason = data.error; }
+      return metadata;
+    }
     const error = new Error(data.error || `\u8bf7\u6c42\u5931\u8d25\uff08HTTP ${response.status}\uff09`);
     error.status = response.status;
+    error.code = data.code;
     error.transient = response.status >= 500 || [408, 425, 429].includes(response.status);
     throw error;
   }
@@ -3427,7 +3439,7 @@ function jobStageLabel(stage, job = {}) {
   if (stage === 'generating_summary' && source === 'preliminary_node_summary') return '生成初步节点摘要';
   if (stage === 'generating_summary' && source === 'deep_node_rebuild') return '生成深度节点摘要';
   return ({
-    queued: '等待 Worker', claimed: 'Worker 已接收', scanning: '盘点目录',
+    queued: '等待 Worker', claimed: 'Worker 已接收', security_inspection: '安全检查', scanning: '盘点目录',
     parsing: '解析文件', analyzing: '内容分析', generating_report: '生成概览',
     generating_summary: '生成深度摘要', preparing_export: '准备导出', exporting: '生成交接包',
     completed: '已完成', failed: '已失败', cancelled: '已取消'
@@ -3436,6 +3448,7 @@ function jobStageLabel(stage, job = {}) {
 
 
 function jobActivityText(job = {}) {
+  if (job.protection_stage && job.blocking_reason) return `安全准入暂停 · ${job.blocking_reason}`;
   const stage = job.current_stage || job.stage || '';
   const currentFile = job.current_file || '';
   const stageLabel = jobStageLabel(stage, job);
@@ -4433,7 +4446,7 @@ $('scanBtn').onclick =
 
     $('progressText')
       .textContent =
-        '正在遍历服务器目录；大数据包扫描阶段可能需要一段时间…';
+        '正在遍历本机目录；大数据包扫描阶段可能需要一段时间…';
 
     // A new scan starts a new UI session; clear selections from the prior package.
     state.scan = null;

@@ -845,6 +845,11 @@ class UnifiedDocumentParser:
             return None, reason + "；PDF 恢复尝试失败：{}".format(str(exc)[:200])
 
     def parse(self, path, relative_path=None, mode="accurate", _archive_depth=0):
+        from sjfx_protection.business import file_execution
+        with file_execution(path,derived=_archive_depth>0,member_name=relative_path) as approved:
+            return self._parse_approved(approved,relative_path,mode,_archive_depth)
+
+    def _parse_approved(self, path, relative_path=None, mode="accurate", _archive_depth=0):
         path = Path(path).resolve()
         file_size = path.stat().st_size
         ext = file_extension(path)

@@ -26,6 +26,8 @@
 """
 from __future__ import annotations
 
+from services.large_package_protection import package_lane, active_lane, recheck_active, guarded_model_call
+from sjfx_protection.store import ProtectionError
 import hashlib
 import json
 import time
@@ -67,6 +69,7 @@ def _source_fingerprint(item):
     return value
 
 
+@package_lane
 def load_file_fingerprints(large_store, package_id, paths, *, strict=False):
     """从**大包库**读取选中文件的 sha256/大小/修改时间（§9.2 快照要用）。"""
     if not large_store or not paths:
@@ -93,6 +96,8 @@ def load_file_fingerprints(large_store, package_id, paths, *, strict=False):
                                              'sensitive': bool(row['sensitive']),
                                              'source_kind': str(row['source_kind'] or ''),
                                              'source_metadata': json.loads(row['source_metadata'] or '{}')}
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('load_file_fingerprints failed: %s', package_id)
         if strict:
@@ -525,6 +530,8 @@ def apply_source_change_check(storage, large_store, scan_id, job_id=""):
             LOGGER.warning('large catalog source changed scan=%s files=%d',
                            scan_id, len(changed))
         return changed
+    except ProtectionError:
+        raise
     except Exception:                          # noqa: BLE001
         LOGGER.exception('source change check failed scan=%s', scan_id)
         return []
@@ -557,6 +564,7 @@ def _tree_from_records(records, root_payload):
     return nodes["."]
 
 
+@package_lane
 def missing_nodes(large_store, package_id, node_ids):
     """§11：选择里有哪些节点在智能目录里并不存在（路由据此返回 404 让用户刷新）。"""
     if not node_ids:
@@ -575,6 +583,7 @@ def missing_nodes(large_store, package_id, node_ids):
     return missing
 
 
+@package_lane
 def missing_paths(large_store, package_id, paths):
     """§11：选择里有哪些文件已不属于该大包（路由据此返回 409 并附上文件列表）。"""
     if not paths:
@@ -674,6 +683,7 @@ def _inventory_records(selection, large_package, fingerprints=None):
     return records, sorted(directories), excluded
 
 
+@active_lane
 def create_scan_from_large_selection(storage, large_package, selection, name, parse_mode,
                                      owner_id, request_key, request_payload=None,
                                      large_store=None):
@@ -914,6 +924,8 @@ def create_scan_from_large_selection(storage, large_package, selection, name, pa
                  json.dumps(snapshot, ensure_ascii=False), len(records), total_bytes,
                  "queued", now, now))
             conn.commit()
+        except ProtectionError:
+            raise
         except Exception:                             # noqa: BLE001
             conn.rollback()
             # Constraint/storage errors are not proof of a valid duplicate.

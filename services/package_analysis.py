@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from config import Config
+from sjfx_protection.store import ProtectionError
 from services.scanner import human_size, resolve_under
 from services.process_liveness import process_rss_bytes, try_lock_file
 from services.evidence import (
@@ -373,7 +374,8 @@ def _call_with_timeout(callable_obj, timeout_seconds, *args, **kwargs):
             completed.set()
 
     worker = threading.Thread(
-        target=invoke,
+        target=copy_context().run,
+        args=(invoke,),
         name="sjfx-bounded-stage-call",
         daemon=True,
     )
@@ -598,6 +600,15 @@ def _open_inventory_source(scan_root, file_node):
     """Open exactly the inventoried regular file without following links."""
     root = Path(scan_root).expanduser().resolve()
     parts = _relative_source_parts(file_node.get("path"))
+    from sjfx_protection.business import enabled,protected_path
+    if enabled():
+        snapshot=protected_path(root.joinpath(*parts))
+        source_fd=os.open(snapshot,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0))
+        opened=os.fstat(source_fd)
+        if opened.st_size!=int(file_node.get('size') or 0):
+            os.close(source_fd)
+            raise SourceFileChangedError('业务清单与获准版本大小不一致')
+        return source_fd,opened
     source_fd = None
     directory_fds = []
     try:
@@ -704,6 +715,11 @@ def _secure_source_snapshot(scan_root, file_node, cancel_check=None):
     is insufficient. Parsing a private snapshot closes the allow-list/open
     race and gives deterministic bytes for hashing and evidence generation.
     """
+    from sjfx_protection.business import enabled,file_execution
+    if enabled():
+        with file_execution(Path(scan_root)/str(file_node.get('path') or ''),operation='read') as approved:
+            yield approved
+        return
     expected_size = int(file_node.get("size") or 0)
     if expected_size > int(Config.MAX_CONTENT_BYTES):
         raise SourceFileChangedError("源文件超过中央 10 GiB 内容上限")
@@ -826,6 +842,22 @@ def _validate_logical_member_size(file_node, declared_size, container_size, comp
 
 @contextmanager
 def _logical_source_snapshot(scan_root, file_node, cancel_check=None, *, max_snapshot_bytes=None):
+    from sjfx_protection.business import enabled,file_execution,inspected_derived_path
+    if enabled():
+        container=container_node_for(file_node) if file_node.get('logical_unit') else file_node
+        with file_execution(Path(scan_root)/str(container['path']),operation='read') as snapshot:
+            if not file_node.get('logical_unit'):
+                yield snapshot
+            else:
+                with _logical_source_snapshot_approved(scan_root,file_node,cancel_check,max_snapshot_bytes=max_snapshot_bytes) as member:
+                    yield inspected_derived_path(member,str(file_node.get('member_name') or file_node.get('name')))
+        return
+    with _logical_source_snapshot_approved(scan_root,file_node,cancel_check,max_snapshot_bytes=max_snapshot_bytes) as snapshot:
+        yield snapshot
+
+
+@contextmanager
+def _logical_source_snapshot_approved(scan_root, file_node, cancel_check=None, *, max_snapshot_bytes=None):
     """Materialise exactly one logical member/partition into private scratch."""
     if not file_node.get("logical_unit"):
         with _secure_source_snapshot(scan_root, file_node, cancel_check) as snapshot:
@@ -1021,7 +1053,8 @@ def _parse_with_limits(
             raise
 
     executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(parser.parse, path, node_path, mode=mode)
+    from contextvars import copy_context
+    future = executor.submit(copy_context().run,parser.parse, path, node_path, mode=mode)
     try:
         deadline = time.monotonic() + timeout
         while True:
@@ -1150,7 +1183,7 @@ def _parallel_parse_files(
                     )
                 _restore_source_provenance(document, scan_root, file_node)
                 item = (index, file_node, document, None)
-            except ParseIsolationCancelled:
+            except (ParseIsolationCancelled, ProtectionError):
                 raise
             except Exception as exc:  # file-level failure is recoverable
                 item = (index, file_node, None, exc)
@@ -1192,12 +1225,13 @@ def _parallel_parse_files(
                     )
                 _restore_source_provenance(document, scan_root, file_node)
                 return index, file_node, document, None
-            except ParseIsolationCancelled:
+            except (ParseIsolationCancelled, ProtectionError):
                 raise
             except Exception as exc:
                 return index, file_node, None, exc
 
-        future_map[executor.submit(parse_task)] = index
+        from contextvars import copy_context
+        future_map[executor.submit(copy_context().run,parse_task)] = index
 
     try:
         # Keep only a small queue ahead of the active workers.  This makes

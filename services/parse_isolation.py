@@ -72,24 +72,26 @@ def _parser_server(conn, config, start_gate=None):
             command = request[0] if isinstance(request, (tuple, list)) else None
             if command == "stop":
                 return
-            if command != "parse" or len(request) != 5:
+            if command != "parse" or len(request) not in {5,6,7}:
                 conn.send(("error", "ValueError", "无效的解析子进程请求"))
                 continue
-            _, path, relative_path, mode, archive_depth = request
+            _, path, relative_path, mode, archive_depth = request[:5]
             try:
-                result = parser.parse(
-                    path,
-                    relative_path,
-                    mode=mode,
-                    _archive_depth=int(archive_depth or 0),
-                )
+                from sjfx_protection.business import activate
+                with activate(request[5] if len(request)>=6 else None,
+                              task_id=request[6] if len(request)==7 else ''):
+                    result = parser.parse(path,relative_path,mode=mode,_archive_depth=int(archive_depth or 0))
                 conn.send(("ok", result))
             except BaseException as exc:
                 # Do not send source text or a full traceback through the IPC
                 # channel; the type and bounded message are enough to diagnose
                 # the file-level failure in the parent job record.
                 try:
-                    conn.send(("error", type(exc).__name__, str(exc)[:1000]))
+                    from sjfx_protection.store import ProtectionError
+                    if isinstance(exc, ProtectionError):
+                        conn.send(("protection_denied", str(exc)[:1000], exc.code, exc.status))
+                    else:
+                        conn.send(("error", type(exc).__name__, str(exc)[:1000]))
                 except Exception:
                     return
     except (EOFError, OSError):
@@ -215,8 +217,10 @@ class IsolatedParserRunner:
             if not self.alive or self._recv is None or self._send is None:
                 self._start(min(timeout, 30.0), cancel_check, memory_mb)
             try:
+                from sjfx_protection.business import context,enabled,current_task_id
                 self._send.send(
-                    ("parse", str(path), str(relative_path), str(mode), int(archive_depth or 0))
+                    ("parse", str(path), str(relative_path), str(mode), int(archive_depth or 0),
+                     context() if enabled() else None,current_task_id())
                 )
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
@@ -227,6 +231,9 @@ class IsolatedParserRunner:
                         message = self._recv.recv()
                         if message[0] == "ok":
                             return message[1]
+                        if message[0] == "protection_denied":
+                            from sjfx_protection.store import ProtectionError
+                            raise ProtectionError(message[1], message[3], message[2])
                         if message[0] == "error":
                             raise ParseIsolationError(
                                 "{}：{}".format(message[1], message[2])

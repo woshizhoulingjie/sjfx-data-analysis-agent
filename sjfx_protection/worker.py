@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 import tempfile
@@ -147,6 +148,10 @@ def verify_inventory(store, collection):
                         db.execute('DELETE FROM risk_reviews WHERE file_id=?', (file_id,))
                 db.execute("UPDATE collections SET state='failed',error=?,updated=? WHERE id=?",
                            ('服务器文件发生变化，旧清单已失效；请重新登记', time.time(), collection))
+                if store._has_table(db,'registrations'):
+                    db.execute("UPDATE registrations SET state='changed',error='服务器成员或内容发生变化，请完整重新核验',updated=? WHERE collection_id=?",(time.time(),collection))
+                    db.execute("UPDATE registration_devices SET state='unverified' WHERE registration_id IN (SELECT id FROM registrations WHERE collection_id=?)",(collection,))
+                    db.execute("UPDATE actions SET state='stale' WHERE binding IN (SELECT i.id FROM file_instances i JOIN registrations r ON r.id=i.registration_id WHERE r.collection_id=?) AND state IN ('pending','running')",(collection,))
                 db.execute('DELETE FROM settings WHERE key=?', ('verified:'+collection,))
                 store._event(db, row['owner'], 'collection.changed',
                              payload={'collection_id': collection, 'change_count': len(changes)})
@@ -156,6 +161,8 @@ def verify_inventory(store, collection):
         with store.db(True) as db:
             db.execute("UPDATE collections SET state='failed',error=?,updated=? WHERE id=? AND state='ready'",
                        (str(exc)[:1000],time.time(),collection))
+            if store._has_table(db,'registrations'):
+                db.execute("UPDATE registrations SET state='unavailable',error=?,updated=? WHERE collection_id=?",(str(exc)[:1000],time.time(),collection))
             db.execute('DELETE FROM settings WHERE key=?', ('verified:'+collection,))
             if row:store._event(db,row['owner'],'collection.changed',payload={'collection_id':collection,'error':str(exc)[:1000]})
 
@@ -163,9 +170,19 @@ def verify_inventory(store, collection):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--state", required=True)
-    p.add_argument("--collection", required=True)
+    p.add_argument("--collection")
+    p.add_argument("--job")
     p.add_argument("--allowed-root", action="append", default=[])
     p.add_argument("--verify", action="store_true")
     args = p.parse_args()
-    if args.verify:verify_inventory(Store(args.state),args.collection)
+    if args.job:
+        from .registration import PackageProtection
+        from .business import BusinessAdapter
+        from config import Config
+        store=Store(args.state)
+        adapter=BusinessAdapter(Config.DB_PATH,Config.DATA_DIR/'large_package.db',Config.OUTPUT_DIR)
+        PackageProtection(store,args.allowed_root or Config.SCAN_ALLOWED_ROOTS,
+            authorize_root=adapter.authorize_root,authorize_owner=adapter.authorize_owner).process_job(args.job,worker_id='pid:'+str(os.getpid()))
+    elif not args.collection:p.error('--collection 或 --job 必须提供')
+    elif args.verify:verify_inventory(Store(args.state),args.collection)
     else:inventory(Store(args.state),args.collection,args.allowed_root)

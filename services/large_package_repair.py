@@ -33,6 +33,8 @@
 """
 from __future__ import annotations
 
+from services.large_package_protection import package_lane, active_lane, recheck_active, guarded_model_call
+from sjfx_protection.store import ProtectionError
 import argparse
 import hashlib
 import json
@@ -149,6 +151,8 @@ def r3_selections(store, apply=False):
             # 口径只有这一处实现（Worker 的 _finish_selection），修复脚本不另写一套。
             if worker._finish_selection(pid, force=True):
                 changed += 1
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("R3 selection settle failed: %s", pid)
     with closing(store._connect()) as conn:
@@ -180,6 +184,8 @@ def r4_member_counts(store, apply=False):
         try:
             if semantic.repair_member_counts(store, pid):
                 fixed += 1
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("R4 member_count repair failed: %s", pid)
     with closing(store._connect()) as conn:
@@ -207,6 +213,8 @@ def _grade(payload_text, deep_status):
         return "", ""
     try:
         data = json.loads(payload_text or "{}")
+    except ProtectionError:
+        raise
     except Exception:
         return _LEGACY_QUALITY, _LEGACY_COVERAGE
     if not isinstance(data, dict) or not data:
@@ -325,6 +333,8 @@ def r8_version_chain(store, apply=False):
                              "ORDER BY created_at DESC LIMIT 1", (pid,))
         try:
             validation = validate_catalog(store, pid)
+        except ProtectionError:
+            raise
         except Exception:
             validation = {}
         plan.append({"package_id": pid, "leaf_count": leaves, "topic_count": topics,
@@ -526,6 +536,8 @@ def run(store, apply=False, only=None):
         t = time.time()
         try:
             out = fn(store, apply=apply)
+        except ProtectionError:
+            raise
         except Exception as exc:
             LOGGER.exception("repair step failed: %s", code)
             out = {"error": repr(exc)[:300]}

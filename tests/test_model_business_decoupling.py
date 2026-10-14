@@ -98,6 +98,9 @@ def test_same_named_translation_model_has_separate_cache_contract_for_each_backe
 
 def test_large_rerank_switches_with_selected_backend_and_retains_candidates_on_outage(monkeypatch):
     monkeypatch.setenv('SJFX_SHARED_GENERATION_GATE', '0')
+    # This test isolates model transport. Authorization behavior has separate
+    # version/denial tests and needs a real protection configuration.
+    monkeypatch.setattr('sjfx_protection.business.enabled', lambda: False)
     items = [{'source_path': '{}.txt'.format(i)} for i in range(3)]
     with model_server() as (server, config), patch('config.Config', config):
         server.content = '3,1'

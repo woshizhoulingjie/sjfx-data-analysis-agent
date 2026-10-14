@@ -55,7 +55,7 @@ def samples(folder):
     book.save(folder / "sheet.xlsx"); book.close(); values["sheet.xlsx"] = folder / "sheet.xlsx"
     from PIL import Image, ImageDraw, ImageFont
     fonts = ("C:/Windows/Fonts/arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-    font = next((ImageFont.truetype(p, 48) for p in fonts if Path(p).is_file()), ImageFont.load_default())
+    font = next((ImageFont.truetype(p, 48) for p in fonts if Path(p).is_file()), ImageFont.load_default(size=48))
     image = Image.new("RGB", (1800, 600), "white"); draw = ImageDraw.Draw(image)
     for i, line in enumerate([TOKEN, "Project budget is 125000 yuan.", "Delivery date is 2026-12-20."]):
         draw.text((70, 80 + i * 115), line, fill="black", font=font)

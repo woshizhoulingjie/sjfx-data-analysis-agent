@@ -1,4 +1,6 @@
 """Evidence-checked synonym consolidation, confined to catalog tables."""
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact
+from sjfx_protection.store import ProtectionError
 from contextlib import closing
 import hashlib
 import json
@@ -73,6 +75,8 @@ def _policy_representation(c, package_id):
         row = c.execute('SELECT representation FROM lp_catalog_policy WHERE package_id=?',
                         (package_id,)).fetchone()
         return int(row[0]) if row else None
+    except ProtectionError:
+        raise
     except Exception:
         return None
 
@@ -103,6 +107,8 @@ def _merged_result_meta(c, package_id, host_id, result_revision, representation=
     try:
         meta = json.loads(c.execute('SELECT result FROM large_catalog_groups '
                                     'WHERE package_id=? AND id=?', (package_id, host_id)).fetchone()[0] or '{}')
+    except ProtectionError:
+        raise
     except Exception:
         meta = {}
     if not isinstance(meta, dict):
@@ -255,6 +261,7 @@ def _validate(value, rows):
     return checked
 
 
+@package_lane
 def apply_merge(store, package_id, rows, result, model, cancelled=lambda:False):
     from services.large_package_catalog_coordination import leaf_batch
     with leaf_batch(store, package_id, 'leaf-merge-apply', cancelled) as allowed:
@@ -305,6 +312,8 @@ def _apply_merge(store, package_id, rows, result, model, cancelled=lambda:False)
             from services.large_package_semantic import effective_group_max
             cap = merge_size_ceiling(store, package_id)
             _leaf_cap = int(effective_group_max(store, package_id))
+        except ProtectionError:
+            raise
         except Exception:
             cap = 0
         if cap > 1:
@@ -391,6 +400,7 @@ def _apply_merge(store, package_id, rows, result, model, cancelled=lambda:False)
     return len(rows)-1
 
 
+@package_lane
 def merge_size_ceiling(store, package_id):
     """同名/同义合并允许的成员上限：**永远不小于自适应叶子上限**。
 
@@ -421,6 +431,8 @@ def merge_size_ceiling(store, package_id):
     from services.large_package_semantic import effective_group_max
     try:
         cap = int(effective_group_max(store, package_id))
+    except ProtectionError:
+        raise
     except Exception:
         # 这里曾经**静默**吞掉异常：`effective_group_max` 当时没有在模块级导入，
         # 抛的 NameError 被吞成 cap=0，于是本函数一直只返回 auto（小语料上退化成 2），
@@ -435,6 +447,8 @@ def merge_size_ceiling(store, package_id):
         with closing(store._connect()) as conn:
             n = conn.execute('SELECT COUNT(*) FROM large_catalog_members '
                              'WHERE package_id=? AND LENGTH(vector)>0', (package_id,)).fetchone()[0]
+    except ProtectionError:
+        raise
     except Exception:
         n = 0
     auto = int(math.ceil(n / float(target) * ratio)) if n else 0
@@ -452,6 +466,7 @@ def merge_size_ceiling(store, package_id):
     return ceiling
 
 
+@package_lane
 def merge_identical_names(store, package_id, cancelled=lambda: False):
     from services.large_package_catalog_coordination import leaf_batch
     with leaf_batch(store, package_id, 'leaf-merge-identical', cancelled) as allowed:
@@ -500,6 +515,8 @@ def _merge_identical_names(store, package_id, cancelled=lambda: False):
             return 0
         try:
             cap = merge_size_ceiling(store, package_id)
+        except ProtectionError:
+            raise
         except Exception:
             cap = 0
         # 批1 第 13 条：**实时成员数**。一次 GROUP BY 取全包的计数（naming.normalize_leaves
@@ -508,6 +525,8 @@ def _merge_identical_names(store, package_id, cancelled=lambda: False):
             sizes = dict((str(r[0]), int(r[1] or 0)) for r in c.execute(
                 'SELECT group_id,COUNT(*) FROM large_catalog_members '
                 'WHERE package_id=? GROUP BY group_id', (package_id,)))
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception('identical-name merge: live sizes failed package=%s', package_id)
             sizes = dict((str(r['group_id']), int(r['member_count'] or 0)) for r in rows)
@@ -586,6 +605,7 @@ def _merge_identical_names(store, package_id, cancelled=lambda: False):
     return merged_groups
 
 
+@package_lane
 def consolidate(store, package_id, round_state, cancelled=lambda:False, model_client=None):
     from services.large_package_catalog_coordination import leaf_batch
     with leaf_batch(store, package_id, 'leaf-consolidation', cancelled) as allowed:
@@ -603,6 +623,8 @@ def _consolidate(store, package_id, round_state, cancelled=lambda:False, model_c
         if merged_identical:
             LOGGER.info('identical-name merge done package=%s groups=%d',
                         package_id, merged_identical)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('identical-name merge failed: %s', package_id)
     with closing(store._connect()) as c:
@@ -633,6 +655,8 @@ def _consolidate(store, package_id, round_state, cancelled=lambda:False, model_c
     # 尺子 `merge_size_ceiling`）：能装下就继续吸，装不下才停。
     try:
         _max_block = int(merge_size_ceiling(store, package_id) or 0)
+    except ProtectionError:
+        raise
     except Exception:
         LOGGER.exception('merge candidates: ceiling failed package=%s', package_id)
         _max_block = 0
@@ -734,7 +758,7 @@ def _consolidate(store, package_id, round_state, cancelled=lambda:False, model_c
                       'timeout':min(cfg['timeout'],max(1,int(round_state['deadline']-time.time())))}
             if getattr(model_client,'supports_json_response_format',False): kwargs['response_format']={'type':'json_object'}
             with background_generation(stop, deadline=naming.round_generation_deadline(round_state)):
-                response=model_client.chat(SYSTEM,user,**kwargs)
+                response=guarded_model_call(model_client,"chat",SYSTEM,user,**kwargs)
             if response.get('finish_reason')=='length' or stop(): raise ValueError('Incomplete merge response')
             data = extract_json_value(response.get('content',''))
             if not isinstance(data,dict): raise ValueError('Invalid merge response')
@@ -753,6 +777,8 @@ def _consolidate(store, package_id, round_state, cancelled=lambda:False, model_c
                 except (ValueError,TypeError,KeyError) as exc:
                     outcome = 'partial'
                     LOGGER.warning('leaf consolidation item skipped package=%s: %s',package_id,exc)
+        except ProtectionError:
+            raise
         except Exception as exc:
             LOGGER.warning('leaf consolidation skipped package=%s: %s',package_id,exc)
         finally:

@@ -222,7 +222,12 @@ def _port():
 
 def _setup(tmp_path, port=None):
     envfile = tmp_path / '配置 目录' / 'sjfx.env'
-    result = invoke(envfile, 'setup', '--port', str(port or _port()), '--backend', 'ollama', cwd=tmp_path)
+    options = ['setup', '--port', str(port or _port()), '--backend', 'ollama', '--helper-port', str(_port())]
+    if os.name == 'nt':
+        helper = os.getenv('SJFX_TEST_WINDOWS_HELPER')
+        if helper:
+            options += ['--helper-binary', helper]
+    result = invoke(envfile, *options, cwd=tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'SJFX_API_ACCESS_TOKEN' not in result.stdout
     return envfile
@@ -282,7 +287,9 @@ def test_lifecycle_four_roles_and_restart_preserves_sqlite(tmp_path, monkeypatch
         assert started.returncode == 0, started.stdout + started.stderr
         state = json.loads(started.stdout)
         assert state['ready']
-        assert set(state['roles_alive']) == {'web', 'worker', 'large-worker', 'qa-worker'}
+        assert set(state['roles_alive']) == {'web', 'worker', 'large-worker', 'qa-worker', 'protection-helper', 'protection-executor'}
+        assert state['desktop_protection']['helper']['running']
+        assert state['desktop_protection']['executor']['healthy']
         assert all(state['roles_alive'].values())
         import psutil
         expected_temp = str(envfile.parent / 'state' / 'parse_temp')
@@ -382,13 +389,18 @@ def test_storage_failure_during_shutdown_still_reaps_all_roles(tmp_path, monkeyp
     class Log:
         def close(self):
             raise PermissionError('injected log cleanup failure')
-    def spawn(role, config, runtime, token):
+    def spawn(role, config, runtime, token, command=None):
         gate = runtime / (role + '.gate')
         gate.with_suffix('.ready').write_text(token, encoding='ascii')
-        process = SimpleNamespace(pid=len(reaped) + 42, poll=lambda: None, role=role)
+        process = SimpleNamespace(pid=len(reaped) + 42, poll=lambda: None, role=role, wait=lambda **kw: None)
         return process, None, Log(), gate
     monkeypatch.setattr(sjfxctl, '_spawn_role', spawn)
+    from sjfx_protection import desktop_runtime
+    monkeypatch.setattr(desktop_runtime, 'prepare_environment', lambda _: {'core_state': str(tmp_path), 'stop_file': str(tmp_path/'helper.stop')})
+    monkeypatch.setattr(desktop_runtime, 'helper_command', lambda _: [])
+    monkeypatch.setattr(desktop_runtime, 'helper_health', lambda _: {})
+    monkeypatch.setattr(desktop_runtime, 'health_report', lambda *_: {})
     monkeypatch.setattr(process_liveness, 'terminate_process_tree', lambda process, **kwargs: reaped.append(process.role))
     with pytest.raises(OSError, match='disk full'):
         sjfxctl.supervise(SimpleNamespace(run_id='test-failure', timeout=10), cfg)
-    assert reaped == ['qa-worker', 'large-worker', 'worker', 'web']
+    assert reaped == ['qa-worker', 'large-worker', 'worker', 'web', 'protection-executor', 'protection-helper']

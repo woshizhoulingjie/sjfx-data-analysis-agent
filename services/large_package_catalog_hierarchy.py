@@ -1,4 +1,6 @@
 """Optional content-based upper navigation; leaf membership never changes."""
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact
+from sjfx_protection.store import ProtectionError
 from contextlib import closing
 import hashlib
 import json
@@ -74,6 +76,7 @@ def needed(c,package_id):
     return c.execute('SELECT COUNT(*) FROM lp_catalog_labels l JOIN large_catalog_groups g ON g.package_id=l.package_id AND g.id=l.group_id WHERE l.package_id=? AND (l.revision=g.content_revision OR l.locked=1)',(package_id,)).fetchone()[0]>=3
 
 
+@package_lane
 def process(store,package_id,round_state,cancelled,model_client=None):
     from services.large_package_catalog_tree import build
     return build(store,package_id,round_state,cancelled,model_client)

@@ -6,6 +6,8 @@ long-running package cannot change the ordinary import workflow.
 """
 from __future__ import annotations
 
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact, package_batch
+from sjfx_protection.store import ProtectionError
 import hashlib
 import json
 import logging
@@ -138,7 +140,9 @@ class LargePackageStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._catalog_cache = {}
+        self._protection_schema_ready=False
         self._init_db()
+        self._protection_schema_ready=True
 
     def _connect(self):
         conn = sqlite3.connect(
@@ -150,8 +154,7 @@ class LargePackageStore:
             conn.close()
             raise
 
-    @staticmethod
-    def _configure_connection(conn):
+    def _configure_connection(self, conn):
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -171,10 +174,14 @@ class LargePackageStore:
         # 改为：连接不自动检查点，由 Worker 在**不持有任何事务的地方**按节流做。
         # 设 `SJFX_LP_WAL_AUTOCHECKPOINT=1000` 可退回原行为。
         conn.execute("PRAGMA wal_autocheckpoint=%d" % _WAL_AUTOCHECKPOINT)
+        if getattr(self,'_protection_schema_ready',False):
+            from services.large_package_sql_cache import protect_connection
+            try:return protect_connection(conn,self.db_path)
+            except BaseException:conn.close();raise
         return conn
 
     def _init_db(self):
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.executescript("""
             CREATE TABLE IF NOT EXISTS packages (
               id TEXT PRIMARY KEY, root_path TEXT NOT NULL, owner_id TEXT NOT NULL,
@@ -217,7 +224,7 @@ class LargePackageStore:
 
         # Additive migration confined to large_package.db. Existing task/results
         # remain readable; legacy previews are upgraded only on explicit request.
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
             for name, default in (("topic", ""), ("recognition_status", "legacy"), ("document_role", ""),
@@ -256,6 +263,12 @@ class LargePackageStore:
                     conn.execute("ALTER TABLE selections ADD COLUMN %s %s" % (name, ddl))
             # 包控制态与发布指针：packages.status 降级为兼容投影，不再是业务开关。
             package_columns = {row[1] for row in conn.execute("PRAGMA table_info(packages)")}
+            if 'protection_context' not in package_columns:
+                conn.execute("ALTER TABLE packages ADD COLUMN protection_context TEXT NOT NULL DEFAULT '{}' ")
+            if 'protection_intake' not in package_columns:
+                conn.execute("ALTER TABLE packages ADD COLUMN protection_intake TEXT NOT NULL DEFAULT '{}' ")
+            if 'protection_context' not in {r[1] for r in conn.execute('PRAGMA table_info(files)')}:
+                conn.execute("ALTER TABLE files ADD COLUMN protection_context TEXT NOT NULL DEFAULT '{}' ")
             for name, ddl in (
                 ("control_state", "TEXT NOT NULL DEFAULT 'active'"),   # active/paused/cancelled
                 ("control_generation", "INTEGER NOT NULL DEFAULT 0"),
@@ -402,7 +415,7 @@ class LargePackageStore:
         if not row:
             return None
         item = dict(row)
-        for key in ("counts", "local_summary", "deep_summary", "rule", "paths", "source_metadata"):
+        for key in ("counts", "local_summary", "deep_summary", "rule", "paths", "source_metadata",'protection_context','protection_intake'):
             if key in item:
                 item[key] = _loads(item[key], [] if key == "paths" else {})
         item["sensitive"] = bool(item.get("sensitive"))
@@ -427,18 +440,25 @@ class LargePackageStore:
 
     def create(self, root_path, owner_id="legacy"):
         root = str(_under_allowed_root(root_path, owner_id=owner_id))
+        from sjfx_protection.business import capture_import
+        captured=capture_import(owner_id,root,{}) or {}
+        protection_context=captured.get('protection_context',{})
         package_id = "lp-" + uuid.uuid4().hex
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             # 新包标记为本进程服务的工作流版本（预留排他机制，见 config 注释）。
             try:
                 from config import Config as _Cfg
                 _wfv = int(getattr(_Cfg, "LP_WORKFLOW_VERSION", 1) or 1)
+            except ProtectionError:
+                raise
             except Exception:
                 _wfv = 1
             conn.execute("INSERT INTO packages(id,root_path,owner_id,status,phase,workflow_version,"
                          "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                          (package_id, root, owner_id or "legacy", "queued", "inventory", _wfv, now, now))
+            conn.execute('UPDATE packages SET protection_context=? WHERE id=?',(_json(protection_context),package_id))
+            conn.execute('UPDATE packages SET protection_intake=?,message=? WHERE id=?',(_json(captured.get('protection_intake',{})), '等待本地资料安全检查' if captured.get('protection_intake') else '',package_id))
             # B1 导入幂等（产品口径：**允许重复导入，但必须让用户看到**）：
             # 同一个 root_path 已经有别的包时，把它们的 id/状态一并返回，
             # 由用户决定继续用新包还是回头用旧包。硬拒绝会挡住 demo_data
@@ -458,10 +478,50 @@ class LargePackageStore:
         return created
 
     def get(self, package_id, owner_id=None):
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM packages WHERE id=?" + (" AND owner_id=?" if owner_id else ""),
                                (str(package_id), str(owner_id)) if owner_id else (str(package_id),)).fetchone()
         return self._row(row)
+
+    def refresh_protection_context(self, package_id, owner_id, *, reset_cache=False):
+        """Explicitly rebind a verified package; optionally rebuild obsolete content caches."""
+        from sjfx_protection.business import enabled,capture_job
+        if not enabled():return self.get(package_id,owner_id)
+        item=self.get(package_id,owner_id)
+        if not item:raise ProtectionError('数据包归属不匹配',404,'package_not_found')
+        captured=capture_job(owner_id,item['root_path'],{},operation='analyze')['protection_context']
+        with self._lock,closing(self._connect()) as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('UPDATE packages SET protection_context=?,updated_at=? WHERE id=? AND owner_id=?',(_json(captured),time.time(),str(package_id),str(owner_id)))
+            if reset_cache:
+                # Rebuild source-derived content, preserve historical publication/audit records.
+                keep={'packages','lp_workflow_events','lp_overview_versions','lp_published_views','lp_evidence_snapshots'}
+                names=[r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+                for table in names:
+                    if table in keep or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',table):continue
+                    if 'package_id' in {r[1] for r in db.execute('PRAGMA table_info('+table+')')}:
+                        db.execute('DELETE FROM '+table+' WHERE package_id=?',(str(package_id),))
+                db.execute("UPDATE packages SET phase='inventory',status='queued',control_state='active',progress=0,counts='{}',published_view_id='',control_generation=control_generation+1 WHERE id=?",(str(package_id),))
+            db.commit()
+        self._catalog_cache.pop(str(package_id),None)
+        return self.get(package_id,owner_id)
+
+    def admit_protection(self,package_id,wait=False):
+        from sjfx_protection.business import enabled,admit_import,protection
+        item=self.get(package_id)
+        if not enabled():return item
+        if not item:raise ProtectionError('数据包不存在',404,'package_not_found')
+        if item.get('status') in {'cancelled','cancelling'} or item.get('control_state')=='cancelled':
+            raise ProtectionError('大包导入已取消',409,'import_cancelled')
+        if item.get('protection_context'):return item
+        captured=admit_import(item['owner_id'],item['root_path'],{
+            'protection_intake':item.get('protection_intake')},wait=wait,
+            cancel=lambda:(self.get(package_id) or {}).get('status') in {'cancelled','cancelling'})
+        with self._lock,closing(self._connect()) as db:
+            result=db.execute("UPDATE packages SET protection_context=?,message=?,updated_at=? WHERE id=? AND status NOT IN ('cancelled','cancelling')",(_json(captured['protection_context']),'安全检查通过，准备盘点资料',time.time(),str(package_id)))
+            if result.rowcount!=1:raise ProtectionError('大包导入已取消',409,'import_cancelled')
+        protection().package.bind_business(item['owner_id'],captured['protection_context']['registration_id'],'large_package',package_id)
+        return self.get(package_id)
 
     def list_history(self, owner_id=None, query="", limit=8, offset=0):
         """Return lightweight history records for the large-package switcher."""
@@ -557,7 +617,7 @@ class LargePackageStore:
                 value = {**(current.get("counts") or {}), **value}
             args.append(_json(value) if key == "counts" else value)
         args.append(str(package_id))
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             guard = ""
             if values.get('status') not in (None, 'paused', 'cancelled'):
                 guard = " AND control_state NOT IN ('paused','cancelled')"
@@ -605,6 +665,7 @@ class LargePackageStore:
         )
         _PHASE_CLOCK[key] = (phase, now_monotonic, now_wall)
 
+    @package_lane
     def upsert_file(self, package_id, item):
         self.upsert_files(package_id, [item])
 
@@ -638,6 +699,7 @@ class LargePackageStore:
                 "ON CONFLICT(package_id,path,stage) DO UPDATE SET status='queued',attempts=0,"
                 "error=NULL,updated_at=excluded.updated_at", (package_id, path, now))
 
+    @package_lane
     def invalidate_changed_archive_members(self, package_id):
         """Retire old evidence before a resumed inventory, including removed members.
 
@@ -659,6 +721,8 @@ class LargePackageStore:
             try:
                 source_identity(package['root_path'], probe)
                 return True
+            except ProtectionError:
+                raise
             except Exception as exc:
                 if resource_code(exc):
                     raise
@@ -682,6 +746,8 @@ class LargePackageStore:
                     meta.pop('compressed_size', None)
                     if not valid_container(_json(meta)):
                         invalid.append(raw)
+                except ProtectionError:
+                    raise
                 except Exception as exc:
                     if resource_code(exc):
                         raise
@@ -698,9 +764,10 @@ class LargePackageStore:
                 conn.commit()
             cursor = rows[-1]['path']
 
+    @package_lane
     def upsert_files(self, package_id, items):
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             for item in items:
                 if item.get('source_kind') == 'archive_member':
@@ -734,7 +801,7 @@ class LargePackageStore:
     def claim(self, stage, limit=1, package_id=None):
         claimed = []
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             # 防御性版本闸门：只领取"不高于本进程服务版本"的包。
             # 正常调度已由 _packages() 过滤，这里再挡一层，避免任何直接调用
@@ -742,6 +809,8 @@ class LargePackageStore:
             try:
                 from config import Config as _Cfg
                 _served = int(getattr(_Cfg, "LP_WORKFLOW_VERSION", 1) or 1)
+            except ProtectionError:
+                raise
             except Exception:
                 _served = 1
             sql = ("SELECT package_id,path FROM queue WHERE stage=? AND status IN ('queued','retry') "
@@ -778,7 +847,7 @@ class LargePackageStore:
         这条路径同样会清掉令牌，避免残留的旧令牌在后续误判。
         """
         status = "completed" if ok else "failed"
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             if token is None:
                 conn.execute("UPDATE queue SET status=?,error=?,updated_at=?,lease_token=NULL WHERE package_id=? AND path=? AND stage=?",
                              (status, error, time.time(), str(package_id), str(path), stage))
@@ -804,6 +873,7 @@ class LargePackageStore:
             ok=ok,file_fields=file_fields,error=error,require_source_hash=require_source_hash,
             drop_catalog_queue=drop_catalog_queue)])[0]
 
+    @package_batch
     def commit_stage_batch(self, items):
         if len(items)>32:raise ValueError('A preview commit batch is limited to 32 files')
         results=[]; batch_started=time.monotonic()
@@ -820,6 +890,8 @@ class LargePackageStore:
                     conn.execute('RELEASE preview_item')
                     results.append(result)
                 conn.commit()
+            except ProtectionError:
+                raise
             except Exception:
                 conn.rollback();raise
             finally:
@@ -830,6 +902,7 @@ class LargePackageStore:
                                 lock_connection_seconds,sqlite_lock_seconds)
         return results
 
+    @package_lane
     def _commit_stage_conn(self, conn, package_id, path, stage, token, *, ok=True,
                             file_fields=None, error=None, require_source_hash=None,
                             drop_catalog_queue=False):
@@ -880,7 +953,7 @@ class LargePackageStore:
             allowed = {"sha256", "quick_status", "deep_status", "category", "confidence",
                        "local_summary", "deep_summary", "error", "file_type", "topic",
                        "recognition_status", "document_role",
-                       "summary_quality", "summary_coverage", "source_changed"}
+                       "summary_quality", "summary_coverage", "source_changed", "protection_context"}
             fields = dict((k, v) for k, v in file_fields.items() if k in allowed)
             schedule_catalog = False
             if "local_summary" in fields or "deep_summary" in fields:
@@ -895,6 +968,7 @@ class LargePackageStore:
                 fields, schedule_catalog = prepare_update(self._row(previous), fields)
                 _m(_pf, 'prepare_update', _t0)
                 fields = dict((k, v) for k, v in fields.items() if k in allowed or k == "updated_at")
+            fields = stamp_fields(fields)
             if "local_summary" in fields:
                 info = (fields["local_summary"] or {}).get("portrait") or {}
                 if info.get("schema"):
@@ -908,7 +982,7 @@ class LargePackageStore:
                 if key == "updated_at":
                     continue
                 cols.append(key + "=?")
-                args.append(_json(value) if key in ("local_summary", "deep_summary") else value)
+                args.append(_json(value) if key in ("local_summary", "deep_summary", "protection_context") else value)
             _m(_pf, 'json_build', _t0)
             if cols:
                 _t0 = time.monotonic()
@@ -939,6 +1013,7 @@ class LargePackageStore:
         _m(_pf, 'queue_update', _t0)
         return True,''
 
+    @package_lane
     def preview_files(self,package_id,paths):
         if not paths:return {}
         with closing(self._connect()) as c:
@@ -1156,6 +1231,8 @@ class LargePackageStore:
             try:
                 import json as _json
                 validation = _json.loads(catv["validation"] or "{}")
+            except ProtectionError:
+                raise
             except Exception:
                 validation = {}
         # 批2 第 18 条：把"概览发布被校验拦下"暴露成显式目录状态。
@@ -1192,6 +1269,8 @@ class LargePackageStore:
         try:
             from services.large_package_semantic import catalog_degraded as _cd
             _degraded = _cd(self, pid)
+        except ProtectionError:
+            raise
         except Exception:
             _degraded = {"degraded": False, "reason": "check_failed"}
         # 待办口径（见下方 return 处的说明）。当前阶段是可调度阶段时，只有它自己的
@@ -1497,8 +1576,9 @@ class LargePackageStore:
             conn.commit()
         return {"control_state": str(control_state), "control_generation": gen + 1}
 
+    @package_lane
     def update_file(self, package_id, path, **fields):
-        allowed = {"sha256", "quick_status", "deep_status", "category", "confidence", "local_summary", "deep_summary", "error", "file_type", "topic", "recognition_status", "document_role"}
+        allowed = {"sha256", "quick_status", "deep_status", "category", "confidence", "local_summary", "deep_summary", "error", "file_type", "topic", "recognition_status", "document_role", "protection_context"}
         fields = {key: value for key, value in fields.items() if key in allowed}
         if not fields:
             return
@@ -1512,6 +1592,7 @@ class LargePackageStore:
                     conn.rollback()
                     return
                 fields, schedule_catalog = prepare_update(self._row(previous), fields)
+            fields = stamp_fields(fields)
             if "local_summary" in fields:
                 info = (fields["local_summary"] or {}).get("portrait") or {}
                 if info.get("schema"):
@@ -1521,7 +1602,7 @@ class LargePackageStore:
             cols, args = [], []
             for key, value in fields.items():
                 cols.append(key + "=?")
-                args.append(_json(value) if key in {"local_summary", "deep_summary"} else value)
+                args.append(_json(value) if key in {"local_summary", "deep_summary", "protection_context"} else value)
             args.extend([str(package_id), str(path)])
             conn.execute("UPDATE files SET " + ",".join(cols) + " WHERE package_id=? AND path=?", args)
             if schedule_catalog:
@@ -1553,6 +1634,7 @@ class LargePackageStore:
                 "queue_pending": queue_pending,
                 "pending_total": int(sum(queue_pending.values()))}
 
+    @package_lane
     def file_page(self, package_id, limit=100, offset=0, query="", category="", topic="", remaining=False, directory=None, facet_kind="", facet_value="", node_id=""):
         where, args = ["package_id=?"], [str(package_id)]
         if query:
@@ -1625,7 +1707,7 @@ class LargePackageStore:
             args.extend([str(package_id), facet_kind, facet_value])
         clause = " AND ".join(where)
         limit, offset = max(1, min(500, int(limit))), max(0, int(offset))
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             total = int(conn.execute("SELECT COUNT(*) FROM files WHERE " + clause, args).fetchone()[0])
             rows = conn.execute("SELECT * FROM files WHERE " + clause + " ORDER BY path LIMIT ? OFFSET ?", args + [limit, offset]).fetchall()
         return {"files": self._decorate_files(package_id, [self._row(row) for row in rows]), "total": total, "offset": offset, "limit": limit, "has_more": offset + len(rows) < total}
@@ -1633,6 +1715,7 @@ class LargePackageStore:
     def list_files(self, package_id, limit=100, offset=0, query="", category="", **filters):
         return self.file_page(package_id, limit, offset, query, category, **filters)["files"]
 
+    @package_lane
     def get_file(self, package_id, path):
         """Fetch one manifest row by its exact relative path."""
         with closing(self._connect()) as conn:
@@ -1642,6 +1725,7 @@ class LargePackageStore:
             ).fetchone()
         return self._decorate_files(package_id, [self._row(row)])[0] if row else None
 
+    @package_lane
     def get_files(self, package_id, paths, *, decorate=True):
         """Read exact paths in bounded batches, without changing file contents.
 
@@ -1670,6 +1754,7 @@ class LargePackageStore:
         from services.large_package_catalog_view import decorate_files
         return decorate_files(self, package_id, files)
 
+    @package_lane
     def create_user_node(self, package_id, name, paths, parent_id=None):
         unique = []
         valid = set(self.existing_paths(package_id, paths or []))
@@ -1680,21 +1765,24 @@ class LargePackageStore:
         if not unique:
             raise ValueError("只能整理当前大数据包中的文件")
         node_id = "large-node-" + uuid.uuid4().hex[:20]
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("INSERT INTO user_nodes(id,package_id,name,parent_id,paths,created_at) VALUES(?,?,?,?,?,?)",
                          (node_id, str(package_id), str(name).strip()[:120], parent_id, _json(unique), time.time()))
         return self.get_user_node(package_id, node_id)
 
+    @package_lane
     def get_user_node(self, package_id, node_id):
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM user_nodes WHERE id=? AND package_id=?", (str(node_id), str(package_id))).fetchone()
         return self._row(row) if row else None
 
+    @package_lane
     def list_user_nodes(self, package_id):
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute("SELECT * FROM user_nodes WHERE package_id=? ORDER BY created_at", (str(package_id),)).fetchall()
         return [self._row(row) for row in rows]
 
+    @package_lane
     def catalog(self, package_id):
         """Bounded directory response and source-supported topic groups.
 
@@ -1707,7 +1795,7 @@ class LargePackageStore:
             return cached[1]
         directories, root_files = {}, []
         omitted = False
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             package = conn.execute("SELECT root_path FROM packages WHERE id=?", (package_id,)).fetchone()
             if not package:
                 return None
@@ -1750,7 +1838,7 @@ class LargePackageStore:
         return result
 
     def enqueue_recognition(self, package_id, path):
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO queue(package_id,path,stage,status,updated_at,priority) "
                 "SELECT ?,f.path,'recognize','queued',?,? FROM files f "
@@ -1802,7 +1890,7 @@ class LargePackageStore:
             return count
 
     def stage_counts(self, package_id, stage):
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             return dict(conn.execute("SELECT status,COUNT(*) FROM queue WHERE package_id=? AND stage=? GROUP BY status", (package_id, stage)).fetchall())
 
     def requeue(self, package_id, path, stage, token=None):
@@ -1812,7 +1900,7 @@ class LargePackageStore:
         （已被回收或已被他人重新领取）则拒绝并返回 False。
         不带 `token` 时保留改动前的无条件语义，同时清掉残留令牌。
         """
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             if token is None:
                 conn.execute("UPDATE queue SET status='queued',leased_at=NULL,lease_token=NULL,updated_at=? WHERE package_id=? AND path=? AND stage=?", (time.time(), package_id, path, stage))
                 return True
@@ -1822,11 +1910,12 @@ class LargePackageStore:
                 (time.time(), package_id, path, stage, str(token)))
             return cursor.rowcount == 1
 
+    @package_lane
     def request_recognition(self, package_id):
         """Explicitly upgrade old previews or continue a deferred recognition slice.
         Deep results and ordinary tables are never touched.
         """
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             item = conn.execute("SELECT status,phase FROM packages WHERE id=?", (package_id,)).fetchone()
             if not item or item["status"] not in {"waiting_for_selection", "completed"}:
@@ -1859,11 +1948,12 @@ class LargePackageStore:
         if not values:
             return []
         placeholders = ",".join("?" for _ in values)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute("SELECT path FROM files WHERE package_id=? AND path IN (" + placeholders + ")",
                                 [str(package_id)] + values).fetchall()
         return [str(row[0]) for row in rows]
 
+    @package_lane
     def export_selection(self, package_id, node_ids=None, paths=None, exclude_paths=None, exclude_node_ids=None):
         """Resolve smart-catalog selections to immutable export metadata.
 
@@ -1976,11 +2066,12 @@ class LargePackageStore:
         if not member_paths:
             raise ValueError("排除所选文件后没有可导出的文件" if excluded else "请至少选择一个智能目录或文件")
         return {"paths": member_paths, "inventory": inventory, "nodes": node_labels}
+    @package_lane
     def save_selection(self, package_id, paths, rule=None):
         selection_id = "sel-" + uuid.uuid4().hex
         now = time.time()
         unique = list(dict.fromkeys(str(path) for path in paths if str(path)))
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute("SELECT status FROM packages WHERE id=?", (str(package_id),)).fetchone()
             if not current or current[0] not in {"waiting_for_selection", "completed"}:
@@ -2019,6 +2110,8 @@ class LargePackageStore:
         try:
             with closing(self._connect()) as conn:
                 return conn.execute("PRAGMA wal_checkpoint(%s)" % mode).fetchone()
+        except ProtectionError:
+            raise
         except Exception:
             LOGGER.exception("wal checkpoint failed")
             return None
@@ -2041,7 +2134,7 @@ class LargePackageStore:
         300s 仍远大于单文件耗时，不会误杀在跑的活。
         """
         cutoff = time.time() - max(60, int(seconds))
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             # 回收时**同时轮换掉租约令牌**（置 NULL）：被判失联的持有者即使晚到，
             # 它的令牌也已经对不上，`finish_queue` / `requeue` 会拒绝它的写入。
             # 这是"旧 worker 覆盖新结果"这条路径上唯一的闸门。
@@ -2050,7 +2143,7 @@ class LargePackageStore:
     def retry_failed_quick(self, package_id):
         """Requeue quick-parse failures so an operator can recover a package."""
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 "SELECT path FROM files WHERE package_id=? AND quick_status='failed'",
@@ -2103,6 +2196,8 @@ def _pdf_preview(path, limit=12000):
         for page in reader.pages[:2]:
             try:
                 value = page.extract_text() or ""
+            except ProtectionError:
+                raise
             except Exception:
                 value = ""
             if value:
@@ -2113,6 +2208,8 @@ def _pdf_preview(path, limit=12000):
         if text:
             return {"pages": pages, "sample": text, "parser": "pypdf", "notice": "仅提取前两页文本预览；深度解析可获取完整正文"}
         return {"pages": pages, "sample": "", "parser": "pypdf", "notice": "PDF 没有可直接提取的文本层；深度解析时将尝试 OCR"}
+    except ProtectionError:
+        raise
     except Exception as exc:
         return {"pages": None, "sample": "", "parser": "unavailable", "notice": "PDF 快速预览失败，已隐藏原始二进制内容：{}".format(str(exc)[:180])}
 
@@ -2175,6 +2272,8 @@ def iter_inventory(root, on_error=None, owner_id=None):
             from services.large_archive_members import discover_members
             try:
                 yield from discover_members(root, item, on_error=on_error)
+            except ProtectionError:
+                raise
             except Exception as exc:
                 if resource_code(exc):
                     raise

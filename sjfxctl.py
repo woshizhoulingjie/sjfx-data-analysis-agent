@@ -1,7 +1,7 @@
 """Cross-platform lifecycle entry point for one SJFX instance.
 
 Model engines remain external local services until the delivery hardware is
-known. This launcher owns only its four application process trees.
+known. This launcher owns application, protection executor and local helper trees.
 """
 from __future__ import annotations
 
@@ -23,8 +23,13 @@ import urllib.request
 import uuid
 import webbrowser
 
+# Installed application and runtime files are immutable; imports and child
+# processes must keep bytecode caches out of the manifest-protected tree.
+sys.dont_write_bytecode = True
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+
 ROOT = Path(__file__).resolve().parent
-RUNTIME_MODULES = ('fastapi', 'uvicorn', 'pydantic', 'httpx', 'werkzeug',
+RUNTIME_MODULES = ('fastapi', 'jinja2', 'uvicorn', 'pydantic', 'httpx', 'werkzeug',
                    'pypdf', 'docx', 'pptx', 'openpyxl', 'psutil', 'cryptography')
 
 def _emit(value):
@@ -124,6 +129,8 @@ def _status(config):
     else:
         state['ready'] = False
     state['application_ready'] = state['ready']
+    from sjfx_protection.desktop_runtime import health_report
+    state['desktop_protection'] = health_report(config)
     state['readiness_scope'] = 'initialized application roles and web; model health is reported separately'
     return state
 
@@ -141,6 +148,17 @@ def _ports_available(config):
                 listener.bind((host, config.PORT))
             except OSError as exc:
                 raise RuntimeError('Web port unavailable: {}:{}'.format(host, config.PORT)) from exc
+    from services.managed_embedding import selected
+    if selected(config):
+        with socket.socket() as listener:
+            if os.name == 'nt':
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                listener.bind(('127.0.0.1', config.MANAGED_EMBED_PORT))
+            except OSError as exc:
+                raise RuntimeError('Bundled embedding port unavailable: ' + str(config.MANAGED_EMBED_PORT)) from exc
 
 def _dependency_check(modules):
     return [name for name in modules if importlib.util.find_spec(name) is None]
@@ -156,9 +174,10 @@ def setup(args):
     models = Path(args.models_dir).expanduser().resolve() if args.models_dir else target.parent / 'models'
     tools = Path(args.tools_dir).expanduser().resolve() if args.tools_dir else ROOT / '.tools'
     parse_temp = Path(args.parse_temp_dir).expanduser().resolve() if args.parse_temp_dir else data / 'parse_temp'
+    optional_paths={name:Path(getattr(args,name)).expanduser().resolve() for name in ('helper_binary','clam_database','clam_binary','clam_certs') if getattr(args,name,None)}
     if target.exists():
         raise RuntimeError('Configuration already exists: ' + str(target))
-    for path in (target, data, output, models, tools, parse_temp):
+    for path in (target, data, output, models, tools, parse_temp,*optional_paths.values()):
         if '\n' in str(path) or '\r' in str(path) or '"' in str(path):
             raise RuntimeError('Configuration paths cannot contain newline or double quote')
     for path in (target.parent, data, output, parse_temp):
@@ -188,11 +207,20 @@ def setup(args):
            'OPENAI_COMPATIBLE_REQUEST_TIMEOUT=180',
            'OPENAI_COMPATIBLE_SUPPORTS_JSON_RESPONSE_FORMAT=0']
           if backend == 'openai_compatible' else []),
+        'SJFX_LOCAL_AGENT_ENDPOINT=http://127.0.0.1:{}'.format(getattr(args,'helper_port',18767)),
+        'SJFX_DESKTOP_ACCESS_AUDIT=1',
+        *(['SJFX_DESKTOP_HELPER_BINARY="{}"'.format(optional_paths['helper_binary'])] if 'helper_binary' in optional_paths else []),
+        *(['SJFX_PROTECTION_CLAM_DATABASE="{}"'.format(optional_paths['clam_database'])] if 'clam_database' in optional_paths else []),
+        *(['SJFX_PROTECTION_CLAM="{}"'.format(optional_paths['clam_binary'])] if 'clam_binary' in optional_paths else []),
+        *(['SJFX_PROTECTION_CLAM_CERTS="{}"'.format(optional_paths['clam_certs'])] if 'clam_certs' in optional_paths else []),
+        'SJFX_PROTECTION_SCAN_WORKDIR="{}"'.format(data/'desktop_protection'/'scan-work'),
         'HF_HUB_OFFLINE=1', 'TRANSFORMERS_OFFLINE=1', '',
     ])
     with target.open('x', encoding='utf-8', newline='\n') as handle:
         handle.write(content)
     os.chmod(target, 0o600)
+    from sjfx_protection.desktop_runtime import protect_private_path
+    protect_private_path(target)
     _emit({'configured': True, 'env_file': str(target), 'data_dir': str(data),
            'output_dir': str(output), 'models_dir': str(models), 'backend': backend,
            'next': 'Run doctor, then start with this --env-file. Model engines are separate local services.'})
@@ -209,6 +237,15 @@ def doctor(config, scope='full', required_features=()):
                                scope=scope, required_features=required_features)
     report.update(platform=platform.system(), architecture=platform.machine(),
                   python=platform.python_version(), backend=config.LLM_BACKEND)
+    from sjfx_protection.desktop_runtime import health_report
+    from sjfx_protection.desktop_audit import preflight
+    report['desktop_protection'] = health_report(config)
+    report['program_access_audit_preflight'] = preflight()
+    from services.managed_embedding import resource_check
+    if getattr(config, 'MANAGED_EMBEDDING', False):
+        report['bundled_embedding'] = resource_check(config)
+        if report['bundled_embedding']['selected'] and not report['bundled_embedding']['resource_complete']:
+            report['ok'] = False
     # Compatibility metadata only. No readiness decision uses these fields.
     report['model_resources_scope'] = 'directory inventory only; see resource_checks for readiness'
     report['model_resources'] = {
@@ -228,7 +265,7 @@ def model_config_command(args, config):
         return 0
     patch = {}
     for name in ('backend', 'base_url', 'model', 'context_tokens', 'timeout_seconds',
-                 'concurrency', 'dimension', 'version', 'weights_id', 'config_id'):
+                 'concurrency', 'dimension', 'version', 'weights_id', 'config_id', 'encoding', 'tokenizer_path'):
         value = getattr(args, name, None)
         if value is not None:
             patch[name] = value
@@ -253,22 +290,67 @@ def model_test_command(args, config):
     _emit(report)
     return 0 if report['ok'] else 1
 
-def _spawn_role(role, config, runtime, token):
+
+def init_admin(args, config):
+    """Set the first password via a private prompt or stdin, never argv/logs."""
+    if _status(config).get('running'):
+        raise RuntimeError('Stop this instance before initializing its administrator')
+    from config import ensure_runtime_directories
+    from sjfx_multiuser.users import UserStore
+    ensure_runtime_directories()
+    store = UserStore(str(config.DB_PATH))
+    try:
+        if store.user_count():
+            raise RuntimeError('Existing accounts are preserved; init-admin only supports a fresh instance')
+        if args.password_stdin:
+            password = sys.stdin.readline(4098).rstrip('\r\n')
+            if len(password) > 4096:
+                raise ValueError('Password exceeds input limit')
+        else:
+            from getpass import getpass
+            password = getpass('管理员密码: ')
+            if password != getpass('再次输入: '):
+                raise ValueError('两次密码不一致')
+        store.validate_password(password)
+        result = store.bootstrap_first_admin(owner_id=config.OWNER_ID, password=password)
+        if not result:
+            raise RuntimeError('Administrator was already initialized')
+        _emit({'initialized': True, 'username': result['username'], 'password_logged': False,
+               'must_change_password': True})
+        return 0
+    finally:
+        store.close()
+
+def _spawn_role(role, config, runtime, token, command=None):
     from services.process_liveness import own_process_tree, terminate_process_tree
     gate = runtime / (token + '-' + role + '.gate')
     env = os.environ.copy()
-    env.update({'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8', 'PYTHONUNBUFFERED': '1',
+    env.update({'PYTHONUTF8': '1', 'PYTHONDONTWRITEBYTECODE': '1',
+                'PYTHONIOENCODING': 'utf-8', 'PYTHONUNBUFFERED': '1',
                 'SJFX_PROCESS_GATE': str(gate), 'SJFX_PROCESS_TOKEN': token,
                 'SJFX_ROLE_READY_FILE': str(gate.with_suffix('.ready')), 'SJFX_ROLE_TOKEN': token,
                 'SJFX_CONTROLLER_PID': str(os.getpid()), 'SJFX_CONTROLLER_CREATED': str(_identity(os.getpid())),
                 'TEMP': str(config.PARSE_TEMP_DIR), 'TMP': str(config.PARSE_TEMP_DIR),
                 'TMPDIR': str(config.PARSE_TEMP_DIR), 'SQLITE_TMPDIR': str(config.PARSE_TEMP_DIR)})
+    env['SJFX_ROLE'] = role
+    if os.name == 'nt':
+        # Go's OS configuration lookup requires APPDATA even when --data is
+        # supplied. Keep all library fallback caches within this instance.
+        for name, folder in (('APPDATA','appdata'), ('LOCALAPPDATA','localappdata')):
+            path = config.DATA_DIR / 'cache' / folder
+            path.mkdir(parents=True, exist_ok=True)
+            env[name] = str(path)
+    env['XDG_CACHE_HOME'] = str(config.DATA_DIR / 'cache')
+    env['TORCH_HOME'] = str(config.DATA_DIR / 'cache' / 'torch')
+    if role == 'embedding':
+        env.update(SJFX_EMBED_PORT=str(config.MANAGED_EMBED_PORT),
+                   SJFX_EMBED_MODEL_NAME='multilingual-e5-small')
     log = open(config.LOG_DIR / ('launcher-' + role + '.log'), 'ab', buffering=0)
     kwargs = {'start_new_session': True} if os.name != 'nt' else {'creationflags': subprocess.CREATE_NO_WINDOW}
     process = None
     owner = None
     try:
-        process = subprocess.Popen([sys.executable, '-X', 'utf8', '-m', 'services.managed_entry', role],
+        process = subprocess.Popen(command or [sys.executable, '-B', '-X', 'utf8', '-m', 'services.managed_entry', role],
                                    cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                    stdout=log, stderr=subprocess.STDOUT, **kwargs)
         owner = own_process_tree(process.pid)
@@ -290,6 +372,8 @@ def supervise(args, config):
     if missing:
         raise RuntimeError('Missing application dependencies: ' + ', '.join(missing))
     ensure_runtime_directories()
+    from sjfx_protection.desktop_runtime import prepare_environment,helper_command,helper_health,health_report
+    protection_paths = prepare_environment(config)
     runtime = _runtime(config)
     runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
     stop_path = runtime / 'stop.json'
@@ -314,6 +398,49 @@ def supervise(args, config):
                 signal.signal(getattr(signal, name), lambda *_: stop.__setitem__(0, True))
         publish()
         try:
+            deadline = time.monotonic() + args.timeout
+            children['protection-helper'] = _spawn_role('protection-helper',config,runtime,token,helper_command(protection_paths))
+            process=children['protection-helper'][0]
+            state['roles']['protection-helper']={'pid':process.pid,'created':_identity(process.pid)}
+            while True:
+                if process.poll() is not None: raise RuntimeError('Protection helper exited; see launcher-protection-helper.log')
+                try:
+                    helper_health(protection_paths)
+                    break
+                except (OSError,ValueError,RuntimeError): pass
+                if requested(): return 0
+                if time.monotonic()>=deadline: raise RuntimeError('Protection helper startup timed out')
+                time.sleep(.2)
+            children['protection-executor'] = _spawn_role('protection-executor',config,runtime,token,
+                [sys.executable,'-B','-X','utf8','-m','sjfx_protection.desktop_runtime','executor','--state',protection_paths['core_state']])
+            process=children['protection-executor'][0]
+            state['roles']['protection-executor']={'pid':process.pid,'created':_identity(process.pid)}
+            ready=children['protection-executor'][3].with_suffix('.ready')
+            while not (ready.is_file() and ready.read_text(encoding='ascii')==token):
+                if process.poll() is not None: raise RuntimeError('Protection executor exited; see launcher-protection-executor.log')
+                if requested(): return 0
+                if time.monotonic()>=deadline: raise RuntimeError('Protection executor startup timed out')
+                time.sleep(.1)
+            state['desktop_protection']=health_report(config,protection_paths)
+            from services.managed_embedding import selected, resource_check
+            if selected(config):
+                check = resource_check(config)
+                if not check['resource_complete']:
+                    raise RuntimeError('Bundled embedding resources are missing: ' + ', '.join(check['missing_files']))
+                children['embedding'] = _spawn_role('embedding', config, runtime, token)
+                process, _, _, gate = children['embedding']
+                state['roles']['embedding'] = {'pid': process.pid, 'created': _identity(process.pid)}
+                publish()
+                ready = gate.with_suffix('.ready')
+                while not (ready.is_file() and ready.read_text(encoding='ascii') == token):
+                    if process.poll() is not None:
+                        raise RuntimeError('Bundled embedding exited; see launcher-embedding.log')
+                    if requested():
+                        return 0
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('Bundled embedding startup timed out; see launcher-embedding.log')
+                    time.sleep(.2)
+                state['bundled_embedding'] = check
             children['web'] = _spawn_role('web', config, runtime, token)
             state['roles']['web'] = {'pid': children['web'][0].pid, 'created': _identity(children['web'][0].pid)}
             publish()
@@ -338,7 +465,7 @@ def supervise(args, config):
                 for role, (process, _, _, gate) in children.items():
                     if process.poll() is not None:
                         raise RuntimeError(role + ' exited during startup; see launcher-' + role + '.log')
-                    if role != 'web':
+                    if role not in {'web','protection-helper'}:
                         ready = gate.with_suffix('.ready')
                         initialized = initialized and ready.is_file() and ready.read_text(encoding='ascii') == token
                 if initialized:
@@ -367,9 +494,18 @@ def supervise(args, config):
             except OSError:
                 pass  # Cleanup must run even when state storage is full.
             failures = []
+            try:
+                health=helper_health(protection_paths)
+                state['pending_dispositions_at_stop']=health.get('active_dispositions',0)
+                state['protection_history_preserved']=True
+            except (OSError,ValueError,RuntimeError): pass
             for role in reversed(list(children)):
                 process, owner, log, gate = children[role]
                 try:
+                    if role=='protection-helper':
+                        Path(protection_paths['stop_file']).write_text(token,encoding='ascii')
+                        try: process.wait(timeout=4)
+                        except subprocess.TimeoutExpired: pass
                     terminate_process_tree(process, job=owner, grace_seconds=3, private_group=os.name != 'nt')
                 except Exception as exc:
                     failures.append(role + ': ' + type(exc).__name__)
@@ -405,7 +541,7 @@ def start(args, config):
     _ports_available(config)
     ensure_runtime_directories()
     run_id = uuid.uuid4().hex
-    command = [sys.executable, '-X', 'utf8', str(ROOT / 'sjfxctl.py')]
+    command = [sys.executable, '-B', '-X', 'utf8', str(ROOT / 'sjfxctl.py')]
     if args.env_file:
         command += ['--env-file', str(Path(args.env_file).expanduser().resolve())]
     command += ['run', '--run-id', run_id, '--timeout', str(args.timeout)]
@@ -453,16 +589,28 @@ def main():
     install.add_argument('--models-dir')
     install.add_argument('--tools-dir', help='Read-only parser tool resource root')
     install.add_argument('--parse-temp-dir', help='Writable temporary directory outside application/resources')
+    install.add_argument('--helper-port',type=int,default=18767,choices=range(1024,65536),metavar='PORT')
+    install.add_argument('--helper-binary',help='Installed native Windows helper executable')
+    install.add_argument('--clam-database',help='Already installed ClamAV database; never downloaded by launcher')
+    install.add_argument('--clam-binary',help='Installed ClamAV clamscan executable')
+    install.add_argument('--clam-certs',help='Installed ClamAV 1.5 CVD certificate directory')
     install.add_argument('--backend', choices=('vllm', 'ollama', 'openai_compatible'))
     install.add_argument('--port', type=int, default=18000, choices=range(1024, 65536), metavar='PORT')
     for name in ('start', 'run', 'stop'):
         command = sub.add_parser(name)
         command.add_argument('--timeout', type=float, default=90 if name != 'stop' else 30)
+        # Launchers append user flags after the implicit command. Accepting
+        # --env-file here keeps both `sjfxctl.py --env-file X start` and
+        # `start_sjfx --env-file X` equivalent.
+        command.add_argument('--env-file', dest='env_file', default=argparse.SUPPRESS,
+                             help=argparse.SUPPRESS)
         if name == 'start':
             command.add_argument('--open-browser', action='store_true')
         if name == 'run':
             command.add_argument('--run-id', help=argparse.SUPPRESS)
     sub.add_parser('status')
+    admin = sub.add_parser('init-admin', help='Initialize a fresh administrator without logging its password')
+    admin.add_argument('--password-stdin', action='store_true', help='Read a private stdin line; default uses hidden interactive prompts')
     check = sub.add_parser('doctor', help='Check deployment prerequisites; does not certify functional inference')
     check.add_argument('--scope', choices=('runtime', 'full'), default='full',
                        help='runtime: modules and writable directories; full (default): configured resources/tools/endpoints')
@@ -476,7 +624,7 @@ def main():
     config_sub.add_parser('get', help='Show active and saved model settings; credentials remain private')
     config_set = config_sub.add_parser('set')
     config_set.add_argument('--role', choices=('generation', 'embedding'), required=True)
-    for field in ('backend', 'base-url', 'model', 'version', 'weights-id', 'config-id'):
+    for field in ('backend', 'base-url', 'model', 'version', 'weights-id', 'config-id', 'encoding', 'tokenizer-path'):
         config_set.add_argument('--' + field)
     for field in ('context-tokens', 'timeout-seconds', 'concurrency', 'dimension'):
         config_set.add_argument('--' + field, type=int)
@@ -491,6 +639,8 @@ def main():
             setup(args)
             return 0
         config = _load_config(args)
+        if args.command == 'init-admin':
+            return init_admin(args, config)
         if args.command == 'config':
             return model_config_command(args, config)
         if args.command == 'model-test':

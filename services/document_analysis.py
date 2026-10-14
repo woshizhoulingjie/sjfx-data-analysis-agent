@@ -4,6 +4,7 @@ import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from collections import Counter
 
 from services.ollama import LocalModelError
@@ -1059,7 +1060,7 @@ def analyze_document(llm, path, node_path, max_chars=2000000, max_chunks=64,
 
     results = {}
     with ThreadPoolExecutor(max_workers=min(getattr(llm, "max_concurrency", 1), len(chunks))) as executor:
-        futures = {executor.submit(analyze_chunk, chunk): chunk for chunk in chunks}
+        futures = {executor.submit(copy_context().run, analyze_chunk, chunk): chunk for chunk in chunks}
         for future in as_completed(futures):
             chunk = futures[future]
             try:

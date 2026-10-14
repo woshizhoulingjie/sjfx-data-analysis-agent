@@ -10,6 +10,8 @@ validation, durable budget ledger and foreground-priority generation gate.
 **逐组结果**与 partial 状态：一次调用里有的组发布了、有的组失败，调用台账不再
 一律记成 completed（专家报告 §10/§13.3）。
 """
+from services.large_package_protection import package_lane, recheck_active, guarded_model_call, current_provenance, stamp_fields, validate_cached_rows, record_report_artifact, require_report_artifact
+from sjfx_protection.store import ProtectionError
 from contextlib import closing
 import json
 import os
@@ -50,6 +52,7 @@ def _preparation_lock(store, package_id):
         return lock
 
 
+@package_lane
 def process_batch(store, package_id, cancelled=lambda: False, model_client=None, prefetch=False):
     """Serialize same-package selection/preparation, never model execution.
 
@@ -187,6 +190,8 @@ def _process_batch(store, package_id, cancelled, model_client, prefetch, prepare
                         return
                     try:
                         prepared.append((job, naming.bundle(store, package_id, job['group_id'])))
+                    except ProtectionError:
+                        raise
                     except Exception as exc:
                         pre_claim_failed.append((job, exc))
                 # Retain the alternating fairness order within each window.
@@ -244,6 +249,8 @@ def _process_batch(store, package_id, cancelled, model_client, prefetch, prepare
                 batch_route=difficulty
                 pending.append((job,material,item['id']))
                 payload.append(item)
+            except ProtectionError:
+                raise
             except Exception as exc:
                 pre_claim_failed.append((job, exc))
         # 领取之前失败的任务：用 expect_status='queued' 复用同一套失败收口，
@@ -312,6 +319,8 @@ def _process_batch(store, package_id, cancelled, model_client, prefetch, prepare
                     naming.release_job(store,package_id,job['group_id'],job['revision'],
                                        attempts=job['attempts'],error='结果作废（命名暂停或修订已变）',
                                        category=naming.FAILURE_STALE)
+            except ProtectionError:
+                raise
             except Exception as exc:
                 one=naming.classify_failure(exc)
                 failed.append({'group':job['group_id'],'category':one})
@@ -358,7 +367,7 @@ def _process_batch(store, package_id, cancelled, model_client, prefetch, prepare
                               stop, getattr(Config, 'LP_EVIDENCE_PREFETCH_GROUPS', 4))
         with background_generation(stop, deadline=naming.round_generation_deadline(current)), naming.lease_renewal(
                 store, package_id, [job['group_id'] for job in claimed], stop):
-            response=model_client.chat(system,user,**kwargs)
+            response=guarded_model_call(model_client,"chat",system,user,**kwargs)
         if response.get('finish_reason')=='length':
             raise ValueError('批量目录命名输出被截断，改为逐组重试')
         from services.model_output import extract_json_value
@@ -387,6 +396,8 @@ def _process_batch(store, package_id, cancelled, model_client, prefetch, prepare
                     naming.release_job(store,package_id,job['group_id'],job['revision'],
                                        attempts=job['attempts'],error='结果作废（命名暂停或修订已变）',
                                        category=naming.FAILURE_STALE)
+            except ProtectionError:
+                raise
             except Exception as exc:
                 one=naming.classify_failure(exc)
                 failed.append({'group':job['group_id'],'category':one})
@@ -403,6 +414,8 @@ def _process_batch(store, package_id, cancelled, model_client, prefetch, prepare
         else:
             outcome = 'failed'
         return True
+    except ProtectionError:
+        raise
     except Exception as exc:
         prepared()
         category = naming.classify_failure(exc)

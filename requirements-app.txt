@@ -34,3 +34,5 @@ py7zr>=1.1.4,<2
 
 # Offline Thai QA lexical retrieval; bundled dictionary fingerprint is verified.
 pythainlp==5.3.8
+# ZoneInfo must work on offline hosts without an OS timezone database.
+tzdata>=2024.1,<2027

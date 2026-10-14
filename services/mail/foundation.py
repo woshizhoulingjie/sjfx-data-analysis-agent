@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from collections import Counter
+from sjfx_protection.store import ProtectionError
 
 VERSION = "mail-foundation-v4-reading"
 
@@ -260,7 +261,11 @@ def retain_content(connection, message_key, raw, parsed):
     digest = hashlib.sha256(raw).hexdigest()
     if digest != parsed.raw_sha256:
         raise ValueError("原始邮件内容哈希不一致")
-    connection.execute("INSERT OR IGNORE INTO mail_raw_store(raw_sha256,raw_bytes) VALUES (?,?)", (digest, raw))
+    from sjfx_protection.business import enabled, validated_cached_bytes
+    protected = enabled()
+    if protected:
+        validated_cached_bytes(raw, 'retained-message.eml')
+    connection.execute(("INSERT OR REPLACE" if protected else "INSERT OR IGNORE") + " INTO mail_raw_store(raw_sha256,raw_bytes) VALUES (?,?)", (digest, raw))
     # Replace the complete reading projection within the caller transaction.
     # Parser upgrades may retire a MIME body path (for example text inside a
     # multipart attachment); retaining that stale path would misattribute it.
@@ -326,7 +331,7 @@ def backfill_slice(repository, package_id, owner_id, *, job_id=None, cancelled=l
     if state and state[1] == 'ready' and state[2] == VERSION and state[3]==package['source_revision'] and not nested_change:
         return {'package_id':package_id,'status':'ready','already_current':True}
     with repository._connection() as c:
-        rows = [dict(r) for r in c.execute("SELECT m.* FROM mail_messages m WHERE m.message_key>? AND EXISTS(SELECT 1 FROM mail_visible_occurrences o WHERE o.package_id=? AND o.message_key=m.message_key) ORDER BY m.message_key LIMIT ?", (cursor,package_id,limit))]
+        rows = [dict(r) for r in c.execute("SELECT m.message_key,m.raw_sha256 FROM mail_messages m WHERE m.message_key>? AND EXISTS(SELECT 1 FROM mail_visible_occurrences o WHERE o.package_id=? AND o.message_key=m.message_key) ORDER BY m.message_key LIMIT ?", (cursor,package_id,limit))]
     errors = int(checkpoint.get('errors',0)); processed = int(checkpoint.get('processed',0))
     set_state(repository,package_id,'historical_backfill','running',cursor=checkpoint,fingerprint=package['source_revision'])
     for message in rows:
@@ -337,7 +342,8 @@ def backfill_slice(repository, package_id, owner_id, *, job_id=None, cancelled=l
         try:
             raw=read_message_raw(repository,key,owner_id,package_id)
             parsed=parse_eml(raw)
-            with repository._connection() as c:
+            from sjfx_protection.mail_cache import raw_production
+            with repository._connection() as c, raw_production(c, raw, 'foundation-message.eml'):
                 retain_content(c,key,raw,parsed)
                 repository._insert_parts(c,key,parsed.parts)
                 repository._insert_participants(c,key,parsed.participants)
@@ -361,6 +367,8 @@ def backfill_slice(repository, package_id, owner_id, *, job_id=None, cancelled=l
                 occurrences=c.execute("SELECT o.*,s.source_size,s.locator_json FROM mail_visible_occurrences o JOIN mail_sources s ON s.source_id=o.source_id WHERE o.package_id=? AND o.message_key=? ORDER BY o.source_member_ordinal,o.source_member_name",(package_id,key)).fetchall()
                 for i,o in enumerate(occurrences):
                     c.execute("INSERT INTO mail_import_entries(package_id,member_name,member_ordinal,byte_size,status,message_key,locator_json) VALUES (?,?,?,?,?,?,?) ON CONFLICT(package_id,member_name,member_ordinal) DO UPDATE SET status=excluded.status,message_key=excluded.message_key,error_json=NULL",(package_id,o['source_member_name'],o['source_member_ordinal'],o['source_size'],'ready' if i==0 else 'duplicate',key,o['locator_json']))
+        except ProtectionError:
+            raise
         except Exception as exc:
             errors+=1
             with repository._connection() as c:
@@ -386,6 +394,8 @@ def backfill_slice(repository, package_id, owner_id, *, job_id=None, cancelled=l
                 exists=c.execute('SELECT 1 FROM mail_import_entries WHERE package_id=? AND member_name=?',(package_id,member.name)).fetchone()
             if not exists:
                 inventory_entry(repository,package_id,member,status,error={'message':error} if error else None)
+    except ProtectionError:
+        raise
     except Exception as exc:
         checkpoint['inventory_warning']=str(exc)[:500]
     with repository._connection() as c:

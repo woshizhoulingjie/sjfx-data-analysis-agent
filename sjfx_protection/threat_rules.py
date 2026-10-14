@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import re
 import ntpath
 import zipfile
 from html.parser import HTMLParser
@@ -66,10 +68,16 @@ class ActiveHTML(HTMLParser):
                 self.findings.append(finding('malformed_link', target))
 
 
-def inspect_payload(raw, name, *, content_type='', depth=0, budget=None):
+def inspect_payload(raw, name, *, content_type='', depth=0, budget=None, provenance=None, parent_hash=None):
     budget = budget if budget is not None else {'bytes': 8 * 1024 * 1024, 'members': 200}
     result = filename_findings(name)
     suffix = ntpath.splitext(name)[1].lower()
+    if suffix in {'.rar','.7z','.tar','.gz','.bz2','.xz','.doc','.xls','.ppt','.msg'}:
+        result.append(finding('unsupported_container_format',name,'incomplete'))
+    if suffix=='.pdf':
+        for token in (b'/JavaScript',b'/JS',b'/Launch',b'/OpenAction',b'/AA'):
+            if token in raw:result.append(finding('pdf_active_object',token.decode()))
+        if b'/EmbeddedFile' in raw:result.append(finding('pdf_embedded_requires_adapter',name,'incomplete'))
     pe_offset = int.from_bytes(raw[60:64], 'little') if len(raw) >= 64 and raw[:2] == b'MZ' else -1
     executable = (pe_offset >= 64 and raw[pe_offset:pe_offset + 4] == bytes([80, 69, 0, 0])) or (
         raw.startswith(bytes([127, 69, 76, 70])) and len(raw) >= 52 and raw[4] in {1, 2})
@@ -101,6 +109,14 @@ def inspect_payload(raw, name, *, content_type='', depth=0, budget=None):
                     result.extend(filename_findings(item))
                     if item.lower().endswith('vbaproject.bin'):
                         result.append(finding('embedded_macro', item))
+                    if item.lower().endswith('.rels'):
+                        # Office relationships declare external objects and linked resources.
+                        if member.file_size <= min(budget['bytes'], 1024*1024):
+                            relationships=archive.read(member)
+                            if re.search(br'TargetMode\s*=\s*[\"\x27]External[\"\x27]',relationships,re.I):
+                                result.append(finding('office_external_relationship',item))
+                    if '/embeddings/' in item.lower() or '/activex/' in item.lower():
+                        result.append(finding('office_active_or_embedded_object',item))
                     if member.flag_bits & 1:
                         result.append(finding('encrypted_archive_member', item))
                         continue
@@ -113,7 +129,10 @@ def inspect_payload(raw, name, *, content_type='', depth=0, budget=None):
                     if len(payload) > member.file_size or budget['bytes'] < 0:
                         result.append(finding('archive_expansion_limit', item))
                         break
-                    result.extend(inspect_payload(payload, item, depth=depth + 1, budget=budget))
+                    if provenance is not None:
+                        provenance.append({'parent_sha256':hashlib.sha256(raw).hexdigest(),
+                            'member_name':item,'sha256':hashlib.sha256(payload).hexdigest(),'size':len(payload),'depth':depth+1})
+                    result.extend(inspect_payload(payload, item, depth=depth + 1, budget=budget,provenance=provenance,parent_hash=hashlib.sha256(raw).hexdigest()))
                     if len(result) >= 180:
                         result.append(finding('archive_findings_limit', name))
                         break

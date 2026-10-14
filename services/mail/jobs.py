@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from config import Config
+from sjfx_protection.store import ProtectionError
 
 from .attachments import read_part
 from .extraction import extract_attachment
@@ -24,7 +25,7 @@ if Config.MAIL_ENABLE_FACT_EXTRACTION:
     MAIL_TASK_TYPES.add("mail_factextract")
 
 
-def _ingest_nested(services,package,source_record,member,parsed,depth=0):
+def _ingest_nested(services,package,source_record,member,parsed,depth=0,parent_hash=None):
     if not package.get("config",{}).get("include_nested_messages",False) or not Config.MAIL_ENABLE_NESTED_MESSAGES or depth>=services.policy.max_nested_message_depth:return 0
     count=0
     for part in parsed.parts:
@@ -32,9 +33,11 @@ def _ingest_nested(services,package,source_record,member,parsed,depth=0):
         raw=part.raw_payload
         services.policy.validate_size(len(raw),limit=services.policy.max_message_bytes,label="嵌套邮件")
         child=MailMember(member.name+"!"+part.mime_path+".eml",member.ordinal,len(raw),{"kind":"nested","parent":member.locator,"mime_path":part.mime_path})
+        from sjfx_protection.business import inspect_bytes
+        raw=inspect_bytes(raw,child.name,parent_hash)
         nested=parse_eml(raw,max_parts=services.policy.max_mime_parts,max_nested_message_depth=services.policy.max_nested_message_depth-depth-1)
         services.repository.upsert_ingested_message(package_id=package["package_id"],source=source_record,member=child,raw=raw,parsed=nested)
-        count+=1+_ingest_nested(services,package,source_record,child,nested,depth+1)
+        count+=1+_ingest_nested(services,package,source_record,child,nested,depth+1,hashlib.sha256(raw).hexdigest())
     return count
 
 
@@ -63,6 +66,8 @@ def _package(services, job):
 
 
 def _active(services, job_id):
+    from sjfx_protection.cache import capture_sources
+    capture_sources()
     if services.repository.cancelled(job_id):
         raise RuntimeError("邮件任务已取消")
 
@@ -104,6 +109,11 @@ def _import(job, services):
     # owner check alone is insufficient because the source path may point at
     # another user's upload tree after a crafted create request.
     source_path = services.policy.resolve_source(package["source_path"], owner_id=owner_id)
+    if package['source_revision']=='pending-inspection':
+        from .api import _source_revision
+        package['source_revision']=_source_revision(source_path,policy=services.policy,owner_id=owner_id)
+        with services.repository._connection() as connection:
+            connection.execute('UPDATE mail_packages SET source_revision=? WHERE package_id=? AND owner_id=?',(package['source_revision'],package['package_id'],owner_id))
     source=SourceRef(
         package_id=package["package_id"], kind=package["source_kind"],
         path=str(source_path), source_revision=package["source_revision"],
@@ -147,8 +157,10 @@ def _import(job, services):
                 services.policy.validate_size(len(raw),limit=services.policy.max_message_bytes,label='邮件')
                 parsed=parse_eml(raw,max_parts=services.policy.max_mime_parts,max_nested_message_depth=services.policy.max_nested_message_depth)
                 row=services.repository.upsert_ingested_message(package_id=package['package_id'],source=source_record,member=member,raw=raw,parsed=parsed)
-                _ingest_nested(services,package,source_record,member,parsed)
+                _ingest_nested(services,package,source_record,member,parsed,parent_hash=hashlib.sha256(raw).hexdigest())
                 processed_bytes+=len(raw)
+            except ProtectionError:
+                raise
             except Exception as exc:
                 inventory_entry(services.repository,package['package_id'],member,'terminal_failed',error={'type':type(exc).__name__,'message':str(exc)[:500]})
         next_index=index+1;processed+=1
@@ -185,6 +197,8 @@ def _extract(job, services):
             part,_=read_part(services.repository,item['message_key'],owner_id,pid,item['mime_path'])
             services.policy.validate_size(part.byte_size,limit=services.policy.max_attachment_bytes,label='附件')
             result=extract_attachment(part)
+        except ProtectionError:
+            raise
         except Exception as exc:
             result={'status':'failed','parser':'mail-source','error':{'type':type(exc).__name__,'message':str(exc)[:500]}}
         services.repository.store_extraction(pid,owner_id,item['message_key'],item['mime_path'],result)
@@ -210,6 +224,8 @@ def _ocr(job, services):
         try:
             part,_=read_part(services.repository,item['message_key'],owner_id,pid,item['mime_path'])
             result=extract_ocr(part,services.parser,lambda:services.repository.cancelled(job['id']))
+        except ProtectionError:
+            raise
         except Exception as exc:
             _active(services,job['id'])
             result={'status':'failed','parser':'mail-source','error':{'message':str(exc)[:500]}}
@@ -236,6 +252,8 @@ def _embed(job, services):
     package=_package(services,job)
     try:
         status=embed_segments_batch(services.repository,package["package_id"],_owner(job),cancelled=lambda:services.repository.cancelled(job["id"]))
+    except ProtectionError:
+        raise
     except Exception as exc:
         _active(services,job["id"])
         previous=services.repository.progress(job["id"])
@@ -325,6 +343,12 @@ def _export(job, services):
 
 
 def run_claimed_mail_job(job):
+    from sjfx_protection.business import job_execution
+    with job_execution(job):
+        return _run_approved_mail_job(job)
+
+
+def _run_approved_mail_job(job):
     if not getattr(Config, "MAIL_FEATURE_ENABLED", False):
         raise RuntimeError("邮件研究功能已由部署配置关闭")
     task_type = str(job.get("task_type") or "")

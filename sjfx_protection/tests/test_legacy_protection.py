@@ -17,6 +17,15 @@ from sjfx_protection.worker import inventory,verify_inventory
 from sjfx_protection.integration import install
 
 
+def enable_auto_quarantine(store):
+    """矩阵 A05：自动处置必须由管理员策略显式启用。"""
+    from sjfx_protection.policy import write_policy
+    write_policy(store.directory, 'admin', True,
+                 {'enabled': True,
+                  'operation_policy': {'observation_only': False, 'automatic_quarantine': True}},
+                 '测试：启用自动隔离')
+
+
 class ProtectionTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
@@ -89,7 +98,8 @@ class ProtectionTests(unittest.TestCase):
         p=self.root/'test.eml'
         p.write_text('Subject: Test\nMIME-Version: 1.0\nContent-Type: text/html; charset=utf-8\n\n<a href="https://evil.example/login">https://bank.example/login</a><script>alert(1)</script>',encoding='utf-8')
         result=inspect_file(p,clam='nonexistent-scanner-for-test')
-        self.assertEqual(result['risk'],'unchecked')
+        # 矩阵 C05：必要引擎缺失记 incomplete。
+        self.assertEqual(result['risk'],'incomplete')
         self.assertEqual(result['engines']['clamav'],'error')
         self.assertFalse(safe_mail_preview(p)['html_rendered'])
         self.assertNotIn('<script>',safe_mail_preview(p)['text'])
@@ -128,6 +138,8 @@ class ProtectionTests(unittest.TestCase):
         _,_,file=self.prepare();dev={'id':self.device,'owner':'alice'}
         with self.store.db(True) as db:db.execute("UPDATE files SET risk='dangerous' WHERE id=?",(file['id'],))
         rec={'file_id':file['id'],'sha256':file['sha256'],'local_path':'D:\\dangerous','local_identity':'v:1'}
+        # 矩阵 A05：自动隔离必须显式启用。
+        enable_auto_quarantine(self.store)
         self.store.bind(dev,[rec]);self.store.bind(dev,[rec])
         actions=self.store.pending_actions(self.device)
         self.assertEqual(len(actions),1);self.assertEqual(actions[0]['kind'],'quarantine')
@@ -160,10 +172,20 @@ class ProtectionTests(unittest.TestCase):
         _,cid,file=self.prepare()
         with self.store.db(True) as db:db.execute("UPDATE files SET risk='unchecked' WHERE id=?",(file['id'],))
         self.assertTrue(self.store.blocked_file(cid))
-        with self.store.db(True) as db:db.execute("UPDATE files SET risk='review' WHERE id=?",(file['id'],))
+        # 矩阵 C05/C09：只有检查覆盖完整的具体版本才允许人工复核放行。
+        with self.store.db(True) as db:
+            db.execute("UPDATE files SET risk='review',scan_status=? WHERE id=?",
+                       (json.dumps({'coverage':{'complete':True}}),file['id']))
         self.assertTrue(self.store.blocked_file(cid))
         self.store.approve_review('alice','admin',file['id'],file['sha256'],'已核对来源及目标地址')
         self.assertFalse(self.store.blocked_file(cid))
+        # 覆盖不完整时不能靠人工复核绕过。
+        with self.store.db(True) as db:
+            db.execute('DELETE FROM risk_reviews WHERE file_id=?',(file['id'],))
+            db.execute("UPDATE files SET risk='review',scan_status=? WHERE id=?",
+                       (json.dumps({'coverage':{'complete':False}}),file['id']))
+        with self.assertRaises(ProtectionError):
+            self.store.approve_review('alice','admin',file['id'],file['sha256'],'放行')
         with self.store.db(True) as db:db.execute("UPDATE files SET risk='dangerous' WHERE id=?",(file['id'],))
         self.assertTrue(self.store.blocked_file(cid))
         with self.assertRaises(ProtectionError):self.store.approve_review('alice','admin',file['id'],file['sha256'],'放行')
@@ -180,17 +202,26 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             p.allow_enforcement=True
             with p.store.db(True) as db:db.execute('INSERT INTO settings VALUES(?,?)',('enforce:alice','1'))
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
+                # 矩阵 A02/A03：关闭保护时原业务不受旧账号级 enforce 影响，直通。
                 client.cookies.set('sjfx_session','alice')
-                self.assertEqual((await client.get('/api/existing')).status_code,403)
-                self.assertEqual((await client.get('/protection/api/status')).json()['mode'],'enforce')
+                self.assertEqual((await client.get('/api/existing')).status_code,200)
                 client.cookies.set('sjfx_session','bob')
                 self.assertEqual((await client.get('/api/existing')).status_code,200)
-                self.assertEqual((await client.get('/protection/api/status')).json()['mode'],'audit')
-                self.assertEqual((await client.post('/protection/api/policy',json={'enabled':True},headers={'X-SJFX-Protection':'1'})).status_code,403)
-                p.allow_enforcement=False
-                self.assertEqual((await client.post('/protection/api/policy',json={'enabled':True},headers={'X-SJFX-Protection':'1'})).status_code,503)
+                # 唯一开关是管理员总开关：可修改，修订号递增并记录操作人。
+                r=await client.post('/protection/api/policy',json={'enabled':True},headers={'X-SJFX-Protection':'1'})
+                self.assertEqual(r.status_code,200)
+                body=r.json()
+                self.assertTrue(body['policy']['enabled'] and body['enforced'] is True)
+                self.assertEqual(body['policy']['actor'],'bob')
+                self.assertGreaterEqual(body['policy']['revision'],1)
+                # 启用总开关会拉起服务器观察进程；Windows 下必须先停掉，否则临时
+                # 状态目录里的 package-watch.log 仍被占用，teardown 会报 WinError 32。
+                watcher=getattr(p,'_watch_proc',None)
+                if watcher is not None and watcher.poll() is None:
+                    watcher.terminate();watcher.wait(timeout=10)
 
-    async def test_monitor_mode_links_business_event_without_restricting_unbound_user(self):
+    async def test_off_mode_is_transparent_for_unbound_business_user(self):
+        """矩阵 A02/A06：关闭保护时未登记用户的原业务直通，不产生保护事件。"""
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)/'source';root.mkdir();(root/'file.txt').write_text('data')
             app=FastAPI()
@@ -202,9 +233,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test',cookies={'sjfx_session':'valid'}) as client:
                 self.assertEqual((await client.post('/api/read-document',json={'path':'file.txt'})).status_code,200)
             records=[e for e in p.store.list_rows('events','alice') if e['action']=='system.request']
-            self.assertEqual(len(records),1)
-            self.assertTrue(records[0]['file_id'])
-            self.assertEqual(json.loads(records[0]['payload'])['payload']['collection_id'],cid)
+            self.assertEqual(records,[])
 
     async def test_disabled_is_transparent_and_has_no_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,18 +253,13 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             p=install(app,state_dir=Path(tmp)/'state',allowed_roots=[tmp],
                 session_resolver=lambda s:{'owner_id':'alice','user_id':'u1'} if s=='valid' else None,mode='enforce')
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test',cookies={'sjfx_session':'valid'}) as client:
-                self.assertEqual((await client.get('/api/existing')).status_code,403)
+                # 矩阵 A02/A06：全局按路由拦截已由按数据包准入取代；关闭时业务接口直通，
+                # 控制入口（配对）始终可用，但跨站请求仍被拒绝。
+                self.assertEqual((await client.get('/api/existing')).status_code,200)
                 r=await client.post('/protection/api/enrollments',json={},headers={'Origin':'https://evil.example','X-SJFX-Protection':'1'})
                 self.assertEqual(r.status_code,403)
-                key=Ed25519PrivateKey.generate()
-                pub=base64.b64encode(key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)).decode()
-                did=p.store.enroll(p.store.enrollment('alice','u1'),pub,'test')
-                p.store.heartbeat(did,{'healthy':True})
-                stamp=str(int(time.time()));nonce=uid()
-                msg='\n'.join(['sjfx-browser-v1',digest('valid'),'GET','/api/existing',did,stamp,nonce])
-                headers={'X-SJFX-Device':did,'X-SJFX-Time':stamp,'X-SJFX-Nonce':nonce,'X-SJFX-Proof':base64.b64encode(key.sign(msg.encode())).decode()}
-                self.assertEqual((await client.get('/api/existing',headers=headers)).status_code,200)
-                self.assertEqual((await client.get('/api/existing',headers=headers)).status_code,403)
+                r=await client.post('/protection/api/enrollments',json={'consent':True},headers={'X-SJFX-Protection':'1'})
+                self.assertEqual(r.status_code,200)
 
 
 if __name__=='__main__':unittest.main()

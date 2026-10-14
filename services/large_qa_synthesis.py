@@ -17,6 +17,8 @@ from services.large_qa_corpus import ReadOnlySourceStore, scan_corpus, scope_man
 from services.large_qa_index import LargeQAIndex, digest, loads, tokens, plain_text
 from services.large_qa_search import _source_columns, _source_is_current, evidence
 from services.qa_execution import current_execution
+from services.large_qa_protection import qa_lane, qa_model_text
+from sjfx_protection.store import ProtectionError
 
 
 _EXCEPTION = re.compile(r'但是|然而|例外|争议|限制|除非|风险|必须|不得|however|unless|except|limitation|risk', re.I)
@@ -76,6 +78,7 @@ def _compact_capsules(capsules, query):
     return output
 
 
+@qa_lane
 def reusable_synthesis(prepared, retrieval, query, base=None):
     """Recheck versions without rescanning text when repairing the same turn."""
     context = dict(prepared.get('package_context') or {})
@@ -230,7 +233,6 @@ def _map(index, key, inputs, lookup, query, model, deadline, *, reduce=False, ov
     remaining = deadline - time.monotonic()
     if model is None or remaining < 5:
         return _fallback(list(lookup), lookup, query), False, False
-    from services.conversation import _model_text
     from services.model_output import extract_json_value
     control = current_execution()
     if control and control.checkpoint:
@@ -252,7 +254,7 @@ def _map(index, key, inputs, lookup, query, model, deadline, *, reduce=False, ov
         if available < 512:
             raise ValueError('全包归并批次超过上下文预算')
         metadata = {}
-        raw = _model_text(model, system, prompt, max_tokens=min(1800 if overview else 2000, available),
+        raw = qa_model_text(model, system, prompt, max_tokens=min(1800 if overview else 2000, available),
                           timeout=max(1, min(60, int(remaining))), interactive=False,
                           response_metadata=metadata)
         if metadata.get('finish_reason') == 'length':
@@ -276,6 +278,8 @@ def _map(index, key, inputs, lookup, query, model, deadline, *, reduce=False, ov
             raise ValueError('归并模型未返回可回查来源')
         _cache_write(index, key, {'points': valid})
         return valid, True, False
+    except ProtectionError:
+        raise
     except Exception:
         return _fallback(list(lookup), lookup, query), False, False
 
@@ -295,6 +299,7 @@ def _source_snapshot(index, store, scope, expected, generation, root, source_dig
     return True, current
 
 
+@qa_lane
 def prepare_global(retrieval, query, model, base=None, *, store=None, scope=None, time_budget=None):
     context = dict(retrieval.get('package_context') or {})
     state = dict(context.get('large_qa') or {})

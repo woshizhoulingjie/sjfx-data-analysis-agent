@@ -8,22 +8,30 @@ from .source import open_locator
 
 def read_message_raw(repository, message_key, owner_id, package_id, occurrence_id=None):
     import hashlib
-    message = repository.get_message(message_key, owner_id, package_id)
-    if not message:
-        raise LookupError("邮件不存在或不属于当前资料包")
-    digest = message['raw_sha256']
-    if occurrence_id:
-        occurrence = next((item for item in message['occurrences'] if item['occurrence_id'] == occurrence_id), None)
-        if not occurrence:
-            raise LookupError('原始副本不存在或不属于当前邮件与资料包')
-        digest = occurrence['raw_sha256']
+    # Resolve only stored identity/ownership here. Raw recovery must not first
+    # consume an unverified historical subject/body projection via get_message.
     with repository._connection() as c:
-        cached = c.execute("SELECT raw_bytes FROM mail_raw_store WHERE raw_sha256=?", (digest,)).fetchone()
+        args = [message_key, package_id, owner_id]
+        condition = ''
+        if occurrence_id:
+            condition = ' AND o.occurrence_id=?'
+            args.append(occurrence_id)
+        identity = c.execute('SELECT o.raw_sha256 FROM mail_occurrences o JOIN mail_packages p ON p.package_id=o.package_id WHERE o.message_key=? AND o.package_id=? AND p.owner_id=?' + condition + ' ORDER BY o.source_member_ordinal LIMIT 1', args).fetchone()
+    if not identity:
+        raise LookupError("邮件不存在或不属于当前资料包")
+    digest = identity['raw_sha256']
+    with repository._connection() as c:
+        # A raw cache can prove itself from its exact bytes and the approved
+        # manifest/derived artifact. This exception never accepts stored text,
+        # summaries or model output and never writes historical provenance.
+        raw_connection = getattr(c, 'raw', c)
+        cached = raw_connection.execute("SELECT raw_bytes FROM mail_raw_store WHERE raw_sha256=?", (digest,)).fetchone()
     if cached:
         raw=bytes(cached[0])
         if hashlib.sha256(raw).hexdigest()!=digest:
             raise ValueError('已保存原始邮件哈希校验失败')
-        return raw
+        from sjfx_protection.business import validated_cached_bytes
+        return validated_cached_bytes(raw,'cached-message.eml',owner_id)
     import json
     with repository._connection() as c:
         sources=c.execute('SELECT s.locator_json FROM mail_sources s JOIN mail_occurrences o ON o.source_id=s.source_id WHERE o.package_id=? AND o.message_key=? AND o.raw_sha256=? ORDER BY o.source_member_ordinal',(package_id,message_key,digest)).fetchall()
@@ -59,5 +67,9 @@ def read_part(repository, message_key, owner_id, package_id, mime_path):
     parsed = parse_eml(raw)
     for part in parsed.parts:
         if part.mime_path == str(mime_path):
+            from sjfx_protection.business import enabled,inspect_bytes
+            if enabled() and part.raw_payload:
+                import hashlib
+                inspect_bytes(part.raw_payload,part.filename_raw or str(mime_path),hashlib.sha256(raw).hexdigest())
             return part, raw
     raise ValueError("邮件部件不存在")

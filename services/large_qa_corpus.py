@@ -15,6 +15,8 @@ import sqlite3
 
 from services.large_archive_members import IDENTITY_FIELDS, member_node
 from services.large_qa_index import loads, tokens
+from services.large_qa_protection import qa_lane
+from sjfx_protection import business
 from services.large_qa_search import _matches_current_source, _source_is_current, current_paths, scope_filter
 
 
@@ -33,13 +35,18 @@ class ReadOnlySourceStore:
     @contextmanager
     def _connect(self):
         connection = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, timeout=20)
+        checked = connection
         try:
             connection.row_factory = sqlite3.Row
-            connection.execute('PRAGMA query_only=ON')
-            connection.execute('BEGIN')
-            yield connection
+            if business.enabled():
+                from services.large_package_sql_cache import protect_connection
+                checked = protect_connection(connection, self.path)
+            else:
+                connection.execute('PRAGMA query_only=ON')
+            checked.execute('BEGIN')
+            yield checked
         finally:
-            connection.close()
+            checked.close()
 
     def get(self, package_id):
         with self._connect() as connection:
@@ -53,6 +60,7 @@ def _scope(value):
     return ConversationScope.from_dict(value) if isinstance(value, dict) or value is None else value
 
 
+@qa_lane
 def scope_manifest(store, index, scope=None):
     """Distinguish inventoried scope files from a potentially incomplete index."""
     scope = _scope(scope)

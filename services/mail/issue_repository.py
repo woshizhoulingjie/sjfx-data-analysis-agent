@@ -653,8 +653,14 @@ class IssueRepository:
                 return None
             key = stable_id('mcache', [package_id, owner_id, message_key, source_hash, scope, slice_scope,
                                       extraction_version, model_version, attribution])
-            row = connection.execute('SELECT payload_json,completion FROM mail_act_extraction_cache '
-                        'WHERE cache_key=? AND package_id=? AND owner_id=?', (key, package_id, owner_id)).fetchone()
+            from sjfx_protection.store import ProtectionError
+            try:
+                row = connection.execute('SELECT payload_json,completion FROM mail_act_extraction_cache '
+                            'WHERE cache_key=? AND package_id=? AND owner_id=?', (key, package_id, owner_id)).fetchone()
+            except ProtectionError as exc:
+                if exc.code != 'cache_provenance_missing':
+                    raise
+                return None
             if not row:
                 return None
             value = _load(row['payload_json'])
@@ -687,7 +693,8 @@ class IssueRepository:
                         raise ValueError('cached citation is outside the extracted slice')
             key = stable_id('mcache', [package_id, owner_id, message_key, source_hash, scope, slice_scope,
                                       extraction_version, model_version, attribution])
-            connection.execute('INSERT OR IGNORE INTO mail_act_extraction_cache(cache_key,package_id,owner_id,message_key,'
+            from sjfx_protection.business import enabled
+            connection.execute(('INSERT OR REPLACE' if enabled() else 'INSERT OR IGNORE') + ' INTO mail_act_extraction_cache(cache_key,package_id,owner_id,message_key,'
                     'source_hash,scope_fingerprint,slice_json,extraction_version,model_version,attribution_fingerprint,payload_json,completion) '
                     'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', (key, package_id, owner_id, message_key, source_hash,
                     fingerprint(scope), canonical(slice_scope), extraction_version, model_version, attribution,

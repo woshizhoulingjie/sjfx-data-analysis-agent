@@ -7,21 +7,34 @@ from .store import ProtectionError
 SELF_SERVICE = {
     '/protection': {'GET'},
     '/protection/setup': {'GET'},
+    '/protection/packages': {'GET'},
+    '/protection/packages.js': {'GET'},
     '/protection/download': {'GET'},
     '/protection/api/status': {'GET'},
     '/protection/api/session': {'GET'},
     '/protection/api/setup': {'GET'},
     '/protection/api/enrollments': {'POST'},
     '/protection/api/revoke-self': {'POST'},
+    '/protection/api/registrations': {'GET','POST'},
+    '/protection/api/registration': {'GET'},
+    '/protection/api/recheck': {'POST'},
+    '/protection/api/cancel-registration': {'POST'},
+    '/protection/api/manifest': {'GET'},
+    '/protection/api/approval-request': {'POST'},
+    '/protection/api/my-approvals': {'GET'},
 }
 ADMIN = {
     '/protection/admin': {'GET'},
+    '/protection/admin.js': {'GET'},
     **{'/protection/api/' + name: methods for name, methods in {
         'policy': {'POST'}, 'collections': {'GET', 'POST'},
         'cancel-collection': {'POST'}, 'files': {'GET'}, 'devices': {'GET'},
         'revoke': {'POST'}, 'bindings': {'GET'}, 'events': {'GET'},
         'trace': {'GET'}, 'actions': {'GET', 'POST'}, 'preview': {'GET'},
         'review': {'POST'}, 'verify-ledger': {'GET'},
+        'package-policy': {'GET','POST'}, 'root-grants': {'GET','POST'},
+        'approvals': {'GET','POST'}, 'registration-mode': {'POST'},
+        'sensitivity': {'POST'}, 'artifact-recheck': {'POST'},
     }.items()},
 }
 

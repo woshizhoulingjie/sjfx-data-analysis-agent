@@ -199,14 +199,31 @@ class SegmentMemory:
             c=self.connection()
             try:
                 row=c.execute("SELECT value FROM translations WHERE key=?",(key,)).fetchone()
-                return json.loads(row[0]) if row else None
+                if not row:
+                    return None
+                value = json.loads(row[0])
+                from sjfx_protection import business, cache
+                if business.enabled():
+                    from sjfx_protection.store import ProtectionError
+                    try:
+                        cache.require_payload(cache.resource_key(self.path, 'mail-translation-segment', *self.scope, key), value, owner=self.scope[0])
+                    except ProtectionError as exc:
+                        if exc.code == 'cache_provenance_missing':
+                            return None
+                        raise
+                return value
             finally:c.close()
         except (sqlite3.Error,OSError,ValueError):return None
     def put(self,key,value):
+        from sjfx_protection import business, cache
+        sources = cache.capture_sources() if business.enabled() else None
         try:
             c=self.connection()
             try:
                 c.execute("INSERT OR REPLACE INTO translations VALUES(?,?,?)",(key,json.dumps(value,ensure_ascii=False),time.time()));c.commit()
+                if business.enabled():
+                    stored = json.loads(c.execute('SELECT value FROM translations WHERE key=?', (key,)).fetchone()[0])
+                    cache.record_payload(cache.resource_key(self.path, 'mail-translation-segment', *self.scope, key), stored, sources, owner=self.scope[0])
             finally:c.close()
         except (sqlite3.Error,OSError):pass
 
@@ -264,6 +281,8 @@ def translation_steps(services, entries, *, contexts=None, memory=None, cancelle
         return values
     yield snapshots()
     while work and not cancelled():
+        from sjfx_protection.cache import capture_sources
+        capture_sources()
         batch=[];size=0
         while work and len(batch)<4 and (not batch or size+len(work[0]["protected"])<=2200):
             task=work.pop(0);task["attempt"]+=1;batch.append(task);size+=len(task["protected"])
@@ -277,6 +296,7 @@ def translation_steps(services, entries, *, contexts=None, memory=None, cancelle
                 response=response.get("json",response)
                 # Review meaning and omissions before accepting any prose; same source boundaries.
                 if response.get("translations"):
+                    capture_sources()
                     with background_generation(cancelled):
                         reviewed=model.chat_json(
                             PROMPT+"\n现在进行译后审校。逐项对照source和draft，修正遗漏、误解、生硬语序和行政术语。不得把否定改肯定。"
