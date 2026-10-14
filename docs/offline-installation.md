@@ -10,7 +10,7 @@
 
 保留原始压缩包及其 SHA256 文件。解压到独立目录，不与最终程序目录或实例数据目录重叠。程序目录存放应用、运行时及只读资源；实例目录存放配置、数据库、日志、缓存、上传和导出。实例必须在可写本地磁盘，SQLite 不应放在网络共享或同步目录。首次安装需为解压包和程序副本预留空间；升级还保留上一份程序备份。
 
-安装器会严格检查每个文件的 SHA256、大小、权限和清单，发现缺失、改动或未列出的文件会停止。清单校验用于检查内容完整性；交付归档的 SHA256 应通过可信渠道核对。
+安装器会严格检查每个文件的 SHA256、大小和清单，发现缺失、改动或未列出的文件会停止；拒绝符号链接和越界路径。Linux 另比较 POSIX mode；Windows 不校验 POSIX mode，安装后为程序文件设置只读属性。清单校验用于检查内容完整性；交付归档的 SHA256 应通过可信渠道核对。
 
 ## Windows
 
@@ -58,7 +58,7 @@ sh ./install_linux.sh
 
 ## 升级、程序路径迁移与恢复
 
-先备份实例目录，并停止正在进行的重要任务。在新版本解压包根目录运行 `upgrade_windows.ps1`（同安装命令的 `-InstallDir`、`-DataDir`）或 `upgrade_linux.sh`（同安装环境变量）。安装器停止旧实例，替换程序目录，保留原配置、数据库和输出；旧程序保留为 `.backup-*`。
+先停止正在进行的重要任务，再使用同一实例配置执行 `stop --timeout 30` 并确认成功，最后备份完整实例目录（包括 SQLite sidecar）；备份完成后才升级。在新版本解压包根目录运行 `upgrade_windows.ps1`（同安装命令的 `-InstallDir`、`-DataDir`）或 `upgrade_linux.sh`（同安装环境变量）。安装器停止旧实例，替换程序目录，保留原配置、数据库和输出；旧程序保留为 `.backup-*`。
 
 更改程序路径时，使用新的程序目录和原实例目录重新运行安装器。安装器根据实例的 `config/install-root.txt` 定位并停止旧程序，迁移原来指向旧程序的模型、工具、分词器和保护助手路径；自定义外部资源路径与模型选择保留。迁移后应检查新配置、运行 `doctor` 并启动验收，再处理旧程序目录。
 
@@ -66,7 +66,7 @@ sh ./install_linux.sh
 
 ## 卸载
 
-Windows 从程序目录运行 `uninstall_windows.ps1 -InstallDir <程序绝对路径> -DataDir <实例绝对路径>`；Linux 设置同一组安装环境变量后运行 `sh <程序绝对路径>/uninstall_linux.sh keep-data`。默认仅删除程序，保留全部实例数据，重新安装时可复用原实例。
+Windows 先将 PowerShell 的当前目录切换到程序目录之外（例如 `Set-Location -LiteralPath $env:USERPROFILE`），再通过脚本绝对路径运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<程序绝对路径>\uninstall_windows.ps1" -InstallDir "<程序绝对路径>" -DataDir "<实例绝对路径>"`；Linux 设置同一组安装环境变量后运行 `sh <程序绝对路径>/uninstall_linux.sh keep-data`。默认仅删除程序，保留全部实例数据，重新安装时可复用原实例。
 
 Windows 的 `-PurgeData` 或 Linux 的 `purge-data` 会同时删除实例。仅在已备份且明确不再需要数据时使用。历史 `.backup-*` 和迁移前程序目录需另行处理，确认路径后再删除。
 

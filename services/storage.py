@@ -7986,7 +7986,14 @@ class Storage:
                 "UPDATE analysis_jobs SET {} WHERE id=?".format(",".join(fields)),
                 values,
             )
-            final = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone()
+            from sjfx_protection import business
+            if business.enabled() and (cancelled or error is not None):
+                # Cancellation/failure publishes queue metadata only. An old
+                # protected result may no longer be readable after a revision
+                # change; do not hydrate it or roll back the terminal state.
+                final = self._job_metadata_row(conn, job_id)
+            else:
+                final = conn.execute("SELECT * FROM analysis_jobs WHERE id=?", (job_id,)).fetchone()
         return self._decode_job(dict(final)) if final else None
 
     def requeue_job_slice(self, job_id, message):

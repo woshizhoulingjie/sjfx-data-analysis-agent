@@ -1042,10 +1042,15 @@ def run_forever():
                     batch_id = str((job.get("options") or {}).get("deep_batch_id") or "")
                     if batch_id:
                         storage.update_deep_parse_batch(batch_id, "cancelled", error_code="job_cancelled", error_message="任务已取消")
-                    if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
-                        storage.update_analysis_progress_status(
-                            job.get("scan_id"), "cancelled", "分析已取消；已完成的文件检查点仍保留。", "cancelled"
-                        )
+                    try:
+                        if job.get("task_type") in {"scan_and_analyze", "analyze_package"} and storage.scan_owned(job.get("scan_id")):
+                            storage.update_analysis_progress_status(
+                                job.get("scan_id"), "cancelled", "分析已取消；已完成的文件检查点仍保留。", "cancelled"
+                            )
+                    except Exception:
+                        # Admission has ended. Advisory progress cannot prevent
+                        # the durable cancellation from being finalized.
+                        logger.warning("Deferred cancelled progress publication scan_id=%s", job.get("scan_id"), exc_info=True)
                     _finalize_job_result(job)
                     continue
                 if isinstance(exc, JobExecutionTimeout) and job.get("task_type") in {"scan_and_analyze", "analyze_package"}:
@@ -1055,11 +1060,14 @@ def run_forever():
                             job_id,
                             "本轮运行达到时间上限；已保存检查点，自动续建下一批（第 {} 轮）。".format(attempts + 1),
                         )
-                        if requeued and storage.scan_owned(job.get("scan_id")):
-                            storage.update_analysis_progress_status(
-                                job.get("scan_id"), "queued",
-                                "本轮达到运行时限，已保存检查点并等待自动续批。", "checkpoint_requeued",
-                            )
+                        try:
+                            if requeued and storage.scan_owned(job.get("scan_id")):
+                                storage.update_analysis_progress_status(
+                                    job.get("scan_id"), "queued",
+                                    "本轮达到运行时限，已保存检查点并等待自动续批。", "checkpoint_requeued",
+                                )
+                        except Exception:
+                            logger.warning("Deferred timeout progress publication scan_id=%s", job.get("scan_id"), exc_info=True)
                         if requeued:
                             logger.warning(
                                 "Worker task slice timed out and was requeued id=%s attempt=%s/%s",
@@ -1070,11 +1078,14 @@ def run_forever():
                         # guarded requeue UPDATE. Resolve that race now instead
                         # of leaving a task permanently in ``cancelling``.
                         if storage.is_job_cancel_requested(job_id):
-                            if storage.scan_owned(job.get("scan_id")):
-                                storage.update_analysis_progress_status(
-                                    job.get("scan_id"), "cancelled",
-                                    "分析已取消；已完成的文件检查点仍保留。", "cancelled",
-                                )
+                            try:
+                                if storage.scan_owned(job.get("scan_id")):
+                                    storage.update_analysis_progress_status(
+                                        job.get("scan_id"), "cancelled",
+                                        "分析已取消；已完成的文件检查点仍保留。", "cancelled",
+                                    )
+                            except Exception:
+                                logger.warning("Deferred timeout cancellation progress publication scan_id=%s", job.get("scan_id"), exc_info=True)
                             _finalize_job_result(job)
                             continue
                 # SQLite uses a single writer even in WAL mode.  Under a
