@@ -199,3 +199,113 @@ def test_legacy_marker_requires_valid_receipt_before_migration(checked,monkeypat
     rd,marker,binding=state(p,rid)
     assert len(calls)==2 and len(marker)==3 and binding['state']=='watching'
     assert p.local_coverage('alice',rid)['healthy'] is True
+
+
+@pytest.fixture
+def heartbeat_checked(checked,monkeypatch):
+    p,rid=checked;client,_=client_for(p,monkeypatch)
+    client.register(p._registration('alice',rid))
+    _,_,binding=state(p,rid)
+    action=p.store.command('alice',binding['id'],'protect_delete','Heartbeat regression fixture')
+    monkeypatch.setattr('sjfx_protection.store.time.time',lambda:1_700_000_000)
+    return p,rid,client,action
+
+
+def heartbeat_rows(p,rid):
+    with p.store.db() as db:
+        return {table:[dict(row) for row in db.execute('SELECT * FROM '+table+' ORDER BY rowid')]
+                for table in ('devices','registration_devices','bindings','file_instances',
+                              'actions','monitoring_epochs','local_manifest_tasks','settings','events')}
+
+
+@pytest.mark.parametrize('previous',[{}, {'lost_events':None}, {'lost_events':0}])
+@pytest.mark.parametrize('incoming',[{}, {'lost_events':None}, {'lost_events':0}])
+def test_heartbeat_optional_counter_is_repeatable(heartbeat_checked,previous,incoming):
+    p,rid,_,action=heartbeat_checked
+    with p.store.db(True) as db:
+        db.execute('UPDATE devices SET health=?',(encode(previous),))
+    before,_,_=state(p,rid)
+    for _ in range(3):
+        p.store.heartbeat(p.local_device_id(),{'healthy':True,**incoming})
+        rows=heartbeat_rows(p,rid)
+        assert json.loads(rows['devices'][0]['health'])['lost_events']==0
+        assert type(json.loads(rows['devices'][0]['health'])['lost_events']) is int
+        assert rows['registration_devices'][0]['gap_epoch']==before['gap_epoch']
+        assert rows['registration_devices'][0]['state']=='verified'
+        assert rows['bindings'][0]['state']=='watching'
+        assert rows['monitoring_epochs']==[]
+        assert next(row for row in rows['actions'] if row['id']==action)['state']=='pending'
+
+
+@pytest.mark.parametrize('unreported',[{}, {'lost_events':None}])
+def test_heartbeat_unreported_counter_preserves_last_measurement(heartbeat_checked,unreported):
+    p,rid,_,_=heartbeat_checked
+    with p.store.db(True) as db:
+        db.execute('UPDATE devices SET heartbeat=?,health=?',
+                   (time.time(),encode({'healthy':True,'lost_events':5})))
+    for incoming in [unreported,{'lost_events':5}]:
+        p.store.heartbeat(p.local_device_id(),{'healthy':True,**incoming})
+        rows=heartbeat_rows(p,rid)
+        assert json.loads(rows['devices'][0]['health'])['lost_events']==5
+        assert rows['registration_devices'][0]['gap_epoch']==0
+        assert rows['monitoring_epochs']==[]
+
+
+@pytest.mark.parametrize('cause',['initial_lost_events','lost_events','unhealthy','timeout'])
+def test_heartbeat_real_gap_still_invalidates_coverage(heartbeat_checked,cause):
+    p,rid,_,action=heartbeat_checked
+    with p.store.db(True) as db:
+        db.execute('UPDATE devices SET heartbeat=?,health=?',
+                   (time.time()-(61 if cause=='timeout' else 0),
+                    encode({'healthy':True,'lost_events':None if cause=='initial_lost_events' else 5})))
+    incoming={'healthy':cause!='unhealthy'}
+    if cause=='initial_lost_events':incoming['lost_events']=1
+    if cause=='lost_events':incoming['lost_events']=6
+    p.store.heartbeat(p.local_device_id(),incoming)
+    rows=heartbeat_rows(p,rid)
+    assert rows['registration_devices'][0]['gap_epoch']==1
+    assert rows['registration_devices'][0]['state']=='unverified'
+    assert rows['bindings'][0]['state']=='unverified'
+    assert rows['file_instances'][0]['state']=='unverified'
+    assert len(rows['monitoring_epochs'])==1
+    assert next(row for row in rows['actions'] if row['id']==action)['state']=='stale'
+
+
+@pytest.mark.parametrize('invalid',[True,False,-1,1.5,'1',[],{}])
+@pytest.mark.parametrize('side',['incoming','stored'])
+def test_heartbeat_invalid_counter_rejected_without_writes(heartbeat_checked,invalid,side):
+    p,rid,_,_=heartbeat_checked
+    previous={'healthy':True,'lost_events':invalid if side=='stored' else 5}
+    incoming={'healthy':False,'lost_events':invalid if side=='incoming' else None}
+    with p.store.db(True) as db:
+        db.execute('UPDATE devices SET heartbeat=?,health=?',(time.time()-61,encode(previous)))
+    before=heartbeat_rows(p,rid)
+    with pytest.raises(ProtectionError,match='lost_events'):
+        p.store.heartbeat(p.local_device_id(),incoming)
+    assert heartbeat_rows(p,rid)==before
+
+
+def test_sync_recovers_legacy_null_without_monitoring_gap(heartbeat_checked,monkeypatch):
+    p,rid,client,_=heartbeat_checked
+    monkeypatch.setattr(client,'token_file','unused-fixture-token')
+    with p.store.db(True) as db:
+        db.execute('UPDATE devices SET heartbeat=?,health=?',
+                   (time.time(),encode({'healthy':True,'lost_events':None})))
+        db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',
+                   ('local-agent-health',encode({'connected':True})))
+    def request(path,payload,**kwargs):
+        assert path=='/agent-local/v1/sync'
+        return {'events':[],'results':[],'health':{'healthy':True,'agent_version':'linux-fixture'}}
+    monkeypatch.setattr(client,'request',request)
+    for _ in range(3):
+        report=client.sync()
+        assert report['connected'] is True
+        assert report['registration_errors']=={}
+    rows=heartbeat_rows(p,rid)
+    assert json.loads(rows['devices'][0]['health'])['lost_events']==0
+    assert rows['registration_devices'][0]['gap_epoch']==0
+    assert rows['monitoring_epochs']==[]
+    saved={row['key']:json.loads(row['value']) for row in rows['settings']
+           if row['key'] in {'local-agent-health','local-agent-acks'}}
+    assert saved['local-agent-health']['connected'] is True
+    assert saved['local-agent-acks']=={'events':[],'results':[]}

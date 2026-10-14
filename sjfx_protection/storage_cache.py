@@ -15,6 +15,12 @@ from . import business
 from .sql_cache import checked_connection
 
 
+_MAIL_TASK_TYPES = frozenset({
+    'mail_import', 'mail_extract', 'mail_ocr', 'mail_research',
+    'mail_export', 'mail_foundation', 'mail_embed', 'mail_factextract',
+})
+
+
 PAYLOAD_TABLES = (
     'scans', 'summaries', 'unified_documents', 'package_analyses',
     'inventory_entries', 'tree_edits', 'scan_overviews', 'analysis_overviews',
@@ -80,6 +86,17 @@ def _owned_control_payload(db, row, column):
 
 
 def _job_control_metadata(db, row):
+    if row.get('task_type') in _MAIL_TASK_TYPES:
+        # New intake queue rows have no produced result or content proof yet.
+        # Only the actual SQL NULL is control metadata; even JSON "null" or {}
+        # remains content. The real mail package must still match the current
+        # owner, source root and deepest registration before this is admitted.
+        if ('result' not in row or row['result'] is not None or
+                not row.get('owner_id') or not row.get('scan_id')):
+            return False
+        from .mail_cache import MailScopes
+        return bool(MailScopes()(db, 'analysis_jobs', {
+            'package_id': row['scan_id'], 'owner_id': row['owner_id']}))
     payload = _owned_control_payload(db, row, 'result')
     if payload is None or set(payload) - {'scan_id', 'scan_available', '_await_selection'}:
         return False
@@ -221,6 +238,16 @@ def connection(db, namespace):
     ordinary = StoredScopes()
     mail = MailScopes()
     def scopes(raw, table, row):
+        # The shared queue stores mail package IDs in scan_id. Resolve that
+        # real relational package only for actual mail task types, preserving
+        # the mail resolver's owner, source-root and deepest-registration gates.
+        if table == 'analysis_jobs' and row.get('task_type') in _MAIL_TASK_TYPES:
+            if not row.get('owner_id') or not row.get('scan_id'):
+                return []
+            resolved = mail(raw, table, {'package_id': row['scan_id'], 'owner_id': row['owner_id']})
+            # Queue results from mail and ordinary scans cannot share a proof,
+            # even if their independently persisted IDs happen to be identical.
+            return [{**scope, 'scope': 'mail-package:' + str(scope['scope'])} for scope in resolved]
         return mail(raw, table, row) if table in mail_specs else ordinary(raw, table, row)
     scopes.rows=lambda raw,table: mail.rows(raw,table) if table in mail_specs else ordinary.rows(raw,table)
     with checked_connection(db, namespace, {**SPECS, **mail_specs}, scopes) as guarded:

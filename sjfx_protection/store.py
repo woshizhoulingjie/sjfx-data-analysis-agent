@@ -175,13 +175,22 @@ class Store:
     def heartbeat(self, device, health):
         if not isinstance(health, dict) or not isinstance(health.get('healthy'), bool):
             raise ProtectionError('设备健康状态必须明确为 true 或 false')
+        def lost_count(value, fallback=0):
+            if value is None:return fallback
+            if type(value) is not int or value<0:
+                raise ProtectionError('lost_events 必须为非负整数或 null')
+            return value
         allowed = {k: health.get(k) for k in ("healthy", "watch_roots", "queue_depth", "errors",
                    "lost_events", "agent_version", "capabilities", "binding_count", "last_error")}
         with self.db(True) as db:
             previous=db.execute('SELECT * FROM devices WHERE id=? AND revoked IS NULL',(device,)).fetchone()
             if not previous:raise ProtectionError('设备已撤销',403,'device_revoked')
             old_health=json.loads(previous['health'])
-            if (previous['heartbeat'] and time.time()-previous['heartbeat']>60) or (old_health.get('healthy') is True and health.get('healthy') is False) or health.get('lost_events',0)>old_health.get('lost_events',0):
+            previous_lost=lost_count(old_health.get('lost_events'))
+            # Missing/null means unreported; retain the last valid measurement.
+            current_lost=lost_count(health.get('lost_events'),previous_lost)
+            allowed['lost_events']=current_lost
+            if (previous['heartbeat'] and time.time()-previous['heartbeat']>60) or (old_health.get('healthy') is True and health.get('healthy') is False) or current_lost>previous_lost:
                 self._package_gap(db,previous['owner'],device,None,'助手离线、监控失效或事件丢失')
                 db.execute("UPDATE bindings SET state='unverified' WHERE device=? AND state NOT IN ('missing','quarantined')",(device,))
                 db.execute("UPDATE actions SET state='stale' WHERE device=? AND kind!='restore' AND state IN ('pending','running')",(device,))
