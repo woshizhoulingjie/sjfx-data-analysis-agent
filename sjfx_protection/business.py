@@ -10,7 +10,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from .policy import protection_enabled
+from .policy import protection_enabled, file_protection_requested
 from .store import ProtectionError
 execution=contextvars.ContextVar("sjfx_package_execution",default=None)
 task_identity=contextvars.ContextVar("sjfx_business_task_identity",default="")
@@ -24,6 +24,7 @@ def configure(protection):
     _configured=protection
 
 def enabled():
+    if not file_protection_requested():return False
     if _configured is not None:return _configured.enabled
     from config import Config
     return protection_enabled(Config.DATA_DIR/"file_protection")

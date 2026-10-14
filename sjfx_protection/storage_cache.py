@@ -118,6 +118,14 @@ def _progress_control_metadata(db, row):
 SPECS['analysis_jobs']['metadata'] = _job_control_metadata
 SPECS['analysis_progress']['metadata'] = _progress_control_metadata
 
+# Queue rows share a table with scan jobs, but these persisted task types use
+# canonical mail package IDs. Keep the set independent of optional worker
+# imports and feature flags; disabled tasks must retain their stored provenance.
+MAIL_JOB_TYPES = frozenset({
+    'mail_import', 'mail_extract', 'mail_ocr', 'mail_embed', 'mail_factextract',
+    'mail_research', 'mail_export', 'mail_foundation',
+})
+
 
 class StoredScopes:
     def __init__(self):
@@ -221,6 +229,13 @@ def connection(db, namespace):
     ordinary = StoredScopes()
     mail = MailScopes()
     def scopes(raw, table, row):
+        if table == 'analysis_jobs' and row.get('task_type') in MAIL_JOB_TYPES:
+            package_id = row.get('scan_id')
+            if not (isinstance(package_id, str) and package_id.startswith('mp_') and row.get('owner_id')):
+                return []
+            # Use the actual queued FK, never caller options. MailScopes checks
+            # persisted package ownership, source root and deepest registration.
+            return mail(raw, table, {**row, 'package_id': package_id})
         return mail(raw, table, row) if table in mail_specs else ordinary(raw, table, row)
     scopes.rows=lambda raw,table: mail.rows(raw,table) if table in mail_specs else ordinary.rows(raw,table)
     with checked_connection(db, namespace, {**SPECS, **mail_specs}, scopes) as guarded:

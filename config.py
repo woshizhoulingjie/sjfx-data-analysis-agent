@@ -4,6 +4,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+from sjfx_protection.policy import file_protection_requested
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -226,6 +227,7 @@ _MODEL_ALLOWED_ENDPOINTS = normalize_allowed_endpoints(os.getenv("SJFX_MODEL_ALL
 
 
 class Config:
+    DESKTOP_FILE_PROTECTION = file_protection_requested()
     OFFLINE_INSTALLATION = os.getenv('SJFX_OFFLINE_INSTALLATION', '0').lower() in {'1','true','yes','on'}
     BASE_DIR = BASE_DIR
     DATA_DIR = _path_setting("SJFX_STATE_DIR", DEFAULT_STATE_DIR)

@@ -515,11 +515,13 @@ OPENAI_COMPATIBLE_BASE_URL=http://127.0.0.1:8001/v1
 OPENAI_COMPATIBLE_MODEL=local-model
 """
     if target == 'windows-x64':
+        env += '# File protection is optional; set 1 and restart all roles to enable.\nSJFX_DESKTOP_FILE_PROTECTION=0\n'
         env += 'SJFX_DESKTOP_HELPER_BINARY=__INSTALL_DIR__/tools/desktop-helper/sjfx-assistant.exe\n'
         env += 'SJFX_PROTECTION_CLAM=__INSTALL_DIR__/tools/clamav/clamscan.exe\n'
     else:
+        env += 'SJFX_DESKTOP_FILE_PROTECTION=1\n'
         env += 'SJFX_PROTECTION_CLAM=__INSTALL_DIR__/tools/clamav/bin/clamscan\n'
-    # A fresh offline installation starts all bundled local services. Generation
+    # A fresh installation starts the core roles and its selected local services. Generation
     # remains selectable and is enabled after its external engine is configured.
     backend = 'openai_compatible'
     values = env.replace("__LLM_BACKEND__", backend)
