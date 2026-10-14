@@ -87,11 +87,38 @@ class UnifiedMailControlScopes(unittest.TestCase):
 
     def test_mail_derivative_queue_and_result_publication(self):
         self.insert_job()
-        self.assertEqual(self.proof_count(), 1)
+        self.assertEqual(self.proof_count(), 0)
         with self.checked() as db:
             db.execute('UPDATE analysis_jobs SET result=? WHERE id=?', ('{"processed":2}', 'job'))
         self.assertEqual(json.loads(self.read_result()[0]), {'processed': 2})
+        self.assertEqual(self.proof_count(), 1)
         self.assertTrue(self.package.calls)
+
+    def test_raw_intake_queue_null_allows_first_protected_result(self):
+        self.db.execute('INSERT INTO analysis_jobs VALUES(?,?,?,?,NULL)',
+                        ('job', 'mail-A', 'alice', 'mail_import'))
+        self.db.commit()
+        self.assertIsNone(self.read_result()[0])
+        self.assertEqual(self.proof_count(), 0)
+        with self.checked() as db:
+            db.execute('UPDATE analysis_jobs SET result=? WHERE id=?', ('{"processed":2}', 'job'))
+        self.assertEqual(json.loads(self.read_result()[0]), {'processed': 2})
+        self.assertEqual(self.proof_count(), 1)
+
+    def test_text_values_cannot_impersonate_raw_intake_sql_null(self):
+        for value in ('null', '{}', 'None', '{"result":null}'):
+            with self.subTest(value=value):
+                self.db.execute('INSERT OR REPLACE INTO analysis_jobs VALUES(?,?,?,?,?)',
+                                ('job', 'mail-A', 'alice', 'mail_import', value))
+                self.db.commit()
+                with self.assertRaises(ProtectionError) as caught:
+                    self.read_result()
+                self.assertEqual(caught.exception.code, 'cache_provenance_missing')
+                with self.assertRaises(ProtectionError):
+                    with self.checked() as db:
+                        db.execute('UPDATE analysis_jobs SET result=? WHERE id=?', ('{"processed":2}', 'job'))
+                self.assertEqual(self.db.execute('SELECT result FROM analysis_jobs').fetchone()[0], value)
+                self.assertEqual(self.proof_count(), 0)
 
     def test_mail_all_actual_task_types_share_owner_and_source_checks(self):
         for task in ('mail_import', 'mail_extract', 'mail_ocr', 'mail_research',
@@ -131,7 +158,7 @@ class UnifiedMailControlScopes(unittest.TestCase):
     def test_revocation_still_blocks_mail_publication(self):
         self.package.blocked.add('A')
         with self.assertRaises(ProtectionError) as caught:
-            self.insert_job()
+            self.insert_job(result='{"processed":2}')
         self.assertEqual(caught.exception.code, 'package_revoked')
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM analysis_jobs').fetchone()[0], 0)
 
