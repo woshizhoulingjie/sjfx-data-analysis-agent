@@ -1,11 +1,14 @@
 """Synthetic original-download HTTP regressions; no lifespan or model calls."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import gc
 import io
 import json
 import os
 from pathlib import Path
 import tarfile
+import threading
 from types import SimpleNamespace
 import zipfile
 
@@ -18,6 +21,8 @@ from services.large_package_isolated import LargePackageStore, iter_inventory
 from services.logical_units import archive_member_units
 from services.scanner import scan_directory
 from services.storage import Storage
+from sjfx_protection import business
+from sjfx_protection.store import ProtectionError
 
 
 TEXT = b'Synthetic selected member, with no sibling contents.'
@@ -298,3 +303,127 @@ def test_snapshot_is_removed_when_asgi_send_fails(downloads):
         asyncio.run(response({'type': 'http', 'method': 'GET', 'headers': []}, receive, send))
     assert not Path(response.path).exists()
     assert not list(downloads.snapshots.iterdir())
+
+
+@pytest.fixture
+def protected_downloads(downloads, monkeypatch):
+    # Exercise the real authorization ContextVar manager around the existing
+    # verified-source fixture, without starting protection services or models.
+    monkeypatch.setattr(business, '_configured', SimpleNamespace(enabled=False))
+    original_snapshot = web._secure_source_snapshot
+    original_logical_snapshot = web._logical_source_snapshot
+    outer = {'owner': 'synthetic-outer'}
+    approved = {'owner': 'download-owner', 'registration_id': 'synthetic-approved'}
+    state = {'events': [], 'reject_recheck': False}
+
+    def observe(stage):
+        state['events'].append((stage, threading.get_ident(),
+                                business.execution.get(), business.current_task_id()))
+
+    @contextmanager
+    def authorized_snapshot(*args, _snapshot_factory=original_snapshot, **kwargs):
+        try:
+            with business.activate(approved, task_id='synthetic-raw-task'):
+                observe('enter')
+                try:
+                    with _snapshot_factory(*args, **kwargs) as snapshot:
+                        yield snapshot
+                        if state['reject_recheck']:
+                            raise ProtectionError('synthetic revoked source', 423, 'context_stale')
+                finally:
+                    observe('exit')
+        finally:
+            observe('reset')
+
+    original_response = web._raw_snapshot_response
+    def response_in_outer_context(*args, **kwargs):
+        with business.activate(outer, task_id='synthetic-outer-task'):
+            response = original_response(*args, **kwargs)
+            # Response creation must not leave a file's authorization active in
+            # the synchronous request worker while ASGI still owns the response.
+            assert business.execution.get() is outer
+            assert business.current_task_id() == 'synthetic-outer-task'
+            return response
+
+    monkeypatch.setattr(web, '_secure_source_snapshot', authorized_snapshot)
+    monkeypatch.setattr(web, '_logical_source_snapshot',
+                        lambda *args, **kwargs: authorized_snapshot(
+                            *args, _snapshot_factory=original_logical_snapshot, **kwargs))
+    monkeypatch.setattr(web, '_raw_snapshot_response', response_in_outer_context)
+    downloads.protected = SimpleNamespace(state=state, outer=outer, approved=approved)
+    return downloads
+
+
+def assert_authorization_closed(case, *, crossed_threads):
+    events = case.protected.state['events']
+    assert [entry[0] for entry in events] == ['enter', 'exit', 'reset']
+    assert events[0][2] is case.protected.approved
+    assert events[1][2] is case.protected.approved
+    assert events[0][3] == events[1][3] == 'synthetic-raw-task'
+    assert events[2][2] is case.protected.outer
+    assert events[2][3] == 'synthetic-outer-task'
+    assert (events[0][1] != events[1][1]) is crossed_threads
+    assert not list(case.snapshots.iterdir())
+
+
+@pytest.mark.parametrize('kind', ['ordinary', 'large'])
+@pytest.mark.parametrize('path', ['plain.txt', 'bundle.zip::docs/member.txt'])
+def test_protected_snapshot_closes_across_real_worker_and_asgi_contexts(protected_downloads, kind, path):
+    case = protected_downloads
+    with business.activate({'owner': 'synthetic-caller'}, task_id='synthetic-caller-task'):
+        caller = business.execution.get()
+        response = get(case, kind, path)
+        assert response.status_code == 200 and response.content == TEXT
+        assert business.execution.get() is caller
+        assert business.current_task_id() == 'synthetic-caller-task'
+    assert_authorization_closed(case, crossed_threads=True)
+
+
+def response_from_worker(case):
+    node = next(node for node in case.files if node['path'] == 'plain.txt')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(web._raw_snapshot_response,
+                           web._secure_source_snapshot(case.root, node), 'plain.txt').result()
+
+
+def test_protected_snapshot_disconnect_resets_tokens_and_cleans_snapshot(protected_downloads):
+    case = protected_downloads
+    response = response_from_worker(case)
+    assert Path(response.path).exists()
+    async def send(_message):
+        raise RuntimeError('synthetic disconnected sender')
+    async def receive():
+        return {'type': 'http.disconnect'}
+    with business.activate({'owner': 'synthetic-sender'}, task_id='synthetic-sender-task'):
+        sender = business.execution.get()
+        with pytest.raises(RuntimeError, match='synthetic disconnected sender'):
+            asyncio.run(response({'type': 'http', 'method': 'GET', 'headers': []}, receive, send))
+        assert business.execution.get() is sender
+        assert business.current_task_id() == 'synthetic-sender-task'
+    assert not Path(response.path).exists()
+    assert_authorization_closed(case, crossed_threads=True)
+
+
+def test_protected_snapshot_construction_failure_resets_tokens_and_cleans(protected_downloads, monkeypatch):
+    case = protected_downloads
+    from fastapi.responses import FileResponse
+    def reject_response(*_args, **_kwargs):
+        raise RuntimeError('synthetic response construction failure')
+    monkeypatch.setattr(FileResponse, '__init__', reject_response)
+    with pytest.raises(RuntimeError, match='synthetic response construction failure'):
+        response_from_worker(case)
+    assert_authorization_closed(case, crossed_threads=False)
+
+
+def test_protected_snapshot_recheck_denial_is_not_hidden(protected_downloads):
+    case = protected_downloads
+    response = response_from_worker(case)
+    case.protected.state['reject_recheck'] = True
+    async def send(_message):
+        pass
+    async def receive():
+        return {'type': 'http.disconnect'}
+    with pytest.raises(ProtectionError) as caught:
+        asyncio.run(response({'type': 'http', 'method': 'GET', 'headers': []}, receive, send))
+    assert caught.value.code == 'context_stale'
+    assert_authorization_closed(case, crossed_threads=True)

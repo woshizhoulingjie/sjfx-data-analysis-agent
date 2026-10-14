@@ -8683,15 +8683,19 @@ def _check_raw_source_policy(node, path):
 
 def _raw_snapshot_response(snapshot, filename, *, attachment=False):
     """Keep a private, verified snapshot alive until ASGI finishes sending."""
+    import contextvars
     from fastapi.responses import FileResponse
-    resolved = snapshot.__enter__()
+    # The synchronous view and asynchronous sender use different Contexts.
+    # Keep authorization tokens and their cleanup in one private Context.
+    snapshot_context = contextvars.copy_context()
+    resolved = snapshot_context.run(snapshot.__enter__)
     try:
         class SnapshotFileResponse(FileResponse):
             async def __call__(self, scope, receive, send):
                 try:
                     await super().__call__(scope, receive, send)
                 finally:
-                    snapshot.__exit__(None, None, None)
+                    snapshot_context.run(snapshot.__exit__, None, None, None)
         filename = Path(str(filename or resolved.name)).name
         media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         # Documents with active browser content must never run in our origin,
@@ -8712,7 +8716,7 @@ def _raw_snapshot_response(snapshot, filename, *, attachment=False):
         )
         return response
     except BaseException:
-        snapshot.__exit__(None, None, None)
+        snapshot_context.run(snapshot.__exit__, None, None, None)
         raise
 
 
