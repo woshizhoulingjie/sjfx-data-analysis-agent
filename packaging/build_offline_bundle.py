@@ -218,7 +218,11 @@ def _target_mode(relative: Path, actual_mode: int, target: str) -> int:
         # Windows does not retain POSIX execute bits. These files must still
         # be runnable after a Linux tarball is built on a Windows host.
         if relative.as_posix().lower() in LINUX_EXECUTABLE_PATHS or relative.suffix.lower() == ".sh":
-            return 0o755
+            mode = 0o755
+        # The Linux installer makes package inputs immutable. Match that
+        # contract in both the manifest and archive metadata without changing
+        # the writable build stage or dropping required execute bits.
+        return mode & ~0o222
     return mode
 
 

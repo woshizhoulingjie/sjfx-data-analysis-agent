@@ -132,6 +132,8 @@ class ArchiveOnlyTests(unittest.TestCase):
             self.assertEqual(item["sha256"], hashlib.sha256(data).hexdigest(), item["path"])
             self.assertEqual(item["mode"], mode, item["path"])
             self.assertFalse(mode & ~0o777)
+            if target == "linux-x64":
+                self.assertFalse(mode & 0o222, item["path"])
         self.assertIn("app/services/example.py", rows)
         self.assertIn("runtime/data/package.dat", rows)
         self.assertIn("tools/licenses/component/tests/copyright", rows)
@@ -139,8 +141,8 @@ class ArchiveOnlyTests(unittest.TestCase):
                           "app/services/tests/excluded.py", "runtime/tests/fixture.py"):
             self.assertNotIn(forbidden, rows)
         if target == "linux-x64":
-            self.assertEqual(rows["runtime/bin/python3"][1], 0o755)
-            self.assertEqual(rows["start_sjfx.sh"][1], 0o755)
+            self.assertEqual(rows["runtime/bin/python3"][1], 0o555)
+            self.assertEqual(rows["start_sjfx.sh"][1], 0o555)
 
     def test_both_archive_formats_have_complete_manifest_and_clean_only_owned_stage(self):
         for target in ("windows-x64", "linux-x64"):
@@ -155,9 +157,9 @@ class ArchiveOnlyTests(unittest.TestCase):
     def test_linux_audited_entrypoints_restore_ntfs_execute_bits_in_manifest_and_tar(self):
         for relative in sorted(BUILDER.LINUX_EXECUTABLE_PATHS):
             self.assertEqual(BUILDER._target_mode(Path(relative), stat.S_IFREG | 0o666,
-                                                "linux-x64"), 0o755, relative)
+                                                "linux-x64"), 0o555, relative)
             self.assertEqual(BUILDER._target_mode(Path(relative), stat.S_IFREG | 0o7666,
-                                                "linux-x64"), 0o755, relative)
+                                                "linux-x64"), 0o555, relative)
             self.assertEqual(BUILDER._target_mode(Path(relative), stat.S_IFREG | 0o666,
                                                 "windows-x64"), 0o666, relative)
             if relative.startswith("tools/"):
@@ -167,17 +169,36 @@ class ArchiveOnlyTests(unittest.TestCase):
         self.write(self.tools, unreviewed[len("tools/"):],
                    b"synthetic unreviewed resource fixture\n").chmod(0o666)
         self.assertEqual(BUILDER._target_mode(Path(unreviewed), stat.S_IFREG | 0o7666,
-                                            "linux-x64"), 0o666)
+                                            "linux-x64"), 0o444)
         archive = self.frozen_build(self.args("linux-x64"))
         self.assert_archive_contract(archive, "linux-x64")
         rows = self.read_archive(archive)
         manifest = json.loads(rows["manifest.json"][0].decode("utf-8"))
         manifest_modes = {row["path"]: row["mode"] for row in manifest["files"]}
         for relative in BUILDER.LINUX_EXECUTABLE_PATHS:
-            self.assertEqual(rows[relative][1], 0o755, relative)
-            self.assertEqual(manifest_modes[relative], 0o755, relative)
-        self.assertEqual(rows[unreviewed][1], 0o666)
-        self.assertEqual(manifest_modes[unreviewed], 0o666)
+            self.assertEqual(rows[relative][1], 0o555, relative)
+            self.assertEqual(manifest_modes[relative], 0o555, relative)
+        self.assertEqual(rows[unreviewed][1], 0o444)
+        self.assertEqual(manifest_modes[unreviewed], 0o444)
+
+    def test_linux_permissions_are_readonly_preserve_execution_and_leave_windows_unchanged(self):
+        relative = Path("tools/fixture/unreviewed-resource")
+        for original, readonly in ((0o644, 0o444), (0o755, 0o555),
+                                   (0o777, 0o555), (0o744, 0o544),
+                                   (0o660, 0o440), (0o400, 0o400)):
+            with self.subTest(mode=oct(original)):
+                linux_mode = BUILDER._target_mode(relative, stat.S_IFREG | original, "linux-x64")
+                self.assertEqual(linux_mode, readonly)
+                self.assertFalse(linux_mode & 0o222)
+                self.assertEqual(linux_mode & 0o111, original & 0o111)
+                self.assertEqual(linux_mode & 0o444, original & 0o444)
+                self.assertEqual(BUILDER._target_mode(relative, stat.S_IFREG | original,
+                                                    "windows-x64"), original)
+        shell_entry = Path("tools/fixture/custom-entry.SH")
+        self.assertEqual(BUILDER._target_mode(shell_entry, stat.S_IFREG | 0o644,
+                                            "linux-x64"), 0o555)
+        self.assertEqual(BUILDER._target_mode(shell_entry, stat.S_IFREG | 0o644,
+                                            "windows-x64"), 0o644)
 
     def test_native_import_failure_retains_mixed_encoding_child_diagnostics(self):
         # Native DLL loaders can emit locale bytes even in a UTF-8 Python
