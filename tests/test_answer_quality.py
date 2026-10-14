@@ -77,7 +77,7 @@ class AnswerQualityTests(unittest.TestCase):
             def get_package_overview(self, _): return {}
             def get_analysis_overview(self, _): return {}
             def list_summaries_page(self, *args, **kwargs):
-                return {'items': [{'path': 'a.txt', 'type': 'deep', 'payload': {'summary': '背景。' * 300 + '付款期限为验收后十日。'}}]}
+                return {'items': [{'path': 'a.txt', 'type': 'deep_file_summary', 'payload': {'summary': '背景。' * 300 + '付款期限为验收后十日。'}}]}
             def inventory_paths_under(self, *args): return ['a.txt']
         result = build_standard_context(Storage(), 'scan')
         self.assertIn('验收后十日', result['file_summaries'][0]['summary'])

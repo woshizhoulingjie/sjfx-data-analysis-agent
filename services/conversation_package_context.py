@@ -11,6 +11,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from services import answer_quality as aq
+from services.import_state_machine import summary_type as staged_summary_type
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -206,7 +207,16 @@ def build_standard_context(storage: Any, scan_id: str, max_summary_chars: int = 
             return 1
         return 0
 
+    # Summary rows also contain physical directories, virtual nodes and
+    # package overviews. Only durable file products belong in file recall and
+    # its reading counts; a directory path alone cannot identify a file.
+    file_summary_types = {
+        "file", staged_summary_type("preliminary", "file"),
+        staged_summary_type("deep", "file"),
+    }
     for item in summaries:
+        if str(item.get("type") or "").lower() not in file_summary_types:
+            continue
         payload = item.get("payload") or {}
         path = str(item.get("path") or payload.get("source_path") or "").strip()
         if not path:
