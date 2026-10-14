@@ -6984,17 +6984,19 @@ class Storage:
             ).fetchone()
             if not row or (owner_id and (row["owner_id"] or "legacy") != owner_id):
                 return []
+            # Replay user operations in insertion order. CURRENT_TIMESTAMP has
+            # second precision and random edit IDs cannot break ties correctly.
             if limit is None:
                 rows = conn.execute(
                     "SELECT edit_id,operation,payload,created_at FROM tree_edits "
-                    "WHERE scan_id=? ORDER BY created_at,edit_id",
+                    "WHERE scan_id=? ORDER BY rowid",
                     (str(scan_id),),
                 ).fetchall()
             else:
                 bounded = max(1, min(1000, int(limit)))
                 rows = conn.execute(
                     "SELECT edit_id,operation,payload,created_at FROM tree_edits "
-                    "WHERE scan_id=? ORDER BY created_at DESC,edit_id DESC LIMIT ?",
+                    "WHERE scan_id=? ORDER BY rowid DESC LIMIT ?",
                     (str(scan_id), bounded),
                 ).fetchall()
                 rows = list(reversed(rows))
