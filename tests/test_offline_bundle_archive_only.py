@@ -183,7 +183,7 @@ class ArchiveOnlyTests(unittest.TestCase):
         # Native DLL loaders can emit locale bytes even in a UTF-8 Python
         # process. Exercise real subprocess decoding, including stderr merge.
         real_run = BUILDER.subprocess.run
-        diagnostic = b"native loader failed: \xce\n" + "权限不足\n".encode("utf-8")
+        diagnostic = b"BEGIN torch\nnative loader failed: \xce\n" + "权限不足\nEND diagnostics\n".encode("utf-8")
         def failing_probe(command, **kwargs):
             script = "import sys; sys.stderr.buffer.write(" + repr(diagnostic) + "); sys.exit(1)"
             return real_run([BUILDER.sys.executable, "-I", "-X", "utf8", "-c", script],
@@ -196,7 +196,33 @@ class ArchiveOnlyTests(unittest.TestCase):
                                                       Path(BUILDER.sys.executable))
         self.assertIn("native loader failed: \\xce", str(caught.exception))
         self.assertIn("权限不足", str(caught.exception))
+        self.assertIn("BEGIN torch", str(caught.exception))
+        self.assertIn("END diagnostics\n", str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, BUILDER.subprocess.CalledProcessError)
+
+    def test_native_import_timeout_retains_partial_mixed_encoding_child_diagnostics(self):
+        # Exercise real TimeoutExpired output, which remains bytes even with
+        # text=True, while bounding this regression independently of the gate.
+        real_run = BUILDER.subprocess.run
+        diagnostic = b"BEGIN torch\nnative loader pending: \xce\n" + "正在加载\n".encode("utf-8")
+        def timed_out_probe(command, **kwargs):
+            self.assertEqual(kwargs["timeout"], 600)
+            script = ("import sys,time; sys.stdout.buffer.write(" + repr(diagnostic)
+                      + "); sys.stdout.buffer.flush(); time.sleep(10)")
+            kwargs["timeout"] = 2
+            return real_run([BUILDER.sys.executable, "-I", "-X", "utf8", "-c", script],
+                            **kwargs)
+        native_target = "windows-x64" if BUILDER.os.name == "nt" else "linux-x64"
+        with mock.patch.object(BUILDER, "RUNTIME_IMPORTS", ()), \
+             mock.patch.object(BUILDER.subprocess, "run", side_effect=timed_out_probe):
+            with self.assertRaises(RuntimeError) as caught:
+                BUILDER._runtime_dependency_preflight(self.runtime, native_target,
+                                                      Path(BUILDER.sys.executable))
+        self.assertIn("timed out after 2 seconds", str(caught.exception))
+        self.assertIn("BEGIN torch", str(caught.exception))
+        self.assertIn("native loader pending: \\xce", str(caught.exception))
+        self.assertIn("正在加载", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, BUILDER.subprocess.TimeoutExpired)
 
     def test_copy_failure_cleans_owned_stage_and_preserves_all_prior_outputs(self):
         for target in ("windows-x64", "linux-x64"):

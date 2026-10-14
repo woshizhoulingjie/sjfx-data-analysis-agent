@@ -393,31 +393,53 @@ def _runtime_dependency_preflight(runtime: Path, target: str, candidate: Path,
     if not native_target:
         return
     script = (
-        "import importlib\n"
+        "import importlib, time\n"
         "required = " + repr(RUNTIME_IMPORTS) + "\n"
         "missing = []\n"
+        "started = time.monotonic()\n"
         "for name in required:\n"
+        "    before = time.monotonic()\n"
+        "    print('BEGIN ' + name, flush=True)\n"
         "    try:\n"
         "        importlib.import_module(name)\n"
         "    except Exception as exc:\n"
         "        missing.append(name + ': ' + type(exc).__name__ + ': ' + str(exc))\n"
+        "        print('FAIL ' + name + ' elapsed=' + format(time.monotonic() - before, '.3f') + ': ' + missing[-1], flush=True)\n"
+        "    else:\n"
+        "        print('PASS ' + name + ' elapsed=' + format(time.monotonic() - before, '.3f'), flush=True)\n"
+        "print('END ALL elapsed=' + format(time.monotonic() - started, '.3f'), flush=True)\n"
         "if missing:\n"
         "    raise SystemExit('missing or unloadable application imports: ' + '; '.join(missing))\n"
     )
+    print(f"BEGIN bundled runtime application import preflight: {candidate}", flush=True)
     try:
-        subprocess.run(
+        result = subprocess.run(
             [str(candidate), "-I", "-B", "-X", "utf8", "-c", script],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=True,
-            timeout=120,
+            timeout=600,
             text=True,
             encoding="utf-8",
             errors="backslashreplace",
         )
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+    except subprocess.TimeoutExpired as exc:
+        # TimeoutExpired retains bytes even when run() was called with text=True.
+        detail = exc.stdout or ""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="backslashreplace")
+        suffix = f"\n{detail}" if detail else ""
+        raise RuntimeError(
+            f"bundled runtime application import preflight timed out after {exc.timeout} seconds: "
+            f"{candidate}{suffix}"
+        ) from exc
     except subprocess.CalledProcessError as exc:
-        detail = (exc.stdout or "").strip()
-        suffix = f": {detail}" if detail else ""
+        detail = exc.stdout or ""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="backslashreplace")
+        suffix = f"\n{detail}" if detail else ""
         raise RuntimeError(
             f"bundled runtime failed application import preflight: {candidate}{suffix}"
         ) from exc
