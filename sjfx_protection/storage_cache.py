@@ -104,6 +104,7 @@ def _progress_control_metadata(db, row):
         return False
     if message in {'', '分析失败，请查看任务错误状态。', '分析已取消；已完成的文件检查点仍保留。',
                    '本轮达到运行时限，已保存检查点并等待自动续批。',
+                   '已安全暂停；已完成结果永久保留，未完成文件仍在待处理队列。',
                    '数据分析、结构化摘要和报告已完成', '正式概览已生成，可查看和下载。'}:
         return True
     # The inventory-only notice contains fixed product text and numeric sizes,
@@ -161,6 +162,13 @@ class StoredScopes:
                           'JOIN scans s ON s.id=t.scan_id WHERE '+ ' OR '.join(clauses),values)
 
     def __call__(self, db, table, row):
+        # Control middleware admits the authenticated owner, not content bytes.
+        # Only exact typed notices/results can use that owner-only authority;
+        # both the real scan ownership and the old/new payload are still checked.
+        if business.metadata_projection.get() is True and table in {'analysis_progress', 'analysis_jobs'}:
+            validator = SPECS[table]['metadata']
+            if validator(db, row):
+                return [{'owner': business.context()['owner'], 'scope': str(row['scan_id'])}]
         current = self.registrations()
         if not current:
             return []
@@ -214,6 +222,18 @@ def connection(db, namespace):
     ordinary = StoredScopes()
     mail = MailScopes()
     def scopes(raw, table, row):
+        # The shared queue stores mail package IDs in scan_id. Resolve that
+        # real relational package only for actual mail task types, preserving
+        # the mail resolver's owner, source-root and deepest-registration gates.
+        if table == 'analysis_jobs' and row.get('task_type') in {
+                'mail_import', 'mail_extract', 'mail_ocr', 'mail_research',
+                'mail_export', 'mail_foundation', 'mail_embed', 'mail_factextract'}:
+            if not row.get('owner_id') or not row.get('scan_id'):
+                return []
+            resolved = mail(raw, table, {'package_id': row['scan_id'], 'owner_id': row['owner_id']})
+            # Queue results from mail and ordinary scans cannot share a proof,
+            # even if their independently persisted IDs happen to be identical.
+            return [{**scope, 'scope': 'mail-package:' + str(scope['scope'])} for scope in resolved]
         return mail(raw, table, row) if table in mail_specs else ordinary(raw, table, row)
     scopes.rows=lambda raw,table: mail.rows(raw,table) if table in mail_specs else ordinary.rows(raw,table)
     with checked_connection(db, namespace, {**SPECS, **mail_specs}, scopes) as guarded:
