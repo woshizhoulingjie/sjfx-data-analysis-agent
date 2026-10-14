@@ -258,7 +258,7 @@ class ArchiveOnlyTests(unittest.TestCase):
         for target in ("windows-x64", "linux-x64"):
             with self.subTest(target=target):
                 before = self.snapshot()
-                def interrupted_archive(root, stream, platform):
+                def interrupted_archive(root, stream, platform, **kwargs):
                     stream.write(b"injected interrupted archive\n")
                     stream.flush()
                     raise RuntimeError("injected archive failure")

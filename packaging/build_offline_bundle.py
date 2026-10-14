@@ -580,23 +580,24 @@ OPENAI_COMPATIBLE_MODEL=local-model
                 destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _archive(root: Path, output: Path, target: str) -> None:
+def _archive(root: Path, output: Path, target: str, *, zip_compression_level: int = 6) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     # Own the new output exclusively. A second build in the same second must
     # never replace an earlier archive, including an incomplete prior build.
     stream = output.open("xb")
     try:
         with stream:
-            _write_archive(root, stream, target)
+            _write_archive(root, stream, target, zip_compression_level=zip_compression_level)
     except BaseException:
         # Only this invocation created this file. Preserve all older outputs.
         output.unlink(missing_ok=True)
         raise
 
 
-def _write_archive(root: Path, stream, target: str) -> None:
+def _write_archive(root: Path, stream, target: str, *, zip_compression_level: int = 6) -> None:
     if target == "windows-x64":
-        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=zip_compression_level) as archive:
             for item in sorted(root.rglob("*")):
                 if item.is_file():
                     # ZIP dates before 1980 are invalid.  Some prepared
@@ -608,6 +609,9 @@ def _write_archive(root: Path, stream, target: str) -> None:
                         time.gmtime(mtime)[:6],
                     )
                     info.compress_type = zipfile.ZIP_DEFLATED
+                    # ZipFile.open() uses the supplied ZipInfo's level, not
+                    # the archive default (including on bundled Python 3.12).
+                    info._compresslevel = zip_compression_level
                     relative = item.relative_to(root)
                     info.external_attr = _target_mode(relative, item.stat().st_mode, target) << 16
                     with item.open("rb") as source, archive.open(info, "w") as target_stream:
@@ -728,7 +732,8 @@ def build(args: argparse.Namespace) -> Path:
                                               encoding="utf-8")
         archive = output / (f"sjfx-offline-{target}-{stamp}.zip" if target == "windows-x64"
                             else f"sjfx-offline-{target}-{stamp}.tar.gz")
-        _archive(root, archive, target)
+        _archive(root, archive, target,
+                 zip_compression_level=getattr(args, 'zip_compression_level', 6))
         return archive
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
@@ -750,6 +755,8 @@ def main() -> int:
     parser.add_argument("--tools", required=True, help="complete native parser/OCR tool root")
     parser.add_argument("--output", required=True, help="new timestamped output directory parent")
     parser.add_argument("--target", choices=("windows-x64", "linux-x64"), required=True)
+    parser.add_argument('--zip-compression-level', type=int, choices=range(10), default=6,
+                        help='Windows ZIP DEFLATE level 0-9 (default: 6); ignored for Linux')
     parser.add_argument(
         "--allow-synthetic",
         action="store_true",

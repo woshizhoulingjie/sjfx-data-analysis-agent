@@ -6867,6 +6867,27 @@ class Storage:
         current["message"] = str(message or "")
         if stage is not None:
             current["stage"] = str(stage)
+        from sjfx_protection import business
+        control_keys = {"schema_version", "progress", "status", "stage", "message"}
+        if (business.enabled() and business.metadata_projection.get() is True
+                and set(current) - control_keys
+                and status == stage == "paused"):
+            # The durable pause is independent of source-derived progress.
+            # A control request has no source receipts: preserve every byte
+            # and the original provenance of a rich card, returning only the
+            # exact typed notice after persisted ownership/control checks.
+            from sjfx_protection.storage_cache import _progress_control_metadata
+            notice = {key: value for key, value in current.items() if key in control_keys}
+            with self._connect() as conn:
+                control = conn.execute(
+                    "SELECT state,pause_requested FROM package_processing_controls WHERE scan_id=?",
+                    (str(scan_id),),
+                ).fetchone()
+                if (control and control["state"] == "paused" and control["pause_requested"] == 1
+                        and _progress_control_metadata(conn, {
+                            "scan_id": str(scan_id), "payload": json.dumps(notice, ensure_ascii=False),
+                        })):
+                    return notice
         self.save_analysis_progress(scan_id, current)
         return current
 

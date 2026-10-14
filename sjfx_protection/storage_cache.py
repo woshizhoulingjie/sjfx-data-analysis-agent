@@ -103,6 +103,7 @@ def _progress_control_metadata(db, row):
     if not isinstance(message, str):
         return False
     if message in {'', '分析失败，请查看任务错误状态。', '分析已取消；已完成的文件检查点仍保留。',
+                   '已安全暂停；已完成结果永久保留，未完成文件仍在待处理队列。',
                    '本轮达到运行时限，已保存检查点并等待自动续批。',
                    '数据分析、结构化摘要和报告已完成', '正式概览已生成，可查看和下载。'}:
         return True
@@ -161,6 +162,12 @@ class StoredScopes:
                           'JOIN scans s ON s.id=t.scan_id WHERE '+ ' OR '.join(clauses),values)
 
     def __call__(self, db, table, row):
+        # Control requests carry an authenticated owner, without content-source
+        # receipts. Only exact typed notices may use that persisted scan scope.
+        if (business.metadata_projection.get() is True and
+                table in {'analysis_jobs', 'analysis_progress'} and
+                SPECS[table]['metadata'](db, row)):
+            return [{'owner': business.context()['owner'], 'scope': str(row['scan_id'])}]
         current = self.registrations()
         if not current:
             return []

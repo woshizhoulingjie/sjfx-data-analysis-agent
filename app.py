@@ -7443,6 +7443,11 @@ def resume_package_processing(scan_id):
                 )
                 import_task = storage.get_import_task(scan_id) or {}
                 import_status = str(import_task.get("status") or "")
+        # Restoring a paused import can put it back at the selection gate.
+        # Check the restored state before any analysis work can be queued.
+        control_state = storage.get_package_processing_control(scan_id).get("state")
+        if control_state == "awaiting_selection" and mode != "selection":
+            return jsonify({"ok": True, "accepted": False, "message": "请先在分析范围确认页面选择文件并确认后再开始深度分析。", "processing": _package_processing_status(scan_id, scan_result)}), 409
         resumable_children = {
             "preliminary_summarizing": ["preliminary_summary_job_ids"],
             "preliminary_nodes": ["preliminary_node_job_ids"],
