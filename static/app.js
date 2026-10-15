@@ -3062,23 +3062,39 @@ function renderCandidatePreviewCard() {
   if (!card || !stats) return;
   const task = state.importTask || {};
   const checkpoint = task.checkpoint || {};
-  const expected = Number(checkpoint.candidate_preview_expected || 0);
-  const completed = Number(checkpoint.candidate_preview_completed || 0);
-  const failed = Number(checkpoint.candidate_preview_failed || 0);
-  const paths = checkpoint.candidate_paths || [];
+  // Ordinary selected-file imports have their own durable checkpoint keys.
+  // Keep the legacy candidate-preview contract when candidate_paths exists.
+  const ordinary = !Array.isArray(checkpoint.candidate_paths) && Array.isArray(checkpoint.selected_paths);
+  const paths = ordinary ? checkpoint.selected_paths : (checkpoint.candidate_paths || []);
+  const expected = Number(ordinary ? (checkpoint.preliminary_summary_expected ?? paths.length) : (checkpoint.candidate_preview_expected || 0));
+  const completed = Number(ordinary ? (checkpoint.preliminary_summary_completed ?? 0) : (checkpoint.candidate_preview_completed || 0));
+  const failed = Number(ordinary ? (checkpoint.preliminary_summary_failed ?? 0) : (checkpoint.candidate_preview_failed || 0));
   const status = String(task.status || '').toLowerCase();
-  const inventoryTotal = Number(state.scan?.file_count || state.scan?.files_total || 0);
+  const inventoryTotal = Number(state.scan?.file_count ?? state.scan?.files_total ?? 0);
   const processingPending = Number(state.processing?.deep_pending_files || state.processing?.pending_files || 0);
-  const remaining = Math.max(0, processingPending || inventoryTotal - paths.length);
+  // Here "remaining" is the inventory outside the user's ordinary selection;
+  // the parser queue can already be empty while unselected files still exist.
+  const remaining = Math.max(0, ordinary
+    ? inventoryTotal - paths.length
+    : (processingPending || inventoryTotal - paths.length));
+  const initialResultsReady = ordinary && ['deep_summarizing_files', 'deep_summarizing_nodes', 'deep_overview_updating', 'deep_update_available', 'completed', 'partial'].includes(status);
+  const stageLabel = ordinary ? ({
+    waiting_for_selection: '等待选择', parsing_selected: '正在解析选中文件',
+    parsed_overview: '正在生成解析版概览', preliminary_summarizing: '正在生成文件初步摘要',
+    preliminary_nodes: '正在生成节点初步摘要', preliminary_overview: '正在生成初步概览',
+    deep_summarizing_files: '初步成果可用 · 后台深析中', deep_summarizing_nodes: '初步成果可用 · 后台深析中',
+    deep_overview_updating: '正在更新深度概览', deep_update_available: '深度结果可更新',
+    completed: '已完成', partial: '部分完成', failed: '失败', cancelled: '已停止', paused: '已暂停', deep_paused: '已暂停'
+  }[status] || '分析中') : (status === 'waiting_for_deep_selection' ? '可选择' : '分析中');
   stats.innerHTML = [
-    `<div class="candidate-preview-stat"><strong>${escapeHtml(paths.length || expected || 0)}</strong><span>候选文件</span></div>`,
-    `<div class="candidate-preview-stat"><strong>${escapeHtml(completed)}/${escapeHtml(expected || paths.length || 0)}</strong><span>已生成初步摘要</span></div>`,
+    `<div class="candidate-preview-stat"><strong>${escapeHtml(ordinary ? paths.length : (paths.length || expected || 0))}</strong><span>${ordinary ? '已选文件' : '候选文件'}</span></div>`,
+    `<div class="candidate-preview-stat"><strong>${escapeHtml(completed)}/${escapeHtml(ordinary ? expected : (expected || paths.length || 0))}</strong><span>已生成初步摘要</span></div>`,
     `<div class="candidate-preview-stat"><strong>${escapeHtml(failed)}</strong><span>降级/失败</span></div>`,
     `<div class="candidate-preview-stat"><strong>${escapeHtml(remaining)}</strong><span>待补充文件</span></div>`,
-    `<div class="candidate-preview-stat"><strong>${escapeHtml(status === 'waiting_for_deep_selection' ? '可选择' : '分析中')}</strong><span>当前阶段</span></div>`,
+    `<div class="candidate-preview-stat"><strong>${escapeHtml(stageLabel)}</strong><span>当前阶段</span></div>`,
   ].join('');
   const open = $('candidateOpenDirectoryBtn');
-  if (open) open.disabled = status !== 'waiting_for_deep_selection' && status !== 'partial' && status !== 'completed';
+  if (open) open.disabled = !initialResultsReady && status !== 'waiting_for_deep_selection' && status !== 'partial' && status !== 'completed';
   const back = $('candidateBackSelectionBtn');
   if (back) {
     const supplementReady = ['waiting_for_deep_selection', 'partial', 'completed', 'deep_update_available', 'deep_summarizing_files', 'deep_summarizing_nodes', 'preliminary_overview'].includes(status);
@@ -3133,8 +3149,14 @@ function renderCandidatePreviewCard() {
     if (readyRefreshButton) {
       const plan = checkpoint.selection_plan || {};
       const active = ['queued', 'running', 'cancelling'].includes(status);
-      readyRefreshButton.disabled = !plan.schema_version || active;
-      readyRefreshButton.title = active ? '等待当前模型任务完成后更新' : '使用已完成的模型摘要重建正式目录和情报概览';
+      // Ordinary imports do not have a large-selection plan. Use the same
+      // saved deep-summary count and task stages as the pipeline action.
+      const deepSummaryFiles = Number(state.processing?.deep_summary_files || checkpoint.deep_summary_completed || 0);
+      const ordinaryDeepReady = deepSummaryFiles > 0 && ['deep_summarizing_files', 'deep_summarizing_nodes', 'deep_update_available'].includes(status);
+      readyRefreshButton.disabled = ordinary ? !ordinaryDeepReady : (!plan.schema_version || active);
+      readyRefreshButton.title = ordinary
+        ? (ordinaryDeepReady ? '按当前已完成的深度摘要更新正式结果，未完成任务继续后台运行' : '当前范围的深度摘要完成后可更新正式结果')
+        : (active ? '等待当前模型任务完成后更新' : '使用已完成的模型摘要重建正式目录和情报概览');
     }
   }
 }
@@ -4146,17 +4168,54 @@ function waitFor(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
+function renderImportTaskPipeline(task) {
+  const status = String(task?.status || '').toLowerCase();
+  const messages = {
+    waiting_for_deep_selection: '初步成果已生成，可继续选择深度范围。',
+    deep_summarizing_files: '选中范围初步成果已生成，可打开目录；深度摘要正在后台继续。',
+    deep_summarizing_nodes: '选中范围初步成果已生成，可打开目录；节点深度摘要正在后台继续。',
+    deep_update_available: '初步成果可用；深度摘要已就绪，可按需更新正式结果。',
+    completed: '当前导入批次已完成。',
+    partial: '当前导入阶段部分完成，请查看待复核项。',
+    failed: '导入阶段失败，请查看任务详情；已保存结果保留。',
+    paused: '导入阶段已暂停，已保存结果保留。',
+    deep_paused: '深度解析已暂停，已保存结果保留。',
+    cancelled: '导入阶段已停止，已保存结果保留。',
+    waiting_for_selection: '目录已导入，等待确认分析范围。'
+  };
+  if (!messages[status]) return;
+  const bar = $('progressBar');
+  if (bar) {
+    // 100% here closes the readable import milestone, not automatic deep work.
+    // A stopped or partial task retains its last bounded progress instead.
+    const readable = ['waiting_for_deep_selection', 'deep_summarizing_files', 'deep_summarizing_nodes', 'deep_update_available', 'completed', 'waiting_for_selection'].includes(status);
+    const previous = Math.max(0, Math.min(99, parseFloat(bar.style.width) || 0));
+    bar.style.width = `${readable ? 100 : previous}%`;
+    bar.dataset.status = status;
+  }
+  if ($('progressText')) $('progressText').textContent = messages[status];
+}
+
 async function pollImportTaskCompletion(scanId) {
   if (!scanId) return null;
+  const session = state.selectionSession;
+  const ownerJobId = state.jobId;
+  const isCurrent = () => selectionIsCurrent(scanId, session) && state.jobId === ownerJobId;
   let lastTask = null;
-  while (true) {
+  while (isCurrent()) {
     const data = await api(`/api/import-tasks/${encodeURIComponent(scanId)}`);
+    if (!isCurrent()) return null;
     lastTask = data.import_task || null;
     const task = lastTask || {};
+    const previousStatus = String(state.importTask?.status || '').toLowerCase();
+    state.importTask = lastTask;
+    state.processing = { ...(state.processing || {}), ...(task.processing || {}), import_task: lastTask, preview_queue: task.preview_queue || {} };
+    renderCandidatePreviewCard();
     const checkpoint = task.checkpoint || {};
-    const expected = Number(checkpoint.deep_summary_expected || 0);
-    const completed = Number(checkpoint.deep_summary_completed || 0);
-    const failed = Number(checkpoint.deep_summary_failed || 0);
+    const preliminary = ['parsed_overview', 'preliminary_summarizing', 'preliminary_nodes', 'preliminary_overview'].includes(String(task.status || '').toLowerCase());
+    const expected = Number(preliminary ? (checkpoint.preliminary_summary_expected ?? 0) : (checkpoint.deep_summary_expected || 0));
+    const completed = Number(preliminary ? (checkpoint.preliminary_summary_completed ?? 0) : (checkpoint.deep_summary_completed || 0));
+    const failed = Number(preliminary ? (checkpoint.preliminary_summary_failed ?? 0) : (checkpoint.deep_summary_failed || 0));
     const candidateExpected = Number(checkpoint.candidate_preview_expected || 0);
     const candidateCompleted = Number(checkpoint.candidate_preview_completed || 0);
     const candidateFailed = Number(checkpoint.candidate_preview_failed || 0);
@@ -4165,6 +4224,7 @@ async function pollImportTaskCompletion(scanId) {
     const progress = Math.max(80, Math.min(99, 80 + Math.round(ratio * 18)));
     const candidateProgress = Math.max(35, Math.min(88, 35 + Math.round(candidateRatio * 50)));
     const status = String(task.status || '').toLowerCase();
+    if (status !== previousStatus) updateStats();
     if (status === 'candidate_importing' || status === 'candidate_analyzing') {
       $('progressBar').style.width = `${candidateProgress}%`;
       $('progressText').textContent = `${candidateProgress}% · ${status === 'candidate_importing' ? '正在完成候选文件解析…' : `正在生成候选文件初步摘要：${candidateCompleted}/${candidateExpected || '多'}${candidateFailed ? `，降级 ${candidateFailed}` : ''}`}`;
@@ -4174,9 +4234,11 @@ async function pollImportTaskCompletion(scanId) {
       continue;
     }
     if (status === 'waiting_for_deep_selection') {
-      await refreshScan(scanId);
+      await refreshScan(scanId, isCurrent);
+      if (!isCurrent()) return null;
       setPackageStage('analysis');
       renderCandidatePreviewCard();
+      renderImportTaskPipeline(state.importTask || lastTask);
       return lastTask;
     }
       if (status === 'parsed_overview' || status === 'preliminary_overview') {
@@ -4213,16 +4275,32 @@ async function pollImportTaskCompletion(scanId) {
               : 'SUMMARIZING_FILES';
     }
       if (status === 'deep_summarizing_files' || status === 'deep_summarizing_nodes' || status === 'deep_update_available') {
-        await refreshScan(scanId);
+        // The initial result is readable now; do not wait for idle deep jobs.
+        await refreshScan(scanId, isCurrent);
+        if (!isCurrent()) return null;
         setPackageStage('analysis');
+        renderImportTaskPipeline(state.importTask || lastTask);
         return lastTask;
       }
-    if (status === 'completed' || status === 'partial' || status === 'failed' || status === 'paused') {
-      await refreshScan(scanId);
+    if (['completed', 'partial', 'failed', 'paused', 'deep_paused', 'cancelled', 'waiting_for_selection'].includes(status)) {
+      await refreshScan(scanId, isCurrent);
+      if (!isCurrent()) return null;
+      renderImportTaskPipeline(state.importTask || lastTask);
       return lastTask;
     }
     await waitFor(1200);
   }
+  return null;
+}
+
+async function showStoppedImportTask(task, job) {
+  const status = String(task?.status || '').toLowerCase();
+  if (!['failed', 'paused', 'deep_paused', 'cancelled', 'waiting_for_selection'].includes(status)) return false;
+  const message = { failed: '导入阶段失败，请查看任务详情', paused: '导入阶段已暂停', deep_paused: '深度解析已暂停', cancelled: '导入阶段已停止', waiting_for_selection: '等待确认分析范围' }[status];
+  state.jobId = null;
+  updateJobControls({ ...job, status: status === 'waiting_for_selection' ? 'completed' : status, message });
+  if (status === 'waiting_for_selection') await openSelectionPanel(task.scan_id || state.scan?.scan_id);
+  return true;
 }
 
 
@@ -4268,6 +4346,7 @@ async function pollJob(jobId) {
       continue;
     }
 
+    if (state.jobId !== jobId) return;
     const job = rememberJob({ ...(data.job || {}), connection_issue: '' }, jobId);
 
     updateJobControls(job);
@@ -4375,6 +4454,10 @@ async function pollJob(jobId) {
         || state.scan?.scan_id
         || job.scan_id;
 
+      const completionSession = state.selectionSession;
+      const isCurrentCompletion = () => state.jobId === jobId && selectionIsCurrent(completedScanId, completionSession);
+      let completedImportTask = null;
+
       if (job.result?._await_selection && completedScanId) {
         state.scan = { scan_id: completedScanId };
         await refreshScan(completedScanId);
@@ -4387,8 +4470,10 @@ async function pollJob(jobId) {
 
       if (Array.isArray(job.result?.candidate_preview_job_ids) && job.result.candidate_preview_job_ids.length && completedScanId) {
         state.scan = { scan_id: completedScanId };
-        await refreshScan(completedScanId);
-        await pollImportTaskCompletion(completedScanId);
+        await refreshScan(completedScanId, isCurrentCompletion);
+        if (!isCurrentCompletion()) return;
+        completedImportTask = await pollImportTaskCompletion(completedScanId);
+        if (!completedImportTask || !isCurrentCompletion() || await showStoppedImportTask(completedImportTask, job)) return;
         state.jobId = null;
         updateJobControls({ ...job, status: 'completed', progress: 100, message: '导入阶段初步分析完成，等待选择深度对象' });
         setPackageStage('analysis');
@@ -4403,9 +4488,13 @@ async function pollJob(jobId) {
 
       if (completedScanId) {
         state.scan = { scan_id: completedScanId };
-        await refreshScan(completedScanId);
-        if (Array.isArray(job.result?.deep_summary_job_ids) && job.result.deep_summary_job_ids.length) {
-          await pollImportTaskCompletion(completedScanId);
+        await refreshScan(completedScanId, isCurrentCompletion);
+        if (!isCurrentCompletion()) return;
+        const followupSummaries = [job.result?.preliminary_summary_job_ids, job.result?.deep_summary_job_ids]
+          .some((ids) => Array.isArray(ids) && ids.length > 0);
+        if (followupSummaries) {
+          completedImportTask = await pollImportTaskCompletion(completedScanId);
+          if (!completedImportTask || !isCurrentCompletion() || await showStoppedImportTask(completedImportTask, job)) return;
         }
       }
 
@@ -4466,7 +4555,9 @@ async function pollJob(jobId) {
       toast(
         job.task_type === 'generate_report'
           ? '概览 Word 已生成'
-          : (job.result?._await_selection ? '轻量预览完成，请确认深度解析范围' : '深度解析、证据校验和正式结果已生成')
+          : (completedImportTask
+            ? (completedImportTask.status === 'deep_update_available' ? '深度摘要已就绪，可按需更新正式结果。' : '选中范围初步成果已生成，可打开目录；深度摘要按后台进度继续。')
+            : (job.result?._await_selection ? '轻量预览完成，请确认深度解析范围' : '深度解析、证据校验和正式结果已生成'))
       );
 
       state.jobId =

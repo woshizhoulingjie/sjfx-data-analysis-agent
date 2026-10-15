@@ -558,23 +558,44 @@ def run_slice(repo,tid,owner,model,*,cancelled=lambda:False,char_budget=9000):
         raw=value['reviews']
         expected={f['finding_id'] for f in findings}
         if not isinstance(raw,list) or len(raw)!=len(expected) or {r.get('finding_id') for r in raw if isinstance(r,dict)}!=expected:raise ValueError('上下文核查未逐项对应发现')
+        rejected=[]
         for r in raw:
-            state=r.get('status');rationale=r.get('rationale')
-            if state not in RANK or not isinstance(rationale,str) or not rationale.strip():raise ValueError('核查状态无效')
-            citations=_citations(r.get('citations',[]),chunks)
-            if state in {'conditional','contradicted','supported'} and not citations:raise ValueError('核查判断没有原文依据')
-            conditions=_strings(r,'conditions');contradictions=_strings(r,'contradictions');unresolved=_strings(r,'unresolved_questions')
             finding=next(f for f in findings if f['finding_id']==r['finding_id'])
-            state,unresolved,scope_audit,scope_citations=_review_qualification_scope(
-                finding,r,chunks,state,conditions,contradictions,unresolved)
+            validation_field='status'
+            try:
+                state=r.get('status');rationale=r.get('rationale')
+                if not isinstance(state,str) or state not in RANK or not isinstance(rationale,str) or not rationale.strip():raise ValueError('核查状态无效')
+                validation_field='citations'
+                citations=_citations(r.get('citations',[]),chunks)
+                if state in {'conditional','contradicted','supported'} and not citations:raise ValueError('核查判断没有原文依据')
+                validation_field='conditions/contradictions/unresolved_questions'
+                conditions=_strings(r,'conditions');contradictions=_strings(r,'contradictions');unresolved=_strings(r,'unresolved_questions')
+                validation_field='qualification_reviews'
+                state,unresolved,scope_audit,scope_citations=_review_qualification_scope(
+                    finding,r,chunks,state,conditions,contradictions,unresolved)
+            except ValueError as exc:
+                # A rejected auxiliary review never supplies evidence or changes
+                # the original finding. Its context remains explicitly unverified.
+                rejection={'finding_id':r['finding_id'],'field':validation_field,'error':str(exc)}
+                rejected.append(rejection)
+                repo.event(tid,'dossier_review_row_rejected',rejection)
+                state='unresolved';rationale='本轮辅助核查未通过原文校验，保留原始发现与证据，相关上下文待核实。'
+                citations=[];conditions=[];contradictions=[];scope_citations=[]
+                unresolved=['辅助核查引用或结构无效，条件与反证尚未完成核实。']
+                scope_audit={'binding':hashlib.sha256(dumps({'finding':finding,'context_chunks':chunks}).encode()).hexdigest(),
+                             'complete':False,'checks':[],'failure_reason':str(exc)}
             if state=='supported' and conditions:state='conditional'
             previous=reviews.get(r['finding_id'],{'status':'supported','conditions':[],'contradictions':[],'unresolved_questions':[],'citations':[]})
             reviews[r['finding_id']]={'status':max((previous['status'],state),key=RANK.get),'rationale':rationale[:800],
                 **{k:list(dict.fromkeys(previous[k]+v))[:8] for k,v in [('conditions',conditions),('contradictions',contradictions),('unresolved_questions',unresolved)]},
                 'citations':(previous['citations']+citations+scope_citations)[-8:],
                 'qualification_scope_audits':previous.get('qualification_scope_audits',[])+[scope_audit]}
-        after={**reserved,'review_cursor':cursor,'reviews':reviews}
-        _commit(repo,tid,owner,reserved,after,tool='dossier_review',value={'reviews':raw,'checked_citations':[q for r in reviews.values() for q in r['citations']]});return _again(tid)
+        rejected_ids={r['finding_id'] for r in rejected}
+        after={**reserved,'review_cursor':cursor,'reviews':reviews,
+               'rejected_review_rows':cp.get('rejected_review_rows',0)+len(rejected)}
+        _commit(repo,tid,owner,reserved,after,tool='dossier_review',value={
+            'reviews':[r for r in raw if r['finding_id'] not in rejected_ids],'rejected_reviews':rejected,
+            'checked_citations':[q for r in reviews.values() for q in r['citations']]});return _again(tid)
     if cp['phase']=='alignment':
         rows=_steps(repo,tid,'dossier_verified',cp.get('alignment_index',0),1)
         if not rows:
@@ -638,8 +659,10 @@ def _finish_dossier(repo,tid,owner,spec,cp):
     if spec['manifest']['missing_body']:limitations.append('范围内有 %s 封邮件缺少可用正文。'%spec['manifest']['missing_body'])
     if coverage.get('attachments_without_text'):limitations.append('资料包仍有附件文本未处理，不能据此证明没有其他条件。')
     limitations.append('文本遍历完成不保证全部通信行为都已抽取；原子语义审核是同一模型的辅助判断，不能证明现实事项已完成。')
+    if cp.get('rejected_review_rows'):
+        limitations.append('有 %s 条辅助核查未通过原文校验；对应上下文仍待核实，原始发现、条件与证据已保留。'%cp['rejected_review_rows'])
     if cp.get('ledger_publication_failures'):limitations.append('共享事项台账部分写入失败，已保留原有发现与核查记录，可重新分析修复。')
-    sufficient=bool(cp['issues']) and not cp.get('ledger_publication_failures') and not cp.get('semantic_unverified_findings') and not spec['manifest']['missing_body'] and not coverage.get('attachments_without_text') and all(i['review_status']=='supported' for i in cp['issues'])
+    sufficient=bool(cp['issues']) and not cp.get('rejected_review_rows') and not cp.get('ledger_publication_failures') and not cp.get('semantic_unverified_findings') and not spec['manifest']['missing_body'] and not coverage.get('attachments_without_text') and all(i['review_status']=='supported' for i in cp['issues'])
     final={**cp,'complete':True,'phase':'completed','answer':answer,'limitations':limitations,'parties':spec['parties'],'message_keys':spec['message_keys'],
         'scope':spec.get('scope',{}),'evidence_note':'每个参与方只按其可归属的实际表达分析；收到或抄送不代表同意。'}
     if spec.get('phase2_enabled',True):final['ledger_dependency']=ledger_dependency(repo,spec['package_id'],owner,workflow_scope(spec))
