@@ -343,6 +343,7 @@ def _expand_authored_citations(value, chunks, parties, roots):
             source={**chunk,'authored':True}
             located=_located_citation(raw,{source['chunk_id']:source})
             original=checked_citation(located,{source['chunk_id']:source})
+            short_seed=original is None
             if original is None:
                 quote=located.get('quote')
                 if not isinstance(quote,str) or not 1<=len(quote)<8:continue
@@ -359,6 +360,24 @@ def _expand_authored_citations(value, chunks, parties, roots):
             if source.get('quotation_boundary') is not None:end=min(end,source['quotation_boundary'])
             base=source['char_start']
             if not 0<end-start<=1200 or start<base or end>base+len(source['text']):continue
+            if short_seed:
+                fragment=source['text'][start-base:end-base]
+                units=[m for m in re.finditer(r'[^。！？!?；;\r\n]+(?:[。！？!?；;]|\r?\n|$)',fragment)
+                       if start+m.start()<=original['char_start'] and start+m.end()>=original['char_end']]
+                if len(units)!=1:continue
+                left,right=units[0].span()
+                separators=list(re.finditer(r'[。！？!?；;]|\r?\n',fragment[:left]))
+                if separators and separators[-1].end()==left:left=separators[-1].start()
+                unit_start,unit_end=start+left,start+right
+                candidate={**raw,'quote':fragment[left:right],'char_start':unit_start}
+                checked=checked_citation(candidate,{source['chunk_id']:source})
+                if not checked or checked['quotation_warning']:continue
+                # Prefer the complete source unit when it supports the unchanged
+                # finding. Claims needing other original facts retain full context.
+                candidate_citations=list(row['citations']);candidate_citations[len(citations)-1]=candidate
+                try:validate_dossier({'findings':[{**row,'citations':candidate_citations}]},chunks,parties,roots)
+                except ValueError:pass
+                else:start,end=unit_start,unit_end
             if (start,end)==(original['char_start'],original['char_end']):continue
             expanded={**raw,'quote':source['text'][start-base:end-base],'char_start':start}
             checked=checked_citation(expanded,{source['chunk_id']:source})

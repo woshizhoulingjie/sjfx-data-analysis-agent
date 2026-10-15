@@ -107,6 +107,93 @@ def test_default_validator_keeps_complete_genuine_short_fragment_exception():
     assert checked_citation({'chunk_id':'c1','quote':'消','char_start':11},{'c1':chunk}) is None
 
 
+def actual_single_mail():
+    text='本邮件为纯合成测试资料。青河项目预算人民币120000元。只有完成三个站点验收后才付款；目前尚未付款。请陈禾确认采购安排。\r\n'
+    _,chunk=sample(text)
+    chunk.update(char_start=0,char_end=len(text),participants=[{'role':'from','address':'lin.qing@example.invalid'}],
+                 body_fragments=[{'fragment_kind':'authored','char_start':0,'char_end':len(text)}])
+    rows=[]
+    for kind,intent,statement,quote,offset,conditions in [
+        ('goal','request','要求陈禾确认采购安排。','请陈禾确认采购安排。',54,[]),
+        ('action','inform','告知只有完成三个站点验收后才付款。','只有完成三个站点验收后才付款',26,['完成三个站点验收']),
+        ('action','inform','告知目前尚未付款。','目前尚未付款',46,[]),
+        ('action','inform','告知青河项目预算为人民币120000元。','青河项目预算人民币120000元',13,[])]:
+        rows.append({'actor':'lin.qing@example.invalid','kind':kind,'intent':intent,'issue':'项目采购与付款',
+                     'statement':statement,'conditions':conditions,'contradictions':[],
+                     'unresolved_questions':[],'uncertainty':'未核实',
+                     'citations':[{'chunk_id':'c1','quote':quote,'char_start':offset}]})
+    return {'findings':rows},chunk
+
+
+@pytest.mark.parametrize('offset',[44,46])
+def test_actual_four_findings_expand_unpaid_state_to_complete_own_unit(offset):
+    value,chunk=actual_single_mail();value['findings'][2]['citations'][0]['char_start']=offset
+    before=deepcopy(value);parties=['lin.qing@example.invalid']
+    with pytest.raises(ValueError):validate_dossier(value,[chunk],parties,{'m1'})
+    expanded,audit=_expand_authored_citations(value,[chunk],parties,{'m1'})
+    assert value==before and len(audit)==1
+    assert audit[0]['original_span']==[44,50] and audit[0]['expanded_span']==[43,51]
+    citation=expanded['findings'][2]['citations'][0]
+    assert citation['quote']=='；目前尚未付款。' and len(citation['quote'])==8
+    assert chunk['text'][citation['char_start']:citation['char_start']+len(citation['quote'])]==citation['quote']
+    assert checked_citation(citation,{'c1':chunk})
+    for old,new in zip(before['findings'],expanded['findings']):
+        assert {k:v for k,v in old.items() if k!='citations'}=={k:v for k,v in new.items() if k!='citations'}
+    checked=validate_dossier(expanded,[chunk],parties,{'m1'})
+    assert len(checked)==4 and checked[1]['conditions']==['完成三个站点验收']
+
+
+@pytest.mark.parametrize('fault',['condition','negation','amount'])
+def test_actual_unit_expansion_cannot_remove_own_condition_negation_or_amount(fault):
+    value,chunk=actual_single_mail();parties=['lin.qing@example.invalid']
+    if fault=='condition':
+        row=value['findings'][1];row.update(statement='告知完成三个站点验收后付款。',conditions=[]);seed='三个站点'
+    elif fault=='negation':
+        row=value['findings'][2];row['statement']='告知目前已付款。';seed='目前尚未付款'
+    else:
+        row=value['findings'][3];row['statement']='告知青河项目预算为人民币120001元。';seed='预算'
+    row['citations']=[{'chunk_id':'c1','quote':seed,'char_start':chunk['text'].index(seed)}]
+    expanded,audit=_expand_authored_citations(value,[chunk],parties,{'m1'})
+    assert audit and expanded['findings'][value['findings'].index(row)]['statement']==row['statement']
+    with pytest.raises(ValueError):validate_dossier(expanded,[chunk],parties,{'m1'})
+
+
+def test_short_complete_unit_below_default_minimum_does_not_borrow_other_words():
+    value,chunk=sample('合同仍待确认；未付款。请陈禾确认采购安排。')
+    row=value['findings'][0];row.update(statement='未付款。',unresolved_questions=[])
+    row['citations']=[{'chunk_id':'c1','quote':'未付款','char_start':10+chunk['text'].index('未付款')}]
+    expanded,audit=_expand_authored_citations(value,[chunk],['alice@test'],{'m1'})
+    assert audit==[] and expanded==value
+    with pytest.raises(ValueError):validate_dossier(expanded,[chunk],['alice@test'],{'m1'})
+
+
+def test_actual_four_findings_commit_first_reading_attempt_after_strict_unit_validation(monkeypatch):
+    from types import SimpleNamespace
+    from services.mail import analysis
+    value,chunk=actual_single_mail()
+    checkpoint={'phase':'reading','cursor':[0,0],'model_calls':0,'batches':0,'characters_read':0,'findings_count':0}
+    spec={'mode':'message_dossier','engine_version':analysis.VERSION,'package_id':'p',
+          'context_keys':['m1'],'message_keys':['m1'],'parties':['lin.qing@example.invalid'],
+          'objective':'说明主要诉求、付款条件和当前付款状态','manifest':{'metadata_fingerprint':'f'}}
+    calls=[];commits=[];events=[]
+    repo=SimpleNamespace(get_turn=lambda *args:{'status':'running','task_spec':spec,'final':checkpoint},
+                         event=lambda *args:events.append(args))
+    monkeypatch.setattr(analysis,'manifest',lambda *args,**kwargs:{'metadata_fingerprint':'f'})
+    monkeypatch.setattr(analysis,'next_chunks',lambda *args,**kwargs:([chunk],[1,0]))
+    def call(*args,**kwargs):
+        calls.append(1)
+        return deepcopy(value),{**checkpoint,'model_calls':len(calls)}
+    monkeypatch.setattr(analysis,'_call',call)
+    monkeypatch.setattr(analysis,'_commit',lambda *args,**kwargs:commits.append((args,kwargs)))
+    analysis.run_slice(repo,'t','owner',object())
+    assert len(calls)==1 and len(commits)==1
+    assert commits[0][0][4]['characters_read']==63 and commits[0][0][4]['findings_count']==4
+    findings=commits[0][1]['value']['findings']
+    assert findings[2]['citations'][0]['quote']=='；目前尚未付款。'
+    assert findings[1]['conditions']==['完成三个站点验收']
+    assert any(event[1]=='dossier_citation_context_expanded' and event[2]['accepted'] for event in events)
+
+
 def test_expansion_leaves_already_valid_findings_and_their_local_context_unchanged():
     delivery='请于2026年10月30日前交付。'
     value,chunk=sample(FIRST+'\n'+DEADLINE+'\n'+delivery)
