@@ -1,3 +1,4 @@
+import hashlib
 import math
 import re
 import unicodedata
@@ -96,6 +97,97 @@ def _document_items(documents):
     return [(item.get("path", ""), item.get("payload", item)) for item in documents]
 
 
+def _ocr_page_passages(document, path, max_chars=1200):
+    """Keep short OCR fields together in an exact, bounded source passage.
+
+    Individual English receipt lines often fail the prose quality gate. A
+    contiguous page passage retains their labels, values and qualifications
+    without treating arbitrary short navigation labels as factual evidence.
+    """
+    body = str(document.get("text") or "")
+    coverage = document.get("coverage") or {}
+    # A sampled projection joins disjoint source spans with a generated marker.
+    # Neither its combined text nor its offsets describe the original document.
+    if (not body or coverage.get("projection_text_truncated")
+            or "[包级语义投影已折叠正文；选择文件可读取完整 sidecar]" in body):
+        return []
+    groups = defaultdict(list)
+    for item in document.get("evidence") or []:
+        if item.get("label") == "ocr_text" and item.get("page") is not None:
+            groups[(item.get("source_path") or path, item["page"],
+                    item.get("archive_source_path"), item.get("archive_member"))].append(item)
+    output = []
+    for (source_path, page, archive_source_path, archive_member), lines in groups.items():
+        region_start, region_end = 0, len(body)
+        if archive_member:
+            member_pattern = re.compile(
+                r"(?m)^\[压缩包成员：" + re.escape(str(archive_member)) + r"\][ \t]*(?:\r?\n)?")
+            member_markers = list(member_pattern.finditer(body))
+            if len(member_markers) != 1:
+                continue
+            region_start = member_markers[0].end()
+            next_member = re.search(r"(?m)^\[压缩包成员：[^\r\n]+\][ \t]*(?:\r?\n)?", body[region_start:])
+            region_end = region_start + next_member.start() if next_member else len(body)
+        page_pattern = re.compile(
+            r"(?m)^\[第[ \t]*" + re.escape(str(page))
+            + r"[ \t]*页(?:/张)?[ \t]*OCR\][ \t]*(?:\r?\n)?")
+        page_markers = list(page_pattern.finditer(body, region_start, region_end))
+        ranges = []
+        for marker in page_markers:
+            next_page = re.search(r"(?m)^\[第[ \t]*\d+[ \t]*页(?:/张)?[ \t]*OCR\]",
+                                  body[marker.end():region_end])
+            ranges.append((marker.end(), marker.end() + next_page.start() if next_page else region_end))
+        # Repeated page numbers (for example combined archive projections) do
+        # not provide an unambiguous source location. Keep their line evidence.
+        if len(ranges) != 1:
+            continue
+        cursor, page_end = ranges[0]
+        windows = []
+        for line in lines:
+            text = str(line.get("original_text") or line.get("text") or "")
+            start = body.find(text, cursor, page_end) if text else -1
+            if start < 0 or len(text) > max_chars:
+                continue
+            end = start + len(text)
+            cursor = end
+            if windows and end - windows[-1][0] <= max_chars:
+                windows[-1][1] = end
+                windows[-1][2].append(line)
+            else:
+                windows.append([start, end, [line]])
+        for start, end, members in windows:
+            if len(members) < 2:
+                continue
+            original = body[start:end]
+            first = members[0]
+            points = [point for line in members for point in (line.get("bbox") or [])
+                      if isinstance(point, (list, tuple)) and len(point) == 2]
+            bbox = None
+            if points:
+                xs, ys = zip(*points)
+                bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
+                        [max(xs), max(ys)], [min(xs), max(ys)]]
+            output.append({
+                "evidence_id": "OCR-PAGE-{}-{}-{}".format(
+                    first.get("source_sha256") or document.get("source", {}).get("sha256") or path,
+                    page, start),
+                "source_path": source_path, "page": page, "label": "ocr_page_text",
+                "text": original, "original_text": original,
+                "char_start": start - region_start, "char_end": end - region_start,
+                "character_range": [start - region_start, end - region_start], "bbox": bbox,
+                "source_sha256": first.get("source_sha256") or document.get("source", {}).get("sha256"),
+                "content_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                "archive_source_path": archive_source_path,
+                "archive_member": archive_member,
+                "archive_char_start": start if archive_member else None,
+                "archive_char_end": end if archive_member else None,
+                "parser": first.get("parser"),
+                "preview_only": any(bool(line.get("preview_only")) for line in members),
+                "coverage": first.get("coverage") or document.get("coverage") or {},
+            })
+    return output
+
+
 def evidence_corpus(documents, scope="."):
     """Create deterministic, deduplicated retrieval chunks from evidence units."""
     chunks = []
@@ -105,6 +197,7 @@ def evidence_corpus(documents, scope="."):
             path = document.get("source", {}).get("path", "")
         source = document.get("source", {})
         evidence = list(document.get("evidence", []) or [])
+        evidence = _ocr_page_passages(document, path) + evidence
         if not evidence and document.get("text"):
             text = document["text"]
             evidence = [
@@ -144,7 +237,9 @@ def evidence_corpus(documents, scope="."):
             if is_preview:
                 quality = dict(quality)
                 quality.update({"eligible": True, "preview_only": True, "reason": quality.get("reason") or "轻量预览候选"})
-            key = (path, item.get("page"), item.get("section"), item.get("content_sha256") or text)
+            key = (item.get("source_path") or path, item.get("archive_source_path"),
+                   item.get("archive_member"), item.get("page"), item.get("section"),
+                   item.get("content_sha256") or text)
             if key in seen:
                 continue
             seen.add(key)
@@ -171,6 +266,20 @@ def evidence_corpus(documents, scope="."):
                 "block_index": item.get("block_index"),
                 "char_start": item.get("char_start"),
                 "char_end": item.get("char_end"),
+                "character_range": item.get("character_range"),
+                "archive_char_start": item.get("archive_char_start"),
+                "archive_char_end": item.get("archive_char_end"),
+                "table": item.get("table"),
+                "row": item.get("row"),
+                "row_range": item.get("row_range"),
+                "column": item.get("column"),
+                "record_index": item.get("record_index"),
+                "sampled": item.get("sampled"),
+                "derivation": item.get("derivation"),
+                "evidence_role": item.get("evidence_role"),
+                "derived_from": item.get("derived_from"),
+                "location": item.get("location"),
+                "evidence_level": item.get("evidence_level"),
                 "preview_only": bool(item.get("preview_only")),
                 "preview_window": item.get("preview_window"),
                 "preview_window_char_start": item.get("preview_window_char_start"),

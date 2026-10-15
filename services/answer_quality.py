@@ -57,10 +57,13 @@ def source_kind(item):
     if item.get('preview_only') or (item.get('coverage') or {}).get('level') == 'preview':
         return 'preview'
     role = str(item.get('evidence_role') or '')
-    if role == 'structured_statistic':
+    label = str(item.get('label') or '')
+    if role == 'structured_statistic' or label == 'table_statistics' or item.get('derivation'):
         return 'structured_statistic'
+    if role == 'structured_record' or label == 'table_record':
+        return 'structured_record'
     if ('summary' in str(location.get('source', '')) or '摘要' in role or 'summary' in role
-            or 'summary' in str(item.get('label', '')) or item.get('evidence_level') == 'file'):
+            or 'summary' in label or item.get('evidence_level') == 'file'):
         return 'summary'
     return 'original'
 

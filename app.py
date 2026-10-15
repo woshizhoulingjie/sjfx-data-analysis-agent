@@ -9184,7 +9184,7 @@ def _merge_summary_evidence(retrieval_request, package_context, indexed):
     for file in (package_context or {}).get("file_summaries") or []:
         path = str(file.get("path") or "")
         summary = str(file.get("summary") or "").strip()
-        if not path or not summary:
+        if not _is_physical_package_path(path) or not summary or not retrieval_request.scope.contains_source(path):
             continue
         evidence_id = "summary:{}:{}".format(scan_id, path)
         if evidence_id in seen:
@@ -9214,6 +9214,13 @@ def _conversation_retrieve(retrieval_request):
         if indexed is not None:
             return indexed
     started_at = time.monotonic()
+    # Focused ordinary retrieval reads the current bounded source projection.
+    # Its index/source can be rebuilt while this process stays alive, so a
+    # query-only TTL cache could replay stale summaries or removed originals.
+    cache_result = str(retrieval_request.scan_id).startswith("lp-") or (
+        retrieval_request.scope.kind in {"package", "directory", "files"}
+        and retrieval_request.intent in {"summary", "analysis", "multi_task"}
+    )
     cache_key = (
         str(retrieval_request.scan_id),
         str(retrieval_request.query or "").strip().casefold(),
@@ -9226,10 +9233,11 @@ def _conversation_retrieve(retrieval_request):
         tuple(sorted(retrieval_request.scope.source_paths or ())),
         str(retrieval_request.intent or ""),
     )
-    with _CONVERSATION_RETRIEVAL_CACHE_LOCK:
-        cached = _CONVERSATION_RETRIEVAL_CACHE.get(cache_key)
-        if cached and (time.monotonic() - cached[0]) < _CONVERSATION_RETRIEVAL_CACHE_TTL:
-            return copy.deepcopy(cached[1])
+    if cache_result:
+        with _CONVERSATION_RETRIEVAL_CACHE_LOCK:
+            cached = _CONVERSATION_RETRIEVAL_CACHE.get(cache_key)
+            if cached and (time.monotonic() - cached[0]) < _CONVERSATION_RETRIEVAL_CACHE_TTL:
+                return copy.deepcopy(cached[1])
     query = retrieval_request.query
     scope = retrieval_request.scope
     package_context = _conversation_package_context(retrieval_request.scan_id)
@@ -9362,6 +9370,8 @@ def _conversation_retrieve(retrieval_request):
         if semantic_scores:
             indexed = ordinary_recall.augment_candidates(
                 indexed, semantic_scores, package_context, retrieval_request.scan_id,
+                storage=None if broad_package_question else storage,
+                scope=scope,
             )
     except Exception:
         # Recall is an enhancement: never let it break a question.
@@ -9574,10 +9584,11 @@ def _conversation_retrieve(retrieval_request):
             + ["检索达到交互式时间预算，已返回当前最高相关证据；可继续追问以扩大范围。"]
         ))
         result["coverage"]["retrieval_time_budget_exceeded"] = True
-    with _CONVERSATION_RETRIEVAL_CACHE_LOCK:
-        _CONVERSATION_RETRIEVAL_CACHE[cache_key] = (time.monotonic(), copy.deepcopy(result))
-        while len(_CONVERSATION_RETRIEVAL_CACHE) > _CONVERSATION_RETRIEVAL_CACHE_MAX:
-            _CONVERSATION_RETRIEVAL_CACHE.pop(next(iter(_CONVERSATION_RETRIEVAL_CACHE)))
+    if cache_result:
+        with _CONVERSATION_RETRIEVAL_CACHE_LOCK:
+            _CONVERSATION_RETRIEVAL_CACHE[cache_key] = (time.monotonic(), copy.deepcopy(result))
+            while len(_CONVERSATION_RETRIEVAL_CACHE) > _CONVERSATION_RETRIEVAL_CACHE_MAX:
+                _CONVERSATION_RETRIEVAL_CACHE.pop(next(iter(_CONVERSATION_RETRIEVAL_CACHE)))
     return result
 
 

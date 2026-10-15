@@ -1689,9 +1689,8 @@ def kmeans_recluster(store, package_id, force=False):
             'SELECT path, vector, input_hash, group_id FROM large_catalog_members '
             'WHERE package_id=? ORDER BY path',
             (package_id,)).fetchall()
-    n = len(rows)
-    # 绝对下界：少于 4 个文件没有分组意义（此时 1 个组也不会出现单人组问题）。
-    if n < 4:
+    # 小包也必须退出暂存组，走同一套正式分组、命名和发布校验。
+    if not rows:
         return 0
     # 向量集指纹没变就不再重复聚类。指纹落库，因此 Worker 重启后结果保持一致
     # （原来用进程内字典记录 assigned，重启即归零，同一份语料会得到不同目录）。
@@ -1714,7 +1713,7 @@ def kmeans_recluster(store, package_id, force=False):
         # 变化过"），也让后续能追踪某个分组是基于哪个版本的内容算出来的。
         # 原实现这里把 input_hash 写成空串，导致指纹只能退化成"数量 + 字节数"。
         input_hashes[r['path']] = r['input_hash'] if 'input_hash' in r.keys() else ''
-    if len(vecs) < 4:
+    if not vecs:
         return 0
     X = np.vstack(vecs)
 
@@ -1745,7 +1744,9 @@ def kmeans_recluster(store, package_id, force=False):
         # 异构语料会失控：实测旧增量锚点分组在 6,925 文件上产出 4,870 个组、
         # 其中 4,435 个单元素组（91%），目录不可浏览且必须命名的节点数失控。
         # 这里只在"单元素组占比确实病态"时补一次带下限的吸收，正常语料零影响。
-        if floor <= 1 and cfg.get('min_group_auto'):
+        # 1–3 个样本中的单例比例天然较高，不代表大目录的病态碎片化；
+        # 保留语义聚类结果，避免把不相关的小样本强行吸进同一组。
+        if len(paths) >= 4 and floor <= 1 and cfg.get('min_group_auto'):
             sizes = {}
             for value in labels:
                 key = int(value)
@@ -1930,16 +1931,15 @@ def kmeans_recluster(store, package_id, force=False):
                     _MEMBER_UPSERT,
                     [(package_id, p, gid, '', b'') for p in stragglers])
                 changed += len(stragglers)
-            # 显式清掉暂存用的占位分组：它是 km-pending-<hash> 命名空间下的空组，
-            # 已无成员，但不能留在目录里（否则会显示成一个没有名字的分组）。
-            # 不依赖 member_count 的触发器时序，直接按主键删除。
+            # 只清掉真正空的暂存壳。未参与聚类的无效向量或锁定成员必须保留，
+            # 不能为了移除占位分组而丢掉成员、绕过后续发布校验。
             ph = 'km-pending-' + hashlib.sha256(package_id.encode()).hexdigest()[:8]
-            conn.execute('DELETE FROM large_catalog_buckets WHERE package_id=? AND group_id=?',
-                         (package_id, ph))
-            conn.execute('DELETE FROM large_catalog_members WHERE package_id=? AND group_id=?',
-                         (package_id, ph))
-            conn.execute('DELETE FROM large_catalog_groups WHERE package_id=? AND id=?',
-                         (package_id, ph))
+            if not conn.execute('SELECT 1 FROM large_catalog_members WHERE package_id=? AND group_id=? LIMIT 1',
+                                (package_id, ph)).fetchone():
+                conn.execute('DELETE FROM large_catalog_buckets WHERE package_id=? AND group_id=?',
+                             (package_id, ph))
+                conn.execute('DELETE FROM large_catalog_groups WHERE package_id=? AND id=?',
+                             (package_id, ph))
             conn.execute('DELETE FROM lp_catalog_changes WHERE package_id=?',(package_id,))
             conn.execute('DELETE FROM lp_catalog_removed_groups WHERE package_id=?',(package_id,))
             save_signature(conn,package_id,len(paths))

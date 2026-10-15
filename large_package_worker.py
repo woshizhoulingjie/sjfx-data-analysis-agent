@@ -21,6 +21,7 @@ from services.summary_fidelity import SUMMARY_QUALIFIER_INSTRUCTION, summary_qua
 from services.large_package_isolated import LargePackageStore, iter_inventory, quick_preview, _under_allowed_root
 from services.large_package_resources import (AdmissionGuard, ResourcePressure,
     defer_lease, pressure, resource_code, show_wait, sqlite_temp_directory)
+from services.model_contract import LocalModelError
 
 LOGGER = logging.getLogger("sjfx.large_package_worker")
 
@@ -44,6 +45,12 @@ SOLO_CATCHUP_STALE_SQL = (
 # UnifiedDocumentParser 内部有可变状态（缓存/句柄），跨线程共享不安全。
 _DEEP_PARSER_LOCAL = threading.local()
 _SURROGATES = re.compile(r"[\ud800-\udfff]")
+_DEEP_MODEL_BUSY_BACKOFF = (1.0, 2.0)
+
+
+def _pending_model_error(exc):
+    return isinstance(exc, LocalModelError) and (
+        exc.code == "cancelled" or (exc.code == "busy" and exc.retryable))
 
 
 class SourceChangedError(RuntimeError):
@@ -2182,7 +2189,28 @@ class LargePackageWorker:
             if not row:
                 raise FileNotFoundError(path)
             self._check_resources()
-            result = _normalize_unicode(self._deep_parse(root, row))
+            from services.model_dispatch import background_generation
+            def cancelled():
+                return self._interrupted(package_id) or bool(
+                    lease and not self.store.holds_lease(package_id, path, 'deep', lease))
+            # Admission releases its ticket before raising busy. Keep this deep
+            # lease alive while retrying, and retain the existing FIFO priority.
+            with background_generation(cancelled=cancelled, priority=100):
+                for attempt in range(len(_DEEP_MODEL_BUSY_BACKOFF) + 1):
+                    if cancelled():
+                        raise LocalModelError('深度摘要已暂停或取消', code='cancelled')
+                    try:
+                        result = _normalize_unicode(self._deep_parse(root, row))
+                        break
+                    except LocalModelError as exc:
+                        if (exc.code != 'busy' or not exc.retryable
+                                or attempt == len(_DEEP_MODEL_BUSY_BACKOFF)):
+                            raise
+                        until = time.monotonic() + _DEEP_MODEL_BUSY_BACKOFF[attempt]
+                        while time.monotonic() < until:
+                            if cancelled():
+                                raise LocalModelError('深度摘要已暂停或取消', code='cancelled') from exc
+                            heartbeat_stop.wait(min(0.1, max(0, until - time.monotonic())))
             if result.get("summary_type") == "local_deep_failed":
                 raise RuntimeError(result.get("error") or "深度解析未获得正文")
             quality = str(result.get("quality") or "")
@@ -2212,6 +2240,9 @@ class LargePackageWorker:
         except ProtectionError:
             raise
         except Exception as exc:
+            if isinstance(exc, LocalModelError) and exc.code == 'cancelled':
+                self.store.requeue(package_id, path, 'deep', token=lease)
+                return path, False, str(exc)[:200]
             if self._defer_resource(package_id,path,'deep',lease,exc):
                 raise pressure(exc) from exc
             ok, why = self.store.commit_stage_result(
@@ -2563,7 +2594,7 @@ class LargePackageWorker:
                 }
             # Model generation remains opt-in for the isolated worker.  A local
             # parser result is still durable and clearly labelled if the model
-            # is busy or unavailable.
+            # is unavailable. Retryable contention must reach the worker.
             if str(os.getenv("LARGE_PACKAGE_MODEL_SUMMARY", "1")).lower() not in {"0", "false", "no", "off"} and text.strip():
                 summary.update(self._model_summary(row["path"], _sample_text(text, 24000)))
             else:
@@ -2578,7 +2609,7 @@ class LargePackageWorker:
         except ProtectionError:
             raise
         except Exception as exc:
-            if resource_code(exc):
+            if resource_code(exc) or _pending_model_error(exc):
                 raise
             return {"summary_type": "local_deep_failed", "source_path": row["path"],
                     "error": str(exc)[:500], "quality": "failed", "coverage": "none",
@@ -2632,7 +2663,7 @@ class LargePackageWorker:
         except ProtectionError:
             raise
         except Exception as exc:
-            if resource_code(exc):
+            if resource_code(exc) or _pending_model_error(exc):
                 raise
             # 模型不可用是**降级**，不是完整深度摘要。
             return {"summary_type": "local_deep", "model_status": "unavailable",

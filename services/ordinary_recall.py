@@ -227,7 +227,8 @@ def augment_candidates(indexed: Sequence[Mapping[str, Any]],
                        package_context: Optional[Mapping[str, Any]],
                        scan_id: str,
                        top_files: int = SEMANTIC_TOP_FILES,
-                       min_files: int = SEMANTIC_MIN_FILES) -> List[Dict[str, Any]]:
+                       min_files: int = SEMANTIC_MIN_FILES,
+                       storage: Any = None, scope: Any = None) -> List[Dict[str, Any]]:
     """Add the semantically nearest files when the lexical pass was too thin."""
     merged = [dict(item) for item in indexed or []]
     if not semantic_scores:
@@ -244,9 +245,53 @@ def augment_candidates(indexed: Sequence[Mapping[str, Any]],
         for item in ((package_context or {}).get("file_summaries") or [])
     }
     added = 0
+    source_chars = 0
+    from services import answer_quality as aq
     for path, score in sorted(semantic_scores.items(), key=lambda kv: -kv[1]):
         if added >= max(1, int(top_files)):
             break
+        if storage is not None:
+            # Semantic similarity discovers a file; its summary is not the
+            # original passage. Read only bounded persisted projections of the
+            # nearest selected files, never a full document sidecar or reparse.
+            if (not path or path == "." or path.startswith(("node:", "naming:", "group:", "summary:"))
+                    or (scope is not None and not scope.contains_source(path))):
+                continue
+            same_source = [item for item in merged if item.get("source_path") == path]
+            authoritative_kinds = {"original", "structured_statistic", "structured_record"}
+            if any(aq.source_kind(item) in authoritative_kinds for item in same_source):
+                continue
+            added += 1
+            from services.retrieval import evidence_corpus
+            direct = []
+            for document in storage.iter_documents_for_paths(scan_id, [path], hydrate=False):
+                payload = document.get("payload") or {}
+                coverage = payload.get("coverage") or {}
+                if coverage.get("formal_evidence_ready") is False or coverage.get("preview_only"):
+                    continue
+                for item in evidence_corpus({path: payload}):
+                    source = item.get("source_path") or path
+                    if not (source == path or source.startswith(path + "::")
+                            or item.get("archive_source_path") == path):
+                        continue
+                    if (scope is not None and not (scope.contains_source(source)
+                            or scope.contains_source(item.get("archive_source_path")))):
+                        continue
+                    if aq.source_kind(item) not in authoritative_kinds:
+                        continue
+                    size = len(str(item.get("original_text") or item.get("text") or ""))
+                    if source_chars + size > 16000:
+                        continue
+                    source_chars += size
+                    direct.append({**item, "semantic_score": round(float(score), 6)})
+                    if len(direct) >= 16:
+                        break
+            # Missing/unparsed originals remain insufficient; do not promote
+            # a summary containing unsupported numbers to source evidence.
+            merged = [item for item in merged if not (
+                item.get("source_path") == path and aq.source_kind(item) in {"summary", "preview"})]
+            merged.extend(direct)
+            continue
         if path in current:
             continue
         summary = str((summaries.get(path) or {}).get("summary") or "").strip()

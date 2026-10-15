@@ -263,12 +263,30 @@ def compact_evidence(item, max_chars=520):
             "evidence_id", "source_path", "page", "section", "label", "bbox",
             "parser", "source_sha256", "content_sha256", "score", "retrieval_score",
             "archive_source_path", "archive_member", "paragraph_index", "block_index",
-            "char_start", "char_end", "parser_version",
+            "char_start", "char_end", "character_range", "parser_version",
+            "table", "row", "row_range", "column", "record_index", "sampled",
+            "derivation",
         )
         if item.get(key) is not None
     }
-    text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
-    result["text"] = text[:max_chars] + ("..." if len(text) > max_chars else "")
+    # Ranking may normalize whitespace, but a displayed source excerpt must
+    # remain a literal slice whose hash and coordinates can be replayed.
+    text = str(item.get("text") or "")
+    result["text"] = text[:max_chars]
+    result["content_sha256"] = hashlib.sha256(result["text"].encode("utf-8")).hexdigest()
+    if len(text) > max_chars:
+        if item.get("content_sha256"):
+            result["original_content_sha256"] = item["content_sha256"]
+        character_range = item.get("character_range")
+        if (isinstance(character_range, (list, tuple)) and len(character_range) == 2
+                and all(isinstance(value, int) for value in character_range)
+                and character_range[1] - character_range[0] == len(text)):
+            result["original_character_range"] = list(character_range)
+            result["character_range"] = [character_range[0], character_range[0] + len(result["text"])]
+        if (isinstance(item.get("char_start"), int) and isinstance(item.get("char_end"), int)
+                and item["char_end"] - item["char_start"] == len(text)):
+            result["original_char_end"] = item["char_end"]
+            result["char_end"] = item["char_start"] + len(result["text"])
     translated = re.sub(r"\s+", " ", str(item.get("translated_text") or "")).strip()
     if translated:
         result["original_text"] = result["text"]

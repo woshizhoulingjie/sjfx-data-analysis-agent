@@ -2271,13 +2271,16 @@ class UnifiedDocumentParser:
     def _add_fallback_evidence(self, base):
         chunks = re.split(r"(?=\[第\s*\d+\s*页(?:/张)?(?:\s*OCR)?\]|\[幻灯片\s*\d+\]|\n#{1,6}\s+)", base["text"])
         evidence = []
+        offset = 0
         for raw in chunks:
+            chunk_start = offset
+            offset += len(raw)
             page_match = re.search(r"\[第\s*(\d+)\s*页(?:/张)?(?:\s*OCR)?\]", raw)
             slide_match = re.search(r"\[幻灯片\s*(\d+)\]", raw)
             page = int((page_match or slide_match).group(1)) if (page_match or slide_match) else None
             for start in range(0, len(raw), 1200):
-                snippet = _short_text(raw[start:start + 1200], 1200)
-                if not snippet:
+                snippet = raw[start:start + 1200]
+                if not snippet.strip():
                     continue
                 evidence.append({
                     "evidence_id": "E-{}-{:05d}".format(base["source"]["sha256"][:10], len(evidence) + 1),
@@ -2286,7 +2289,7 @@ class UnifiedDocumentParser:
                     "section": None,
                     "label": "text_chunk",
                     "text": snippet,
-                    "character_range": [start, min(len(raw), start + 1200)],
+                    "character_range": [chunk_start + start, chunk_start + min(len(raw), start + 1200)],
                     "bbox": None,
                     "parser": base["parser"].get("name"),
                     "source_sha256": base["source"]["sha256"],
