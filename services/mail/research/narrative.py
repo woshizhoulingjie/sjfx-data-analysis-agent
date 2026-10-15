@@ -1,9 +1,10 @@
-"""A short Chinese answer, separately audited without changing source verdicts.
+"""Chinese answer prose without changing source verdicts.
 
 The host constructs complete source-bound sentence prototypes. Each new
-sentence goes through the existing atomic verifier. Unknowns and reading scope
-are controlled presentation text; original facts, qualifications and literals
-remain available in the evidence appendix.
+verified sentence goes through the existing atomic verifier. Incomplete review
+still receives a conservative paragraph attributed to its linked originals.
+Unknowns and reading scope are controlled presentation text; original facts,
+qualifications and literals remain available in the evidence appendix.
 """
 from copy import deepcopy
 import hashlib
@@ -391,6 +392,61 @@ def _compose(sentences, unknowns):
     return paragraphs
 
 
+def _conservative_conclusion(state, claims, evidence, unknowns):
+    """A source-attributed paragraph when context or semantic review is incomplete.
+
+    Existing model findings select relevant originals; their unverified wording
+    is never promoted to a fact. Only the linked source quotation is presented,
+    and the original verdicts, evidence and scope remain untouched.
+    """
+    allowed = state.get('allowed_keys')
+    sources = {row.get('evidence_id'): row for row in evidence or []
+        if isinstance(row, dict) and row.get('evidence_id')
+        and (allowed is None or row.get('message_key') in allowed)}
+    synthesis = state.get('answer_synthesis') or {}
+    rows = list(state.get('findings') or []) + list(synthesis.get('claims') or []) + list(claims or [])
+    passages, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get('answer_relevance') not in ('direct', 'qualification'):
+            continue
+        ids = list(row.get('evidence_ids') or ([row['evidence_id']] if row.get('evidence_id') else []))
+        ids += list(row.get('counter_evidence_ids') or [])
+        for evidence_id in ids:
+            source = sources.get(evidence_id)
+            if not source:
+                continue
+            original = str(source.get('quote_text') or '').strip()
+            quote = row.get('source_quote')
+            if not isinstance(quote, str) or not quote.strip() or quote not in original:
+                quote = original
+            quote = ' '.join(quote.split())
+            if not quote or quote in seen:
+                continue
+            seen.add(quote)
+            label = {'attachment': '附件原文', 'body': '邮件原文'}.get(source.get('source_kind'), '资料原文')
+            passages.append(label + '记载“' + quote + '”')
+    if passages:
+        text = '综合本轮已读取的相关资料，' + '；'.join(passages) + '。'
+        text += ('这些原文是目前对所问事项可直接参照的记录，其中的表述、条件与限制需要一并理解。'
+                 '由于相关上下文或结论尚未完成核验，本轮只能作出限于这些已读材料的保守归纳，'
+                 '不能据此认定条件已经履行、完整历史或事项当前的最终状态。')
+    else:
+        hints = _source_hints(list(sources.values()))
+        if hints:
+            text = ('综合本轮检索结果，已找到与问题相关的邮件线索，包括' +
+                '、'.join(hint.removeprefix('- ') for hint in hints) +
+                '，但尚未取得足以直接支撑所问结论的原文记录。'
+                '因此，目前只能确认这些来源值得进一步核查，尚不能判断所问事项的具体结果或当前状态。')
+        else:
+            text = ('综合本轮可用资料，目前尚不足以确定所问结论：'
+                '尚未取得可直接支撑答案并供核查的相关原文记录。'
+                '这表示本轮证据不足，不能据此认定所问事实成立、不成立，或条件已经履行；'
+                '需要补充相关邮件、附件或前后文后再作判断。')
+    if unknowns:
+        text += _unknown_sentence(unknowns)
+    return text
+
+
 def fallback_presentation(state, claims=None, *, evidence=None, reason=None):
     """Conservative natural text when a separately verified narrative is unavailable.
 
@@ -434,24 +490,8 @@ def fallback_presentation(state, claims=None, *, evidence=None, reason=None):
         if pending:
             paragraphs.append('以下为相关材料中已经识别、但未通过完整核验的信息，不作为结论：')
             paragraphs += pending
-    elif records:
-        paragraphs = ['现有已核验邮件只能说明相关历史安排，尚不足以直接确定所问结论。']
-        if unknowns:
-            paragraphs[0] += _unknown_sentence(unknowns)
     else:
-        pending = _pending_records(state)
-        if pending:
-            paragraphs = ['现有证据尚不足以给出经过完全核验的明确答案。以下为相关材料中已经识别的信息，均未通过完整核验，不作为结论：']
-            paragraphs += [text if text.startswith('待核实') else '待核实：' + text for text in pending]
-        else:
-            hints = _source_hints(evidence)
-            if hints:
-                paragraphs = ['未能形成经过完整核验的明确答案。以下为本轮检索到的相关来源线索（供参考，未逐条核验）：']
-                paragraphs += hints
-            else:
-                paragraphs = ['现有证据尚不足以给出经过核验的明确答案。']
-        if unknowns:
-            paragraphs[0] += _unknown_sentence(unknowns)
+        paragraphs = [_conservative_conclusion(state, claims, evidence, unknowns)]
     return {'version': VERSION, 'status': 'fallback', 'answer': '\n\n'.join(paragraphs),
             'paragraphs': paragraphs, 'unknowns': unknowns, 'scope': 'reviewed_related_sources',
             'reason': reason or 'separate_narrative_not_verified',
