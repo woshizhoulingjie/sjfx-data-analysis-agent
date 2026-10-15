@@ -4795,12 +4795,10 @@ $('physicalTreeBtn').onclick =
 
 $('analysisTreeBtn').onclick =
   async () => {
-    if (
-      !state.analysis
-        ?.analysis_tree
-    ) {
-      return;
-    }
+    const scanId = state.scan?.scan_id;
+    const session = state.selectionSession;
+    if (!scanId || !state.analysis?.analysis_tree) return;
+    const isCurrent = () => selectionIsCurrent(scanId, session) && state.activeTree === 'analysis' && Boolean(state.analysis?.analysis_tree);
 
     state.activeTree =
       'analysis';
@@ -4822,11 +4820,13 @@ $('analysisTreeBtn').onclick =
       $('treeFilter').value = 'all';
     }
     try {
-      const data = await api(`/api/tree/${state.scan.scan_id}?kind=analysis&filter=all&limit=100`);
+      const data = await api(`/api/tree/${encodeURIComponent(scanId)}?kind=analysis&filter=all&limit=100`);
+      if (!isCurrent()) return;
       state.analysis.analysis_tree = data.node || state.analysis.analysis_tree;
     } catch (_) {
       // Keep the already loaded root if a transient page request fails.
     }
+    if (!isCurrent()) return;
     renderTree(state.analysis.analysis_tree);
     updateTreeEditPanel();
   };
@@ -5509,14 +5509,27 @@ async function initializeApp() {
   bindDataSourceControls();
   bindSelectionControls();
   $('candidateOpenDirectoryBtn')?.addEventListener('click', async () => {
-    if (!state.scan?.scan_id) return;
-    setPackageStage('analysis');
-    await refreshScan(state.scan.scan_id);
-    state.activeTree = 'analysis';
-    if (state.analysis?.analysis_tree) {
-      $('analysisTreeBtn')?.click();
+    const scanId = state.scan?.scan_id;
+    if (!scanId) return;
+    const session = state.selectionSession;
+    const sourceRoute = window.SJFXShell?.route;
+    const isCurrent = () => selectionIsCurrent(scanId, session) && window.SJFXShell?.route === sourceRoute;
+    try {
+      await refreshScan(scanId, isCurrent);
+      if (!isCurrent()) return;
+      if (!state.analysis?.analysis_tree) {
+        toast('当前范围的智能目录尚未就绪，请稍后重试。', true);
+        return;
+      }
+      setPackageStage('analysis');
+      // The tree tab only changes its contents; the shell opens the explore view.
+      if (window.SJFXShell) window.SJFXShell.activate('analysis');
+      else await $('analysisTreeBtn')?.onclick?.();
+      if (!selectionIsCurrent(scanId, session)) return;
+      $('tree')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (error) {
+      if (isCurrent()) toast(error.message || '无法打开当前数据包的智能目录。', true);
     }
-    $('tree')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
   $('candidateBackSelectionBtn')?.addEventListener('click', () => {
     openSelectionPanel(state.scan?.scan_id);
