@@ -9245,7 +9245,44 @@ def _merge_summary_evidence(retrieval_request, package_context, indexed):
     return merged
 
 
+def _conversation_file_discovery_metadata(retrieval_request):
+    """Find current-scan inventory names without claiming body evidence."""
+    from services.package_questions import (
+        discover_inventory_file_paths, file_discovery_query, is_filename_discovery_query,
+    )
+    inventory_files = 0
+
+    def inventory_entries():
+        nonlocal inventory_files
+        for entry in storage.iter_inventory_entries(retrieval_request.scan_id, batch_size=1000):
+            if entry.get("kind") in {"file", "logical_file"}:
+                inventory_files += 1
+            yield entry
+
+    paths, truncated = discover_inventory_file_paths(
+        inventory_entries(), retrieval_request.query, retrieval_request.scope,
+    )
+    return {
+        "query": file_discovery_query(retrieval_request.query),
+        "results": [], "candidate_paths": paths, "related_file_paths": paths,
+        # An old scan without an inventory retains its existing retrieval path.
+        "filename_only": bool(inventory_files) and is_filename_discovery_query(retrieval_request.query),
+        "index_mode": "file-inventory-metadata", "retrieval_mode": "file_metadata",
+        "warnings": ["匹配文件超过显示上限，请缩小文件名或目录范围。"] if truncated else [],
+        "coverage": {"scope": retrieval_request.scope.kind, "candidate_files": len(paths),
+                     "inspected_files": 0, "query_coverage": None,
+                     "coverage_basis": "file_inventory", "truncated": truncated},
+    }
+
+
 def _conversation_retrieve(retrieval_request):
+    file_metadata = None
+    if retrieval_request.intent == "file_search" and not str(retrieval_request.scan_id).startswith("lp-"):
+        from services.package_questions import file_discovery_query, is_content_file_discovery_query, file_discovery_scope_contains
+        if not is_content_file_discovery_query(retrieval_request.query):
+            file_metadata = _conversation_file_discovery_metadata(retrieval_request)
+            if file_metadata.pop("filename_only"):
+                return file_metadata
     if str(retrieval_request.scan_id).startswith("lp-") and Config.LARGE_QA_ENABLED:
         import sqlite3
         from services.large_qa_search import retrieve as retrieve_large_qa
@@ -9281,7 +9318,9 @@ def _conversation_retrieve(retrieval_request):
             cached = _CONVERSATION_RETRIEVAL_CACHE.get(cache_key)
             if cached and (time.monotonic() - cached[0]) < _CONVERSATION_RETRIEVAL_CACHE_TTL:
                 return copy.deepcopy(cached[1])
-    query = retrieval_request.query
+    query = (file_discovery_query(retrieval_request.query)
+             if retrieval_request.intent == "file_search" and not str(retrieval_request.scan_id).startswith("lp-")
+             else retrieval_request.query)
     scope = retrieval_request.scope
     package_context = _conversation_package_context(retrieval_request.scan_id)
     # Restrict model-facing summaries to the active directory/file scope.
@@ -9431,6 +9470,9 @@ def _conversation_retrieve(retrieval_request):
                 or Path(str(item.get("archive_source_path") or item.get("source_path") or "").split("::", 1)[0]).suffix.lower() == expected
             )
         ]
+    if retrieval_request.intent == "file_search" and not str(retrieval_request.scan_id).startswith("lp-"):
+        indexed = [item for item in indexed
+                   if file_discovery_scope_contains(scope, item.get("source_path") or item.get("archive_source_path"))]
     result_top_k = int(retrieval_request.top_k or 0)
     if broad_package_question:
         # Never truncate a whole-package evidence list below the number of
@@ -9477,6 +9519,19 @@ def _conversation_retrieve(retrieval_request):
             )
         except Exception:
             result["related_file_paths"] = list(candidate_paths)
+    if retrieval_request.intent == "file_search" and not str(retrieval_request.scan_id).startswith("lp-"):
+        result["related_file_paths"] = [path for path in result.get("related_file_paths") or []
+                                        if file_discovery_scope_contains(scope, path)]
+    if file_metadata is not None:
+        result["related_file_paths"] = list(dict.fromkeys(
+            list(file_metadata.get("related_file_paths") or []) + list(result.get("related_file_paths") or [])
+        ))[:5000]
+        candidate_paths = list(dict.fromkeys(
+            candidate_paths + list(file_metadata.get("candidate_paths") or [])
+        ))
+        result["warnings"] = list(dict.fromkeys(
+            list(result.get("warnings") or []) + list(file_metadata.get("warnings") or [])
+        ))
     result["candidate_paths"] = list(candidate_paths)
     states = storage.get_file_states(
         retrieval_request.scan_id,

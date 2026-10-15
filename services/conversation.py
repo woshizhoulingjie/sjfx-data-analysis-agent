@@ -18,7 +18,7 @@ import hashlib
 import json
 import re
 import uuid
-from services.package_questions import FILE_SEARCH_PATTERN, PACKAGE_OVERVIEW_PATTERN, file_discovery_text, is_recorded_total_lookup
+from services.package_questions import FILE_SEARCH_PATTERN, PACKAGE_OVERVIEW_PATTERN, file_discovery_text, file_discovery_query, is_recorded_total_lookup
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -1527,15 +1527,20 @@ class ConversationEngine:
         retrieval_override: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Find files deterministically; file discovery never needs the model."""
-        file_query = re.sub(
-            r"^(?:请|帮我|麻烦|给我|可以)?\s*(?:搜索|查找|找一下|帮我找|找到|找出|列出|显示|搜索一下)\s*(?:有关|关于|包含|命中)?\s*",
-            "", resolution.resolved_query, flags=re.I,
-        )
-        file_query = re.sub(r"(?:的)?(?:文件|资料|文档)(?:列表|清单)?[。！？!?]*$", "", file_query, flags=re.I).strip()
+        discovery_instruction = resolution.resolved_query
+        ordinary_file_search = not str(session.scan_id).startswith('lp-')
+        if ordinary_file_search:
+            file_query = file_discovery_query(discovery_instruction)
+        else:
+            file_query = re.sub(
+                r"^(?:请|帮我|麻烦|给我|可以)?\s*(?:搜索|查找|找一下|帮我找|找到|找出|列出|显示|搜索一下)\s*(?:有关|关于|包含|命中)?\s*",
+                "", resolution.resolved_query, flags=re.I,
+            )
+            file_query = re.sub(r"(?:的)?(?:文件|资料|文档)(?:列表|清单)?[。！？!?]*$", "", file_query, flags=re.I).strip()
         if file_query and file_query != resolution.resolved_query:
             resolution = FollowUpResolution(resolution.original_question, file_query, resolution.is_follow_up, resolution.antecedent)
         retrieval = (dict(retrieval_override) if isinstance(retrieval_override, Mapping)
-                     else self._retrieve(session, resolution.resolved_query, scope, decision.name))
+                     else self._retrieve(session, discovery_instruction if ordinary_file_search else resolution.resolved_query, scope, decision.name))
         citations = _normalise_citations(self._retrieval_items(retrieval), limit=self.context_policy.max_display_evidence)
         model_citations = _select_model_citations(citations, self.context_policy)
         coverage = CoverageSnapshot.from_values(

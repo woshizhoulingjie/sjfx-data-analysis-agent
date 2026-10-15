@@ -2022,9 +2022,14 @@
     const contextVersion = state.conversationContextVersion;
     const stored = state.turns.get(turn.assistant_message_id);
     const resultPayload = turn.result && typeof turn.result === 'object' ? turn.result : {};
+    const authoritativeOrdinaryPaths = !String(chatScanId()).startsWith('lp-') && (
+      Array.isArray(resultPayload.related_file_paths) || Array.isArray(turn.related_file_paths)
+      || Boolean(stored && Array.isArray(stored.related_file_paths))
+    );
     const relatedPaths = Array.isArray(resultPayload.related_file_paths)
       ? resultPayload.related_file_paths.filter(Boolean)
-      : (stored && Array.isArray(stored.related_file_paths) ? stored.related_file_paths.filter(Boolean) : []);
+      : (authoritativeOrdinaryPaths && Array.isArray(turn.related_file_paths) ? turn.related_file_paths.filter(Boolean)
+        : (stored && Array.isArray(stored.related_file_paths) ? stored.related_file_paths.filter(Boolean) : []));
     if (relatedPaths.length && stored) {
       // The backend resolves the complete related-file set.  Keep this list
       // independent from the bounded evidence window shown to the model.
@@ -2042,6 +2047,18 @@
       const intent = stored.intent && typeof stored.intent === 'object' ? stored.intent.name : stored.intent;
       stored.file_search = intent === 'file_search';
       renderConversation();
+      return;
+    }
+    if (authoritativeOrdinaryPaths) {
+      // An empty backend result is scoped and authoritative. A package-wide
+      // legacy search cannot safely replace it with unrelated file cards.
+      if (stored) {
+        stored.related_file_paths = [];
+        stored.file_results = [];
+        stored.file_results_total = 0;
+        stored.file_results_coverage = null;
+        renderConversation();
+      }
       return;
     }
     const text = String(question || '').trim();

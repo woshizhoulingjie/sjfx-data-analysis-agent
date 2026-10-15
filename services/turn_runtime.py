@@ -431,6 +431,14 @@ class AnalysisTurnRuntime:
             ordered_modes = list(plan.get("modes") or [])
             modes = set(ordered_modes)
             primary_mode = ordered_modes[0] if ordered_modes else "analysis"
+            ordinary_file_search = primary_mode == "file_search" and not str(turn["scan_id"]).startswith("lp-")
+            content_file_discovery = False
+            if ordinary_file_search:
+                from services.package_questions import is_content_file_discovery_query
+                content_file_discovery = is_content_file_discovery_query(turn["question"])
+                # Keep filename/content conditions until the retrieval adapter
+                # separates the keyword from output instructions exactly once.
+                plan["query_variants"] = [turn["question"]]
             # Package answers may directly publish the composed text when review is disabled.
             factual_answer = bool(modes - {"casual", "creative", "general_qa", "file_search"})
             verification_required = factual_answer and self.verify_answers
@@ -438,6 +446,15 @@ class AnalysisTurnRuntime:
                 str(path) for path in inventory_paths or []
                 if scope.contains_source(path)
             ]
+            if ordinary_file_search and scope.source_paths:
+                # Directory.contains_source historically returns before the
+                # selected-source check. Apply both boundaries before resolving
+                # an explicitly named file into a new execution scope.
+                scoped_inventory_paths = [
+                    path for path in scoped_inventory_paths
+                    if any(path == source or path.startswith(source + "/") or path.startswith(source + "::")
+                           for source in scope.source_paths)
+                ]
             if scope.kind == "file_type":
                 expected_extension = str(scope.value or "").lower().strip()
                 if expected_extension and not expected_extension.startswith("."):
@@ -448,7 +465,7 @@ class AnalysisTurnRuntime:
                     == expected_extension
                 ]
             execution_scope = scope
-            explicit_paths = self._explicit_question_paths(
+            explicit_paths = [] if content_file_discovery else self._explicit_question_paths(
                 turn["question"], scoped_inventory_paths
             )
             if explicit_paths:
