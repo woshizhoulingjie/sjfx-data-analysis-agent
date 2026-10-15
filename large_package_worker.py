@@ -1735,11 +1735,29 @@ class LargePackageWorker:
 
     @package_lane
     def _merge_topics_once(self, package_id):
-        """叶组命名收尾后归并一次上位主题（默认关闭；失败不影响叶组目录）。"""
+        """在叶组租约释放后完成目录；主题归并开关仍由原配置决定。"""
         try:
             from config import Config
             if not getattr(Config, "LP_TOPIC_MERGE", False):
-                return False
+                from services.large_package_catalog_naming import state
+                from services.large_package_catalog_hierarchy import needed, process
+                current = state(self.store, package_id)
+                # Reuse the existing round and its remaining budget. Finished,
+                # expired or still-busy rounds must not be renewed just to
+                # register independent leaves.
+                if not current.get('active') or self._naming_jobs_pending(package_id):
+                    return False
+                with closing(self.store._connect()) as conn:
+                    if not needed(conn, package_id):
+                        return False
+                def hierarchy_cancelled():
+                    item = self.store.get(package_id)
+                    return (self.stop_requested or not item
+                            or item['status'] in {'paused', 'cancelled'}
+                            or time.time() >= current['deadline'])
+                if hierarchy_cancelled():
+                    return False
+                return process(self.store, package_id, current, hierarchy_cancelled)
             # 叶组签名：(叶组数, 成员总数之和, 最大内容修订)。
             # 与上次归并时相同就不再重复调用模型；不同就必须重来一次——
             # 全局聚类可能在主题归并之后又跑了一遍（实测 66 个叶组 → 69 个），

@@ -73,7 +73,17 @@ def init(c):
 
 
 def needed(c,package_id):
-    return c.execute('SELECT COUNT(*) FROM lp_catalog_labels l JOIN large_catalog_groups g ON g.package_id=l.package_id AND g.id=l.group_id WHERE l.package_id=? AND (l.revision=g.content_revision OR l.locked=1)',(package_id,)).fetchone()[0]>=3
+    # Even one named leaf needs a persisted independent scope. The tree
+    # builder decides whether shared themes exist; a minimum leaf count here
+    # used to complete small rounds before that registration could run.
+    from services.large_package_catalog_tree import live_leaf_sql
+    from services.large_package_catalog_naming import system_group_sql
+    return c.execute(
+        'SELECT 1 FROM lp_catalog_labels l JOIN large_catalog_groups g '
+        'ON g.package_id=l.package_id AND g.id=l.group_id WHERE l.package_id=? '
+        "AND l.name<>'' AND (l.revision=g.content_revision OR l.locked=1) AND "
+        + live_leaf_sql() + ' AND ' + system_group_sql('g.id') + ' LIMIT 1',
+        (package_id,)).fetchone() is not None
 
 
 @package_lane

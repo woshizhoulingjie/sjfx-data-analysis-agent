@@ -4781,19 +4781,10 @@ def _process_one(store,package_id,cancelled=lambda:False,model_client=None,repai
             pending=c.execute("SELECT COUNT(*) FROM lp_catalog_jobs WHERE package_id=? AND (status IN ('queued','running') OR (status='deferred' AND attempts<?))",(package_id,_max_attempts)).fetchone()[0]
             c.commit()
             if pending:return False
-            # LP_TOPIC_MERGE 开启时，上层目录由 merge_topics 用向量聚类 + 大小下限
-            # 生成。这里必须停用旧的层级构建器：它写的是同一张表
-            # lp_catalog_branches，而且每次导入都会在主题归并之后把结果覆盖掉
-            # （实测主题层被从 6 个主题/69 个叶组覆盖成 4 个主题/21 个叶组，
-            # 因为它的叶组查询带 LIMIT 40 且要求模型只输出 4 个上层目录）。
-            from config import Config as _Cfg
-            if getattr(_Cfg, 'LP_TOPIC_MERGE', False):
-                return False
-            from services.large_package_catalog_hierarchy import process
-            def hierarchy_cancelled():
-                item=store.get(package_id)
-                return cancelled() or not item or item['status'] in {'paused','cancelled'} or time.time()>=current['deadline']
-            return process(store,package_id,current,hierarchy_cancelled,model_client)
+            # The worker builds either hierarchy after this leaf_batch lease
+            # exits. Building here makes topic_window wait for our own lease
+            # (including the enclosing batch lease), so it can only time out.
+            return False
         gid=job['group_id'];revision=job['revision']
         # P0：领取的同时记下包当前的控制代次（同一事务内取，无竞态）。
         c.execute("UPDATE lp_catalog_jobs SET status='running',leased=?,"

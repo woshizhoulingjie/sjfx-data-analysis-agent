@@ -125,6 +125,14 @@ def test_drained_round_is_not_revived_by_the_next_slice():
             with closing(case.store._connect()) as c:
                 c.execute("DELETE FROM lp_catalog_jobs WHERE package_id=?", (case.pid,))
                 c.commit()
+            # A named live leaf is not drained until the worker has persisted
+            # its independent scope. The old >=3 threshold hid this missing
+            # work for the one-leaf fixture.
+            from large_package_worker import LargePackageWorker
+            with patch.object(Config, 'LP_TOPIC_MERGE', False), \
+                    patch.object(naming, 'client', return_value=None):
+                assert LargePackageWorker(case.store)._merge_topics_once(case.pid)
+            naming.settle_round(case.store, case.pid)
             assert not naming.naming_work_pending(case.store, case.pid)
             from services import large_package_catalog_batch as batch
             for _ in range(3):
