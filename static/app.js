@@ -2299,6 +2299,7 @@ function renderSummary(
 
 
 function updateStats() {
+  updateOverviewPublishButton();
   if (!state.scan) {
     return;
   }
@@ -2420,6 +2421,21 @@ function packageSelectedPaths() {
     (item.member_paths || []).forEach((path) => paths.push(String(path)));
   });
   return [...new Set(paths)];
+}
+
+
+function updateOverviewPublishButton() {
+  const button = $('packageOverviewPublishBtn');
+  if (!button) return;
+  const scanId = String(state.scan?.scan_id || '');
+  const task = state.importTask || {};
+  const sameScan = Boolean(scanId && String(task.scan_id || '') === scanId);
+  const status = String(task.status || '').toLowerCase();
+  const deepFiles = Number(state.processing?.deep_summary_files || task.checkpoint?.deep_summary_completed || 0);
+  const ready = sameScan && deepFiles > 0 && ['completed', 'partial', 'deep_update_available'].includes(status);
+  button.dataset.scanId = sameScan ? scanId : '';
+  button.disabled = !ready || button.dataset.publishBusy === 'true';
+  button.title = ready ? '使用当前已完成的深度摘要更新正式目录和情报概览' : '当前范围的深度摘要完成后可更新正式结果';
 }
 
 
@@ -2721,6 +2737,7 @@ async function refreshScan(scanId = state.scan?.scan_id, isCurrent = () => true)
   if (!scanId) {
     return;
   }
+  if ($('packageOverviewPublishBtn')) $('packageOverviewPublishBtn').disabled = true;
   const previousScanId = state.scan?.scan_id;
   if (previousScanId && previousScanId !== scanId) {
     state.fileWorkflowRequestSeq += 1;
@@ -5350,6 +5367,20 @@ async function initializeApp() {
   });
   $('refreshDeepResultsBtn')?.addEventListener('click', (event) => {
     runPackageProcessingAction('refresh-deep-results', event.currentTarget);
+  });
+  $('packageOverviewPublishBtn')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    if (button.disabled || button.dataset.scanId !== String(state.scan?.scan_id || '')) return;
+    button.dataset.publishBusy = 'true';
+    try {
+      await runPackageProcessingAction('refresh-deep-results', button);
+    } finally {
+      delete button.dataset.publishBusy;
+      updateOverviewPublishButton();
+    }
+  });
+  window.addEventListener('sjfx-scan-changed', () => {
+    if ($('packageOverviewPublishBtn')) $('packageOverviewPublishBtn').disabled = true;
   });
   // Each panel can become usable without waiting for unrelated status reads.
   await Promise.allSettled([
