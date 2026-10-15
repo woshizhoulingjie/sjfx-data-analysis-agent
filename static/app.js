@@ -3495,56 +3495,14 @@ function jobIdOf(job, fallbackId = '') {
 }
 
 
-function persistTaskRegistry() {
-  try {
-    const jobs = [...state.jobs.values()]
-      .sort((left, right) => Number(right.updated_local || 0) - Number(left.updated_local || 0))
-      .slice(0, 30)
-      .map((job) => ({
-        id: job.id,
-        scan_id: job.scan_id || '',
-        task_type: job.task_type || '',
-        workflow_source: job.workflow_source || job.options?.workflow_source || '',
-        status: job.status || 'queued',
-        stage: job.stage || '',
-        current_stage: job.current_stage || '',
-        current_file: job.current_file || '',
-        progress: Number(job.progress || 0),
-        message: job.message || '',
-        error: job.error || '',
-        queue_position: job.queue_position ?? null,
-        blocking_job: job.blocking_job || null,
-        heartbeat_at: job.heartbeat_at || null,
-        heartbeat_age_seconds: job.heartbeat_age_seconds ?? null,
-        worker_online: job.worker_online ?? null,
-        updated_at: job.updated_at || null,
-        updated_local: Number(job.updated_local || Date.now())
-      }));
-    window.localStorage.setItem(TASK_REGISTRY_KEY, JSON.stringify(jobs));
-  } catch (_) {
-    // Task polling must continue even when localStorage is disabled or full.
-  }
+function discardLegacyTaskRegistry() {
+  // Task metadata belongs to the authenticated server identity, not this
+  // browser origin. Keep live tasks in memory and restore them from the API.
+  try { window.localStorage.removeItem(TASK_REGISTRY_KEY); } catch (_) {}
 }
 
 
-function loadTaskRegistry() {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(TASK_REGISTRY_KEY) || '[]');
-    const oldest = Date.now() - (7 * 24 * 60 * 60 * 1000);
-    if (!Array.isArray(stored)) return;
-    stored.forEach((job) => {
-      const id = jobIdOf(job);
-      if (id && Number(job.updated_local || 0) >= oldest) {
-        state.jobs.set(id, { ...job, id });
-      }
-    });
-  } catch (_) {
-    try { window.localStorage.removeItem(TASK_REGISTRY_KEY); } catch (_) {}
-  }
-}
-
-
-function rememberJob(job = {}, fallbackId = '') {
+function rememberJob(job = {}, fallbackId = '', updatedLocal = Date.now()) {
   const id = jobIdOf(job, fallbackId);
   if (!id) return job;
   const previous = state.jobs.get(id) || {};
@@ -3554,10 +3512,9 @@ function rememberJob(job = {}, fallbackId = '') {
     id,
     status: String(job.status || previous.status || 'queued').toLowerCase(),
     progress: Math.max(0, Math.min(100, Number(job.progress ?? previous.progress ?? 0))),
-    updated_local: Date.now()
+    updated_local: updatedLocal
   };
   state.jobs.set(id, normalized);
-  persistTaskRegistry();
   renderTaskCenter();
   return normalized;
 }
@@ -3565,8 +3522,28 @@ function rememberJob(job = {}, fallbackId = '') {
 
 function removeRememberedJob(jobId) {
   state.jobs.delete(String(jobId || ''));
-  persistTaskRegistry();
   renderTaskCenter();
+}
+
+
+function applyServerTaskSnapshot(jobs, previousJobs, requestedAt) {
+  if (!Array.isArray(jobs)) throw new Error('任务列表响应格式错误');
+  const listedIds = new Set(jobs.map((job) => jobIdOf(job)).filter(Boolean));
+  previousJobs.forEach((previous, id) => {
+    // The list is bounded; absent active work still receives an individual
+    // owner-checked status read in refreshKnownJobs or the focused poller.
+    if (!listedIds.has(id) && !ACTIVE_JOB_STATUSES.has(previous.status)
+        && state.jobs.get(id) === previous) state.jobs.delete(id);
+  });
+  jobs.forEach((job, index) => {
+    const id = jobIdOf(job);
+    // A poll or submission completed while the list was in flight. Its newer
+    // in-page state must survive this bounded server snapshot.
+    if (state.jobs.get(id) !== previousJobs.get(id)) return;
+    rememberJob({ ...job, connection_issue: '' }, '', requestedAt - index);
+  });
+  renderTaskCenter();
+  return listedIds;
 }
 
 
@@ -3736,6 +3713,10 @@ function renderTaskCenter() {
   if (!displayJobs.length) {
     list.className = 'task-list empty';
     list.innerHTML = '<div class="task-list-empty"><strong>当前没有任务</strong><span>导入数据包后，排队、运行、取消和失败状态会显示在这里。</span></div>';
+    if ($('dashboardActivity')) {
+      $('dashboardActivity').className = 'activity-empty';
+      $('dashboardActivity').textContent = '导入数据包后，这里会显示最近一次分析和导出状态。';
+    }
     return;
   }
   list.className = 'task-list';
@@ -3804,14 +3785,12 @@ async function refreshTaskCenter() {
     let listedIds = null;
     if (state.jobsEndpointAvailable !== false) {
       try {
-        const data = await api('/api/jobs?status=active&limit=50&compact=1');
+        const previousJobs = new Map(state.jobs);
+        const requestedAt = Date.now();
+        const data = await api('/api/jobs?status=all&limit=50&compact=1');
         if (!Array.isArray(data.jobs)) throw new Error('任务列表响应格式错误');
         state.jobsEndpointAvailable = true;
-        listedIds = new Set();
-        data.jobs.forEach((job) => {
-          const remembered = rememberJob({ ...job, connection_issue: '' });
-          if (remembered.id) listedIds.add(remembered.id);
-        });
+        listedIds = applyServerTaskSnapshot(data.jobs, previousJobs, requestedAt);
         if (indicator) indicator.textContent = '已与 Worker 队列同步';
       } catch (error) {
         if ([404, 405].includes(error.status)) {
@@ -3827,7 +3806,7 @@ async function refreshTaskCenter() {
       .filter((jobId) => !listedIds || !listedIds.has(jobId));
     if (knownActiveIds.length) await refreshKnownJobs(knownActiveIds);
     if (state.jobsEndpointAvailable === false && indicator) {
-      indicator.textContent = '已同步本浏览器提交的任务';
+      indicator.textContent = '已同步本页提交的任务';
     }
   } finally {
     state.taskCenterRefreshInFlight = false;
@@ -3837,7 +3816,7 @@ async function refreshTaskCenter() {
 
 
 async function startTaskCenterRefresh() {
-  loadTaskRegistry();
+  discardLegacyTaskRegistry();
   renderTaskCenter();
   await refreshTaskCenter();
   window.setInterval(refreshTaskCenter, 3000);
@@ -3900,9 +3879,11 @@ async function restoreWorkspace() {
   let candidate = scanJobCandidate([...state.jobs.values()]);
   if (!candidate) {
     try {
+      const previousJobs = new Map(state.jobs);
+      const requestedAt = Date.now();
       const data = await api('/api/jobs?status=all&limit=50&compact=1');
-      (data.jobs || []).forEach((job) => rememberJob(job));
-      candidate = scanJobCandidate(data.jobs || []);
+      applyServerTaskSnapshot(data.jobs, previousJobs, requestedAt);
+      candidate = scanJobCandidate([...state.jobs.values()]);
     } catch (_) {
       return;
     }

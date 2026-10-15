@@ -18,6 +18,11 @@
 
   var API = '/api/auth/me';
 
+  function clearTaskCache() {
+    try { window.localStorage.removeItem('sjfx_task_registry_v1'); } catch (_) {}
+    try { window.sessionStorage.removeItem('sjfx-authenticated'); } catch (_) {}
+  }
+
   function el(tag, cls, text) {
     var n = document.createElement(tag);
     if (cls) n.className = cls;
@@ -79,6 +84,7 @@
     out.addEventListener('click', function () {
       out.disabled = true;
       out.textContent = '退出中…';
+      clearTaskCache();
       fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' })
         .catch(function () { /* 网络失败也要走：会话可能已经没了 */ })
         .then(function () { window.location.href = '/login'; });
@@ -89,10 +95,7 @@
   }
 
   function toLogin() {
-    // 只在"确实没登录"时跳，并且用 sessionStorage 防跳转循环
-    try {
-      if (sessionStorage.getItem('sjfx-authenticated') === '1') return;
-    } catch (_) { /* 隐私模式下 sessionStorage 可能不可用，忽略 */ }
+    clearTaskCache();
     if (location.pathname === '/login' || location.pathname === '/register') return;
     window.location.href = '/login';
   }
