@@ -1731,12 +1731,26 @@ def _first_evidence(document):
 
             return result
 
+    body_text = str(_analysis_text(document) or "").strip()
+    parse_status = str(document.get("parse_status") or (document.get("coverage") or {}).get("status") or "")
+    if body_text:
+        reason = "quality_filtered"
+        message = "已提取正文，但现有片段未通过正文证据质量校验；请检查完整性和上下文。"
+    elif parse_status in {"failed", "damaged", "timeout", "dependency_missing", "encrypted", "unsupported"}:
+        reason = "parse_unavailable"
+        message = "当前解析结果未包含可读正文；请按实际解析状态检查失败原因或文件支持情况。"
+    else:
+        reason = "empty_body"
+        message = "当前未提取到可读正文；请核对源文件内容和解析覆盖情况。"
+    # Availability is processing metadata, never a quote or an evidence unit.
     return {
         "evidence_id": None,
         "source_path": document.get("source", {}).get("path"),
         "page": None,
         "section": None,
-        "text": "该文件仅有元数据或未提取到可引用正文。",
+        "text": "",
+        "availability_reason": reason,
+        "availability_message": message,
         "source_sha256": document.get("source", {}).get("sha256"),
     }
 

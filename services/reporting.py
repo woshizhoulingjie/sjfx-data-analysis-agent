@@ -22,6 +22,14 @@ def _valid_summaries(summaries):
     return [item for item in summaries if item.get("payload", {}).get("schema_version") in (3, 4)]
 
 
+def _quotable_evidence(item):
+    """Processing notices and navigation-only units are not source quotes."""
+    return bool(isinstance(item, dict) and str(item.get("evidence_id") or "").strip()
+                and str(item.get("text") or "").strip()
+                and not item.get("availability_reason")
+                and evidence_quality(item).get("eligible"))
+
+
 def _analysis_evidence(analysis, limit=8, categories=None):
     """Collect evidence across query and topic pools without retrieval-order bias."""
     pools = []
@@ -73,6 +81,8 @@ def _analysis_evidence(analysis, limit=8, categories=None):
             while per_pool[index] < len(items):
                 item = items[per_pool[index]]
                 per_pool[index] += 1
+                if not _quotable_evidence(item):
+                    continue
                 key = item.get("evidence_id") or (
                     item.get("source_path"), item.get("content_sha256"), item.get("text")
                 )
@@ -484,18 +494,43 @@ def _research_direction(_scan, _summaries, analysis, candidates=None):
         return candidates[0]
     evidence = _analysis_evidence(analysis, 8)
     coverage = analysis.get("coverage") or {}
+    statistics = analysis.get("statistics") or {}
+    failed = int(coverage.get("failed_files", statistics.get("failed_files", len(analysis.get("failures") or []))) or 0)
+    pending = int(coverage.get("pending_files", statistics.get("pending_files", 0)) or 0)
+    parsed = int(coverage.get("parsed_files", statistics.get("parsed_files", 0)) or 0)
+    body_files = sum(
+        1 for document in _document_index(analysis).values()
+        if (document.get("coverage") or {}).get("stored_characters")
+        or str(document.get("text") or "").strip()
+        or any(str(item.get("text") or "").strip() for item in document.get("evidence") or [] if isinstance(item, dict))
+    )
+    if evidence:
+        title = "核验正文依据并补充研究条件"
+        basis = "已有可引用正文，但尚未形成通过审查的研究机会；先核对主题、适用条件与研究目标。"
+    elif body_files:
+        title = "检查证据质量并补充正文上下文"
+        basis = "已提取正文，但当前没有通过质量校验的可引用正文证据；这不等同于解析失败。"
+    else:
+        title = "核对正文可用性并补充源资料"
+        basis = "当前没有通过质量校验的可引用正文证据；请核对源文件是否包含可读正文及解析覆盖情况。"
+    basis += " 当前已登记解析结果 {} 个文件，解析失败 {} 个，待解析 {} 个。".format(parsed, failed, pending)
+    methods = ["核对原文片段、证据质量和上下文", "补充包含完整事实与适用条件的正文资料"]
+    if failed:
+        methods.insert(0, "检查 {} 个解析失败文件的原因，再按需重试".format(failed))
+    if pending:
+        methods.insert(0, "处理 {} 个待解析文件，再更新概览".format(pending))
     return {
-        "title": "补充解析并核验代表性正文证据",
-        "direction": "补充解析并核验代表性正文证据",
+        "title": title,
+        "direction": title,
         "type": "推论",
         "priority": "低",
         "score": 0,
         "evidence_status": "insufficient",
         "quality_gate": {"status": "insufficient", "reason": "no_evidence_backed_opportunity"},
         "rationale": "当前尚未形成有足够正文证据支撑的稳定主题，不能强行推荐领域方向。",
-        "basis": "先补充待分析或失败文件，再重新生成概览。",
+        "basis": basis,
         "research_questions": ["哪些文件可以形成稳定主题？", "当前证据是否足以回答客户指定问题？"],
-        "methods": ["重试失败文件", "选择待分析节点进行分批深化"],
+        "methods": methods,
         "evidence_chain": evidence,
         "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
         "limitations": list(coverage.get("limitations") or []) + ["证据不足，当前方向仅作为处理建议。"],
@@ -860,7 +895,7 @@ def _matching_evidence(analysis, paths, limit=4):
 
     def add(items):
         for item in items or []:
-            if not isinstance(item, dict) or item.get("source_path") not in path_set:
+            if not _quotable_evidence(item) or item.get("source_path") not in path_set:
                 continue
             key = item.get("evidence_id") or (item.get("source_path"), item.get("content_sha256"), item.get("text"))
             if key in seen:

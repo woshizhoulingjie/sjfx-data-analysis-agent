@@ -17,7 +17,8 @@
     idle: '等待导入', queued: '排队中', processing: '正在处理', running: '正在处理',
     cancelling: '正在安全暂停', paused: '已安全暂停', completed: '全部完成',
     failed: '需要处理', retry_waiting: '等待重试', partial: '部分完成',
-    out_of_scope: '范围外', cancelled: '已取消'
+    out_of_scope: '范围外', cancelled: '已取消',
+    deep_update_available: '深度成果可更新'
   };
   const workflow = [
     ['packages', '资料'], ['overview', '概览'], ['analysis', '分析'],

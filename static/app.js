@@ -57,10 +57,56 @@ const $ = (id) => document.getElementById(id);
 // so switching packages never cancels or loses the work already completed.
 function detachUiFromCurrentWork() {
   invalidateSelectionSession();
+  resetNodeInspector();
   state.jobId = null;
   state.fileWorkflowRequestSeq += 1;
   state.fileWorkflowAbortController?.abort();
   state.fileWorkflowAbortController = null;
+}
+
+
+function resetNodeInspector() {
+  // Clearing state alone leaves the previously rendered facts on screen.
+  // Also invalidate requests before replacing the package or its inspector.
+  state.selectionRequestId += 1;
+  state.selected = null;
+  state.summary = null;
+  state.summaries = new Map();
+  state.selectedNodes = new Map();
+  state.lastRetrievalId = null;
+  state.pendingEvidenceLocation = null;
+  state.retrievalScope = 'package';
+  document.querySelectorAll('.tree-row.selected').forEach((row) => row.classList.remove('selected'));
+  const selection = $('selection');
+  if (selection) {
+    selection.className = 'selection empty';
+    selection.textContent = '请从当前数据包的目录树选择文件、主题或文件夹';
+  }
+  const summary = $('summary');
+  if (summary) {
+    summary.className = 'summary empty';
+    summary.textContent = '选择当前数据包的节点后，查看摘要和证据来源。';
+  }
+  ['summaryBtn', 'deepenBtn', 'exportBtn', 'retrievalBtn'].forEach((id) => {
+    const button = $(id);
+    if (!button) return;
+    if (button.dataset.label) button.textContent = button.dataset.label;
+    delete button.dataset.label;
+    button.disabled = true;
+  });
+  // Do not persist an empty cart under the package being left. Its saved
+  // selections are restored by refreshScan for the package being opened.
+  const cart = $('selectionCart');
+  if (cart) {
+    cart.className = 'selection-cart empty';
+    cart.textContent = '可勾选多个主题、目录、文档或原文证据，组合导出时会自动去重。';
+  }
+  if ($('treeEditPanel')) $('treeEditPanel').hidden = true;
+  closeTreeContextMenu();
+  renderEvidenceScopeControl();
+  // The existing reader close handler clears its blob and invalidates its
+  // request sequence, so a late raw-file response cannot reopen old content.
+  if ($('fileReaderModal')?.hidden === false) $('fileReaderClose')?.click();
 }
 
 
@@ -1291,12 +1337,13 @@ function localSummaryFor(node) {
 }
 
 async function hydrateFileConclusions(node, summary, requestStillCurrent, summaryType = 'file') {
-  if (!state.scan?.scan_id || node?.kind !== 'file' || !node.path) {
+  const scanId = state.scan?.scan_id;
+  if (!scanId || node?.kind !== 'file' || !node.path) {
     return summary;
   }
   try {
     const data = await api(
-      `/api/file-conclusions/${encodeURIComponent(state.scan.scan_id)}?path=${encodeURIComponent(node.path)}&type=${encodeURIComponent(summaryType)}`
+      `/api/file-conclusions/${encodeURIComponent(scanId)}?path=${encodeURIComponent(node.path)}&type=${encodeURIComponent(summaryType)}`
     );
     if (!requestStillCurrent()) return summary;
     const merged = { ...(summary || {}), ...data };
@@ -1317,9 +1364,13 @@ async function selectNode(
   node,
   row
 ) {
+  const scanId = state.scan?.scan_id;
+  if (!scanId) return;
+  const session = state.selectionSession;
   const requestId = ++state.selectionRequestId;
   const selectionStillCurrent = () =>
-    requestId === state.selectionRequestId
+    selectionIsCurrent(scanId, session)
+    && requestId === state.selectionRequestId
     && state.selected === node;
 
   document
@@ -1339,6 +1390,15 @@ async function selectNode(
 
   state.selected = node;
   state.summary = null;
+  $('summary').className = 'summary empty';
+  $('summary').textContent = '正在读取当前节点的摘要…';
+  ['summaryBtn', 'retrievalBtn'].forEach((id) => {
+    const button = $(id);
+    if (button?.dataset.label) {
+      button.textContent = button.dataset.label;
+      delete button.dataset.label;
+    }
+  });
   renderEvidenceScopeControl();
 
   /*
@@ -1463,7 +1523,7 @@ async function selectNode(
       // Always re-read the durable summary; the tree can still contain a preview.
       for (const summaryType of summaryTypes) {
         const page = await api(
-          `/api/summaries/${state.scan.scan_id}?path=${encodeURIComponent(summaryPath)}&type=${summaryType}&limit=1`
+          `/api/summaries/${encodeURIComponent(scanId)}?path=${encodeURIComponent(summaryPath)}&type=${summaryType}&limit=1`
         );
         if (!selectionStillCurrent()) return;
         const item = (page.items || [])[0];
@@ -1524,7 +1584,7 @@ async function selectNode(
     try {
       const data =
         await api(
-          `/api/document/${state.scan.scan_id}?path=${encodeURIComponent(node.path)}`
+          `/api/document/${encodeURIComponent(scanId)}?path=${encodeURIComponent(node.path)}`
         );
 
       if (!selectionStillCurrent()) return;
@@ -1974,6 +2034,13 @@ function focusPendingEvidenceLocation(path) {
 }
 
 
+function isModelPreviewNodeSummary(data = {}) {
+  return String(data?.generated_by || '').toLowerCase() === 'model-preview-node-summary'
+    && String(data?.analysis_depth || '').toLowerCase() === 'preview_folder'
+    && data?.deep_analysis !== true;
+}
+
+
 function renderSummary(
   data,
   kicker = '分析结果'
@@ -1983,6 +2050,9 @@ function renderSummary(
 
   host.className =
     'summary';
+
+  const isModelPreviewNode = isModelPreviewNodeSummary(data);
+  if (isModelPreviewNode) kicker = '模型节点预览摘要';
 
   let html =
     `<div class="summary-kicker">${
@@ -2003,20 +2073,23 @@ function renderSummary(
     || analysisDepth === 'preliminary_document'
     || analysisDepth === 'preliminary_node';
   const isPreliminaryNode = analysisDepth === 'preliminary_node';
-  const isModelDeep = !isPreliminary
+  const isModelDeep = !isPreliminary && !isModelPreviewNode
     && (generatedBy === 'model-deep-analysis'
       || generatedBy === 'model'
       || data.deep_analysis === true);
-  const provenanceLabel = isPreliminary
-    ? (isPreliminaryNode ? '节点初步摘要' : '模型初步摘要')
+  const isDegraded = data.degraded === true || data.parser_info?.degraded === true;
+  const provenanceLabel = isModelPreviewNode
+    ? '模型节点预览摘要'
+    : isPreliminary
+      ? (isPreliminaryNode ? '节点初步摘要' : '模型初步摘要')
     : isModelDeep
       ? (analysisDepth === 'deep_folder' ? '模型深度分析 · 节点范围' : '模型深度分析 · 全文')
     : generatedBy === 'local-unified-parser'
       ? '本地解析预览'
       : generatedBy === 'local-inventory'
         ? '文件盘点信息'
-        : '本地降级结果';
-  html += `<div class="summary-provenance ${isModelDeep ? 'is-deep' : 'is-preview'}"><span>${escapeHtml(provenanceLabel)}</span>${data.parser_info?.degraded ? '<small>部分步骤未达到完整性门槛，请查看覆盖与告警</small>' : ''}</div>`;
+        : isDegraded ? '降级摘要结果' : '摘要结果';
+  html += `<div class="summary-provenance ${isModelDeep ? 'is-deep' : 'is-preview'}"><span>${escapeHtml(provenanceLabel)}</span>${isDegraded ? '<small>部分步骤未达到完整性门槛，请查看覆盖与告警</small>' : ''}</div>`;
 
   const summary =
     data.summary
@@ -2741,9 +2814,11 @@ async function refreshScan(scanId = state.scan?.scan_id, isCurrent = () => true)
   if (!scanId) {
     return;
   }
+  if (!isCurrent()) return;
   if ($('packageOverviewPublishBtn')) $('packageOverviewPublishBtn').disabled = true;
   const previousScanId = state.scan?.scan_id;
   if (previousScanId && previousScanId !== scanId) {
+    resetNodeInspector();
     state.fileWorkflowRequestSeq += 1;
     state.fileWorkflowAbortController?.abort();
     state.fileWorkflowAbortController = null;
@@ -4304,7 +4379,15 @@ async function showStoppedImportTask(task, job) {
 }
 
 
-async function pollJob(jobId) {
+async function pollJob(jobId, summaryIsCurrent = null) {
+  // Task watching may begin from another package. Only the actual job source
+  // may own the inspector, and changing the selected node invalidates it.
+  const summaryOwner = {
+    scanId: state.scan?.scan_id,
+    session: state.selectionSession,
+    requestId: state.selectionRequestId,
+    node: state.selected,
+  };
   state.jobId =
     jobId;
 
@@ -4426,20 +4509,32 @@ async function pollJob(jobId) {
       if (job.task_type === 'generate_summary') {
         const result = job.result || {};
         const workflowSource = jobWorkflowSource(job) || String(result.workflow_source || '');
-        const preliminary = workflowSource === 'preliminary_model_summary';
-        if (result.summary) {
+        const modelPreviewNode = isModelPreviewNodeSummary(result.summary);
+        const preliminary = workflowSource === 'preliminary_model_summary' || modelPreviewNode;
+        const sourceScanId = job.scan_id;
+        const displaySummary = Boolean(
+          sourceScanId && summaryOwner.scanId
+          && String(sourceScanId) === String(summaryOwner.scanId)
+          && selectionIsCurrent(summaryOwner.scanId, summaryOwner.session)
+          && state.selectionRequestId === summaryOwner.requestId
+          && state.selected === summaryOwner.node
+          && (!summaryIsCurrent || summaryIsCurrent())
+        );
+        if (result.summary && displaySummary) {
           state.summary = result.summary;
           const resultPath = result.summary.node_path || state.selected?.path;
           const resultType = result.summary.summary_type || (state.selected?.kind === 'directory' ? 'folder' : 'file');
           if (resultPath) state.summaries.set(summaryKey(resultPath, resultType), result.summary);
           renderSummary(
             result.summary,
-            result.node_id
-              ? (workflowSource === 'preliminary_node_summary' ? '主题节点初步摘要' : '主题节点深度摘要')
-              : (preliminary ? '模型初步摘要' : '模型深度摘要')
+            modelPreviewNode
+              ? '模型节点预览摘要'
+              : result.node_id
+                ? (workflowSource === 'preliminary_node_summary' ? '主题节点初步摘要' : '主题节点深度摘要')
+                : (preliminary ? '模型初步摘要' : '模型深度摘要')
           );
           }
-        toast(
+        if (displaySummary) toast(
           result.degraded
             ? `${preliminary ? '初步摘要' : '深度摘要'}已完成，但部分内容使用了本地保底结果`
             : `${preliminary ? '初步摘要' : '深度摘要'}生成完成`
@@ -4613,6 +4708,7 @@ $('scanBtn').onclick =
     // shell, overview, translation and relationship modules from presenting
     // stale results while the new inventory is being built.
     forgetCurrentScan();
+    resetNodeInspector();
     state.fileWorkflowRequestSeq += 1;
     state.fileWorkflowAbortController?.abort();
     state.fileWorkflowAbortController = null;
@@ -4942,40 +5038,47 @@ renderEvidenceScopeControl();
  */
 $('summaryBtn').onclick =
   async () => {
-    if (!state.scan || !state.selected) return;
+    const scanId = state.scan?.scan_id;
+    const node = state.selected;
+    if (!scanId || !node) return;
+    const session = state.selectionSession;
+    const requestId = state.selectionRequestId;
+    const isCurrent = () => selectionIsCurrent(scanId, session) && state.selected === node && state.selectionRequestId === requestId;
     const btn = $('summaryBtn');
     setBusy(btn, true, '正在读取文件摘要…');
     $('summary').textContent = '正在读取导入阶段生成的文件或节点摘要。';
     try {
       const summaryPayload = {
-        scan_id: state.scan.scan_id,
-        path: state.selected.path || '.',
-        kind: state.selected.kind,
+        scan_id: scanId,
+        path: node.path || '.',
+        kind: node.kind,
         force: false,
       };
-      if (state.selected.kind === 'group' && state.selected.node_id) {
-        summaryPayload.node_id = state.selected.node_id;
+      if (node.kind === 'group' && node.node_id) {
+        summaryPayload.node_id = node.node_id;
       }
       const data = await api('/api/summary', { method: 'POST', body: JSON.stringify(summaryPayload) });
+      if (!isCurrent()) return;
       if (data.accepted && data.job_id) {
         toast('摘要正在生成，完成后会自动刷新。');
-        await pollJob(data.job_id);
+        await pollJob(data.job_id, isCurrent);
         return;
       }
       state.summary = data.summary;
-      const returnedPath = data.summary?.node_path || state.selected.path;
-      const returnedType = data.summary?.summary_type || (state.selected.kind === 'directory' ? 'folder' : 'file');
+      const returnedPath = data.summary?.node_path || node.path;
+      const returnedType = data.summary?.summary_type || (node.kind === 'directory' ? 'folder' : 'file');
       if (returnedPath) state.summaries.set(summaryKey(returnedPath, returnedType), data.summary);
-      if (state.selected.kind === 'group' && state.selected.node_id) {
-        state.summaries.set(summaryKey(`node:${state.selected.node_id}`, 'folder'), data.summary);
+      if (node.kind === 'group' && node.node_id) {
+        state.summaries.set(summaryKey(`node:${node.node_id}`, 'folder'), data.summary);
       }
-      renderSummary(data.summary, state.selected.kind === 'group' ? '节点摘要' : '文件摘要');
+      renderSummary(data.summary, node.kind === 'group' ? '节点摘要' : '文件摘要');
       toast(data.cached ? '已读取导入阶段摘要' : '摘要生成完成', Boolean(data.degraded));
     } catch (e) {
+      if (!isCurrent()) return;
       $('summary').textContent = e.message;
       toast(e.message, true);
     } finally {
-      setBusy(btn, false);
+      if (isCurrent()) setBusy(btn, false);
     }
   };
 
@@ -5188,9 +5291,12 @@ function applyRetrievalScope(payload) {
  */
 $('retrievalBtn').onclick =
   async () => {
-    if (!state.scan) {
-      return;
-    }
+    const scanId = state.scan?.scan_id;
+    if (!scanId) return;
+    const session = state.selectionSession;
+    const requestId = state.selectionRequestId;
+    const node = state.selected;
+    const isCurrent = () => selectionIsCurrent(scanId, session) && state.selectionRequestId === requestId && state.selected === node;
 
     const query =
       $('retrievalQuery')
@@ -5215,10 +5321,14 @@ $('retrievalBtn').onclick =
       '本地检索中…'
     );
 
+    state.summary = null;
+    $('summary').className = 'summary empty';
+    $('summary').textContent = '正在检索当前数据包的证据…';
+
     try {
       const payload = {
         scan_id:
-          state.scan.scan_id,
+          scanId,
 
         query:
           query,
@@ -5245,6 +5355,7 @@ $('retrievalBtn').onclick =
           }
         );
 
+      if (!isCurrent()) return;
       const result =
         data.retrieval;
 
@@ -5321,16 +5432,14 @@ $('retrievalBtn').onclick =
       );
 
     } catch (e) {
+      if (!isCurrent()) return;
       toast(
         e.message,
         true
       );
 
     } finally {
-      setBusy(
-        btn,
-        false
-      );
+      if (isCurrent()) setBusy(btn, false);
     }
   };
 

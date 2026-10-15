@@ -6,6 +6,7 @@ import re
 
 from services.research_opportunities import KINDS
 from services.research_elements import complete_excerpt
+from services.evidence import evidence_quality
 
 VERSION = 'ordinary-overview-chinese/1.3'
 LATIN = re.compile(r'[A-Za-z]')
@@ -14,6 +15,14 @@ ROLES = {'support': '背景支撑', 'prior_work': '已有工作', 'conditions': 
 FIELDS = ('title', 'rationale', 'known_work', 'research_gap', 'selection_reason',
           'hypothesis', 'confidence_note', 'package_profile')
 LIST_FIELDS = ('research_questions', 'methods', 'limitations')
+
+
+def _quotable_evidence(item):
+    """Apply the same source and quality contract to every presentation path."""
+    return bool(isinstance(item, dict) and str(item.get('evidence_id') or '').strip()
+                and str(item.get('text') or '').strip()
+                and not item.get('availability_reason')
+                and evidence_quality(item).get('eligible'))
 
 
 def _text(value):
@@ -106,6 +115,11 @@ def translate_overview(report, model, cached=None, explain=False):
             if _valid_translation(source, translated):
                 normalized_cache[_key(source)] = {'source': source, 'text': translated}
     cached = normalized_cache
+    direction = report.get('recommended_research_direction') or {}
+    # A processing recommendation without source evidence needs no model
+    # explanation. Keep its factual processing notice and actions unchanged.
+    explain = bool(explain and any(_quotable_evidence(item)
+                                  for item in direction.get('evidence_chain') or []))
     records = translation_records(report)
     missing = []
     for row in records:
@@ -224,7 +238,8 @@ def translate_overview(report, model, cached=None, explain=False):
 
 
 def _reason_source(report):
-    return _key(json.dumps({'research_goal': report.get('research_goal'), 'direction': report.get('recommended_research_direction'),
+    return _key(json.dumps({'quote_contract': 'evidence-id-and-quality/1',
+                            'research_goal': report.get('research_goal'), 'direction': report.get('recommended_research_direction'),
                             'candidates': report.get('direction_candidates')}, ensure_ascii=False, sort_keys=True))
 
 
@@ -261,7 +276,7 @@ def build_overview_presentation(report, translations=None, translation_status=No
         role_ids = candidate.get('evidence_roles') or {}
         explicit_counter = candidate.get('counterevidence') or []
         for evidence in list(candidate.get('evidence_chain') or []) + list(explicit_counter):
-            if not isinstance(evidence, dict):
+            if not _quotable_evidence(evidence):
                 continue
             key = json.dumps([evidence.get('evidence_id'), evidence.get('source_path'),
                               evidence.get('archive_source_path'), evidence.get('page'),
@@ -341,15 +356,15 @@ def build_overview_presentation(report, translations=None, translation_status=No
         choice += '先围绕已检出的判断与限制核验原文条件；确认研究目标、数据与资源后，再决定是否优先开展。来源身份数量不能代替独立实验验证。'
         if (selected.get('score_breakdown') or {}).get('goal_known') is False:
             choice += '当前尚未明确研究目标，评分未评价与具体研究目标的匹配程度。'
-    reasons = [{'label': '已有依据', 'text': direction.get('known_work') or direction.get('rationale') or '当前正文证据不足，暂不能形成可靠研究推荐。'},
+    reasons = [{'label': '已有依据', 'text': direction.get('known_work') or direction.get('basis') or direction.get('rationale') or '当前正文证据不足，暂不能形成可靠研究推荐。'},
                {'label': '待解决问题与研究价值', 'text': (direction.get('research_gap') or '需先核对原文判断、适用条件和资料覆盖范围。') + ' ' + value.get(direction.get('opportunity_kind'), '研究价值仍需结合目标与正文证据判断。')},
                {'label': '为什么优先推荐', 'text': choice or '当前依据不能证明该方向优于其他方向，应结合研究目标与可用资源继续比较。'},
                {'label': '怎样开始验证', 'text': '；'.join(direction.get('methods')[:2]) or '核对原文问题与条件，建立证据对照表，先确认资源和评价口径。'},
                {'label': '推荐的前提与限制', 'text': feasibility}]
-    reasons[0]['text'] = prior_work or reasons[0]['text']
+    reasons[0]['text'] = (direction.get('basis') if not direction['evidence_numbers'] else prior_work) or reasons[0]['text']
     for reason in reasons:
         reason['evidence_numbers'] = direction['evidence_numbers']
-    if (effective_status.get('reason_status') == 'completed'
+    if (direction['evidence_numbers'] and effective_status.get('reason_status') == 'completed'
             and effective_status.get('reason_source') == _reason_source(report)):
         reasons = copy.deepcopy(effective_status['reasons'])
     categories = [row for row in (report.get('global_categories') or []) if isinstance(row, dict)]
