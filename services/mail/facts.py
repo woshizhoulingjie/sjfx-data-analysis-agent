@@ -144,6 +144,29 @@ def source_span(candidate,source):
     return source[positions[start]:positions[start+len(needle)-1]+1]
 
 
+def explicit_amount_state(raw,subject,source):
+    """Recognize only an exact subject:value clause with one explicit predicate.
+
+    This supplements a model's missing state, never a bare header, another
+    subject, a conditional/negated clause or a before/after amount comparison.
+    The matching sentence is retained verbatim as the supporting quote.
+    """
+    if not subject or not raw or source.count(raw)!=1:return None
+    if re.search(r'尚未确认|未确认|没有确认|尚未批准|未批准|尚未付款|未付款|修改前|修改后|如果|条件|若|not\s+(?:confirmed|approved|paid)|subject to|provided that|\bif\b',source,re.I):return None
+    predicates={'proposed':r'提议|提出|建议|拟议|proposed',
+        'confirmed':r'确认|批准|confirmed|approved',
+        'modified':r'修改|变更|更改|modified|revised|changed',
+        'cancelled':r'取消|撤回|cancelled|canceled|withdrawn'}
+    fields=r'(?:金额|报价|费用|预算|amount|price|budget)'
+    for clause in re.split(r'[。！!;；\r\n]',source):
+        clause=clause.strip()
+        if clause.endswith('.'):clause=clause[:-1]
+        for status,predicate in predicates.items():
+            pattern=re.escape(subject)+r'\s*[:：]\s*(?:'+predicate+r')\s*'+fields+r'\s*[:：]?\s*'+re.escape(raw)
+            if re.fullmatch(pattern,clause,re.I):return status,clause
+    return None
+
+
 def normalize_fact(candidate,evidence,sent_at=None):
     if not isinstance(candidate,dict):return None
     kind=str(candidate.get('fact_type') or '')
@@ -168,7 +191,10 @@ def normalize_fact(candidate,evidence,sent_at=None):
     if status in markers and not re.search(markers[status],quote,re.I):status='mentioned'
     if status=='confirmed' and re.search(r'未确认|没有确认|尚未批准|not confirmed|not approved|ไม่ยืนยัน|ยังไม่ได้ยืนยัน|ไม่อนุมัติ',quote,re.I):status='mentioned'
     if re.search(markers['cancelled'],quote,re.I) and not re.search(r'未取消|没有取消|not cancel|ไม่ยกเลิก',quote,re.I):status='cancelled'
-    elif re.search(markers['conditional'],quote,re.I):status='conditional' 
+    elif re.search(markers['conditional'],quote,re.I):status='conditional'
+    if kind=='amount' and status=='mentioned':
+        explicit=explicit_amount_state(raw,subject,source)
+        if explicit:status,quote=explicit
     return {'fact_type':kind,'fact_key':key,'subject_ref':subject,'value_raw':raw,'value_normalized':value,'quote':quote,'status':status,'evidence_id':evidence['evidence_id'],'message_key':evidence['message_key'],'segment_id':evidence.get('segment_id'),'confidence':0.8 if value is not None else 0.4,'normalization_status':'ready' if value is not None else 'unknown'}
 
 
