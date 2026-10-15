@@ -271,12 +271,38 @@ def reading_chunk_payload(chunk):
     return payload
 
 
-def checked_citation(citation, chunks):
+def _authored_semantic_unit_spans(text):
+    """Return complete literal units; keep decimal and abbreviation context."""
+    ends=[]
+    for match in re.finditer(r'[。！？!?；;\r\n]|\.',text):
+        end=match.end()
+        if match.group()=='.':
+            pos=match.start()
+            if (pos and text[pos-1]=='.') or (end<len(text) and text[end]=='.'):continue
+            if pos and end<len(text) and text[pos-1].isdigit() and text[end].isdigit():continue
+            if re.search(r'(?i)(?:\b(?:mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|e\.g|i\.e|a\.m|p\.m|no|fig|eq|inc|ltd|co)|\b[a-z]|\b(?:[a-z]\.)+[a-z])\.$',text[:end]):continue
+            while end<len(text) and text[end] in '\"\'”’)]}':end+=1
+            if end<len(text) and not text[end].isspace():continue
+        ends.append(end)
+    ends.append(len(text))
+    start=0;units=[]
+    for end in sorted(set(ends)):
+        left=start;right=end
+        while left<right and text[left].isspace():left+=1
+        while right>left and text[right-1].isspace():right-=1
+        if left<right and any(char.isalnum() for char in text[left:right]):units.append((left,right))
+        start=end
+    return units
+
+
+def checked_citation(citation, chunks, *, min_quote_chars=8):
     """Match an exact quote and its explicit occurrence, with provenance preserved."""
+    if isinstance(min_quote_chars,bool) or not isinstance(min_quote_chars,int) or not 1<=min_quote_chars<=1200:
+        return None
     if not isinstance(citation, dict) or not isinstance(citation.get('chunk_id'), str):
         return None
     chunk = chunks.get(citation['chunk_id']); quote = citation.get('quote')
-    minimum=max(1,min(8,len(chunk['text'].strip()))) if chunk and chunk.get('attribution_version')==2 else 8
+    minimum=max(1,min(min_quote_chars,len(chunk['text'].strip()))) if chunk and chunk.get('attribution_version')==2 else min_quote_chars
     if not chunk or not isinstance(quote,str) or not quote.strip() or not 1 <= len(quote) <= 1200:
         return None
     supplied = citation.get('char_start')
@@ -309,11 +335,19 @@ def checked_citation(citation, chunks):
             left=fragment['char_start']-chunk['char_start'];right=fragment_end-chunk['char_start']
             if left<0 or right>len(chunk['text']) or right<=left:continue
             original=chunk['text'][left:right];short=original.strip()
-            if not short or len(short)>=8:continue
             content_start=fragment['char_start']+len(original)-len(original.lstrip())
             content_end=fragment_end-(len(original)-len(original.rstrip()))
-            if quote.strip()==short and absolute<=content_start and end>=content_end:
+            if short and len(short)<min_quote_chars and quote.strip()==short and absolute<=content_start and end>=content_end:
                 minimum=min(minimum,len(short));break
+            # A short subspan is evidence only when it is a complete unique
+            # authored source unit, never a substring padded with a separator.
+            if (fragment['fragment_kind']!='authored' or chunk.get('source_kind')!='body'
+                    or chunk.get('attribution_uncertain')):continue
+            first=chunk['text'].find(quote)
+            if first<0 or chunk['text'].find(quote,first+1)>=0:continue
+            if any(quote==original[a:b] and absolute==fragment['char_start']+a and end==fragment['char_start']+b
+                   for a,b in _authored_semantic_unit_spans(original)):
+                minimum=min(minimum,len(quote));break
     if len(quote)<minimum:return None
     if chunk.get('attribution_version') == 2:
         quoted = bool(chunk.get('attribution_uncertain')) or chunk.get('source_kind') != 'body'

@@ -45,8 +45,10 @@
     chatSourceOffset: 0, chatSourceHasMore: false, chatSourceLoading: false, chatSourceError: '', chatSourceSelectionSeq: 0,
     translationSourceKind: 'standard', translationSourceId: '', translationSourceList: [], translationSourceRequestSeq: 0,
     translationSourceOffset: 0, translationSourceHasMore: false, translationSourceLoading: false, translationSourceError: '',
-    watchers: new Map(), scopeConstraints: {}, fileFolder: new Set()
+    watchers: new Map(), scopeConstraints: {}, scopeEditVersion: 0, fileFolder: new Set(),
+    fileReaderRequestSeq: 0
   };
+  let fileReaderReturnFocus = null;
 
   try { state.fileFolder = new Set(JSON.parse(sessionStorage.getItem('sjfx_file_folder_v1') || '[]')); } catch (_) {}
 
@@ -651,6 +653,7 @@
   }
 
   function carryScopeToConversation(scope) {
+    state.scopeEditVersion += 1;
     scope = scope || state.selectedScope || { kind: 'package', value: '' };
     state.scopeConstraints = Object.assign({}, scope.constraints || {});
     state.scopeConstraints.source_paths = scope.source_paths || [];
@@ -895,6 +898,7 @@
   }
 
   async function setChatSource(kind, id) {
+    closeOriginalFile();
     const selectionSeq = ++state.chatSourceSelectionSeq;
     const nextKind = kind === 'large' ? 'large' : 'standard';
     if (nextKind === 'standard' && id && id !== state.scanId) {
@@ -1306,7 +1310,7 @@
     $('conversationScopeSummary').textContent = session ? (generalMode ? '通用聊天 · 导入数据包后可切换资料证据模式' : scopeSummary(session.scope)) : '请选择范围并新建会话';
     const contextPicker = document.querySelector('.v2-context-picker');
     if (contextPicker) contextPicker.hidden = generalMode;
-    updateContextChip(generalMode ? { kind: 'general' } : (session && session.scope));
+    updateContextChip(generalMode ? { kind: 'general' } : undefined);
     const messages = session && Array.isArray(session.messages) ? session.messages : [];
     const older = session && session.message_page && session.message_page.has_more
       ? '<button type="button" class="text-button v2-load-older" data-load-older-messages>加载更早消息</button>'
@@ -1692,75 +1696,104 @@
     } catch (error) { notify(error.message || '原文件下载失败', true); }
   }
 
-  function buildReaderWindowHtml(name, path, fileUrl, bodyHtml) {
-    // 阅读窗口自带"下载原文件"，下载入口已并入阅读，不再单列按钮。
-    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(name)} · 原文阅读</title><style>
-      :root{color-scheme:dark}
-      body{margin:0;background:#0d1420;color:#d1daed;font:14px/1.7 "Microsoft YaHei",system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
-      header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:#141c2c;border-bottom:1px solid #2c3952;flex-shrink:0}
-      header strong{font-size:14px;color:#e1e9fb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      header small{color:#7d8fac;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
-      header a.dl{flex-shrink:0;padding:6px 14px;border:1px solid #4169a1;border-radius:6px;background:#4169a1;color:#fff;text-decoration:none;font-size:12px}
-      header a.dl:hover{background:#5279b8}
-      main{flex:1;overflow:auto;padding:18px 22px;min-height:0}
-      main.frameless{padding:0;display:flex}
-      pre{white-space:pre-wrap;word-break:break-word;margin:0;font:13px/1.8 "Consolas","Microsoft YaHei",monospace;color:#c9d6ea}
-      object,iframe,img{width:100%;height:100%;border:0;flex:1}
-      img{object-fit:contain;height:auto}
-      .hint{color:#91a3c1;padding:30px;text-align:center}
-    </style></head><body><header><strong>${escapeHtml(name)}</strong><small>${escapeHtml(path)}</small><a class="dl" href="${fileUrl}" download="${escapeHtml(name)}">下载原文件</a></header>${bodyHtml}</body></html>`;
-  }
-
-  function openReaderWindow(html) {
-    const htmlUrl = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
-    const win = window.open(htmlUrl, '_blank');
-    if (!win) { URL.revokeObjectURL(htmlUrl); notify('浏览器拦截了新窗口，请允许弹出窗口后重试', true); return null; }
-    // 阅读窗口加载完成后 HTML blob 即可回收；raw 文件 blob 由窗口内的下载按钮继续持有。
-    setTimeout(() => URL.revokeObjectURL(htmlUrl), 60000);
-    return win;
-  }
-
   async function openOriginalFile(path) {
-    if (!chatScanId() || !path) return;
-    notify('正在打开原文…');
+    const scanId = chatScanId();
+    const modal = $('fileReaderModal');
+    const content = $('fileReaderContent');
+    if (!scanId || !path || !modal || !content) return;
+    const returnFocus = modal.hidden ? document.activeElement : fileReaderReturnFocus;
+    closeOriginalFile(false);
+    fileReaderReturnFocus = returnFocus;
+    const requestSeq = state.fileReaderRequestSeq;
+    const sourceVersion = state.chatSourceVersion;
+    const isCurrent = () => requestSeq === state.fileReaderRequestSeq && !modal.hidden
+      && scanId === chatScanId() && sourceVersion === state.chatSourceVersion;
+    modal.dataset.path = path;
+    modal.hidden = false;
+    $('fileReaderTitle').textContent = basename(path);
+    $('fileReaderMeta').textContent = path;
+    $('fileReaderState').textContent = '正在加载原文…';
+    $('fileReaderDownload').disabled = true;
+    $('fileReaderDeepSummary').disabled = true;
+    $('fileReaderDeepSummary').textContent = '生成深度摘要';
+    $('fileReaderClose')?.focus();
     try {
-      const endpoint = String(chatScanId()).startsWith('lp-')
-        ? `/api/large-packages/${encodeURIComponent(chatScanId())}/file?path=${encodeURIComponent(path)}`
-        : `/api/document/${encodeURIComponent(chatScanId())}/raw?path=${encodeURIComponent(path)}`;
+      const endpoint = String(scanId).startsWith('lp-')
+        ? `/api/large-packages/${encodeURIComponent(scanId)}/file?path=${encodeURIComponent(path)}`
+        : `/api/document/${encodeURIComponent(scanId)}/raw?path=${encodeURIComponent(path)}`;
       const response = await window.SJFXAuth.request(
         endpoint,
         { headers: { Accept: '*/*' } },
       );
+      if (!isCurrent()) return;
       if (!response.ok) throw new Error('原文件读取失败');
       const type = String(response.headers.get('content-type') || '').toLowerCase();
       const blob = await response.blob();
-      const name = basename(path);
+      if (!isCurrent()) return;
+      const textType = type.startsWith('text/') || type.includes('json') || type.includes('xml') || type.includes('csv');
+      const text = textType ? await blob.text() : '';
+      if (!isCurrent()) return;
       const fileUrl = URL.createObjectURL(blob);
+      modal.dataset.objectUrl = fileUrl;
+      $('fileReaderDownload').disabled = false;
+      $('fileReaderDeepSummary').disabled = false;
       if (type.includes('pdf')) {
-        // 原生 PDF 查看器自带下载/打印；外层套工具栏让"下载原文件"始终可见。
-        openReaderWindow(buildReaderWindowHtml(name, path, fileUrl,
-          `<main class="frameless"><object data="${fileUrl}" type="application/pdf" aria-label="${escapeHtml(name)}"><div class="hint">浏览器未能内嵌显示此 PDF，请使用右上角"下载原文件"。</div></object></main>`));
+        const frame = document.createElement('iframe');
+        frame.src = fileUrl;
+        frame.title = basename(path) + ' · PDF 原文';
+        frame.style.cssText = 'width:100%;height:100%;min-height:480px;border:0;display:block';
+        content.appendChild(frame);
+        $('fileReaderState').textContent = 'PDF 原文已载入；若浏览器无法显示，请下载原文件查看。';
       } else if (type.startsWith('image/')) {
-        openReaderWindow(buildReaderWindowHtml(name, path, fileUrl,
-          `<main class="frameless"><img src="${fileUrl}" alt="${escapeHtml(name)}"></main>`));
-      } else if (type.startsWith('text/') || type.includes('json') || type.includes('xml') || type.includes('csv')) {
-        const text = await blob.text();
-        openReaderWindow(buildReaderWindowHtml(name, path, fileUrl, `<main><pre>${escapeHtml(text)}</pre></main>`));
+        const image = document.createElement('img');
+        image.src = fileUrl;
+        image.alt = basename(path);
+        image.style.cssText = 'max-width:100%;height:auto;display:block;margin:0 auto';
+        image.onerror = () => { if (isCurrent()) $('fileReaderState').textContent = '浏览器无法显示此图片，请下载原文件查看。'; };
+        content.appendChild(image);
+        $('fileReaderState').textContent = '图片原文已载入。';
+      } else if (textType) {
+        // HTML/XML source is shown as literal text, never interpreted as markup.
+        content.textContent = text;
+        $('fileReaderState').textContent = '原文已载入。';
       } else {
-        openReaderWindow(buildReaderWindowHtml(name, path, fileUrl,
-          `<main><div class="hint">此格式（${escapeHtml(type || '未知')}）无法在浏览器内直接展示，请使用右上角"下载原文件"查看。</div></main>`));
+        content.textContent = `此格式（${type || '未知'}）无法在浏览器内直接展示，请下载原文件查看。`;
+        $('fileReaderState').textContent = '原文件已载入，可下载查看。';
       }
     } catch (error) {
-      notify(error.message || '原文读取失败', true);
+      if (!isCurrent()) return;
+      content.textContent = '';
+      if (modal.dataset.objectUrl) URL.revokeObjectURL(modal.dataset.objectUrl);
+      modal.dataset.objectUrl = '';
+      $('fileReaderDownload').disabled = true;
+      $('fileReaderDeepSummary').disabled = true;
+      $('fileReaderState').textContent = error.message || '原文读取失败';
     }
   }
 
-  function closeOriginalFile() {
+  function closeOriginalFile(restoreFocus = true) {
+    state.fileReaderRequestSeq += 1;
     const modal = $('fileReaderModal');
     if (!modal) return;
+    const wasOpen = !modal.hidden;
+    if ($('fileReaderContent')) $('fileReaderContent').textContent = '';
     if (modal.dataset.objectUrl) URL.revokeObjectURL(modal.dataset.objectUrl);
     modal.dataset.objectUrl = '';
+    modal.dataset.path = '';
     modal.hidden = true;
+    if (restoreFocus && wasOpen && fileReaderReturnFocus?.isConnected) fileReaderReturnFocus.focus();
+    fileReaderReturnFocus = null;
+  }
+
+  function downloadReaderOriginal() {
+    const modal = $('fileReaderModal');
+    if (!modal || modal.hidden || !modal.dataset.objectUrl) return;
+    const anchor = document.createElement('a');
+    anchor.href = modal.dataset.objectUrl;
+    anchor.download = basename(modal.dataset.path);
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
   }
 
   async function queueFileDeepSummary(path, button) {
@@ -2042,6 +2075,7 @@
     if (!generalMode) {
       try { turnScope = conversationScope(); } catch (error) { notify(error.message, true); return; }
     }
+    const scopeEditVersion = state.scopeEditVersion;
     if (generalMode) {
       state.generalChatSending = true;
       const history = (state.conversation.messages || []).filter((message) => message.role === 'user' || message.role === 'assistant').slice(-12);
@@ -2100,6 +2134,9 @@
       });
       if (!isCurrent()) return;
       state.conversation = response.session;
+      // Adopt the next-turn scope once the request is accepted. Polling only
+      // redraws the draft chip, so later scope edits stay under user control.
+      if (scopeEditVersion === state.scopeEditVersion) restoreConversationScope(response.session?.scope);
       state.conversationPending = null;
       registerAnalysisTurn(response.turn, []);
       await attachFileResults(question, response.turn);
@@ -2827,6 +2864,7 @@
   }
 
   function resetForScan(scanId) {
+    if (!isLargeChatSource()) closeOriginalFile();
     const previousScanId = state.scanId;
     const preserveIndependentTranslation = Boolean(state.translationSourceId);
     if (!preserveIndependentTranslation && previousScanId && previousScanId !== scanId) {
@@ -2941,8 +2979,10 @@
     $('packageOverviewAskAllBtn').addEventListener('click', () => carryScopeToConversation({ kind: 'package', label: '整个数据包', source_paths: [] }));
     $('packageOverviewAskBtn').addEventListener('click', () => carryScopeToConversation(state.selectedScope));
     $('packageOverviewReportBtn').addEventListener('click', downloadReport);
-    $('conversationScopeKind').addEventListener('change', () => { state.scopeConstraints = {}; renderScopeFields(); });
-    $('conversationScopeFields').addEventListener('input', () => updateContextChip());
+    $('conversationScopeKind').addEventListener('change', () => { state.scopeEditVersion += 1; state.scopeConstraints = {}; renderScopeFields(); });
+    const scopeEdited = () => { state.scopeEditVersion += 1; updateContextChip(); };
+    $('conversationScopeFields').addEventListener('input', scopeEdited);
+    $('conversationScopeFields').addEventListener('change', scopeEdited);
     document.querySelector('[data-view="overview"]').addEventListener('click', (event) => {
       const appendixLink = event.target.closest('[data-io-open-evidence], [data-io-evidence-number]');
       if (appendixLink) {
@@ -3083,7 +3123,10 @@
     });
     $('fileReaderClose')?.addEventListener('click', closeOriginalFile);
     $('fileReaderModal')?.addEventListener('click', (event) => { if (event.target.id === 'fileReaderModal') closeOriginalFile(); });
-    $('fileReaderDownload')?.addEventListener('click', () => downloadOriginalFile($('fileReaderModal')?.dataset.path || ''));
+    $('fileReaderDownload')?.addEventListener('click', downloadReaderOriginal);
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !$('fileReaderModal')?.hidden) closeOriginalFile();
+    });
     $('fileReaderDeepSummary')?.addEventListener('click', () => queueFileDeepSummary($('fileReaderModal')?.dataset.path || '', $('fileReaderDeepSummary')));
     $('translationListRefreshBtn').addEventListener('click', () => loadTranslationList());
     $('translationFilter').addEventListener('change', () => loadTranslationList({ offset: 0 }));

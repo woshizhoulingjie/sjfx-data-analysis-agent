@@ -170,6 +170,12 @@
     if((result.items || []).length>200){const li=document.createElement("li");li.textContent="当前显示前 200 条，完整记录可导出查看";list.append(li);}
   }
   function renderOverview(overview) {
+    const pkg = overview?.package;
+    const packageOption = pkg && Array.from(byId("mail-package").options).find((item) => item.value === pkg.package_id);
+    if (packageOption) {
+      if (pkg.display_name) packageOption.dataset.displayName = pkg.display_name;
+      packageOption.textContent = `${packageOption.dataset.displayName || pkg.package_id} (${zhLabel(pkg.status)})`;
+    }
     const node = byId("mail-overview"); clear(node);
     const counts = (overview || {}).counts || {};
     [["唯一邮件数", counts.logical_messages, "messages"], ["来源副本", counts.occurrences, "package"], ["正文可读", counts.messages_with_body, "messages"], ["附件", counts.explicit_attachments, "structure"], ["参与邮箱", counts.participant_addresses, "network"]].forEach(([label, value, module]) => {
@@ -186,7 +192,11 @@
   async function loadPackages(selectId) {
     const payload = await api("/api/mail/packages");
     const select = byId("mail-package"); clear(select); select.appendChild(option("选择邮件资料包...", ""));
-    payload.packages.forEach((item) => select.appendChild(option(`${item.display_name} (${zhLabel(item.status)})`, item.package_id)));
+    payload.packages.forEach((item) => {
+      const entry = option(`${item.display_name} (${zhLabel(item.status)})`, item.package_id);
+      entry.dataset.displayName = item.display_name;
+      select.appendChild(entry);
+    });
     if (selectId) { select.value = selectId; state.packageId = selectId; await loadPackage(); }
   }
   async function loadPackage() {

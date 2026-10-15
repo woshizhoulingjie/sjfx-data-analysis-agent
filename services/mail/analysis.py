@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib, json, uuid, re
 from .person_corpus import next_chunks, related_messages
-from .person_research import checked_citation, validate_findings, KINDS
+from .person_research import checked_citation, validate_findings, KINDS, _authored_semantic_unit_spans
 from .research.runtime import JobCancelled
 from .research.verifier import verify_translated_finding
 from .communication_acts import EXTRACTION_INSTRUCTIONS, ACT_TYPES, INTENT_ADAPTER, VERSION as ACT_VERSION
@@ -343,13 +343,39 @@ def _expand_authored_citations(value, chunks, parties, roots):
             source={**chunk,'authored':True}
             located=_located_citation(raw,{source['chunk_id']:source})
             original=checked_citation(located,{source['chunk_id']:source})
+            short_seed=original is None
+            if original is None:
+                quote=located.get('quote')
+                if not isinstance(quote,str) or not 1<=len(quote)<8:continue
+                seed=source['text'].find(quote)
+                # Short text only locates context; even an explicit offset cannot
+                # make an ambiguous seed safe. Attribution checks stay unchanged.
+                if seed<0 or source['text'].find(quote,seed+1)>=0:continue
+                original=checked_citation(located,{source['chunk_id']:source},min_quote_chars=1)
             if not original or original['quotation_warning']:continue
             fragments=[f for f in source.get('body_fragments',[]) if f.get('fragment_kind')=='authored'
                        and f.get('char_start',-1)<=original['char_start'] and f.get('char_end',-1)>=original['char_end']]
             if len(fragments)!=1:continue
             start,end=fragments[0]['char_start'],fragments[0]['char_end']
+            if source.get('quotation_boundary') is not None:end=min(end,source['quotation_boundary'])
             base=source['char_start']
             if not 0<end-start<=1200 or start<base or end>base+len(source['text']):continue
+            if short_seed:
+                fragment=source['text'][start-base:end-base]
+                units=[(left,right) for left,right in _authored_semantic_unit_spans(fragment)
+                       if start+left<=original['char_start'] and start+right>=original['char_end']]
+                if len(units)!=1:continue
+                left,right=units[0]
+                unit_start,unit_end=start+left,start+right
+                candidate={**raw,'quote':fragment[left:right],'char_start':unit_start}
+                checked=checked_citation(candidate,{source['chunk_id']:source})
+                if not checked or checked['quotation_warning']:continue
+                # Prefer the complete source unit when it supports the unchanged
+                # finding. Claims needing other original facts retain full context.
+                candidate_citations=list(row['citations']);candidate_citations[len(citations)-1]=candidate
+                try:validate_dossier({'findings':[{**row,'citations':candidate_citations}]},chunks,parties,roots)
+                except ValueError:pass
+                else:start,end=unit_start,unit_end
             if (start,end)==(original['char_start'],original['char_end']):continue
             expanded={**raw,'quote':source['text'][start-base:end-base],'char_start':start}
             checked=checked_citation(expanded,{source['chunk_id']:source})

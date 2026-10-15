@@ -207,9 +207,10 @@ class _SecurityHeadersMiddleware:
                         "script-src 'self'; style-src 'self' 'unsafe-inline'; "
                         # Mail inline images are fetched with the authenticated
                         # API and exposed to the page as short-lived Blob URLs.
-                        # Keep blob: scoped to image loads; scripts and frames
-                        # remain same-origin unless a route opts in explicitly.
                         "img-src 'self' data: blob:; connect-src 'self'"
+                        # Only the main reader embeds authenticated PDF Blobs.
+                        # Keep object/script policies and other routes intact.
+                        + ("; frame-src 'self' blob:" if scope.get("path") == "/" else "")
                     ),
                 }
                 for name, value in defaults.items():

@@ -22,6 +22,7 @@ import time
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 
 from services.ollama import LocalModelError
 
@@ -953,6 +954,32 @@ def _heading_texts(structure):
     return values
 
 
+def _is_filename_title(document, title):
+    """Recognise the parser's filename fallback, including old checkpoints.
+
+    Older parsed documents have no title provenance. Require an exact source
+    basename/stem match and defer to any extracted title/heading evidence.
+    """
+    structure = document.get("structure") or {}
+    source = document.get("source") or {}
+    filename = str(
+        source.get("name") or source.get("path") or source.get("absolute_path") or ""
+    ).replace("\\", "/").rsplit("/", 1)[-1]
+    if not filename or title not in {filename, PurePosixPath(filename).stem}:
+        return False
+    normalised_title = re.sub(r"\s+", " ", title).strip()
+    if normalised_title in _heading_texts(structure):
+        return False
+    for item in document.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("kind") or "").lower()
+        text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+        if label in {"title", "section_header", "heading"} and text == normalised_title:
+            return False
+    return True
+
+
 _LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-]*")
 _LINK_OR_ID_RE = re.compile(
     r"(?:https?://\S+|www\.\S+|\bdoi\s*[:/]\s*\S+|\S+@\S+\.\S+|"
@@ -1142,6 +1169,7 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
     source = document.get("source") or {}
     title = str(structure.get("title") or source.get("name") or "")
     body = str(document.get("text") or "")
+    filename_title = _is_filename_title(document, title)
     heading_values = _heading_texts(structure)
     evidence_markers = [
         (
@@ -1175,7 +1203,8 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                     None,
                 )
                 unit_paragraph_index = paragraph_index
-            base_detection = detect_language(item["text"])
+            is_filename_metadata = kind == "title" and filename_title
+            base_detection = detect_language("" if is_filename_metadata else item["text"])
             if block_kind == "table":
                 pieces = split_table_text(item["text"])
             elif base_detection["language"] == "mixed":
@@ -1186,7 +1215,10 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                 piece_start = int(item["start"]) + int(piece["start"])
                 piece_end = int(item["start"]) + int(piece["end"])
                 piece_text = piece["text"]
-                detection = detect_language(piece_text)
+                # A parser-generated filename is metadata, not foreign prose.
+                # Decide this before creating the key so retries cannot reuse
+                # a translation made with the filename's spurious language.
+                detection = detect_language("" if is_filename_metadata else piece_text)
                 preserved_kind = (
                     block_kind if block_kind in _PRESERVED_BLOCK_KINDS else None
                 )
@@ -1223,7 +1255,8 @@ def build_translation_units(document, max_unit_chars=2400, glossary=None,
                     ),
                     "error": None, "retryable": True,
                     "preserved_reason": (
-                        _PRESERVED_BLOCK_REASONS.get(preserved_kind)
+                        "filename_metadata" if is_filename_metadata
+                        else _PRESERVED_BLOCK_REASONS.get(preserved_kind)
                         if annotate_preserved else None
                     ),
                 })
@@ -1378,7 +1411,10 @@ class TranslationService:
             )
 
         source_fingerprint = document_translation_fingerprint(document)
-        language_detection = detect_language(original_title + "\n" + original_text)
+        language_detection = detect_language(
+            original_text if _is_filename_title(document, original_title)
+            else original_title + "\n" + original_text
+        )
         return {
             "schema_version": TRANSLATION_SCHEMA_VERSION,
             "contract_version": self.policy.contract_version,
