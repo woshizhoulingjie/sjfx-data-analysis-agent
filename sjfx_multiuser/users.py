@@ -47,7 +47,7 @@ USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{2,31}$")
 OWNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 MIN_PASSWORD_LENGTH = 8
-SESSION_HOURS_DEFAULT = 12
+SESSION_HOURS_DEFAULT = 168
 
 USER_DDL = """
 CREATE TABLE IF NOT EXISTS users (

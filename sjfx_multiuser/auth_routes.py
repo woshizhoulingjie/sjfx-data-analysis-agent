@@ -39,7 +39,7 @@ from .http_adapter import (
     make_adapter,
 )
 from .ownership import ROLE_ADMIN, ROLE_USER, validate_view_target
-from .users import STATUS_ACTIVE, STATUS_DISABLED, AuthError, UserStore
+from .users import SESSION_HOURS_DEFAULT, STATUS_ACTIVE, STATUS_DISABLED, AuthError, UserStore
 
 #: 每个 IP 每小时允许的注册次数
 REGISTER_LIMIT_PER_HOUR = 3
@@ -274,7 +274,7 @@ def register(app, user_store, config_owner_id=None, adapter=None,
         return s, None
 
     def _set_cookie_header(session_id):
-        return build_set_cookie(SESSION_COOKIE, session_id)
+        return build_set_cookie(SESSION_COOKIE, session_id, max_age=SESSION_HOURS_DEFAULT * 3600)
 
     # ---------------- 强制改密守卫（服务端）----------------
 
