@@ -1103,6 +1103,14 @@
     }[intent] || intent || '\u52a9\u624b\u56de\u7b54';
   }
 
+  function conclusionVerificationLabel(status, turn) {
+    if (status !== 'unverified') return status;
+    const disabled = turn && (turn.answer_verification_enabled === false
+      || turn.verification && turn.verification.disabled === true
+      || turn.quality_metrics && turn.quality_metrics.answer_verification_enabled === false);
+    return disabled ? '未进行结论核验' : '结论尚未核实';
+  }
+
   function analysisQualityMarkup(turn) {
     const metrics = turn && turn.quality_metrics;
     if (!metrics || typeof metrics !== 'object' || metrics.verification_status === 'not_required') return '';
@@ -1139,7 +1147,7 @@
     if (coverage != null && scopeCoverage == null && candidateDepth == null) values.splice(5, 0, ['覆盖率', `${Math.round(coverage * 100)}%`]);
     if (packageReadingFiles != null) values.splice(1, 0, ['全包摘要', `${integer(summaryBackedFiles)}/${integer(packageReadingFiles)}`]);
     if (packageReadingCoverage != null) values.splice(2, 0, ['摘要覆盖', `${Math.round(packageReadingCoverage * 100)}%`]);
-    const status = { verified: '引用核验通过', partial: '引用部分通过', insufficient_evidence: '证据不足', not_required: '无需引用核验' }[metrics.verification_status] || metrics.verification_status || '待核验';
+    const status = { verified: '引用核验通过', partial: '引用部分通过', insufficient_evidence: '证据不足', not_required: '无需引用核验' }[metrics.verification_status] || conclusionVerificationLabel(metrics.verification_status, turn) || '待核验';
     const task = taskStatusLabel(turn && turn.task_status);
     return `<section class="v2-quality" aria-label="分析质量"><header><strong>分析质量</strong><span>${escapeHtml(task ? `${task} · ${status}` : status)}</span></header><div>${values.map(([label, value]) => `<dl><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></dl>`).join('')}</div></section>`;
   }
@@ -1248,7 +1256,7 @@
       return `<article class="v2-file-card"><label class="v2-file-select"><input type="checkbox" data-file-select="${escapeHtml(path)}"><span class="sr-only">选择 ${escapeHtml(basename(path))}</span></label><div><strong title="${escapeHtml(path)}">${escapeHtml(basename(path))}</strong><small>${escapeHtml(path)} · ${escapeHtml(item.extension || '未知类型')}${item.size != null ? ` · ${escapeHtml(formatBytes(item.size))}` : ''}${pages}${status ? ` · ${escapeHtml(status)}` : ''}</small>${previewText ? `<p>${escapeHtml(truncate(previewText, 260))}</p>` : ''}</div><div class="v2-file-card-actions"><button type="button" data-file-open="${escapeHtml(path)}">阅读原文</button><button type="button" data-file-deep-summary="${escapeHtml(path)}">深度摘要</button><button type="button" data-file-collect="${escapeHtml(path)}">加入资料夹</button><button type="button" data-file-node="${escapeHtml(path)}">归入新节点</button></div></article>`;
     }).join('')}</section></details>` : '';
     const meta = finalLargeQA ? '<div class="v2-message-meta"><span>资料问答 · 已回答</span></div>'
-      : role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intentLabel(intent))}</span>${task ? `<span>${escapeHtml(task)}</span>` : ''}${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${evidenceStatus && evidenceStatus !== 'not_required' ? `<span>证据：${escapeHtml(evidenceStatus)}</span>` : ''}</div>` : '';
+      : role === 'assistant' ? `<div class="v2-message-meta"><span>${escapeHtml(intentLabel(intent))}</span>${task ? `<span>${escapeHtml(task)}</span>` : ''}${turn && turn.context && turn.context.follow_up ? '<span>已理解为追问</span>' : ''}${evidenceStatus && evidenceStatus !== 'not_required' ? `<span>证据：${escapeHtml(conclusionVerificationLabel(evidenceStatus, turn))}</span>` : ''}</div>` : '';
     const content = role === 'assistant' ? safeMarkdown(assistantDisplayText(message.content)) : `<p>${escapeHtml(message.content || '')}</p>`;
     const retryable = turn && ['failed', 'cancelled'].includes(turn.status);
     const quality = role === 'assistant' && turn && !simpleFileSearch ? analysisQualityMarkup(turn) : '';
@@ -2038,7 +2046,7 @@
     }
     const text = String(question || '').trim();
     const intent = turn.intent && typeof turn.intent === 'object' ? turn.intent.name : turn.intent;
-    if (intent !== 'file_search' && !/(?:搜索|查找|找一下|找出|找到|列出|显示|筛选).{0,80}(?:文件|资料|文档)?|(?:哪些|相关).{0,20}(?:文件|资料|文档)/.test(text)) return;
+    if (intent !== 'file_search') return;
     const query = fileSearchQuery(text);
     if (!query) return;
     try {

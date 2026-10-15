@@ -10,6 +10,7 @@
   let lastCatalogAt = 0;
   let directoryPending = 0;
   let currentStage = 'import';
+  let workspaceStatus = null;
   let showAllFiles = false;
   let fileOffset = 0;
   let fileTopic = '';
@@ -113,6 +114,8 @@
       progress: Number(wf.progress == null ? status.progress : wf.progress) || 0,
       message: wf.message || status.message,
     }) : status;
+    workspaceStatus = { packageId, item: view, workflow: wf };
+    window.dispatchEvent(new CustomEvent('sjfx-large-state'));
     const actions = wf && wf.allowed_actions ? wf.allowed_actions : null;
     const counts = view.counts || {};
     const quick = counts.quick || {};
@@ -369,7 +372,9 @@
     if (!packageId) return;
     const endpoint = action === 'pause' ? 'pause' : action === 'resume' ? 'resume' : 'cancel';
     if (action === 'cancel' && !window.confirm('停止后会保留已完成结果，但未完成文件不会继续处理。确定停止这个数据包吗？')) return;
-    const response = await api()(`/api/large-packages/${encodeURIComponent(packageId)}/${endpoint}`, { method: 'POST' });
+    const token = contextToken(), targetId = packageId;
+    const response = await api()(`/api/large-packages/${encodeURIComponent(targetId)}/${endpoint}`, { method: 'POST' });
+    if (!stillCurrent(token)) return;
     // pause/resume/cancel 三个接口统一返回 snapshot（改动前 cancel 返回的是
     // 裸 large_package，页面因此渲染不出来）。两者都接受，然后立刻整体刷新一次。
     render(response.large_package || {}, response.snapshot || null);
@@ -448,7 +453,8 @@
     return button;
   }
 
-  window.SJFXLargePackage = { setStage, activate };
+  window.SJFXLargePackage = { setStage, activate,
+    workspace: () => workspaceStatus?.packageId === packageId ? workspaceStatus : null };
   document.addEventListener('click', event => {
     const node = event.target.closest('#largePackageSmartCatalog [data-large-node-type], #largePackageSelectCatalogTree [data-large-node-type]');
     if (node && event.target.closest('summary')) {

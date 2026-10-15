@@ -48,7 +48,7 @@ def _coverage(analysis: Mapping[str, Any], summary_count: int, file_count: int) 
     raw = dict(analysis.get("coverage") or {}) if isinstance(analysis, Mapping) else {}
     return {
         "scope": "package",
-        "total_files": int(raw.get("inventory_files") or raw.get("total_files") or file_count or 0),
+        "total_files": int(file_count or 0),
         "parsed_files": int(raw.get("parsed_files") or 0),
         "deep_analyzed_files": int(raw.get("deep_analyzed_files") or 0),
         "summary_records": int(summary_count or 0),
@@ -194,7 +194,27 @@ def build_standard_context(storage: Any, scan_id: str, max_summary_chars: int = 
         if next_offset is None or not items:
             break
         offset = next_offset
-    files_by_path: Dict[str, Dict[str, Any]] = {}
+    # The physical inventory owns file identity. Folder, semantic-node and
+    # report summaries remain useful context, but cannot create ledger files.
+    # Let an unavailable inventory reach the caller's unavailable-context
+    # handler instead of inventing a zero-file or summary-only scope.
+    inventory_paths = storage.inventory_paths_under(scan_id, ".") or []
+
+    def inventory_path(value: Any) -> str:
+        path = str(value or "").strip().replace("\\", "/")
+        return path if path not in {"", "."} and not path.startswith("node:") else ""
+
+    files_by_path: Dict[str, Dict[str, Any]] = {
+        path: {"path": path, "name": Path(path.split("::", 1)[-1]).name,
+               "summary_type": None, "summary": ""}
+        for path in (inventory_path(value) for value in inventory_paths) if path
+    }
+    context_summaries: List[Dict[str, Any]] = []
+    # The short stage names are legacy file-summary aliases, accepted only
+    # when an exact inventory file exists. Canonical durable types are explicit.
+    file_types = {"file", "preliminary", "deep", "preliminary_file_summary", "deep_file_summary"}
+    aggregate_types = {"folder", "node", "report", "preliminary_node_summary", "deep_node_summary",
+                       "preliminary_report", "deep_report"}
 
     def summary_priority(summary_type: Any) -> int:
         label = str(summary_type or "").lower()
@@ -208,7 +228,7 @@ def build_standard_context(storage: Any, scan_id: str, max_summary_chars: int = 
 
     for item in summaries:
         payload = item.get("payload") or {}
-        path = str(item.get("path") or payload.get("source_path") or "").strip()
+        path = str(item.get("path") or payload.get("source_path") or "").strip().replace("\\", "/")
         if not path:
             continue
         candidate = {
@@ -217,26 +237,18 @@ def build_standard_context(storage: Any, scan_id: str, max_summary_chars: int = 
             "summary_type": item.get("type"),
             "summary": _text(payload, max_summary_chars),
         }
+        label = str(candidate["summary_type"] or "").lower()
+        if label in aggregate_types:
+            if candidate["summary"]:
+                context_summaries.append(candidate)
+            continue
+        # Stale/orphan file summaries are not part of the current inventory.
+        # A non-file summary at a physical path must not fill its summary gap.
         current = files_by_path.get(path)
-        if current is None or summary_priority(candidate["summary_type"]) >= summary_priority(current["summary_type"]):
+        if label not in file_types or current is None or not candidate["summary"]:
+            continue
+        if not current["summary"] or summary_priority(candidate["summary_type"]) >= summary_priority(current["summary_type"]):
             files_by_path[path] = candidate
-    # A package can contain files whose summary job is still pending or failed.
-    # Include the persisted inventory as zero-summary records so package scope
-    # remains complete without triggering parsing or summary work.
-    known = set(files_by_path)
-    try:
-        inventory_paths = storage.inventory_paths_under(scan_id, ".") or []
-    except Exception:
-        inventory_paths = []
-    for raw_path in inventory_paths:
-        path = str(raw_path or "").strip()
-        if path and path not in known:
-            files_by_path[path] = {
-                "path": path,
-                "name": Path(path.split("::", 1)[-1]).name,
-                "summary_type": None,
-                "summary": "",
-            }
     files = list(files_by_path.values())
     files.sort(key=lambda item: item["path"])
     reading_manifest = _reading_manifest(files)
@@ -246,6 +258,7 @@ def build_standard_context(storage: Any, scan_id: str, max_summary_chars: int = 
         "package_overview": overview,
         "analysis_overview": analysis,
         "coverage": _coverage(analysis, len(summaries), len(files)),
+        "context_summaries": context_summaries,
         "file_summaries": files,
         "reading_manifest": reading_manifest,
     }
@@ -382,9 +395,25 @@ def model_digest(
     payload["representative_file_capsules"] = _representative_capsules(
         files, max(0, int(max_chars) - base_size - 200), query=query
     )
+    # Keep useful topic/folder/report context separate from file evidence and
+    # coverage. It only receives space left after the physical-file sample.
+    context_budget = min(2000, max(0, int(max_chars) - len(json.dumps(payload, ensure_ascii=False)) - 300))
+    aggregate_context = context.get("context_summaries") or [] if (context.get("coverage") or {}).get("scope", "package") == "package" else []
+    context_capsules = _representative_capsules(aggregate_context, context_budget, query=query)
+    if not context_capsules and aggregate_context and context_budget > 0:
+        # A broad question can have no lexical overlap with another-language
+        # theme. Keep a bounded balanced sample as context in that case.
+        context_capsules = _representative_capsules(aggregate_context, context_budget)
+    if context_capsules:
+        payload["aggregate_summary_context"] = {
+            "instruction": "主题、目录和报告摘要仅供组织上下文；不是物理文件或原文证据，不计入文件阅读与摘要覆盖数量。",
+            "summaries": context_capsules,
+        }
     if aq.enabled():
         payload["instruction"] = "账本表示程序扫描已有资料的范围，不表示模型已阅读全部全文。归并要点用于组织整体脉络，摘要样本与统计不能视为全包穷尽结论；具体事实以编号证据为准。"
         dump = lambda: json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        while len(dump()) > max_chars and payload.get("aggregate_summary_context", {}).get("summaries"):
+            payload["aggregate_summary_context"]["summaries"].pop()
         while len(dump()) > max_chars and payload["representative_file_capsules"]:
             payload["representative_file_capsules"].pop()
         for key in ("directory_atlas", "semantic_signals", "missing_summary_sample"):

@@ -214,9 +214,65 @@
     return value || 'idle';
   }
 
+  function largeWorkspace() {
+    const route = document.body.dataset.route || '';
+    if (!['large-import', 'large-select', 'large-catalog', 'large-overview', 'large-result'].includes(route)) return null;
+    // Import is a new-package form. Never show the previous large package here.
+    if (route === 'large-import') return { route, snapshot: null };
+    const client = route === 'large-select' ? window.SJFXLargePackage : window.SJFXLargeResult;
+    const snapshot = client?.workspace?.();
+    const expected = String(window.sjfxLargeResultId || '');
+    return { route, snapshot: snapshot && snapshot.packageId === expected ? snapshot : null };
+  }
+
+  function railMetricLabels(large) {
+    const labels = { railSearchable: large ? '快速摘要' : '可搜索', railDeep: large ? '深度摘要' : '深析', railPending: large ? '待办' : '待处理' };
+    Object.entries(labels).forEach(([id, label]) => {
+      const span = $(id)?.parentElement?.querySelector('span');
+      if (span) span.textContent = label;
+    });
+    $('railDeepCompact')?.parentElement?.setAttribute('aria-label', large ? '已完成深度摘要文件数' : '深度分析覆盖率');
+    const action = document.querySelector('#workspaceRail [data-go-route]');
+    if (action) action.dataset.goRoute = large ? (large.snapshot ? 'large-select' : 'large-import') : 'source';
+  }
+
+  function updateLargeRail(context) {
+    const snapshot = context.snapshot;
+    const item = snapshot?.item || {};
+    const workflow = snapshot?.workflow || item;
+    const counts = item.counts || {};
+    // Only display server-supplied counts, including real zeroes. Quick
+    // summaries are not an evidence-index count or a derived completion rate.
+    const count = (value) => value != null && Number.isFinite(Number(value)) && Number(value) >= 0 ? String(value) : '—';
+    const root = String(item.root_path || '').replace(/[\\/]+$/, '');
+    $('workspaceRailName').textContent = snapshot ? (root.split(/[\\/]/).pop() || snapshot.packageId) : '大数据包';
+    $('railInventory').textContent = count(counts.total_files);
+    $('railSearchable').textContent = count(counts.quick?.completed);
+    const deep = count(counts.deep?.completed);
+    $('railDeep').textContent = deep;
+    if ($('railDeepCompact')) $('railDeepCompact').textContent = deep;
+    $('railPending').textContent = workflow.pending_blocking != null && workflow.pending_optional != null
+      ? `阻塞 ${count(workflow.pending_blocking)} / 可选 ${count(workflow.pending_optional)}` : '—';
+    const state = String(workflow.status || item.status || 'idle').toLowerCase();
+    const importReady = workflow.import_completed === true && ['completed', 'waiting_for_selection'].includes(state);
+    const label = !snapshot ? (context.route === 'large-import' ? '等待导入' : '正在读取大数据包')
+      : importReady ? '导入已完成 · 深度摘要可选'
+        : state === 'waiting_for_selection' ? '等待选择深度摘要'
+          : state === 'completed' ? '本轮处理完成' : statusLabels[state] || '准备中';
+    $('workspaceRail').dataset.state = state;
+    $('workspaceRailState').textContent = label;
+    const meta = $('workspaceRailMeta');
+    if (meta) meta.textContent = !snapshot
+      ? (context.route === 'large-import' ? '选择目录后导入大数据包。' : '正在读取当前大数据包的真实状态。')
+      : String(workflow.message || item.message || label).replace(/\s+/g, ' ').slice(0, 160);
+  }
+
   function updateRail() {
     const rail = $('workspaceRail');
     if (!rail) return;
+    const large = largeWorkspace();
+    railMetricLabels(large);
+    if (large) { updateLargeRail(large); return; }
     const realScan = hasRealScan();
     const name = $('workspaceName')?.textContent.trim() || '';
     const root = $('rootPath')?.value.trim() || '';
@@ -291,7 +347,9 @@
     if (!host) return;
     const route = document.body.dataset.route || 'dashboard';
     const hasScan = hasRealScan();
-    host.hidden = route === 'dashboard' || route === 'settings' || !hasScan;
+    // This five-step journey belongs to the ordinary source pipeline.
+    // Large pages already have their own catalog/overview/selection navigation.
+    host.hidden = Boolean(largeWorkspace()) || route === 'dashboard' || route === 'settings' || !hasScan;
     if (host.hidden) return;
     const state = hasScan ? processingState() : 'idle';
     const activeStage = stageForRoute[route] || 'packages';
@@ -427,6 +485,7 @@
     });
     window.addEventListener('sjfx-scan-changed', scheduleSync);
     window.addEventListener('sjfx-shell-state', scheduleSync);
+    window.addEventListener('sjfx-large-state', scheduleSync);
     window.addEventListener('scroll', syncScrollChrome, { passive: true });
     document.addEventListener('keydown', handleQuickNavigatorKeys);
   }

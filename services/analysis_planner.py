@@ -6,7 +6,7 @@ import re
 import uuid
 from typing import Any, Dict, List, Mapping, Optional
 
-from services.package_questions import PACKAGE_OVERVIEW_PATTERN, is_recorded_total_lookup
+from services.package_questions import FILE_SEARCH_PATTERN, PACKAGE_OVERVIEW_PATTERN, file_discovery_text, is_recorded_total_lookup
 
 
 ALLOWED_TOOLS = {
@@ -44,13 +44,7 @@ class AnalysisPlanner:
         r"^(?:你好|您好|嗨|hi|hello|谢谢|感谢|再见|你是谁|怎么用|帮助)[！!。.？?\s]*$",
         re.I,
     )
-    FILE_SEARCH_RE = re.compile(
-        r"(?:搜索|查找|找一下|找出|找到|列出|显示|筛选)\s*\S+"
-        r"|(?:包含|命中|有关|关于).{0,80}(?:文件|资料|文档)"
-        r"|(?:文件|资料|文档).{0,40}(?:搜索|查找|列表|清单|在哪|有哪些(?!发现|结论|成果|特点|问题|变化|影响|风险|建议|方法)|包含|命中)"
-        r"|\bfiles?\b",
-        re.I,
-    )
+    FILE_SEARCH_RE = re.compile(FILE_SEARCH_PATTERN, re.I)
     TRANSLATION_RE = re.compile(r"翻译|译成|双语|中英对照|translate|translation", re.I)
     # Structured execution is reserved for aggregation across records/files.
     # A bare value lookup such as ``预算多少`` or ``episodeSteps 是多少`` is a
@@ -120,7 +114,8 @@ class AnalysisPlanner:
             modes.append("general_qa")
         else:
             intent_text = re.sub(r"(?:不要|不必|无需|避免)(?:只|仅)?(?:列出|罗列|显示)[^。！？；;]{0,50}(?:目录|清单|列表)", "", question)
-            modes.extend(name for name, pattern in checks if pattern.search(intent_text)
+            modes.extend(name for name, pattern in checks
+                         if pattern.search(file_discovery_text(intent_text) if name == "file_search" else intent_text)
                          and not (name == "structured" and is_recorded_total_lookup(intent_text)))
             if not modes:
                 # Keep ordinary factual questions on the fast retrieval path.

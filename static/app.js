@@ -39,7 +39,10 @@ const state = {
   selectionOffset: 0,
   selectionTotal: 0,
   selectionNextOffset: null,
-  selectionShowAll: true
+  selectionShowAll: true,
+  selectionReady: false,
+  selectionSession: 0,
+  selectionFilesRequestSeq: 0
 };
 
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running', 'cancelling']);
@@ -53,6 +56,7 @@ const $ = (id) => document.getElementById(id);
 // server-side job keeps its durable checkpoint and continues in the Worker,
 // so switching packages never cancels or loses the work already completed.
 function detachUiFromCurrentWork() {
+  invalidateSelectionSession();
   state.jobId = null;
   state.fileWorkflowRequestSeq += 1;
   state.fileWorkflowAbortController?.abort();
@@ -2992,6 +2996,15 @@ function renderSelectionPanel() {
   const list = $('selectionFileList');
   const stats = $('selectionStats');
   if (!list || !stats) return;
+  ['selectionSelectAllBtn', 'selectionClearBtn', 'selectionConfirmBtn'].forEach((id) => {
+    const button = $(id);
+    if (button) button.disabled = !state.selectionReady || selectionConfirmPending;
+  });
+  if (!state.selectionReady) {
+    stats.textContent = '文件清单尚未就绪';
+    list.innerHTML = '<div class="empty-state">请等待文件清单加载完成；读取失败时可点击刷新重试。</div>';
+    return;
+  }
   const selection = state.selection || {};
   const included = new Set(selection.included_paths || []);
   const excluded = new Set(selection.excluded_paths || []);
@@ -3019,6 +3032,8 @@ function renderSelectionPanel() {
 async function loadSelectionFiles({ reset = false } = {}) {
   const scanId = state.scan?.scan_id;
   if (!scanId) return;
+  const session = state.selectionSession;
+  const requestSeq = ++state.selectionFilesRequestSeq;
   if (reset) state.selectionOffset = 0;
   const query = String($('selectionSearch')?.value || '').trim();
   const fileType = String($('selectionFileType')?.value || '').trim();
@@ -3028,9 +3043,11 @@ async function loadSelectionFiles({ reset = false } = {}) {
   if (fileType) params.set('file_type', fileType);
   if (query) params.set('search_scope', searchScope);
   const data = await api('/api/scan/' + encodeURIComponent(scanId) + '/files?' + params.toString());
+  if (!selectionIsCurrent(scanId, session) || requestSeq !== state.selectionFilesRequestSeq) return;
   state.selectionFiles = data.items || [];
   state.selectionTotal = Number(data.total || 0);
   state.selectionNextOffset = data.next_offset == null ? null : Number(data.next_offset);
+  state.selectionReady = true;
   if ($('selectionPrevBtn')) $('selectionPrevBtn').disabled = state.selectionOffset <= 0;
   if ($('selectionNextBtn')) $('selectionNextBtn').disabled = state.selectionNextOffset == null;
   renderSelectionPanel();
@@ -3123,6 +3140,7 @@ function renderCandidatePreviewCard() {
 }
 
 function setPackageStage(stage) {
+  if (stage === 'source' || stage === 'import') invalidateSelectionSession();
   const show = (id, visible) => $(id)?.classList.toggle('hidden', !visible);
   const isSource = stage === 'source';
   const isImport = stage === 'import';
@@ -3139,8 +3157,16 @@ function setPackageStage(stage) {
 
 async function openSelectionPanel(scanId = state.scan?.scan_id) {
   if (!scanId) return;
+  invalidateSelectionSession();
+  const session = state.selectionSession;
   state.scan = state.scan || { scan_id: scanId };
+  // A previous view may have already sent a draft. Read after it settles.
+  if (selectionSavePromise) {
+    try { await selectionSavePromise; } catch (_) { /* Previous view owns its error. */ }
+  }
+  if (!selectionIsCurrent(scanId, session)) return;
   const data = await api(`/api/scan/${encodeURIComponent(scanId)}/selection`);
+  if (!selectionIsCurrent(scanId, session)) return;
   state.selection = data.selection || {};
   const taskStatus = String(state.importTask?.status || state.processing?.import_task?.status || '').toLowerCase();
   // On a later visit, show the files outside the previous batch first. The
@@ -3151,21 +3177,70 @@ async function openSelectionPanel(scanId = state.scan?.scan_id) {
   );
   setPackageStage('selection');
   await loadSelectionFiles({ reset: true });
+  if (!selectionIsCurrent(scanId, session)) return;
   $('selectionCard')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 let selectionSaveTimer = null;
-function scheduleSelectionDraft() {
+let selectionSavePromise = null;
+let selectionConfirmPending = false;
+let selectionDraftRevision = 0;
+
+function selectionIsCurrent(scanId, session) {
+  return session === state.selectionSession && state.scan?.scan_id === scanId;
+}
+
+function invalidateSelectionSession() {
+  state.selectionSession += 1;
+  state.selectionFilesRequestSeq += 1;
+  state.selectionReady = false;
+  state.selection = null;
+  state.selectionFiles = [];
+  state.selectionOffset = 0;
+  state.selectionTotal = 0;
+  state.selectionNextOffset = null;
+  selectionDraftRevision += 1;
   clearTimeout(selectionSaveTimer);
-  selectionSaveTimer = setTimeout(async () => {
-    if (!state.scan?.scan_id || !state.selection) return;
-    try {
+  selectionSaveTimer = null;
+  selectionConfirmPending = false;
+  const button = $('selectionConfirmBtn');
+  if (button) setBusy(button, false);
+  renderSelectionPanel();
+}
+
+async function saveSelectionDraft(scanId, session) {
+  const previousSave = selectionSavePromise;
+  const save = (async () => {
+    if (previousSave) await previousSave;
+    if (selectionConfirmPending || !selectionIsCurrent(scanId, session) || !state.selection) return;
     const importStatus = String(state.importTask?.status || '').toLowerCase();
     if (importStatus && importStatus !== 'waiting_for_selection') return;
-      const data = await api(`/api/scan/${encodeURIComponent(state.scan.scan_id)}/selection`, { method: 'POST', body: JSON.stringify({ included_paths: state.selection.included_paths || [], excluded_paths: state.selection.excluded_paths || [], rules: state.selection.rules || {}, version: state.selection.version }) });
-      state.selection = data.selection || state.selection;
-      renderSelectionPanel();
-    } catch (error) { toast(error.message || '保存分析范围失败', true); }
+    const revision = selectionDraftRevision;
+    const data = await api(`/api/scan/${encodeURIComponent(scanId)}/selection`, { method: 'POST', body: JSON.stringify({ included_paths: state.selection.included_paths || [], excluded_paths: state.selection.excluded_paths || [], rules: state.selection.rules || {}, version: state.selection.version }) });
+    if (!selectionIsCurrent(scanId, session) || !state.selection) return;
+    // A newer edit keeps its paths while using the version just saved.
+    if (revision === selectionDraftRevision) state.selection = data.selection || state.selection;
+    else if (data.selection) state.selection.version = data.selection.version;
+    renderSelectionPanel();
+  })();
+  selectionSavePromise = save;
+  try { await save; } finally {
+    if (selectionSavePromise === save) selectionSavePromise = null;
+  }
+}
+
+function scheduleSelectionDraft() {
+  selectionDraftRevision += 1;
+  clearTimeout(selectionSaveTimer);
+  if (selectionConfirmPending) return;
+  const scanId = state.scan?.scan_id;
+  const session = state.selectionSession;
+  selectionSaveTimer = setTimeout(async () => {
+    selectionSaveTimer = null;
+    if (!scanId || !selectionIsCurrent(scanId, session)) return;
+    try {
+      await saveSelectionDraft(scanId, session);
+    } catch (error) { if (selectionIsCurrent(scanId, session)) toast(error.message || '保存分析范围失败', true); }
   }, 300);
 }
 
@@ -3190,30 +3265,42 @@ function bindSelectionControls() {
     renderSelectionPanel();
   });
   $('selectionSelectAllBtn')?.addEventListener('click', () => {
-    if (!state.selection) return;
+    if (!state.selection || !state.selectionReady || selectionConfirmPending) return;
     const excluded = new Set(state.selection.excluded_paths || []);
     const included = new Set(state.selection.included_paths || []);
     state.selectionFiles.forEach((item) => { const path = String(item.node_path || item.path || ''); if (path && !excluded.has(path) && item.status !== 'out_of_scope') included.add(path); });
     state.selection.included_paths = [...included];
     renderSelectionPanel(); scheduleSelectionDraft();
   });
-  $('selectionClearBtn')?.addEventListener('click', () => { if (!state.selection) return; state.selection.included_paths = []; renderSelectionPanel(); scheduleSelectionDraft(); });
+  $('selectionClearBtn')?.addEventListener('click', () => { if (!state.selection || !state.selectionReady || selectionConfirmPending) return; state.selection.included_paths = []; renderSelectionPanel(); scheduleSelectionDraft(); });
   $('selectionFileList')?.addEventListener('change', (event) => {
     const checkbox = event.target.closest('[data-selection-path]'); if (!checkbox || !state.selection) return;
+    if (!state.selectionReady || selectionConfirmPending) { renderSelectionPanel(); return; }
     const path = checkbox.dataset.selectionPath; const included = new Set(state.selection.included_paths || []); const excluded = new Set(state.selection.excluded_paths || []);
     if (checkbox.checked) { included.add(path); excluded.delete(path); } else { included.delete(path); excluded.add(path); }
     state.selection.included_paths = [...included]; state.selection.excluded_paths = [...excluded]; renderSelectionPanel(); scheduleSelectionDraft();
   });
   $('selectionConfirmBtn')?.addEventListener('click', async () => {
-    if (!state.scan?.scan_id || !state.selection) return;
+    if (!state.scan?.scan_id || !state.selection || !state.selectionReady || selectionConfirmPending) return;
+    const scanId = state.scan.scan_id;
+    const session = state.selectionSession;
+    selectionConfirmPending = true;
+    clearTimeout(selectionSaveTimer);
+    selectionSaveTimer = null;
     const button = $('selectionConfirmBtn'); setBusy(button, true, '正在启动…');
     try {
+      // Drain already-sent drafts before reading the confirmation version.
+      if (selectionSavePromise) await selectionSavePromise;
+      if (!selectionIsCurrent(scanId, session) || !state.selection) return;
       const importStatus = String(state.importTask?.status || '').toLowerCase();
-      const endpoint = importStatus && importStatus !== 'waiting_for_selection' ? 'supplement' : 'confirm'; const data = await api(`/api/scan/${encodeURIComponent(state.scan.scan_id)}/selection/${endpoint}`, { method: 'POST', body: JSON.stringify({ included_paths: state.selection.included_paths || [], excluded_paths: state.selection.excluded_paths || [], rules: state.selection.rules || {}, version: state.selection.version }) });
+      const endpoint = importStatus && importStatus !== 'waiting_for_selection' ? 'supplement' : 'confirm'; const data = await api(`/api/scan/${encodeURIComponent(scanId)}/selection/${endpoint}`, { method: 'POST', body: JSON.stringify({ included_paths: state.selection.included_paths || [], excluded_paths: state.selection.excluded_paths || [], rules: state.selection.rules || {}, version: state.selection.version }) });
+      if (!selectionIsCurrent(scanId, session)) return;
       state.selection = data.selection || state.selection;
+      selectionConfirmPending = false;
       setPackageStage('analysis');
       if (!data.accepted || !data.job_id) {
-        await refreshScan(state.scan.scan_id);
+        await refreshScan(scanId, () => selectionIsCurrent(scanId, session));
+        if (!selectionIsCurrent(scanId, session)) return;
         renderCandidatePreviewCard();
         toast(data.message || '当前没有新增的可解析文件。');
         return;
@@ -3221,7 +3308,7 @@ function bindSelectionControls() {
       state.jobId = data.job_id;
       toast(endpoint === 'supplement' ? `已补充 ${data.new_paths?.length || 0} 个文件，开始解析与初步摘要。` : `已确认 ${data.selected_count || 0} 个文件，开始解析与初步摘要。`);
       await pollJob(data.job_id);
-    } catch (error) { toast(error.message || '确认分析范围失败', true); } finally { if (button.isConnected) setBusy(button, false); }
+    } catch (error) { if (selectionIsCurrent(scanId, session)) toast(error.message || '确认分析范围失败', true); } finally { if (selectionIsCurrent(scanId, session)) { selectionConfirmPending = false; if (button.isConnected) setBusy(button, false); } }
   });
   $('selectionSwitchPackageBtn')?.addEventListener('click', () => window.SJFXDataSources?.open('standard') || window.SJFXShell?.activate('packages'));
 }

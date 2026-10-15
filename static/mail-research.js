@@ -1,6 +1,6 @@
 (() => {
   "use strict";
-  const state = { packageId: "", packageEpoch: 0, sessionId: "", resultSetId: "", evidenceId: "", jobId: "", turnId: "", pollEpoch: 0, researchTurns: {}, questions: {}, titles: {}, chinese: {}, previewEpoch: 0, resultEpoch: 0, listEpoch: 0, offset: 0, final: null, conversationItems: [], conversationOffset: 0, versionItems: [], versionOffset: 0 };
+  const state = { packageId: "", packageEpoch: 0, overviewEpoch: 0, coverageEpoch: 0, sessionId: "", resultSetId: "", evidenceId: "", jobId: "", turnId: "", pollEpoch: 0, researchTurns: {}, questions: {}, titles: {}, chinese: {}, previewEpoch: 0, resultEpoch: 0, listEpoch: 0, offset: 0, final: null, conversationItems: [], conversationOffset: 0, versionItems: [], versionOffset: 0 };
   const byId = (id) => document.getElementById(id);
   // 分页大小与「邮件与证据」列表保持一致。这两个列表不再截断，全部条目均可翻页抵达。
   const PANEL_PAGE_SIZE = 25;
@@ -213,9 +213,10 @@
     if (!state.packageId) {status("请先选择资料包，再选择首页任务；也可导入新的邮件资料。");updateText("mail-package-summary","选择资料包后查看已收录邮件和来源。");updateText("mail-current-scope","尚未选择资料包");updateText("mail-processing-summary","选择资料包后显示处理状态与资料缺口");return;}
     status("正在读取所选资料包…");
     updateText("mail-package-summary","正在读取资料包数量与覆盖情况…");
+    const overviewEpoch=++state.overviewEpoch;
     const payload = await api(`/api/mail/packages/${encodeURIComponent(packageId)}`);
     if(packageEpoch!==state.packageEpoch || packageId!==state.packageId)return;
-    renderOverview({ ...payload.overview, coverage: payload.coverage });
+    if(overviewEpoch===state.overviewEpoch)renderOverview({ ...payload.overview, coverage: payload.coverage });
     await Promise.all([loadMessages(), loadSessions(), loadRelations(), loadMiningViews()]);
     if(packageEpoch===state.packageEpoch && packageId===state.packageId)status(`已选择资料包：${byId('mail-package').selectedOptions?.[0]?.textContent||'当前资料包'}。可选择首页任务或浏览邮件。`);
   }
@@ -439,11 +440,15 @@
     if(packageEpoch!==state.packageEpoch)return;
     watchJob(payload.job_id, true);
   }
-  async function refreshPackageReadOnly(packageId, packageEpoch) {
-    const payload=await api(`/api/mail/packages/${encodeURIComponent(packageId)}`);
+  async function refreshPackageReadOnly(packageId, packageEpoch, {refreshFoundation=true,refreshGaps=false}={}) {
+    const overviewEpoch=++state.overviewEpoch;
+    const coverageEpoch=refreshGaps?++state.coverageEpoch:null;
+    const base=`/api/mail/packages/${encodeURIComponent(packageId)}`;
+    const [payload,gaps]=await Promise.all([api(base),refreshGaps?api(`${base}/coverage`):null]);
     if(packageEpoch!==state.packageEpoch || packageId!==state.packageId)return;
-    renderOverview({...payload.overview,coverage:payload.coverage});
-    if(window.SJFXMailFoundation)await window.SJFXMailFoundation.refreshFoundation();
+    if(overviewEpoch===state.overviewEpoch)renderOverview({...payload.overview,coverage:payload.coverage});
+    if(gaps && coverageEpoch===state.coverageEpoch)renderCoverageGaps(gaps);
+    if(refreshFoundation && overviewEpoch===state.overviewEpoch && window.SJFXMailFoundation)await window.SJFXMailFoundation.refreshFoundation();
   }
   async function watchJob(jobId, download = false) {
     const packageId=state.packageId,packageEpoch=state.packageEpoch;
@@ -603,9 +608,14 @@
     translateResult(result).catch(report);
   }
 
+  function renderCoverageGaps(coverage) {
+    const gaps=byId("mail-coverage-gaps");clear(gaps);
+    (coverage.items || []).forEach((item,i)=>{const li=document.createElement("li");const button=document.createElement("button");button.type="button";button.className="mail-relation-link";button.textContent=`${zhLabel(item.status)} · ${item.filename_raw || `未命名附件 ${i+1}`}`;button.addEventListener("click",()=>inspectAttachment(item.message_key,item.mime_path,item.filename_raw || `未命名附件 ${i+1}`).catch(report));li.append(button);gaps.append(li);});
+    if (!coverage.total) {const li=document.createElement("li");li.textContent="当前附件没有待处理缺口";gaps.append(li);}
+  }
   async function loadMiningViews() {
     if (!state.packageId) return;
-    const packageEpoch=state.packageEpoch;
+    const packageEpoch=state.packageEpoch,coverageEpoch=++state.coverageEpoch;
     const base=`/api/mail/packages/${encodeURIComponent(state.packageId)}`;
     const scopeQuery=window.SJFXMailFoundation?window.SJFXMailFoundation.query(window.SJFXMailFoundation.currentScope()):"";
     const [coverage,results,conversations,versions,network]=await Promise.all([api(`${base}/coverage`),api(`${base}/result-sets`),api(`${base}/conversations?${window.SJFXMailFoundation?window.SJFXMailFoundation.query(window.SJFXMailFoundation.currentScope()):""}`),api(`${base}/attachment-versions?${scopeQuery}`),api(`${base}/relations/network?${scopeQuery}`).catch(error=>{
@@ -620,9 +630,7 @@
       return null;
     })]);
     if(packageEpoch!==state.packageEpoch)return;
-    const gaps=byId("mail-coverage-gaps");clear(gaps);
-    (coverage.items || []).forEach((item,i)=>{const li=document.createElement("li");const button=document.createElement("button");button.type="button";button.className="mail-relation-link";button.textContent=`${zhLabel(item.status)} · ${item.filename_raw || `未命名附件 ${i+1}`}`;button.addEventListener("click",()=>inspectAttachment(item.message_key,item.mime_path,item.filename_raw || `未命名附件 ${i+1}`).catch(report));li.append(button);gaps.append(li);});
-    if (!coverage.total) {const li=document.createElement("li");li.textContent="当前附件没有待处理缺口";gaps.append(li);}
+    if(coverageEpoch===state.coverageEpoch)renderCoverageGaps(coverage);
     const history=byId("mail-result-history");clear(history);history.append(option("选择结果集…",""));(results.items || []).forEach(item=>history.append(option(`${date(item.created_at)} · ${item.item_count} 条${item.parent_result_set_id ? " · 追问" : ""}`,item.result_set_id)));history.value=state.resultSetId;
     state.conversationItems=conversations.items || []; renderConversationList();
     state.versionItems=versions.items || []; renderVersionList();
@@ -809,6 +817,15 @@
       }
     }catch(_){host.textContent='暂时无法读取当前服务器能力。可先浏览已导入资料；导入格式与分析服务是否可用，以提交后的服务提示为准。';const readiness=byId('mail-workspace-readiness');if(readiness){readiness.textContent='当前服务器分析服务状态尚未确认；可先浏览资料，连接服务后会更新。';readiness.classList.remove('mail-error');}}
   }
+  // Foundation stages can finish after the import job. Refresh the same package's
+  // actual repository coverage; ready vector segments are not a text-readiness proxy.
+  document.addEventListener("sjfx:mail-foundation-refreshed",event=>{
+    const packageId=event.detail?.package_id,packageEpoch=state.packageEpoch;
+    if(!packageId || packageId!==state.packageId)return;
+    refreshPackageReadOnly(packageId,packageEpoch,{refreshFoundation:false,refreshGaps:true}).catch(error=>{
+      if(packageEpoch===state.packageEpoch && packageId===state.packageId)report(error);
+    });
+  });
   document.addEventListener("sjfx:mail-scope",event=>{
     const detail=event.detail || {};if(detail.source!=="people" || (detail.package_id && detail.package_id!==state.packageId))return;
     const filters=detail.filters || detail;

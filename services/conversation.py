@@ -18,7 +18,7 @@ import hashlib
 import json
 import re
 import uuid
-from services.package_questions import PACKAGE_OVERVIEW_PATTERN, is_recorded_total_lookup
+from services.package_questions import FILE_SEARCH_PATTERN, PACKAGE_OVERVIEW_PATTERN, file_discovery_text, is_recorded_total_lookup
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -403,13 +403,7 @@ class IntentRouter:
         r"group\s+by|how many",
         re.I,
     )
-    FILE_SEARCH_RE = re.compile(
-        r"(?:搜索|查找|找一下|找出|找到|列出|显示|筛选)\s*\S+"
-        r"|(?:包含|命中|有关|关于).{0,80}(?:文件|资料|文档)"
-        r"|(?:文件|资料|文档).{0,40}(?:搜索|查找|列表|清单|在哪|有哪些(?!发现|结论|成果|特点|问题|变化|影响|风险|建议|方法)|包含|命中)"
-        r"|\bfiles?\b",
-        re.I,
-    )
+    FILE_SEARCH_RE = re.compile(FILE_SEARCH_PATTERN, re.I)
     SUMMARY_RE = re.compile(r"总结|概括|概览|综述|梳理|整体介绍|总体介绍|主要(?:讲|内容|发现|主题|方向)|资料.{0,16}(?:研究什么|讲什么)|重点是什么|摘要|overview|summari[sz]e|" + PACKAGE_OVERVIEW_PATTERN, re.I)
     CASUAL_RE = re.compile(
         r"^(?:你好|您好|嗨|hi|hello|谢谢|感谢|辛苦了|再见|你是谁|你能做什么|怎么用|帮助)(?:[呀啊吗呢！!。.？?\s]*)$",
@@ -462,7 +456,8 @@ class IntentRouter:
                 ("summary", self.SUMMARY_RE),
                 ("analysis", self.ANALYSIS_RE),
             )
-            if pattern.search(text) and not (name == "structured" and is_recorded_total_lookup(text))
+            if pattern.search(file_discovery_text(text) if name == "file_search" else text)
+            and not (name == "structured" and is_recorded_total_lookup(text))
         ]
         if len(matched_intents) > 1:
             return IntentDecision(
@@ -478,7 +473,8 @@ class IntentRouter:
             ("summary", self.SUMMARY_RE, "问题要求概括当前资料范围"),
             ("analysis", self.ANALYSIS_RE, "问题要求分析、推理、研究方向或下一步建议"),
         ):
-            if pattern.search(text) and not (name == "structured" and is_recorded_total_lookup(text)):
+            if (pattern.search(file_discovery_text(text) if name == "file_search" else text)
+                    and not (name == "structured" and is_recorded_total_lookup(text))):
                 return IntentDecision(name=name, confidence=0.98, reason=reason)
         if is_follow_up and previous_intent in {"file_search", "translation", "relationship", "structured", "summary", "retrieval", "analysis", "casual", "creative", "general_qa"}:
             return IntentDecision(

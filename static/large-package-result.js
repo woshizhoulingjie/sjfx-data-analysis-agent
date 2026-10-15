@@ -8,6 +8,7 @@
   const selectedForSummary = new Set();
   let currentStage = 'overview';
   let latestStatus = {};
+  let workspaceStatus = null;
   let liveTimer = null;
   let retryTimer = null;
 
@@ -22,7 +23,7 @@
     document.querySelector('.large-result-view')?.setAttribute('data-large-mode', currentStage);
     const titles = {
       catalog: ['大数据包目录', '选择目录或主题，查看关联文件与摘要。'],
-      overview: ['大数据包情报概览', '深度摘要完成后生成研究简报、推荐方向和下载报告。'],
+      overview: ['大数据包情报概览', '基于智能目录与已有摘要形成初步简报；完成深度摘要后自动更新。'],
     };
     const heading = titles[currentStage] || titles.overview;
     setText('largeResultPageTitle', heading[0]);
@@ -592,6 +593,8 @@
 
   function renderControls(item, snapshot = null) {
     latestStatus = item || {};
+    workspaceStatus = { packageId, item: latestStatus, workflow: snapshot };
+    window.dispatchEvent(new CustomEvent('sjfx-large-state'));
     const status = String(item.status || '').toLowerCase();
     const active = status === 'queued' || status === 'running';
     const paused = status === 'paused';
@@ -787,7 +790,8 @@
     document.querySelectorAll('.app-view').forEach(el => el.classList.toggle('active', el.dataset.view === 'large-result'));
     try { await load(); } catch (error) { if (requestId === activationId) setText('largeResultStatus', error.message || '大数据包成果读取失败'); }
   }
-  window.SJFXLargeResult = { activate };
+  window.SJFXLargeResult = { activate,
+    workspace: () => workspaceStatus?.packageId === packageId ? workspaceStatus : null };
   window.addEventListener('sjfx-shell-state', event => {
     if (!['large-catalog', 'large-overview', 'large-result'].includes(event.detail?.route)) {
       clearTimeout(liveTimer); clearInterval(retryTimer); loadRequestId++; fileRequestId++; activationId++;
