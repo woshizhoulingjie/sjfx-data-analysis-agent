@@ -7684,13 +7684,7 @@ def get_scan_selection(scan_id):
     """Return the resumable import-preprocessing selection contract."""
     try:
         scan_result = require_scan(scan_id)
-        selection = storage.get_scan_selection(scan_id)
-        if not selection:
-            defaults = storage.default_scan_selection(scan_id)
-            selection = storage.save_scan_selection(
-                scan_id, defaults.get("included_paths"), defaults.get("excluded_paths"),
-                defaults.get("rules"), status="draft",
-            )
+        selection = storage.ensure_default_scan_selection(scan_id)
         selection_stats = storage.scan_selection_stats(scan_id, selection)
         selection.update(selection_stats)
         return jsonify({

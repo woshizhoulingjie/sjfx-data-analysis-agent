@@ -5144,13 +5144,7 @@ def analyze_package(scan_id, scan, storage, parser, progress=None, embedding_cli
         progress(72, "全量轻度解析完成，准备确认分析范围")
 
     if preprocess_only:
-        selection = storage.get_scan_selection(scan_id)
-        if not selection:
-            defaults = storage.default_scan_selection(scan_id)
-            selection = storage.save_scan_selection(
-                scan_id, defaults.get("included_paths"), defaults.get("excluded_paths"),
-                defaults.get("rules"), status="draft",
-            )
+        selection = storage.ensure_default_scan_selection(scan_id)
         preview_counts = storage.file_preview_counts(scan_id)
         selection_gate = {
             "status": "awaiting_user_confirmation",

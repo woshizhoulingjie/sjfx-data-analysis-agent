@@ -6529,6 +6529,24 @@ class Storage:
             item["inventory_fingerprint"] = self.inventory_fingerprint(scan_id)
         return item
 
+    def ensure_default_scan_selection(self, scan_id):
+        """Create the initial draft once; never update an existing selection."""
+        selection = self.get_scan_selection(scan_id)
+        if selection:
+            return selection
+        defaults = self.default_scan_selection(scan_id)
+        inventory_fingerprint = self.inventory_fingerprint(scan_id)
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO scan_selections("
+                "scan_id,status,version,included_paths,excluded_paths,rules,inventory_fingerprint,confirmed_at,updated_at) "
+                "VALUES (?,'draft',1,?,?,?,?,NULL,CURRENT_TIMESTAMP)",
+                (str(scan_id), json.dumps(defaults.get("included_paths") or [], ensure_ascii=False),
+                 json.dumps(defaults.get("excluded_paths") or [], ensure_ascii=False),
+                 json.dumps(defaults.get("rules") or {}, ensure_ascii=False), inventory_fingerprint),
+            )
+        return self.get_scan_selection(scan_id)
+
     def save_scan_selection(self, scan_id, included_paths=None, excluded_paths=None,
                             rules=None, status="draft", expected_version=None):
         """Persist a resumable selection draft or immutable confirmed snapshot."""
