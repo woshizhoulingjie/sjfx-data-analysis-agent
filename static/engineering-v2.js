@@ -45,7 +45,7 @@
     chatSourceOffset: 0, chatSourceHasMore: false, chatSourceLoading: false, chatSourceError: '', chatSourceSelectionSeq: 0,
     translationSourceKind: 'standard', translationSourceId: '', translationSourceList: [], translationSourceRequestSeq: 0,
     translationSourceOffset: 0, translationSourceHasMore: false, translationSourceLoading: false, translationSourceError: '',
-    watchers: new Map(), scopeConstraints: {}, fileFolder: new Set()
+    watchers: new Map(), scopeConstraints: {}, scopeEditVersion: 0, fileFolder: new Set()
   };
 
   try { state.fileFolder = new Set(JSON.parse(sessionStorage.getItem('sjfx_file_folder_v1') || '[]')); } catch (_) {}
@@ -651,6 +651,7 @@
   }
 
   function carryScopeToConversation(scope) {
+    state.scopeEditVersion += 1;
     scope = scope || state.selectedScope || { kind: 'package', value: '' };
     state.scopeConstraints = Object.assign({}, scope.constraints || {});
     state.scopeConstraints.source_paths = scope.source_paths || [];
@@ -1306,7 +1307,7 @@
     $('conversationScopeSummary').textContent = session ? (generalMode ? '通用聊天 · 导入数据包后可切换资料证据模式' : scopeSummary(session.scope)) : '请选择范围并新建会话';
     const contextPicker = document.querySelector('.v2-context-picker');
     if (contextPicker) contextPicker.hidden = generalMode;
-    updateContextChip(generalMode ? { kind: 'general' } : (session && session.scope));
+    updateContextChip(generalMode ? { kind: 'general' } : undefined);
     const messages = session && Array.isArray(session.messages) ? session.messages : [];
     const older = session && session.message_page && session.message_page.has_more
       ? '<button type="button" class="text-button v2-load-older" data-load-older-messages>加载更早消息</button>'
@@ -2042,6 +2043,7 @@
     if (!generalMode) {
       try { turnScope = conversationScope(); } catch (error) { notify(error.message, true); return; }
     }
+    const scopeEditVersion = state.scopeEditVersion;
     if (generalMode) {
       state.generalChatSending = true;
       const history = (state.conversation.messages || []).filter((message) => message.role === 'user' || message.role === 'assistant').slice(-12);
@@ -2100,6 +2102,9 @@
       });
       if (!isCurrent()) return;
       state.conversation = response.session;
+      // Adopt the next-turn scope once the request is accepted. Polling only
+      // redraws the draft chip, so later scope edits stay under user control.
+      if (scopeEditVersion === state.scopeEditVersion) restoreConversationScope(response.session?.scope);
       state.conversationPending = null;
       registerAnalysisTurn(response.turn, []);
       await attachFileResults(question, response.turn);
@@ -2941,8 +2946,10 @@
     $('packageOverviewAskAllBtn').addEventListener('click', () => carryScopeToConversation({ kind: 'package', label: '整个数据包', source_paths: [] }));
     $('packageOverviewAskBtn').addEventListener('click', () => carryScopeToConversation(state.selectedScope));
     $('packageOverviewReportBtn').addEventListener('click', downloadReport);
-    $('conversationScopeKind').addEventListener('change', () => { state.scopeConstraints = {}; renderScopeFields(); });
-    $('conversationScopeFields').addEventListener('input', () => updateContextChip());
+    $('conversationScopeKind').addEventListener('change', () => { state.scopeEditVersion += 1; state.scopeConstraints = {}; renderScopeFields(); });
+    const scopeEdited = () => { state.scopeEditVersion += 1; updateContextChip(); };
+    $('conversationScopeFields').addEventListener('input', scopeEdited);
+    $('conversationScopeFields').addEventListener('change', scopeEdited);
     document.querySelector('[data-view="overview"]').addEventListener('click', (event) => {
       const appendixLink = event.target.closest('[data-io-open-evidence], [data-io-evidence-number]');
       if (appendixLink) {

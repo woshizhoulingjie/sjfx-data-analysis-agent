@@ -343,11 +343,20 @@ def _expand_authored_citations(value, chunks, parties, roots):
             source={**chunk,'authored':True}
             located=_located_citation(raw,{source['chunk_id']:source})
             original=checked_citation(located,{source['chunk_id']:source})
+            if original is None:
+                quote=located.get('quote')
+                if not isinstance(quote,str) or not 1<=len(quote)<8:continue
+                seed=source['text'].find(quote)
+                # Short text only locates context; even an explicit offset cannot
+                # make an ambiguous seed safe. Attribution checks stay unchanged.
+                if seed<0 or source['text'].find(quote,seed+1)>=0:continue
+                original=checked_citation(located,{source['chunk_id']:source},min_quote_chars=1)
             if not original or original['quotation_warning']:continue
             fragments=[f for f in source.get('body_fragments',[]) if f.get('fragment_kind')=='authored'
                        and f.get('char_start',-1)<=original['char_start'] and f.get('char_end',-1)>=original['char_end']]
             if len(fragments)!=1:continue
             start,end=fragments[0]['char_start'],fragments[0]['char_end']
+            if source.get('quotation_boundary') is not None:end=min(end,source['quotation_boundary'])
             base=source['char_start']
             if not 0<end-start<=1200 or start<base or end>base+len(source['text']):continue
             if (start,end)==(original['char_start'],original['char_end']):continue

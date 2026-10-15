@@ -271,12 +271,14 @@ def reading_chunk_payload(chunk):
     return payload
 
 
-def checked_citation(citation, chunks):
+def checked_citation(citation, chunks, *, min_quote_chars=8):
     """Match an exact quote and its explicit occurrence, with provenance preserved."""
+    if isinstance(min_quote_chars,bool) or not isinstance(min_quote_chars,int) or not 1<=min_quote_chars<=1200:
+        return None
     if not isinstance(citation, dict) or not isinstance(citation.get('chunk_id'), str):
         return None
     chunk = chunks.get(citation['chunk_id']); quote = citation.get('quote')
-    minimum=max(1,min(8,len(chunk['text'].strip()))) if chunk and chunk.get('attribution_version')==2 else 8
+    minimum=max(1,min(min_quote_chars,len(chunk['text'].strip()))) if chunk and chunk.get('attribution_version')==2 else min_quote_chars
     if not chunk or not isinstance(quote,str) or not quote.strip() or not 1 <= len(quote) <= 1200:
         return None
     supplied = citation.get('char_start')
@@ -309,7 +311,7 @@ def checked_citation(citation, chunks):
             left=fragment['char_start']-chunk['char_start'];right=fragment_end-chunk['char_start']
             if left<0 or right>len(chunk['text']) or right<=left:continue
             original=chunk['text'][left:right];short=original.strip()
-            if not short or len(short)>=8:continue
+            if not short or len(short)>=min_quote_chars:continue
             content_start=fragment['char_start']+len(original)-len(original.lstrip())
             content_end=fragment_end-(len(original)-len(original.rstrip()))
             if quote.strip()==short and absolute<=content_start and end>=content_end:

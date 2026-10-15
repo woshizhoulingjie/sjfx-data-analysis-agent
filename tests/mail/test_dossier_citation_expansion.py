@@ -2,6 +2,7 @@
 from copy import deepcopy
 import pytest
 from services.mail.analysis import _expand_authored_citations, validate_dossier
+from services.mail.person_research import checked_citation
 
 FIRST='报价90,000.00元/台，需经财务审批后生效。'
 DEADLINE='财务预计2026年9月17日完成审批。'
@@ -30,6 +31,80 @@ def test_expand_valid_citation_preserves_claim_and_passes_original_strict_valida
     assert audit[0]['original_span']==[10,10+len(FIRST)]
     assert audit[0]['expanded_span']==[10,10+len(chunk['text'])]
     assert len(validate_dossier(expanded,[chunk],['alice@test'],{'m1'}))==1
+
+
+def test_unique_short_seed_expands_real_authored_body_without_relaxing_final_validation():
+    value,chunk=sample();short='需经财务审批后'
+    raw={'chunk_id':'c1','quote':short,'char_start':10+chunk['text'].index(short)}
+    value['findings'][0]['citations']=[raw];before=deepcopy(value)
+    assert len(short)==7 and checked_citation(raw,{'c1':chunk}) is None
+    located=checked_citation(raw,{'c1':chunk},min_quote_chars=1)
+    assert located['char_start']==raw['char_start'] and not located['quotation_warning']
+    assert located['message_key']=='m1' and located['mime_path']=='1'
+    with pytest.raises(ValueError):validate_dossier(value,[chunk],['alice@test'],{'m1'})
+    expanded,audit=_expand_authored_citations(value,[chunk],['alice@test'],{'m1'})
+    assert value==before
+    assert {k:v for k,v in expanded['findings'][0].items() if k!='citations'}=={k:v for k,v in before['findings'][0].items() if k!='citations'}
+    assert expanded['findings'][0]['citations'][0]=={**raw,'quote':chunk['text'],'char_start':10}
+    assert audit[0]['original_span']==[raw['char_start'],raw['char_start']+7]
+    assert audit[0]['expanded_span']==[10,chunk['char_end']]
+    checked=checked_citation(expanded['findings'][0]['citations'][0],{'c1':chunk})
+    assert checked and checked['quote']==chunk['text'] and not checked['quotation_warning']
+    assert len(validate_dossier(expanded,[chunk],['alice@test'],{'m1'}))==1
+
+
+@pytest.mark.parametrize('fault',['ambiguous','overlapping','missing','actor','quoted','uncertain','nonroot','attachment','legacy','overlapping_authored'])
+def test_short_seed_cannot_bypass_source_or_unique_occurrence_requirements(fault):
+    value,chunk=sample();short='需经财务审批后'
+    if fault=='ambiguous':chunk['text']+='\n'+short
+    elif fault=='overlapping':short='哈哈';chunk['text']+='\n哈哈哈'
+    elif fault=='missing':short='不存在的引用'
+    elif fault=='actor':value['findings'][0]['actor']='bob@test'
+    elif fault=='quoted':chunk['quoted_ranges']=[(10,10+len(chunk['text']))]
+    elif fault=='uncertain':chunk['attribution_uncertain']=True
+    elif fault=='nonroot':chunk['message_key']='outside'
+    elif fault=='attachment':chunk['source_kind']='attachment'
+    elif fault=='legacy':chunk['attribution_version']=1
+    elif fault=='overlapping_authored':chunk['body_fragments'].append(deepcopy(chunk['body_fragments'][0]))
+    chunk['char_end']=10+len(chunk['text']);chunk['body_fragments'][0]['char_end']=chunk['char_end']
+    position=chunk['text'].find(short)
+    value['findings'][0]['citations']=[{'chunk_id':'c1','quote':short,'char_start':10+max(0,position)}]
+    before=deepcopy(value)
+    expanded,audit=_expand_authored_citations(value,[chunk],['alice@test','bob@test'],{'m1'})
+    assert audit==[] and expanded==before
+    with pytest.raises(ValueError):validate_dossier(expanded,[chunk],['alice@test','bob@test'],{'m1'})
+
+
+def test_short_seed_expansion_stops_at_real_authored_quotation_boundary():
+    value,chunk=sample();body=chunk['text'];short='需经财务审批后'
+    chunk['text']+='\nOriginal message\n历史转发内容及其原始报价条件。'
+    chunk['char_end']=10+len(chunk['text']);chunk['body_fragments'][0]['char_end']=chunk['char_end']
+    chunk['quotation_boundary']=10+len(body)
+    value['findings'][0]['citations']=[{'chunk_id':'c1','quote':short,'char_start':10+body.index(short)}]
+    expanded,audit=_expand_authored_citations(value,[chunk],['alice@test'],{'m1'})
+    assert audit[0]['expanded_span']==[10,10+len(body)]
+    assert expanded['findings'][0]['citations'][0]['quote']==body
+    assert len(validate_dossier(expanded,[chunk],['alice@test'],{'m1'}))==1
+
+
+def test_expanded_short_seed_still_rejects_omitted_approval_condition():
+    value,chunk=sample();short='需经财务审批后'
+    value['findings'][0].update(statement='报价90,000.00元/台。',unresolved_questions=[])
+    value['findings'][0]['citations']=[{'chunk_id':'c1','quote':short,'char_start':10+chunk['text'].index(short)}]
+    expanded,audit=_expand_authored_citations(value,[chunk],['alice@test'],{'m1'})
+    assert audit and expanded['findings'][0]['citations'][0]['quote']==chunk['text']
+    assert expanded['findings'][0]['statement']==value['findings'][0]['statement']
+    with pytest.raises(ValueError):validate_dossier(expanded,[chunk],['alice@test'],{'m1'})
+
+
+def test_default_validator_keeps_complete_genuine_short_fragment_exception():
+    _,chunk=sample('取消\nOriginal message\nEarlier conditional negotiation details.')
+    chunk['body_fragments']=[{'fragment_kind':'authored','char_start':10,'char_end':13},
+                             {'fragment_kind':'quoted','char_start':13,'char_end':chunk['char_end']}]
+    chunk['quotation_boundary']=13
+    short=checked_citation({'chunk_id':'c1','quote':'取消','char_start':10},{'c1':chunk})
+    assert short and not short['quotation_warning']
+    assert checked_citation({'chunk_id':'c1','quote':'消','char_start':11},{'c1':chunk}) is None
 
 
 def test_expansion_leaves_already_valid_findings_and_their_local_context_unchanged():
@@ -69,10 +144,16 @@ def test_expansion_requires_same_actor_message_exact_quote_and_bounded_authored_
 
 
 @pytest.mark.parametrize('has_deadline',[True,False])
-def test_reading_commits_cursor_only_after_strict_revalidation(monkeypatch,has_deadline):
+@pytest.mark.parametrize('short_seed',[False,True])
+def test_reading_commits_cursor_only_after_strict_revalidation(monkeypatch,has_deadline,short_seed):
     from types import SimpleNamespace
     from services.mail import analysis
     value,chunk=sample(None if has_deadline else FIRST+'\n财务审批尚未完成。')
+    if short_seed:
+        value['findings']=[deepcopy(value['findings'][0]) for _ in range(3)]
+        for row in value['findings'][:2]:row['unresolved_questions']=[]
+        quote='需经财务审批后'
+        value['findings'][2]['citations']=[{'chunk_id':'c1','quote':quote,'char_start':10+chunk['text'].index(quote)}]
     checkpoint={'phase':'reading','cursor':[0,0],'model_calls':0,'batches':0,'characters_read':0,'findings_count':0}
     spec={'mode':'message_dossier','engine_version':analysis.VERSION,'package_id':'p',
           'context_keys':['m1'],'message_keys':['m1'],'parties':['alice@test'],
@@ -91,6 +172,7 @@ def test_reading_commits_cursor_only_after_strict_revalidation(monkeypatch,has_d
         analysis.run_slice(repo,'t','owner',object())
         assert len(calls)==1  # Context repair needs no second model request.
         assert len(commits)==1 and commits[0][0][4]['cursor']==[99,0]
+        assert len(commits[0][1]['value']['findings'])==(3 if short_seed else 1)
         assert any(event[1]=='dossier_citation_context_expanded' and event[2]['accepted'] for event in events)
     else:
         with pytest.raises(ValueError,match='17'):analysis.run_slice(repo,'t','owner',object())

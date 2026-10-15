@@ -184,13 +184,19 @@ def test_sensitive_member_basename_is_enforced_even_if_flag_is_absent(downloads,
     assert 'synthetic-secret-only' not in response.text
 
 
-def test_ordinary_member_missing_inventory_never_falls_back_to_container(downloads):
+def test_ordinary_member_missing_inventory_recovers_only_exact_member_without_writes(downloads):
     with downloads.storage._connect() as conn:
         conn.execute('DELETE FROM inventory_entries WHERE scan_id=? AND node_path=?',
                      (downloads.scan_id, 'bundle.zip::docs/member.txt'))
+    with downloads.storage._connect() as conn:
+        before = tuple(conn.iterdump())
     response = get(downloads, 'ordinary', 'bundle.zip::docs/member.txt')
-    assert response.status_code == 404
+    assert response.status_code == 200, response.text
+    assert response.content == TEXT
     assert response.content != (downloads.root / 'bundle.zip').read_bytes()
+    with downloads.storage._connect() as conn:
+        assert tuple(conn.iterdump()) == before
+    assert not list(downloads.snapshots.iterdir())
 
 
 @pytest.mark.parametrize('kind', ['ordinary', 'large'])

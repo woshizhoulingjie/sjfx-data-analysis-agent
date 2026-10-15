@@ -9,6 +9,7 @@ import stat as stat_module
 import tempfile
 import tarfile
 from contextlib import contextmanager
+from contextvars import copy_context
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 import re
 import threading

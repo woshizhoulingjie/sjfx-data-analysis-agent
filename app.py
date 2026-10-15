@@ -77,7 +77,7 @@ from services.scanner import (
 from services.storage import LazyStorage, Storage
 from services.tree_editor import filter_tree
 from services.structured_qa import answer_question
-from services.unified_parser import UnifiedDocumentParser
+from services.unified_parser import UnifiedDocumentParser, strict_archive_member_name
 from services.agent_runtime import PydanticAgentRuntime
 from services.offline_translation import OfflineNLLBProvider
 from services.quickmt_translation import OfflineQuickMTProvider
@@ -112,7 +112,7 @@ from services.package_exploration import (
     classify_preview, preview_as_document, preview_matches_category,
 )
 from services.homogeneous_documents import analyze_homogeneous_documents
-from services.logical_units import iter_logical_units
+from services.logical_units import ARCHIVE_EXTENSIONS, iter_logical_units
 
 
 MINIMUM_PYTHON_VERSION = (3, 10)
@@ -8686,6 +8686,50 @@ def _check_raw_source_policy(node, path):
         raise ValueError("当前文件仅允许查看元数据")
 
 
+def _discover_raw_archive_member(scan_id, scan, node_path):
+    """Recover one missing logical identity from an owned physical inventory.
+
+    Import remains metadata-only. Old and newly parsed ordinary packages can
+    therefore lack logical rows; this read-time recovery never changes their
+    inventory, selection or caches and never trusts an evidence label.
+    """
+    from services.package_analysis import SourceFileChangedError
+    physical_path, separator, member = node_path.partition("::")
+    if not separator or strict_archive_member_name(member) != member:
+        raise ValueError("归档成员请求路径不安全")
+    resolve_under(scan["root"], physical_path)
+    container = storage.get_inventory_entry(scan_id, physical_path)
+    if not container:
+        container = next((node for node in _walk_analysis_nodes(scan.get("tree") or {})
+                          if node.get("path") == physical_path), None)
+    if (not container or container.get("path") != physical_path
+            or container.get("kind") != "file" or container.get("logical_unit")
+            or not any(physical_path.lower().endswith(ext) for ext in ARCHIVE_EXTENSIONS)):
+        raise ValueError("逻辑文件缺少可信容器清点记录")
+    _check_raw_source_policy(container, physical_path)
+    if container.get("source_changed"):
+        raise SourceFileChangedError("来源文件已变更，请重新盘点后再读取")
+    matched = None
+    with _secure_source_snapshot(scan["root"], container) as snapshot:
+        # Exhaust the bounded generator: an over-budget or ambiguous late
+        # member invalidates a previously seen match rather than authorizing it.
+        for unit in iter_logical_units(
+            scan["root"], [container],
+            max_units_per_container=Config.MAX_LOGICAL_UNITS_PER_CONTAINER,
+            physical_source_overrides={physical_path: snapshot},
+        ):
+            if unit.get("path") == node_path:
+                if (matched is not None or unit.get("logical_kind") != "archive_member"
+                        or unit.get("container_path") != physical_path
+                        or unit.get("member_name") != member):
+                    raise ValueError("归档成员来源不唯一或不一致")
+                matched = unit
+    if matched is None:
+        raise ValueError("归档成员不属于当前扫描清单")
+    _check_raw_source_policy(matched, node_path)
+    return matched
+
+
 def _raw_snapshot_response(snapshot, filename, *, attachment=False):
     """Keep a private, verified snapshot alive until ASGI finishes sending."""
     import contextvars
@@ -8731,19 +8775,24 @@ def get_raw_document(scan_id):
     from services.package_analysis import SourceFileChangedError
     try:
         scan = require_scan(scan_id)
-        node_path = str(request.args.get("path") or "").replace("\\", "/").strip()
+        requested_path = str(request.args.get("path") or "")
+        physical_path, separator, member = requested_path.partition("::")
+        if separator and strict_archive_member_name(member) != member:
+            raise ValueError("归档成员请求路径不安全")
+        node_path = physical_path.replace("\\", "/").strip() + separator + member
         if not node_path:
             raise ValueError("缺少文件路径")
         physical_path = node_path.split("::", 1)[0]
         resolve_under(scan["root"], physical_path)
         source = storage.get_inventory_entry(scan_id, node_path)
         if not source:
-            # Older ordinary scans persist the identity in the physical tree.
-            # A missing logical record must never fall back to its container.
+            # Recover members only from verified owned container bytes, while
+            # older physical files retain their saved tree identity fallback.
             if "::" in node_path:
-                raise ValueError("逻辑文件缺少可信清点记录，请重新盘点")
-            source = next((node for node in _walk_analysis_nodes(scan.get("tree") or {})
-                           if node.get("path") == node_path), None)
+                source = _discover_raw_archive_member(scan_id, scan, node_path)
+            else:
+                source = next((node for node in _walk_analysis_nodes(scan.get("tree") or {})
+                               if node.get("path") == node_path), None)
         if not source or source.get("path") != node_path:
             raise ValueError("文件不属于当前扫描清单")
         _check_raw_source_policy(source, node_path)

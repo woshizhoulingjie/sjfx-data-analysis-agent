@@ -274,7 +274,7 @@
 
   function bind() {
     ensureTaskControls();
-    document.querySelectorAll('[data-route]').forEach((el) => el.addEventListener('click', () => activate(el.dataset.route)));
+    document.querySelectorAll('#primaryNav .nav-item[data-route]').forEach((el) => el.addEventListener('click', () => activate(el.dataset.route)));
     document.querySelectorAll('[data-go-route]').forEach((el) => el.addEventListener('click', () => {
       if (el.dataset.entryFocus) {
         try { window.sessionStorage.setItem('sjfx-package-entry-focus-v1', el.dataset.entryFocus); } catch (_) {}

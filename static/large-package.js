@@ -43,7 +43,9 @@
   function setModeText() {
     const large = mode() === 'large';
     const btn = $('scanBtn');
-    if (btn) btn.textContent = large ? '启动大数据包流式处理' : '仅导入目录';
+    const label = large ? '启动大数据包流式处理' : '仅导入目录';
+    if (btn && !btn.disabled) btn.textContent = label;
+    else if (btn?.dataset.label) btn.dataset.label = label;
     const note = $('workflowModeNote');
     if (note) note.textContent = large
       ? '大数据包生成智能目录后即完成导入；完成后可按需选择文件生成深度摘要。'
@@ -55,6 +57,11 @@
   }
   function setStage(stage) {
     currentStage = stage || 'import';
+    if (currentStage === 'import' || currentStage === 'normal') {
+      const nextMode = currentStage === 'import' ? 'large' : 'standard';
+      document.querySelectorAll('input[name="workflowMode"]').forEach((input) => { input.checked = input.value === nextMode; });
+      setModeText();
+    }
     if (currentStage === 'normal') {
       if (typeof window.setPackageStage === 'function') window.setPackageStage('source');
       $('dataSourcePanel')?.style.removeProperty('display');

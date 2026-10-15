@@ -45,9 +45,10 @@ def _base_unit(container, logical_path, name, extension, size, kind, **extra):
     }
 
 
-def archive_member_units(root, container, max_units=250000):
-    path = Path(root) / str(container.get("path") or "")
-    archive_name = str(path).lower()
+def archive_member_units(root, container, max_units=250000, *, physical_source_override=None):
+    original_path = Path(root) / str(container.get("path") or "")
+    path = Path(physical_source_override) if physical_source_override is not None else original_path
+    archive_name = str(original_path).lower()
     if not any(archive_name.endswith(ext) for ext in ARCHIVE_EXTENSIONS):
         return
     count = 0
@@ -67,6 +68,27 @@ def archive_member_units(root, container, max_units=250000):
             compressed_size=int(compressed_size or 0), encrypted=bool(encrypted),
             promotion_allowed=not bool(encrypted), archive_format=archive_name,
         )
+    if physical_source_override is not None:
+        # A caller may already hold a verified private source snapshot. Keep
+        # original inventory identities and dispatch, but never reopen live
+        # bytes while discovering its members. The bounded reader inventories
+        # every entry before publishing any, including late duplicate names.
+        from services.archive_formats import ArchiveLimits, ArchiveReader
+        seen = set()
+        with ArchiveReader(path, filename=str(original_path),
+                           limits=ArchiveLimits.from_config(entry_limit=max_units)) as archive:
+            for entry in archive.entries():
+                member = _safe_member_name(entry.name)
+                if member and not entry.directory:
+                    canonical = member[2:] if member.startswith("./") else member
+                    if canonical in seen:
+                        raise ValueError("归档成员规范路径重复，未发布该归档的成员清单")
+                    seen.add(canonical)
+                if entry.regular:
+                    unit = emit(entry.name, entry.size, entry.compressed_size, entry.encrypted)
+                    if unit:
+                        yield unit
+        return
     if archive_name.endswith(".zip"):
         preflight = _zip_central_directory_preflight(path)
         if not preflight.get("safe"):
@@ -291,13 +313,17 @@ def workbook_units(root, container, rows_per_partition=10000, max_units=250000):
 
 
 def iter_logical_units(root, physical_files, partition_bytes=1024 * 1024,
-                       rows_per_partition=10000, max_units_per_container=250000):
+                       rows_per_partition=10000, max_units_per_container=250000,
+                       *, physical_source_overrides=None):
     """Yield logical children; ordinary physical files remain unchanged."""
     for container in physical_files:
         path_name = str(container.get("path") or "").lower()
         extension = str(container.get("extension") or Path(path_name).suffix).lower()
         if extension in ARCHIVE_EXTENSIONS or any(path_name.endswith(ext) for ext in ARCHIVE_EXTENSIONS):
-            yield from archive_member_units(root, container, max_units=max_units_per_container)
+            yield from archive_member_units(
+                root, container, max_units=max_units_per_container,
+                physical_source_override=(physical_source_overrides or {}).get(container.get("path")),
+            )
         elif extension in STRUCTURED_TEXT_EXTENSIONS:
             yield from structured_text_units(root, container, partition_bytes=partition_bytes)
         elif extension in WORKBOOK_EXTENSIONS:
