@@ -33,8 +33,15 @@ function element(id) {
       toggle(name, on) { on ? classes.add(name) : classes.delete(name); },
       contains(name) { return classes.has(name); }
     },
-    setAttribute(name, value) { this[name] = value; },
-    removeAttribute(name) { delete this[name]; },
+    // HTML hidden reflects attribute presence as a boolean property.
+    setAttribute(name, value) {
+      if (name === 'hidden') this.hidden = true;
+      else this[name] = value;
+    },
+    removeAttribute(name) {
+      if (name === 'hidden') this.hidden = false;
+      else delete this[name];
+    },
     querySelector() { return null; }, focus() {}, scrollIntoView() {}
   };
 }
