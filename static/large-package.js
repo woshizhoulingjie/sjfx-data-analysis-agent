@@ -363,7 +363,7 @@
     stopPolling();
     const current = await api()(`/api/large-packages/${encodeURIComponent(packageId)}`);
     const curStatus = String((current.workflow && current.workflow.status) || current.large_package?.status || '');
-    const route = requestedStage || (curStatus === 'completed' ? 'large-overview' : 'large-select');
+    const route = requestedStage === 'select' ? 'large-select' : requestedStage || (curStatus === 'completed' ? 'large-overview' : 'large-select');
     if (window.SJFXShell) window.SJFXShell.activate(route); else setStage(route === 'large-overview' ? 'overview' : 'select');
     pollingNeeded = !['completed', 'failed', 'cancelled'].includes(curStatus) || (curStatus === 'completed' && directoryPending > 0);
     if (!pollingNeeded) stopPolling(); else startPolling();
