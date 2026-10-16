@@ -34,7 +34,7 @@
       el.hidden = !visible;
     });
     const select = $('largeResultToSelect');
-    if (select) select.hidden = !window.sjfxLargeResultId;
+    if (select) select.hidden = !packageId;
     const catalog = $('largeResultToCatalog');
     if (catalog) catalog.disabled = currentStage === 'catalog';
     const overview = $('largeResultToOverview');

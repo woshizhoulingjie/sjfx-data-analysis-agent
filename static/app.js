@@ -3447,6 +3447,10 @@ function bindDataSourceControls() {
     $('rootPath')?.focus();
   });
   document.querySelector('[data-back-source]')?.addEventListener('click', () => {
+    if (document.querySelector('input[name="workflowMode"]:checked')?.value === 'large') {
+      window.SJFXDataSources.open('large');
+      return;
+    }
     setPackageStage('source');
     $('dataSourcePanel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
