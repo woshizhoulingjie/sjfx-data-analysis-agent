@@ -1739,13 +1739,19 @@ class LargePackageWorker:
         try:
             from config import Config
             if not getattr(Config, "LP_TOPIC_MERGE", False):
-                from services.large_package_catalog_naming import state
+                from services.large_package_catalog_naming import state, settle_round
                 from services.large_package_catalog_hierarchy import needed, process
                 current = state(self.store, package_id)
                 # Reuse the existing round and its remaining budget. Finished,
                 # expired or still-busy rounds must not be renewed just to
                 # register independent leaves.
                 if not current.get('active') or self._naming_jobs_pending(package_id):
+                    return False
+                # A later leaf batch can make an already saved legacy tree
+                # incomplete. Persist its effective active state through the
+                # existing writer, retaining the original deadline and budget.
+                current = settle_round(self.store, package_id) or current
+                if not current.get('active'):
                     return False
                 with closing(self.store._connect()) as conn:
                     if not needed(conn, package_id):

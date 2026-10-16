@@ -1222,8 +1222,8 @@ def validate_catalog(store, package_id):
             "warnings": warnings, "blocking": bool(violations)}
 
 
-def _tree_partition_check(conn, package_id):
-    """Verify saved navigation and legacy partition describe the same leaf identities."""
+def _tree_partition_check(conn, package_id, allow_stale=False):
+    """Verify the current partition, or inspect a self-consistent saved snapshot."""
     row = conn.execute('SELECT fingerprint,payload FROM lp_catalog_tree WHERE package_id=?',
                        (package_id,)).fetchone()
     if not row:
@@ -1237,6 +1237,7 @@ def _tree_partition_check(conn, package_id):
             + system_group_sql('g.id'), (package_id,))]
         payload = json.loads(row['payload'])
         publication = None
+        legacy_snapshot_changed = False
         if payload.get('publication_schema') == 1:
             dependencies = payload.get('dependencies') or {}
             semantic = payload.get('semantic_snapshot') or {}
@@ -1249,7 +1250,23 @@ def _tree_partition_check(conn, package_id):
                 raise ValueError('完整目录未覆盖构建快照中的全部叶组')
             publication = publication_state(conn, package_id, payload)
         elif row['fingerprint'] != fingerprint(leaves):
-            return {'ok': False, 'reason': '主题快照与当前叶组名称或内容修订不一致'}
+            if not allow_stale:
+                return {'ok': False, 'reason': '主题快照与当前叶组名称或内容修订不一致'}
+            # A sound saved partition can lag behind a later leaf batch. Verify
+            # that exact old snapshot before treating it as unfinished work;
+            # malformed snapshots and broken persisted branches remain INV-8.
+            revisions, versions, names = (payload.get(key) for key in ('revisions', 'versions', 'names'))
+            if not all(isinstance(value, dict) for value in (revisions, versions, names)):
+                raise ValueError('主题快照缺少已保存的叶组依赖')
+            if set(revisions) != set(versions) or set(revisions) != set(names):
+                raise ValueError('主题快照的叶组依赖范围不一致')
+            saved_leaves = [{'group_id': gid, 'content_revision': revision,
+                             'version': versions[gid], 'name': names[gid]}
+                            for gid, revision in revisions.items()]
+            if row['fingerprint'] != fingerprint(saved_leaves):
+                raise ValueError('主题快照指纹与已保存的叶组依赖不一致')
+            expected = set(revisions)
+            legacy_snapshot_changed = True
         else:
             expected = {leaf['group_id'] for leaf in leaves}
         nodes = {node['node_id']: node for node in payload['nodes']}
@@ -1298,9 +1315,31 @@ def _tree_partition_check(conn, package_id):
             raise ValueError('持久主题分区与可见目录树不一致')
         return {'ok': True, 'leaf_nodes': len(expected), 'independent_leaf_nodes': len(independent),
                 'theme_nodes': len(nodes), **({'publication':publication,
-                'complete':publication['complete'], 'publication_state':'complete' if publication['complete'] else 'partial'} if publication is not None else {})}
+                'complete':publication['complete'], 'publication_state':'complete' if publication['complete'] else 'partial'} if publication is not None else {}),
+                **({'legacy_snapshot_changed': True} if legacy_snapshot_changed else {})}
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         return {'ok': False, 'reason': str(exc)}
+
+
+def _legacy_topic_snapshot_pending(conn, package_id):
+    """A valid legacy snapshot needs rebuilding after its leaf inputs changed."""
+    row = conn.execute("SELECT CASE WHEN json_valid(payload) THEN "
+                       "COALESCE(json_extract(payload,'$.publication_schema'),0) ELSE -1 END "
+                       "FROM lp_catalog_tree WHERE package_id=?", (package_id,)).fetchone()
+    if not row or row[0] != 0:
+        return False
+    verdict = _tree_partition_check(conn, package_id, allow_stale=True)
+    return bool(verdict and verdict.get('ok') and verdict.get('legacy_snapshot_changed'))
+
+
+def _legacy_topic_round_resumable(conn, package_id, row):
+    """Continue an unfinished snapshot using only the original remaining budget."""
+    if (not row or row['status'] not in {'active', 'completed'}
+            or row['deadline'] <= time.time() or row['requests'] >= row['max_requests']
+            or row['tokens'] >= row['max_tokens']):
+        return False
+    package = conn.execute('SELECT status,control_state FROM packages WHERE id=?', (package_id,)).fetchone()
+    return bool(package and not any(value in {'paused', 'cancelled'} for value in package))
 
 
 def _write_evidence_snapshot(conn, package_id, catalog_id, labels, branches, validation, leaves,
@@ -1732,12 +1771,19 @@ def state(store, package_id, settle=False):
                           (package_id,)).fetchone()[0]
         result = dict(row) if row else {}
         publication = _current_topic_publication(c, package_id)
+        legacy_pending = (_legacy_topic_round_resumable(c, package_id, row)
+                          and _legacy_topic_snapshot_pending(c, package_id))
+        if legacy_pending:
+            result['hierarchy_status'] = 'queued'
+            if settle and row['hierarchy_status'] == 'completed':
+                c.execute("UPDATE lp_catalog_rounds SET hierarchy_status='queued' WHERE package_id=? AND id=?",
+                          (package_id, row['id']))
         if publication is not None:
             result['topic_publication'] = publication
             result['hierarchy_status'] = 'completed' if publication['complete'] else 'partial'
             if settle and row and not publication['complete'] and row['hierarchy_status'] == 'completed':
                 c.execute("UPDATE lp_catalog_rounds SET hierarchy_status='partial' WHERE package_id=? AND id=?", (package_id,row['id']))
-        partial_topics = publication is not None and not publication['complete']
+        partial_topics = (publication is not None and not publication['complete']) or legacy_pending
         if row and (row['status']=='active' or (partial_topics and row['status']=='completed')):
             exhausted = row['deadline'] <= time.time() or row['requests'] >= row['max_requests'] or row['tokens'] >= row['max_tokens']
             if exhausted:
@@ -1751,7 +1797,7 @@ def state(store, package_id, settle=False):
             if not exhausted and (not counts.get('queued',0) and not counts.get('running',0)
                   and not retryable_deferred):
                 from services.large_package_catalog_hierarchy import needed
-                hierarchy_pending=(publication is not None and not publication['complete']) or (row['hierarchy_status'] in {'queued','running'} and needed(c,package_id))
+                hierarchy_pending=legacy_pending or (publication is not None and not publication['complete']) or (row['hierarchy_status'] in {'queued','running'} and needed(c,package_id))
                 if hierarchy_pending:
                     return {**result,'enabled':cfg['enabled'],'jobs':counts,'named_nodes':named,'named_files':covered,
                             'total_nodes':total,'pending_nodes':max(0,total-named),'active':True,
@@ -1793,6 +1839,10 @@ def naming_work_pending(store, package_id):
         publication = _current_topic_publication(c, package_id)
         if publication is not None and not publication['complete']:
             return True
+        if _legacy_topic_snapshot_pending(c, package_id):
+            # Do not fall through to queued hierarchy work after its remaining
+            # budget expires: ensure_round('initial') can otherwise extend it.
+            return _legacy_topic_round_resumable(c, package_id, latest)
         try:
             if latest['hierarchy_status'] in {'queued', 'running'}:
                 from services.large_package_catalog_hierarchy import needed

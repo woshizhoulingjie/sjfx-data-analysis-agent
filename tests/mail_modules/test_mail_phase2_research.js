@@ -10,24 +10,29 @@ const root=path.resolve(__dirname,'../..');
   const html=fs.readFileSync(path.join(root,'templates/mail_research.html'),'utf8').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,'').replace(/<link\b[^>]*>/gi,'');
   await page.setContent(html);await page.addStyleTag({path:path.join(root,'static/mail-research.css')});
   await page.evaluate(()=>{
-   window.calls=[];window.resumed=false;
+   window.calls=[];window.resumed=false;window.attachmentReady=false;window.deferPackageRefresh=false;
    window.SJFXMailFoundation={currentScope:()=>({package_id:'p',date_from:'2024-05-03'}),query:()=>'',emitScope:()=>{},refreshFoundation:async()=>{},renderMessage:async()=>{}};
    const final=()=>({result_set_id:window.resumed?'r2':'r1',research_version:'mail-research-phase2-v1',question:'双方对 v2 的条件是什么？',answer:'双方接受 v2 的前提是完成联调。现有邮件没有证明这一条件已满足，因此目前不能确认已经履行。',answer_presentation:{version:'answer-first-v1',status:'complete'},evidence_appendix:{recorded_answer:'2026年10月9日，Alice 的邮件记载：完成联调后接受 v2。'},limitations:['mm_internal: uncertain_thread_links','补检停止：awaiting_semantic_verification'],context_review:Array.from({length:8},(_,i)=>({complete:false,message_key:'mm_'+i,gaps:['uncertain_thread_links']})),research_memory:{conditions:['条件与后续变化'],open_questions:['待核实问题']},coverage:{research:{matched:2,model_calls:2,tool_calls:3}},fields:[],evidence:[{evidence_id:'e1',message_key:'m1',quote_text:'完成联调后接受 v2。',source_kind:'body',subject_raw:'v2 确认',actor:'alice@example.com',sent_at_utc:'2026-10-09T01:00:00Z'}],findings:[{text:'完成联调后接受 v2。',evidence_id:'e1'}],claims:[{claim_text:'Alice 接受 v2',semantic_status:'supported',evidence_ids:[],semantic_verification:{atoms:[{text:'Alice 表达接受 v2',status:'supported'}],missing_requirements:[]}},{claim_text:'当前条件已满足',semantic_status:'insufficient',evidence_ids:[],semantic_verification:{atoms:[{text:'当前条件已满足',status:'insufficient'}],missing_requirements:['temporal_scope_or_full_history_unproven'],temporal_status:'unknown'}}],token_usage:{total_tokens:30,actual_tokens:20,estimated_tokens:10,reserved_tokens:0,max_tokens:window.resumed?60:30,exhausted:!window.resumed},gap_search:{rounds:[{queries:['accept v2']}],stop_reason:'token_budget'}});
-   const turn=()=>({turn_id:'rt',status:'completed',sufficiency:window.resumed?'sufficient':'partial',result_set_id:window.resumed?'r2':'r1',task_spec:{package_id:'p',research_version:'mail-research-phase2-v1',scope:{date_from:'2024-05-03'},budget:{max_tokens:30,max_model_calls:2,max_tool_calls:3,max_seconds:10}},final:final()});
+   const historicalFinal=()=>({...final(),coverage:{...final().coverage,explicit_attachments:1,attachments_with_text:0,attachments_without_text:1}});
+   const turn=()=>({turn_id:'rt',status:'completed',sufficiency:window.resumed?'sufficient':'partial',result_set_id:window.resumed?'r2':'r1',task_spec:{package_id:'p',research_version:'mail-research-phase2-v1',scope:{date_from:'2024-05-03'},budget:{max_tokens:30,max_model_calls:2,max_tool_calls:3,max_seconds:10}},final:historicalFinal()});
    window.fetch=async(raw,options={})=>{
     const u=new URL(raw,'http://test');window.calls.push({path:u.pathname,method:options.method||'GET',body:options.body});let data;
-    if(u.pathname==='/api/mail/packages')data={packages:[{package_id:'p',display_name:'虚构验证样本',status:'ready'}]};
-    else if(u.pathname==='/api/mail/packages/p')data={overview:{counts:{logical_messages:2}},coverage:{}};
+    if(u.pathname==='/api/mail/packages')data={packages:[{package_id:'p',display_name:'虚构验证样本',status:'ready'},{package_id:'q',display_name:'第二个虚构资料包',status:'ready'}]};
+    else if(u.pathname==='/api/mail/packages/p'){
+     if(window.deferPackageRefresh){window.pendingPackageRefresh=new Promise(resolve=>{window.releasePackageRefresh=resolve;});await window.pendingPackageRefresh;}
+     data={overview:{counts:{logical_messages:2}},coverage:{explicit_attachments:1,attachments_with_text:window.attachmentReady?1:0,attachments_without_text:window.attachmentReady?0:1}};
+    }
+    else if(u.pathname==='/api/mail/packages/q')data={overview:{counts:{logical_messages:7}},coverage:{explicit_attachments:2,attachments_with_text:2,attachments_without_text:0}};
     else if(u.pathname.endsWith('/messages'))data={messages:{items:[],total:0}};
     else if(u.pathname==='/api/mail/research-sessions')data=options.method==='POST'?{session:{session_id:'s'}}:{sessions:[]};
     else if(u.pathname==='/api/mail/research-sessions/s/turns')data={turn:{turn_id:'rt'},job_id:'j'};
     else if(u.pathname==='/api/mail/research-turns/rt/resume'){window.resumed=true;data={turn_id:'rt',job_id:'jr'};}
-    else if(u.pathname==='/api/mail/research-turns/rt')data={turn:turn()};
+    else if(u.pathname==='/api/mail/research-turns/rt'){window.attachmentReady=true;data={turn:turn()};}
     else if(u.pathname.endsWith('/relations/communication'))data={communication:{items:[]}};
     else if(u.pathname.endsWith('/relations/threads'))data={threads:[]};
     else if(u.pathname.endsWith('/relations/business'))data={relations:[]};
     else if(u.pathname.endsWith('/relations/network'))data={network:{nodes:[],edges:[]}};
-    else if(/^\/api\/mail\/result-sets\//.test(u.pathname))data={result_set:{result_set_id:window.resumed?'r2':'r1',item_count:0,items:[],definition:{},final:final()}};
+    else if(/^\/api\/mail\/result-sets\//.test(u.pathname)){window.savedResultFinal=historicalFinal();data={result_set:{result_set_id:window.resumed?'r2':'r1',item_count:0,items:[],definition:{},final:window.savedResultFinal}};}
     else if(u.pathname==='/api/mail/evidence/e1')data={evidence:{evidence_id:'e1',message_key:'m1',mime_path:'1',quote_text:'完成联调后接受 v2。'}};
     else if(u.pathname==='/api/mail/messages/m1')data={message:{subject_raw:'v2 确认',sent_at_utc:'2026-10-09T01:00:00Z',participants:[],parts:[]}};
     else if(u.pathname==='/api/mail/messages/m1/preview')data={content_type:'text/plain',content:'完成联调后接受 v2。'};
@@ -41,10 +46,15 @@ const root=path.resolve(__dirname,'../..');
    };
   });
   await page.addScriptTag({path:path.join(root,'static/mail-research.js')});await page.addScriptTag({path:path.join(root,'static/mail-modules.js')});
-  await page.waitForFunction(()=>document.querySelector('#mail-package').options.length===2);await page.locator('#mail-package').selectOption('p');await page.getByText('当前范围没有邮件',{exact:true}).first().waitFor({state:'attached'});await page.locator('[data-mail-module-link="research"]').click();
+  await page.waitForFunction(()=>document.querySelector('#mail-package').options.length===3);await page.locator('#mail-package').selectOption('p');await page.getByText('当前范围没有邮件',{exact:true}).first().waitFor({state:'attached'});await page.locator('[data-mail-module-link="research"]').click();
+  assert((await page.locator('#mail-coverage').innerText()).includes('附件可读 0/1；尚无文本 1'));
   await page.locator('#mail-question').fill('双方对 v2 的条件是什么？');await page.locator('#mail-question-form').evaluate(n=>n.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
   await page.getByRole('button',{name:'增加预算继续研究',exact:true}).waitFor();
   assert.equal(await page.locator('#mail-answer').innerText(),'双方接受 v2 的前提是完成联调。现有邮件没有证明这一条件已满足，因此目前不能确认已经履行。');
+  await page.waitForFunction(()=>document.querySelector('#mail-coverage').textContent.includes('附件可读 1/1；尚无文本 0'));
+  assert((await page.locator('#mail-processing-summary').innerText()).includes('没有已报告的文本处理缺口'));
+  await page.waitForFunction(()=>!!window.savedResultFinal);
+  assert.equal(await page.evaluate(()=>window.savedResultFinal.coverage.attachments_without_text),1,'current readiness does not rewrite saved research coverage');
   assert((await page.locator('#mail-answer-question').innerText()).includes('双方对 v2 的条件是什么？'));
   const meta=await page.locator('#mail-answer-meta').innerText();assert(meta.includes('依据 1 封相关邮件'));assert(!meta.includes('token')&&!meta.includes('补检')&&!meta.includes('上下文'));
   assert.equal(await page.locator('#mail-evidence-appendix').evaluate(n=>n.open),false);
@@ -64,6 +74,15 @@ const root=path.resolve(__dirname,'../..');
   assert(!(await page.locator('.mail-answer-result').innerText()).includes('uncertain_thread_links'));
   await page.locator('[data-mail-module-link="research"]').click();await page.locator('#mail-export').click();await page.waitForFunction(()=>window.calls.some(c=>c.path==='/api/download-ticket'));
   const exported=await page.evaluate(()=>window.calls.find(c=>c.path==='/api/mail/exports'));assert.deepEqual(JSON.parse(exported.body),{result_set_id:'r2',format:'xlsx'});
+  // An older completion refresh must not repaint the newly selected package.
+  await page.evaluate(()=>{window.deferPackageRefresh=true;});
+  await page.locator('#mail-question').fill('再核查一次条件');await page.locator('#mail-question-form').evaluate(n=>n.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+  await page.waitForFunction(()=>typeof window.releasePackageRefresh==='function');
+  await page.locator('#mail-package').selectOption('q');
+  await page.waitForFunction(()=>document.querySelector('#mail-coverage').textContent.includes('附件可读 2/2；尚无文本 0'));
+  await page.evaluate(async()=>{window.releasePackageRefresh();await window.pendingPackageRefresh;await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));});
+  assert((await page.locator('#mail-coverage').innerText()).includes('附件可读 2/2；尚无文本 0'));
+  assert((await page.locator('#mail-package-summary').innerText()).includes('7 封唯一邮件'));
   assert.deepEqual(errors,[]);console.log('PASS: direct Chinese answer, hidden diagnostics, expandable source appendix, original source, export, cumulative budget continuation and original-turn polling');
  }finally{await browser.close()}
 })().catch(e=>{console.error(e);process.exitCode=1});

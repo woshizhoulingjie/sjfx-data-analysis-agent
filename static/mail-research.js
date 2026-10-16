@@ -369,6 +369,7 @@
   }
   async function pollTurn(turnId, restoredTurn = null) {
     const epoch = ++state.pollEpoch;
+    const packageId=state.packageId,packageEpoch=state.packageEpoch;
     const tick = async () => {
       if (epoch !== state.pollEpoch) return;
       const payload = restoredTurn ? {turn:restoredTurn} : await api(`/api/mail/research-turns/${encodeURIComponent(turnId)}`);
@@ -381,7 +382,7 @@
         byId("mail-start").disabled = false; byId("mail-cancel").disabled = true;
         if (turn.status !== "completed") { byId("mail-answer").textContent=`研究状态：${zhLabel(turn.status)}。本次未生成完整结论。`;status(`研究状态：${zhLabel(turn.status)} ${turn.error ? display(turn.error) : ""}`, true); return; }
         const final = turn.final; state.resultSetId = (final || {}).result_set_id || turn.result_set_id || "";
-        if(final){if(final.result_set_id)state.researchTurns[final.result_set_id]=turn;renderFinal(final);} await Promise.all([loadRelations(), loadMiningViews()]);
+        if(final){if(final.result_set_id)state.researchTurns[final.result_set_id]=turn;renderFinal(final);} await Promise.all([loadRelations(), loadMiningViews(), refreshPackageReadOnly(packageId,packageEpoch,{refreshFoundation:false}).catch(error=>{if(epoch===state.pollEpoch && packageEpoch===state.packageEpoch && packageId===state.packageId)report(error);})]);
         if(epoch!==state.pollEpoch)return;
         if (state.resultSetId) await showResult(state.resultSetId);
         if(epoch!==state.pollEpoch)return;

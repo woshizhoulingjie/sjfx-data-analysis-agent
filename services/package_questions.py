@@ -155,10 +155,23 @@ def is_recorded_total_lookup(question):
     """
     text = str(question or "")
     if re.search(
-        r"所有|全部|这些|这批|多份|多个|各份|各个|跨文件|跨文档|逐条|"
+        r"跨文件|跨文档|逐条|"
         r"计算|算出|求和|加总|累加|统计|汇总|平均|均值|最大值|最小值|占比|分组",
         text,
     ):
+        return False
+    # Ignore quantifiers only in a complete citation/answer-format clause.
+    # "所有证据中的金额" still selects inputs even though it names evidence.
+    scope_text = re.sub(
+        r"(?:引用|给出|提供|附上|注明|标明|列出)\s*(?:支持)?"
+        r"(?:所有|全部|这些|这批|多份|多个|各份|各个)\s*"
+        r"(?:(?:的|原文|相关|对应|完整|关键|直接|必要)\s*)*"
+        r"(?:结论|证据|引文|引用|出处|要点|答案|回答)"
+        r"(?:的原文证据|及对应的原文证据)?"
+        r"(?=\s*(?:$|[，,。！？!?；;：:\n]))",
+        "", text,
+    )
+    if re.search(r"所有|全部|这些|这批|多份|多个|各份|各个", scope_text):
         return False
     return bool(
         re.search(r"凭证|发票|合同|报告|单据|文件|原文|记录", text)

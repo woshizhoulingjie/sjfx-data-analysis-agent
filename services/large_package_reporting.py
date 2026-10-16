@@ -1434,7 +1434,7 @@ def build_overview(store, item, milestone="catalog", note="", _dedup_retry=True)
                     item.get("id"), preflight.get("reason"))
         blocked_report = {
             "package_id": str(item["id"]), "milestone": milestone,
-            "published": False, "catalog_rejected": True,
+            "published": False, "catalog_rejected": preflight.get("reason") != "catalog_snapshot_changed",
             "publication_blocked": preflight,
             "rejection": rejection,
         }
@@ -1527,8 +1527,11 @@ def _overview_publication_preflight(store, package_id):
     current catalog validation and tree completeness.  _publish_overview still
     repeats both checks in its write transaction to protect against races.
     """
-    from services.large_package_catalog_naming import validate_catalog
+    from services.large_package_catalog_naming import validate_catalog, _legacy_topic_snapshot_pending
 
+    with closing(store._connect()) as conn:
+        if _legacy_topic_snapshot_pending(conn, package_id):
+            return {"reason": "catalog_snapshot_changed", "violations": ["catalog_snapshot_changed"]}
     verdict = validate_catalog(store, package_id) or {}
     if verdict.get("blocking"):
         return {
@@ -1592,6 +1595,12 @@ def _publish_overview(store, item, report, milestone, rejection=None):
         tree_row = conn.execute('SELECT payload FROM lp_catalog_tree WHERE package_id=?',
                                 (package_id,)).fetchone()
         tree_payload = json.loads(tree_row[0] or '{}') if tree_row else {}
+        from services.large_package_catalog_naming import _legacy_topic_snapshot_pending
+        if _legacy_topic_snapshot_pending(conn, package_id):
+            conn.rollback()
+            if isinstance(rejection, dict):
+                rejection['violations'] = ['catalog_snapshot_changed']
+            return None
         if tree_payload.get('publication_schema'):
             from services.large_package_catalog_tree import publication_state
             if not publication_state(conn, package_id, tree_payload)['complete']:

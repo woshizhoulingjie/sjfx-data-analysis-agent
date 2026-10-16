@@ -612,6 +612,7 @@ FAST_OVERVIEW_SYSTEM = '''你是中文邮件研究助理。材料是用户的研
 - 开头如需概述，直接写"涉及以下项目/事项"，不要写任何数量表述（如"共N个项目"、"四个具体项目"——数量极易数错）；直接逐一列出各项目/事项即可。
 - 内容充实、条理清楚，但必须一次性完整输出：全文控制在 700 字以内（最多不超过 900 字）；输出一旦超出上限被截断，整条回答就会作废。
 - 只使用材料中出现的真实信息，不要编造；材料没有记载或互相矛盾之处，用简短一句话说明即可。
+- 缺失的单项金额只能写“金额未知/未单独记录，需补充明细”；合计、已列明金额与数量不能证明明细完整，不得用差额倒推、分摊或猜测缺失项为0元、免费、赠品。只有原文明示零金额或免费/赠品时才可报告，且须完整照录该原文句子（包括跨行前置条件），保留事项、条件与否定，不作改写。
 - 语言自然、有逻辑，可分短段；不要罗列来源编号、文件名或元数据。
 输出 JSON：{"overview": "..."}'''
 
@@ -619,6 +620,7 @@ FAST_OVERVIEW_BLOCK_SYSTEM = '''你是中文邮件研究助理。以下是资料
 要求：
 - 逐个记录这块邮件中出现的所有项目/事项名称，以及各自的关键事实：相关公司/人物、金额、时间安排、当前状态、后续变化与待确认事项。
 - 只记录材料中明确出现的信息；不确定的注明"待确认"；不要编造。
+- 缺失的单项金额只能记录“金额未知/未单独记录，需补充明细”；不得从合计、已列明金额或数量倒推缺失项为0元、免费或赠品。原文明示零金额或免费/赠品时，完整照录该原文句子（包括跨行前置条件），保留事项、条件与否定。
 - 笔记简洁分点，约 150~400 字，必须一次性完整输出（被截断会作废），使用中文。输出 JSON：{"notes": "..."}'''
 
 
@@ -629,6 +631,35 @@ def _neutralize_count_claims(text):
     """Model self-counts are unreliable (e.g. '四个' while listing five items),
     so a count claim never ships: it is rewritten to a neutral phrase."""
     return _COUNT_CLAIM.sub('以下项目', text)
+
+
+_ZERO_COST_EXPLANATION = re.compile(
+    r'免费|赠品|赠送|无偿|零(?:元|金额|费用|成本)|'
+    r'(?<![\d.:：])0+(?:\.0+)?(?![\d.])\s*(?:元|圆|人民币|美元|欧元|港元|日元|英镑|USD\b|CNY\b|RMB\b)|'
+    r'(?:[¥￥$€£]|人民币|美元|欧元|港元|日元|英镑|USD\b|CNY\b|RMB\b)\s*0+(?:\.0+)?(?![\d.:：])|'
+    r'(?:金额|单价|价格|费用|成本|差额)\s*(?:为|是|[:：=])?\s*(?:零|0+(?:\.0+)?(?![\d.:：条次项件个]))', re.I)
+
+
+def _fast_overview_zero_cost_supported(text, corpus):
+    """Zero/free explanations need a complete original clause, not a residual.
+
+    Keep this narrow fast-mode guard independent of the general claim judge.
+    Block notes are model output, so only original corpus text can support it.
+    Monetary units/context keep times and non-monetary counts outside this guard.
+    A full sentence, including line breaks, prevents another item's zero price
+    or a negated/conditional mention from supporting an invented explanation.
+    """
+    def clauses(value):
+        # A line break is not a sentence boundary: "若获批：\n第三项为赠品。"
+        # cannot supply an unconditional gift clause. Keep question marks too.
+        return [part.strip() for part in re.split(r'(?<=[。！？!?])', str(value or '')) if part.strip()]
+
+    originals = {clause for row in corpus for clause in clauses(row.get('text'))}
+    for clause in clauses(text):
+        if _ZERO_COST_EXPLANATION.search(clause):
+            if clause not in originals:
+                return False
+    return True
 
 
 def _package_corpus(runtime, package_id, owner):
@@ -785,6 +816,9 @@ def synthesize_fast_overview(runtime, tid, owner, state, spec, evidence, package
         read_mode = 'blocked_notes'
         writer_calls = len(payloads) + 1
     if not overview or len(overview) > 3000:
+        return False
+    if not _fast_overview_zero_cost_supported(overview, corpus):
+        runtime.repository.event(tid, 'fast_overview_rejected', {'reason': 'unsupported_zero_cost_explanation'})
         return False
     state['fast_overview'] = {'version': 'mail-fast-overview-v1', 'overview': overview,
         'messages': len(corpus), 'blocks': len(payloads), 'read_mode': read_mode,
