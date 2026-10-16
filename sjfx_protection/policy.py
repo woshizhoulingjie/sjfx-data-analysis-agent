@@ -41,8 +41,25 @@ def read_policy(state_dir):
         # Corruption of a previously persisted switch must never make protection OFF.
         return {**DEFAULT_POLICY, 'enabled': True, 'invalid': True, 'revision': -1}
 
+def file_protection_requested():
+    """An explicit instance switch overrides policy without rewriting history."""
+    value = os.getenv('SJFX_DESKTOP_FILE_PROTECTION', '1')
+    if value not in {'0', '1'}:
+        raise RuntimeError('SJFX_DESKTOP_FILE_PROTECTION must be exactly 0 or 1')
+    return value == '1'
+
+
+def effective_policy(state_dir):
+    value = read_policy(state_dir)
+    if not file_protection_requested():
+        return {**value, 'stored_enabled': value['enabled'], 'enabled': False,
+                'disabled_by_configuration': True}
+    return value
+
+
 def protection_enabled(state_dir):
-    return read_policy(state_dir)['enabled']
+    # Explicit OFF must not inspect a stale/corrupt persisted policy or SQLite.
+    return file_protection_requested() and read_policy(state_dir)['enabled']
 
 def write_policy(state_dir, actor, is_admin, changes, reason):
     if not is_admin:

@@ -13605,7 +13605,7 @@ def import_large_package_catalog(package_id):
         params = bridge.validate_request(payload, package)
         # §11 精确失败码：节点不存在 → 404（要求刷新目录）；文件已消失 → 409 且附文件列表。
         # 这两项必须在 export_selection 之前判定，否则只会得到一个笼统的 400。
-        if bridge.missing_nodes(large_package_store, package_id, params["node_ids"]):
+        if bridge.missing_nodes(large_package_store, package_id, params["node_ids"] + params["exclude_node_ids"]):
             return api_error("智能目录节点不存在，请刷新目录后重试", 404)
         gone = bridge.missing_paths(large_package_store, package_id, params["paths"])
         if gone:

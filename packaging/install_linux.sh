@@ -319,8 +319,8 @@ if model_settings.is_file():
         model_settings.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
 fi
-# Add newly introduced local runtime settings when upgrading an older env.
-# Existing values and the user's generation/embedding selections take priority.
+# Fill missing local runtime and reviewed business defaults on upgrade.
+# Explicit instance values and generation/embedding selections take priority.
 "$install_dir/runtime/bin/python3" -B - "$env_file" "$install_dir/config/sjfx.env.template" "$data_dir" "$install_dir" <<'PY'
 import pathlib, sys
 target, template, data_dir, install_dir = map(pathlib.Path, sys.argv[1:])
@@ -335,11 +335,18 @@ text = target.read_text(encoding="utf-8-sig")
 present = {line.split("=", 1)[0].strip() for line in text.splitlines()
            if "=" in line and not line.lstrip().startswith("#")}
 missing = []
+in_business_defaults = False
 for line in template.read_text(encoding="utf-8").splitlines():
+    if line.strip() == '# BEGIN SJFX LINUX BUSINESS DEFAULTS':
+        in_business_defaults = True
+        continue
+    if line.strip() == '# END SJFX LINUX BUSINESS DEFAULTS':
+        in_business_defaults = False
+        continue
     if "=" not in line or line.lstrip().startswith("#"):
         continue
     key = line.split("=", 1)[0].strip()
-    if key in keys and key not in present:
+    if (key in keys or in_business_defaults) and key not in present:
         missing.append(line.replace("__DATA_DIR__", str(data_dir)).replace("__INSTALL_DIR__", str(install_dir)))
         present.add(key)
 if missing:

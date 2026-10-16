@@ -221,21 +221,31 @@ def _clean_paths(values):
 
 def validate_request(payload, large_package):
     """把请求体规整成受信任的入参。任何不合法都抛 SelectionError。"""
-    payload = payload or {}
-    node_ids = payload.get("node_ids") or []
-    paths = payload.get("paths") or []
-    if not isinstance(node_ids, list) or not isinstance(paths, list):
-        raise SelectionError("目录节点和文件选择必须是列表")
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise SelectionError("导入请求必须是对象")
+    selections = {}
+    for field in ("node_ids", "paths", "exclude_paths", "exclude_node_ids"):
+        values = payload.get(field)
+        if values is None:
+            values = []
+        if not isinstance(values, list):
+            raise SelectionError("目录节点、文件选择和排除项必须是列表")
+        selections[field] = values
+    node_ids = selections["node_ids"]
+    paths = selections["paths"]
     node_ids = [str(v).strip() for v in node_ids if str(v).strip()]
     node_ids = list(dict.fromkeys(node_ids))
     paths = _clean_paths(paths)
-    exclude_paths = _clean_paths(payload.get("exclude_paths") or [])
-    exclude_node_ids = [str(v).strip() for v in (payload.get("exclude_node_ids") or []) if str(v).strip()]
+    exclude_paths = _clean_paths(selections["exclude_paths"])
+    exclude_node_ids = [str(v).strip() for v in selections["exclude_node_ids"] if str(v).strip()]
     exclude_node_ids = list(dict.fromkeys(exclude_node_ids))
 
     if not node_ids and not paths:
         raise SelectionError("请至少选择一个目录节点或文件")
-    if len(node_ids) > MAX_NODES or len(paths) > MAX_FILES or len(exclude_paths) > MAX_EXCLUSIONS:
+    if (len(node_ids) > MAX_NODES or len(paths) > MAX_FILES
+            or len(exclude_paths) + len(exclude_node_ids) > MAX_EXCLUSIONS):
         raise SelectionError("一次导入的选择数量超出上限", 413)
     # 临时节点不是"已生成的智能目录"，不能进普通导入（文档 §4.2）
     for node_id in node_ids + exclude_node_ids:

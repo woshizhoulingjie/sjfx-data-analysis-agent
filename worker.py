@@ -20,6 +20,7 @@ import traceback
 from pathlib import Path
 
 from config import Config, ensure_runtime_directories
+from services.file_capabilities import ARCHIVE_EXTENSIONS, file_extension
 from services.storage import LazyStorage, Storage
 from services.process_liveness import (
     available_memory_bytes, initialize_process_family, own_process_tree, terminate_process_tree,
@@ -158,6 +159,65 @@ def _finish_conversation_turn_after_worker_failure(job, status, error=None):
     )
 
 
+def _summary_uses_persisted_sources(job):
+    """Identify summary jobs that will not create a source-file snapshot."""
+    if job.get("task_type") != "generate_summary":
+        return False
+    options = job.get("options") or {}
+    source = options.get("workflow_source")
+    if source == "deep_node_rebuild":
+        return True
+    if (source != "idle_deep_model_summary"
+            or options.get("kind", "file") != "file" or options.get("node_id")):
+        return False
+    scan_id, path = job.get("scan_id"), options.get("path")
+    if not scan_id or not path:
+        return False
+    document = storage.get_document(scan_id, path)
+    if not document:
+        return False
+    # Keep this conservative check aligned with summarize()'s deep-parse
+    # upgrades. A stored preview is not always sufficient to avoid parsing.
+    parser = document.get("parser") or {}
+    coverage = document.get("coverage") or {}
+    if (Path(path).suffix.lower() in {".json", ".jsonl", ".csv", ".tsv", ".xlsx", ".xls", ".xlsm", ".ods"}
+            and parser.get("name") not in {"structured-json", "structured-table"}):
+        return False
+    if parser.get("name") != "structured-json" and (
+        parser.get("mode") == "fast" or parser.get("fast_preview")
+        or coverage.get("limited_by_fast_mode") or coverage.get("overview_sampled")
+    ):
+        analysis = storage.get_analysis(scan_id) or {}
+        if (((analysis.get("policy") or {}).get("large_package") or {}).get("enabled")):
+            return False
+    return True
+
+
+def _summary_source_snapshot_bytes(job):
+    """Budget one physical snapshot from durable inventory, never request size."""
+    maximum = int(Config.MAX_CONTENT_BYTES)
+    options = job.get("options") or {}
+    if (job.get("task_type") != "generate_summary"
+            or options.get("workflow_source") != "idle_deep_model_summary"
+            or options.get("kind", "file") != "file" or options.get("node_id")):
+        return maximum
+    scan_id, path = job.get("scan_id"), options.get("path")
+    if not scan_id or not path:
+        return maximum
+    node = (storage.get_inventory_entry(scan_id, path)
+            or storage.get_tree_page(scan_id, "physical", node_key=path, limit=1))
+    # Logical members/partitions and archives may create extraction scratch in
+    # addition to the source snapshot. Keep their existing conservative budget.
+    if (not node or node.get("kind") != "file" or node.get("logical_unit")
+            or node.get("container_path") or node.get("path") != path
+            or file_extension(path) in ARCHIVE_EXTENSIONS):
+        return maximum
+    size = node.get("size")
+    if type(size) is not int or not 0 <= size <= maximum:
+        return maximum
+    return size
+
+
 def _background_resource_state(job):
     """Gate only optional coverage expansion; foreground work always proceeds."""
     options = job.get("options") or {}
@@ -177,7 +237,14 @@ def _background_resource_state(job):
         reasons.append("已有更高优先级任务")
     try:
         free_bytes = int(shutil.disk_usage(str(Config.PARSE_TEMP_DIR)).free)
-        required_bytes = int(Config.PARSE_TEMP_DISK_RESERVE_BYTES) + int(Config.MAX_CONTENT_BYTES)
+        reserve_bytes = int(Config.PARSE_TEMP_DISK_RESERVE_BYTES)
+        required_bytes = reserve_bytes + int(Config.MAX_CONTENT_BYTES)
+        if reserve_bytes <= free_bytes < required_bytes:
+            if _summary_uses_persisted_sources(job):
+                # Persisted model inputs need only the output reserve.
+                required_bytes = reserve_bytes
+            elif job.get("task_type") == "generate_summary":
+                required_bytes = reserve_bytes + _summary_source_snapshot_bytes(job)
         if free_bytes < required_bytes:
             reasons.append("解析临时磁盘空间不足")
     except OSError:

@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA = "large-package-report/2.6"
+SCHEMA = "large-package-report/2.7"
 # 研究方向规则的版本：它参与缓存键，规则变了就必须重建报告。
 DIRECTION_RULES_VERSION = "directions/2"
 # 占位分类：**永远不得成为推荐研究方向**。改动前首选方向按 score(≈文件数) 排序，
@@ -394,7 +394,7 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
         modified_min, modified_max, total_bytes = None, None, 0
         # ---- 骨架选择（方案 A：第一版基于智能目录）----
         # 有主题层就用「主题」当报告的骨架（分类、研究方向、主题摘要都跟着它），
-        # 没有（小语料或主题尚未归并）就回落快速解析的分类器输出，行为与原来一致。
+        # 没有（小语料或主题尚未归并）就回落有效原分类，再采用已命名叶组。
         # 这一步只改"用哪个字段分组"，不改任何聚合逻辑。
         topic_of_group = {}
         try:
@@ -480,9 +480,13 @@ def _build_report_locked(store, item, cache_fix=False, want_model=True):
                     "summary_type": deep.get("summary_type"), "summary": _text(deep.get("summary") or text, 1000),
                     "source_sha256": deep.get("source_sha256"), "coverage": deep.get("coverage") or {},
                 }})
-            # 骨架键：有主题层用主题名（方案 A），否则用快速解析的分类
+            # 骨架键：优先有效主题/原分类；小目录尚无主题时采用已命名叶组。
             topic_name = topic_of_group.get(str(row.get("catalog_group_id") or ""))
-            category = topic_name or row["category"] or "未分类"
+            category = next((name for name in (topic_name, row["category"])
+                             if str(name or "").strip() and
+                             str(name).strip() not in _PLACEHOLDER_CATEGORIES), row["category"] or "未分类")
+            if (not str(category).strip() or str(category).strip() in _PLACEHOLDER_CATEGORIES) and not _holistic_placeholder(row.get("catalog_model_name")):
+                category = row["catalog_model_name"]
             group = groups.setdefault(category, {"files": 0, "confidence": 0, "text_files": 0, "models": 0, "examples": [], "_pool": [], "keywords": Counter(), "leaves": Counter()})
             group["files"] += 1
             group["confidence"] += float(row["confidence"] or 0)

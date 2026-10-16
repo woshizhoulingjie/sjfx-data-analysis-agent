@@ -162,6 +162,8 @@
   }
 
   function resetTree(message) {
+    state.treeRequest += 1;
+    closeImportDialog();
     state.roots = [];
     state.nodeByKey.clear();
     state.nodeById.clear();
@@ -230,6 +232,7 @@
   async function loadTree() {
     if (!state.sourceId) return;
     const seq = ++state.treeRequest;
+    closeImportDialog();
     state.loadError = "";
     state.roots = [];
     state.nodeByKey.clear();
@@ -435,12 +438,19 @@
     const chain = node.nodeId ? ancestors.concat([node]) : ancestors;
     let selected = 0;
     let total = 0;
-    if (state.loaded.has(node.key) && node.children.length) {
+    if ((state.loaded.has(node.key) || state.mode === "large") && node.children.length) {
       node.children.forEach((child) => {
         const result = syncSubtree(child, chain);
         selected += result.selected;
         total += result.total;
       });
+      // A partially loaded file page still inherits its selected ancestors.
+      // Keep the unseen members in the parent checkbox's effective scope.
+      if (state.mode === "large" && node.hasMore) {
+        const remaining = Math.max(0, node.count - node.children.length);
+        total += remaining;
+        if (folderEffective(node, ancestors)) selected += remaining;
+      }
     }
     if (!total) {
       total = 1;
@@ -525,11 +535,12 @@
   function estimateFiles(node, ancestors) {
     if (node.kind === "file") return fileEffective(node.path, ancestors) ? 1 : 0;
     const chain = node.nodeId ? ancestors.concat([node]) : ancestors;
-    if (!state.loaded.has(node.key) || !node.children.length) {
+    if ((!state.loaded.has(node.key) && state.mode !== "large") || !node.children.length) {
       return folderEffective(node, ancestors) ? Number(node.count || 0) : 0;
     }
     let total = 0;
     node.children.forEach((child) => { total += estimateFiles(child, chain); });
+    if (state.mode === "large" && node.hasMore && folderEffective(node, ancestors)) total += Math.max(0, node.count - node.children.length);
     return total;
   }
 
@@ -862,6 +873,7 @@
   /* 复用页面已有的"打开普通数据包"出口：SJFXDataSources.open('standard') 是
    * app.js 给模块级"切换数据包"提供的公共入口，这里不新造路由。 */
   function openOrdinaryPackage(scanId) {
+    closeImportDialog();
     const id = String(scanId || "").replace(/^\/api\/scan\//, "").trim();
     if (id) {
       // app.js 的 rememberCurrentScan()（app.js:540）就是"当前数据包"的既有约定：
@@ -887,6 +899,9 @@
     const chosen = String($("exportImportParseMode")?.value || "accurate");
     const parseMode = IMPORT_PARSE_MODES.includes(chosen) ? chosen : "accurate";
     const requestKey = importRequestKey();
+    const sourceId = state.sourceId;
+    const treeRequest = state.treeRequest;
+    const isCurrent = () => sourceId === state.sourceId && treeRequest === state.treeRequest;
 
     state.importBusy = true;
     const button = $("exportImportConfirm");
@@ -894,7 +909,7 @@
     setImportState("正在创建普通数据包…", false);
     renderCart();
     try {
-      const data = await api(`/api/large-packages/${encodeURIComponent(state.sourceId)}/catalog/import`, {
+      const data = await api(`/api/large-packages/${encodeURIComponent(sourceId)}/catalog/import`, {
         method: "POST",
         body: JSON.stringify({
           node_ids: [...state.nodes],
@@ -906,14 +921,14 @@
           request_key: requestKey,
         }),
       });
-      showImportResult(data, requestKey, name);
+      if (isCurrent()) showImportResult(data, requestKey, name);
       notify(data.reused
         ? "已复用之前的导入任务"
         : `已开始导入 ${Number(data.selected_file_count || 0).toLocaleString()} 个文件`);
     } catch (error) {
       const status = Number(error.status || 0);
       const message = `导入失败（HTTP ${status || "—"}）：${error.message || "请求失败"}${IMPORT_ERROR_HINTS[status] || ""}`;
-      setImportState(message, true);
+      if (isCurrent()) setImportState(message, true);
       notify(error.message || "导入失败", true);
     } finally {
       state.importBusy = false;

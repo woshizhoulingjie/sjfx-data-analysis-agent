@@ -43,6 +43,8 @@ def current_owner():
 
 def prepare_environment(config):
     """Fresh formal state; never adopt a hand-run acceptance helper directory."""
+    from .policy import file_protection_requested
+    if not file_protection_requested():return None
     # A test-shell override must never reach the formally managed installation.
     os.environ.pop('SJFX_PROTECTION_TEST_STATIC_ONLY',None)
     root=Path(config.DATA_DIR)/'desktop_protection';root.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -107,10 +109,20 @@ def helper_health(paths):
 
 
 def health_report(config,paths=None):
+    from .policy import file_protection_requested, protection_enabled
+    if not file_protection_requested():
+        return {'enabled':False,'status':'disabled','configured':False,
+            'disabled_by_configuration':True,
+            'supported_platform':os.name=='nt' or sys.platform.startswith('linux'),
+            'model_auto_download':False,
+            'helper':{'running':False,'status':'disabled','directory_monitor_healthy':False,'access_audit_healthy':False},
+            'executor':{'healthy':False,'status':'disabled'}}
     root=Path(config.DATA_DIR)/'desktop_protection'
     paths=paths or {'token_file':str(root/'local-process-token'),'endpoint':os.getenv('SJFX_LOCAL_AGENT_ENDPOINT','http://127.0.0.1:18767'),'core_state':str(Path(config.DATA_DIR)/'file_protection')}
-    from .policy import read_policy
-    report={'enabled':read_policy(paths['core_state'])['enabled'],'supported_platform':os.name=='nt' or sys.platform.startswith('linux'),'model_auto_download':False}
+    enabled=protection_enabled(paths['core_state'])
+    report={'enabled':enabled,'status':'enabled' if enabled else 'disabled',
+        'configured':True,'disabled_by_configuration':False,
+        'supported_platform':os.name=='nt' or sys.platform.startswith('linux'),'model_auto_download':False}
     try:
         health=helper_health(paths)
         report['helper']={'running':True,'directory_monitor_healthy':health.get('directory_monitor_healthy',False),'access_audit_healthy':health.get('access_audit_healthy',False),'access_audit_requested':health.get('access_audit_requested',False),'access_audit_error':health.get('access_audit_error',''),'has_unresolved_gaps':health.get('has_unresolved_gaps',False),'registration_limits':health.get('registration_limits',{}),'coverage_limits':health.get('coverage_limits',[]),'active_dispositions':health.get('active_dispositions',0)}
@@ -123,6 +135,9 @@ def health_report(config,paths=None):
 
 
 def executor(args):
+    from .policy import file_protection_requested
+    if not file_protection_requested():
+        raise RuntimeError('File protection executor is disabled by instance configuration')
     from .store import Store
     from .registration import PackageProtection
     from .watch import package_service

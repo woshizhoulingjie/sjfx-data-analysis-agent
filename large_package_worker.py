@@ -2776,11 +2776,20 @@ class LargePackageWorker:
             # 其它包的目录队列（27 个文件）和命名任务全部饿死。
             from config import Config as _CfgN
             _max_att = max(1, int(getattr(_CfgN, 'LP_NAME_MAX_ATTEMPTS', 5) or 5))
+            # Expired initial rounds cannot be renewed by ensure_round(). Their
+            # queued jobs must not monopolize LIMIT 1 and starve ready packages.
+            # Match state()'s latest round; packages without a round can initialize.
+            _naming_now = time.time()
             naming = conn.execute(
                 """SELECT j.package_id FROM lp_catalog_jobs j JOIN packages p ON p.id=j.package_id
                    WHERE (j.status IN ('queued','retry') OR (j.status='deferred' AND j.attempts<?))
                      AND p.status IN ('waiting_for_selection','completed')
-                   ORDER BY j.next_at, j.package_id LIMIT 1""", (_max_att,)).fetchone()
+                     AND j.next_at<=?
+                     AND COALESCE((SELECT r.deadline>? FROM lp_catalog_rounds r
+                                   WHERE r.package_id=j.package_id
+                                   ORDER BY r.started DESC LIMIT 1),1)
+                   ORDER BY j.next_at, j.package_id LIMIT 1""",
+                (_max_att, _naming_now, _naming_now)).fetchone()
         if self.stop_requested:return False
         # **主题层落后于叶组的补做。**
         #
@@ -2839,8 +2848,10 @@ class LargePackageWorker:
                 busy = self._naming_inflight()
                 sql = ("SELECT r.package_id FROM lp_catalog_rounds r "
                        "JOIN packages p ON p.id=r.package_id "
-                       "WHERE r.status='active' AND p.status IN ('waiting_for_selection','completed') ")
-                params = []
+                       "WHERE r.status='active' AND p.status IN ('waiting_for_selection','completed') "
+                       "AND r.deadline>? AND r.id=(SELECT latest.id FROM lp_catalog_rounds latest "
+                       "WHERE latest.package_id=r.package_id ORDER BY latest.started DESC LIMIT 1) ")
+                params = [time.time()]
                 if busy:
                     sql += "AND r.package_id NOT IN (%s) " % ','.join('?' * len(busy))
                     params.extend(busy)

@@ -22,6 +22,7 @@ from services.summary_fidelity import SUMMARY_QUALIFIER_INSTRUCTION
 LOG = logging.getLogger("sjfx.preliminary")
 CONTRACT = "preliminary-ready-v3-file-citations"
 PROMPT_VERSION = "compact-6500-qualifiers-v4-sections"
+OUTPUT_BUDGET_VERSION = "single-1200-batch-600-v1"
 
 
 def enabled(job):
@@ -41,7 +42,15 @@ def result_identity(job):
 
 def configuration_key():
     return {"contract": CONTRACT, "input": INPUT_VERSION, "prompt": PROMPT_VERSION,
-            "model": Config.LLM_MODEL, "input_chars": Config.PRELIMINARY_SUMMARY_INPUT_MAX_CHARS}
+            "model": Config.LLM_MODEL, "input_chars": Config.PRELIMINARY_SUMMARY_INPUT_MAX_CHARS,
+            "output_budget": OUTPUT_BUDGET_VERSION}
+
+
+def _output_tokens(file_count):
+    # Single-file recovery includes the outline and research-direction fields.
+    # Use the existing successful preview budget instead of repeating a short
+    # 700-token request after a batch has already failed.
+    return 1200 if file_count == 1 else 100 + 600 * file_count
 
 
 def ready_matches(job, ready):
@@ -95,7 +104,7 @@ def _call(llm, rows, ledger, lock=None):
     try:
         response = llm.chat_json(
             "你是严谨的中文资料预读助手。独立分析每个文件，输出简短、完整且有来源支持的JSON。",
-            _prompt(rows), max_tokens=100 + 600 * len(rows), long_output=True,
+            _prompt(rows), max_tokens=_output_tokens(len(rows)), long_output=True,
             strict=True, retries=0, structured_retry_limit=0,
             timeout=180 if len(rows) > 1 else 90, allow_short_timeout=True,
             required_fields=("documents",), output_context="普通文件初步摘要",
@@ -201,7 +210,7 @@ def _prepare(row, raw, response, ledger, batch_id, batch_size, fallback_reason=N
         "parser_info": {"parser": (document.get("parser") or {}).get("name"), "coverage": document.get("coverage") or {},
                         "model": response.get("model"), "local_model": response.get("model"),
                         "usage": response.get("usage") or {}, "degraded": degraded, "batch_size": batch_size,
-                        "model_calls": [_model_call_profile("candidate_preview", response, int(response.get("max_tokens") or 100 + 600 * batch_size), Config.LLM_CONTEXT_TOKENS, 1)]},
+                        "model_calls": [_model_call_profile("candidate_preview", response, int(response.get("max_tokens") or _output_tokens(batch_size)), Config.LLM_CONTEXT_TOKENS, 1)]},
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     })
     if degraded:
@@ -229,7 +238,9 @@ def _collect_groups(storage, jobs, per_call, width):
     每组的上下文预算判断与改动前逐字一致；width=1 时只可能产出一组，
     因此「装不下就停」的语义和改动前的 break 完全相同。
     """
-    groups, current, estimated = [], [], 1700
+    # Keep the historical multi-file estimate: 1600 fixed input tokens plus
+    # 300 per file and the actual output budget equals 1700 + 900 per file.
+    groups, current, estimated = [], [], 1600
     for job in jobs:
         snapshot = storage.preliminary_document_snapshot(job)
         if not snapshot:
@@ -238,17 +249,17 @@ def _collect_groups(storage, jobs, per_call, width):
             continue
         started = time.monotonic()
         text = build_preliminary_input(snapshot["document"], Config.PRELIMINARY_SUMMARY_INPUT_MAX_CHARS)
-        cost = _estimated_tokens(text) + 900
+        cost = _estimated_tokens(text) + 300
         full = bool(current) and (
             len(current) >= per_call
-            or estimated + cost > Config.LLM_CONTEXT_TOKENS - 1500
+            or estimated + cost + _output_tokens(len(current) + 1) > Config.LLM_CONTEXT_TOKENS - 1500
         )
         if full:
             if len(groups) + 1 >= width:
                 # width=1 时等价于改动前的 break：剩下的文件留给后续任务。
                 break
             groups.append(current)
-            current, estimated = [], 1700
+            current, estimated = [], 1600
         estimated += cost
         current.append({"job": job, "document": snapshot["document"], "stamp": snapshot["stamp"],
                         "input": text, "input_build_ms": round((time.monotonic() - started) * 1000, 2)})

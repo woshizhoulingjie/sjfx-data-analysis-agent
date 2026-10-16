@@ -45,6 +45,11 @@ class Protection:
         self._watch_proc = None
 
     def ensure_executor(self):
+        from .policy import file_protection_requested
+        if not file_protection_requested():
+            if self._watch_proc is not None and self._watch_proc.poll() is None:
+                self._watch_proc.terminate()
+            return
         if os.getenv('SJFX_DESKTOP_MANAGED_PROTECTION')=='1':return
         if not self.enabled and not os.getenv('SJFX_LOCAL_AGENT_TOKEN_FILE'):
             if self._watch_proc is not None and self._watch_proc.poll() is None:
@@ -478,9 +483,14 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
                                     headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff","Vary":"Cookie","X-Frame-Options":"DENY"})
             if path == "/protection/api/status":
                 mode=protection.mode
-                from .policy import read_policy,mode_allowed
-                package_policy=read_policy(protection.state_dir)
+                from .policy import effective_policy,mode_allowed,file_protection_requested
+                configured=file_protection_requested()
+                if not configured:mode='off'
+                package_policy=effective_policy(protection.state_dir)
                 package_status={'enabled':package_policy['enabled'],'policy_revision':package_policy['revision'],
+                    'status':'enabled' if package_policy['enabled'] else 'disabled',
+                    'configured':configured,'disabled_by_configuration':not configured,
+                    'runtime_disabled':not configured,
                     'registration_modes':[m for m in ('local',) if mode_allowed(package_policy,actor['owner_id'],m)],
                     'registration_url':'/protection/packages'}
                 if mode=='audit':
@@ -489,7 +499,8 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
                     except ProtectionError:pass
                 if actor.get('role') != 'admin':
                     return JSONResponse({'ok':True, 'mode':mode, 'access_version':2,**package_status}, headers={'Cache-Control':'no-store'})
-                return JSONResponse({"ok":True,"mode":mode,"global_mode":protection.mode, 'access_version':1,
+                return JSONResponse({"ok":True,"mode":mode,"global_mode":protection.mode if configured else 'off',
+                    'configured_mode':protection.mode, 'access_version':1,
                     'enforcement_available':protection.allow_enforcement,'source_mode':'local','reader_host':__import__('platform').node(),
                     'protection_version': '4.0-local-candidate', **package_status, 'capabilities': {'file_trace': True, 'version_aware_actions': True,'package_registration':True},
                     "assistant_transport":"authenticated_process_loopback"},headers={'Cache-Control':'no-store'})
@@ -580,13 +591,21 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
         owner=management_owner(user)
         operation=path.rsplit('/',1)[-1]
         if operation=='package-policy':
-            if method=='GET':return {'policy':protection.package.policy()}
+            if method=='GET':
+                from .policy import read_policy,file_protection_requested
+                # The form edits durable policy, while status reports the
+                # effective runtime switch. Never persist an OFF projection.
+                return {'policy':read_policy(protection.state_dir),
+                    'effective_enabled':protection.enabled,
+                    'runtime_disabled':not file_protection_requested()}
             if owner != user['owner_id']:
                 raise ProtectionError('请先切回本人空间再调整保护总开关',403,'own_view_required')
             policy=protection.package.update_policy(user['user_id'],user.get('role')=='admin',
                 {k:v for k,v in data.items() if k!='reason'},str(data.get('reason','')))
             protection.ensure_executor()
-            return {'policy':policy}
+            from .policy import file_protection_requested
+            return {'policy':policy,'effective_enabled':protection.enabled,
+                'runtime_disabled':not file_protection_requested()}
         if operation=='root-grants':
             key='package-root-grants:'+owner
             if method=='GET':
@@ -639,7 +658,7 @@ def install(app, *, state_dir, allowed_roots, session_resolver, resource_root=No
             policy=protection.package.update_policy(user['user_id'],user.get('role')=='admin',
                 {'enabled':data.get('enabled')},str(data.get('reason') or '管理员通过保护设置变更总开关'))
             protection.ensure_executor()
-            return {'policy':policy,'enforced':policy['enabled']}
+            return {'policy':policy,'enforced':protection.enabled}
         if path.endswith('/session'):
             result = {'session_tag':session_tag,'name':user.get('display_name',''),'admin':user.get('role')=='admin'}
             if user.get('role') == 'admin': result.update(owner=owner, device_owner=user['owner_id'])

@@ -112,3 +112,101 @@ def test_http_excluded_path_is_not_a_worker_target(api):
         options = conn.execute('SELECT options FROM analysis_jobs WHERE id=?',
                                (response.json()['job_id'],)).fetchone()[0]
     assert json.loads(options)['target_paths'] == [fixtures.FILES[1][0]]
+
+
+@pytest.mark.parametrize('payload', [
+    ['not-an-object'],
+    {'exclude_paths': 'unselected.txt'},
+    {'exclude_node_ids': fixtures.GROUP_B},
+    {'exclude_paths': {'path': fixtures.FILES[0][0]}},
+    {'exclude_node_ids': 1},
+])
+def test_http_malformed_selection_is_rejected_without_creating_job(api, payload):
+    _, case, client = api
+    if isinstance(payload, dict):
+        response = submit(client, **payload)
+    else:
+        response = client.post('/api/large-packages/%s/catalog/import' % fixtures.PACKAGE,
+                               headers={'X-SJFX-Token': 'catalog-test-only'}, json=payload)
+    assert response.status_code == 400
+    assert case._count('SELECT COUNT(*) FROM scans') == 0
+    assert case._count('SELECT COUNT(*) FROM analysis_jobs') == 0
+
+
+@pytest.mark.parametrize('selection,status', [
+    ({'node_ids': [], 'paths': []}, 400),
+    ({'node_ids': [], 'paths': ['missing.txt']}, 409),
+    ({'node_ids': ['missing-node']}, 404),
+    ({'paths': ['../outside.txt'], 'node_ids': []}, 400),
+    ({'node_ids': ['preview:unfinished']}, 409),
+    ({'exclude_paths': [path for path, group in fixtures.FILES if group == fixtures.GROUP_A]}, 400),
+])
+def test_http_empty_missing_or_unavailable_selection_never_creates_job(api, selection, status):
+    _, case, client = api
+    response = submit(client, **selection)
+    assert response.status_code == status
+    assert case._count('SELECT COUNT(*) FROM scans') == 0
+    assert case._count('SELECT COUNT(*) FROM analysis_jobs') == 0
+
+
+def test_http_mixed_exclusions_share_the_server_limit(api, monkeypatch):
+    _, case, client = api
+    from services import large_package_catalog_import as bridge
+    monkeypatch.setattr(bridge, 'MAX_EXCLUSIONS', 1)
+    response = submit(client, exclude_paths=[fixtures.FILES[0][0]],
+                      exclude_node_ids=[fixtures.GROUP_B])
+    assert response.status_code == 413
+    assert case._count('SELECT COUNT(*) FROM scans') == 0
+    assert case._count('SELECT COUNT(*) FROM analysis_jobs') == 0
+
+
+def test_http_stale_excluded_node_requires_refresh_without_expanding_selection(api):
+    _, case, client = api
+    response = submit(client, node_ids=[fixtures.GROUP_A, fixtures.GROUP_B],
+                      exclude_node_ids=['removed-child-node'])
+    assert response.status_code == 404
+    for table in ('scans', 'analysis_jobs', 'import_tasks'):
+        assert case._count('SELECT COUNT(*) FROM ' + table) == 0
+    # The route rejects before the bridge's lazy audit-table initialization.
+    assert case._count("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                       "AND name='large_catalog_imports'") == 0
+
+
+@pytest.mark.parametrize('selection,expected', [
+    ({'node_ids': [], 'paths': [fixtures.FILES[2][0], fixtures.FILES[0][0], fixtures.FILES[2][0]]},
+     [fixtures.FILES[2][0], fixtures.FILES[0][0]]),
+    ({'node_ids': [fixtures.GROUP_A, fixtures.GROUP_B], 'exclude_node_ids': [fixtures.GROUP_B],
+      'exclude_paths': [fixtures.FILES[0][0]]}, [fixtures.FILES[1][0]]),
+    ({'node_ids': [fixtures.GROUP_A, fixtures.GROUP_A], 'paths': [fixtures.FILES[0][0]]},
+     [fixtures.FILES[0][0], fixtures.FILES[1][0]]),
+])
+def test_http_selection_remains_exact_through_ordinary_handoff(api, selection, expected):
+    _, case, client = api
+    first = submit(client, **selection)
+    assert first.status_code == 202
+    retry = submit(client, **selection)
+    assert retry.status_code == 200 and retry.json()['reused']
+    assert retry.json()['job_id'] == first.json()['job_id']
+    assert first.json()['selected_file_count'] == len(expected)
+    scan_id, job_id = first.json()['scan_id'], first.json()['job_id']
+    with case.ordinary._connect() as conn:
+        scan = conn.execute('SELECT root_path,owner_id,payload FROM scans WHERE id=?', (scan_id,)).fetchone()
+        inventory = [row[0] for row in conn.execute(
+            "SELECT node_path FROM inventory_entries WHERE scan_id=? AND kind='file'", (scan_id,))]
+        selection_row = conn.execute('SELECT included_paths FROM scan_selections WHERE scan_id=?', (scan_id,)).fetchone()
+        task = conn.execute('SELECT owner_id,checkpoint FROM import_tasks WHERE scan_id=?', (scan_id,)).fetchone()
+        job = conn.execute('SELECT task_type,owner_id,options FROM analysis_jobs WHERE id=?', (job_id,)).fetchone()
+    options = json.loads(job['options'])
+    assert set(inventory) == set(json.loads(selection_row[0])) == set(expected)
+    assert set(json.loads(scan['payload'])['selected_paths']) == set(expected)
+    assert set(json.loads(task['checkpoint'])['selected_paths']) == set(expected)
+    assert set(options['target_paths']) == set(expected)
+    assert scan['owner_id'] == task['owner_id'] == job['owner_id'] == 'o1'
+    assert scan['root_path'] == '/tmp/lpimport-src'
+    assert job['task_type'] == 'analyze_package'
+    assert options['workflow_source'] == 'selected_file_parse'
+    assert options['continue_full'] is False and options['candidate_preview'] is False
+    assert options['deep_batch_id'] is None
+    assert case._count('SELECT COUNT(*) FROM analysis_jobs') == 1
+    with closing(case.large._connect()) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM queue WHERE stage=\'deep\'').fetchone()[0] == 0

@@ -130,7 +130,7 @@ def test_fast_single_and_batch_use_the_same_real_wrapper_and_factory_contract(pr
     assert result["structured_retry"] is False
     assert len(ledger) == 1 and ledger[0]["success"] is True
     assert ledger[0]["files"] == files
-    assert_wire_contract(protocol, "documents", 100 + 600 * files, 90 if files == 1 else 180, compact=False)
+    assert_wire_contract(protocol, "documents", 1200 if files == 1 else 100 + 600 * files, 90 if files == 1 else 180, compact=False)
 
 
 @pytest.mark.parametrize("content,finish", (("not JSON", "stop"), ('{"documents":[{"core_summary":"看似完整"}]}', "length")))
@@ -141,7 +141,7 @@ def test_fast_disabled_structured_retry_rejects_invalid_or_truncated_output(prot
         _call(protocol.runtime, [{"job":{"id":"1", "options":{"path":"A.txt"}}, "input":"原始材料"}], ledger)
     assert len(protocol.calls) == 1
     assert ledger[0]["success"] is False
-    assert output_budget(protocol.calls[0], protocol.backend) == 700
+    assert output_budget(protocol.calls[0], protocol.backend) == 1200
 
 
 def test_wrapper_retains_existing_single_format_correction_without_transport_retry(protocol):

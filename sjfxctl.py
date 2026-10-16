@@ -163,6 +163,17 @@ def _ports_available(config):
 def _dependency_check(modules):
     return [name for name in modules if importlib.util.find_spec(name) is None]
 
+def _apply_linux_business_defaults(content):
+    """Load public packaging defaults without importing instance configuration."""
+    if not sys.platform.startswith('linux'):
+        return content
+    path = ROOT / 'packaging' / 'build_offline_bundle.py'
+    spec = importlib.util.spec_from_file_location('sjfx_linux_business_defaults', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.apply_linux_business_defaults(content)
+
+
 def setup(args):
     if not args.env_file:
         raise RuntimeError('setup requires --env-file; an existing configuration is never overwritten')
@@ -216,6 +227,7 @@ def setup(args):
         'SJFX_PROTECTION_SCAN_WORKDIR="{}"'.format(data/'desktop_protection'/'scan-work'),
         'HF_HUB_OFFLINE=1', 'TRANSFORMERS_OFFLINE=1', '',
     ])
+    content = _apply_linux_business_defaults(content)
     with target.open('x', encoding='utf-8', newline='\n') as handle:
         handle.write(content)
     os.chmod(target, 0o600)
@@ -240,7 +252,10 @@ def doctor(config, scope='full', required_features=()):
     from sjfx_protection.desktop_runtime import health_report
     from sjfx_protection.desktop_audit import preflight
     report['desktop_protection'] = health_report(config)
-    report['program_access_audit_preflight'] = preflight()
+    from sjfx_protection.policy import file_protection_requested
+    report['program_access_audit_preflight'] = (preflight() if file_protection_requested() else
+        {'enabled':False,'status':'disabled','configuration_required':False,
+         'healthy':False,'coverage_complete':False,'reason':'File protection is disabled by instance configuration'})
     from services.managed_embedding import resource_check
     if getattr(config, 'MANAGED_EMBEDDING', False):
         report['bundled_embedding'] = resource_check(config)
@@ -373,7 +388,8 @@ def supervise(args, config):
         raise RuntimeError('Missing application dependencies: ' + ', '.join(missing))
     ensure_runtime_directories()
     from sjfx_protection.desktop_runtime import prepare_environment,helper_command,helper_health,health_report
-    protection_paths = prepare_environment(config)
+    from sjfx_protection.policy import file_protection_requested
+    protection_paths = prepare_environment(config) if file_protection_requested() else None
     runtime = _runtime(config)
     runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
     stop_path = runtime / 'stop.json'
@@ -399,28 +415,29 @@ def supervise(args, config):
         publish()
         try:
             deadline = time.monotonic() + args.timeout
-            children['protection-helper'] = _spawn_role('protection-helper',config,runtime,token,helper_command(protection_paths))
-            process=children['protection-helper'][0]
-            state['roles']['protection-helper']={'pid':process.pid,'created':_identity(process.pid)}
-            while True:
-                if process.poll() is not None: raise RuntimeError('Protection helper exited; see launcher-protection-helper.log')
-                try:
-                    helper_health(protection_paths)
-                    break
-                except (OSError,ValueError,RuntimeError): pass
-                if requested(): return 0
-                if time.monotonic()>=deadline: raise RuntimeError('Protection helper startup timed out')
-                time.sleep(.2)
-            children['protection-executor'] = _spawn_role('protection-executor',config,runtime,token,
-                [sys.executable,'-B','-X','utf8','-m','sjfx_protection.desktop_runtime','executor','--state',protection_paths['core_state']])
-            process=children['protection-executor'][0]
-            state['roles']['protection-executor']={'pid':process.pid,'created':_identity(process.pid)}
-            ready=children['protection-executor'][3].with_suffix('.ready')
-            while not (ready.is_file() and ready.read_text(encoding='ascii')==token):
-                if process.poll() is not None: raise RuntimeError('Protection executor exited; see launcher-protection-executor.log')
-                if requested(): return 0
-                if time.monotonic()>=deadline: raise RuntimeError('Protection executor startup timed out')
-                time.sleep(.1)
+            if protection_paths is not None:
+                children['protection-helper'] = _spawn_role('protection-helper',config,runtime,token,helper_command(protection_paths))
+                process=children['protection-helper'][0]
+                state['roles']['protection-helper']={'pid':process.pid,'created':_identity(process.pid)}
+                while True:
+                    if process.poll() is not None: raise RuntimeError('Protection helper exited; see launcher-protection-helper.log')
+                    try:
+                        helper_health(protection_paths)
+                        break
+                    except (OSError,ValueError,RuntimeError): pass
+                    if requested(): return 0
+                    if time.monotonic()>=deadline: raise RuntimeError('Protection helper startup timed out')
+                    time.sleep(.2)
+                children['protection-executor'] = _spawn_role('protection-executor',config,runtime,token,
+                    [sys.executable,'-B','-X','utf8','-m','sjfx_protection.desktop_runtime','executor','--state',protection_paths['core_state']])
+                process=children['protection-executor'][0]
+                state['roles']['protection-executor']={'pid':process.pid,'created':_identity(process.pid)}
+                ready=children['protection-executor'][3].with_suffix('.ready')
+                while not (ready.is_file() and ready.read_text(encoding='ascii')==token):
+                    if process.poll() is not None: raise RuntimeError('Protection executor exited; see launcher-protection-executor.log')
+                    if requested(): return 0
+                    if time.monotonic()>=deadline: raise RuntimeError('Protection executor startup timed out')
+                    time.sleep(.1)
             state['desktop_protection']=health_report(config,protection_paths)
             from services.managed_embedding import selected, resource_check
             if selected(config):
@@ -494,11 +511,12 @@ def supervise(args, config):
             except OSError:
                 pass  # Cleanup must run even when state storage is full.
             failures = []
-            try:
-                health=helper_health(protection_paths)
-                state['pending_dispositions_at_stop']=health.get('active_dispositions',0)
-                state['protection_history_preserved']=True
-            except (OSError,ValueError,RuntimeError): pass
+            state['protection_history_preserved']=True
+            if protection_paths is not None:
+                try:
+                    health=helper_health(protection_paths)
+                    state['pending_dispositions_at_stop']=health.get('active_dispositions',0)
+                except (OSError,ValueError,RuntimeError): pass
             for role in reversed(list(children)):
                 process, owner, log, gate = children[role]
                 try:

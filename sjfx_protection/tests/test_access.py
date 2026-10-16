@@ -81,7 +81,10 @@ def test_pages_and_safe_payloads(env):
             assert status['registration_modes'] == ['local']
             assert status['registration_url'] == '/protection/packages'
             assert set(status) == {'ok', 'mode', 'access_version', 'enabled',
-                                   'policy_revision', 'registration_modes', 'registration_url'}
+                                   'policy_revision', 'registration_modes', 'registration_url',
+                                   'status', 'configured', 'disabled_by_configuration', 'runtime_disabled'}
+            assert status['status'] == 'disabled' and status['configured'] is True
+            assert status['disabled_by_configuration'] is False and status['runtime_disabled'] is False
             session = (await c.get('/protection/api/session')).json()
             assert session['admin'] is False and 'owner' not in session
         async with client(env[0], 'admin') as c:

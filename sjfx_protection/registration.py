@@ -13,7 +13,7 @@ import secrets
 import time
 from pathlib import Path
 from .store import ProtectionError,uid,encode,digest
-from .policy import read_policy,write_policy,mode_allowed
+from .policy import effective_policy,write_policy,mode_allowed
 from .jobs import Jobs,JOBS_SCHEMA
 from .inspection import create_snapshot,evidence,profile_key,effective_profile,refresh_runtime_engines
 from .scanner import stable_hash
@@ -108,7 +108,7 @@ class PackageProtection(LocalSourceMixin):
         self.store=store;self.allowed_roots=list(allowed_roots)
         self.authorize_root=authorize_root;self.authorize_owner=authorize_owner;self._schema_ready=False
         self.jobs=Jobs(store)
-    def policy(self):return read_policy(self.store.directory)
+    def policy(self):return effective_policy(self.store.directory)
     @property
     def enabled(self):return self.policy()['enabled']
     def update_policy(self,actor,is_admin,changes,reason):

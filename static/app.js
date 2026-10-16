@@ -2073,6 +2073,8 @@ function renderSummary(
     || analysisDepth === 'preliminary_document'
     || analysisDepth === 'preliminary_node';
   const isPreliminaryNode = analysisDepth === 'preliminary_node';
+  const isPreliminaryFallback = isPreliminary
+    && ['local-preliminary-fallback', 'local-preview-fallback', 'local-fallback'].includes(generatedBy);
   const isModelDeep = !isPreliminary && !isModelPreviewNode
     && (generatedBy === 'model-deep-analysis'
       || generatedBy === 'model'
@@ -2081,7 +2083,7 @@ function renderSummary(
   const provenanceLabel = isModelPreviewNode
     ? '模型节点预览摘要'
     : isPreliminary
-      ? (isPreliminaryNode ? '节点初步摘要' : '模型初步摘要')
+      ? (isPreliminaryFallback ? '本地解析保底摘要' : (isPreliminaryNode ? '节点初步摘要' : '模型初步摘要'))
     : isModelDeep
       ? (analysisDepth === 'deep_folder' ? '模型深度分析 · 节点范围' : '模型深度分析 · 全文')
     : generatedBy === 'local-unified-parser'
@@ -2089,7 +2091,10 @@ function renderSummary(
       : generatedBy === 'local-inventory'
         ? '文件盘点信息'
         : isDegraded ? '降级摘要结果' : '摘要结果';
-  html += `<div class="summary-provenance ${isModelDeep ? 'is-deep' : 'is-preview'}"><span>${escapeHtml(provenanceLabel)}</span>${isDegraded ? '<small>部分步骤未达到完整性门槛，请查看覆盖与告警</small>' : ''}</div>`;
+  const provenanceWarning = isPreliminaryFallback
+    ? '模型摘要未完成，当前显示本地解析保底结果；可重试生成'
+    : '部分步骤未达到完整性门槛，请查看覆盖与告警';
+  html += `<div class="summary-provenance ${isModelDeep ? 'is-deep' : 'is-preview'}"><span>${escapeHtml(provenanceLabel)}</span>${isDegraded ? `<small>${escapeHtml(provenanceWarning)}</small>` : ''}</div>`;
 
   const summary =
     data.summary

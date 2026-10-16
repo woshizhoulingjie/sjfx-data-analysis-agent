@@ -9,6 +9,7 @@
   5. 同一主题内同名但内容不相容的叶组既不合并也不改名 → INV-3 永久阻断。
 """
 import time
+import unittest
 from contextlib import closing
 from unittest.mock import patch
 
@@ -178,6 +179,66 @@ def test_exhausted_deferred_job_does_not_capture_the_background_lane():
             assert submitted == [], '耗尽的任务不应再被当成命名待办'
     finally:
         case.doCleanups()
+
+
+class BackgroundNamingReadinessTests(unittest.TestCase):
+    def _selection(self, round_status='completed', deadline_offset=-60, next_offset=0, only_expired=False):
+        case = _case()
+        self.addCleanup(case.doCleanups)
+        old_pid, ready_pid = sorted([case.pid, case.store.create(case.root)['id']])
+        now = time.time()
+        with closing(case.store._connect()) as c:
+            for pid in ((old_pid,) if only_expired else (old_pid, ready_pid)):
+                c.execute("UPDATE packages SET status='completed',phase='report_ready' WHERE id=?", (pid,))
+                c.execute("INSERT INTO lp_catalog_jobs(package_id,group_id,revision,next_at) VALUES(?,?,1,?)",
+                          (pid, 'g1', now + next_offset if pid == old_pid and next_offset else 0))
+            rounds = [] if only_expired else [(ready_pid, 'initial', now, now + 3600, 'active', 0)]
+            if round_status is not None:
+                # An older usable round must not hide the latest expired round.
+                rounds.extend([(old_pid, 'earlier', now - 120, now + 3600, 'active', 0),
+                               (old_pid, 'initial', now, now + deadline_offset, round_status,
+                                1 if round_status == 'exhausted' else 0)])
+            c.executemany("INSERT INTO lp_catalog_rounds(package_id,id,request_key,started,deadline,"
+                          "status,requests,max_requests,max_tokens) VALUES(?,?,?,?,?,?,?,1,100)",
+                          [(pid, key, key, started, deadline, status, requests)
+                           for pid, key, started, deadline, status, requests in rounds])
+            before = [tuple(row) for row in c.execute('SELECT * FROM lp_catalog_rounds ORDER BY package_id,id')]
+            c.commit()
+        from large_package_worker import LargePackageWorker
+        worker = LargePackageWorker(store=case.store, poll_seconds=0.2)
+        worker._topic_catchup = lambda: False
+        worker._solo_catchup = lambda: 0
+        worker._degraded_report_candidates = lambda: []
+        worker._overview_catchup = lambda: False
+        submitted = []
+        worker._submit_naming = lambda pid: submitted.append(pid) or True
+        with patch.object(Config, 'LP_CATALOG_MODEL_NAMING', True), \
+                patch('services.large_package_catalog_refine.process_one', return_value=False):
+            self.assertEqual(bool(worker._catalog_background()), not only_expired)
+        with closing(case.store._connect()) as c:
+            self.assertEqual(before, [tuple(row) for row in c.execute(
+                'SELECT * FROM lp_catalog_rounds ORDER BY package_id,id')])
+            self.assertEqual([(row['status'], row['attempts']) for row in c.execute(
+                'SELECT status,attempts FROM lp_catalog_jobs')], [('queued', 0)] * (1 if only_expired else 2))
+        return submitted, old_pid, ready_pid
+
+    def test_latest_expired_round_does_not_starve_ready_package(self):
+        submitted, _, ready_pid = self._selection()
+        self.assertEqual(submitted, [ready_pid])
+
+    def test_idle_fallback_does_not_submit_an_earlier_active_round(self):
+        submitted, _, _ = self._selection(only_expired=True)
+        self.assertEqual(submitted, [])
+
+    def test_unexpired_or_missing_round_preserves_existing_initialization(self):
+        for status in (None, 'active', 'completed', 'exhausted'):
+            with self.subTest(status=status):
+                submitted, old_pid, _ = self._selection(status, deadline_offset=3600)
+                self.assertEqual(submitted, [old_pid])
+
+    def test_future_job_does_not_starve_due_package(self):
+        submitted, _, ready_pid = self._selection('active', deadline_offset=3600, next_offset=3600)
+        self.assertEqual(submitted, [ready_pid])
 
 
 def test_catalog_message_switches_to_refined_when_everything_is_done():
