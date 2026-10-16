@@ -251,4 +251,9 @@ def test_embedding_server_uses_shared_local_model_from_any_cwd(project, tmp_path
     expected_model = str(project / "离线 模型" / "multilingual-e5-small")
     assert data["path"] == expected_model
     assert data["port"] == expected
-    assert data["calls"] == [[expected_model, {"local_files_only": True}]] * 2
+    # Both loaders stay offline and reject remote code; model weights must use
+    # the existing safetensors-only loading contract.
+    assert data["calls"] == [
+        [expected_model, {"local_files_only": True, "trust_remote_code": False}],
+        [expected_model, {"local_files_only": True, "trust_remote_code": False, "use_safetensors": True}],
+    ]
